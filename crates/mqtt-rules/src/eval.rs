@@ -75,6 +75,11 @@ pub struct EvalCtx<'a> {
     /// For a dry run: the scratch store its state calls go to instead of the one the
     /// rules were loaded with ([`dry_run`](Self::dry_run)).
     scratch: Option<crate::state::Scratch<'a>>,
+    /// The dictionary `proc_dict_*` work on: the evaluating task's
+    /// ([`on`](Self::on)); without one, an empty one of this context's own, made when
+    /// a call first asks for it.
+    dictionary: Option<&'a crate::state::Dictionary>,
+    own_dictionary: OnceCell<crate::state::Dictionary>,
 }
 
 /// Patterns and the result of compiling each, most recent first.
@@ -102,7 +107,25 @@ impl<'a> EvalCtx<'a> {
             budget: None,
             own_state_calls: std::cell::Cell::new(0),
             scratch: None,
+            dictionary: None,
+            own_dictionary: OnceCell::new(),
         }
+    }
+
+    /// The same context, evaluated by the task that owns `dictionary`: what
+    /// `proc_dict_*` read and write (ADR 0085 D13).
+    #[must_use]
+    pub fn on(mut self, dictionary: &'a crate::state::Dictionary) -> Self {
+        self.dictionary = Some(dictionary);
+        self
+    }
+
+    /// The dictionary `proc_dict_*` work on.
+    pub(crate) fn dictionary(&self) -> &crate::state::Dictionary {
+        self.dictionary.unwrap_or_else(|| {
+            self.own_dictionary
+                .get_or_init(crate::state::Dictionary::new)
+        })
     }
 
     /// The same context, counting its state calls in `budget`: the original message's,

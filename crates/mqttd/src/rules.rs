@@ -55,6 +55,15 @@
 //!   events say about a message's publisher travels with the message as its
 //!   [`Origin`], stamped at the publish only while a rule here or on a peer selects one
 //!   of them ([`Rules::origin_wanted`]).
+//! - **The dictionary** ([ADR 0085](../../../docs/adr/0085-rule-state-store.md) D13).
+//!   EMQX's `proc_dict_*` work on the dictionary of the process that evaluates the
+//!   rule, which there is the client's connection process. Here it is the connection
+//!   task's: a [`Dictionary`] in its [`ConnRules`], handed to everything that task
+//!   evaluates (its publishes and what they republish, its events, the deliveries to
+//!   it, the hub's notes about either), empty at connect and dropped with the
+//!   connection. No other task can reach it, so no call takes a lock for it. A Will
+//!   (the hub's, or its own task's) and the notes task evaluate on an empty dictionary
+//!   that is dropped afterwards.
 //! - **Watching it** ([ADR 0084](../../../docs/adr/0084-watching-and-editing-rules-live.md)).
 //!   [`RulesObserve`] holds the live `[rules]` settings for the `$SYS` statistics and
 //!   the trace, each rule's last error, and the trace's queue. With the trace off an
@@ -72,6 +81,7 @@ use bytes::Bytes;
 use mqtt_codec::QoS;
 use mqtt_core::{AppProperties, ClientId, Origin};
 use mqtt_observability::metrics::Metrics;
+use mqtt_rules::state::Dictionary;
 use mqtt_rules::{
     Budget, Effect, EventInput, EventKind, EventMessage, Functions, Input, JqSettings, JqSwitch,
     ModuleSettings, Outcome, PublishInput, Recursion, Republish, Rule, RuleSet,
@@ -494,6 +504,8 @@ struct Engine<'a> {
     observe: Option<&'a RulesObserve>,
     /// Whether the messages it derives carry an [`Origin`].
     origin_wanted: bool,
+    /// The evaluating task's dictionary (`proc_dict_*`).
+    dictionary: &'a Dictionary,
 }
 
 impl Engine<'_> {
@@ -509,22 +521,25 @@ impl Engine<'_> {
             set,
             metrics,
             observe,
+            dictionary,
             ..
         } = self;
         let mut effects = Vec::new();
         // The trace's gate: one relaxed load, then the plain report or the capturing one.
         match observe.filter(|o| o.tracing()) {
-            None => set.on_publish_within(
+            None => set.on_publish_in(
                 input,
                 budget,
+                dictionary,
                 &mut |r, o| report(metrics, observe, r, o),
                 &mut effects,
             ),
             Some(o) => {
                 let mut capture = Capture::new(o.trace_rate());
-                set.on_publish_within(
+                set.on_publish_in(
                     input,
                     budget,
+                    dictionary,
                     &mut |r, out| {
                         capture.see(r, out);
                         report(metrics, observe, r, out);
@@ -575,9 +590,11 @@ impl Engine<'_> {
 /// Evaluate a publish against `set`, and what it republishes in turn. `origin` is the
 /// publish's own, when it carries one: its rules then see the `id` and
 /// `publish_received_at` the message events will report for it, and what they
-/// republish carries an origin too.
+/// republish carries an origin too. `dictionary` is the evaluating task's.
+#[allow(clippy::too_many_arguments)] // one evaluation's facts, passed once
 fn evaluate(
     set: &RuleSet,
+    dictionary: &Dictionary,
     node: &str,
     metrics: Option<&Metrics>,
     observe: Option<&RulesObserve>,
@@ -604,6 +621,7 @@ fn evaluate(
         metrics,
         observe,
         origin_wanted: origin.is_some(),
+        dictionary,
     };
     let budget = Budget::new(f.payload.len());
     let effects = engine.publish(&input, &budget, || TraceTrigger::message(trigger, f));
@@ -694,7 +712,11 @@ impl Rules {
         hub: mpsc::UnboundedSender<HubCommand>,
     ) -> mpsc::Sender<Box<MessageNote>> {
         let (tx, mut rx) = mpsc::channel::<Box<MessageNote>>(NOTE_QUEUE);
-        let rules = self.for_connection();
+        // No connection's task: each note is evaluated on an empty dictionary.
+        let rules = ConnRules {
+            keeps_dictionary: false,
+            ..self.for_connection()
+        };
         let mut reloaded = self.rx.clone();
         reloaded.mark_unchanged();
         tokio::spawn(async move {
@@ -770,8 +792,24 @@ impl Rules {
         let mut rx = self.rx.clone();
         let set = rx.borrow_and_update().clone();
         ConnRules {
+            view: Mutex::new(View {
+                rx,
+                set,
+                dictionary: self.dictionary(),
+            }),
             engine: self.clone(),
-            view: Mutex::new(View { rx, set }),
+            keeps_dictionary: true,
+        }
+    }
+
+    /// An empty dictionary for one evaluating task (`proc_dict_*`, ADR 0085 D13),
+    /// whose bytes count against the ceiling of the store the rules keep their state
+    /// in. Where rule state is off no rule that calls `proc_dict_*` loads, and the
+    /// dictionary stays empty.
+    fn dictionary(&self) -> Dictionary {
+        match &self.state {
+            Some(store) => Dictionary::counted_in(store.clone()),
+            None => Dictionary::new(),
         }
     }
 
@@ -796,8 +834,12 @@ impl Rules {
         origin: Option<&Origin>,
         send: impl Fn(HubCommand),
     ) {
+        // EMQX evaluates a Will in the dying connection's process, which still holds
+        // its dictionary. Here the connection's task has ended: an empty one, dropped
+        // after this (ADR 0085 D13, a listed difference).
         let derived = evaluate(
             &self.current(),
+            &self.dictionary(),
             &self.node,
             self.metrics.as_deref(),
             self.observe.as_deref(),
@@ -814,15 +856,18 @@ impl Rules {
 struct View {
     rx: RulesWatch,
     set: Arc<RuleSet>,
+    /// The connection task's dictionary (`proc_dict_*`): beside the rule set, behind
+    /// the connection's own lock, which an evaluation already holds. Empty, it is
+    /// a few words and no allocation.
+    dictionary: Dictionary,
 }
 
 impl View {
-    fn fresh(&mut self) -> &RuleSet {
+    fn refresh(&mut self) {
         // `has_changed` loads the watch's version: no shared write per publish.
         if self.rx.has_changed().unwrap_or(false) {
             self.set = self.rx.borrow_and_update().clone();
         }
-        &self.set
     }
 }
 
@@ -837,6 +882,10 @@ impl View {
 pub struct ConnRules {
     engine: Rules,
     view: Mutex<View>,
+    /// Whether what `proc_dict_*` wrote stays for the next evaluation: yes for a
+    /// connection, whose dictionary lives as long as it does; no for the notes task,
+    /// which evaluates for clients that have no connection.
+    keeps_dictionary: bool,
 }
 
 impl std::fmt::Debug for ConnRules {
@@ -848,12 +897,17 @@ impl std::fmt::Debug for ConnRules {
 }
 
 impl ConnRules {
-    fn with_set<T>(&self, f: impl FnOnce(&RuleSet) -> T) -> T {
+    fn with_set<T>(&self, f: impl FnOnce(&RuleSet, &Dictionary) -> T) -> T {
         let mut view = self
             .view
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        f(view.fresh())
+        view.refresh();
+        let result = f(&view.set, &view.dictionary);
+        if !self.keeps_dictionary {
+            view.dictionary.clear();
+        }
+        result
     }
 
     /// Evaluate a client publish. Returns the messages its rules republish, in rule
@@ -865,10 +919,11 @@ impl ConnRules {
         let metrics = self.engine.metrics.as_deref();
         let observe = self.engine.observe.as_deref();
         let peers = self.engine.peers_want_origin.load(Relaxed);
-        self.with_set(|set| {
+        self.with_set(|set, dictionary| {
             let origin = (peers || set.wants_message_events()).then(|| client_origin(f));
             let derived = evaluate(
                 set,
+                dictionary,
                 &self.engine.node,
                 metrics,
                 observe,
@@ -884,20 +939,20 @@ impl ConnRules {
     /// held — for a connection that is idle but alive (its PINGREQ), so a series of
     /// reloads does not keep a series of old rule sets in memory.
     pub fn refresh(&self) {
-        self.with_set(|_| ());
+        self.with_set(|_, _| ());
     }
 
     /// Whether any rule selects `kind` (checked before building the event).
     #[must_use]
     pub fn wants(&self, kind: mqtt_rules::EventKind) -> bool {
-        self.with_set(|set| set.wants_event(kind))
+        self.with_set(|set, _| set.wants_event(kind))
     }
 
     /// Which message events the rules select: what a connection reads once per batch
     /// of deliveries it writes, so a batch no rule watches costs one uncontended lock.
     #[must_use]
     pub fn message_wants(&self) -> MessageWants {
-        self.with_set(MessageWants::of)
+        self.with_set(|set, _| MessageWants::of(set))
     }
 
     /// This node's id, the `node` of every event.
@@ -993,23 +1048,25 @@ impl ConnRules {
         let observe = self.engine.observe.as_deref();
         let node = &self.engine.node;
         let peers = self.engine.peers_want_origin.load(Relaxed);
-        let derived = self.with_set(|set| {
+        let derived = self.with_set(|set, dictionary| {
             let budget = Budget::new(input.payload().map_or(0, Bytes::len));
             let mut effects = Vec::new();
             match observe.filter(|o| o.tracing()) {
                 None => {
-                    set.on_event_within(
+                    set.on_event_in(
                         input,
                         &budget,
+                        dictionary,
                         &mut |r, o| report(metrics, observe, r, o),
                         &mut effects,
                     );
                 }
                 Some(o) => {
                     let mut capture = Capture::new(o.trace_rate());
-                    set.on_event_within(
+                    set.on_event_in(
                         input,
                         &budget,
+                        dictionary,
                         &mut |r, out| {
                             capture.see(r, out);
                             report(metrics, observe, r, out);
@@ -1025,6 +1082,7 @@ impl ConnRules {
                 metrics,
                 observe,
                 origin_wanted: peers || set.wants_message_events(),
+                dictionary,
             };
             engine.reenter(effects, input.republish_depth(), &budget)
         });

@@ -884,7 +884,6 @@ impl Parser<'_, '_> {
         self.loading
             .state
             .binding(family)
-            .map(Some)
             .map_err(|e| ParseError::at(self.sql, start, e))
     }
 

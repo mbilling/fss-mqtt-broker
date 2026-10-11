@@ -832,9 +832,13 @@ fn dry_run(
             .map(|r| &**r.id())
             .collect(),
     };
+    // A scratch dictionary too, for EMQX's `proc_dict_*`: this request's own, as each
+    // of EMQX's SQL tests over its API runs in a process of its own. Never a
+    // connection's.
+    let dictionary = mqtt_rules::state::Dictionary::new();
     ids.into_iter()
         .filter_map(|id| set.get(id))
-        .map(|rule| evaluate(set, rule, input, scratch))
+        .map(|rule| evaluate(set, rule, input, scratch, &dictionary))
         .collect()
 }
 
@@ -872,6 +876,7 @@ fn evaluate(
     rule: &Rule,
     input: &dyn Input,
     scratch: Option<&dyn mqtt_rules::StateStore>,
+    dictionary: &mqtt_rules::state::Dictionary,
 ) -> Tested {
     let id = &**rule.id();
     if let Some(reason) = rule.from_mismatch(input) {
@@ -888,10 +893,11 @@ fn evaluate(
     // Each output runs every action in order; an `ActionOk` is followed by its effect.
     let (mut actions, mut rendered, per_output) = (0usize, 0usize, rule.action_count().max(1));
     let mut effects = Vec::new();
-    set.evaluate_one(
+    set.evaluate_one_on(
         id,
         input,
         scratch,
+        dictionary,
         &mut |_, outcome| match outcome {
             Outcome::Passed => result = "passed",
             Outcome::NoResult => result = "no_result",

@@ -899,7 +899,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-rules/src/lib.rs` — 213 test(s)
+## `crates/mqtt-rules/src/lib.rs` — 227 test(s)
 
 - `edit::tests::a_json_rule_body_is_a_rule_edit`
 - `edit::tests::an_insert_appends_the_rule_at_the_end`
@@ -1078,6 +1078,20 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests_modules::a_rules_file_declares_a_module_by_path_and_sha256_and_its_rules_call_it`
 - `tests_modules::a_statement_on_its_own_calls_the_modules_a_rules_file_declares`
 - `tests_modules::every_built_in_and_every_emqx_function_name_is_reserved`
+- `tests_proc_dict::a_call_counts_against_the_messages_state_calls_and_build_budget`
+- `tests_proc_dict::a_call_runs_when_evaluation_reaches_it_and_is_never_undone`
+- `tests_proc_dict::a_dictionary_counts_against_the_stores_ceiling_and_gives_its_bytes_back`
+- `tests_proc_dict::a_dictionary_holds_64_keys`
+- `tests_proc_dict::a_dictionary_holds_64_kib`
+- `tests_proc_dict::a_dictionary_is_one_tasks_from_one_message_to_the_next`
+- `tests_proc_dict::a_dry_run_works_on_a_scratch_dictionary`
+- `tests_proc_dict::a_held_undefined_reads_as_no_key_and_takes_none`
+- `tests_proc_dict::a_key_is_the_exact_term`
+- `tests_proc_dict::a_value_of_any_type_is_held_as_it_is`
+- `tests_proc_dict::an_evaluation_without_a_dictionary_gets_an_empty_one`
+- `tests_proc_dict::foreach_calls_run_per_element`
+- `tests_proc_dict::put_and_del_answer_the_value_held_before_and_get_the_value`
+- `tests_proc_dict::the_functions_are_built_in_and_load_only_with_a_store`
 - `tests_republish::a_message_republished_from_an_event_has_no_dup_flag`
 - `tests_republish::a_republished_message_is_seen_as_emqx_shows_it`
 - `tests_republish::a_rule_does_not_republish_its_own_republished_message`
@@ -2002,9 +2016,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `the_authorization_dry_run_never_allows_a_publish_into_sys`
 - `the_cluster_view_compares_every_nodes_rules_digest`
 
-## `crates/mqttd/tests/admin_rules.rs` — 17 test(s)
+## `crates/mqttd/tests/admin_rules.rs` — 18 test(s)
 
 - `a_dry_run_and_a_check_leave_the_running_rule_state_untouched`
+- `a_dry_run_works_on_a_scratch_dictionary_of_its_own`
 - `a_last_error_is_shown_only_for_the_definition_it_was_about`
 - `a_rejected_reload_says_the_file_was_written_and_what_still_runs`
 - `a_rules_body_is_read_only_from_a_role_that_may_send_one`
@@ -2419,7 +2434,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `rules_republishing_into_each_other_stop_at_the_depth_cap`
 - `the_original_s_limits_cover_the_whole_chain`
 
-## `crates/mqttd/tests/rules_binary.rs` — 62 test(s)
+## `crates/mqttd/tests/rules_binary.rs` — 63 test(s)
 
 - `a_broker_keeps_rule_state_between_publishes`
 - `a_closed_stdout_leaves_probe_and_backup_their_exit_status`
@@ -2474,6 +2489,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `rule_test_runs_a_topics_and_events_statement_against_a_publish_unless_event_is_given`
 - `rule_test_runs_an_events_statement_against_a_sample_event`
 - `rule_test_runs_jq_with_the_results_emqx_gives`
+- `rule_test_runs_proc_dict_on_a_dictionary_of_its_own`
 - `rule_test_runs_the_state_functions_on_a_store_of_its_own`
 - `session_subscribed_fires_once_per_granted_filter`
 - `session_unsubscribed_fires_once_per_filter_actually_removed`
@@ -2547,6 +2563,19 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `an_unrouted_publish_is_dropped_on_the_node_it_arrived_at`
 - `only_the_selected_event_is_raised`
 - `the_legacy_spellings_and_the_wildcard_select_the_events`
+
+## `crates/mqttd/tests/rules_proc_dict.rs` — 10 test(s)
+
+- `a_clients_events_and_deliveries_work_on_its_dictionary`
+- `a_connections_dictionary_holds_64_keys`
+- `a_connections_dictionary_lasts_from_one_publish_to_the_next_and_is_its_own`
+- `a_dropped_publish_works_on_its_publishers_dictionary_and_a_rules_on_an_empty_one`
+- `a_memory_brownout_refuses_a_dictionary_room_to_grow`
+- `a_reconnect_starts_with_an_empty_dictionary`
+- `a_resumed_session_starts_with_an_empty_dictionary`
+- `a_takeover_does_not_carry_the_dictionary`
+- `a_wills_rules_get_an_empty_dictionary`
+- `the_dictionaries_count_against_the_stores_ceiling`
 
 ## `crates/mqttd/tests/rules_state.rs` — 6 test(s)
 

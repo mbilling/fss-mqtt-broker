@@ -457,12 +457,15 @@ was.
   namespace; mqttd has no such namespaces (ADR 0083), so it is EMQX's one global key
   space.
 - **`proc_dict_*` is a dictionary per evaluating task.** In EMQX the process is the
-  client's channel for its publishes, its events and the deliveries to it, so the values
-  live as long as the connection and are seen by nothing else. mqttd evaluates those on
-  the client's connection task (ADR 0083), which gets the dictionary: empty at connect,
-  gone at disconnect, not carried by a takeover (EMQX starts a new process there too).
-  A republished message is evaluated on the same task and sees it, as in EMQX.
-  *(Decided by default, 2026-10-11: provided. The other answer keeps them refused.)*
+  client's connection process for its publishes, its events, the deliveries to it and
+  its Will, so the values are seen by nothing else and live as long as that process: as
+  long as the connection, and for a session that outlives its connection until the
+  session is resumed (amended 2026-10-11, T11). mqttd evaluates those on the client's
+  connection task (ADR 0083), which gets the dictionary: empty at connect, gone at
+  disconnect, not carried by a takeover or a resumed session (EMQX starts a new process
+  there too). A republished message is evaluated on the same task and sees it, as in
+  EMQX. *(Decided by default, 2026-10-11: provided. The other answer keeps them
+  refused.)*
 - **What differs from EMQX,** each listed in RULES.md:
   - *Bounds.* EMQX's table and dictionaries grow until the node runs out of memory.
     Here `kv_store` has the bounds of any namespace (D9), with a key of at most 256
@@ -473,8 +476,13 @@ was.
     the dying channel process, which still has the connection's dictionary. mqttd
     evaluates it on the hub or on a task of its own (ADR 0086), with an empty dictionary
     that is discarded afterwards; so is the dictionary of an event evaluated by the
-    notes task or the store's expiry task.
-  - *The test.* A dry run uses a scratch table (D11).
+    notes task or the store's expiry task. The notes task's events are those EMQX
+    still evaluates in a process that has the dictionary: a `delivery_dropped` for a
+    session without a connection, and `message_dropped` for a message a rule
+    republished or for a Will (amended 2026-10-11, T11).
+  - *The test.* A dry run uses a scratch table (D11), and a scratch dictionary: for
+    the dictionary that is what EMQX's SQL test over its API does too, each request
+    being a process of its own.
 - **The two families do not share keys.** `kv_get('x')` does not read what
   `kv_store_put('x', …)` wrote. `mqttd --check-rules` warns about a file that calls both.
 - These names leave the list of EMQX functions mqttd refuses (`EMQX_ONLY`), and the
@@ -790,3 +798,90 @@ eight. RULES.md carries the figures.
 rule's `state` key but cannot set one, since ADR 0084's rule body has no such field: a
 writer declares namespaces and names them by writing the whole file. T6 or T8 decides
 whether the body gains the field.
+
+### 2026-10-11 — T11: what EMQX 6.3.1 answered about `proc_dict_*`
+
+D13 said what the three functions return from EMQX's source, and which process the
+dictionary belongs to from reading the channel. T11 probed both on EMQX 6.3.1
+(`emqx/emqx:latest`): 99 probes. 30 call `emqx_rule_funcs` directly; 29 run statements
+through `emqx_rule_sqltester:test/1` in one process and read its dictionary back; 3 run
+the SQL test over the REST API; 37 use clients on the running node, with rules that put
+a value on one trigger and read it on another, and a scan of every process's dictionary
+for `{'@rule_engine', _}` keys. They are pinned as tests: the answers in
+`crates/mqtt-rules/src/tests_proc_dict.rs`, the process each trigger works on in
+`crates/mqttd/tests/rules_proc_dict.rs`.
+
+**What D13's table says holds.** `proc_dict_put` and `proc_dict_del` answer the value
+held before or `undefined`, `proc_dict_get` the value or `undefined`. A key is any value
+matched exactly, as T1 found for the table (`1`, `1.0` and `'1'` are three keys, `0.0`
+and `-0.0` two, a map is one key whatever its order, `undefined` and `null` are keys).
+The dictionary and the `kv_store` table share nothing. A call runs when evaluation
+reaches it, in the order T1 pinned, and nothing undoes it.
+
+**Whose dictionary, per trigger.** The process is `emqx_socket_connection`, the client's
+connection, in every case:
+
+| Trigger | The process in EMQX | The task in mqttd | Same |
+|---|---|---|---|
+| A client's publish; a later rule on it | the publisher's connection | the publisher's connection task | yes |
+| A message a rule republished, re-entering the rules | the same process | the same task | yes |
+| `client_connected`, `client_connack`, `check_authn_complete`, `check_authz_complete`, `session_subscribed`, `session_unsubscribed` | the client's connection | its connection task | yes |
+| `client_disconnected` | the client's connection, as it ends: it still sees the dictionary | its connection task, before it ends | yes |
+| `message_delivered`, `message_acked` | the subscriber's connection | the subscriber's connection task | yes |
+| `message_dropped` for a client's publish | the publisher's connection | the publisher's connection task (the notes task once it has gone) | yes, while it is connected |
+| `message_dropped` for a message a rule republished, or for a Will | the process that published it: the client's | the notes task | **no: empty** |
+| `delivery_dropped` | the subscriber's connection process, also when its session has no connection | the subscriber's connection task; the notes task for a session without one | **no for a session without a connection: empty** |
+| A Will | the connection's process as it ends: it sees the dictionary | the hub, or a task of the Will's own | **no: empty** |
+| The SQL test | the caller's: a process per request over the REST API | a scratch dictionary per dry run | yes |
+
+Two publishes of one connection see each other's values; another client does not; the
+same client after a DISCONNECT and a new CONNECT does not; a connection that takes the
+client id over does not; a resumed session does not.
+
+**Where the probes corrected the record**
+
+- **"The values live as long as the connection."** They live as long as the process.
+  For a session that outlives its connection (`clean_start = false`, a session expiry
+  above 0) EMQX keeps the process after the socket closes, and with it the dictionary:
+  a `delivery_dropped` raised for the offline session read what the closed connection
+  had put. The process, and the dictionary, end when the session is resumed (the new
+  connection is a new process and starts empty), taken over or expired. D13 now says
+  so. mqttd's dictionary still ends with the connection: nothing can read it
+  afterwards but those events, which are evaluated by the notes task on an empty one.
+  That is the second listed difference, now stated as what it is.
+- **`message_dropped` is evaluated by whoever published the message**, not by a session.
+  For a message a rule republished, or a Will, that is still the client's process in
+  EMQX; mqttd hands that note to the notes task. D13's second difference named "events
+  about a client that has no connection"; these are events about a message with no
+  client of its own, with the same answer (an empty dictionary), and RULES.md lists
+  them.
+- **The dry run is not a difference for the dictionary** where EMQX's SQL test is called
+  over its API: each request is a process, and nothing carries from one to the next.
+  It is one only against a test run from a shell that stays.
+
+**What the record left open and T11 settled**
+
+- **`undefined` as a value.** EMQX stores it (the key is in the dictionary), and no
+  function a rule can call tells that key from one that is not there. mqttd answers
+  the same and holds nothing for it, so putting `undefined` frees a key rather than
+  using one of the 64.
+- **The bounds, exactly.** 64 keys; 64 KiB for the keys and values together, each as
+  the rule engine writes it (a string as its bytes, anything else as JSON text). A key
+  has no bound of its own. A put past either fails the rule (`dictionary_full`) and
+  leaves what was held; reading or deleting a key too large to be held answers
+  `undefined`, as EMQX would.
+- **The ceiling.** A dictionary's bytes count in `rules.state_max_bytes` with the
+  namespaces', in no namespace: a put the store has no room for fails the rule
+  (`store_full`), and a dictionary does not grow in a memory brownout (`brownout`). The
+  store counts those refusals; T6 exports them. A rules file that calls `proc_dict_*`
+  therefore loads only where there is a store, like any state function.
+- **The per-message bounds apply**: a call is one of the message's 1,024 state calls,
+  and what it reads is charged to the build budget, so a `FOREACH` cannot multiply a
+  64 KiB value into a large message.
+- **Where it lives.** In the connection's own view of the rules, beside the rule set it
+  evaluates against and behind the lock that connection's evaluations already take,
+  which nothing else contends for: no lock was added, and no other task can reach it.
+  Empty, it is a few words and no allocation. A Will's evaluation makes one and drops
+  it; the notes task clears its own after every note; a dry run makes one per request.
+- **A wrong argument count** is a load error, as for every function, where EMQX fails
+  the rule on each message.

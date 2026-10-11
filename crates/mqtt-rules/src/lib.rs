@@ -1022,25 +1022,58 @@ impl RuleSet {
         report: &mut dyn FnMut(&Rule, Outcome<'_>),
         out: &mut Vec<(Arc<str>, Effect)>,
     ) {
-        if self.topic_index.is_empty() {
-            return;
-        }
-        let mut hits: Vec<usize> = Vec::new();
-        self.topic_index.for_each_matching(input.topic, |f| {
-            if let Some(rules) = self.by_filter.get(f) {
-                hits.extend_from_slice(rules);
-            }
-        });
+        let hits = self.matching(input.topic);
         if hits.is_empty() {
             return;
         }
-        // A rule whose FROM lists several matching filters fires once.
-        hits.sort_unstable();
-        hits.dedup();
         let ctx = EvalCtx::new(input).within(budget);
         for i in hits {
             apply_timed(&self.rules[i], &ctx, budget, report, out);
         }
+    }
+
+    /// [`on_publish_within`](Self::on_publish_within), evaluated by the task that owns
+    /// `dictionary`: what EMQX's `proc_dict_*` read and write (ADR 0085 D13). The
+    /// broker hands a connection's own dictionary to everything that connection's task
+    /// evaluates; without one (the other entry points) the rules get an empty
+    /// dictionary that is dropped with the evaluation.
+    pub fn on_publish_in(
+        &self,
+        input: &PublishInput<'_>,
+        budget: &Budget,
+        dictionary: &state::Dictionary,
+        report: &mut dyn FnMut(&Rule, Outcome<'_>),
+        out: &mut Vec<(Arc<str>, Effect)>,
+    ) {
+        let hits = self.matching(input.topic);
+        if hits.is_empty() {
+            return;
+        }
+        let ctx = EvalCtx::new(input).within(budget).on(dictionary);
+        for i in hits {
+            apply_timed(&self.rules[i], &ctx, budget, report, out);
+        }
+    }
+
+    /// The enabled rules whose `FROM` matches `topic`, in id order; none allocates
+    /// nothing.
+    #[inline]
+    fn matching(&self, topic: &str) -> Vec<usize> {
+        let mut hits: Vec<usize> = Vec::new();
+        if self.topic_index.is_empty() {
+            return hits;
+        }
+        self.topic_index.for_each_matching(topic, |f| {
+            if let Some(rules) = self.by_filter.get(f) {
+                hits.extend_from_slice(rules);
+            }
+        });
+        // A rule whose FROM lists several matching filters fires once.
+        if hits.len() > 1 {
+            hits.sort_unstable();
+            hits.dedup();
+        }
+        hits
     }
 
     /// Evaluate every enabled rule selecting this event.
@@ -1072,6 +1105,26 @@ impl RuleSet {
         }
     }
 
+    /// [`on_event_within`](Self::on_event_within), evaluated by the task that owns
+    /// `dictionary` ([`on_publish_in`](Self::on_publish_in)).
+    pub fn on_event_in(
+        &self,
+        input: &EventInput,
+        budget: &Budget,
+        dictionary: &state::Dictionary,
+        report: &mut dyn FnMut(&Rule, Outcome<'_>),
+        out: &mut Vec<(Arc<str>, Effect)>,
+    ) {
+        let hits = &self.by_event[input.kind().index()];
+        if hits.is_empty() {
+            return;
+        }
+        let ctx = EvalCtx::new(input).within(budget).on(dictionary);
+        for &i in hits {
+            apply_timed(&self.rules[i], &ctx, budget, report, out);
+        }
+    }
+
     /// Evaluate the one rule `id` on `input`, whether or not it is enabled, as a dry run
     /// does (ADR 0084): its SQL, then its actions, reported and collected as
     /// [`on_publish`](Self::on_publish) would. Its `FROM` is not consulted — the caller
@@ -1084,6 +1137,9 @@ impl RuleSet {
     /// name and settings it has here. Rules evaluated on one scratch store see each
     /// other's writes, as rules on one message do. With `None`, a state call fails the
     /// rule.
+    ///
+    /// EMQX's `proc_dict_*` work on an empty dictionary that is dropped with this call;
+    /// [`evaluate_one_on`](Self::evaluate_one_on) takes one that several rules share.
     pub fn evaluate_one(
         &self,
         id: &str,
@@ -1092,11 +1148,30 @@ impl RuleSet {
         report: &mut dyn FnMut(&Rule, Outcome<'_>),
         out: &mut Vec<(Arc<str>, Effect)>,
     ) -> bool {
+        self.evaluate_one_on(id, input, scratch, &state::Dictionary::new(), report, out)
+    }
+
+    /// [`evaluate_one`](Self::evaluate_one) with the dry run's own `dictionary`: the
+    /// scratch one the caller made for it, never a connection's. Rules evaluated on one
+    /// see each other's `proc_dict_put`, as the rules a connection's message matches
+    /// do.
+    pub fn evaluate_one_on(
+        &self,
+        id: &str,
+        input: &dyn Input,
+        scratch: Option<&dyn StateStore>,
+        dictionary: &state::Dictionary,
+        report: &mut dyn FnMut(&Rule, Outcome<'_>),
+        out: &mut Vec<(Arc<str>, Effect)>,
+    ) -> bool {
         let Some(rule) = self.get(id) else {
             return false;
         };
         let budget = Budget::new(input.payload().map_or(0, Bytes::len));
-        let ctx = EvalCtx::new(input).within(&budget).dry_run(scratch);
+        let ctx = EvalCtx::new(input)
+            .within(&budget)
+            .dry_run(scratch)
+            .on(dictionary);
         apply(rule, &ctx, &budget, report, out);
         true
     }
@@ -1306,6 +1381,8 @@ mod tests_emqx_examples;
 mod tests_message_events;
 #[cfg(all(test, feature = "jq"))]
 mod tests_modules;
+#[cfg(test)]
+mod tests_proc_dict;
 #[cfg(test)]
 mod tests_republish;
 #[cfg(test)]
