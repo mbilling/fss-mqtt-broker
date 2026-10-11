@@ -6,6 +6,10 @@
 //!   difference is what the call adds to a publish.
 //! - `op/*` — one call on the store, uncontended: a map operation under one shard's
 //!   lock.
+//!   `incr_once_seen` and `incr_once_new` are `kv_incr` with an idempotency key (D8),
+//!   which is two such operations: one whose key the namespace remembers (a message
+//!   sent again: it adds nothing), and one whose key is new (it is remembered, and
+//!   the count goes up).
 //! - `contended/<what>/<threads>` — every thread calling at once, as connection tasks
 //!   on a multi-threaded runtime do: `hot_key` is all of them incrementing one key (one
 //!   shard, one lock, the worst case), `own_keys` each on keys of its own (the usual
@@ -107,6 +111,60 @@ fn publish_in(c: &mut Criterion, name: &str, tables: &str, sql: &str) {
 
 fn namespace(store: &Arc<Store>, settings: &NamespaceSettings) -> Arc<dyn StateNamespace> {
     store.open("bench", settings).expect("a namespace opens")
+}
+
+/// `kv_incr` with an idempotency key (D8), on the store.
+fn once_ops(c: &mut Criterion) {
+    let store = Store::new(CEILING);
+    let counters = namespace(&store, &NamespaceSettings::defaults(CEILING));
+    // With an idempotency key the namespace remembers: nothing is added.
+    counters
+        .call(&StateOp::IncrOnce {
+            key: b"count:device-00042",
+            by: 1,
+            ttl: None,
+            once: b"device-00042:8c1f",
+        })
+        .expect("room for the remembered key");
+    c.bench_function("op/incr_once_seen", |b| {
+        b.iter(|| {
+            black_box(counters.call(&StateOp::IncrOnce {
+                key: b"count:device-00042",
+                by: 1,
+                ttl: None,
+                once: b"device-00042:8c1f",
+            }))
+        });
+    });
+    // With one that is new each time: a key is inserted and the count goes up. A
+    // namespace takes 50,000 of them and is then dropped, outside the time measured.
+    let onces: Vec<String> = (0..50_000)
+        .map(|i| format!("device-00042:{i:04x}"))
+        .collect();
+    c.bench_function("op/incr_once_new", |b| {
+        b.iter_custom(|iters| {
+            let mut spent = Duration::ZERO;
+            let mut left = usize::try_from(iters).unwrap_or(usize::MAX);
+            while left > 0 {
+                let store = Store::new(CEILING);
+                let ns = namespace(&store, &NamespaceSettings::defaults(CEILING));
+                let round = left.min(onces.len());
+                let started = Instant::now();
+                for once in &onces[..round] {
+                    black_box(ns.call(&StateOp::IncrOnce {
+                        key: b"count:device-00042",
+                        by: 1,
+                        ttl: None,
+                        once: once.as_bytes(),
+                    }))
+                    .ok();
+                }
+                spent += started.elapsed();
+                left -= round;
+            }
+            spent
+        });
+    });
 }
 
 fn ops(c: &mut Criterion) {
@@ -575,6 +633,23 @@ fn eventual_ops(c: &mut Criterion, shipped: bool) {
             }))
         });
     });
+    ns.call(&StateOp::IncrOnce {
+        key: counters[0].as_bytes(),
+        by: 1,
+        ttl: None,
+        once: b"device-00042:8c1f",
+    })
+    .expect("room for the remembered key");
+    c.bench_function(&format!("eventual/incr_once_seen/{how}"), |b| {
+        b.iter(|| {
+            black_box(ns.call(&StateOp::IncrOnce {
+                key: counters[next()].as_bytes(),
+                by: 1,
+                ttl: None,
+                once: b"device-00042:8c1f",
+            }))
+        });
+    });
     let seen = stable_hash(b"device-0042");
     ns.call(&StateOp::HllAdd {
         key: b"devices",
@@ -954,6 +1029,13 @@ fn bench(c: &mut Criterion) {
         "SELECT clientid, payload.temp AS temp, kv_incr('n:' + clientid) AS n FROM \
          \"sensors/+/data\" WHERE payload.temp > 30",
     );
+    // The same message again and again: its idempotency key is remembered.
+    publish(
+        c,
+        "kv_incr_once",
+        "SELECT clientid, payload.temp AS temp, kv_incr('n:' + clientid, 1, 3600, clientid + \
+         ':' + payload.site) AS n FROM \"sensors/+/data\" WHERE payload.temp > 30",
+    );
     publish(
         c,
         "kv_held",
@@ -1001,6 +1083,7 @@ fn bench(c: &mut Criterion) {
          AS devices FROM \"sensors/+/data\" WHERE payload.temp > 30",
     );
     ops(c);
+    once_ops(c);
     eventual_ops(c, false);
     eventual_ops(c, true);
     replication(c);

@@ -37,6 +37,15 @@ sql = '''SELECT kv_incr('n') AS n, kv_add('seen', clientid) AS seen, kv_set('las
 state = "shared"
 sql = '''SELECT kv_del('last:' + payload) AS gone FROM "forget/#"'''
 
+[rules.count_once]
+state = "shared"
+sql = '''SELECT kv_incr('orders', 1, 3600, payload) AS orders FROM "once/#"'''
+
+[rules.read_orders]
+state = "shared"
+sql = '''SELECT clientid AS c, kv_get('orders') AS orders FROM "orders/#"'''
+actions = [{ function = "republish", args = { topic = "out/${c}", payload = "${orders}" } }]
+
 [rules.read]
 state = "shared"
 sql = '''SELECT clientid AS c, kv_get('n') AS n, kv_get('seen') AS seen, kv_get('last:' + payload) AS last FROM "read/#"'''
@@ -249,6 +258,65 @@ async fn rules_on_every_node_count_one_counter_and_every_node_reads_the_same() {
         let replication = node.state.replication("shared").unwrap();
         assert_eq!(replication.links, 2, "{}", node.id.0);
         assert_eq!(replication.refused, [0; 6], "{}", node.id.0);
+    }
+}
+
+/// What `kv_get('orders')` reads on the reader's node, after everything the reader
+/// has published there.
+async fn orders(reader: &mut Reader) -> String {
+    publish(&mut reader.client, "orders/now", "").await;
+    match reader.client.recv().await {
+        Packet::Publish(p) => String::from_utf8_lossy(&p.payload).into_owned(),
+        other => panic!("expected the rule's output, got {other:?}"),
+    }
+}
+
+/// Wait until `node` remembers the idempotency key `once` and its reader reads the
+/// count `wanted`: replication is on its own time, and the entry and the counter are
+/// two keys.
+async fn heard(node: &Node, reader: &mut Reader, once: &str, wanted: &str) {
+    let entry = mqtt_rules::state::Remembered::of(once.as_bytes());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let remembered = node.state.key("shared", entry.key()).unwrap().is_some();
+        let read = orders(reader).await;
+        if remembered && read == wanted {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{}: remembers {once}: {remembered}, read {read}, never {wanted}",
+            node.id.0
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// T5's cluster acceptance (D8): a message counted on one node is not counted again
+/// on another once the entry that remembers its idempotency key has arrived there,
+/// and a message that is new counts wherever it arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_message_resent_to_another_node_is_counted_once_when_the_entry_has_arrived() {
+    let (a, b) = (start_node("node-a").await, start_node("node-b").await);
+    let _up = link(&a, &b);
+    let mut on_a = Reader::on(&a, "r-a").await;
+    let mut on_b = Reader::on(&b, "r-b").await;
+    publish(&mut on_a.client, "once/x", "m-1").await;
+    assert_eq!(orders(&mut on_a).await, "1");
+    heard(&b, &mut on_b, "m-1", "1").await;
+    // The device reconnects to the other node and sends it again, twice.
+    publish(&mut on_b.client, "once/x", "m-1").await;
+    publish(&mut on_b.client, "once/x", "m-1").await;
+    // A new message there counts, and node a hears of it.
+    publish(&mut on_b.client, "once/x", "m-2").await;
+    assert_eq!(orders(&mut on_b).await, "2");
+    heard(&a, &mut on_a, "m-2", "2").await;
+    publish(&mut on_a.client, "once/x", "m-2").await;
+    assert_eq!(orders(&mut on_a).await, "2");
+    assert_eq!(orders(&mut on_b).await, "2");
+    // The counter and the two remembered keys, on both.
+    for node in [&a, &b] {
+        assert_eq!(node.state.stats("shared").unwrap().keys, 3, "{}", node.id.0);
     }
 }
 

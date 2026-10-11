@@ -177,6 +177,64 @@ async fn a_rule_keeps_state_between_publishes_and_counts_what_its_where_rejects(
     assert_eq!(broker.state.stats("rule:count").unwrap().keys, 4);
 }
 
+/// D8: a `QoS` 1 publish that is sent again is evaluated again (`QoS` 1 has no window
+/// that would stop it), and `kv_incr` with an idempotency key the publisher put in the
+/// message counts it once: on the same connection, and after a reconnect, which is
+/// when a client really resends. The rule engine's own `id` is made for each PUBLISH
+/// the broker receives, so it is new for the resend and does not serve as the key.
+#[tokio::test]
+async fn a_qos1_publish_sent_again_is_counted_once_by_its_idempotency_key() {
+    let broker = start_broker(&format!(
+        "[rules.count]\nsql = '''SELECT \
+         kv_incr('orders', 1, 3600, clientid + ':' + payload.msg) AS orders, \
+         kv_incr('evaluated') AS evaluated, \
+         kv_incr('by_id', 1, 3600, id) AS by_id FROM \"in/#\"'''\n{}",
+        republish("out")
+    ))
+    .await;
+    let mut sub = Client::connect(broker.addr, "watch").await;
+    sub.subscribe(1, "out", QoS::AtMostOnce).await;
+    let order = |msg: &str, pkid: u16, dup: bool| {
+        Packet::Publish(mqtt_codec::packet::Publish {
+            dup,
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            topic: "in/orders".into(),
+            pkid: Some(pkid),
+            payload: bytes::Bytes::from(format!("{{\"msg\":\"{msg}\"}}")),
+            properties: mqtt_codec::Properties::new(),
+        })
+    };
+    let counts = |orders: u32, evaluated: u32, by_id: u32| {
+        out(
+            "out",
+            &format!("{{\"orders\":{orders},\"evaluated\":{evaluated},\"by_id\":{by_id}}}"),
+        )
+    };
+    let mut dev = Client::connect(broker.addr, "dev-1").await;
+    dev.send(&order("a1", 7, false)).await;
+    assert_eq!(dev.recv().await, Packet::PubAck(7.into()));
+    assert_eq!(next(&mut sub).await, counts(1, 1, 1));
+    // The same PUBLISH again, DUP set, as a client that did not see the PUBACK sends
+    // it: acknowledged, routed and evaluated again, and counted once.
+    dev.send(&order("a1", 7, true)).await;
+    assert_eq!(dev.recv().await, Packet::PubAck(7.into()));
+    assert_eq!(next(&mut sub).await, counts(1, 2, 2));
+    // And once more after a reconnect, on a new connection task.
+    drop(dev);
+    let mut dev = Client::connect(broker.addr, "dev-1").await;
+    dev.send(&order("a1", 7, true)).await;
+    assert_eq!(dev.recv().await, Packet::PubAck(7.into()));
+    assert_eq!(next(&mut sub).await, counts(1, 3, 3));
+    // The next message counts.
+    dev.send(&order("a2", 8, false)).await;
+    assert_eq!(dev.recv().await, Packet::PubAck(8.into()));
+    assert_eq!(next(&mut sub).await, counts(2, 4, 4));
+    // Three counters, and a remembered key for each of the two messages and each of
+    // the four `id`s.
+    assert_eq!(broker.state.stats("rule:count").unwrap().keys, 3 + 2 + 4);
+}
+
 /// D13: EMQX's `kv_store_put` and `kv_store_get` across two messages (what EMQX 6.3.1
 /// answers for the same statement: 1, then 2), in a table every rule shares.
 #[tokio::test]

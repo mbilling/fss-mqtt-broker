@@ -382,6 +382,90 @@ actions = [{ function = "republish", args = { topic = "loop/again", payload = "$
     assert_eq!(report.failed(), 0);
 }
 
+/// D8: a message that is sent again carries the id its publisher gave it, and
+/// `kv_incr` with that id as its idempotency key counts it once. The namespace
+/// remembers the id for its dedupe window (five minutes), as an entry the replay
+/// shows; after that the same id is a new message.
+#[test]
+fn a_message_sent_again_with_the_id_it_had_is_counted_once() {
+    let report = statement(
+        r#"SELECT kv_incr('orders:' + clientid, 1, '1h', clientid + ':' + payload.msg) AS orders
+           FROM "orders/#""#,
+        r#"
+        {"at": 0, "topic": "orders/new", "clientid": "c1", "qos": 1, "payload": {"msg": "a1"}}
+        # the PUBACK was lost: the client sends it again
+        {"at": 2, "topic": "orders/new", "clientid": "c1", "qos": 1, "payload": {"msg": "a1"}}
+        {"at": 10, "topic": "orders/new", "clientid": "c1", "qos": 1, "payload": {"msg": "a2"}}
+        # another client's a1 is another message
+        {"at": 11, "topic": "orders/new", "clientid": "c2", "qos": 1, "payload": {"msg": "a1"}}
+        {"at": "5m", "topic": "orders/new", "clientid": "c1", "qos": 1, "payload": {"msg": "a1"}}
+        "#,
+    );
+    assert_eq!(
+        report.text(true),
+        transcript(
+            r#"
+            #1 +0s orders/new {"msg": "a1"}
+              {"orders":1}
+              state rule:test: + idempotency key "c1:a1" = 1735689600000 (first, expires +300s)
+              state rule:test: + "orders:c1" = 1 (sum, expires +3600s)
+            #2 +2s orders/new {"msg": "a1"}
+              {"orders":1}
+            #3 +10s orders/new {"msg": "a2"}
+              {"orders":2}
+              state rule:test: + idempotency key "c1:a2" = 1735689610000 (first, expires +310s)
+              state rule:test: ~ "orders:c1" = 2 (sum, expires +3610s)
+            #4 +11s orders/new {"msg": "a1"}
+              {"orders":1}
+              state rule:test: + idempotency key "c2:a1" = 1735689611000 (first, expires +311s)
+              state rule:test: + "orders:c2" = 1 (sum, expires +3611s)
+            #5 +300s orders/new {"msg": "a1"}
+              {"orders":3}
+              state rule:test: - idempotency key "c1:a1" (expired +300s)
+              state rule:test: + idempotency key "c1:a1" = 1735689900000 (first, expires +600s)
+              state rule:test: ~ "orders:c1" = 3 (sum, expires +3900s)
+            state at the end (+300s):
+              rule:test: idempotency key "c1:a1" = 1735689900000 (first, expires +600s)
+              rule:test: idempotency key "c1:a2" = 1735689610000 (first, expires +310s)
+              rule:test: idempotency key "c2:a1" = 1735689611000 (first, expires +311s)
+              rule:test: "orders:c1" = 3 (sum, expires +3900s)
+              rule:test: "orders:c2" = 1 (sum, expires +3611s)
+            "#
+        )
+    );
+}
+
+/// D3 said a rule that counts and republishes into its own `FROM` counts twice. With
+/// the message's id as the idempotency key, and the id carried in what it
+/// republishes, it counts once.
+#[test]
+fn a_rule_that_re_enters_itself_counts_once_with_an_idempotency_key() {
+    let report = rules(
+        r#"
+[rules.loop]
+sql = '''SELECT payload.msg AS msg, kv_incr('n', 1, 60, payload.msg) AS n FROM "loop/#"'''
+actions = [{ function = "republish", args = { topic = "loop/again", payload = "${.}" } }]
+"#,
+        r#"{"topic": "loop/start", "payload": {"msg": "a1"}}"#,
+    );
+    assert_eq!(
+        report.text(false),
+        transcript(
+            r#"
+            #1 +0s loop/start {"msg": "a1"}
+              loop: passed
+                republish loop/again qos 0 {"msg":"a1","n":1}
+              > loop/again (republished by loop)
+                loop: passed
+                  republish skipped: the message is one this rule republished
+              state rule:loop: + idempotency key "a1" = 1735689600000 (first, expires +300s)
+              state rule:loop: + "n" = 1 (sum, expires +60s)
+            "#
+        )
+    );
+    assert_eq!(report.failed(), 0);
+}
+
 #[test]
 fn the_clock_is_the_sequences_and_a_replay_prints_the_same_every_time() {
     let sql = r#"SELECT now_timestamp() AS s, now_timestamp('millisecond') AS ms,

@@ -363,6 +363,11 @@ exact. Across nodes it holds once the entry has arrived: a resend that reaches a
 node inside the replication lag counts twice. Without an idempotency key, the
 documentation states that counts are at least once.
 
+*(Amended 2026-10-11, T5: the key is at most 255 bytes and is remembered under a key of
+the namespace that no rule can write; a remembered key raises no expiry event; the call
+is two map operations, and what that means; why the merge does not take a second node's
+count back. See [Amendments](#amendments).)*
+
 ### D9. Bounds, accounting and eviction
 
 Keys carry client-chosen values (`clientid`, topic levels, payload fields), so everything
@@ -1912,3 +1917,202 @@ which is the spread between two builds and not a gain: nothing on that path chan
 +2.7%, inside the spread. New (`sweep/*`): a pass that finds nothing due in a namespace
 of 100,000 keys takes 0.50 µs; a key the sweep removes costs 0.135 µs, with or without
 its event (the value is read out after the lock is released).
+
+### 2026-10-11 — T5: counting a message once, as built
+
+D8 decided that `kv_incr` takes an optional idempotency key, remembered for the
+namespace's `dedupe_window` as an entry of the namespace: exact on one node, and across
+nodes holding once the entry has arrived. T5 built that (`crates/mqtt-rules/src/state.rs`:
+`StateOp::IncrOnce`, `Remembered`; `crates/mqttd/src/rule_state.rs`: `Handle::incr_once`;
+`rule_state/replica.rs`: `Replica::remember`). D8's guarantee is the one that was built,
+and no stronger one was found that `eventual` mode can keep. This lists where D8 was
+changed and what it left open.
+
+**Where D8 was not built as written**
+
+- **"A string of at most 256 bytes" is 255.** The entry that remembers an idempotency key
+  is a key of the namespace (next point): one marker byte and the idempotency key. A key
+  is at most 256 bytes everywhere a key is handled: a rule's call, a state frame (a
+  longer one is `malformed`), an operator's read and delete. 255 keeps every one of
+  those as it was.
+- **"Entries of the namespace like any other", under a key no rule can write.** Were the
+  entry's key the idempotency key itself, a payload field used as one would let a
+  publisher make a `first` key of any name in the rule's namespace: an id of
+  `hot:<another device>` would make that device's `kv_held` fail for the window, and an
+  id that is a counter's key would fail the count (`wrong_type`). D1 refused `ns:key`
+  addressing for the same reason: a value a publisher chooses must not choose where it
+  lands. So the entry's key is a NUL byte and then the idempotency key, and **a `kv_*`
+  key may no longer start with a NUL byte** (`bad_key`). That is the one change to what
+  T1 answered. A client id and a topic level cannot hold a NUL (MQTT); a payload field
+  can, and a key built from one that starts with it now fails its rule. EMQX's
+  `kv_store_*` keys are any term and are not touched (the table keeps `undefined` under
+  that byte alone, which remembers nothing). In every other respect the entry is a key
+  like any other: type `first`, holding the time it was first seen in milliseconds, its
+  expiry the window; counted toward `max_keys`, `max_bytes` and the store's ceiling;
+  refused in a brownout; evicted by `lru`; sent, merged and repaired as a `first` key;
+  listed, read and deleted by an operator.
+- **A remembered key raises no `$events/state/expired`** (D7). It is the namespace's
+  bookkeeping, and with a rule on the event every counted message would otherwise raise
+  one when its window ends, and the events' pace (`rules.state_expiry_per_sec`) would be
+  spent on them. It is not held for an event, a call that finds it expired removes it,
+  and the sweep removes it without charging the pace. The sweep still goes in order of
+  expiry: behind a backlog of owed events a remembered key is removed in its turn and
+  counts as a key until then.
+
+**What D8 left open and T5 settled**
+
+- **The form.** `kv_incr(key, by, ttl, idempotency_key)`: the fourth argument, so `by`
+  and the TTL are written out. The idempotency key is a string of 1 to 255 bytes;
+  anything else, a payload field that is missing included, **fails the rule**
+  (`bad_idempotency_key`), so a message without an id is neither counted twice nor left
+  out without a word.
+- **The scope is the namespace,** as D8 says ("new to the namespace"), not the counter.
+  One message that feeds two counters of one namespace therefore needs two idempotency
+  keys (`'all:' + id`, `'mine:' + id`), and rules that share a declared namespace share
+  what it remembers. The other answer, a key per counter, makes the entry's key the two
+  together (up to 511 bytes, so a hash of them) and an operator could then no longer
+  read which message an entry is. RULES.md says it where the function is, and a replay
+  shows it.
+- **The window** is `dedupe_window` in `[state.<name>]` and `[state.default]`: one second
+  to one hour, five minutes unless set, and never above the namespace's `max_ttl` (a
+  default above it is lowered to it, a setting above it is a load error). Refused for
+  `kv_store`. It runs **from the first sight**: a later sight does not extend it, changes
+  nothing and, in an `eventual` namespace, sends nothing. It is not in the declaration's
+  fingerprint (D15): of two nodes with different windows the later expiry wins, as for
+  any `first` key (T2).
+- **What a call with a remembered key answers:** the count as it is at that moment, `0`
+  where there is no counter (one that lives for less than the window has expired), and
+  `wrong_type` where the key holds another type, as the increment would have. It leaves
+  the counter's expiry alone and makes no key. It is counted as an `incr` in the
+  metrics.
+- **It is two of a message's 1,024 state calls** (D9): it writes two entries, and what a
+  message can make the store hold stays bounded by the calls it may make.
+- **What a rule passes.** A value the *publisher* gave the message: a payload field, an
+  MQTT 5 user property or the correlation data, with `clientid` in front unless ids are
+  unique across publishers. **Not `id`:** checked in the code and by a test on a broker,
+  it is made for each PUBLISH the broker receives (and for each message a rule
+  republishes), as EMQX's is, so a resent QoS 1 PUBLISH has a new one; it is the same
+  only for the rules one received publish matches. The MQTT packet identifier is not a
+  field of a rule's input, and a client reuses it once it is acknowledged. D8's
+  "typically the message's id" meant the publisher's, and RULES.md now has a table of
+  which values serve.
+
+**Two map operations, not one (D14)**
+
+D14 says a state call is one operation on a sharded map under a lock held for that
+operation. This call works on two keys, which are in two shards more often than not, and
+no call holds two shard locks. It is therefore two operations, each under one lock:
+
+1. The entry is inserted if the namespace does not hold it. Whichever of any number of
+   calls with one idempotency key finds it missing is the first, decided under that one
+   shard's lock: **on one node the check is exact** (a test has eight threads present
+   4,000 keys each at once: 4,000 increments).
+2. That call alone increments. The others read the count.
+
+What follows from there being two:
+
+- A call with a remembered key can read the count just before the first call has added
+  to it. Its answer is then one behind; nothing is counted twice or lost.
+- **An increment that is refused is not remembered.** The entry is in by then, so it is
+  taken out again: removed in a `local` namespace; in an `eventual` one deleted, a
+  delete like any other (D4), which leaves a tombstone for the tombstone window. The
+  rule fails with the increment's own error (`namespace_full`, `store_full`,
+  `brownout`, `wrong_type`, a counter past 64 bits or 256 rows), and the message counts
+  when it is sent again and the increment can be made. A namespace with no room for the
+  entry refuses before anything is written. In no case is an increment applied without
+  its key being remembered.
+- Between the entry going in and coming out again, a call with the same key answers the
+  count and adds nothing. Neither call counted the message; the first one's failure is
+  its rule's error.
+
+**Across nodes: what is promised, and why not more**
+
+- **One node:** a message is counted once per idempotency key per window, whatever the
+  concurrency.
+- **`eventual`:** a message is counted **at most once by each node that sees it before
+  that node has heard of another node's entry**, and those counts add (D4's sum). A
+  resend that reaches a node after the entry has arrived there is not counted. The
+  entry travels like any changed key: with the next frame, 5 ms at most after the write
+  plus the link (T3 measured 0.4 to 0.8 ms on an idle link), or when a partition heals.
+  The two nodes' entries merge to the earlier one (`first`), with the later of the two
+  expiries, so every node then remembers the key alike and no further sight counts
+  until the window is over. This is D8's "a resend that reaches another node inside the
+  replication lag counts twice", unchanged; tests pin both halves, with the links
+  driven by hand and on two real nodes.
+- **Why the merge does not take the second count back.** Considered: the entry names
+  the node that counted, and a node whose entry loses the merge subtracts its own
+  increment. Not built, because it cannot be made exact either. The subtraction has to
+  find the counter the increment went into, and that counter may have expired or been
+  deleted and made anew since, in which case it takes one from a count that never held
+  the increment. It has to happen exactly once per lost entry on a node whose memory is
+  gone after a restart (the others still hold its old row, T3). And the entry would
+  carry the counter's key and the step, up to 264 bytes more for every counted message.
+  A count that is exact across nodes is what `strong` is for (T9).
+- **A refused increment on one node, and the same message on another.** The delete that
+  takes the first node's entry out also covers an entry another node made without
+  having heard of it (T2's delete rule for `first`). That node's count stays and its
+  entry is forgotten, so a third sight there within the window counts again. It takes a
+  refusal on one node, the same message on another inside the lag, and a third sight.
+- **A node at its bound** refuses a peer's entry like any key that is new to it (D15),
+  so it does not remember what the others do, and a resend that reaches it counts. A
+  namespace run at its bound dedupes less across nodes, as it holds fewer keys.
+- **A `local` namespace** in a cluster remembers on each node for itself, and a node
+  that restarts has forgotten what it had seen (D5).
+
+**Bounds (D9)**
+
+- A remembered key is accounted as a key: 128 bytes, its own 1 + n bytes and 8 for the
+  time, and 96 more in an `eventual` namespace. A namespace that counts `r` messages a
+  second holds `r` times the window of them: 30,000 at 100 a second and five minutes.
+  That is the sizing rule RULES.md gives, with `dedupe_window` as the lever.
+- A full namespace, a full store and a brownout refuse the call with the errors they
+  refuse any new key with, counted as a refused `incr`.
+- `eviction = "lru"` evicts a remembered key like any key, the least recently used first
+  (a sight is a use). A full `lru` namespace therefore remembers for less than its
+  window, and a resend of an evicted key counts.
+
+**What an operator sees (D10, T6)**
+
+Remembered keys are in the namespace's counts, bytes and listings: a key that starts
+with a NUL byte, type `first`, the time it was first seen as its value, its expiry. A
+listing by the prefix of that one byte is exactly the remembered keys, and no prefix a
+rule's keys have lists one. An operator's delete of one lets its message count again
+(replicated, in an `eventual` namespace) and is audited like any delete. T6's tests are
+unchanged. **Not given a type or a filter of their own:** the listing's entries are
+being extended by T12, which can mark them (`mqtt_rules::state::remembered` tells a
+remembered key from any other). The overview does not show `dedupe_window`.
+
+**The replay (D11)** prints an entry as `idempotency key "<key>"`, so a sequence with a
+message sent twice shows one `+` for the entry and one increment, and nothing for the
+resend. RULES.md's worked sequence is run by CI.
+
+**Measured** (`cargo bench -p mqttd --bench rule_state`, Apple M1 Pro; `main`'s binary
+and this change's run in turn, eight rounds, the fastest median of each case. The
+machine was heavily loaded by other work: two rounds of one binary differed by up to a
+factor of five, so only the fastest rounds say anything.)
+
+- **Without an idempotency key, nothing moved.** A publish evaluated with no state call
+  1.449 to 1.419 µs, with `kv_incr` 1.888 to 1.807 µs, with `kv_held` 1.966 to 2.041 µs,
+  with `kv_incr` in an `eventual` namespace 2.048 to 1.978 µs; in the store, `kv_incr`
+  127.8 to 126.9 ns, `kv_set` 138.7 to 146.1 ns, `kv_incr` in an `eventual` namespace
+  236 to 223 ns alone and 393 to 380 ns with a link reading. Between −5.5% and +5.4%,
+  inside the spread; the path gained one comparison.
+- **With one.** In the store: 224 ns for a key the namespace remembers (two lookups under
+  two locks, nothing written) and 449 ns for a new one (a key inserted, then the
+  increment); in an `eventual` namespace a remembered key 241 ns, 251 ns with a link
+  reading. A publish evaluated with one, its key remembered: 2.38 µs, 0.57 µs more than
+  with a plain `kv_incr`, the key's own expression (`clientid + ':' + payload.site`)
+  included.
+- **Not measured:** the call under contention, and a namespace holding a window's worth
+  of remembered keys at a high message rate.
+
+**Left open**
+
+- **A type or a filter of their own in an operator's listing** (T12), and
+  `dedupe_window` in the admin overview and on `$SYS`.
+- **The cluster half of T4** must leave remembered keys out of the expiry event in
+  `eventual` namespaces as this does in `local` ones.
+- **T8:** the threat model's row (a publisher who chooses idempotency keys makes the
+  namespace hold one entry a message for the window, which is what `max_keys` is for;
+  one who can guess another publisher's ids can use them up, which is what `clientid`
+  in the key is for), and the cookbook's recipe.

@@ -65,6 +65,7 @@ impl StateNamespace for Recorded {
             StateOp::Set { key, .. } => ("set", key),
             StateOp::SetOnce { key, .. } => ("set_once", key),
             StateOp::Incr { key, .. } => ("incr", key),
+            StateOp::IncrOnce { key, .. } => ("incr_once", key),
             StateOp::Extreme { key, .. } => ("extreme", key),
             StateOp::Add { key, .. } => ("add", key),
             StateOp::Del { key } => ("del", key),
@@ -74,11 +75,12 @@ impl StateNamespace for Recorded {
             StateOp::HllAdd { key, .. } => ("hll_add", key),
             StateOp::HllCount { key } => ("hll_count", key),
         };
-        self.log.lock().unwrap().push(format!(
-            "{} {what} {}",
-            self.name,
-            String::from_utf8_lossy(key)
-        ));
+        let mut line = format!("{} {what} {}", self.name, String::from_utf8_lossy(key));
+        if let StateOp::IncrOnce { once, .. } = op {
+            line.push_str(" once ");
+            line.push_str(&String::from_utf8_lossy(once));
+        }
+        self.log.lock().unwrap().push(line);
         let at = (self.name.clone(), key.to_vec());
         let mut data = self.data.lock().unwrap();
         let value = match op {
@@ -318,6 +320,11 @@ fn a_namespace_declaration_is_checked_when_the_file_loads() {
         ("a", "ttl = 5", "unknown field `ttl`"),
         ("kv_store", "default_ttl = \"1h\"", "EMQX's kv_store table has no expiry: default_ttl and max_ttl cannot be set"),
         ("kv_store", "consistency = \"eventual\"", "EMQX's kv_store table is one per node; it is always \"local\""),
+        ("a", "dedupe_window = 0", "dedupe_window = 0: expected 1 second to 1 hour (3600 seconds), and at most max_ttl (2592000 seconds)"),
+        ("a", "dedupe_window = \"2h\"", "dedupe_window = \"2h\": expected 1 second to 1 hour (3600 seconds)"),
+        ("a", "max_ttl = \"10m\"\ndefault_ttl = \"1m\"\ndedupe_window = \"20m\"", "dedupe_window = \"20m\": expected 1 second to 1 hour (3600 seconds), and at most max_ttl (600 seconds)"),
+        ("a", "dedupe_window = \"soon\"", "dedupe_window: \"soon\" is not a duration"),
+        ("kv_store", "dedupe_window = \"1m\"", "dedupe_window is for the namespaces kv_incr counts in"),
         ("default", "max_keys = 0", "[state.default]: max_keys = 0"),
     ] {
         let e = declared(name, body);
@@ -342,6 +349,7 @@ fn a_namespace_declaration_is_checked_when_the_file_loads() {
             max_ttl_secs: 3600,
             eviction: state::Eviction::Lru,
             tombstone_window_secs: 3600,
+            dedupe_window_secs: 300,
         }
     );
     // A rule's own namespace gets `[state.default]`; the store's ceiling (1 MiB here)
@@ -379,6 +387,26 @@ fn a_namespace_declaration_is_checked_when_the_file_loads() {
         }
     );
     assert_eq!(settings("plain").tombstone_window_secs, 3600);
+}
+
+/// D8: how long a namespace remembers an idempotency key. Five minutes unless the
+/// table says, and never longer than a key of the namespace may live.
+#[test]
+fn a_namespace_declares_how_long_it_remembers_an_idempotency_key() {
+    let store = Arc::new(Recorder::default());
+    let text = "[state.plain]\n[state.long]\ndedupe_window = \"1h\"\n\
+                [state.brief]\nmax_ttl = 60\ndefault_ttl = 30\n\
+                [rules.r]\nsql = '''SELECT 1 AS v FROM \"t/#\"'''\n";
+    load(text, &store).unwrap();
+    let opened = store.opened.lock().unwrap().clone();
+    let window = |name: &str| {
+        let settings = &opened.iter().find(|(n, _)| n == name).unwrap().1;
+        settings.dedupe_window_secs
+    };
+    assert_eq!(
+        (window("plain"), window("long"), window("brief")),
+        (300, 3600, 60)
+    );
 }
 
 #[test]
@@ -452,8 +480,8 @@ fn the_state_functions_are_built_in() {
             "kv_store_del() takes 1 argument(s), 2 given",
         ),
         (
-            "kv_incr('a', 1, 60, 'idem')",
-            "kv_incr() takes 1..=3 argument(s), 4 given",
+            "kv_incr('a', 1, 60, 'idem', 2)",
+            "kv_incr() takes 1..=4 argument(s), 5 given",
         ),
         (
             "kv_hll_add('a')",
@@ -531,6 +559,97 @@ fn a_call_with_a_bad_key_value_or_ttl_fails_the_rule_before_the_store() {
         assert!(out.is_ok(), "{call}: {out:?}");
         assert_eq!(log.len(), 1, "{call}");
     }
+}
+
+/// D8: `kv_incr`'s fourth argument is the idempotency key, a string of 1 to 255 bytes,
+/// handed to the store beside the counter's key. A message that has none fails its
+/// rule: it is neither counted twice without a word nor left out without one.
+#[test]
+fn kv_incr_hands_the_store_its_idempotency_key() {
+    let sql = "SELECT kv_incr('n', 1, 60, payload.id) AS v FROM \"t/#\"";
+    assert_eq!(
+        calls(sql, r#"{"id":"m-1"}"#),
+        ["rule:test incr_once n once m-1"]
+    );
+    let longest = "i".repeat(state::MAX_IDEMPOTENCY_KEY_BYTES);
+    assert_eq!(
+        calls(sql, &format!(r#"{{"id":"{longest}"}}"#)),
+        [format!("rule:test incr_once n once {longest}")]
+    );
+    // Without one it is the call it always was.
+    assert_eq!(
+        calls("SELECT kv_incr('n', 1, 60) AS v FROM \"t/#\"", "{}"),
+        ["rule:test incr n"]
+    );
+    for (payload, wanted) in [
+        ("{}", "an idempotency key is a string, got a undefined"),
+        (
+            r#"{"id":7}"#,
+            "an idempotency key is a string, got a integer",
+        ),
+        (
+            r#"{"id":""}"#,
+            "an idempotency key is 1 to 255 bytes, got 0",
+        ),
+        (
+            &format!(r#"{{"id":"{longest}i"}}"#),
+            "an idempotency key is 1 to 255 bytes, got 256",
+        ),
+    ] {
+        let (out, log) = run(sql, payload);
+        let e = out.expect_err(payload);
+        assert_eq!(e, format!("kv_incr(): bad_idempotency_key: {wanted}"));
+        assert!(log.is_empty(), "{payload}: {log:?}");
+    }
+}
+
+/// D8: the namespace remembers an idempotency key under a key of its own that starts
+/// with a NUL byte, and no `kv_*` key may: a value a publisher chooses can then
+/// neither read nor write what the namespace remembers, and an idempotency key can
+/// never name a key of the rule's. EMQX's table matches any term, and is not touched.
+#[test]
+fn a_key_cannot_start_with_a_nul_byte() {
+    let payload = r#"{"k":"\u0000m-1"}"#;
+    for call in [
+        "kv_get(payload.k)",
+        "kv_set(payload.k, 1)",
+        "kv_set_once(payload.k, 1)",
+        "kv_incr(payload.k)",
+        "kv_incr(payload.k, 1, 60, 'm-1')",
+        "kv_del(payload.k)",
+        "kv_ttl(payload.k)",
+        "kv_held(payload.k, true)",
+        "kv_changed(payload.k, 1)",
+        "kv_add(payload.k, 1)",
+        "kv_max(payload.k, 1)",
+        "kv_hll_add(payload.k, 1)",
+        "kv_hll_count(payload.k)",
+    ] {
+        let (out, log) = run(&format!("SELECT {call} AS v FROM \"t/#\""), payload);
+        let e = out.expect_err(call);
+        assert!(
+            e.contains("bad_key: a key cannot start with a NUL byte"),
+            "{call}: {e}"
+        );
+        assert!(log.is_empty(), "{call}: {log:?}");
+    }
+    let (out, log) = run(
+        "SELECT kv_store_put(payload.k, 1) AS v FROM \"t/#\"",
+        payload,
+    );
+    assert!(out.is_ok() && log.len() == 1, "{out:?} {log:?}");
+    // The entry's key is that byte and then the idempotency key; nothing else is one.
+    let entry = state::Remembered::of(b"m-1");
+    assert_eq!(entry.key(), b"\0m-1");
+    assert_eq!(state::remembered(entry.key()), Some(&b"m-1"[..]));
+    assert_eq!(state::remembered(b"m-1"), None);
+    // EMQX's table keeps `undefined` under that byte alone.
+    assert_eq!(term_key(&Value::Undefined), [state::REMEMBERED_PREFIX]);
+    assert_eq!(state::remembered(&term_key(&Value::Undefined)), None);
+    assert_eq!(
+        state::Remembered::of(&[b'i'; 255]).key().len(),
+        state::MAX_KEY_BYTES
+    );
 }
 
 /// What `kv_store_*` answers is EMQX's whatever the table says (probed on 6.3.1:
@@ -1109,6 +1228,28 @@ fn the_1025th_state_call_of_a_message_fails_its_rule() {
     assert!(publish(&set, "t/1", &array(10))
         .iter()
         .all(|r| !r.contains("failed")));
+}
+
+/// D8: a `kv_incr` with an idempotency key writes two entries, the count and the
+/// remembered key, and is two of the message's 1,024 calls.
+#[test]
+fn a_kv_incr_with_an_idempotency_key_is_two_of_a_messages_calls() {
+    let store = Arc::new(Recorder::default());
+    let text = "[rules.a]\nsql = '''FOREACH payload.a INCASE kv_incr('n', 1, 60, 'k') < 0 \
+                FROM \"t/#\"'''\n";
+    let set = load(text, &store).unwrap().rules;
+    let results = publish(&set, "t/1", &array(512));
+    assert_eq!(results, ["a no_result"]);
+    assert_eq!(log_of(&store).len(), 512);
+    let results = publish(&set, "t/1", &array(513));
+    assert_eq!(
+        results,
+        [
+            "a failed: kv_incr(): this message already made 1024 state calls (across every rule \
+          it matched and every message they republished); the rest fail"
+        ]
+    );
+    assert_eq!(log_of(&store).len(), 512);
 }
 
 /// The budget is the original message's: a message its rules republished is evaluated
