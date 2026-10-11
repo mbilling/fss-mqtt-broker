@@ -1,5 +1,7 @@
 //! The store rules keep their state in ([ADR 0085](../../../docs/adr/0085-rule-state-store.md)):
-//! `local` namespaces of small keyed values, in memory, on this node.
+//! namespaces of small keyed values, in memory. A `local` namespace lives on this node
+//! only and is what this file is about; an `eventual` one is held by every member of
+//! the cluster and is kept in [`replica`], sent and repaired by [`link`].
 //!
 //! `mqtt-rules` defines what a state call is ([`StateOp`]) and checks its arguments;
 //! this is the [`StateStore`] the broker hands it. One [`Store`] serves the running
@@ -57,15 +59,24 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{BuildHasher, RandomState};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::atomic::{
+    AtomicBool, AtomicU64, AtomicUsize,
+    Ordering::{Relaxed, SeqCst},
+};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
-use mqtt_rules::crdt::{Counts, CountsError, Data, Elements, Hll, SetFull, Stamp};
+use mqtt_rules::crdt::{Counts, CountsError, Data, Elements, Hlc, Hll, SetFull, Stamp};
 use mqtt_rules::state::{
-    Eviction, NamespaceSettings, StateError, StateNamespace, StateOp, StateReply, StateStore,
-    Stored, BROWNOUT, MAX_SET_ELEMENTS, NAMESPACE_FULL, STORE_FULL, WRONG_TYPE,
+    Consistency, Eviction, NamespaceSettings, StateError, StateNamespace, StateOp, StateReply,
+    StateStore, Stored, BROWNOUT, MAX_SET_ELEMENTS, NAMESPACE_FULL, STORE_FULL, WRONG_TYPE,
 };
 use mqtt_rules::Value;
+
+mod link;
+mod replica;
+
+pub use link::StateLink;
+pub use replica::{Refused, Replication};
 
 /// The maps a namespace's keys are spread over, each behind its own lock.
 pub const SHARDS: usize = 64;
@@ -126,6 +137,59 @@ impl Clock {
     }
 }
 
+/// Who this node is to the others, and its clock: what the writes of an `eventual`
+/// namespace are stamped with (D6), and whose counts its counters raise.
+#[derive(Debug)]
+struct Node {
+    /// Whose counts a counter's increments on this node raise: the node's id and
+    /// when this run of it began. The store is in memory, so a node that restarts
+    /// has forgotten what it had counted, and the others have not: counting on
+    /// under the same name, its new counts would be taken for old ones already
+    /// counted (the larger of two is kept) and lost. Each run counts under a name of
+    /// its own instead, and what an earlier run counted stays counted.
+    counts_as: Box<str>,
+    clock: Hlc,
+}
+
+impl Node {
+    fn new(id: &str) -> Self {
+        // When this run began, in milliseconds; never the same twice in one
+        // process, where a test may start two stores in one millisecond.
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let wall_ms = Clock::System.now_ms();
+        let mut began = wall_ms;
+        let _ = LAST.fetch_update(Relaxed, Relaxed, |last| {
+            began = wall_ms.max(last.saturating_add(1));
+            Some(began)
+        });
+        Self {
+            counts_as: format!("{id}#{began:x}").into_boxed_str(),
+            clock: Hlc::new(id),
+        }
+    }
+}
+
+/// How a write to an `eventual` namespace tells the peer links there is something to
+/// send, without paying for it on every write: the first write after a link went to
+/// sleep wakes the links, and the writes after it only read a flag.
+#[derive(Debug, Default)]
+struct Wake {
+    /// Whether the links have been told since one of them last looked.
+    told: AtomicBool,
+    links: tokio::sync::Notify,
+}
+
+impl Wake {
+    /// There is something to send. The caller has already made it visible (a shard's
+    /// latest version, stored `SeqCst`): a link clears the flag and then looks, so one
+    /// of the two sees the other.
+    fn ping(&self) {
+        if !self.told.load(SeqCst) && !self.told.swap(true, SeqCst) {
+            self.links.notify_waiters();
+        }
+    }
+}
+
 /// What every namespace of one store shares.
 #[derive(Debug)]
 struct Shared {
@@ -133,6 +197,23 @@ struct Shared {
     bytes: AtomicU64,
     brownout: AtomicBool,
     clock: Clock,
+    /// Set once, before the rules are loaded ([`Store::set_node`]).
+    node: OnceLock<Node>,
+    wake: Wake,
+    /// Raised whenever a namespace is made: what a peer link compares to know that
+    /// its list of `eventual` namespaces is out of date.
+    generation: AtomicU64,
+    /// How often two members compare an `eventual` namespace, in milliseconds.
+    repair_every_ms: AtomicU64,
+    /// State frames refused because this node declares no such `eventual` namespace.
+    undeclared: AtomicU64,
+}
+
+impl Shared {
+    /// This node. A store nobody named (a dry run's) is the node with no name.
+    fn node(&self) -> &Node {
+        self.node.get_or_init(|| Node::new(""))
+    }
 }
 
 /// The rule state of one broker process, or of one dry run.
@@ -219,11 +300,55 @@ impl Store {
                 bytes: AtomicU64::new(0),
                 brownout: AtomicBool::new(false),
                 clock,
+                node: OnceLock::new(),
+                wake: Wake::default(),
+                generation: AtomicU64::new(0),
+                repair_every_ms: AtomicU64::new(link::REPAIR_EVERY_MS),
+                undeclared: AtomicU64::new(0),
             }),
             namespaces: Mutex::new(HashMap::new()),
             kept: None,
             dictionary_refused: AtomicU64::new(0),
         })
+    }
+
+    /// Name this node, once, before any rules are loaded: the id its counters count
+    /// under and its clock breaks ties with in `eventual` namespaces. Later calls
+    /// change nothing.
+    pub fn set_node(&self, id: &str) {
+        let _ = self.shared.node.set(Node::new(id));
+    }
+
+    /// How often two members compare their copies of an `eventual` namespace (they
+    /// also do when their link comes up). For tests, which cannot wait 30 seconds.
+    pub fn set_repair_interval(&self, every: std::time::Duration) {
+        let ms = u64::try_from(every.as_millis()).unwrap_or(u64::MAX).max(1);
+        self.shared.repair_every_ms.store(ms, Relaxed);
+    }
+
+    /// The `eventual` namespaces loaded rule sets hold now.
+    fn eventual(&self) -> Vec<Arc<Namespace>> {
+        lock(&self.namespaces)
+            .values()
+            .filter_map(Weak::upgrade)
+            .filter(|ns| ns.replica.is_some())
+            .collect()
+    }
+
+    /// How replication of one `eventual` namespace stands; `None` when no loaded rule
+    /// set holds it, or it is `local`.
+    #[must_use]
+    pub fn replication(&self, namespace: &str) -> Option<Replication> {
+        let ns = lock(&self.namespaces).get(namespace)?.upgrade()?;
+        let replica = ns.replica.as_ref()?;
+        Some(replica.stats(self.shared.clock.now_ms()))
+    }
+
+    /// State frames refused because they named a namespace this node's rules do not
+    /// declare `eventual`.
+    #[must_use]
+    pub fn replication_undeclared(&self) -> u64 {
+        self.shared.undeclared.load(Relaxed)
     }
 
     /// Whether the broker is over its memory watermark (ADR 0041): while it is, a key
@@ -285,19 +410,40 @@ impl StateStore for Store {
         settings: &NamespaceSettings,
     ) -> Result<Arc<dyn StateNamespace>, String> {
         let mut namespaces = lock(&self.namespaces);
+        let eventual = settings.consistency == Consistency::Eventual;
         let namespace = if let Some(namespace) = namespaces.get(name).and_then(Weak::upgrade) {
+            // D1: a namespace does not change its mode while rules hold it. Its keys
+            // are kept in a different form, and the other members hold them or do not.
+            if namespace.replica.is_some() != eventual {
+                let (was, now) = if eventual {
+                    ("local", "eventual")
+                } else {
+                    ("eventual", "local")
+                };
+                return Err(format!(
+                    "[state.{name}]: consistency = \"{now}\", and the rules running now hold \
+                     this namespace as \"{was}\": a namespace cannot change its mode; declare \
+                     a new one"
+                ));
+            }
             namespace
         } else {
             // What rule sets dropped is forgotten here, so the map holds at most the
             // namespaces of the sets alive now.
             namespaces.retain(|_, ns| ns.strong_count() > 0);
-            let namespace = Arc::new(Namespace::new(name, self.shared.clone()));
+            let namespace = Arc::new(Namespace::new(name, self.shared.clone(), eventual));
             namespaces.insert(name.to_string(), Arc::downgrade(&namespace));
             if let Some(kept) = &self.kept {
                 lock(kept).push(namespace.clone());
             }
+            self.shared.generation.fetch_add(1, SeqCst);
             namespace
         };
+        if let Some(replica) = &namespace.replica {
+            replica.declare(settings);
+            // A link learns of a new namespace as it learns of a write.
+            self.shared.wake.ping();
+        }
         Ok(Arc::new(Handle {
             namespace,
             settings: settings.clone(),
@@ -350,7 +496,7 @@ const LOCK_SPINS: usize = 24;
 /// caller that finds it taken tries again a few times before it waits: measured (see
 /// the module's benchmark), that is the difference between a collision costing tens
 /// of nanoseconds and costing microseconds on a platform whose mutex does not spin.
-fn lock_shard(mutex: &Mutex<Shard>) -> MutexGuard<'_, Shard> {
+fn lock_shard<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     for _ in 0..LOCK_SPINS {
         match mutex.try_lock() {
             Ok(guard) => return guard,
@@ -451,6 +597,9 @@ struct Namespace {
     purged_ms: AtomicU64,
     refused: [AtomicU64; REFUSALS],
     evicted: AtomicU64,
+    /// An `eventual` namespace's keys: every call goes there, and `shards` stays
+    /// empty. The counts and the refusals above are kept either way.
+    replica: Option<replica::Replica>,
 }
 
 impl Drop for Namespace {
@@ -520,8 +669,9 @@ fn owned(v: &Value) -> Value {
 }
 
 impl Namespace {
-    fn new(name: &str, shared: Arc<Shared>) -> Self {
+    fn new(name: &str, shared: Arc<Shared>, eventual: bool) -> Self {
         Self {
+            replica: eventual.then(replica::Replica::new),
             name: Arc::from(name),
             shared,
             hasher: RandomState::new(),
@@ -573,12 +723,15 @@ impl Namespace {
     }
 
     fn wrong_type(&self, held: &Data, wanted: &str) -> StateError {
+        self.wrong_type_named(held.type_name(), wanted)
+    }
+
+    fn wrong_type_named(&self, held: &str, wanted: &str) -> StateError {
         self.refuse(
             Refusal::WrongType,
             format!(
-                "the key holds a value of type `{}`, and this is an operation on type \
-                 `{wanted}` (kv_del deletes a key of any type)",
-                held.type_name()
+                "the key holds a value of type `{held}`, and this is an operation on type \
+                 `{wanted}` (kv_del deletes a key of any type)"
             ),
         )
     }
@@ -608,8 +761,12 @@ impl Namespace {
     /// Reserve room for one new key of `bytes`, or say which bound is in the way.
     /// No count is ever past its bound, and nothing is left reserved on refusal.
     fn reserve(&self, settings: &NamespaceSettings, bytes: usize) -> Result<(), Refusal> {
+        self.reserve_within(settings.max_keys, settings.max_bytes, bytes)
+    }
+
+    /// [`reserve`](Self::reserve), under bounds given as numbers.
+    fn reserve_within(&self, max_keys: usize, max_bytes: u64, bytes: usize) -> Result<(), Refusal> {
         let bytes = wide(bytes);
-        let max_keys = settings.max_keys;
         if self
             .keys
             .fetch_update(Relaxed, Relaxed, |keys| {
@@ -619,7 +776,7 @@ impl Namespace {
         {
             return Err(Refusal::NamespaceFull);
         }
-        if !add_within(&self.bytes, bytes, settings.max_bytes) {
+        if !add_within(&self.bytes, bytes, max_bytes) {
             self.keys.fetch_sub(1, Relaxed);
             return Err(Refusal::NamespaceFull);
         }
@@ -843,25 +1000,30 @@ fn done(value: Option<Value>) -> Step<StateReply> {
     })
 }
 
+/// The key `op` is about.
+fn op_key<'a>(op: &StateOp<'a>) -> &'a [u8] {
+    match op {
+        StateOp::Get { key }
+        | StateOp::Set { key, .. }
+        | StateOp::SetOnce { key, .. }
+        | StateOp::Incr { key, .. }
+        | StateOp::Extreme { key, .. }
+        | StateOp::Add { key, .. }
+        | StateOp::Del { key }
+        | StateOp::Ttl { key }
+        | StateOp::Held { key, .. }
+        | StateOp::Changed { key, .. }
+        | StateOp::HllAdd { key, .. }
+        | StateOp::HllCount { key } => key,
+    }
+}
+
 impl Handle {
     /// One attempt at `op`: its shard's lock, the one map operation, the lock released.
     fn attempt(&self, op: &StateOp<'_>) -> Result<Step<StateReply>, StateError> {
         let ns = &*self.namespace;
         let now_ms = ns.shared.clock.now_ms();
-        let key = match op {
-            StateOp::Get { key }
-            | StateOp::Set { key, .. }
-            | StateOp::SetOnce { key, .. }
-            | StateOp::Incr { key, .. }
-            | StateOp::Extreme { key, .. }
-            | StateOp::Add { key, .. }
-            | StateOp::Del { key }
-            | StateOp::Ttl { key }
-            | StateOp::Held { key, .. }
-            | StateOp::Changed { key, .. }
-            | StateOp::HllAdd { key, .. }
-            | StateOp::HllCount { key } => *key,
-        };
+        let key = op_key(op);
         let at = ns.shard_of(key);
         let mut shard = lock_shard(&ns.shards[at]);
         let step = self.apply(op, key, &mut shard, now_ms);
@@ -1181,6 +1343,9 @@ impl Handle {
 
 impl StateNamespace for Handle {
     fn call(&self, op: &StateOp<'_>) -> Result<StateReply, StateError> {
+        if let Some(replica) = &self.namespace.replica {
+            return replica.call(self, op);
+        }
         let mut evictions = 0;
         loop {
             // The shard's lock is released before anything else is done about room.
@@ -1222,3 +1387,5 @@ pub use held::HeldKey;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_replica;

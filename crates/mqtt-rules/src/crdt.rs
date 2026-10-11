@@ -619,6 +619,13 @@ impl Counts {
         self.rows().len()
     }
 
+    /// The bytes of the node ids it has counts of: what a store accounts a counter
+    /// of several nodes as, beyond its numbers.
+    #[must_use]
+    pub fn node_bytes(&self) -> usize {
+        self.rows().iter().map(|row| row.node.len()).sum()
+    }
+
     /// Add `by` on behalf of `node` and answer the count after, which must fit 64
     /// bits. Nothing changes when it is refused.
     pub fn add(&mut self, node: &str, by: i64) -> Result<i64, CountsError> {
@@ -1463,9 +1470,27 @@ impl KeyState {
         default_ttl_secs: Option<u64>,
         by: &Writer<'_>,
     ) -> Result<(), WriteError> {
+        self.apply(write, ttl_secs, default_ttl_secs, by)
+            .map(|_| ())
+    }
+
+    /// [`write`](Self::write), answering whether the state is another than it was: a
+    /// value that is already the largest, an element the set holds, a value the
+    /// sketch has seen and a second `kv_set_once` leave it as it is, and there is
+    /// then nothing to send to anyone.
+    #[allow(clippy::too_many_lines)] // one arm per write and type
+    pub fn apply(
+        &mut self,
+        write: &Write<'_>,
+        ttl_secs: Option<u64>,
+        default_ttl_secs: Option<u64>,
+        by: &Writer<'_>,
+    ) -> Result<bool, WriteError> {
         let now_ms = by.clock.physical_ms(by.wall_ms);
+        let mut changed = false;
         if self.data.is_some() && self.live(now_ms).is_none() {
             self.delete(by.clock.now(by.wall_ms));
+            changed = true;
         }
         let wrong = |held: &Data| WriteError::WrongType {
             held: held.type_name(),
@@ -1481,17 +1506,19 @@ impl KeyState {
         match (write, &mut self.data) {
             (Write::Delete, _) => {
                 self.delete(by.clock.now(by.wall_ms));
-                return Ok(());
+                return Ok(true);
             }
             (Write::Set(value), None | Some(Data::Lww { .. })) => {
                 let value = normal(value).map_err(WriteError::Value)?;
                 let stamp = by.clock.now(by.wall_ms);
                 self.data = Some(Data::Lww { stamp, value });
+                changed = true;
             }
             (Write::SetOnce(value), None) => {
                 let value = normal(value).map_err(WriteError::Value)?;
                 let stamp = by.clock.now(by.wall_ms);
                 self.data = Some(Data::First { stamp, value });
+                changed = true;
             }
             (Write::SetOnce(_), Some(Data::First { .. })) => {}
             (Write::Extreme { value, largest }, None) => {
@@ -1501,6 +1528,7 @@ impl KeyState {
                 } else {
                     Data::Min(value)
                 });
+                changed = true;
             }
             (
                 Write::Extreme {
@@ -1511,6 +1539,7 @@ impl KeyState {
             ) => {
                 if term_order(value, held) == Ordering::Greater {
                     *held = number(value)?;
+                    changed = true;
                 }
             }
             (
@@ -1522,15 +1551,18 @@ impl KeyState {
             ) => {
                 if term_order(value, held) == Ordering::Less {
                     *held = number(value)?;
+                    changed = true;
                 }
             }
             (Write::Incr(n), None) => {
                 let mut counts = Counts::default();
                 counts.add(by.node, *n).map_err(WriteError::Counter)?;
                 self.data = Some(Data::Sum(counts));
+                changed = true;
             }
             (Write::Incr(n), Some(Data::Sum(counts))) => {
                 counts.add(by.node, *n).map_err(WriteError::Counter)?;
+                changed |= *n != 0;
             }
             (Write::Add(element), slot @ None) => {
                 let element = normal(element).map_err(WriteError::Value)?;
@@ -1539,10 +1571,11 @@ impl KeyState {
                     .insert(&term_key(&element), &element, Value::clone)
                     .map_err(|SetFull| WriteError::SetFull)?;
                 *slot = Some(Data::Union(elements));
+                changed = true;
             }
             (Write::Add(element), Some(Data::Union(elements))) => {
                 let element = normal(element).map_err(WriteError::Value)?;
-                elements
+                changed |= elements
                     .insert(&term_key(&element), &element, Value::clone)
                     .map_err(|SetFull| WriteError::SetFull)?;
             }
@@ -1550,16 +1583,19 @@ impl KeyState {
                 let mut sketch = Box::<Hll>::default();
                 sketch.add(*hash);
                 *slot = Some(Data::Hll(sketch));
+                changed = true;
             }
             (Write::HllAdd(hash), Some(Data::Hll(sketch))) => {
-                sketch.add(*hash);
+                changed |= sketch.add(*hash);
             }
             (_, Some(held)) => return Err(wrong(held)),
         }
         if let Some(secs) = ttl_secs.or(default_ttl_secs.filter(|_| new)) {
-            self.expires_ms = now_ms.saturating_add(secs.saturating_mul(1000)).max(1);
+            let expires_ms = now_ms.saturating_add(secs.saturating_mul(1000)).max(1);
+            changed |= expires_ms != self.expires_ms;
+            self.expires_ms = expires_ms;
         }
-        Ok(())
+        Ok(changed)
     }
 
     /// The state as bytes: at most [`MAX_ENCODED_BYTES`] of them, appended to `out`.

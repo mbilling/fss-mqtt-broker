@@ -486,9 +486,8 @@ under it. A message no rule selects prints `(no rule selects it)`.
   replay's own, under the configured `rules.state_max_bytes`, and is dropped at the end.
 - `proc_dict_*` work on one dictionary per `clientid` in the sequence, which stands in for
   one connection of that client. The report does not show the dictionaries.
-- It is one node. Once namespaces can be replicated (`consistency = "eventual"`, not in
-  this release), such a namespace behaves as `local` in a replay, and the report says so
-  in a `note:` line.
+- It is one node. A namespace that a cluster replicates (`consistency = "eventual"`)
+  behaves as `local` in a replay, and the report says so in a `note:` line.
 - A step that fails does not stop the replay: it prints `FAILED: <why>`, what it wrote
   before failing stays, and the next step runs. The replay then exits `1`, with
   `rule test FAILED: <n> of <m> steps had a rule or an action fail` on stderr. It also
@@ -2301,6 +2300,7 @@ keys are built from values a publisher chooses.
 
 ```toml
 [state.fleet]              # a lower-case letter, then up to 63 lower-case letters, digits or `_`
+consistency = "local"      # the default: this node only. Or "eventual": every node of the cluster
 max_keys = 50000           # default 100,000; at most 1,000,000
 max_bytes = "32MiB"        # default 64 MiB; at most the broker's rules.state_max_bytes
 default_ttl = "1h"         # default 24 hours
@@ -2315,12 +2315,67 @@ actions = [{ function = "console" }]
 
 `[state.default]` sets the bounds of the rules' own namespaces and `[state.kv_store]` those
 of EMQX's table (which has no expiry: a TTL there is refused); a file declares at most 64
-others. `consistency = "local"` is the only mode this release has: `"eventual"` and
-`"strong"` are refused at load. Across a reload a namespace that is still declared, and
+others. Across a reload a namespace that is still declared, and
 the namespace of a rule that kept its id, keeps its keys, and changed bounds apply at once
 (lowering `max_keys` evicts nothing; it refuses new keys until the count is below it); a
 namespace that is no longer declared, and the namespace of a rule that is gone or renamed,
-is dropped with its keys.
+is dropped with its keys. A namespace cannot change its `consistency` while rules hold
+it: the reload is refused; declare a new namespace.
+
+**Across a cluster.** A `local` namespace is this node's alone: a device that reconnects
+to another node finds none of its keys there. `consistency = "eventual"` makes every node
+of the cluster hold the namespace ([ADR 0085](adr/0085-rule-state-store.md) D5, D15). A
+call still reads and writes this node's copy and never waits. What it wrote is sent to
+the other nodes in the background, each changed key once however often it was written
+meanwhile, so a read on another node can be a few milliseconds behind, and both sides of
+a partition go on working. Copies that meet again merge, each key by its type:
+
+| Written by | Two nodes' copies become |
+|---|---|
+| `kv_set`, `kv_changed` | the later write, by a clock the nodes keep between them |
+| `kv_set_once`, `kv_held` | the earlier write |
+| `kv_max`, `kv_min` | the larger, the smaller |
+| `kv_incr` | the sum of what every node counted |
+| `kv_add` | the union (the first 1,024 elements in order, past that) |
+| `kv_hll_add` | the sketch of everything any node saw |
+| `kv_del`, `kv_held` on a false condition | deleted on every node |
+
+- **A delete** is remembered for the namespace's `tombstone_window` (default `"1h"`, at
+  most 30 days), so that a node that was cut off cannot bring the key back; until then
+  the deleted key still counts as one of the namespace's keys. It deletes what this node
+  holds: on a key this node holds nothing of, `kv_del` answers `false` and does nothing.
+  A counter, set, sketch, maximum or first value deleted on one node while another, not
+  having heard, was still adding to it is deleted with what was added; a `kv_set` made
+  after the delete, by the clock, survives it.
+- **Time.** A key expires at the same moment on every node, and `kv_held` measures from
+  the node that saw the condition first, so the nodes' clocks must agree: keep them
+  synchronised. A value stamped more than 60 seconds ahead of the receiving node's clock
+  is refused there until that node's clock catches up.
+- **It is in memory.** A node that restarts comes back empty and is filled by the others
+  when its links come up (100,000 small keys: 0.14 s on one machine); if
+  every node stops at once the state is gone. Counts are at least once, as on one node,
+  and are not a ledger. A counter keeps one count for each run of each node that counted
+  on it, at most 256: one that outlives that many node restarts refuses the next node's
+  increment until it is deleted.
+- **Rules files are per node.** Two nodes share a namespace when both declare it
+  `eventual` with the same `tombstone_window`. A node that declares it otherwise, or not
+  at all, takes nothing of it from the others and counts what it was sent. The bounds
+  may differ: a node at its `max_keys`, its `max_bytes` or `rules.state_max_bytes` takes
+  no key that is new to it and so holds fewer than the others, and the others offer the
+  key again every 30 seconds. `eviction = "lru"` is for `local` namespaces only, and
+  EMQX's `kv_store` table is always `local`.
+- **What to watch.** `mqttd_rule_state_replication_pending{namespace}` is how many
+  changed keys the slowest peer link has yet to send (at most the keys there are),
+  `mqttd_rule_state_replication_lag_seconds{namespace}` how long that link has been
+  behind, and `mqttd_rule_state_replication_refused_total{namespace,reason}` what peers
+  sent that this node did not take: `declaration`, `clock_skew`, `namespace_full`,
+  `store_full`, `brownout`, `malformed`, and `undeclared` (under the namespace
+  `(undeclared)`) for a namespace this node does not declare `eventual`.
+- **Upgrading.** `eventual` state travels on the peer links at peer protocol 14, which
+  this release introduces. A node still on an earlier release speaks 13: it holds no such
+  state and is sent none, and a rules file that declares an `eventual` namespace does not
+  load there. Upgrade every node first, then deploy the rules that use it.
+  `consistency = "strong"` is refused at load: it is a later phase.
 
 **Bounds.** Keys carry client ids, topic levels and payload fields, so everything a
 message can make the broker hold is bounded. A key that does not exist yet is refused,
@@ -2370,6 +2425,13 @@ threads, 0.20 µs on four and 0.33 µs on eight; with all of them incrementing *
 0.19 µs, 0.63 µs and 1.9 µs. A new key in a full `lru` namespace costs an eviction: 0.9 µs
 alone, about 10 µs when eight threads do nothing else. `kv_hll_add` is the dearest call,
 about twice a `kv_incr` in the store: it works out its estimate each time.
+In an `eventual` namespace a call costs the same on the publish path (1.84 µs beside
+1.80 µs for the publish with a `kv_incr`). In the store a write is 0.16 µs, and 0.27 to
+0.30 µs while the other nodes keep up, since the key is put back in the order the peer
+links read; with eight threads writing keys of their own, 0.9 µs a call, and 1.65 µs when
+every write is a `kv_set` (each takes a stamp of the node's one clock). On the wire a
+counter is about 65 bytes and a 44-byte value about 105, once per peer for whatever was
+written in the 5 ms before.
 
 ## Actions
 

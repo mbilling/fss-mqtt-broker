@@ -34,6 +34,22 @@ struct VersionLabel {
     version: String,
 }
 
+/// `{namespace}` for the replication series of rule state (ADR 0085 D10): a name from
+/// the operator's rules file (a declared namespace, or `rule:<id>`), never from a
+/// client. The same bounded exception to ADR 0020 as the `rule` label.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct StateNamespaceLabel {
+    namespace: String,
+}
+
+/// `{namespace, reason}` for `mqttd_rule_state_replication_refused_total`: `reason` is
+/// one of a fixed set (see `set_rule_state_replication_refused`).
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct StateRefusedLabel {
+    namespace: String,
+    reason: String,
+}
+
 /// `{module}` label for `crypto_module_info` (ADR 0068): which crypto module
 /// the running binary uses — the metric half of the fips build's runtime
 /// visibility (version line and startup log are the other two).
@@ -520,6 +536,11 @@ pub struct Metrics {
     peer_links: Gauge,
     /// Per-link work counters (`peer_link_stat{peer, stat}`), cumulative per link.
     peer_link_stat: Family<PeerLinkStatLabel, Gauge<f64, std::sync::atomic::AtomicU64>>,
+    /// Replication of `eventual` rule state (ADR 0085 D10), per namespace.
+    rule_state_replication_lag_seconds:
+        Family<StateNamespaceLabel, Gauge<f64, std::sync::atomic::AtomicU64>>,
+    rule_state_replication_pending: Family<StateNamespaceLabel, Gauge>,
+    rule_state_replication_refused_total: Family<StateRefusedLabel, Counter>,
     peer_forwards_in_flight: Gauge,
     members_by_state: Family<StateLabel, Gauge>,
     lease_leader: Gauge,
@@ -931,6 +952,38 @@ impl Metrics {
              frames_out, writes, frames_in, reads \
              (frames per write/read is the batching per I/O call)",
             peer_link_stat.clone(),
+        );
+        let rule_state_replication_lag_seconds =
+            Family::<StateNamespaceLabel, Gauge<f64, std::sync::atomic::AtomicU64>>::default();
+        registry.register(
+            "rule_state_replication_lag_seconds",
+            "How long the peer link furthest behind has had rule state of this `eventual` \
+             namespace to send (ADR 0085): the time since that link last had sent every \
+             changed key. 0 when every link has. It grows while a peer is slow or its link \
+             is busy with other traffic; nothing is queued meanwhile, the link sends each \
+             changed key once when it gets to it",
+            rule_state_replication_lag_seconds.clone(),
+        );
+        let rule_state_replication_pending = register_gauge_family(
+            &mut registry,
+            "rule_state_replication_pending",
+            "Keys of this `eventual` rule-state namespace changed on this node and not yet \
+             sent to the peer link furthest behind (ADR 0085): at most the keys the namespace \
+             holds, however often they were written",
+        );
+        let rule_state_replication_refused_total = register_family(
+            &mut registry,
+            "rule_state_replication_refused",
+            "Rule state a peer sent for this `eventual` namespace that this node did not \
+             take (ADR 0085), by reason: declaration (the peer's rules file declares the \
+             namespace otherwise: a whole frame), clock_skew (a state stamped more than 60 \
+             seconds ahead of this node's clock), namespace_full and store_full (a key new \
+             to this node, or one that would grow, and no room under max_keys, max_bytes or \
+             rules.state_max_bytes), brownout (a key new to this node while it is over its \
+             memory watermark), malformed (not a key, a state or a summary). The peers \
+             offer what was refused again when they next compare. Frames for a namespace \
+             this node does not declare `eventual` at all are counted under the namespace \
+             `(undeclared)` and the reason `undeclared`",
         );
         // Issue #504: the peer links are `mpsc::unbounded_channel()`, so a publish
         // forwarded to a peer is counted `received` here and then reported by
@@ -1510,6 +1563,9 @@ impl Metrics {
             cluster_members,
             peer_links,
             peer_link_stat,
+            rule_state_replication_lag_seconds,
+            rule_state_replication_pending,
+            rule_state_replication_refused_total,
             peer_forwards_in_flight,
             replication_desired,
             replication_min_actual,
@@ -1991,6 +2047,43 @@ impl Metrics {
                 stat: stat.to_string(),
             })
             .set(value);
+    }
+
+    /// How replication of one `eventual` rule-state namespace stands (ADR 0085 D10):
+    /// how long its slowest link has been behind, and how many keys that link has
+    /// yet to send.
+    pub fn set_rule_state_replication(&self, namespace: &str, lag_secs: f64, pending: u64) {
+        let label = StateNamespaceLabel {
+            namespace: namespace.to_string(),
+        };
+        self.rule_state_replication_lag_seconds
+            .get_or_create(&label)
+            .set(lag_secs);
+        self.rule_state_replication_pending
+            .get_or_create(&label)
+            .set(i64::try_from(pending).unwrap_or(i64::MAX));
+    }
+
+    /// The running count of rule state refused for `reason` in `namespace` (ADR 0085
+    /// D10). `reason` is one of `declaration`, `clock_skew`, `namespace_full`,
+    /// `store_full`, `brownout`, `malformed`, or `undeclared`. The count only rises.
+    pub fn set_rule_state_replication_refused(
+        &self,
+        namespace: &str,
+        reason: &'static str,
+        total: u64,
+    ) {
+        let counter = self
+            .rule_state_replication_refused_total
+            .get_or_create(&StateRefusedLabel {
+                namespace: namespace.to_string(),
+                reason: reason.to_string(),
+            })
+            .clone();
+        let so_far = counter.get();
+        if total > so_far {
+            counter.inc_by(total - so_far);
+        }
     }
 
     pub fn set_peer_links(&self, n: usize) {
@@ -3046,6 +3139,33 @@ mod tests {
             "mqttd_rule_module_instances{module=\"jq\"} 3",
             "mqttd_rule_module_memory_bytes{module=\"jq\"} 9437184",
             "mqttd_rule_module_instances_replaced_total{module=\"jq\"} 3",
+        ] {
+            assert!(text.contains(line), "missing {line}:\n{text}");
+        }
+    }
+
+    /// ADR 0085 D10: replication of `eventual` rule state, per namespace. The refused
+    /// count is a counter fed with running totals: it follows them up and never back.
+    #[test]
+    fn rule_state_replication_is_reported_per_namespace() {
+        let m = Metrics::new("test");
+        assert!(
+            !m.render().contains("namespace=\"alerts\""),
+            "no series before a namespace is reported"
+        );
+        m.set_rule_state_replication("alerts", 1.5, 42);
+        m.set_rule_state_replication_refused("alerts", "namespace_full", 3);
+        m.set_rule_state_replication_refused("alerts", "namespace_full", 7);
+        m.set_rule_state_replication_refused("alerts", "namespace_full", 5);
+        m.set_rule_state_replication_refused("alerts", "clock_skew", 0);
+        m.set_rule_state_replication_refused("(undeclared)", "undeclared", 2);
+        let text = m.render();
+        for line in [
+            "mqttd_rule_state_replication_lag_seconds{namespace=\"alerts\"} 1.5",
+            "mqttd_rule_state_replication_pending{namespace=\"alerts\"} 42",
+            "mqttd_rule_state_replication_refused_total{namespace=\"alerts\",reason=\"namespace_full\"} 7",
+            "mqttd_rule_state_replication_refused_total{namespace=\"alerts\",reason=\"clock_skew\"} 0",
+            "mqttd_rule_state_replication_refused_total{namespace=\"(undeclared)\",reason=\"undeclared\"} 2",
         ] {
             assert!(text.contains(line), "missing {line}:\n{text}");
         }
