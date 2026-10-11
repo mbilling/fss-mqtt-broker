@@ -899,7 +899,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-rules/src/lib.rs` — 202 test(s)
+## `crates/mqtt-rules/src/lib.rs` — 213 test(s)
 
 - `edit::tests::a_json_rule_body_is_a_rule_edit`
 - `edit::tests::an_insert_appends_the_rule_at_the_end`
@@ -1028,6 +1028,15 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::user_properties_and_pub_props_emqx_docs`
 - `tests::where_filters_and_can_use_select_aliases`
 - `tests::wildcard_event_filters_select_what_emqx_s_match_selects`
+- `tests_conditions::a_bare_operand_of_and_or_or_reads_as_not_true_unless_it_is`
+- `tests_conditions::a_bare_value_as_a_condition_passes_only_when_it_is_true`
+- `tests_conditions::a_case_when_takes_any_expression_and_goes_on_unless_it_is_true`
+- `tests_conditions::a_case_with_an_operand_takes_a_logical_when_as_a_boolean`
+- `tests_conditions::a_function_that_does_not_return_a_boolean_reads_as_not_true`
+- `tests_conditions::an_incase_reads_its_condition_as_a_where_does`
+- `tests_conditions::not_in_and_not_over_and_or_not_are_evaluated`
+- `tests_conditions::the_portable_forms_give_the_same_in_both_engines`
+- `tests_conditions::true_and_false_are_booleans_in_any_case`
 - `tests_emqx_examples::array_functions_match_emqx_examples`
 - `tests_emqx_examples::bit_functions_match_emqx_examples`
 - `tests_emqx_examples::bit_sequence_functions_match_emqx_examples`
@@ -1079,6 +1088,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests_state::a_call_behind_and_or_or_an_untaken_case_branch_does_not_run`
 - `tests_state::a_call_in_a_select_field_runs_for_a_message_the_where_rejects`
 - `tests_state::a_call_with_a_bad_key_value_or_ttl_fails_the_rule_before_the_store`
+- `tests_state::a_case_operand_is_evaluated_after_each_when_as_emqx_does`
+- `tests_state::a_condition_emqx_fails_goes_on_to_the_calls_behind_it`
 - `tests_state::a_dry_run_never_touches_the_store_the_rules_were_loaded_with`
 - `tests_state::a_file_declares_at_most_64_namespaces`
 - `tests_state::a_file_that_uses_state_is_refused_where_there_is_no_store`

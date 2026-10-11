@@ -671,11 +671,179 @@ fn a_call_behind_and_or_or_an_untaken_case_branch_does_not_run() {
         ),
         ["rule:test set c1", "rule:test set c2"]
     );
-    // The value compared, once, and no branch but the one taken.
+    // The value compared (once per `WHEN` tried), and no branch but the one taken.
     assert_eq!(
         select("CASE kv_set('on', 1) WHEN 1 THEN 'yes' ELSE kv_set('else', 1) END"),
         ["rule:test set on"]
     );
+}
+
+/// The calls of a statement on [`CONDITIONS_PAYLOAD`] as `<op> <key>`, in order,
+/// without the table's name or the key's encoding.
+fn ops(sql: &str) -> (Result<Vec<String>, String>, String) {
+    let (out, log) = run(sql, CONDITIONS_PAYLOAD);
+    let log: Vec<String> = log
+        .iter()
+        .map(|call| {
+            let op = call.split(' ').nth(1).unwrap();
+            format!("{op} {}", call.chars().last().unwrap())
+        })
+        .collect();
+    (out, log.join(", "))
+}
+
+/// The message EMQX was probed with for the two tests below.
+const CONDITIONS_PAYLOAD: &str = r#"{"flag":true,"f":false,"n":1,"s":"a","arr":[1,2,3]}"#;
+
+/// `CASE x WHEN v THEN …` is EMQX's `eval_switch_clauses`: for each `WHEN` it comes to,
+/// `v` is evaluated and then `x`. So a call in `x` runs once per `WHEN` tried, each
+/// time after that `WHEN`'s own calls, and not at all when the first `v` fails. Each
+/// row is the calls EMQX 6.3.1 made (`kv_store_put`, read back from the node's table
+/// after `emqx_rule_sqltester:test/1`) and the field it gave.
+#[test]
+fn a_case_operand_is_evaluated_after_each_when_as_emqx_does() {
+    for (expr, value, calls) in [
+        // Two `WHEN`s tried: the operand twice, so the counter in it ends at 2.
+        (
+            "CASE kv_store_put('L', kv_store_get('L', 0) + 1) WHEN 5 THEN 'a' WHEN 6 THEN 'b' \
+             ELSE 'c' END",
+            Some("c"),
+            "get L, set L, get L, set L",
+        ),
+        // The first `WHEN` matches (`kv_store_put` gives `true`): the operand once.
+        (
+            "CASE kv_store_put('L', kv_store_get('L', 0) + 1) WHEN true THEN 'a' WHEN 6 THEN 'b' \
+             ELSE 'c' END",
+            Some("a"),
+            "get L, set L",
+        ),
+        // The `WHEN`'s value before the operand.
+        (
+            "CASE kv_store_put('L', 1) WHEN kv_store_put('R', 1) THEN 'y' ELSE 'n' END",
+            Some("y"),
+            "set R, set L",
+        ),
+        // A `WHEN` that fails leaves the operand uncalled, and its error is the rule's.
+        (
+            "CASE kv_store_put('L', 1) WHEN abs('x') THEN 'a' ELSE 'c' END",
+            None,
+            "",
+        ),
+        // An operand that fails does so after the `WHEN`'s call.
+        (
+            "CASE abs('x') WHEN kv_store_put('R', 1) THEN 'a' ELSE 'c' END",
+            None,
+            "set R",
+        ),
+        // The last two rows follow from `eval_switch_clauses` as decompiled, and were
+        // not probed on their own. The second `WHEN` fails after the operand ran for
+        // the first.
+        (
+            "CASE kv_store_put('L', 1) WHEN 5 THEN 'a' WHEN abs('x') THEN 'b' ELSE 'c' END",
+            None,
+            "set L",
+        ),
+        // A `WHEN` after the one that matched is not evaluated, nor the operand again.
+        (
+            "CASE kv_store_put('L', 1) WHEN true THEN 'a' WHEN kv_store_put('R', 1) THEN 'b' END",
+            Some("a"),
+            "set L",
+        ),
+    ] {
+        let (out, log) = ops(&format!("SELECT {expr} AS a FROM \"t/#\""));
+        let want = value.map(|v| vec![format!("{{\"a\":\"{v}\"}}")]);
+        assert_eq!(out.clone().ok(), want, "{expr}: {out:?}");
+        assert_eq!(log, calls, "{expr}");
+    }
+    // Which error surfaces where both fail: the `WHEN`'s, evaluated first.
+    let e = error(
+        "SELECT CASE abs('x') WHEN -payload.s THEN 1 END AS a FROM \"t/#\"",
+        CONDITIONS_PAYLOAD,
+    );
+    assert!(e.contains("cannot negate"), "{e}");
+    let e = error(
+        "SELECT CASE -payload.s WHEN abs('x') THEN 1 END AS a FROM \"t/#\"",
+        CONDITIONS_PAYLOAD,
+    );
+    assert!(e.starts_with("abs(): "), "{e}");
+}
+
+/// Conditions EMQX fails and this engine evaluates (ADR 0083, amendment of 2026-10-11;
+/// `tests_conditions` has the outcomes): what runs here where EMQX has already failed
+/// the rule. Each row carries the calls EMQX 6.3.1 made, probed as above. A row whose
+/// calls differ is a rule that does not work in EMQX at all, so no rule that works
+/// there sees the difference.
+#[test]
+fn a_condition_emqx_fails_goes_on_to_the_calls_behind_it() {
+    // (condition, passes, calls here, EMQX's calls; EMQX fails the rule unless noted)
+    for (cond, passes, calls, _emqx_calls) in [
+        // A bare value on the left of an `OR` that is not `true`: the right side runs.
+        ("payload.f OR kv_store_put('R', 1)", true, "set R", ""),
+        // One that is `true` decides, as a comparison would.
+        ("payload.flag OR kv_store_put('R', 1)", true, "", ""),
+        ("payload.f AND kv_store_put('R', 1)", false, "", ""),
+        // On the right, EMQX fails after the left side's call too.
+        (
+            "kv_store_put('L', 1) AND payload.flag",
+            true,
+            "set L",
+            "set L",
+        ),
+        // `NOT IN` evaluates its list whole, as `IN` does; so does the portable
+        // `NOT contains` (EMQX passes that one: the same calls).
+        (
+            "payload.s NOT IN ('x', kv_store_put('L', 1))",
+            true,
+            "set L",
+            "",
+        ),
+        (
+            "NOT (payload.s IN ('x', kv_store_put('L', 1)))",
+            true,
+            "set L",
+            "",
+        ),
+        (
+            "NOT contains(payload.s, ['x', kv_store_put('L', 1)])",
+            true,
+            "set L",
+            "set L",
+        ),
+        (
+            "NOT (kv_store_put('L', 1) AND kv_store_put('R', 1))",
+            false,
+            "set L, set R",
+            "",
+        ),
+        // A function's number: "not true" here, so an `OR` goes on.
+        ("abs(1) OR kv_store_put('R', 1)", true, "set R", ""),
+        ("abs(1) AND kv_store_put('R', 1)", false, "", ""),
+        (
+            "kv_store_put('L', 1) AND abs(1) AND kv_store_put('R', 1)",
+            false,
+            "set L",
+            "set L",
+        ),
+    ] {
+        let (out, log) = ops(&format!("SELECT 1 AS a FROM \"t/#\" WHERE {cond}"));
+        assert_eq!(out.clone().map(|o| !o.is_empty()), Ok(passes), "{cond}");
+        assert_eq!(log, calls, "{cond}");
+    }
+    // `CASE x WHEN <NOT …>`: EMQX fails before either call; here the `WHEN` is `true`.
+    let (out, log) = ops(
+        "SELECT CASE kv_store_put('L', 1) WHEN NOT payload.f THEN 'y' ELSE 'n' END AS a \
+         FROM \"t/#\"",
+    );
+    assert_eq!(out.unwrap(), [r#"{"a":"y"}"#]);
+    assert_eq!(log, "set L");
+    // An `INCASE` with a bare right side of `OR`: EMQX runs the first element's `DO`
+    // ("set L") and fails the rule at the second; here the others are turned away.
+    let (out, log) = ops(
+        "FOREACH payload.arr DO item AS v, kv_store_put('L', item) AS w INCASE item < 2 OR item \
+         FROM \"t/#\"",
+    );
+    assert_eq!(out.unwrap().len(), 1);
+    assert_eq!(log, "set L");
 }
 
 /// EMQX evaluates an `IN` list whole before it looks for the value (probed on 6.3.1:
