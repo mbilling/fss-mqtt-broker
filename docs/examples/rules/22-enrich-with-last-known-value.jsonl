@@ -1,0 +1,7 @@
+# d1 is commissioned and reports; d2 reports without a configuration; d1's limit is raised
+{"at": 0,  "topic": "registry/d1/config", "payload": {"site": "oslo", "limit": 30}}
+{"at": 10, "topic": "devices/d1/data",    "payload": {"temp": 28.5}}
+{"at": 20, "topic": "devices/d1/data",    "payload": {"temp": 31}}
+{"at": 30, "topic": "devices/d2/data",    "payload": {"temp": 99}}
+{"at": 40, "topic": "registry/d1/config", "payload": {"site": "oslo", "limit": 35}}
+{"at": 50, "topic": "devices/d1/data",    "payload": {"temp": 31}}

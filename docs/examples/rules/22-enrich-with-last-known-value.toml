@@ -1,0 +1,53 @@
+# Recipe 22: enrich a reading with a value another topic delivered earlier
+#
+# A reading says what a device measured; where the device stands and what its limit is
+# came on another topic, once, when it was commissioned. A rule sees one message, so
+# the two meet in the state store: remember_config keeps each device's configuration,
+# and enrich reads it back for every reading of that device.
+#
+# - remember_config stores what registry/<device>/config says, as the decoded JSON
+#   object, under the device id.
+# - enrich publishes each reading on enriched/<device> with the device's site, and
+#   over_limit says whether the reading is above the device's own limit. A device
+#   whose configuration is not known gets nothing here (the WHERE): route those
+#   readings elsewhere with a rule of their own if they must not be lost.
+#
+# Both rules name the same declared namespace, or neither would see the other's keys.
+# It is replicated ("eventual"), so a configuration published to one node of a cluster
+# is read on whichever node the device is connected to, a few milliseconds later. A
+# key lives for at most 30 days after it was last written (max_ttl): have the registry
+# publish each configuration again more often than that, or after a broker restart.
+#
+# Replay: docs/examples/rules/22-enrich-with-last-known-value.jsonl (mqttd --rule-test --sequence).
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[state.registry]
+consistency = "eventual"
+default_ttl = "30d"
+
+[rules.remember_config]
+description = "Keep each device's configuration"
+state = "registry"
+sql = '''
+SELECT kv_set(topic(2), json_decode(payload)) AS config
+FROM "registry/+/config"
+WHERE is_str(payload.site) AND is_num(payload.limit)
+'''
+
+[rules.enrich]
+description = "Each reading with its device's site and limit"
+state = "registry"
+sql = '''
+SELECT
+  topic(2) AS device,
+  payload.temp AS temp,
+  kv_get(topic(2)) AS config,
+  config.site AS site,
+  (payload.temp > config.limit) AS over_limit
+FROM "devices/+/data"
+WHERE is_num(payload.temp) AND is_map(config)
+'''
+actions = [
+  { function = "republish", args = { topic = "enriched/${device}", payload = '{"device":"${device}","site":"${site}","temp":${temp},"over_limit":${over_limit}}' } },
+]

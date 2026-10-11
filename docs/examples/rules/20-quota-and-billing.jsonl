@@ -1,0 +1,7 @@
+# acme sends four requests and sends the second one twice; the next hour starts at zero
+{"at": 0,    "topic": "api/acme/requests", "qos": 1, "payload": {"request_id": "r-1", "units": 5}}
+{"at": 60,   "topic": "api/acme/requests", "qos": 1, "payload": {"request_id": "r-2", "units": 1}}
+{"at": 62,   "topic": "api/acme/requests", "qos": 1, "payload": {"request_id": "r-2", "units": 1}}
+{"at": 120,  "topic": "api/acme/requests", "qos": 1, "payload": {"request_id": "r-3", "units": 2}}
+{"at": 180,  "topic": "api/acme/requests", "qos": 1, "payload": {"request_id": "r-4", "units": 1}}
+{"at": "1h", "topic": "api/acme/requests", "qos": 1, "payload": {"request_id": "r-5", "units": 1}}

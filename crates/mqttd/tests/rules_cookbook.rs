@@ -11,6 +11,13 @@
 //! `QoS` 0 message can overtake a `QoS` 1 or 2 one routed before it), and nothing else
 //! arrives.
 //!
+//! The recipes that keep state (ADR 0085) need several messages at the right times,
+//! ten minutes apart for some, so they are not driven through a broker: each has a
+//! sequence file beside it, and the suite replays that sequence through the recipe with
+//! the real binary (`mqttd --rule-test --sequence`), on the replay's own clock. What the
+//! replay prints is what the page shows, line for line, and each recipe's table entry
+//! pins the lines that are the point of it.
+//!
 //! It also keeps the page and the files from drifting apart. Every file in
 //! `docs/examples/rules/` has a case here, runs on the broker and passes
 //! `mqttd --check-rules` with no warning. Every fenced block on the page, section by
@@ -972,6 +979,153 @@ const RECIPES: [&Recipe; 16] = [
     &R01, &R02, &R03, &R04, &R05, &R06, &R07, &R08, &R09, &R10, &R11, &R12, &R13, &R14, &R15, &R16,
 ];
 
+/// A recipe that keeps state between messages: a rules file and, beside it, the
+/// sequence of messages `mqttd --rule-test --sequence` replays through it.
+#[derive(Debug)]
+struct Replayed {
+    file: &'static str,
+    /// What `mqttd --check-rules` lists after its summary: one line per rule, in id order.
+    listing: &'static [&'static str],
+    /// What replaying it proves; a failure prints it.
+    proves: &'static str,
+    /// Lines the replay must print, in this order: the point of the recipe. The page
+    /// shows the whole replay; these keep a change of behaviour from being pasted over.
+    shows: &'static [&'static str],
+}
+
+/// Every recipe that keeps state, in file order.
+const REPLAYED: [Replayed; 7] = [
+    Replayed {
+        file: "17-silent-device.toml",
+        listing: &[
+            r#"  last_seen (enabled): FROM "devices/+/telemetry", 0 action(s)"#,
+            r#"  silent (enabled): FROM "$events/state/expired", 1 action(s)"#,
+        ],
+        proves: "a device that stops is reported ten minutes after its last reading, with \
+                 that reading, and a reading in between moves the deadline",
+        shows: &[
+            r#"  state seen: ~ "d1" = 22 (lww, expires +1080s)"#,
+            r#"  event state.expired seen: "d2" at +660s"#,
+            r#"      republish alerts/silent/d2 qos 1 {"device":"d2","last_temp":21,"expired_at":1735690260000}"#,
+            r#"  event state.expired seen: "d1" at +1500s"#,
+            r#"      republish alerts/silent/d1 qos 1 {"device":"d1","last_temp":23,"expired_at":1735691100000}"#,
+        ],
+    },
+    Replayed {
+        file: "18-hot-for-five-minutes.toml",
+        listing: &[
+            r#"  hot_alarm (enabled): FROM "sensors/+/data", 1 action(s)"#,
+            r#"  hot_sensor (enabled): FROM "sensors/+/data", 1 action(s)"#,
+        ],
+        proves: "nothing is published until the reading has been hot for five minutes, the \
+                 alarm is published once when it starts and once when it ends, and a cool \
+                 reading starts the five minutes again",
+        shows: &[
+            "#1 +0s sensors/s1/data {\"temp\": 31}",
+            r#"    republish alarms/hot/s1 qos 1 retain {"sensor":"s1","alarm":false}"#,
+            "  hot_sensor: no_result",
+            "#3 +300s sensors/s1/data {\"temp\": 33}",
+            r#"    republish alarms/hot/s1 qos 1 retain {"sensor":"s1","alarm":true}"#,
+            r#"    republish alerts/hot/s1 qos 1 {"sensor":"s1","temp":33,"hot_for":300}"#,
+            "#4 +360s sensors/s1/data {\"temp\": 34}",
+            "  hot_alarm: no_result",
+            r#"    republish alerts/hot/s1 qos 1 {"sensor":"s1","temp":34,"hot_for":360}"#,
+            "#5 +420s sensors/s1/data {\"temp\": 20}",
+            r#"    republish alarms/hot/s1 qos 1 retain {"sensor":"s1","alarm":false}"#,
+            r#"  state rule:hot_sensor: - "s1""#,
+            "#7 +540s sensors/s1/data {\"temp\": 36}",
+            "  hot_alarm: no_result",
+            "  hot_sensor: no_result",
+        ],
+    },
+    Replayed {
+        file: "19-report-on-change.toml",
+        listing: &[r#"  state_change (enabled): FROM "machines/+/status", 1 action(s)"#],
+        proves: "a status is forwarded the first time and when it differs from the last one \
+                 of the same machine, and a repeat, in capitals too, is not",
+        shows: &[
+            r#"    republish changes/m1 qos 1 retain {"machine":"m1","status":"running"}"#,
+            "#2 +5s machines/m1/status {\"status\": \"running\"}",
+            "  state_change: no_result",
+            r#"    republish changes/m2 qos 1 retain {"machine":"m2","status":"running"}"#,
+            r#"    republish changes/m1 qos 1 retain {"machine":"m1","status":"stopped"}"#,
+            "#5 +20s machines/m1/status {\"status\": \"STOPPED\"}",
+            "  state_change: no_result",
+            r#"    republish changes/m1 qos 1 retain {"machine":"m1","status":"running"}"#,
+        ],
+    },
+    Replayed {
+        file: "20-quota-and-billing.toml",
+        listing: &[
+            r#"  billing_event (enabled): FROM "api/+/requests", 1 action(s)"#,
+            r#"  quota (enabled): FROM "api/+/requests", 1 action(s)"#,
+        ],
+        proves: "every request reaches billing, the resent one too (the billing system drops \
+                 it by its id); the quota counts the resent one once, is exceeded by the \
+                 fourth request and starts again in the next hour",
+        shows: &[
+            r#"  state quota: + idempotency key "acme:r-2" = 1735689660000 (first, expires +660s)"#,
+            r#"  state quota: ~ "acme:482136" = 2 (sum, expires +7260s)"#,
+            "#3 +62s api/acme/requests {\"request_id\": \"r-2\", \"units\": 1}",
+            r#"    republish billing/acme qos 1 {"tenant":"acme","request_id":"r-2","units":1,"at":1735689662000}"#,
+            "  quota: no_result",
+            "#4 +120s api/acme/requests {\"request_id\": \"r-3\", \"units\": 2}",
+            r#"  state quota: ~ "acme:482136" = 3 (sum, expires +7320s)"#,
+            r#"    republish quota/exceeded/acme qos 1 {"tenant":"acme","used":4}"#,
+            r#"  state quota: + "acme:482137" = 1 (sum, expires +10800s)"#,
+        ],
+    },
+    Replayed {
+        file: "21-distinct-devices.toml",
+        listing: &[r#"  distinct_devices (enabled): FROM "sites/+/data", 1 action(s)"#],
+        proves: "a site's count goes up for a device it has not seen this hour and not for \
+                 one it has, sites are counted apart, and the next hour starts at one",
+        shows: &[
+            r#"    republish stats/oslo/devices qos 1 retain {"site":"oslo","hour":482136,"devices":2}"#,
+            "#3 +20s sites/oslo/data {\"v\": 2}",
+            "  distinct_devices: no_result",
+            r#"    republish stats/bergen/devices qos 1 retain {"site":"bergen","hour":482136,"devices":1}"#,
+            r#"    republish stats/oslo/devices qos 1 retain {"site":"oslo","hour":482136,"devices":3}"#,
+            "#6 +50s sites/oslo/data {\"v\": 3}",
+            "  distinct_devices: no_result",
+            r#"    republish stats/oslo/devices qos 1 retain {"site":"oslo","hour":482137,"devices":1}"#,
+        ],
+    },
+    Replayed {
+        file: "22-enrich-with-last-known-value.toml",
+        listing: &[
+            r#"  enrich (enabled): FROM "devices/+/data", 1 action(s)"#,
+            r#"  remember_config (enabled): FROM "registry/+/config", 0 action(s)"#,
+        ],
+        proves: "a reading carries the site and is judged by the limit its device's \
+                 configuration gave, a device without one gets nothing, and a new \
+                 configuration applies to the next reading",
+        shows: &[
+            r#"  state registry: + "d1" = {"site":"oslo","limit":30} (lww, expires +2592000s)"#,
+            r#"    republish enriched/d1 qos 0 {"device":"d1","site":"oslo","temp":28.5,"over_limit":false}"#,
+            r#"    republish enriched/d1 qos 0 {"device":"d1","site":"oslo","temp":31,"over_limit":true}"#,
+            "#4 +30s devices/d2/data {\"temp\": 99}",
+            "  enrich: no_result",
+            r#"  state registry: ~ "d1" = {"site":"oslo","limit":35} (lww, expires +2592000s)"#,
+            r#"    republish enriched/d1 qos 0 {"device":"d1","site":"oslo","temp":31,"over_limit":false}"#,
+        ],
+    },
+    Replayed {
+        file: "23-emqx-kv-store-counter.toml",
+        listing: &[r#"  door_count (enabled): FROM "doors/+/opened", 1 action(s)"#],
+        proves: "a rule written for EMQX's kv_store table counts per device across \
+                 messages, in the table that has no expiry",
+        shows: &[
+            "    republish doors/door-front/count qos 0 1",
+            r#"  state kv_store: + "door-front" = 1 (lww)"#,
+            "    republish doors/door-front/count qos 0 2",
+            "    republish doors/door-back/count qos 0 1",
+            "    republish doors/door-front/count qos 0 3",
+            r#"  state kv_store: ~ "door-front" = 3 (lww)"#,
+        ],
+    },
+];
+
 /// Recipe 01's offline half: `mqttd --rule-test` runs a statement against a sample
 /// message. (statement, topic, payload, exit code, what the terminal shows).
 const RULE_TESTS: [(&str, &str, &str, i32, &str); 3] = [
@@ -1203,9 +1357,40 @@ fn cookbook() -> String {
 
 /// A recipe's number: 2 for `02-....toml`.
 fn number(r: &Recipe) -> u8 {
-    r.file[..2]
+    file_number(r.file)
+}
+
+fn file_number(file: &str) -> u8 {
+    file[..2]
         .parse()
         .expect("a recipe file starts with its number")
+}
+
+/// The sequence file beside a recipe that keeps state: `17-….jsonl` for `17-….toml`.
+fn sequence_rel(r: &Replayed) -> String {
+    let stem = r.file.strip_suffix(".toml").expect("a .toml recipe");
+    recipe_rel(&format!("{stem}.jsonl"))
+}
+
+/// The command the cookbook shows for a recipe that keeps state.
+fn replay_cmd(r: &Replayed) -> String {
+    format!(
+        "MQTTD_RULES_FILE={} mqttd --rule-test --sequence {}",
+        recipe_rel(r.file),
+        sequence_rel(r)
+    )
+}
+
+/// What that command prints: the recipe's sequence replayed through its rules by the
+/// real binary. It must exit 0, with nothing on stderr.
+fn replay(r: &Replayed) -> String {
+    let (code, stdout, stderr) = run_cli_with(
+        &[("MQTTD_RULES_FILE", &recipe_rel(r.file))],
+        &["--rule-test", "--sequence", &sequence_rel(r)],
+    );
+    assert_eq!(code, Some(0), "{}: {stdout}{stderr}", r.file);
+    assert_eq!(stderr, "", "{}", r.file);
+    stdout
 }
 
 /// `bytes` in lower-case hex, as `mosquitto_sub`'s `%x` prints a payload.
@@ -1682,7 +1867,12 @@ fn sections(doc: &str) -> Vec<(String, String)> {
 
 /// A recipe's section: `## 2. ...` for `02-....toml`.
 fn recipe_section(doc: &str, r: &Recipe) -> String {
-    let prefix = format!("{}. ", number(r));
+    numbered_section(doc, number(r))
+}
+
+/// The section of recipe `n`: `## <n>. ...`.
+fn numbered_section(doc: &str, n: u8) -> String {
+    let prefix = format!("{n}. ");
     let mut found = sections(doc)
         .into_iter()
         .filter(|(h, _)| h.starts_with(&prefix));
@@ -1886,6 +2076,18 @@ fn recipe_blocks(r: &Recipe) -> Vec<WantBlock> {
     want
 }
 
+/// The blocks of a recipe that keeps state: its file verbatim, its sequence file
+/// verbatim, the command that replays one through the other, and what that prints.
+fn replayed_blocks(r: &Replayed) -> Vec<WantBlock> {
+    let lines = |text: String| text.lines().map(String::from).collect::<Vec<_>>();
+    vec![
+        WantBlock::exact("toml", lines(read(&recipe_rel(r.file)))),
+        WantBlock::exact("text", lines(read(&sequence_rel(r)))),
+        WantBlock::exact("sh", [replay_cmd(r)]),
+        WantBlock::exact("text", lines(replay(r))),
+    ]
+}
+
 /// The blocks the section under `heading` must show: the quick start's, a recipe's, or
 /// none.
 fn section_blocks(heading: &str) -> Vec<WantBlock> {
@@ -1901,6 +2103,9 @@ fn section_blocks(heading: &str) -> Vec<WantBlock> {
     else {
         return Vec::new();
     };
+    if let Some(r) = REPLAYED.iter().find(|r| file_number(r.file) == n) {
+        return replayed_blocks(r);
+    }
     let r = RECIPES.iter().find(|r| number(r) == n).unwrap_or_else(|| {
         panic!("docs/RULES-COOKBOOK.md has a section for recipe {n}, which has no file")
     });
@@ -2630,10 +2835,34 @@ fn every_recipe_file_has_a_case_and_every_case_a_file() {
         .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
         .collect();
     files.sort();
-    let cases: Vec<String> = RECIPES.iter().map(|r| r.file.to_string()).collect();
+    let cases: Vec<String> = RECIPES
+        .iter()
+        .map(|r| r.file)
+        .chain(REPLAYED.iter().map(|r| r.file))
+        .map(String::from)
+        .collect();
     assert_eq!(
         files, cases,
-        "docs/examples/rules/*.toml and this suite's RECIPES"
+        "docs/examples/rules/*.toml and this suite's RECIPES and REPLAYED"
+    );
+    // A recipe that keeps state is replayed, so its sequence file is part of it, and a
+    // sequence file belongs to such a recipe.
+    let mut sequences: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .map(|p| {
+            format!(
+                "docs/examples/rules/{}",
+                p.file_name().unwrap().to_string_lossy()
+            )
+        })
+        .collect();
+    sequences.sort();
+    let replayed: Vec<String> = REPLAYED.iter().map(sequence_rel).collect();
+    assert_eq!(
+        sequences, replayed,
+        "docs/examples/rules/*.jsonl and this suite's REPLAYED"
     );
 }
 
@@ -2649,6 +2878,72 @@ fn every_recipe_passes_check_rules_with_no_warning() {
         assert_eq!(stderr, "", "{} warns", r.file);
         assert_eq!(stdout, check_rules_stdout(r), "{}", r.file);
     }
+    for r in &REPLAYED {
+        let (code, stdout, stderr) = run_cli(&["--check-rules", &recipe_rel(r.file)]);
+        assert_eq!(code, Some(0), "{}: {stdout}{stderr}", r.file);
+        assert_eq!(stderr, "", "{} warns", r.file);
+        let n = r.listing.len();
+        let mut want = format!(
+            "rules OK: {}: {n} rule(s), {n} enabled, sha256 {}\n",
+            recipe_rel(r.file),
+            sha256_hex(read(&recipe_rel(r.file)).as_bytes())
+        );
+        for l in r.listing {
+            want.push_str(l);
+            want.push('\n');
+        }
+        assert_eq!(stdout, want, "{}", r.file);
+    }
+}
+
+/// Each recipe that keeps state does what the cookbook says, replayed by the real
+/// binary: its sequence file goes through its rules file on the replay's clock
+/// (`mqttd --rule-test --sequence`), exits 0, and prints the lines that are the point
+/// of the recipe, in order (an alert at a key's expiry and not before; an alarm once
+/// when it starts and once when it ends; a repeat not forwarded; a resent request
+/// counted once; a device counted once; a reading enriched from another topic's
+/// value; an EMQX `kv_store_*` counter). The page shows the whole of what each replay
+/// prints ([`the_page_shows_exactly_the_blocks_this_suite_runs`]). Each file's header
+/// names its sequence file and this suite.
+#[test]
+fn every_recipe_that_keeps_state_replays_as_the_cookbook_shows() {
+    let mut failed = Vec::new();
+    for r in &REPLAYED {
+        let printed = replay(r);
+        let mut rest = printed.lines();
+        for want in r.shows {
+            if !rest.any(|l| l == *want) {
+                failed.push(format!(
+                    "{}: {}\nthe replay does not print, after the lines before it,\n{want}\n\
+                     it printed\n{printed}",
+                    r.file, r.proves
+                ));
+                break;
+            }
+        }
+        let header = read(&recipe_rel(r.file));
+        for line in [
+            format!(
+                "# Replay: {} (mqttd --rule-test --sequence).",
+                sequence_rel(r)
+            ),
+            "# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in \
+             docs/RULES-COOKBOOK.md."
+                .to_string(),
+        ] {
+            assert!(
+                header.lines().any(|l| l == line),
+                "{}: its header must have the line\n{line}",
+                r.file
+            );
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "{} recipe(s) that keep state do not do what the cookbook shows:\n\n{}",
+        failed.len(),
+        failed.join("\n\n")
+    );
 }
 
 /// Every `In:`, `Out:` and `Late:` example a recipe file's header shows is what the
@@ -2671,7 +2966,9 @@ fn every_recipe_header_shows_what_the_recipe_does() {
 /// subscriber, publish and output; each recipe's file (verbatim, byte for byte), its
 /// `mosquitto_pub` commands, what the subscriber prints, and what a late subscriber
 /// prints; recipe 01's console line, `--rule-test` commands and their output, and its
-/// binary-payload gotcha; recipe 11's steps. No other section has a block. Every recipe
+/// binary-payload gotcha; recipe 11's steps; for a recipe that keeps state, its file and
+/// its sequence file (both verbatim), the command that replays them and everything the
+/// replay prints. No other section has a block. Every recipe
 /// has its section, recipe 16's properties table is the properties the broker test
 /// receives, and the quick start builds the package and binary this suite runs.
 #[test]
@@ -2685,6 +2982,15 @@ fn the_page_shows_exactly_the_blocks_this_suite_runs() {
             "docs/RULES-COOKBOOK.md must quote {} verbatim in a ```toml block",
             r.file
         );
+    }
+    for r in &REPLAYED {
+        let sec = numbered_section(&doc, file_number(r.file));
+        for (lang, rel) in [("toml", recipe_rel(r.file)), ("text", sequence_rel(r))] {
+            assert!(
+                sec.contains(&format!("```{lang}\n{}```\n", read(&rel))),
+                "docs/RULES-COOKBOOK.md must quote {rel} verbatim in a ```{lang} block"
+            );
+        }
     }
     assert!(
         recipe_section(&doc, &R01).contains(&format!("```toml\n{HEX_DEBUG}```\n")),

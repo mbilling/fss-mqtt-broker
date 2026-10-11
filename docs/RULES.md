@@ -1,6 +1,6 @@
 # Rule engine
 
-**Dated 2026-10-11.** Unreleased: no release has the rule engine yet
+**Dated 2026-10-12.** Unreleased: no release has the rule engine yet
 ([ADR 0083](adr/0083-rule-engine.md)). Rules filter, transform and re-route messages as
 they pass through the broker. They are written in **EMQX's rule SQL**, with EMQX's
 `republish` and `console` actions. A rule written for EMQX's rule engine runs here
@@ -12,8 +12,9 @@ delivered exactly as it would have been without the rule; what the rule *produce
 an additional message.
 
 **New to rules?** [Try it in two minutes](#try-it-in-two-minutes), then take a recipe
-from the **[rule cookbook](RULES-COOKBOOK.md)**: sixteen tested rules (alerts, unit
-conversion, routing, device presence, CSV and binary decoding, MQTT 5 properties), each a
+from the **[rule cookbook](RULES-COOKBOOK.md)**: twenty-three tested rules files (alerts,
+unit conversion, routing, device presence, CSV and binary decoding, MQTT 5 properties,
+and seven that remember: silence, duration, change, a quota, distinct counts), each a
 file in [`docs/examples/rules/`](examples/rules/) with the messages to publish and the
 exact output to expect. [Testing and debugging rules](#testing-and-debugging-rules) and
 [Gotchas](#gotchas) cover what goes wrong, and [Watch and edit rules
@@ -225,6 +226,13 @@ run, start [`demo/rules-live/up.sh`](../demo/rules-live/README.md).
 - [Functions](#functions): [`jq`](#jq) (what it needs from the host, its limits, its cost),
   [your own functions](#your-own-functions-functionsname) as WebAssembly modules, and
   [state](#state-what-a-rule-remembers): what a rule remembers between messages
+  ([namespaces](#declaring-a-namespace), [the functions](#the-state-functions),
+  [one node or every node](#local-and-eventual-one-node-or-every-node),
+  [when a call runs](#when-a-state-call-runs),
+  [counting a message once](#counting-a-message-once),
+  [expiry events](#when-a-key-expires-eventsstateexpired),
+  [bounds and errors](#bounds-and-errors), [what it costs](#what-state-costs),
+  [watching it](#watching-and-managing-state))
 - [Actions](#actions)
 - [Operating rules](#operating-rules)
 - [Performance](#performance)
@@ -609,6 +617,7 @@ the event a replay only reports the expired keys.
   | `mqttd_rule_state_keys{namespace}`, `mqttd_rule_state_bytes{namespace}` | What a [state](#state-what-a-rule-remembers) namespace holds: its keys, and the bytes its bounds count. `namespace` is a name the rules file declares, `kv_store`, or `rule:<id>`; never a key. |
   | `mqttd_rule_state_ops_total{namespace,op,result}` | State calls that reached the store, by operation (`get`, `set`, `set_once`, `incr`, `max`, `min`, `add`, `del`, `ttl`, `held`, `changed`, `hll_add`, `hll_count`; `kv_store_put`, `kv_store_get` and `kv_store_del` count as `set`, `get` and `del`) and result: `ok`, or why the store refused it (`namespace_full`, `store_full`, `brownout`, `wrong_type`, `refused`). A refused call is also a `failed` evaluation of its rule. A call refused for its arguments (a key too long, a bad TTL, the message's budget) is a `failed` evaluation only. |
   | `mqttd_rule_state_expired_total{namespace}`, `mqttd_rule_state_expiry_backlog{namespace}` | Keys removed because their expiry had passed, and keys past their expiry that are still held (they read as absent). |
+  | `mqttd_rule_state_replication_pending{namespace}`, `mqttd_rule_state_replication_lag_seconds{namespace}`, `mqttd_rule_state_replication_refused_total{namespace,reason}` | For a namespace every node of a cluster holds (`consistency = "eventual"`): the changed keys the peer link furthest behind has yet to send, how long it has had something to send, and what peers sent that this node did not take, by reason ([Watching and managing state](#watching-and-managing-state)). |
   | `mqttd_rule_state_dictionary_bytes`, `mqttd_rule_state_dictionary_refused_total` | What the connections' `proc_dict_*` dictionaries hold together, and puts refused room (`store_full`, `brownout`). |
   | `mqttd_rules_loaded` | Enabled rules loaded on this node. |
   | `mqttd_rules_info{checksum}` | The loaded file's SHA-256, at 1. A checksum replaced by a reload stays exported at 0. |
@@ -669,8 +678,16 @@ Work down the list; each step rules out one cause.
      clean session) gets nothing published while it is away. A persistent one has the
      message queued, QoS 0 included, up to `limits.max_queued_messages`, and gets it when
      it reconnects.
-7. **It fires on a republished message?** It never does: a message a rule publishes
-   never runs rules. Write the second rule against the original topic.
+7. **It should fire on a republished message.** It does, unless the action that
+   published the message set `direct_dispatch = true`. Its fields are not the
+   original's: `clientid` is the id of the rule that republished it and `username` is
+   `undefined` ([Republished messages](#republished-messages)), so a `WHERE` on either
+   no longer matches. A rule's own output runs the rule again, with its `republish`
+   actions skipped.
+8. **It keeps state and decides wrongly.** Replay the messages, with their times,
+   through [`mqttd --rule-test --sequence`](#replay-a-sequence-mqttd---rule-test---sequence):
+   it prints what each step changed in the store. A rule that fails with a reason such
+   as `namespace_full` or `wrong_type`: [Bounds and errors](#bounds-and-errors).
 
 ---
 
@@ -1032,7 +1049,17 @@ mosquitto_sub -h 127.0.0.1 -t '$SYS/brokers/+/rules' -v
 - **`topic(n)` counts from 1:** `topic(2)` of `home/kitchen/temp` is `kitchen`, and
   `topic(0)` fails the rule. Indexes (`payload.list[1]`) and `nth` count from 1 too, but
   `substr` counts from 0. More function traps are under [Functions](#functions).
-- **Rules never chain.** A message a rule publishes never runs rules, its own or another's.
+- **Rules chain.** A message a rule republishes is a new message, and every rule whose
+  `FROM` matches it runs on it, the rule that published it included (only that rule's
+  `republish` actions are skipped). Its `clientid` is the id of the rule that
+  republished it, not the device's. See [Republished messages](#republished-messages),
+  and, for a rule that keeps state, [When a state call runs](#when-a-state-call-runs).
+- **A state call in `SELECT` runs for every message the `FROM` selects**, whatever the
+  `WHERE` says: `SELECT kv_incr('n') … WHERE payload.ok = true` counts every message. To
+  write only on a match, put the condition first: `WHERE payload.ok = true AND
+  kv_incr('n') > 5` ([When a state call runs](#when-a-state-call-runs)).
+- **A resent QoS 1 publish is counted again**, unless `kv_incr` is given an
+  [idempotency key](#counting-a-message-once).
 - **`$SYS` is the broker's.** A republish that renders a `$SYS` topic fails its action,
   and a `FROM` on `$SYS/…` never matches: clients cannot publish there, and the broker's
   own `$SYS` messages never run rules. `--check-rules` warns about a republish whose fixed
@@ -2276,129 +2303,175 @@ runtime (`cargo build --no-default-features`) cannot load a module and says so.
 
 ### State: what a rule remembers
 
-A rule sees one message at a time. The state functions let it keep values between
-messages: a count, the last value, when a condition first held
-([ADR 0085](adr/0085-rule-state-store.md)). State lives **in memory**, in namespaces: a
-namespace is this node's alone, or, declared `consistency = "eventual"`, held by every
-node of the cluster. A node starts with none of it, and is given a replicated namespace
-again by the others. A key that expires
-[raises an event](#when-a-key-expires-eventsstateexpired).
-What the store holds can be [watched and managed](#watching-and-managing-state).
+A rule sees one message at a time. The state functions let it keep small values between
+messages, in a store inside the broker that only rules read and write
+([ADR 0085](adr/0085-rule-state-store.md)). That is what these need:
 
-There are three families, and they do not share keys (`kv_get('x')` does not read what
-`kv_store_put('x', …)` wrote, and `--check-rules` warns about a file that calls both;
-neither reads what `proc_dict_put('x', …)` wrote):
+| You want | Use | Recipe |
+|---|---|---|
+| "Above 30 **for five minutes**", not on the first hot reading | `kv_held` | [18](RULES-COOKBOOK.md#18-hot-for-five-minutes) |
+| "Only when the value **changed**" | `kv_changed` | [19](RULES-COOKBOOK.md#19-forward-a-value-only-when-it-changes) |
+| "More than N **in this hour**", a quota | `kv_incr`, with an idempotency key | [20](RULES-COOKBOOK.md#20-a-quota-and-the-billing-record-beside-it) |
+| "**Nothing** from this device for ten minutes" | a key with a TTL, and `$events/state/expired` | [17](RULES-COOKBOOK.md#17-silent-for-ten-minutes) |
+| "How many **distinct** devices this hour" | `kv_hll_add` | [21](RULES-COOKBOOK.md#21-count-distinct-devices) |
+| A value **another topic** delivered earlier | `kv_set` in one rule, `kv_get` in another | [22](RULES-COOKBOOK.md#22-enrich-with-the-last-known-value) |
+| A rule from EMQX that calls `kv_store_*` or `proc_dict_*` | it runs as it is | [23](RULES-COOKBOOK.md#23-a-rule-from-emqx-that-uses-kv_store) |
 
-**EMQX's table**, with EMQX's results (probed on EMQX 6.3.1), for rules ported from it:
+Three things to know before anything else:
 
-| Function | Returns |
-|---|---|
-| `kv_store_put(key, value)` | `true` |
-| `kv_store_get(key)`, `kv_store_get(key, default)` | the value; `undefined`, or `default`, when there is no such key |
-| `kv_store_del(key)` | `true`, whether or not the key was there |
+- **State is in memory.** A node that restarts has none. A namespace declared
+  `consistency = "eventual"` is held by every node of the cluster and given back to a
+  restarted node by the others; if every node stops at once it is gone. No backup
+  carries it. It makes decisions; it is [not a ledger](#state-is-not-a-system-of-record).
+- **A state call in `SELECT` runs for every message the `FROM` selects**, whether or not
+  the `WHERE` then passes. That is EMQX's evaluation order, and it is what makes
+  `kv_held` and `kv_changed` work ([When a state call runs](#when-a-state-call-runs)).
+- **Using it is the switch.** A rules file that declares no namespace and calls no state
+  function holds no store, runs no task and sends nothing to its peers. The broker's
+  `rules.state_max_bytes` (256 MiB unless set) is the ceiling on all of it; `0` switches
+  state off ([Bounds and errors](#bounds-and-errors)).
 
-One table per node, shared by every rule, as in EMQX. A key and a value may be of any
-type, and a key is matched exactly: `1`, `1.0` and `'1'` are three keys, `0.0` and `-0.0`
-two, a map is the same key whatever order it was written in. `undefined` is a value like
-any other: `kv_store_get(key, default)` returns it, not the default.
+In this section: [declaring a namespace](#declaring-a-namespace) ·
+[the functions](#the-state-functions) · [types](#types-and-how-copies-merge) ·
+[`local` and `eventual`](#local-and-eventual-one-node-or-every-node) ·
+[when a call runs](#when-a-state-call-runs) ·
+[counting a message once](#counting-a-message-once) ·
+[expiry and its event](#when-a-key-expires-eventsstateexpired) ·
+[EMQX's `kv_store_*` and `proc_dict_*`](#emqxs-own-kv_store_-and-proc_dict_) ·
+[bounds and errors](#bounds-and-errors) ·
+[not a system of record](#state-is-not-a-system-of-record) ·
+[testing](#testing-a-rule-that-keeps-state) · [cost](#what-state-costs) ·
+[watching and managing it](#watching-and-managing-state).
 
-**EMQX's process dictionary**, with EMQX's results (probed on EMQX 6.3.1), for rules
-ported from it:
+There are three families of functions, and **they do not share keys**: mqttd's own
+`kv_*`, described first, and EMQX's `kv_store_*` and `proc_dict_*`, for rules moved from
+EMQX. `kv_get('x')` does not read what `kv_store_put('x', …)` or `proc_dict_put('x', …)`
+wrote. `mqttd --check-rules` warns about a file that calls both of the first two:
 
-| Function | Returns |
-|---|---|
-| `proc_dict_put(key, value)` | the value held before, or `undefined` |
-| `proc_dict_get(key)` | the value, or `undefined` |
-| `proc_dict_del(key)` | the value held before, or `undefined` |
+```text
+warning: the file calls both EMQX's kv_store_* functions and mqttd's kv_* functions: they do not share keys (kv_get does not read what kv_store_put wrote)
+```
 
-In EMQX these work on the dictionary of the process that evaluates the rule, and that
-process is the client's connection. Here it is **one dictionary per client connection**,
-with the same reach:
+#### Declaring a namespace
 
-- It is empty when the client connects and gone when the connection ends. A reconnect, a
-  session that is resumed and a connection that takes the client id over all start with an
-  empty one, as they do in EMQX.
-- Everything that connection evaluates works on it: the client's publishes and the
-  messages their rules republish, its `client/…`, `auth/…` and `session/…` events
-  (`client/disconnected` still sees it), `message/delivered` and `message/acked` for the
-  deliveries to it, and `message/dropped` and `message/delivery_dropped` about its
-  publishes and deliveries while it is connected. So a rule on `client/connected` can put
-  a value that a rule on the client's publishes reads.
-- No other client's rules see it, and neither does a rule on another node.
+`kv_*` keys live in a **namespace**. A rule uses exactly one:
 
-A key and a value may be of any type, and a key is matched exactly, as for `kv_store_*`.
-A key that holds `undefined` and a key that is not there answer alike, as in EMQX.
+- **Its own**, when the rule has no `state` key. It is called `rule:<id>` wherever a
+  namespace is named (metrics, the admin API, the expiry event), and no other rule can
+  reach it, so two rules cannot overwrite each other's keys by accident.
+- **A declared one**, which the rule names with `state = "<name>"`. Rules share state
+  only this way: every rule that names the namespace reads and writes the same keys.
 
-Three evaluations run where there is no connection, and work on an **empty dictionary that
-is discarded afterwards**; in EMQX each still sees the client's:
+```toml
+[state.fleet]              # a lower-case letter, then up to 63 lower-case letters, digits or `_`
+consistency = "eventual"   # every node of the cluster holds it; the default is "local"
+max_keys = 50000
+max_bytes = "32MiB"
+default_ttl = "1h"
+max_ttl = "7d"
+eviction = "fail"
+tombstone_window = "1h"
+dedupe_window = "5m"
 
-- a Will's rules (EMQX evaluates them in the connection's process as it ends);
-- an event about a session that has no connection, such as `message/delivery_dropped` for
-  an offline session (EMQX keeps the process, and its dictionary, for as long as the
-  session waits to be resumed);
-- `message/dropped` for a message that a rule republished, or for a Will.
+[rules.count_reports]
+state = "fleet"
+sql = 'SELECT clientid, kv_incr(clientid) AS reports FROM "reports/#"'
+actions = [{ function = "console" }]
+```
 
-**mqttd's own** (an mqttd extension: EMQX has no function of these names):
+Every key of the table is optional:
 
-| Function | Returns |
-|---|---|
-| `kv_get(key)` | the value, or `undefined`. A counter reads as its count, a set as an array of its elements, a sketch as its estimate |
-| `kv_set(key, value[, ttl])` | the value written |
-| `kv_set_once(key, value[, ttl])` | the value now held: the new one, or the one already there |
-| `kv_incr(key[, by[, ttl[, idempotency_key]]])` | the count after. `by` is an integer, 1 unless given, and may be negative. With an [idempotency key](#counting-a-message-once), a message the namespace has already seen adds nothing |
-| `kv_max(key, value[, ttl])`, `kv_min(key, value[, ttl])` | the larger (smaller) of `value` and the number held, which is stored |
-| `kv_add(key, element[, ttl])` | the number of elements in the set after (at most 1,024, each at most 256 bytes) |
-| `kv_del(key)` | whether a value was there |
-| `kv_ttl(key)` | whole seconds until the key expires, rounded up; `undefined` for no key |
-| `kv_held(key, condition[, ttl])` | how many whole seconds `condition` has been `true` without a break. It records when it first became true; on anything but `true` it deletes the key and returns `undefined` |
-| `kv_changed(key, value[, ttl])` | whether `value` differs exactly from the one stored, storing it: `true` the first time |
-| `kv_hll_add(key, value[, ttl])` | the estimate of how many distinct values the key has been given, this one included |
-| `kv_hll_count(key)` | that estimate, or `0` for no key |
+| Key | Default | Range | |
+|---|---|---|---|
+| `consistency` | `"local"` | `"local"`, `"eventual"` | `local`: each node has keys of its own. `eventual`: every node holds the namespace and the copies converge ([below](#local-and-eventual-one-node-or-every-node)). `"strong"` is refused at load: it is a later phase |
+| `max_keys` | 100,000 | 1 to 1,000,000 | The most keys it holds. In an `eventual` namespace deleted keys count until their `tombstone_window` is over; remembered idempotency keys and keys whose expiry event has not been raised count too |
+| `max_bytes` | `"64MiB"` | 1 byte to `rules.state_max_bytes` | The most bytes it holds, as the store accounts them ([Bounds](#bounds-and-errors)). A number of bytes, or text with `B`, `KiB`, `MiB`, `GiB`. Whichever of the two bounds is reached first refuses |
+| `default_ttl` | `"24h"` | 1 second to `max_ttl` | How long a new key lives when the call that creates it names no TTL. Every `kv_*` key expires: there is no "never" |
+| `max_ttl` | `"30d"` | 1 second to 30 days | The longest TTL a call may name. A `max_ttl` below 24 hours needs a `default_ttl` of its own |
+| `eviction` | `"fail"` | `"fail"`, `"lru"` | What a new key meets in a full namespace: `fail` refuses it (`namespace_full`); `lru` removes the least recently used key to make room (a read is a use). `lru` is for `local` namespaces only |
+| `tombstone_window` | `"1h"` | 1 second to 30 days | `eventual` only: how long a deleted key is remembered, so that a node that was cut off cannot bring it back |
+| `dedupe_window` | `"5m"` | 1 second to 1 hour, and at most `max_ttl` | How long `kv_incr` remembers an [idempotency key](#counting-a-message-once) |
 
-A key is a string of 1 to 256 bytes that does not start with a NUL byte. A value is
-anything but `undefined`, at most 4 KiB as JSON (a string as its bytes). A TTL is a whole number of seconds or a duration such as
-`'10m'` (`s`, `m`, `h`, `d`), at least one second; a write without one gives a new key the
-namespace's `default_ttl` and leaves an existing key's expiry alone. A key has the type of
-the function that created it until it is deleted or expires: `kv_incr` on a key `kv_set`
-wrote fails the rule (`wrong_type`). `kv_get`, `kv_ttl` and `kv_del` take any.
+A duration is a whole number of seconds or text with `s`, `m`, `h` or `d` (`"90s"`,
+`"10m"`). Two names are reserved. **`[state.default]`** sets the bounds of the rules' own
+namespaces (and may make them `eventual`). **`[state.kv_store]`** sets `max_keys`,
+`max_bytes` and `eviction` of EMQX's table, which is always `local` and has no expiry.
+A file declares at most 64 other namespaces. An unknown key, a name that is not a
+namespace's, and a `state` key that names nothing are load errors, each naming the
+table or the rule:
+
+```text
+rules INVALID (rules.toml): rule `a`: state = "nope": the file declares no [state.nope]
+rules INVALID (rules.toml): rules file: [state.x]: eviction = "lru" is for a "local" namespace: a key evicted on one node of an "eventual" one would come back from the others
+rules INVALID (rules.toml): rules file: [state.x]: consistency = "strong" is not available: it is a later phase (ADR 0085 D5); use "local" or "eventual"
+```
+
+**The namespace is never read out of a key.** A key is the whole string the rule builds,
+and keys are built from client ids, topic levels and payload fields; a key that could
+name its namespace would let a publisher choose it.
+
+**Across a reload**, a namespace that is still declared, and the namespace of a rule
+that kept its id, keeps its keys. Changed bounds apply at once: lowering `max_keys`
+evicts nothing, it refuses new keys until the count is below it. A namespace that is no
+longer declared, and the namespace of a rule that is gone or renamed, is **dropped with
+its keys**, without an expiry event. A namespace cannot change its `consistency` while
+rules hold it: the reload is refused; declare a new namespace.
+
+`PUT /admin/v1/rule`, which writes one rule, keeps a rule's `state` key and cannot set
+or change one, and it never touches a `[state.<name>]` table. A rule added that way has
+a namespace of its own. To declare a namespace, or to move a rule to one, write the
+whole file ([ADMIN-API.md](ADMIN-API.md#put-adminv1rule-delete-adminv1rule)).
+
+#### The state functions
+
+mqttd's own. EMQX has no function of these names, so a rule that calls one does not
+load there, and a [module](#your-own-functions-functionsname) cannot take one of the
+names.
+
+| Function | Returns | Fails the rule with |
+|---|---|---|
+| `kv_get(key)` | the value, or `undefined` for no key. A counter reads as its count, a set as an array of its elements in a fixed order, a sketch as its estimate | `bad_key` |
+| `kv_set(key, value[, ttl])` | `value` | `bad_key`, `bad_value`, `value_too_large`, `bad_ttl`, `wrong_type`, the room errors |
+| `kv_set_once(key, value[, ttl])` | the value now held: `value`, or the one already there | as `kv_set` |
+| `kv_incr(key[, by[, ttl[, idempotency_key]]])` | the count after. `by` is an integer of at most 64 bits, 1 unless given, and may be negative. With an [idempotency key](#counting-a-message-once), a message the namespace has already seen adds nothing | `bad_key`, `bad_value` (a `by` that is not an integer), `bad_ttl`, `bad_idempotency_key`, `wrong_type`, `refused` (the count would pass 64 bits; in an `eventual` namespace, a counter that already has 256 rows), the room errors |
+| `kv_max(key, value[, ttl])`, `kv_min(key, value[, ttl])` | the larger (smaller) of `value` and the number held, which is what is stored | `bad_key`, `bad_value` (not a number), `bad_ttl`, `wrong_type`, the room errors |
+| `kv_add(key, element[, ttl])` | the number of elements in the set after. An element the set holds changes nothing | `bad_key`, `bad_value`, `value_too_large` (an element over 256 bytes), `bad_ttl`, `wrong_type`, `refused` (the set holds 1,024 elements), the room errors |
+| `kv_del(key)` | `true` when a value was there on this node, `false` otherwise | `bad_key` |
+| `kv_ttl(key)` | whole seconds until the key expires, rounded up so that a key that is still held never reads `0`; `undefined` for no key | `bad_key` |
+| `kv_held(key, condition[, ttl])` | how many whole seconds `condition` has been `true` without a break: `0` on the message that starts the run. It records when the condition first became true. On anything but the boolean `true` (`false`, `undefined`, a number) it deletes the key and returns `undefined` | `bad_key`, `bad_ttl`, `wrong_type`, the room errors |
+| `kv_changed(key, value[, ttl])` | whether `value` differs from the one stored, storing it: `true` the first time | as `kv_set` |
+| `kv_hll_add(key, value[, ttl])` | the estimate of how many distinct values the key has been given, this one included | as `kv_set` |
+| `kv_hll_count(key)` | that estimate, or `0` for no key | `bad_key`, `wrong_type` |
+
+"The room errors" are `namespace_full`, `store_full` and `brownout`, which only a call
+that would create a key or make one larger can meet. Every error, with what triggers it
+and its exact text, is under [Bounds and errors](#bounds-and-errors). A wrong number of
+arguments fails the **load**, as for every function.
+
+- **A key** is a string of 1 to 256 bytes that does not start with a NUL byte. Build it
+  with a prefix that says what it is for: `'hot:' + clientid`. Anything else (a number,
+  a missing payload field) fails the rule: write `str(payload.id)` for a number.
+- **A value** is anything but `undefined`, at most 4 KiB as the rule engine writes it: a
+  string or a binary as its bytes, anything else as JSON text. To remove a value, call
+  `kv_del`. An integer of any size stays an integer and a float a float.
+- **A TTL** is a whole number of seconds or a duration such as `'10m'` (`s`, `m`, `h`,
+  `d`), at least one second and at most the namespace's `max_ttl`. **A call with a TTL
+  sets the key's expiry to that long from now**, sooner or later than it was. A call
+  without one gives a new key the namespace's `default_ttl` and leaves an existing key's
+  expiry alone. So `kv_incr(k, 1, 60)` on every message is "no message for a minute
+  resets the count", and `kv_incr(k)` after a first `kv_incr(k, 1, 60)` is "a count per
+  minute, from the first message".
+- **Equality is exact**, wherever values are compared (`kv_changed`, a set's elements, a
+  sketch's values): `1` and `1.0` are two values, and so are `'on'` and `'ON'`; a string
+  and a binary of the same bytes are one.
 
 `kv_hll_add` counts distinct values without keeping them: a HyperLogLog sketch of 2^14
 registers, at most 12 KiB however many values it is given, with a standard error of about
-0.8% (a count of 100,000 is typically within 800). Two values are one when they are
-exactly equal, as in a set: `1` and `1.0` are two, text and the same bytes one. "How many
-distinct devices reported from this site this hour" is
-`kv_hll_add('devices:' + payload.site, clientid, '1h')`.
+0.8% (a count of 100,000 is typically within 800; measured, at most 0.6% off over eight
+sizes from 1,000 to 300,000). Small counts are exact in practice.
 
-**A state call takes effect when evaluation reaches it, and nothing undoes it.** That is
-EMQX's behaviour for `kv_store_put`, and evaluation order is EMQX's: every `SELECT` field,
-left to right, then the `WHERE`.
-
-- A call in a `SELECT` field runs for **every message the `FROM` selects**, whether or not
-  the `WHERE` then passes. `SELECT kv_incr('n') AS n … WHERE payload.ok = true` counts every
-  message, not the ones that pass.
-- `AND` and `OR` stop at the operand that decides, and a `CASE` evaluates only the branch
-  it takes. To write only for messages that match, put the condition first:
-  `WHERE payload.temp > 30 AND kv_incr('hot') > 5`, or
-  `CASE WHEN payload.temp > 30 THEN kv_incr('hot') END AS hot`. An `IN` list is evaluated
-  whole, as in EMQX.
-- A `CASE x WHEN v THEN …` evaluates `v` and then `x`, again for each `WHEN` it comes to,
-  as EMQX does: a call in `x` runs once per `WHEN` tried, so
-  `CASE kv_incr('n') WHEN 5 THEN … WHEN 10 THEN …` counts twice on a message that matches
-  neither. Count in a field of its own and compare the field:
-  `SELECT kv_incr('n') AS n, CASE n WHEN 5 THEN … END AS step`.
-- In a `FOREACH`, a call in the `INCASE` runs once per element, one in the `DO` once per
-  element that passed.
-- A write stays when a later field fails the rule, when the `WHERE` is false, and when an
-  action fails. A QoS 1 publish that is sent again is evaluated again and writes again:
-  to count such a message once, give `kv_incr` an
-  [idempotency key](#counting-a-message-once).
-- A later rule the message matches, and the rules a republished message re-enters, see the
-  write. A rule also runs on its own republished output, so one that counts and republishes
-  into its own `FROM` counts twice (once, with an idempotency key that the republished
-  message still carries).
-
-`kv_held` and `kv_changed` are made for this order: they run on every message and carry
-their own reset. "Above 30 for five minutes", and "only when the state flips":
+`kv_held` and `kv_changed` carry their own reset, and are meant to stand where every
+message reaches them. "Above 30 for five minutes", and "only when the state flips":
 
 ```toml
 [rules.hot_sensor]
@@ -2419,111 +2492,227 @@ WHERE kv_changed('state:' + clientid, payload.state)
 actions = [{ function = "republish", args = { topic = "changes/state", payload = "${.}" } }]
 ```
 
-**Namespaces.** `kv_*` keys live in a namespace. Without anything else it is the rule's
-own, so two rules cannot clobber each other's keys by accident. Rules share state by
-naming a namespace the file declares; the namespace is never read out of a key, since
-keys are built from values a publisher chooses.
+#### Types, and how copies merge
 
-```toml
-[state.fleet]              # a lower-case letter, then up to 63 lower-case letters, digits or `_`
-consistency = "local"      # the default: this node only. Or "eventual": every node of the cluster
-max_keys = 50000           # default 100,000; at most 1,000,000
-max_bytes = "32MiB"        # default 64 MiB; at most the broker's rules.state_max_bytes
-default_ttl = "1h"         # default 24 hours
-max_ttl = "7d"             # default and at most 30 days
-eviction = "fail"          # or "lru": the least recently used key makes room
-dedupe_window = "5m"       # how long kv_incr remembers an idempotency key; default 5 minutes, at most 1 hour
+A key has the **type** of the function that created it, until it is deleted or expires.
+A function of another type on it fails the rule (`wrong_type`); `kv_get`, `kv_ttl` and
+`kv_del` take a key of any type. The type is what the admin listing and the expiry event
+show, and in an `eventual` namespace it decides what two nodes' copies of a key become
+when they meet:
 
-[rules.count_reports]
-state = "fleet"
-sql = 'SELECT clientid, kv_incr(clientid) AS reports FROM "reports/#"'
-actions = [{ function = "console" }]
+| Type | Created by | Two nodes' copies become |
+|---|---|---|
+| `lww` | `kv_set`, `kv_changed` | the later write, by a clock the nodes keep between them; of two writes at the same instant, one node's, the same on every node |
+| `first` | `kv_set_once`, `kv_held` | the earlier write |
+| `max`, `min` | `kv_max`, `kv_min` | the larger, the smaller |
+| `sum` | `kv_incr` | the sum of what every node added and took away |
+| `union` | `kv_add` | the union; past 1,024 elements, the first 1,024 in the set's order |
+| `hll` | `kv_hll_add` | the sketch of everything any node saw |
+
+`kv_held` writes a `first` key that holds a time, so `kv_held` on a key `kv_set_once`
+wrote fails as `wrong_type` unless the value is such a time; give the two different
+keys. Where two nodes create one key at the same moment with functions of different
+types, every node ends with the same one (an `lww` write wins; among the others the one
+later in the table) and refuses the other type's calls alike.
+
+#### `local` and `eventual`: one node or every node
+
+**`local`** (the default). The namespace is this node's alone. A call is one operation
+on an in-memory map. A device that reconnects to another node finds none of its keys
+there, and two nodes count the same key separately. On a single broker this is all you
+need.
+
+**`eventual`.** Every node of the cluster holds the whole namespace
+([ADR 0085](adr/0085-rule-state-store.md) D5, D15). A call still reads and writes **this
+node's copy and never waits**: there is no round trip on the publish path. What it wrote
+is sent to the other nodes in the background.
+
+- **What is sent.** Each changed key, whole, to every other node; a key written a
+  thousand times while a link is slow is sent once. A write that leaves the key as it
+  was (a `kv_max` that is not the largest, an element the set already holds, a value the
+  sketch has seen) sends nothing. An idle link sends within 5 ms of the write; a
+  congested one waits, and drops nothing.
+- **The lag.** A read on another node is normally a few milliseconds behind (measured
+  on one machine over loopback: 0.4 to 0.8 ms on an idle link). During a partition both
+  sides go on working on their own copies, and when the link is back the copies are
+  compared and merged, each key by its type (the table above). Copies are also compared
+  every 30 seconds, which repairs anything a link lost.
+- **What two nodes can disagree about, and for how long.** Inside the lag: the value of
+  a key (a `kv_get` on node B does not see node A's `kv_set` yet), the count of a
+  counter (each node sees its own increments at once and the others' a little later, so
+  a threshold can be crossed late, or seen crossed by two nodes), and whether a
+  `kv_changed` value is new (two nodes that each see the same new value both answer
+  `true`). After the lag, nothing, with one exception: a namespace run **at its bounds**
+  (next point).
+- **A merge is refused at the bounds.** A node takes a key that is new to it, or one
+  that would grow, only while its own copy has room under `max_keys`, `max_bytes` and
+  `rules.state_max_bytes`, and not in a memory brownout. What it refuses is counted
+  (`mqttd_rule_state_replication_refused_total`), what it held is kept as it was, and
+  the others offer the key again at every comparison. A namespace run at its bound
+  therefore does not hold the same keys on every node. Size it so that it is not.
+- **A delete** (`kv_del`, `kv_held` on a false condition, an operator's `state-del`)
+  reaches every node, and is remembered for the namespace's `tombstone_window` so that a
+  node that was cut off cannot bring the key back; until then the deleted key still
+  counts toward `max_keys`. Two things follow from how a delete has to merge:
+  - **It deletes what this node holds.** On a key this node holds nothing of, `kv_del`
+    answers `false` and does nothing, so a write of that key made on another node and
+    not yet arrived survives it.
+  - **For every type but `lww`, a delete also covers writes of nodes that had not heard
+    of it.** A counter, set, sketch, maximum, minimum or first value deleted on one node
+    while another node, not having heard, was still adding to it is deleted *with* what
+    was added there: those increments are lost. A write made after the node has heard of
+    the delete starts the key afresh and is never covered. An `lww` value is one stamped
+    write and is exact: a `kv_set` stamped after the delete survives it, whoever had
+    heard what. So do not delete a busy replicated counter to "reset" it; put the window
+    in its key (`'n:' + str(timestamp div 3600000)`) and let the old key expire.
+- **A counter keeps a row for each run of each node** that has incremented it, so that a
+  node that restarts loses no counts (it comes back empty, and would otherwise count
+  again from zero under a number the others already hold for it). A counter has at most
+  **256 rows**. One with a TTL goes with its key long before that. One that is
+  refreshed for ever and outlives that many node restarts refuses the next new run's
+  increment (`refused: the counter holds counts of as many nodes as it may`) until it
+  is deleted.
+- **Expiry and TTLs.** A key expires at the same moment on every node. Between nodes
+  the *later* of two expiries wins for every type but `lww`, whose expiry travels with
+  its write. Refreshing a key, which is what windows and `kv_held` do, only ever moves
+  the expiry later, so this is invisible; a rule that shortens a TTL on one node sees
+  another node's later expiry win.
+- **Time.** Expiries, `kv_held` and the order of `lww` writes go by the nodes' clocks,
+  so **keep them synchronised** (NTP or better). A value stamped more than 60 seconds
+  ahead of the receiving node's clock is refused there (`reason="clock_skew"`) until
+  that node's clock catches up, so one node with a wrong clock cannot drag the others
+  ahead; its writes are simply not seen elsewhere until its clock is fixed.
+- **A restart.** A node comes back empty and is filled by the others when its links
+  come up (measured: 100,000 small keys in 0.14 s, two nodes in one process over
+  loopback; not measured across machines). Until then its rules read nothing.
+- **Values are held as they read back from the replicated form**, which has no `-0.0`
+  (kept as `0.0`) and no bytes that are not UTF-8 inside an array or a map (a binary on
+  its own keeps its bytes).
+- `eviction = "lru"` cannot be combined with it, and EMQX's `kv_store` table is always
+  `local`.
+
+**Rules files are per node, and so is a declaration.** Two nodes share a namespace when
+both declare it `eventual` with the same `tombstone_window`: those two settings are the
+declaration's fingerprint, sent with every frame. A node that declares the namespace
+otherwise, or not at all, takes nothing of it from the others and counts what it was
+sent (`reason="declaration"`, or `undeclared` under the namespace `(undeclared)`). The
+bounds, the TTLs and `dedupe_window` are not in the fingerprint and may differ, with
+the consequence above for a node with smaller bounds. Ship the same rules file to every
+node and compare `summary.same_rules` of `mqttd --admin cluster --json`.
+
+**Upgrading.** `eventual` state travels on the peer links at **peer protocol 14**, which
+the first release with the rule engine introduces. A node on `v1.1.0` or earlier has no rule engine and
+speaks 12 or below: it runs no rules, holds no state and is sent none. The members that speak 14 replicate among
+themselves. **Upgrade every node first, then deploy the rules that use state.** A
+cluster without an `eventual` namespace puts nothing new on the wire.
+
+**What to watch**: [Watching and managing state](#watching-and-managing-state).
+
+#### When a state call runs
+
+**A state call takes effect when evaluation reaches it, and nothing undoes it.** That is
+EMQX's behaviour for its own `kv_store_put`, and evaluation order is EMQX's: every
+`SELECT` field, left to right, then the `WHERE`.
+
+- A call in a `SELECT` field runs for **every message the `FROM` selects**, whether or not
+  the `WHERE` then passes. `SELECT kv_incr('n') AS n … WHERE payload.ok = true` counts every
+  message, not the ones that pass.
+- **To write only for messages that match, put the condition first.** `AND` and `OR`
+  stop at the operand that decides, and a `CASE` evaluates only the branch it takes:
+  `WHERE payload.temp > 30 AND kv_incr('hot') > 5`, or
+  `CASE WHEN payload.temp > 30 THEN kv_incr('hot') END AS hot`. An `IN` list is evaluated
+  whole, as in EMQX.
+- A `CASE x WHEN v THEN …` evaluates `v` and then `x`, again for each `WHEN` it comes to,
+  as EMQX does: a call in `x` runs once per `WHEN` tried, so
+  `CASE kv_incr('n') WHEN 5 THEN … WHEN 10 THEN …` counts twice on a message that matches
+  neither. Count in a field of its own and compare the field:
+  `SELECT kv_incr('n') AS n, CASE n WHEN 5 THEN … END AS step`.
+- In a `FOREACH`, a call in the collection expression runs once per message, before the
+  `WHERE`; one in the `INCASE` once per element; one in the `DO` once per element that
+  passed.
+- **Nothing is rolled back.** A write stays when a later field fails the rule, when the
+  `WHERE` is false, when an action fails, and when the broker then refuses the publish.
+- A later call sees an earlier one: in the same statement, in the next rule the message
+  matches (rules run in id order), and in the rules a republished message re-enters.
+
+One statement shows all three places a call can stand. `all` counts every reading,
+`hot` only the hot ones (the `CASE`), `passed` only those the `WHERE` reached it for:
+
+```sh
+cat > readings.jsonl <<'EOF'
+{"topic": "t/1", "payload": {"temp": 20}}
+{"topic": "t/1", "payload": {"temp": 35}}
+{"topic": "t/1", "payload": {"temp": 36}}
+EOF
 ```
 
-`[state.default]` sets the bounds of the rules' own namespaces and `[state.kv_store]` those
-of EMQX's table (which has no expiry: a TTL there is refused); a file declares at most 64
-others. Across a reload a namespace that is still declared, and
-the namespace of a rule that kept its id, keeps its keys, and changed bounds apply at once
-(lowering `max_keys` evicts nothing; it refuses new keys until the count is below it); a
-namespace that is no longer declared, and the namespace of a rule that is gone or renamed,
-is dropped with its keys. A namespace cannot change its `consistency` while rules hold
-it: the reload is refused; declare a new namespace.
+```console
+$ mqttd --rule-test --sql 'SELECT kv_incr('"'"'all'"'"') AS seen, CASE WHEN payload.temp > 30 THEN kv_incr('"'"'hot'"'"') END AS hot FROM "t/#" WHERE payload.temp > 30 AND kv_incr('"'"'passed'"'"') > 0' --sequence readings.jsonl
+#1 +0s t/1 {"temp": 20}
+  (no output)
+  state rule:test: + "all" = 1 (sum, expires +86400s)
+#2 +0s t/1 {"temp": 35}
+  {"seen":2,"hot":1}
+  state rule:test: ~ "all" = 2 (sum, expires +86400s)
+  state rule:test: + "hot" = 1 (sum, expires +86400s)
+  state rule:test: + "passed" = 1 (sum, expires +86400s)
+#3 +0s t/1 {"temp": 36}
+  {"seen":3,"hot":2}
+  state rule:test: ~ "all" = 3 (sum, expires +86400s)
+  state rule:test: ~ "hot" = 2 (sum, expires +86400s)
+  state rule:test: ~ "passed" = 2 (sum, expires +86400s)
+```
 
-**Across a cluster.** A `local` namespace is this node's alone: a device that reconnects
-to another node finds none of its keys there. `consistency = "eventual"` makes every node
-of the cluster hold the namespace ([ADR 0085](adr/0085-rule-state-store.md) D5, D15). A
-call still reads and writes this node's copy and never waits. What it wrote is sent to
-the other nodes in the background, each changed key once however often it was written
-meanwhile, so a read on another node can be a few milliseconds behind, and both sides of
-a partition go on working. Copies that meet again merge, each key by its type:
+**Three things that surprise.**
 
-| Written by | Two nodes' copies become |
-|---|---|
-| `kv_set`, `kv_changed` | the later write, by a clock the nodes keep between them |
-| `kv_set_once`, `kv_held` | the earlier write |
-| `kv_max`, `kv_min` | the larger, the smaller |
-| `kv_incr` | the sum of what every node counted |
-| `kv_add` | the union (the first 1,024 elements in order, past that) |
-| `kv_hll_add` | the sketch of everything any node saw |
-| `kv_del`, `kv_held` on a false condition | deleted on every node |
+- **A QoS 1 publish that is sent again is evaluated again, and writes again.** A
+  publisher that did not see its PUBACK repeats the PUBLISH, and the broker cannot tell
+  it from a new message (an inbound QoS 2 publish is deduplicated before the rules, and a
+  publish the ACL refuses is never evaluated). Counts are therefore **at least once**
+  unless `kv_incr` is given an [idempotency key](#counting-a-message-once).
+- **A rule runs again on its own republished output**
+  ([Republished messages](#republished-messages): the guard stops only its `republish`
+  actions, not its SQL). A rule that counts and republishes into its own `FROM` counts
+  twice: once, with an idempotency key that the republished message still carries. Give
+  the output a topic the rule's `FROM` does not match.
+- **`clientid` of a republished message is the id of the rule that republished it**, not
+  the device's. A rule that keys its state by `clientid` and runs on another rule's
+  output keeps one key for every device (below). Key by something the first rule
+  carried over instead: a topic level (`topic(2)`), or a payload field it selected.
 
-- **A delete** is remembered for the namespace's `tombstone_window` (default `"1h"`, at
-  most 30 days), so that a node that was cut off cannot bring the key back; until then
-  the deleted key still counts as one of the namespace's keys. It deletes what this node
-  holds: on a key this node holds nothing of, `kv_del` answers `false` and does nothing.
-  A counter, set, sketch, maximum or first value deleted on one node while another, not
-  having heard, was still adding to it is deleted with what was added; a `kv_set` made
-  after the delete, by the clock, survives it.
-- **Time.** A key expires at the same moment on every node, and `kv_held` measures from
-  the node that saw the condition first, so the nodes' clocks must agree: keep them
-  synchronised. A value stamped more than 60 seconds ahead of the receiving node's clock
-  is refused there until that node's clock catches up.
-- **It is in memory.** A node that restarts comes back empty and is filled by the others
-  when its links come up (100,000 small keys: 0.14 s on one machine); if
-  every node stops at once the state is gone. Counts are at least once, as on one node,
-  and are not a ledger. With an [idempotency key](#counting-a-message-once) a message is
-  counted once on each node that sees it before it has heard of another node's count:
-  once, when the nodes are in touch. A counter keeps one count for each run of each node that counted
-  on it, at most 256: one that outlives that many node restarts refuses the next node's
-  increment until it is deleted.
-- **Rules files are per node.** Two nodes share a namespace when both declare it
-  `eventual` with the same `tombstone_window`. A node that declares it otherwise, or not
-  at all, takes nothing of it from the others and counts what it was sent. The bounds
-  may differ: a node at its `max_keys`, its `max_bytes` or `rules.state_max_bytes` takes
-  no key that is new to it and so holds fewer than the others, and the others offer the
-  key again every 30 seconds. `eviction = "lru"` is for `local` namespaces only, and
-  EMQX's `kv_store` table is always `local`.
-- **What to watch.** `mqttd_rule_state_replication_pending{namespace}` is how many
-  changed keys the slowest peer link has yet to send (at most the keys there are),
-  `mqttd_rule_state_replication_lag_seconds{namespace}` how long that link has been
-  behind, and `mqttd_rule_state_replication_refused_total{namespace,reason}` what peers
-  sent that this node did not take: `declaration`, `clock_skew`, `namespace_full`,
-  `store_full`, `brownout`, `malformed`, and `undeclared` (under the namespace
-  `(undeclared)`) for a namespace this node does not declare `eventual`.
-- **Upgrading.** `eventual` state travels on the peer links at peer protocol 14, which
-  this release introduces. A node still on an earlier release speaks 13: it holds no such
-  state and is sent none, and a rules file that declares an `eventual` namespace does not
-  load there. Upgrade every node first, then deploy the rules that use it.
-  `consistency = "strong"` is refused at load: it is a later phase.
+```sh
+cat > chain.toml <<'EOF'
+[rules.a_copy]
+sql = 'SELECT clientid, payload FROM "in/#"'
+actions = [{ function = "republish", args = { topic = "mid/x", payload = "${payload}" } }]
 
-**Bounds.** Keys carry client ids, topic levels and payload fields, so everything a
-message can make the broker hold is bounded. A key that does not exist yet is refused,
-failing the rule, when its namespace is full (`namespace_full`; with `eviction = "lru"`
-the least recently used key goes instead), when all namespaces together hold
-`rules.state_max_bytes` (`store_full`; 256 MiB unless configured, and `0` switches rule
-state off: a rules file that uses it then does not load), or while the broker is over its
-memory watermark (`brownout`). Existing keys still update. One message may make at most
-1,024 state calls across every rule it matches and every message they republish, and what
-it reads from state counts against its 1 MiB function budget. A refused call fails the
-rule, counted and logged like any SQL error; it is never "no result". EMQX's table has no
-bounds of its own; here a `kv_store_put` key is at most 256 bytes as JSON and a value
-4 KiB. Nor has EMQX's process dictionary; here a connection's dictionary holds at most
-64 keys, and 64 KiB of keys and values together (each as JSON, a string as its bytes). A
-`proc_dict_put` past either fails the rule (`dictionary_full`) and leaves what was held;
-`proc_dict_del` frees a key. What the dictionaries hold counts against
-`rules.state_max_bytes` like any key (`store_full`), a dictionary does not grow while the
-broker is over its memory watermark (`brownout`), and every `proc_dict_*` call is one of
-the message's 1,024.
+[rules.b_count]
+sql = 'SELECT clientid, kv_incr(clientid) AS n FROM "mid/#"'
+actions = [{ function = "console" }]
+EOF
+cat > chain.jsonl <<'EOF'
+{"topic": "in/1", "clientid": "dev-1"}
+{"topic": "in/1", "clientid": "dev-2"}
+EOF
+```
+
+```console
+$ MQTTD_RULES_FILE=chain.toml mqttd --rule-test --sequence chain.jsonl
+#1 +0s in/1 {}
+  a_copy: passed
+    republish mid/x qos 0 {}
+  > mid/x (republished by a_copy)
+    b_count: passed
+      console {"clientid":"a_copy","n":1}
+  state rule:b_count: + "a_copy" = 1 (sum, expires +86400s)
+#2 +0s in/1 {}
+  a_copy: passed
+    republish mid/x qos 0 {}
+  > mid/x (republished by a_copy)
+    b_count: passed
+      console {"clientid":"a_copy","n":2}
+  state rule:b_count: ~ "a_copy" = 2 (sum, expires +86400s)
+```
 
 #### Counting a message once
 
@@ -2699,6 +2888,9 @@ It is about no client: `clientid` and `username` read `undefined`.
     The events a member had taken over from one that left, if it leaves too before it
     has raised them. And nothing is raised by a member whose rules do not select the
     event, even when it is the only one left.
+
+  So ship the rule on the event to every node, and let whatever consumes the alert
+  take the same alert twice: the event is **at least once**.
 - **Not for a remembered idempotency key.** The keys `kv_incr` remembers
   ([Counting a message once](#counting-a-message-once)) expire without an event, on every member; behind
   a backlog of events they are removed in their turn, and count as keys until then.
@@ -2714,9 +2906,10 @@ It is about no client: `clientid` and `username` read `undefined`.
   have been raised for some. A key written again after it expired is a new key; the old
   one still raises its event, with the value it held.
 - **Not across a restart, a reload that drops the namespace, or an eviction.** State is
-  in memory: a broker that stops before it has raised an event never raises it, and a
-  device that was already silent when the broker started is not noticed until it has
-  spoken once. A namespace a reload drops goes with its keys, silently. A key an `lru`
+  in memory: a broker that stops before it has raised an event never raises it (in an
+  `eventual` namespace the other members raise what one stopped member had not; if all
+  stop, nothing does), and a device that was already silent when the broker started is
+  not noticed until it has spoken once. A namespace a reload drops goes with its keys, silently. A key an `lru`
   namespace evicts before it expired raises nothing; one that had expired is kept for its
   event and another key is evicted. `kv_del` is not an expiry, and EMQX's `kv_store` table
   has none.
@@ -2729,12 +2922,214 @@ It is about no client: `clientid` and `username` read `undefined`.
   [`--sequence`](#replay-a-sequence-mqttd---rule-test---sequence) raises the real one when
   its clock passes a key's expiry.
 
-**Testing.** `mqttd --rule-test`, `mqttd --check-rules` and the admin API's rule test work
-on an empty store of their own that is dropped afterwards: they never read or write the
-state the running rules keep (EMQX's SQL test writes the node's real table). `proc_dict_*`
-work on an empty dictionary of the test's own, never a connection's (as in EMQX, where
-each SQL test over the API runs in a process of its own). Within one test a later call
-sees an earlier one:
+#### EMQX's own: `kv_store_*` and `proc_dict_*`
+
+EMQX's rule engine has two kinds of memory of its own. Both are provided under EMQX's
+names with EMQX's results (probed on EMQX 6.3.1), so a rule that uses them moves over
+unchanged. For a rule you write for mqttd, prefer `kv_*`: it expires, it has types, and
+it can be replicated.
+
+**EMQX's table: `kv_store_*`.**
+
+| Function | Returns |
+|---|---|
+| `kv_store_put(key, value)` | `true` |
+| `kv_store_get(key)`, `kv_store_get(key, default)` | the value; `undefined`, or `default`, when there is no such key |
+| `kv_store_del(key)` | `true`, whether or not the key was there |
+
+- **Scope: one table per node, shared by every rule on it**, whatever a rule's `state`
+  key says. It is the reserved namespace `kv_store`: always `local`, never replicated,
+  and **its keys never expire** and raise no expiry event. A key is there until a rule or
+  an operator deletes it, or the node restarts.
+- A key and a value may be of any type, and a key is matched exactly: `1`, `1.0` and
+  `'1'` are three keys, `0.0` and `-0.0` two, a map is the same key whatever order it was
+  written in. `undefined` is a value like any other: `kv_store_get(key, default)` returns
+  it, not the default. The default is evaluated whether or not it is used.
+- They take effect when evaluation reaches them, a `SELECT` field before the `WHERE`,
+  exactly as `kv_*` ([When a state call runs](#when-a-state-call-runs)).
+
+**EMQX's process dictionary: `proc_dict_*`.**
+
+| Function | Returns |
+|---|---|
+| `proc_dict_put(key, value)` | the value held before, or `undefined` |
+| `proc_dict_get(key)` | the value, or `undefined` |
+| `proc_dict_del(key)` | the value held before, or `undefined` |
+
+In EMQX these work on the dictionary of the process that evaluates the rule, and that
+process is the client's connection. Here it is **one dictionary per client connection**,
+with the same reach:
+
+- It is empty when the client connects and gone when the connection ends. A reconnect, a
+  session that is resumed and a connection that takes the client id over all start with an
+  empty one, as they do in EMQX.
+- Everything that connection evaluates works on it: the client's publishes and the
+  messages their rules republish, its `client/…`, `auth/…` and `session/…` events
+  (`client/disconnected` still sees it), `message/delivered` and `message/acked` for the
+  deliveries to it, and `message/dropped` and `message/delivery_dropped` about its
+  publishes and deliveries while it is connected. So a rule on `client/connected` can put
+  a value that a rule on the client's publishes reads.
+- No other client's rules see it, and neither does a rule on another node. It is in no
+  namespace and is never replicated.
+
+A key and a value may be of any type, and a key is matched exactly, as for `kv_store_*`.
+A key that holds `undefined` and a key that is not there answer alike, as in EMQX.
+
+**What differs from EMQX**, all of it also in
+[Differences from EMQX](#differences-from-emqx):
+
+- **They are bounded.** EMQX's table and dictionaries grow until the node runs out of
+  memory. Here a `kv_store_put` key is at most 256 bytes and a value 4 KiB, each as the
+  rule engine writes it, and the table holds 100,000 keys and 64 MiB unless
+  `[state.kv_store]` says otherwise. A connection's dictionary holds at most 64 keys,
+  and 64 KiB of keys and values together; `proc_dict_del` frees a key. Past a bound the
+  call fails the rule, where EMQX would have stored the value. Both count against
+  `rules.state_max_bytes`.
+- **Three evaluations run where there is no connection**, and work on an empty
+  dictionary that is discarded afterwards; in EMQX each still sees the client's:
+  - a Will's rules (EMQX evaluates them in the connection's process as it ends);
+  - an event about a session that has no connection, such as `message/delivery_dropped`
+    for an offline session (EMQX keeps the process, and its dictionary, for as long as
+    the session waits to be resumed);
+  - `message/dropped` for a message that a rule republished, or for a Will.
+
+  The rules of [`$events/state/expired`](#when-a-key-expires-eventsstateexpired), which
+  EMQX does not have, run on an empty dictionary too.
+- **A dry run does not touch them.** `--rule-test`, `--check-rules` and the admin API's
+  rule test work on an empty table and an empty dictionary of their own. EMQX's SQL test
+  writes the node's real table. (For the dictionary EMQX's test over its API is the
+  same as here: each request is a process of its own.)
+- **A wrong number of arguments** fails the load, as for every function; in EMQX it
+  fails the rule on each message.
+- **`rules.state_max_bytes = 0` switches them off** with the rest of rule state: a rules
+  file that calls them then does not load.
+
+#### Bounds and errors
+
+Keys carry client ids, topic levels and payload fields, so everything a message can make
+the broker hold is bounded.
+
+| Bound | Value | Set by |
+|---|---|---|
+| The whole store, on one node: every namespace and every connection's dictionary | 256 MiB | `rules.state_max_bytes` (`MQTTD_RULES_STATE_MAX_BYTES`) in the broker's configuration, read at startup. A rules file cannot raise it. `0` switches rule state off |
+| A namespace | 100,000 keys, 64 MiB | `max_keys` (at most 1,000,000), `max_bytes` (at most the store's ceiling). The namespaces' bounds may add up to more than the ceiling; whichever is reached first refuses |
+| Namespaces in a file | 64 declared, and one of its own per rule that uses state without naming one | fixed |
+| A key | 256 bytes | fixed |
+| A value | 4 KiB as written | fixed |
+| A set | 1,024 elements of at most 256 bytes each | fixed |
+| A sketch | 12 KiB | fixed |
+| A counter | 64 bits a node; 256 rows in an `eventual` namespace | fixed |
+| An idempotency key | 255 bytes | fixed |
+| A connection's `proc_dict_*` dictionary | 64 keys, and 64 KiB of keys and values | fixed |
+| State calls by one message | 1,024, across every rule it matches and every message they republish. A `kv_incr` with an idempotency key is two | fixed |
+| What one message reads from state | part of its 1 MiB function budget ([The rules file](#the-rules-file)), so a `FOREACH` cannot multiply a stored value into a large message | fixed |
+| Expiry events raised by a node | 1,000 a second | `rules.state_expiry_per_sec` (`MQTTD_RULES_STATE_EXPIRY_PER_SEC`), read at startup |
+
+**What a key is accounted as**, toward `max_bytes` and the ceiling: its own bytes, what
+it holds, and 128 bytes for the entry. What it holds is a value's bytes as written; 8
+bytes for a counter, a maximum's number as written, or a `kv_held` time; each element of
+a set and 32 bytes more; a sketch's registers (four bytes each while few are set, 12 KiB
+at the most) and 128 bytes. In an `eventual` namespace a key is 96 bytes more, a deleted
+key that is still remembered is a key without a value, and a counter 32 bytes and the
+node's name for each row beyond the first. So a counter under a 20-byte key is 156 bytes
+`local` and 252 `eventual`, and a namespace of 100,000 of them 15.6 MB or 25.2 MB
+([SIZING.md](SIZING.md#rule-state) has the arithmetic for sizing a namespace).
+
+**A refused call fails the rule**, for that message: it is counted
+(`mqttd_rule_evaluations_total{result="failed"}`), logged and traced like any SQL error,
+and the message itself is still routed. It is never "no result": a `WHERE` does not pass
+or fail silently because the store refused. The error starts with the function and a
+reason:
+
+```text
+kv_incr(): namespace_full: namespace `x` holds 2 keys and 274 bytes (max_keys 2, max_bytes 67108864); a new key does not fit
+```
+
+| Reason | What triggers it | What to do |
+|---|---|---|
+| `bad_key` | A key that is not a string (`a key is a string, got a undefined`: a missing field, or a `"double-quoted"` name), is empty or longer than 256 bytes (`a key is 1 to 256 bytes, got 300`), or starts with a NUL byte. For `kv_store_*`: a key over 256 bytes as written | Guard the field (`is_str(payload.id)`), or shorten the key: `sha256(…)` of a long value is 64 bytes |
+| `bad_value` | Storing `undefined` (`a value cannot be undefined (kv_del deletes a key)`); a `by` of `kv_incr` that is not an integer; a `kv_max`/`kv_min` value that is not a number | Guard the field, or `coalesce` it |
+| `value_too_large` | A value over 4 KiB, or a set element over 256 bytes, as written (`a value is 5000 bytes as written; at most 4096`) | Store less: the fields you need, not the payload |
+| `bad_ttl` | A TTL that is not a positive whole number of seconds or a duration such as `'10m'`, or is longer than the namespace's `max_ttl` (`a TTL is at most the namespace's max_ttl, 2592000 seconds`) | Raise `max_ttl`, or name a shorter TTL |
+| `bad_idempotency_key` | `kv_incr`'s fourth argument is not a string of 1 to 255 bytes: usually a message without the id field | Intended: such a message is neither counted twice nor dropped silently. Guard it in the `WHERE` if it should be skipped instead |
+| `wrong_type` | A function of one type on a key another type's function created (``the key holds a value of type `lww`, and this is an operation on type `sum` ``) | Two rules, or two functions, are using one key: give them different prefixes |
+| `namespace_full` | A call that would create a key, in a namespace at its `max_keys` or `max_bytes`. With `eviction = "lru"` the least recently used key goes instead. Existing keys still update | Raise the bound, shorten TTLs, or see what fills it: `mqttd --admin state-keys <ns>` |
+| `store_full` | The same, when all namespaces and dictionaries together hold `rules.state_max_bytes` | Raise the ceiling (a restart), or lower the namespaces' own bounds so that one cannot starve the others |
+| `brownout` | A call that would create a key while the broker is over its **memory** watermark. Existing keys still update, expire and delete; nothing is evicted | The broker is short of memory: [OPERATIONS.md](OPERATIONS.md#rule-state) |
+| `refused` | A counter that would pass 64 bits; a set that holds 1,024 elements; in an `eventual` namespace, a counter that has 256 rows | Delete the key, or key it by a window so that it expires |
+| `dictionary_full` | A `proc_dict_put` past 64 keys or 64 KiB on this connection. What was held is kept | `proc_dict_del` what is no longer needed |
+| (no reason word) `this message already made 1024 state calls …; the rest fail` | The message's 1,025th state call, counting the rules its republished messages run | Fewer calls per element of a `FOREACH`, or fewer rules on the topic |
+| (no reason word) `the values this message's rules read from state would pass 1048576 bytes …` | Reads that add up to more than the message's 1 MiB function budget | Read less per message |
+
+`namespace_full`, `store_full`, `brownout`, `wrong_type` and `refused` are refusals by
+the store, and are also counted in `mqttd_rule_state_ops_total{result}`. The others are
+refused by the rule engine before the store is asked, and are counted only as the
+rule's failed evaluation.
+
+**At load**, not per message: a file that uses state where it is switched off
+(``rule state is switched off: `rules.state_max_bytes` is 0 (set it above 0 for rules to keep state; see RULES.md)``),
+an unknown key in a `[state.<name>]` table, a bound out of its range, a `state` key that
+names no declared namespace, and a wrong number of arguments.
+
+#### State is not a system of record
+
+The store makes live decisions. It is not a ledger, and three things say why:
+
+- **It is in memory.** A node that stops loses what only it held; a cluster that stops
+  loses everything.
+- **`eventual` counters can be read before every node's increments have arrived**, so a
+  threshold can fire late, or on two nodes. A node lost before it has sent its last
+  increments (normally those of the last few milliseconds) takes them with it.
+- **Counts are at least once** without an idempotency key, and with one a message that
+  reaches two nodes inside the replication lag is counted by both
+  ([Counting a message once](#counting-a-message-once)).
+
+**Billing is the worked example.** Do not bill from a counter. Publish each billable
+event as a durable QoS 1 message that the billing system consumes with a persistent
+session and deduplicates by the publisher's id, and use the store only to decide what to
+do *now* (throttle, alert, cut off):
+
+```toml
+[state.quota]
+default_ttl = "2h"
+dedupe_window = "10m"
+
+# The record. No state: every request goes to the billing system, with its id.
+[rules.billing_event]
+sql = '''
+SELECT topic(2) AS tenant, payload.request_id AS request_id, payload.units AS units, timestamp AS at
+FROM "api/+/requests"
+WHERE is_str(payload.request_id)
+'''
+actions = [{ function = "republish", args = { topic = "billing/${tenant}", qos = 1, payload = "${.}" } }]
+
+# The decision. A count per tenant and hour, each request counted once.
+[rules.quota]
+state = "quota"
+sql = '''
+SELECT topic(2) AS tenant,
+       kv_incr(topic(2) + ':' + str(timestamp div 3600000), 1, '2h',
+               topic(2) + ':' + payload.request_id) AS used
+FROM "api/+/requests"
+WHERE used > 3
+'''
+actions = [{ function = "republish", args = { topic = "quota/exceeded/${tenant}", qos = 1, payload = "${.}" } }]
+```
+
+If the quota over-admits a few requests during a partition, or forgets its count at a
+restart, the bill is still right, because the bill never read the counter. The cookbook
+runs this pair on a sequence with a request that is sent twice
+([recipe 20](RULES-COOKBOOK.md#20-a-quota-and-the-billing-record-beside-it)). A count
+that is exact across a cluster needs `consistency = "strong"`, which is a later phase
+and is refused at load today.
+
+#### Testing a rule that keeps state
+
+`mqttd --rule-test`, `mqttd --check-rules` and the admin API's rule test work on an empty
+store of their own that is dropped afterwards: **they never read or write the state the
+running rules keep** (EMQX's SQL test writes the node's real table). `proc_dict_*` work
+on an empty dictionary of the test's own, never a connection's. Within one test a later
+call sees an earlier one:
 
 ```console
 $ mqttd --rule-test --sql 'SELECT kv_incr(clientid) AS first, kv_incr(clientid) AS second, kv_changed(topic, qos) AS changed FROM "t/#"'
@@ -2743,55 +3138,117 @@ $ mqttd --rule-test --sql 'SELECT kv_incr(clientid) AS first, kv_incr(clientid) 
 
 One message does not show what a rule does with what it remembers.
 [`mqttd --rule-test --sequence`](#replay-a-sequence-mqttd---rule-test---sequence) replays
-a list of messages, each at a time of its own, on one such store and prints what every
-step changed in it.
+a list of messages, each at a time of its own, on one such store and on a clock the
+sequence drives, and prints what every step changed in the store: `+` a new key, `~` a
+changed value or expiry, `-` a key that is gone. Expiry events fire when the sequence's
+clock passes a key's expiry. Write the sequence first, with the output you expect, as
+you would write a test: every transcript in this section and every stateful recipe of
+the [cookbook](RULES-COOKBOOK.md#rules-that-remember) is one, and CI runs them. A replay
+is one node: it shows what an `eventual` namespace does on one member, not the lag
+between two.
 
-**Cost.** A state call is one operation on an in-memory map under a lock held for that
-operation only; it never waits, and a rules file that calls none pays nothing. A
-`proc_dict_*` call takes no lock at all: the dictionary belongs to the connection that
-is evaluating. Measured
-(`cargo bench -p mqttd --bench rule_state`, Apple M1 Pro, 2026-10): one call adds 0.35 to
-0.5 µs to the evaluation of a publish (1.38 µs without, 1.74 µs with a `kv_incr`, 1.88 µs
-with a `kv_held`); the store's part of that is 0.11 to 0.14 µs. With every worker thread
-calling at once, each on keys of its own (a key per device), a call takes 0.14 µs on two
-threads, 0.20 µs on four and 0.33 µs on eight; with all of them incrementing **one** key,
-0.19 µs, 0.63 µs and 1.9 µs. A new key in a full `lru` namespace costs an eviction: 0.9 µs
-alone, about 10 µs when eight threads do nothing else. `kv_hll_add` is the dearest call,
-about twice a `kv_incr` in the store: it works out its estimate each time. Expiry is not
-on a call's path: one task looks through each namespace about once a second (0.5 µs for a
-namespace of 100,000 keys with nothing due) and removes an expired key in 0.14 µs, with or
-without a rule on [its event](#when-a-key-expires-eventsstateexpired).
-In an `eventual` namespace a call costs the same on the publish path (1.84 µs beside
-1.80 µs for the publish with a `kv_incr`). In the store a write is 0.16 µs, and 0.27 to
-0.30 µs while the other nodes keep up, since the key is put back in the order the peer
-links read; with eight threads writing keys of their own, 0.9 µs a call, and 1.65 µs when
-every write is a `kv_set` (each takes a stamp of the node's one clock). On the wire a
-counter is about 65 bytes and a 44-byte value about 105, once per peer for whatever was
-written in the 5 ms before.
-A `kv_incr` with an [idempotency key](#counting-a-message-once) is two such operations:
-0.22 µs in the store for a message the namespace has seen (0.13 µs without a key) and
-0.45 µs for a new one, which makes a key; a publish evaluated with one, 2.4 µs beside
-1.8 µs. A `kv_incr` without a key costs what it did.
+#### What state costs
+
+A state call is one operation on an in-memory map under a lock held for that operation
+only. It never waits, in a `local` namespace or an `eventual` one, and a rules file that
+calls none pays nothing. A `proc_dict_*` call takes no lock at all: the dictionary
+belongs to the connection that is evaluating.
+
+All figures below are from `cargo bench -p mqttd --bench rule_state` on one Apple M1 Pro
+(eight cores), 2026-10, taken while the features were built. **The machine was shared
+with other work for most of them**, and rounds of one binary differed by tens of percent
+(up to a factor of five for the idempotency figures), so read them as the order of
+magnitude and the ratios, not as a guarantee. They are microbenchmarks of the store and
+of one rule's evaluation, not a cluster benchmark, and nothing here was measured across
+machines.
+
+| | Time |
+|---|---|
+| A publish evaluated against one rule, no state call | 1.4 µs |
+| The same with one `kv_incr` | 1.8 µs |
+| with one `kv_held` | 1.9 µs |
+| with one `kv_hll_add` | 2.1 µs |
+| with one `kv_incr` and an idempotency key (a message already seen) | 2.4 µs |
+| The store's part of a call, one thread | 0.11 to 0.15 µs |
+| Every worker calling at once, each on keys of its own: 2, 4, 8 threads | 0.14, 0.20, 0.33 µs a call |
+| Every worker incrementing **one** key: 2, 4, 8 threads | 0.19, 0.63, 1.9 µs a call |
+| A new key in a full `lru` namespace (an eviction) | 0.9 µs alone; about 10 µs when eight threads do nothing else |
+| `kv_incr` with an idempotency key, in the store: seen before, new | 0.22 µs, 0.45 µs |
+
+- **One call adds about 0.4 to 0.5 µs to a publish**, of which the store is a third; the
+  rest is evaluating the call's arguments. A key per device spreads over the store's 64
+  shards a namespace; one key that every connection increments is the contended case.
+- **On Linux** (the same benchmark in an arm64 container, eight cores): a call is
+  0.19 µs alone; on keys of their own 0.23, 0.32 and 0.49 µs with two, four and eight
+  threads; all on one key 0.3 to 0.4, 0.95 and 3.0 µs.
+- **An `eventual` namespace costs the same on the publish path**: a publish with a
+  `kv_incr` 1.84 µs beside 1.80 µs `local`. In the store a write is 0.16 µs, and 0.27 to
+  0.30 µs while a peer link keeps up (the key is put back in the order the links read).
+  With eight threads writing keys of their own, 0.9 µs a call beside 0.34 µs `local`,
+  and 1.65 µs when every write is a `kv_set`, each of which takes a stamp of the node's
+  one clock. Not compared against the previous build run in turn.
+- **On the wire**, per key and per peer, for whatever changed in the 5 ms before: a
+  counter about 65 bytes, a 44-byte value about 105, a `kv_held` time 74, a deleted key
+  38, a set of ten client ids 175, a sketch of 1,000 values about 3 KiB. Every node
+  holds the whole namespace, and a changed key is sent to every other node.
+- **Expiry is not on a call's path.** One task looks through the namespaces about once a
+  second (0.5 µs for a `local` namespace of 100,000 keys with nothing due) and removes
+  an expired key in about 0.14 µs, with or without a rule on its event. The rules of the
+  event are evaluated on that task, at no more than `rules.state_expiry_per_sec`.
+  **The sweep over an `eventual` namespace and the hand-over of events between members
+  have not been measured**: the machine was too busy for the numbers to be trusted. From
+  the code, a write to an `eventual` namespace gained one comparison and an entry 16
+  bytes.
+- `kv_hll_add` is the dearest call, about twice a `kv_incr` in the store: it works out
+  its estimate each time.
 
 ### Watching and managing state
 
-How full each namespace is, why a call was refused and what a key holds
-([ADR 0085](adr/0085-rule-state-store.md) D10):
+How full each namespace is, why a call was refused, how replication stands and what a
+key holds ([ADR 0085](adr/0085-rule-state-store.md) D10).
 
-- **Metrics**: the `mqttd_rule_state_*` series in the [metrics table](#watch-a-running-rule),
-  by namespace. A scrape reads the store as it is at that moment.
+**Metrics**, on `GET /metrics`, by namespace. `namespace` is a name the rules file
+declares, `kv_store`, or `rule:<id>`; no label is ever a key. A scrape reads the store
+as it is at that moment.
+
+| Series | What it tells you |
+|---|---|
+| `mqttd_rule_state_keys{namespace}`, `mqttd_rule_state_bytes{namespace}` | What the namespace holds against its `max_keys` and `max_bytes`. Alert before it is full: a full namespace fails the rules that would create a key |
+| `mqttd_rule_state_ops_total{namespace,op,result}` | State calls that reached the store, by operation and result: `ok`, or the refusal (`namespace_full`, `store_full`, `brownout`, `wrong_type`, `refused`; [Bounds and errors](#bounds-and-errors)). Anything but `ok` is a rule failing |
+| `mqttd_rule_state_expired_total{namespace}` | Keys whose expiry this node is done with |
+| `mqttd_rule_state_expiry_backlog{namespace}` | Keys past their expiry that are still held: waiting for their event at this node's pace, or, in an `eventual` namespace, for the member that raises it. They read as absent and count toward the bounds. It should return to zero; one that grows means events arrive faster than `rules.state_expiry_per_sec` |
+| `mqttd_rule_state_replication_pending{namespace}` | `eventual`: the changed keys the peer link furthest behind has yet to send. At most the keys there are |
+| `mqttd_rule_state_replication_lag_seconds{namespace}` | `eventual`: how long that link has had something to send. Near zero normally; it grows while a peer is slow or away |
+| `mqttd_rule_state_replication_refused_total{namespace,reason}` | `eventual`: what peers sent that this node did not take. `namespace_full`, `store_full`, `brownout`: this node's copy has no room, and holds fewer keys than the others. `declaration`: the peer declares the namespace with another mode or `tombstone_window`. `undeclared` (under the namespace `(undeclared)`): this node's rules file does not declare it `eventual` at all. `clock_skew`: the sender's clock is more than 60 seconds ahead. `malformed`: a frame or a state this node cannot read. Any of them rising means the nodes' copies differ |
+| `mqttd_rule_state_dictionary_bytes`, `mqttd_rule_state_dictionary_refused_total` | What the connections' `proc_dict_*` dictionaries hold together, and puts refused room |
+
+```promql
+# A namespace above 80% of its keys (max_keys is in `mqttd --admin state` and on $SYS).
+mqttd_rule_state_keys{namespace="fleet"} > 0.8 * 50000
+# Rules failing because the store refused.
+sum by (namespace, result) (rate(mqttd_rule_state_ops_total{result!="ok"}[5m])) > 0
+# Copies that cannot converge.
+sum by (namespace, reason) (rate(mqttd_rule_state_replication_refused_total[5m])) > 0
+```
+
 - **`$SYS`**: with `[rules] sys_interval_secs`, one message per namespace on
   `$SYS/brokers/<node>/rule_state/<namespace>` each interval: its mode, bounds, keys,
-  bytes, counts and rates. It is a subtree of its own: a grant on
-  `$SYS/brokers/+/rules/#` does not cover it.
+  bytes, counts, rates and, for an `eventual` namespace, how its replication stands. It
+  is a subtree of its own: a grant on `$SYS/brokers/+/rules/#` does not cover it.
 - **The trace** shows a refused call as its rule's error, with the reason first:
   ``kv_set(): namespace_full: namespace `alerts` holds 100000 keys …``.
 - **The admin API and CLI**: `mqttd --admin state` (the namespaces and their counts, a
-  viewer's), `state-keys <ns>` and `state-get <ns> <key>` (an operator's), and
-  `state-del <ns> <key>` (a rules writer's, audited; in an `eventual` namespace the
-  delete reaches every node, as a rule's `kv_del` does):
+  viewer's), `state-keys <ns>` (each key with its type, size and expiry; `--prefix`,
+  `--expires-within`, `--no-expiry` select, `--values` adds the values) and
+  `state-get <ns> <key>` (an operator's), and `state-del <ns> <key>` (an operator who is
+  a listed rules writer; audited; in an `eventual` namespace the delete reaches every
+  node, as a rule's `kv_del` does):
   [ADMIN-CLI.md](ADMIN-CLI.md#state-state-keys-state-get-state-del),
-  [ADMIN-API.md](ADMIN-API.md#rule-state).
+  [ADMIN-API.md](ADMIN-API.md#rule-state). Each node answers for its own copy.
+- **Not built yet:** removing many keys at once and changing the expiry of stored keys
+  are planned for a later release ([ADR 0085](adr/0085-rule-state-store.md), T13 to
+  T15). Today an operator deletes keys one at a time, and a rule's TTL decides when a
+  key goes.
 
 **Keys and values are payload data.** A key is built from client ids, topic levels and
 payload fields. Metrics and `$SYS` therefore carry counts and never a key or a value, a
@@ -2799,12 +3256,12 @@ viewer of the admin API sees counts only, and the audit log names a key by its S
 Only an operator lists keys and reads a value.
 
 **What looking costs.** None of it is on the publish path, and a listing takes a shard's
-lock for 64 keys at a time. Measured beside publishes (the same benchmark, `-- inspect`):
-in a namespace of 100,000 keys a state call takes 0.14 µs alone and 0.30 µs while another
-thread lists every key without pause (0.35 and 0.49 µs with four threads calling, 0.63
-and 0.98 µs with eight); at 1,000,000 keys, the most a namespace may hold, 0.26 and
-2.6 µs (1.14 and 3.1 µs with eight). Reading the counts, as a scrape and a `$SYS` tick
-do, takes under 1 µs.
+lock for 64 keys at a time. Measured beside publishes (the same benchmark, `-- inspect`,
+one run on the same shared machine): in a namespace of 100,000 keys a state call takes
+0.14 µs alone and 0.30 µs while another thread lists every key without pause (0.35 and
+0.49 µs with four threads calling, 0.63 and 0.98 µs with eight); at 1,000,000 keys, the
+most a namespace may hold, 0.26 and 2.6 µs (1.14 and 3.1 µs with eight). Reading the
+counts, as a scrape and a `$SYS` tick do, takes under 1 µs.
 
 ## Actions
 
@@ -2885,9 +3342,10 @@ publish, gated, so the PUBACK or PUBREC waits for all of it
 
 `direct_dispatch = true` opts a message out: no rule runs on it and it is not retained.
 
-**Upgrading from an earlier mqttd.** In mqttd 1.1.0 and earlier a republished message
-never re-entered the rules. A rules file written for that starts chaining when upgraded: a
-rule whose output topic another rule's `FROM` matches now triggers that rule too. Check
+**Upgrading from an earlier build.** No release has the rule engine yet, so this is
+about builds of `main`: until 2026-10-10 a republished message never re-entered the
+rules. A rules file written for such a build starts chaining on a later one: a rule
+whose output topic another rule's `FROM` matches now triggers that rule too. Check
 each `republish` topic against every `FROM` (`mqttd --check-rules` lists them), and set
 `direct_dispatch = true` on the actions that must not trigger anything.
 
@@ -2997,10 +3455,11 @@ across the connection tasks. These are microbenchmarks of the engine, not a clus
 benchmark. A derived message costs what any publish costs to route, so a rule that
 doubles your message count doubles the routing load.
 
-A [state](#state-what-a-rule-remembers) call adds 0.35 to 0.5 µs to the evaluation of a
-publish, and more when every worker thread calls the store at once; the figures, and the
-machine they were measured on, are in that section. A rules file that calls no state
-function pays nothing for them.
+A [state](#state-what-a-rule-remembers) call adds about 0.4 to 0.5 µs to the evaluation
+of a publish, and more when every worker thread calls the store at once, on one key
+above all; the figures, the machine they were measured on and what was not measured are
+under [What state costs](#what-state-costs). A rules file that calls no state function
+pays nothing for them.
 
 ## Differences from EMQX
 
@@ -3018,10 +3477,11 @@ EMQX fails on each message, and statements only mqttd accepts.
 | `authz_source` | The source that decided: `file`, `built_in_database`, `http`, …, `superuser`, `default`, and `cache` for a decision its authorization cache answered | `file` or `default`: mqttd has the ACL file only, no superusers and no authorization cache |
 | Data-integration sources (`$bridges/…`, `$sources/…`) | Yes | No: refused at load |
 | Functions | 124 in the built-in reference, plus `jq`; every other export of `emqx_rule_funcs` is callable too | 120 of those 124, plus `jq`, plus 29 EMQX exports without documenting (150 in all), `kv_store_put`, `kv_store_get`, `kv_store_del`, `proc_dict_put`, `proc_dict_get` and `proc_dict_del` among them. `maptab_lookup`, `mongo_date`, `schema_encode`, `schema_decode`, `term_encode`/`term_decode` are refused at load. |
-| `kv_store_put`, `kv_store_get`, `kv_store_del` | One table per node that grows until the node runs out of memory; a wrong argument count fails the rule on each message; the SQL test writes the node's real table | The same table and the same results, but bounded: a key of at most 256 bytes and a value of at most 4 KiB as JSON, 100,000 keys and 64 MiB unless `[state.kv_store]` says otherwise, under `rules.state_max_bytes`; past a bound the call fails the rule, where EMQX would have stored the value. A wrong argument count fails the load, as for every function. A dry run (`--rule-test`, the admin API's rule test) works on an empty table of its own. `rules.state_max_bytes = 0` switches it off: a rules file that calls them then does not load ([State](#state-what-a-rule-remembers)) |
-| `proc_dict_put`, `proc_dict_get`, `proc_dict_del` | The dictionary of the process that evaluates the rule: the client's connection process, for its publishes and what their rules republish, its events, the deliveries to it and its Will. It grows until the node runs out of memory. A session that outlives its connection keeps the process and the dictionary until it is resumed. A wrong argument count fails the rule on each message | The same results on one dictionary per client connection, for everything that connection evaluates, but bounded: 64 keys, and 64 KiB of keys and values as JSON, counted against `rules.state_max_bytes`; past a bound the call fails the rule, where EMQX would have stored the value. The dictionary is gone when the connection ends. Three evaluations have no connection to run on and get an empty dictionary that is discarded afterwards, where EMQX's still see the client's: a Will's rules; an event about a session that has no connection (`delivery_dropped` for an offline session); `message/dropped` for a message a rule republished, or for a Will. A wrong argument count fails the load, as for every function. A dry run works on an empty dictionary of its own, as each SQL test over EMQX's API does. `rules.state_max_bytes = 0` switches them off: a rules file that calls them then does not load ([State](#state-what-a-rule-remembers)) |
-| State of mqttd's own (mqttd-only extension) | None. `kv_get`, `kv_set`, `kv_set_once`, `kv_incr`, `kv_max`, `kv_min`, `kv_add`, `kv_del`, `kv_ttl`, `kv_held` and `kv_changed` are unknown functions, and `[state.<name>]` and the rule key `state` are not EMQX configuration | Typed, expiring, bounded keys in namespaces the rules file declares. A rule that uses them does not port back to EMQX |
-| `$events/state/expired` (mqttd-only extension) | No such event: a `FROM` that names it is refused. `"$events/#"` selects EMQX's 16 event topics | Raised when a key of mqttd's own state passes its expiry ([When a key expires](#when-a-key-expires-eventsstateexpired)), with `namespace`, `key`, `value`, `type` and `expired_at`. Selected only by its exact name: `"$events/#"` and every other wildcard select what they select in EMQX, never this event, so a rule ported from EMQX is not sent it. At most `rules.state_expiry_per_sec` a second on a node, late rather than dropped. In a replicated namespace one member raises it: exactly one while the cluster is stable, at least once around a change of members, and for what that member's copy held. EMQX's `kv_store` table has no expiry and raises none |
+| `kv_store_put`, `kv_store_get`, `kv_store_del` | One table per node that grows until the node runs out of memory; a wrong argument count fails the rule on each message; the SQL test writes the node's real table | The same table, the same results and the same moment of effect (a `SELECT` field before the `WHERE`), but **bounded**: a key of at most 256 bytes and a value of at most 4 KiB as the rule engine writes them, 100,000 keys and 64 MiB unless `[state.kv_store]` says otherwise, under `rules.state_max_bytes`; past a bound the call fails the rule (`bad_key`, `value_too_large`, `namespace_full`, `store_full`, or `brownout` over the memory watermark), where EMQX would have stored the value. A wrong argument count fails the load, as for every function. A dry run (`--rule-test`, `--check-rules`, the admin API's rule test) works on an empty **scratch table** of its own and never writes the node's. `rules.state_max_bytes = 0` switches it off: a rules file that calls them then does not load. EMQX's current source scopes the table by the rule's EMQX namespace; mqttd has no such namespaces, so it is one table for the node ([EMQX's own](#emqxs-own-kv_store_-and-proc_dict_)) |
+| `proc_dict_put`, `proc_dict_get`, `proc_dict_del` | The dictionary of the process that evaluates the rule: the client's connection process, for its publishes and what their rules republish, its events, the deliveries to it and its Will. It grows until the node runs out of memory. A session that outlives its connection keeps the process and the dictionary until it is resumed. A wrong argument count fails the rule on each message | The same results on one dictionary per client connection, for everything that connection evaluates, with two differences. **It is bounded:** 64 keys, and 64 KiB of keys and values as the rule engine writes them, counted against `rules.state_max_bytes`; past a bound the call fails the rule (`dictionary_full`, `store_full`, `brownout`), where EMQX would have stored the value. **It ends with the connection**, so three evaluations have no connection to run on and get an empty dictionary that is discarded afterwards, where EMQX's still see the client's: a Will's rules; an event about a session that has no connection (`delivery_dropped` for an offline session); `message/dropped` for a message a rule republished, or for a Will. A wrong argument count fails the load, as for every function. A dry run works on an empty scratch dictionary of its own, as each SQL test over EMQX's API does. `rules.state_max_bytes = 0` switches them off: a rules file that calls them then does not load ([EMQX's own](#emqxs-own-kv_store_-and-proc_dict_)) |
+| The `kv_*` functions (mqttd-only extension) | None. `kv_get`, `kv_set`, `kv_set_once`, `kv_incr`, `kv_max`, `kv_min`, `kv_add`, `kv_del`, `kv_ttl`, `kv_held`, `kv_changed`, `kv_hll_add` and `kv_hll_count` are unknown functions: a rule that calls one is not created | Typed, expiring, bounded keys that a rule reads and writes during evaluation, in EMQX's evaluation order ([The state functions](#the-state-functions)). They do not share keys with `kv_store_*`, and `--check-rules` warns about a file that calls both. A rule that uses them does not port back to EMQX |
+| `[state.<name>]` tables and the rule key `state` (mqttd-only extension) | Not EMQX configuration | A rules file may declare namespaces for `kv_*` keys, each with its consistency (`local`, or `eventual`: held by every node of the cluster), bounds, TTLs and eviction, and a rule names the one it uses with `state`; without it the rule has a namespace of its own ([Declaring a namespace](#declaring-a-namespace)). A rules file that has either does not load in EMQX |
+| `$events/state/expired` (mqttd-only extension) | No such event: a `FROM` that names it is refused. `"$events/#"` selects EMQX's 16 event topics | Raised when a key of mqttd's own state passes its expiry ([When a key expires](#when-a-key-expires-eventsstateexpired)), with `namespace`, `key`, `value`, `type` and `expired_at`. Selected only by its exact name: `"$events/#"` and every other wildcard select what they select in EMQX, never this event, so a rule ported from EMQX is not sent it. At most `rules.state_expiry_per_sec` a second, late rather than dropped. In a cluster one member raises a key's event, exactly once while the cluster is stable and at least once around a change of members. EMQX's `kv_store` table has no expiry and raises none |
 | `jq` | A NIF in the broker's own process: always on, with no limit on memory, output or stack, the broker's whole environment in `$ENV`, and a timeout that cannot stop a program inside one long C call | The same jq in a WebAssembly sandbox, with EMQX's results, tags and texts, but **off unless `rules.jq = true`** (a rules file that calls it then fails to load), and needing a host that allows executable memory. 64 MiB of memory, 4 MiB of stack, an output charged to the message's 1 MiB build budget, a 5 s bound on compiling a program, `$ENV` empty unless variables are listed in `rules.jq_env` (a ported rule that reads `$ENV.X` gets `null` until `X` is listed), a timeout that always stops the call and is never longer than `rules.function_max_ms` (10 s unless set) whatever `jq/3`'s third argument or a payload asks for, a wrong number of arguments refused at load instead of on each message; the last one or two digits of some transcendental functions differ (musl's libm against glibc's), `strptime` fails on `%z`, `strftime("%Z")` of a UTC time is `UTC` where EMQX's is `GMT`, and local time is UTC. Each limit fails the rule for that message, with its kind counted ([Limits of jq](#limits-of-jq-and-what-happens-at-each), [the whole table](#jq)) |
 | Functions supplied as modules (mqttd-only extension) | None. A rules file with a `[functions.<name>]` table is not EMQX configuration | A rules file may declare WebAssembly modules, each pinned by its SHA-256, whose functions rules call; they run in the sandbox under time, memory, output and stack limits. A module cannot take the name of a built-in function or of any function of EMQX's rule engine, so it never changes what a rule written for EMQX means. A module is read only from under the rules file's directory, sees no file, socket or host function, the clock only with `clock = true` and only the environment variables `rules.functions_env` allows. A rules file that declares one does not load in EMQX ([Your own functions](#your-own-functions-functionsname)) |
 | Regular expressions | Erlang `re`: PCRE2 10.47 (OTP 28) on bytes, compiled per call | PCRE2 10.46 on bytes, with OTP's compile options, match and depth limits and global-match loop: the same syntax and results ([above](#functions)). A match needing more than 64 MiB of backtracking memory is no match (OTP allows 20 GB); a pattern nesting parentheses more than 250 deep does not compile (OTP's limit is 10,000, though PCRE2's own workspace stops most such patterns below 2,000). A literal pattern is compiled once, when the file loads (one that does not compile warns), and a rules file holds at most 512 distinct ones, 256 KiB together. |
@@ -3038,7 +3498,7 @@ EMQX fails on each message, and statements only mqttd accepts.
 | `$SYS` messages | The broker's own `$SYS` messages run rules only with `rule_engine.ignore_sys_message = false` (default `true`). The default ACL denies only subscribing to `$SYS/#`, so a client may publish to `$SYS/x`, and that message runs rules whatever `ignore_sys_message` says (it checks only the flag the broker sets on its own) | Never run rules. Clients cannot publish to `$SYS`, except a Mosquitto bridge's `$SYS/broker/connection/<id>/state`, so a `FROM` on any other `$SYS` topic never matches. The broker publishes only opt-in rule statistics and trace there ([above](#watch-and-edit-rules-live)) |
 | Rule statistics | The dashboard and the REST API | `/metrics`; with `sys_interval_secs`, `$SYS/brokers/<node>/rules/<id>`; `GET /admin/v1/rules` |
 | Changing rules | The dashboard and the REST API, applied across the cluster | The rules file, reloaded; for a listed writer, the admin API writes that file, on the node it asks |
-| Testing a rule | The dashboard's SQL test, which calls the real functions: a test of `kv_store_put` writes the node's table | `mqttd --rule-test` (the statement only), or `POST /admin/v1/rules/test` (the statement and the rendered actions); a state call in a test never touches the running rules' state |
+| Testing a rule | The dashboard's SQL test, which calls the real functions: a test of `kv_store_put` writes the node's table | `mqttd --rule-test` (the statement only; with `--sequence`, a timed list of messages through a statement or the whole rules file), or `POST /admin/v1/rules/test` (the statement and the rendered actions). Every one of them works on a scratch store and a scratch dictionary that are dropped afterwards: a state call in a test never touches the running rules' state |
 | Conditions EMQX's runtime has no clause for (mqttd-only): a bare value as a condition or as an operand of `AND`/`OR`, `NOT IN`, `NOT` over `AND`/`OR`/`NOT`, a function that does not return a boolean, `AND`/`OR`/`NOT`/`IN` in `CASE x WHEN …` | The rule is created, with nothing said, and fails on each message that reaches the form (`failed`, `failed.exception`) (EMQX 6.3.1) | Evaluated: a condition passes exactly when it is the boolean `true`, `NOT IN` is the negation of `IN`. No rule that works in EMQX holds one of these, so none behaves differently here; a rule that relies on one does not port back to EMQX ([the table below](#conditions-emqx-fails-and-mqttd-evaluates), with the form to write for both) |
 | Statements only mqttd accepts (mqttd-only extensions) | A parse error: the rule is not created (EMQX 6.3.1, rulesql 0.2.1) | Accepted, each with the meaning it has where EMQX allows it: `AND`, `OR`, `NOT`, `IN` and `NOT IN` outside `WHERE`/`INCASE`/`WHEN` (in `SELECT`, `DO`, a function argument, an array); a comparison in parentheses or in an array (`(a > 1) AS ok`); `CASE` inside a larger expression (`1 + CASE … END`); a keyword, `div`, `mod`, `true` or `false` as a path segment (`payload.from`, `payload.true`, which EMQX takes as `payload.'from'`); `true` or `false` as a path's head or an alias (`true.x`; `1 AS true` is created in EMQX and fails on every message, and is the key `true` here); `if` and `elsif`, which EMQX reserves and never uses, as names; field or index access on a computed value (`json_decode(payload).a`, `nth(1, l).b`); a name starting with `_`; a float literal with an exponent and no fraction (`1e5`, `10e5`) or with an `f`/`d` suffix (`1.5f`). Every statement EMQX accepts loads in mqttd; leave these out of a rule that must also load in EMQX. |
 
@@ -3087,6 +3547,15 @@ actions: a rule left with none runs and produces nothing, so give it a `republis
 consumer, [INTEGRATION.md](INTEGRATION.md)) or delete it. A rule that selects a
 data-bridge source or an event mqttd does not raise, or calls a function it does not
 implement, is written **commented out** with the reason, so the file still loads.
+
+**A rule that calls `kv_store_*` or `proc_dict_*` is carried live**, with a `TODO(migrate)`
+line above it that says what differs here: the bounds (EMQX's table and dictionaries
+have none), and for `proc_dict_*` the evaluations that get an empty dictionary
+([EMQX's own](#emqxs-own-kv_store_-and-proc_dict_)). Nothing needs switching on: rule
+state is on unless `rules.state_max_bytes` is `0`, and a file that calls these then
+does not load. A rule that grew EMQX's table without end meets `namespace_full` here at
+100,000 keys: set `[state.kv_store]` `max_keys` for what it really holds, or
+`eviction = "lru"` if it is a cache.
 
 **A rule that calls `jq` is commented out too**, although mqttd has `jq`: it is off by
 default, and one call in a file that is loaded all-or-nothing would keep every other rule

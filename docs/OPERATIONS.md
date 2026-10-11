@@ -1171,6 +1171,9 @@ operating summary. The engine is unreleased: no release has it yet.
   counted in the summary's `stats_dropped`, not queued. With 1,024 rules at a 1 s interval
   that is 1,025 messages a second per node, in `mqttd_publish_received_total{qos="0"}` like
   any publish; 10 s or more is plenty for a dashboard.
+- **Rules that keep state** ([ADR 0085](adr/0085-rule-state-store.md);
+  [RULES.md § State](RULES.md#state-what-a-rule-remembers)). See [Rule state](#rule-state)
+  below for what to watch.
 - **The trace** (`[rules] trace`, `MQTTD_RULES_TRACE`) copies the messages rules see —
   payloads up to 1 KiB, client ids, usernames — onto
   `$SYS/brokers/<node>/trace/rules/<id>`, at most `trace_rate` (default 20) records per
@@ -1299,6 +1302,55 @@ operating summary. The engine is unreleased: no release has it yet.
 
 These rule expressions are recommendations; the chart's `PrometheusRule` does not ship
 them.
+
+### Rule state
+
+Rules may keep values between messages (`kv_*`, and EMQX's `kv_store_*` and
+`proc_dict_*`). The store is **in memory**: a node that restarts starts empty, and
+nothing of it is in a backup. A rules file that uses none creates none.
+
+- **Configure.** Namespaces, their bounds and TTLs are in the rules file
+  (`[state.<name>]`). Two settings are the broker's, both read at startup:
+  `rules.state_max_bytes` (`MQTTD_RULES_STATE_MAX_BYTES`, 256 MiB; the ceiling for all
+  state on the node, `0` = off) and `rules.state_expiry_per_sec`
+  (`MQTTD_RULES_STATE_EXPIRY_PER_SEC`, 1,000; the most expiry events a second). Count the
+  ceiling in the process's memory limit and under `MQTTD_MEMORY_MAX_BYTES`
+  ([SIZING.md](SIZING.md#rule-state)).
+- **In a cluster**, a namespace declared `consistency = "eventual"` is held by every node
+  and replicated over the peer links (peer protocol 14). Ship the same rules file to
+  every node: a node that declares the namespace differently, or not at all, takes none
+  of it. Keep the nodes' clocks synchronised: expiries and last-write-wins go by them.
+  **Upgrading:** upgrade every node to a release with the rule engine first, then deploy
+  rules that use state.
+- **What to watch.**
+
+  | Signal | Means | Do |
+  |---|---|---|
+  | `mqttd_rule_state_keys` near a namespace's `max_keys`, `mqttd_rule_state_bytes` near its `max_bytes` | The namespace is filling | Before it is full: raise the bound, shorten the TTLs, or find what keys fill it (`mqttd --admin state-keys <ns>`) |
+  | `mqttd_rule_state_ops_total{result="namespace_full"}` | New keys are refused and the rules that make them **fail** for those messages (`mqttd_rule_evaluations_total{result="failed"}`) | As above. A namespace of expired keys waiting for their events is full too: see the backlog |
+  | `…{result="store_full"}` | All namespaces together reached `rules.state_max_bytes` | Raise it (a restart), or lower namespaces' own bounds |
+  | `…{result="brownout"}` | New keys refused because the broker is over its **memory** watermark; existing keys still update | The memory brownout is the problem: [Alert: Brownout](#alert-brownout) |
+  | `…{result="wrong_type"}` | Two functions of different types use one key | A rule bug: give the keys different prefixes |
+  | `…{result="refused"}` | A counter past 64 bits or 256 rows, or a set of 1,024 elements | Delete the key, or key by a time window so that it expires |
+  | `mqttd_rule_state_expiry_backlog` growing | Keys expire faster than `rules.state_expiry_per_sec` raises their events, or, in a cluster, the member that raises them is behind. They still count toward the bounds | Raise the pace (a restart), or check the peer links |
+  | `mqttd_rule_state_replication_lag_seconds` rising, `…_pending` high | A peer link is slow or down; reads on that node are stale by that much | Look at the peer link (`mqttd --admin cluster`, and the `links` a namespace shows in `mqttd --admin state`). Nothing is queued per link, so memory does not grow |
+  | `mqttd_rule_state_replication_refused_total{reason}` | This node did not take what a peer sent: `namespace_full`/`store_full`/`brownout` (no room here: this node holds fewer keys than the others), `declaration`/`undeclared` (the rules files differ between nodes), `clock_skew` (the sender's clock is over 60 s ahead), `malformed` (mixed builds, or a bug) | Make the rules files and the bounds the same on every node (`mqttd --admin cluster --json`, `summary.same_rules`); fix the clock; report `malformed` |
+  | `mqttd_rule_state_dictionary_refused_total` | A connection's `proc_dict_*` dictionary was refused room | As `store_full` or `brownout` |
+
+- **Look at it:** `mqttd --admin state` (every namespace with its bounds, counts and, for
+  an `eventual` one, how replication stands), `state-keys <ns>`, `state-get <ns> <key>`,
+  `state-del <ns> <key>` ([ADMIN-CLI.md](ADMIN-CLI.md#state-state-keys-state-get-state-del)).
+  Each node answers for its own copy. With `[rules] sys_interval_secs`, the same counts
+  are on `$SYS/brokers/<node>/rule_state/<namespace>`.
+- **A reload** keeps the keys of namespaces that are still declared, and **drops** those
+  of a namespace that is no longer declared and of a rule that is gone or renamed. A
+  reload that would change a namespace's `consistency` is refused.
+- **A restart loses state.** On a rolling restart of a cluster, an `eventual` namespace
+  is given back to each node by the others as it returns; a `local` one, and everything
+  when all nodes stop together, is gone. Counters start at zero and devices that were
+  already silent raise no expiry event until they have spoken again.
+- **Not built yet:** a bulk purge and a change of expiry on stored keys (planned, ADR
+  0085 T13 to T15), `strong` consistency, and a snapshot to disk.
 
 ## Monitoring for the operator (and humans)
 

@@ -961,6 +961,15 @@ file's shape: `[{"function": "republish", "args": {…}}]`). `DELETE` removes it
 the file stays byte for byte ([a per-rule edit](#rules)). The answer is the whole-file
 `PUT`'s.
 
+**A per-rule write does not set a rule's `state` key** (the namespace its `kv_*` calls
+work on, [RULES.md](RULES.md#declaring-a-namespace)), and the body has no such field: a
+body that carries one is refused as an unknown field. An update keeps the key the rule
+has on disk, so the rule keeps its namespace and its keys. A rule inserted this way has
+none, and therefore a namespace of its own (`rule:<id>`). A per-rule write never changes
+a `[state.<name>]` table either. To declare a namespace, or to move a rule into or out
+of one, write the whole file (`PUT /admin/v1/rules`): the two belong together, and
+moving a rule to another namespace leaves the keys it had behind.
+
 ### `GET /admin/v1/rules/state`
 
 Viewer. What the [rule state](#rule-state) store holds on this node: its total against the

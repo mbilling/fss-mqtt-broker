@@ -1,0 +1,39 @@
+# Recipe 17: alert when a device has been silent for ten minutes
+#
+# A rule runs when a message arrives, so it cannot see a message that did not. The
+# state store can: last_seen sets a key per device on every reading, with a ten-minute
+# expiry that each reading moves, and when a device stops the key expires and the
+# broker raises $events/state/expired. silent turns that event into
+# alerts/silent/<device>, with the last temperature the device sent.
+#
+# The event is sent for every namespace's keys, so silent says which one it means
+# (WHERE namespace = 'seen'). It is raised up to a second after the expiry, never on a
+# node that restarted meanwhile (state is in memory), and a device that has never
+# spoken has no key to expire.
+#
+# Replay: docs/examples/rules/17-silent-device.jsonl (mqttd --rule-test --sequence).
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[state.seen]
+default_ttl = "10m"
+
+[rules.last_seen]
+description = "Remember each device's last reading for ten minutes"
+state = "seen"
+sql = '''
+SELECT kv_set(topic(2), payload.temp, '10m') AS last_temp
+FROM "devices/+/telemetry"
+WHERE is_num(payload.temp)
+'''
+
+[rules.silent]
+description = "A device whose key expired has said nothing for ten minutes"
+sql = '''
+SELECT key AS device, value AS last_temp, expired_at
+FROM "$events/state/expired"
+WHERE namespace = 'seen'
+'''
+actions = [
+  { function = "republish", args = { topic = "alerts/silent/${device}", qos = 1, payload = "${.}" } },
+]

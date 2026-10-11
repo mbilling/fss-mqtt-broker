@@ -1,0 +1,38 @@
+# Recipe 23: a rule moved from EMQX that keeps a counter in kv_store
+#
+# EMQX's rule engine has a table of its own, written with kv_store_put and read with
+# kv_store_get and kv_store_del. A rule that uses it runs here as it was written, with
+# EMQX's results: this one counts each device's door openings and publishes the count.
+# kv_store_get(key, 0) answers 0 for a device it has not seen, and kv_store_put
+# answers true.
+#
+# The table is EMQX's in every respect a rule can see: one per node, shared by every
+# rule whatever its state key says, never replicated, and its keys never expire. Two
+# things differ. Here it is bounded (100,000 keys and 64 MiB unless [state.kv_store]
+# says otherwise, a key of 256 bytes and a value of 4 KiB), and a put past a bound
+# fails the rule where EMQX would have stored the value. And a dry run (--rule-test,
+# the admin API's rule test) works on an empty table of its own, where EMQX's SQL
+# test writes the node's real one.
+#
+# In a rule you write for mqttd, kv_incr does the same in one call, expires, and can
+# be replicated; see recipe 20. It does not read what kv_store_put wrote.
+#
+# Replay: docs/examples/rules/23-emqx-kv-store-counter.jsonl (mqttd --rule-test --sequence).
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[state.kv_store]
+max_keys = 50000
+
+[rules.door_count]
+description = "Count each device's door openings, as the rule did in EMQX"
+sql = '''
+SELECT
+  clientid,
+  kv_store_put(clientid, kv_store_get(clientid, 0) + 1) AS stored,
+  kv_store_get(clientid) AS openings
+FROM "doors/+/opened"
+'''
+actions = [
+  { function = "republish", args = { topic = "doors/${clientid}/count", payload = "${openings}" } },
+]

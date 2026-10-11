@@ -1,0 +1,47 @@
+# Recipe 18: alert when a reading has stayed above a threshold for five minutes
+#
+# A threshold alert (recipe 02) fires on the first hot reading. kv_held fires when the
+# condition has held without a break: it records when the condition first became true,
+# answers how many whole seconds ago that was, and forgets it on the first reading
+# that is not hot.
+#
+# - hot_sensor publishes every reading of a sensor that has been above 30 for five
+#   minutes or more, with how long, on alerts/hot/<sensor>.
+# - hot_alarm publishes once when that alarm starts and once when it ends, on
+#   alarms/hot/<sensor>: kv_changed passes a message only when the alarm's state
+#   differs from the last one. A sensor's first reading reports its state too.
+#
+# kv_held stands in the SELECT, so it runs on every reading, the ones the WHERE turns
+# away included. That is what records the first hot reading. The one-hour TTL forgets
+# a sensor that stops reporting while it is hot.
+#
+# Replay: docs/examples/rules/18-hot-for-five-minutes.jsonl (mqttd --rule-test --sequence).
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[rules.hot_sensor]
+description = "Every reading of a sensor that has been above 30 for five minutes"
+sql = '''
+SELECT
+  topic(2) AS sensor,
+  payload.temp AS temp,
+  kv_held(topic(2), payload.temp > 30, '1h') AS hot_for
+FROM "sensors/+/data"
+WHERE hot_for >= 300
+'''
+actions = [
+  { function = "republish", args = { topic = "alerts/hot/${sensor}", qos = 1, payload = "${.}" } },
+]
+
+[rules.hot_alarm]
+description = "Once when the alarm starts, once when it ends"
+sql = '''
+SELECT
+  topic(2) AS sensor,
+  (kv_held('hot:' + topic(2), payload.temp > 30, '1h') >= 300) AS alarm
+FROM "sensors/+/data"
+WHERE kv_changed('alarm:' + topic(2), alarm, '1h')
+'''
+actions = [
+  { function = "republish", args = { topic = "alarms/hot/${sensor}", qos = 1, retain = true, payload = "${.}" } },
+]

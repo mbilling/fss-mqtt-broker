@@ -1,0 +1,8 @@
+# a sensor runs hot for six minutes, cools, and runs hot again for one
+{"at": 0,     "topic": "sensors/s1/data", "payload": {"temp": 31}}
+{"at": "2m",  "topic": "sensors/s1/data", "payload": {"temp": 32}}
+{"at": "5m",  "topic": "sensors/s1/data", "payload": {"temp": 33}}
+{"at": "6m",  "topic": "sensors/s1/data", "payload": {"temp": 34}}
+{"at": "7m",  "topic": "sensors/s1/data", "payload": {"temp": 20}}
+{"at": "8m",  "topic": "sensors/s1/data", "payload": {"temp": 35}}
+{"at": "9m",  "topic": "sensors/s1/data", "payload": {"temp": 36}}

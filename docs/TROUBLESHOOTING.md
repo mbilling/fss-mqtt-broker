@@ -432,6 +432,36 @@ topic or payload.
   program met a shape it does not handle), `timeout`, `memory`, `output` or `stack` (a
   limit; [RULES.md](RULES.md#limits-of-jq-and-what-happens-at-each)). `first(jq(…))`
   fails with `first([]) is undefined` when the program produced nothing.
+- **The file does not load, and the error is about state.**
+  ``rule state is switched off: `rules.state_max_bytes` is 0``: the node has rule state
+  off and the file declares a `[state.<name>]` or calls `kv_*`, `kv_store_*` or
+  `proc_dict_*`; set `[rules] state_max_bytes` above 0 and restart.
+  `state = "x": the file declares no [state.x]`: declare it, or drop the key.
+  `consistency = "strong" is not available`: use `"local"` or `"eventual"`. A reload
+  refused because a namespace would change its `consistency`: declare a new namespace.
+- **A rule that keeps state fails on some messages.** The WARN names the function and a
+  reason: `namespace_full` or `store_full` (a bound is reached: `mqttd --admin state`
+  shows which, and what fills it), `brownout` (the broker is over its memory watermark),
+  `wrong_type` (two functions use one key), `bad_key` or `bad_value` (a payload field
+  that is missing: guard it with `is_str` / `is_num`), `bad_idempotency_key` (a message
+  without its id). Every reason, with what to do:
+  [RULES.md § Bounds and errors](RULES.md#bounds-and-errors).
+- **A rule that keeps state decides wrongly.** Three usual causes. A state call in
+  `SELECT` runs for every message the `FROM` selects, whatever the `WHERE` says: a
+  counter there counts everything. A QoS 1 publish that is sent again is counted again
+  unless `kv_incr` has an idempotency key. And a restart forgets everything. Replay the
+  messages with their times through `mqttd --rule-test --sequence` to see what each one
+  changed ([RULES.md](RULES.md#replay-a-sequence-mqttd---rule-test---sequence)). In a
+  cluster, a `local` namespace is per node: a device that reconnects elsewhere finds no
+  keys; declare the namespace `consistency = "eventual"`.
+- **No `$events/state/expired` arrives, or it arrives twice.** Only the event's exact
+  name selects it (`"$events/#"` does not). It is raised up to a second after the expiry
+  and at most `rules.state_expiry_per_sec` a second
+  (`mqttd_rule_state_expiry_backlog` shows what waits). Nothing is raised for a key the
+  broker forgot at a restart, for a key of a namespace a reload dropped, or for EMQX's
+  `kv_store` table. In a cluster one member raises it, and only a member whose own rules
+  file has a rule on the event; around a node failure or a partition the same event can
+  be raised twice ([RULES.md](RULES.md#when-a-key-expires-eventsstateexpired)).
 - **`grep` finds the line but not the value.** The broker writes colour codes around each
   field name even into a file, a pipe, `docker logs` or the journal, so `grep 'rules=1'`
   or `grep 'digest=…'` matches nothing in a saved log while `grep 'rules loaded'` does.

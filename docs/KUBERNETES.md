@@ -104,6 +104,14 @@ ConfigMap volume is read-only (a rules write through the admin API answers
 ([ADR 0084](adr/0084-watching-and-editing-rules-live.md)). The per-rule statistics and
 trace on `$SYS` work as anywhere else ([RULES.md](RULES.md#watch-and-edit-rules-live)).
 
+**Rules that keep state** ([RULES.md](RULES.md#state-what-a-rule-remembers)) hold it in
+the pod's memory: a pod that restarts starts empty. With more than one replica, declare
+the namespaces a device's state must follow it to as `consistency = "eventual"`: every
+pod then holds them, and a restarted pod is given them back by the others. One ConfigMap
+gives every pod the same declarations, which replication needs. Count
+`rules.state_max_bytes` (256 MiB unless set, `MQTTD_RULES_STATE_MAX_BYTES` through
+`extraEnv`) in the pod's memory limit ([SIZING.md](SIZING.md#rule-state)).
+
 **`jq` and WebAssembly modules.** The rule engine's `jq` function is off by default, and a
 rules file that calls it does not load until every pod has the switch
 ([RULES.md](RULES.md#jq)):

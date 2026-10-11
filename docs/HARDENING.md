@@ -1,6 +1,6 @@
 # Hardening baseline
 
-**Verified against `v1.1.0` (2026-10-07); ADR 0084's items added 2026-10-08, ADR 0086's (H-7.12 to H-7.15) 2026-10-11.** The checkable companion to the
+**Verified against `v1.1.0` (2026-10-07); ADR 0084's items added 2026-10-08, ADR 0086's (H-7.12 to H-7.15) 2026-10-11, ADR 0085's (H-7.16 to H-7.19) 2026-10-12.** The checkable companion to the
 [threat model](THREAT-MODEL.md) (ADR 0066 T2): numbered items, each stating the
 control, the knob that enforces it, the shipped default, and a **verification an
 auditor can run**. The [SECURED-CLUSTER-TUTORIAL](SECURED-CLUSTER-TUTORIAL.md)
@@ -109,6 +109,10 @@ Single-node deployments: verify none of the cluster binds are set and skip to §
 | H-7.13 | L2 | An installation that must not contain a compiler at all runs a build without the runtime. Release binaries and images contain it (unused unless H-7.12 is deviated from), so this is a build of your own from the release tag, outside the release's signature and reproducibility proof | `cargo build --release -p mqttd --no-default-features`: the `jq` cargo feature, the only default one, is the runtime | `MQTTD_RULES_JQ=1 mqttd --check-config` prints ``warning: rules.jq is on, but this mqttd was built without jq (the `jq` cargo feature is off): a rules file that calls jq will not load``; the binary is 7 MB or more smaller (7.4 MB for a static `aarch64-unknown-linux-musl` build) |
 | H-7.14 | L2 | Where the sandbox is on, what a publisher can make it spend is bounded on purpose: the ceiling on one call (`rules.function_max_ms`) lowered from its ten seconds to what the slowest program or function needs, and the timeouts under it with it, most of all where rules run `jq` or modules on payloads from publishers you do not trust; no secret among the variables shown to programs and modules; module files not writable by the broker; a memory limit on the process, because the number of concurrent long calls is not capped, only the time each may take ([threat model](THREAT-MODEL.md#rule-functions-in-the-webassembly-sandbox-adr-0086)) | `MQTTD_RULES_FUNCTION_MAX_MS` (default 10000; a few hundred milliseconds is generous for a program over one message), `MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS` (default 10000, at most the ceiling) and each module's `timeout_ms`, `memory_mib`; `MQTTD_RULES_JQ_ENV`, `MQTTD_RULES_FUNCTIONS_ENV` (default empty); file ownership; `MemoryMax` or a container limit | `mqttd --check-config` prints `rules.function_max_ms is <N>: no jq or module call runs longer, whatever a rule or a payload asks for` with the N you chose; `mqttd --print-config` shows the ceiling, the timeout and the two lists, each entry reviewed; no rule takes a `jq` program from a payload (`grep -n 'jq(' <rules file>` shows literal first arguments; a third argument taken from a payload is held to the ceiling); `ls -l <rules dir>/**/*.wasm` shows an owner other than the broker's user and no write bit for it; `systemctl show mqttd -p MemoryMax` (or the pod's `resources.limits.memory`) is set |
 | H-7.15 | L2 | systemd: where the sandbox is on, the one restriction it cannot live with is lifted in a drop-in, alone, and recorded as a deviation from H-7.5; the shipped unit file is not edited | `MemoryDenyWriteExecute=false` under `[Service]` in `/etc/systemd/system/mqttd.service.d/override.conf` (`systemctl edit mqttd`); the unit ships `true` | `systemctl cat mqttd` shows the drop-in with that one line; `systemctl show mqttd -p MemoryDenyWriteExecute,ProtectSystem,NoNewPrivileges,SystemCallFilter` shows `no` and the unit's other values unchanged; run under the service's own settings, `MQTTD_RULES_JQ=1 mqttd --check-config` prints `rules.jq is on: this host allows compiled code` |
+| H-7.16 | L2 | Rule state is off where no rule needs it. A rules file that declares no `[state.<name>]` and calls no state function already holds no store; setting the ceiling to `0` makes that a property of the node, which no rules file and no rules writer can undo: a file that uses state is then refused at load | `MQTTD_RULES_STATE_MAX_BYTES=0` (default 268435456 = 256 MiB; read at startup) | `mqttd --print-config` shows `state_max_bytes = 0` under `[rules]`; `mqttd --admin state` says rule state is switched off; a rules file that calls `kv_incr` is refused by `mqttd --check-rules` with ``rule state is switched off: `rules.state_max_bytes` is 0`` |
+| H-7.17 | L2 | Where rule state is on, what publishers can make the broker hold is bounded on purpose: the ceiling lowered from its 256 MiB to what the rules need and counted in the process's memory limit; every namespace's `max_keys` and `max_bytes` sized for the device population it keys by, not left at 100,000 and 64 MiB by default; TTLs as short as the rule's meaning allows; `eviction = "fail"` (the default) wherever a forgotten key would be a wrong decision, `"lru"` only for caches ([threat model](THREAT-MODEL.md#state-for-rules-adr-0085), [sizing](SIZING.md#rule-state)) | `MQTTD_RULES_STATE_MAX_BYTES`; `max_keys`, `max_bytes`, `default_ttl`, `max_ttl`, `eviction`, `dedupe_window` in each `[state.<name>]`, `[state.default]` and `[state.kv_store]` of the rules file; `MemoryMax` or a container limit | `mqttd --admin state` lists every namespace with its bounds and what it holds, each reviewed; no namespace sits at its `max_keys`; `mqttd_rule_state_ops_total{result!="ok"}` and `mqttd_rule_state_replication_refused_total` are alerted on (H-8.6) |
+| H-7.18 | L2 | Rules that keep state key by values the publisher cannot choose freely: `clientid` where `connect` rules or mTLS pin it (H-3.4), or a topic level the ACL pins, not a bare payload field; an idempotency key has the publisher's identity in front; a value read from state is guarded like a payload field before it becomes a topic level | the rules file; the ACL file | review: every `kv_*` key and every fourth argument of `kv_incr` in `mqttd --admin rules-source` starts from `clientid` or `topic(n)`, or the rule's `FROM` is a topic only trusted publishers may write; `mqttd --rule-test --sequence` with a hostile sequence shows what one publisher can do to another's keys |
+| H-7.19 | L2 | Reading and deleting rule state is least-privilege: keys and values are payload data. Viewers see counts only; only operators list keys and read values; only an operator who is also a listed rules writer deletes one. `$SYS/brokers/+/rule_state/#` is granted on purpose, apart from the rule statistics | `MQTTD_ADMIN_VIEWERS`, `MQTTD_ADMIN_OPERATORS`, `MQTTD_RULES_ADMIN_WRITERS` (H-7.8, H-7.10); the ACL file | `mqttd --admin state-keys <ns>` with a viewer's certificate is refused (`403`); the ACL grants `$SYS/brokers/+/rule_state/#` to no client that should not see how many keys each namespace holds |
 | H-7.6 | L2 | Containers run the shipped image (distroless, nonroot) pinned to a release tag | compose/chart defaults | image ref is `ghcr.io/mbilling/fss-mqtt-broker:<X.Y.Z>` — exact version, never `latest`; cosign verification per [RELEASING](../RELEASING.md) |
 
 ### When to leave rule functions in the sandbox out (H-7.12 to H-7.15)
@@ -154,6 +158,45 @@ What is **not** given up: a module, jq's or yours, reaches no file, no socket, n
 environment variable that was not listed for it, and nothing of the broker's memory; a
 fault in it fails the rule it was called from. Those hold as long as the runtime is sound.
 
+### How to bound rule state, or switch it off (H-7.16 to H-7.19)
+
+Rules can keep values between messages ([RULES.md](RULES.md#state-what-a-rule-remembers),
+[ADR 0085](adr/0085-rule-state-store.md)). Unlike `jq`, this needs no switch: a rules
+file that uses state gets a store, under a ceiling. The keys are built from what
+publishers send, so the store is memory the broker holds on their behalf, and the
+hardened position is to decide how much.
+
+| Position | How | What you get |
+|---|---|---|
+| Off for the node | `MQTTD_RULES_STATE_MAX_BYTES=0` (H-7.16) | No store, no sweeping task, no state frame sent or kept. A rules file that declares a namespace or calls `kv_*`, `kv_store_*` or `proc_dict_*` does not load, at boot, at a reload or through the admin API, and the error names the key. Rules that keep no state run as before |
+| Not in use (the default with rules that keep none) | A rules file with no `[state.<name>]` and no state call | The same absence, but a later rules file, or a rules writer, can start using state, up to the ceiling |
+| In use, bounded | A ceiling you chose, and bounds per namespace (H-7.17 to H-7.19) | What follows |
+
+- **The ceiling is the broker's, not the rules file's.** `rules.state_max_bytes` is read
+  at startup from the configuration; a rules file can lower a namespace's bounds under
+  it and never raise it, and the admin API cannot change it. It covers every namespace
+  and every connection's `proc_dict_*` dictionary. Count it in the process's memory
+  limit: on every node, for an `eventual` namespace.
+- **Bound each namespace for what it keys by.** A namespace keyed by client id needs
+  about as many keys as there are devices, plus, with idempotency keys, the messages of
+  one `dedupe_window`, plus, in an `eventual` namespace, the deletes of one
+  `tombstone_window`. A bound far above that is room a hostile publisher can fill; a
+  bound below it fails rules in normal operation. The arithmetic is in
+  [SIZING.md](SIZING.md#rule-state).
+- **`eviction`.** `"fail"` refuses a new key in a full namespace and fails the rule,
+  which is visible (`namespace_full`) and loses no existing state. `"lru"` keeps the
+  rule working and silently forgets the least recently used key: right for a cache,
+  wrong for a quota or a `kv_held` run, where a forgotten key is a wrong decision.
+- **Short TTLs are a bound too.** Every key expires; a key that lives for 30 days is
+  room held for 30 days after one message.
+- **Who should be a rules writer.** A subject in `[rules] admin_writers` can make a node
+  hold up to the ceiling, can store and read back fields of any message the rules
+  select, and can drop any namespace's keys by editing the file. That is the reach of
+  whoever edits the ACL file, and the list should be the same people (H-7.10). An
+  operator who only needs to *look* at state needs the operator role and not this list.
+- **Not available:** state is not encrypted in memory, is not written to disk, and has
+  no per-publisher quota inside a namespace.
+
 ## 8. Audit and monitoring
 
 | # | Lvl | Control | Knob / default | Verify |
@@ -162,6 +205,7 @@ fault in it fails the rule it was called from. Those hold as long as the runtime
 | H-8.2 | L1 | The chain-boundary invariant is alerted on | SIEM rule | rule exists: a chain ending **without** `audit.shutdown`, or a genesis **not** preceded by one, raises an alert (crash or suppression) |
 | H-8.3 | L2 | Metrics scraped; refusal/drop counters dashboarded | `MQTTD_METRICS_BIND` or `MQTTD_OTLP_ENDPOINT` | dashboards show `publish_dropped_*`, gossip drop counters, brownout state |
 | H-8.5 | L2 | Admin actions are alerted on | SIEM rule over `admin.request` records, and over `rules.write` records | rule exists: any `role=operator` record with a non-`GET` target, and any `rules.write` record, raises a notification |
+| H-8.6 | L2 | Where rules keep state, refusals by the store are alerted on: a full namespace or store fails rules, and refused replication means the nodes' copies differ | Alert rules over `mqttd_rule_state_ops_total{result!="ok"}`, `mqttd_rule_state_replication_refused_total` and `mqttd_rule_state_keys` against each namespace's `max_keys`; a SIEM rule over `state.delete` records | rules exist; a test namespace filled to its bound raises the alert |
 | H-8.4 | L2 | `/readyz` drives load-balancer membership | orchestrator wiring | draining/browned-out/quorumless nodes leave rotation automatically |
 
 ---

@@ -1,0 +1,7 @@
+# two machines; m1 repeats itself, changes, and repeats the change in capitals
+{"at": 0,  "topic": "machines/m1/status", "payload": {"status": "running"}}
+{"at": 5,  "topic": "machines/m1/status", "payload": {"status": "running"}}
+{"at": 10, "topic": "machines/m2/status", "payload": {"status": "running"}}
+{"at": 15, "topic": "machines/m1/status", "payload": {"status": "stopped"}}
+{"at": 20, "topic": "machines/m1/status", "payload": {"status": "STOPPED"}}
+{"at": 25, "topic": "machines/m1/status", "payload": {"status": "running"}}

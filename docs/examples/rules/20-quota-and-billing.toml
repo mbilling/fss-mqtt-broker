@@ -1,0 +1,58 @@
+# Recipe 20: a quota per tenant and hour, and the billing record beside it
+#
+# Tenants publish API requests on api/<tenant>/requests at QoS 1, each with a
+# request_id the tenant chose. Two rules, with two different jobs:
+#
+# - billing_event is the record. It republishes every request to billing/<tenant> at
+#   QoS 1, id included, and keeps no state. The billing system consumes that topic
+#   with a persistent session and drops an id it has already seen. This is what you
+#   bill from.
+# - quota is the decision. It counts each tenant's requests in the current hour and
+#   publishes to quota/exceeded/<tenant> for every request past the third. This is
+#   what you act on now, and it is not a ledger: the count is in memory, gone when
+#   the node restarts, and in a cluster two nodes can each count a request that
+#   reaches both before they have heard of each other.
+#
+# The fourth argument of kv_incr is an idempotency key: a request that is sent again
+# (a lost PUBACK, a client retry) is counted once. The tenant is in front of the id,
+# so one tenant cannot use up another's ids. A request without a request_id fails the
+# rule (bad_idempotency_key): it is neither counted twice nor left out without a word.
+#
+# The hour is in the counter's key (timestamp div 3600000 is the hour since 1970), so
+# every hour starts a counter of its own. A TTL alone would not do: kv_incr with an
+# idempotency key always names its TTL, and a write that names a TTL moves the expiry.
+#
+# Replay: docs/examples/rules/20-quota-and-billing.jsonl (mqttd --rule-test --sequence).
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[state.quota]
+max_keys = 200000
+default_ttl = "2h"
+dedupe_window = "10m"
+
+[rules.billing_event]
+description = "The record: every request, to the billing system, at QoS 1"
+sql = '''
+SELECT topic(2) AS tenant, payload.request_id AS request_id, payload.units AS units, timestamp AS at
+FROM "api/+/requests"
+WHERE is_str(payload.request_id)
+'''
+actions = [
+  { function = "republish", args = { topic = "billing/${tenant}", qos = 1, payload = "${.}" } },
+]
+
+[rules.quota]
+description = "The decision: more than three requests from a tenant this hour"
+state = "quota"
+sql = '''
+SELECT
+  topic(2) AS tenant,
+  kv_incr(topic(2) + ':' + str(timestamp div 3600000), 1, '2h',
+          topic(2) + ':' + payload.request_id) AS used
+FROM "api/+/requests"
+WHERE used > 3
+'''
+actions = [
+  { function = "republish", args = { topic = "quota/exceeded/${tenant}", qos = 1, payload = "${.}" } },
+]

@@ -1,16 +1,17 @@
 # Recipe 10: thin out a high-rate stream without state
 #
-# A rule sees one message at a time and remembers nothing, so it can only thin a stream
-# by something in the message itself:
+# The cheapest way to thin a stream is by something in the message itself. It needs no
+# memory, so it costs nothing to keep and decides the same on every node of a cluster:
 #
 # - decimate_by_seq keeps every 10th reading, using the device's own sequence counter,
 #   on vib/<device>/1in10.
 # - fleet_sample keeps every reading from a stable ~25% of the devices (the same ones
 #   every time: the hash of the device id decides), on debug/sample/<device>.
 #
-# What needs state is not possible in a rule: an average or a min/max over a window,
-# counting, deduplication, "only when the value changed" (a deadband), a per-device rate
-# limit, or exactly one message per interval. docs/RULES-COOKBOOK.md says what to use.
+# What needs memory ("only when the value changed", a count, at most one message per
+# device per minute) is done with the state functions: recipes 17 to 23. An average
+# over a time window, and exactly one message per interval, are not a rule's job:
+# docs/RULES-COOKBOOK.md says what to use.
 #
 # In:  vib/pump-1/raw  qos=0 retain=0  {"seq": 10, "v": 0.42}
 # Out: vib/pump-1/1in10  qos=0 retain=0  {"device":"pump-1","seq":10,"v":0.42}
