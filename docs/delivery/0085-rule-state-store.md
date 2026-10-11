@@ -63,8 +63,10 @@ tasks:
     evidence: "PR 933: crates/mqtt-rules/src/state/dict.rs (a Dictionary per evaluating task, the three names in state::FUNCS) and one dictionary per connection in crates/mqttd/src/rules.rs; 99 probes of EMQX 6.3.1 (direct calls, emqx_rule_sqltester, the REST SQL test, and clients on a running node for whose process holds the dictionary per trigger) pinned in mqtt-rules tests_proc_dict (14) and crates/mqttd/tests/rules_proc_dict.rs (10), plus one test each in admin_rules.rs and rules_binary.rs; bounds of 64 keys and 64 KiB with dictionary_full; the ADR amended where the probes contradicted it; the converter carries proc_dict_* rules live."
   - id: 0085-T12
     title: "View the contents of the store: each key's type, size and expiry in the listing, optionally values, filters by expiry (expires within, no expiry), kv_store included"
-    status: in-progress
+    status: done
     issue: 940
+    date: 2026-10-11
+    evidence: "PR 957: GET /admin/v1/rules/state/keys lists each key with type, bytes and expires_at, and with values=true its value, filtered by prefix, expires_within and no_expiry (AND; a contradiction is a 400), for local, eventual and kv_store namespaces, with no field added to an entry (ENTRY_OVERHEAD asserted at 128); expires_within in a local namespace walks the existing expiry order; the single-key read returns bytes; the cursor is hashed in the audit record; state-keys gains --values, --expires-within and --no-expiry; 16 tests in the mqttd lib and admin_rules.rs, the rule_state filtered benchmark."
   - id: 0085-T13
     title: "Expire entries manually: a bulk purge of one namespace by prefix, by expiry (expires within, no expiry), or already expired; dry run, batches off the publish path, 100,000 keys a call with a cursor, audited; no expiry event unless asked"
     status: planned
@@ -143,7 +145,7 @@ and T15 carries the documentation of these three.
 | 0085-T9 | ⬜ planned | [#925](https://github.com/mbilling/fss-mqtt-broker/issues/925) | — |  |
 | 0085-T10 | ⬜ planned | [#926](https://github.com/mbilling/fss-mqtt-broker/issues/926) | — |  |
 | 0085-T11 | ✅ done | [#927](https://github.com/mbilling/fss-mqtt-broker/issues/927) | 2026-10-11 | "PR 933: crates/mqtt-rules/src/state/dict.rs (a Dictionary per evaluating task, the three names in state::FUNCS) and one dictionary per connection in crates/mqttd/src/rules.rs; 99 probes of EMQX 6.3.1 (direct calls, emqx_rule_sqltester, the REST SQL test, and clients on a running node for whose process holds the dictionary per trigger) pinned in mqtt-rules tests_proc_dict (14) and crates/mqttd/tests/rules_proc_dict.rs (10), plus one test each in admin_rules.rs and rules_binary.rs; bounds of 64 keys and 64 KiB with dictionary_full; the ADR amended where the probes contradicted it; the converter carries proc_dict_* rules live." |
-| 0085-T12 | 🚧 in-progress | [#940](https://github.com/mbilling/fss-mqtt-broker/issues/940) | — |  |
+| 0085-T12 | ✅ done | [#940](https://github.com/mbilling/fss-mqtt-broker/issues/940) | 2026-10-11 | "PR 957: GET /admin/v1/rules/state/keys lists each key with type, bytes and expires_at, and with values=true its value, filtered by prefix, expires_within and no_expiry (AND; a contradiction is a 400), for local, eventual and kv_store namespaces, with no field added to an entry (ENTRY_OVERHEAD asserted at 128); expires_within in a local namespace walks the existing expiry order; the single-key read returns bytes; the cursor is hashed in the audit record; state-keys gains --values, --expires-within and --no-expiry; 16 tests in the mqttd lib and admin_rules.rs, the rule_state filtered benchmark." |
 | 0085-T13 | ⬜ planned | [#941](https://github.com/mbilling/fss-mqtt-broker/issues/941) | — |  |
 | 0085-T14 | ⬜ planned | [#942](https://github.com/mbilling/fss-mqtt-broker/issues/942) | — |  |
 | 0085-T15 | ⬜ planned | [#943](https://github.com/mbilling/fss-mqtt-broker/issues/943) | — |  |
