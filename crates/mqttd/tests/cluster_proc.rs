@@ -364,7 +364,7 @@ async fn a_disk_bound_crash_mid_write_loses_no_acked_fact() {
 
     // Blast through the UNBOUNDED nodes until the kernel kills the bounded one.
     let topic = proc.subs[target].topic.clone();
-    let deadline = Instant::now() + Duration::from_secs(180);
+    let deadline = Instant::now() + Duration::from_mins(3);
     let mut publisher: Option<common::Client> = None;
     let mut i = 0u64;
     loop {
@@ -480,8 +480,7 @@ async fn rapid_kill_restart_flapping_loses_no_acked_fact() {
             proc.nodes[victim].spawn();
         }
         assert!(
-            proc.wait_node_serving(victim, Duration::from_secs(60))
-                .await,
+            proc.wait_node_serving(victim, Duration::from_mins(1)).await,
             "flapped node {id} never re-admitted (cycle {cycle})"
         );
     }
@@ -989,7 +988,7 @@ async fn subscribe_on_owner(proc: &mut proc_common::Proc, i: usize, client: &str
     let seed = proc.seed;
     let topic = format!("fl/{seed}/{i}");
     let addr = proc.nodes[i].client_addr;
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     loop {
         if let Some((mut conn, present)) =
             common::Client::connect_v311_within(addr, client, false, Duration::from_secs(10)).await
@@ -1053,7 +1052,7 @@ async fn assert_acked_and_delivered(
         &format!("f-{}-{tag}", proc.seed),
         &topic,
         &payload,
-        Duration::from_secs(60),
+        Duration::from_mins(1),
     )
     .await;
     assert!(
@@ -1065,7 +1064,7 @@ async fn assert_acked_and_delivered(
     if proc.subs[sub].conn.is_none() {
         proc.bring_subscriber_online(sub, true).await;
     }
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     loop {
         proc.drain_subscriber(sub).await;
         if proc.subs[sub].received.contains(&payload) {
@@ -1113,7 +1112,7 @@ async fn poll_replication(
     node: &proc_common::ProcNode,
     want: impl Fn((usize, usize, usize, bool)) -> bool,
 ) -> Result<(usize, usize, usize, bool), Option<(usize, usize, usize, bool)>> {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     let mut last = None;
     loop {
         if let Some(view) = node.statusz_replication().await {

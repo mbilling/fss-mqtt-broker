@@ -1636,12 +1636,7 @@ fn client_policy(
     // does not load refuses the boot, exactly as an ACL file that does not parse does —
     // and re-read by every reload, validate-before-swap, from whatever path the live
     // config names then.
-    let initial_rules = {
-        let snap = live
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        mqttd::rules::load(snap.rules.file.as_deref()).map_err(|e| format!("rules: {e}"))?
-    };
+    let (functions, initial_rules) = rules_at_startup(live)?;
     metrics.set_rules_loaded(
         reload::enabled_rules(&initial_rules),
         initial_rules.digest(),
@@ -1666,7 +1661,8 @@ fn client_policy(
     }
     let rules =
         mqttd::rules::Rules::new(rules_rx, Arc::from(node.0.as_str()), Some(metrics.clone()))
-            .with_observe(observe);
+            .with_observe(observe)
+            .with_functions(functions.clone());
     reloader.attach_rules(rules_tx, {
         let live = live.clone();
         move || -> reload::RulesBuildResult {
@@ -1676,7 +1672,7 @@ fn client_policy(
                 .rules
                 .file
                 .clone();
-            mqttd::rules::load(path.as_deref()).map(Arc::new)
+            mqttd::rules::load_with(path.as_deref(), &functions).map(Arc::new)
         }
     });
 
@@ -2635,7 +2631,7 @@ struct HubRetainedSource {
 }
 
 /// How long the exporter waits for the hub's retained snapshot before failing the run.
-const RETAINED_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(60);
+const RETAINED_SNAPSHOT_TIMEOUT: Duration = Duration::from_mins(1);
 
 #[async_trait::async_trait]
 impl mqttd::backup::RetainedSource for HubRetainedSource {
@@ -4272,6 +4268,39 @@ fn runtime_precheck(config: &Config) -> Result<(), String> {
     Ok(())
 }
 
+/// What the rules may call beyond the built-in functions on this node, and the rules
+/// file loaded with it, at startup.
+///
+/// `jq`, where `rules.jq` switches it on (ADR 0086 D13), is read here, once. Nothing of
+/// the WebAssembly runtime exists until a rules file that calls `jq` is loaded, so the
+/// host is not asked here whether it could run it: a file that calls `jq` where it is
+/// off, or cannot run, fails to load with the reason, and that refuses the boot.
+fn rules_at_startup(
+    live: &Arc<RwLock<Config>>,
+) -> Result<(mqtt_rules::Functions, mqtt_rules::RuleSet), String> {
+    let snap = live
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let functions = mqttd::rules::functions_from_config(&snap.rules);
+    match &functions.jq {
+        mqtt_rules::JqSwitch::Off => {}
+        mqtt_rules::JqSwitch::Unavailable(why) => {
+            warn!("rules.jq is on, but {why}: a rules file that calls jq will not load (ADR 0086)");
+        }
+        mqtt_rules::JqSwitch::On(jq) => info!(
+            default_timeout_ms = snap.rules.jq_default_timeout_ms,
+            env = snap.rules.jq_env.len(),
+            module_sha256 = mqtt_rules::Jq::module_sha256().unwrap_or("unknown"),
+            loaded = jq.is_loaded(),
+            "rules.jq is on: rules may call jq; its module is compiled when a rules file \
+             first does (ADR 0086)"
+        ),
+    }
+    let rules = mqttd::rules::load_with(snap.rules.file.as_deref(), &functions)
+        .map_err(|e| format!("rules: {e}"))?;
+    Ok((functions, rules))
+}
+
 /// The config sections that changed between `old` and `new` **and are not live-swappable** — i.e.
 /// changes that only take effect after a restart (ADR 0046 T4). The live-swappable fields are
 /// masked out before comparing: the policy paths + `allow_anonymous` (rebuilt by the reloader)
@@ -4339,6 +4368,18 @@ fn requires_restart(old: &Config, new: &Config) -> Vec<&'static str> {
     // certificate, key and client CA are rebuilt by the reload (T18).
     if o.admin != n.admin {
         changed.push("admin");
+    }
+    // What `jq` is on this node is read at startup (ADR 0086 D13); every other
+    // `[rules]` key is live.
+    let jq = |c: &Config| {
+        (
+            c.rules.jq,
+            c.rules.jq_default_timeout_ms,
+            c.rules.jq_env.clone(),
+        )
+    };
+    if jq(old) != jq(new) {
+        changed.push("rules.jq");
     }
     changed
 }
@@ -4592,11 +4633,13 @@ USAGE:
   mqttd --print-config      print the effective config (secrets fingerprinted)
   mqttd --check-tls         check every configured certificate, key, CA and CRL
   mqttd --check-rules [f]   validate a rules file and list its rules (default: the
-                            rules.file of the effective config, which is checked too)
+                            rules.file of the effective config, which is checked too);
+                            jq() is allowed where the effective config sets rules.jq
   mqttd --rule-test --sql <statement>
                             run one rule statement against a simulated publish
                             (--topic t --payload p --clientid c --username u --qos n)
-                            or, for a $events statement, a sample event (--event e)
+                            or, for a $events statement, a sample event (--event e);
+                            jq() runs where the effective config sets rules.jq
   mqttd --hash-password [u] print an Argon2id password-file line and exit
   mqttd --probe [/readyz]   query the running broker's health endpoint and exit
   mqttd --decommission      drain and gracefully stop the running broker
@@ -4626,15 +4669,17 @@ see docs/mqttd.example.toml and the README.",
 /// located error on failure; exit `2` if the invocation itself is malformed.
 fn check_config() -> ! {
     match check_config_inner() {
-        Ok(Some(path)) => {
+        Ok((Some(path), jq)) => {
             outln!(
                 "config OK: {} + MQTTD_* env overlay validates",
                 path.display()
             );
+            report_jq(jq);
             std::process::exit(0);
         }
-        Ok(None) => {
+        Ok((None, jq)) => {
             outln!("config OK: defaults + MQTTD_* env overlay validates (no config file set)");
+            report_jq(jq);
             std::process::exit(0);
         }
         Err(CheckError::Usage(e)) => {
@@ -4662,14 +4707,22 @@ fn check_rules_cli() -> ! {
         .nth(1)
         .filter(|v| !v.starts_with('-'))
         .cloned();
-    let Some(file) = named.or_else(|| load_config_or_exit().rules.file) else {
+    // The effective config says which file (unless one is named) and whether the rules
+    // may call `jq` (`rules.jq`, ADR 0086): the file is loaded as the broker with this
+    // configuration, on this host, would load it.
+    let rules = match &named {
+        Some(_) => rules_config_or_default(),
+        None => load_config_or_exit().rules,
+    };
+    let functions = mqttd::rules::functions_from_config(&rules);
+    let Some(file) = named.or(rules.file) else {
         eprintln!(
             "error: no rules file — pass one (mqttd --check-rules <file>) or set rules.file / \
              MQTTD_RULES_FILE"
         );
         std::process::exit(2);
     };
-    match mqtt_rules::RuleSet::load(Path::new(&file)) {
+    match mqtt_rules::RuleSet::load_with(Path::new(&file), &functions) {
         Ok(loaded) => {
             for w in &loaded.warnings {
                 eprintln!("warning: {w}");
@@ -4737,9 +4790,15 @@ fn rule_test_cli() -> ! {
     let mut input = mqtt_rules::PublishInput::new(&clientid, &topic, &payload, qos, &props);
     input.username = username.as_deref();
     input.node = "rule-test";
+    // `jq` is what the effective config makes it (`rules.jq`, ADR 0086): off unless
+    // switched on, and then with the configured timeout and environment.
+    let functions = mqttd::rules::functions_from_config(&rules_config_or_default());
     // A statement that selects events runs against a sample of one: the one --event
     // names, else its first event when it selects no topic.
-    let event = match (mqtt_rules::statement_sources(&sql), opt("--event")) {
+    let event = match (
+        mqtt_rules::statement_sources_with(&sql, &functions),
+        opt("--event"),
+    ) {
         (Err(e), _) => {
             eprintln!("rule test FAILED: {e}");
             std::process::exit(1);
@@ -4778,7 +4837,7 @@ fn rule_test_cli() -> ! {
         }
         None => &input,
     };
-    match mqtt_rules::test_sql(&sql, input) {
+    match mqtt_rules::test_sql_with(&sql, input, &functions) {
         Ok(outputs) if outputs.is_empty() => {
             outln!("(no output: the statement's WHERE / INCASE did not match this message)");
             std::process::exit(0);
@@ -4792,6 +4851,27 @@ fn rule_test_cli() -> ! {
         Err(e) => {
             eprintln!("rule test FAILED: {e}");
             std::process::exit(1);
+        }
+    }
+}
+
+/// The effective config's `[rules]`, for the commands that are about a rules file or a
+/// statement someone names and need the config only to know whether `jq` is switched
+/// on (ADR 0086). Read without validating the rest: a rules file is checked, and a
+/// statement tried, on machines where no broker could start. A config that cannot
+/// even be read is said, and `jq` is then off, as it is by default.
+fn rules_config_or_default() -> mqtt_config::Rules {
+    let loaded = config_path()
+        .map_err(|e| e.to_string())
+        .and_then(|path| Config::load_unvalidated(path.as_deref()).map_err(|e| e.to_string()));
+    match loaded {
+        Ok(config) => config.rules,
+        Err(e) => {
+            eprintln!(
+                "warning: the effective config cannot be read ({e}); jq() is taken as \
+                 switched off (rules.jq)"
+            );
+            mqtt_config::Rules::default()
         }
     }
 }
@@ -5101,7 +5181,7 @@ fn run_backup() -> ! {
             if std::env::args().any(|a| a == "--timeout") {
                 t
             } else {
-                Duration::from_secs(300)
+                Duration::from_mins(5)
             },
         ),
         Err(e) => {
@@ -5239,7 +5319,7 @@ fn run_decommission() -> ! {
 #[cfg(unix)]
 fn decommission_args() -> Result<(i32, Duration), String> {
     let mut pid: i32 = 1;
-    let mut timeout = Duration::from_secs(3600);
+    let mut timeout = Duration::from_hours(1);
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -5272,7 +5352,23 @@ enum CheckError {
 
 /// The testable core of [`check_config`]: resolve the path and load+validate, returning the
 /// resolved path on success (so the caller can report it) or a classified error.
-fn check_config_inner() -> Result<Option<std::path::PathBuf>, CheckError> {
+/// What `--check-config` says about `rules.jq = true` on the host it runs on (ADR 0086
+/// D13): whether compiled code may run here. A report, not a verdict — the config is
+/// valid either way, and the check may be running where the broker will not; a rules
+/// file that calls `jq` on a host that refuses is what fails, at `--preflight`,
+/// `--check-rules` and startup.
+fn report_jq(report: Option<Result<String, String>>) {
+    match report {
+        Some(Ok(line)) => outln!("{line}"),
+        Some(Err(line)) => outln!("warning: {line}"),
+        None => {}
+    }
+}
+
+/// The config file checked, and what `rules.jq` means on this host ([`report_jq`]).
+type Checked = (Option<std::path::PathBuf>, Option<Result<String, String>>);
+
+fn check_config_inner() -> Result<Checked, CheckError> {
     let path = config_path().map_err(CheckError::Usage)?;
     let config = match Config::load(path.as_deref()) {
         Ok(c) => c,
@@ -5296,7 +5392,8 @@ fn check_config_inner() -> Result<Option<std::path::PathBuf>, CheckError> {
             error: ConfigError::Invalid(message),
         });
     }
-    Ok(path)
+    let jq = mqttd::rules::jq_host_report(&mqttd::rules::functions_from_config(&config.rules));
+    Ok((path, jq))
 }
 
 /// What `--check-config` runs beyond `Config::load` (issue #671): the checks startup makes
@@ -5345,8 +5442,13 @@ fn host_checks(config: &Config) -> Result<(), String> {
     }
     authorizer_from_config(config).map_err(text)?;
     authenticator_from_config(config, None, None).map_err(text)?;
-    // The rules file (ADR 0083), loaded exactly as startup and a reload load it.
-    mqttd::rules::load(config.rules.file.as_deref()).map_err(|e| format!("rules: {e}"))?;
+    // The rules file (ADR 0083), loaded exactly as startup and a reload load it: with
+    // `jq` as `[rules]` switches it, on this host (ADR 0086).
+    mqttd::rules::load_with(
+        config.rules.file.as_deref(),
+        &mqttd::rules::functions_from_config(&config.rules),
+    )
+    .map_err(|e| format!("rules: {e}"))?;
     let peer_tls = peer_tls_from_config(config).map_err(text)?;
     if config.cluster.swim.bind.is_some() {
         let (auth, signed) =
@@ -5820,7 +5922,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = super::HubRetainedSink {
             hub: tx,
-            timeout: Duration::from_secs(300),
+            timeout: Duration::from_mins(5),
             warn_every: Duration::from_secs(15),
         };
 
@@ -5843,7 +5945,7 @@ mod tests {
         );
         assert_eq!(
             started.elapsed(),
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             "fails AT the deadline"
         );
         drop(sink);
@@ -5858,7 +5960,7 @@ mod tests {
         });
         let sink = super::HubRetainedSink {
             hub: tx,
-            timeout: Duration::from_secs(300),
+            timeout: Duration::from_mins(5),
             warn_every: Duration::from_secs(15),
         };
         sink.publish(&record, None)

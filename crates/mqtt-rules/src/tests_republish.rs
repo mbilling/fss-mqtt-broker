@@ -23,7 +23,7 @@ fn run(
         budget,
         &mut |r, o| {
             let what = match o {
-                Outcome::Elapsed(_) => return,
+                Outcome::Elapsed(_) | Outcome::Function(_) => return,
                 Outcome::Passed => "passed".to_string(),
                 Outcome::NoResult => "no_result".to_string(),
                 Outcome::Failed(e) => format!("failed({e})"),

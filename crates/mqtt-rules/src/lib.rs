@@ -38,6 +38,7 @@ pub mod edit;
 mod eval;
 mod funcs;
 mod input;
+mod jq;
 mod json;
 mod lexer;
 mod num;
@@ -53,6 +54,7 @@ pub use input::{
     reason_code_name, ClientInfo, ConnInfo, EventInput, EventKind, EventMatch, EventMessage,
     PublishInput, EMQX_EVENT_TOPICS,
 };
+pub use jq::{FunctionCall, Functions, HandOff, Jq, JqSettings, JqSwitch, ModuleStats};
 pub use value::{json_decode, Map, Value};
 
 /// The most rules one file may define.
@@ -281,6 +283,10 @@ pub enum Outcome<'a> {
     /// [`RuleSet::on_publish`] and [`RuleSet::on_event`], never by a dry run
     /// ([`RuleSet::evaluate_one`]), so it describes live traffic only.
     Elapsed(std::time::Duration),
+    /// The rule's SQL called a sandboxed function (`jq`, ADR 0086): how long the call
+    /// took and how it ended. Reported after the SQL has run and before its
+    /// `Passed`, `NoResult` or `Failed`, once per call, in call order.
+    Function(&'a FunctionCall),
 }
 
 /// Why a `republish` action was not run on a republished message.
@@ -496,6 +502,8 @@ pub struct RuleSet {
     by_event: [Vec<usize>; EventKind::COUNT],
     digest: String,
     warnings: Vec<String>,
+    /// Whether any rule, enabled or not, calls a sandboxed function.
+    sandboxed: bool,
 }
 
 /// A successfully loaded rules file and what the author should be told about it.
@@ -614,13 +622,13 @@ fn event_sources(from: &str, warnings: &mut Vec<String>) -> Result<Vec<EventKind
     Ok(m.kinds)
 }
 
-/// Compile one statement and its `FROM` list, its literal regex patterns through
-/// `regexes`.
-fn compile(sql: &str, regexes: &mut parser::RegexPool) -> Result<Compiled, CompileError> {
+/// Compile one statement and its `FROM` list, its literal regex patterns and its calls
+/// of `jq` through `loading`.
+fn compile(sql: &str, loading: &mut parser::Loading<'_>) -> Result<Compiled, CompileError> {
     if sql.len() > MAX_SQL_BYTES {
         return Err(format!("sql is longer than {MAX_SQL_BYTES} bytes").into());
     }
-    let (stmt, mut warnings) = parser::parse(sql, regexes).map_err(|e| CompileError {
+    let (stmt, mut warnings) = parser::parse(sql, loading).map_err(|e| CompileError {
         message: e.to_string(),
         at: Some((e.line, e.column)),
     })?;
@@ -678,8 +686,16 @@ impl RuleSet {
         Self::default()
     }
 
-    /// Load a rules file's text. All-or-nothing.
+    /// Load a rules file's text, with `jq` switched off. All-or-nothing.
     pub fn parse(text: &str) -> Result<Loaded, LoadError> {
+        Self::parse_with(text, &Functions::default())
+    }
+
+    /// Load a rules file's text. All-or-nothing. `functions` is what its rules may
+    /// call beyond the built-in functions: a file that calls `jq` loads only where
+    /// that is switched on and this host can run it (ADR 0086). The first such load of
+    /// a process compiles the jq module, which takes about half a second.
+    pub fn parse_with(text: &str, functions: &Functions) -> Result<Loaded, LoadError> {
         let file: FileSchema = toml::from_str(text).map_err(|e| LoadError::File {
             message: e.to_string(),
             span: e.span(),
@@ -697,8 +713,8 @@ impl RuleSet {
             ..RuleSet::default()
         };
         let mut warnings = Vec::new();
-        // One pool for the whole file: the regex budget is file-wide (ADR 0084 D3).
-        let mut regexes = parser::RegexPool::default();
+        // One for the whole file: the regex budget is file-wide (ADR 0084 D3).
+        let mut loading = parser::Loading::new(functions);
         for (id, r) in file.rules {
             let fail = |e: CompileError| LoadError::Rule {
                 id: id.clone(),
@@ -726,7 +742,7 @@ impl RuleSet {
                 topics,
                 events,
                 warnings: w,
-            } = compile(&r.sql, &mut regexes).map_err(fail)?;
+            } = compile(&r.sql, &mut loading).map_err(fail)?;
             warnings.extend(w.into_iter().map(|w| format!("rule `{id}`: {w}")));
             let mut actions = Vec::with_capacity(r.actions.len());
             let mut aw = Vec::new();
@@ -762,6 +778,13 @@ impl RuleSet {
                 set.by_event[e.index()].push(i);
             }
         }
+        if let Some(jq) = &loading.jq {
+            set.sandboxed = true;
+            // The programs the file spells out, compiled into every warm instance now:
+            // no publisher pays for that (ADR 0086 D5).
+            let programs: Vec<&[u8]> = loading.jq_programs.iter().map(|p| p.as_bytes()).collect();
+            jq.warm(&programs);
+        }
         set.warnings.clone_from(&warnings);
         Ok(Loaded {
             rules: set,
@@ -769,11 +792,24 @@ impl RuleSet {
         })
     }
 
-    /// Load a rules file from disk.
+    /// Load a rules file from disk, with `jq` switched off.
     pub fn load(path: &std::path::Path) -> Result<Loaded, LoadError> {
+        Self::load_with(path, &Functions::default())
+    }
+
+    /// Load a rules file from disk ([`parse_with`](Self::parse_with)).
+    pub fn load_with(path: &std::path::Path, functions: &Functions) -> Result<Loaded, LoadError> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| LoadError::file(format!("{}: {e}", path.display())))?;
-        Self::parse(&text)
+        Self::parse_with(&text, functions)
+    }
+
+    /// Whether any rule of the file, enabled or not, calls a function that runs in the
+    /// sandbox (`jq`): such a rule may take as long as its timeout allows, so whoever
+    /// evaluates it must not be something everything else waits for.
+    #[must_use]
+    pub fn calls_sandbox(&self) -> bool {
+        self.sandboxed
     }
 
     /// Every loaded rule (enabled or not), in id order.
@@ -960,7 +996,12 @@ fn apply(
 ) {
     *ctx.rule_id.borrow_mut() = rule.id.clone();
     let mut outputs = Vec::new();
-    if let Err(e) = eval::run(&rule.stmt, ctx, &mut outputs) {
+    let ran = eval::run(&rule.stmt, ctx, &mut outputs);
+    let calls = std::mem::take(&mut *ctx.calls.borrow_mut());
+    for call in &calls {
+        report(rule, Outcome::Function(call));
+    }
+    if let Err(e) = ran {
         report(rule, Outcome::Failed(&e));
         return;
     }
@@ -1031,12 +1072,20 @@ fn charge_derived(budget: &Budget, effect: Effect) -> Result<Effect, EvalError> 
 
 /// What one statement's `FROM` selects: its topic filters and its events.
 pub fn statement_sources(sql: &str) -> Result<(Vec<String>, Vec<EventKind>), String> {
-    compile_alone(sql).map(|c| (c.topics, c.events))
+    statement_sources_with(sql, &Functions::default())
+}
+
+/// [`statement_sources`] for a statement that may call what `functions` has.
+pub fn statement_sources_with(
+    sql: &str,
+    functions: &Functions,
+) -> Result<(Vec<String>, Vec<EventKind>), String> {
+    compile_alone(sql, functions).map(|c| (c.topics, c.events))
 }
 
 /// [`compile`] for a statement on its own, with a regex budget of its own.
-fn compile_alone(sql: &str) -> Result<Compiled, String> {
-    compile(sql, &mut parser::RegexPool::default()).map_err(|e| e.message)
+fn compile_alone(sql: &str, functions: &Functions) -> Result<Compiled, String> {
+    compile(sql, &mut parser::Loading::new(functions)).map_err(|e| e.message)
 }
 
 /// Why a rule selecting `topics` and `events` would never run on `input`; `None` when
@@ -1081,12 +1130,22 @@ fn from_mismatch(topics: &[String], events: &[EventKind], input: &dyn Input) -> 
 /// than evaluated: a message whose topic no `FROM` filter matches, a message given to a
 /// statement that selects only events, or an event its `FROM` does not name.
 pub fn test_sql(sql: &str, input: &dyn Input) -> Result<Vec<String>, String> {
+    test_sql_with(sql, input, &Functions::default())
+}
+
+/// [`test_sql`] for a statement that may call what `functions` has (`jq`, where it is
+/// switched on).
+pub fn test_sql_with(
+    sql: &str,
+    input: &dyn Input,
+    functions: &Functions,
+) -> Result<Vec<String>, String> {
     let Compiled {
         stmt,
         topics,
         events,
         ..
-    } = compile_alone(sql)?;
+    } = compile_alone(sql, functions)?;
     if let Some(why) = from_mismatch(&topics, &events, input) {
         return Err(why);
     }
@@ -1102,7 +1161,7 @@ pub fn test_sql(sql: &str, input: &dyn Input) -> Result<Vec<String>, String> {
 
 /// Validate one statement without running it; returns its warnings.
 pub fn check_sql(sql: &str) -> Result<Vec<String>, String> {
-    compile_alone(sql).map(|c| c.warnings)
+    compile_alone(sql, &Functions::default()).map(|c| c.warnings)
 }
 
 #[cfg(test)]

@@ -1,8 +1,8 @@
 //! Rule functions as WebAssembly modules, run in a sandbox (ADR 0086).
 //!
-//! Nothing in the broker depends on this crate yet. It is how EMQX's `jq` rule
-//! function can be the real jq — the C library, compiled to WebAssembly — run where it
-//! can do no harm, and what the same mechanism needs to carry functions an operator
+//! It is how EMQX's `jq` rule function is the real jq — the C library, compiled to
+//! WebAssembly — run where it can do no harm (`mqtt-rules` calls it through
+//! [`jq::Pool`]), and what the same mechanism needs to carry functions an operator
 //! supplies.
 //!
 //! * [`Sandbox`] validates and compiles a module, refuses any import outside a fixed
@@ -29,6 +29,6 @@ mod timer;
 mod wasi;
 
 pub use sandbox::{
-    Arg, CallError, Execution, Instance, Limits, LoadError, Reply, Sandbox, ABI_VERSION,
+    Arg, CallError, Execution, HandOff, Instance, Limits, LoadError, Reply, Sandbox, ABI_VERSION,
 };
 pub use wasi::Grants;

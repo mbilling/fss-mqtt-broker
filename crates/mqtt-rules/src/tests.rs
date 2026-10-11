@@ -1273,7 +1273,7 @@ fn effects(set: &RuleSet, input: &PublishInput) -> (Vec<(Arc<str>, Effect)>, Vec
                 "{}:{}",
                 r.id(),
                 match o {
-                    Outcome::Elapsed(_) => unreachable!(),
+                    Outcome::Elapsed(_) | Outcome::Function(_) => unreachable!(),
                     Outcome::Passed => "passed".to_string(),
                     Outcome::NoResult => "no_result".to_string(),
                     Outcome::Failed(e) => format!("failed({e})"),
@@ -1874,7 +1874,8 @@ fn identical_regular_expressions_are_compiled_once() {
     let over = funcs::compile_regex(format!("(?:\\w\\w){{{}}}", n + 1).as_bytes()).unwrap_err();
     assert!(over.contains("regular expression is too large"), "{over}");
     let at_limit = format!("(?:\\w\\w){{{n}}}");
-    let mut pool = parser::RegexPool::default();
+    let functions = Functions::default();
+    let mut pool = parser::Loading::new(&functions).regexes;
     let first = pool.get(&at_limit).unwrap().unwrap();
     assert!(Arc::ptr_eq(&first, &pool.get(&at_limit).unwrap().unwrap()));
     assert!(!Arc::ptr_eq(
@@ -2210,6 +2211,7 @@ fn outcome_kind(o: Outcome<'_>) -> &'static str {
         Outcome::ActionOk => "action_ok",
         Outcome::ActionFailed(_) => "action_failed",
         Outcome::Elapsed(_) => "elapsed",
+        Outcome::Function(_) => "function",
         Outcome::Recursive(Recursion::SameRule) => "recursive_same_rule",
         Outcome::Recursive(Recursion::Depth) => "recursive_depth",
     }
@@ -2964,7 +2966,12 @@ fn regex_calls(subject: &[u8], pattern: &[u8], literal: bool) -> RegexResults {
     let call = |name: &str, args: &[Value]| {
         let func = funcs::lookup(name).unwrap();
         let regex = literal.then_some(&compiled);
-        (func.f)(args, &funcs::FnCtx { ctx: &ctx, regex }).map_err(|_| ())
+        let cx = funcs::FnCtx {
+            ctx: &ctx,
+            regex,
+            jq: None,
+        };
+        (func.f)(args, &cx).map_err(|_| ())
     };
     let bytes = |b: &[u8]| Value::from_bytes(&Bytes::copy_from_slice(b));
     let (subject, pattern) = (bytes(subject), bytes(pattern));
@@ -5085,4 +5092,92 @@ fn json_reader_accepts_what_serde_json_accepts() {
     ] {
         assert_eq!(json_decode(doc.as_bytes()).unwrap_err().to_string(), want);
     }
+}
+
+/// ADR 0086 D13: `jq` is off unless the operator switches it on. A rules file that
+/// calls it then does not load, at the call, and the error names the switch.
+#[test]
+fn a_rules_file_that_calls_jq_does_not_load_while_jq_is_switched_off() {
+    let text =
+        "[rules.shape]\nsql = \"\"\"\nSELECT\n  jq('.a', payload) AS a\nFROM \"t/#\"\n\"\"\"\n";
+    for loaded in [
+        RuleSet::parse(text),
+        RuleSet::parse_with(text, &Functions::default()),
+    ] {
+        let LoadError::Rule {
+            id,
+            message,
+            sql_line,
+            sql_column,
+        } = loaded.expect_err("jq is off")
+        else {
+            panic!("a rule error")
+        };
+        assert_eq!(id, "shape");
+        assert!(
+            message.starts_with(
+                "jq is switched off: set `rules.jq = true` to use it (see RULES.md for what it \
+                 needs from the host)"
+            ),
+            "{message}"
+        );
+        assert_eq!((sql_line, sql_column), (Some(2), Some(3)));
+    }
+    // The same for a disabled rule, for one statement on its own, and wherever in the
+    // statement the call is.
+    let disabled =
+        "[rules.r]\nenable = false\nsql = 'SELECT 1 FROM \"t\" WHERE jq(payload.p, 1) = [1]'\n";
+    assert!(RuleSet::parse(disabled)
+        .expect_err("jq is off")
+        .to_string()
+        .contains("jq is switched off"));
+    for sql in [
+        "SELECT jq('.', payload, 100) AS r FROM \"t\"",
+        "FOREACH jq('.[]', payload) FROM \"t\"",
+    ] {
+        let payload = Bytes::from_static(b"1");
+        let props = mqtt_core::AppProperties::default();
+        let error = test_sql(sql, &msg("t", &payload, &props)).expect_err(sql);
+        assert!(error.contains("jq is switched off"), "{sql}: {error}");
+        assert!(check_sql(sql)
+            .expect_err(sql)
+            .contains("jq is switched off"));
+        assert!(statement_sources(sql)
+            .expect_err(sql)
+            .contains("jq is switched off"));
+    }
+    // A file that does not call it loads as it always did, and says it needs no sandbox.
+    let plain = RuleSet::parse("[rules.r]\nsql = 'SELECT 1 FROM \"t\"'\n").unwrap();
+    assert!(!plain.rules.calls_sandbox());
+}
+
+/// A build without jq (the `jq` cargo feature off, or made without the module) has
+/// nothing for the switch to turn on, and a rules file that calls `jq` says so.
+#[test]
+fn a_build_without_jq_says_why_the_switch_has_nothing_to_turn_on() {
+    let functions = Functions {
+        jq: JqSwitch::Unavailable("this mqttd was built without the jq module".to_string()),
+    };
+    let error = RuleSet::parse_with(
+        "[rules.r]\nsql = 'SELECT jq(payload.p, payload) AS r FROM \"t\"'\n",
+        &functions,
+    )
+    .expect_err("no jq in this build")
+    .to_string();
+    assert!(
+        error.contains("jq is not available: this mqttd was built without the jq module"),
+        "{error}"
+    );
+    assert!(functions.jq().is_none());
+    // Arity is checked first, as for every function.
+    let error = RuleSet::parse_with(
+        "[rules.r]\nsql = 'SELECT jq(payload) AS r FROM \"t\"'\n",
+        &functions,
+    )
+    .expect_err("one argument")
+    .to_string();
+    assert!(
+        error.contains("jq() takes 2..=3 argument(s), 1 given"),
+        "{error}"
+    );
 }

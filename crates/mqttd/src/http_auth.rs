@@ -442,7 +442,7 @@ mod tests {
         // Bounded: past the ceiling with everything live, further inserts are dropped
         // rather than growing a map fed from an attacker-reachable path.
         let mut long = cfg("https://hook.example/auth");
-        long.cache_ttl = Duration::from_secs(60);
+        long.cache_ttl = Duration::from_mins(1);
         long.cache_max = 2;
         let auth = HttpAuthenticator::new(long, None).expect("build");
         for i in 0..10u8 {

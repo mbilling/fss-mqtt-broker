@@ -4420,6 +4420,32 @@ impl Hub {
         )
         .await;
         let Some(rules) = &self.rules else { return };
+        if rules.calls_sandbox() {
+            // Rules that call `jq` may run for as long as its timeout allows (EMQX's
+            // default is ten seconds), and nothing may wait that long for the hub: such
+            // a Will's rules run on a task of their own, as a client's publish runs
+            // on its connection task (ADR 0086 D6, amended 2026-10-11). What they
+            // produce is posted back exactly as below.
+            let (rules, self_tx) = (rules.clone(), self.self_tx.clone());
+            let (client, will) = (client.clone(), will.clone());
+            tokio::spawn(async move {
+                let w = &will.message;
+                let facts = crate::rules::PublishFacts {
+                    client: &client,
+                    publisher: &will.publisher,
+                    topic: &w.topic,
+                    payload: &w.payload,
+                    qos: w.qos,
+                    retain: w.retain,
+                    app: &w.app,
+                    message_expiry: None,
+                };
+                rules.on_will_from(&facts, origin.as_deref(), |cmd| {
+                    let _ = self_tx.send(cmd);
+                });
+            });
+            return;
+        }
         let self_tx = &self.self_tx;
         rules.on_will_from(&facts, origin.as_deref(), |cmd| {
             let _ = self_tx.send(cmd);
@@ -16859,7 +16885,7 @@ mod tests {
         let mut peer = connect_peer(&tx, "joiner", 1);
 
         // Boot scan: the owned offline session materializes and its filter gossips.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + Duration::from_mins(1);
         loop {
             match recv_peer(&mut peer).await {
                 Some(PeerMessage::Interest { filters }) if filters.contains(&"mv/t".into()) => {
@@ -16882,7 +16908,7 @@ mod tests {
 
         // The sweep observes the member-set change, re-arms the window, and the
         // next scan RELEASES the moved session: interest re-gossips without it.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + Duration::from_mins(1);
         loop {
             match recv_peer(&mut peer).await {
                 Some(PeerMessage::Interest { filters }) if !filters.contains(&"mv/t".into()) => {
@@ -17456,7 +17482,7 @@ mod tests {
         filter: &str,
         present: bool,
     ) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + Duration::from_mins(1);
         loop {
             match recv_peer(peer).await {
                 Some(PeerMessage::Interest { filters })
@@ -17497,7 +17523,7 @@ mod tests {
 
     /// Wait for the rehome close (`0x9C` Use another server) on a v5 client's socket.
     async fn await_rehome_disconnect(out: &mut crate::hub::OutboundRx) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + Duration::from_mins(1);
         loop {
             match recv_packet(out).await {
                 Some(Packet::Disconnect(d)) => {
@@ -17778,7 +17804,7 @@ mod tests {
         commit_lease(&placement, client, Some(&remote));
 
         // First close: the ordinary rehome.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + Duration::from_mins(1);
         loop {
             match recv_packet(&mut first).await {
                 Some(Packet::Disconnect(_)) => break,
@@ -18245,7 +18271,7 @@ mod tests {
 
         // Wait for the first tick that closes anything, then read the cap off the metrics
         // before the next tick can add to it.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + Duration::from_mins(1);
         loop {
             let rendered = metrics.render();
             if let Some(deferred) = counter_value(&rendered, "reason=\"deferred\"") {
@@ -18314,7 +18340,7 @@ mod tests {
         placement.write().unwrap().set_lease_owners(owners);
 
         // Let the whole drain finish, so the counter is read at its final value.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        let deadline = tokio::time::Instant::now() + Duration::from_mins(2);
         loop {
             let rendered = metrics.render();
             if counter_value(&rendered, "reason=\"stale-owner\"") == Some(n as u64) {

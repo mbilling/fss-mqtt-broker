@@ -108,7 +108,7 @@ fn run(mut cmd: Command) -> Ran {
 /// Wait for `child` to exit, at most 60 s: a command that hangs, or boots a broker
 /// instead of exiting, fails the test instead of wedging the suite.
 fn wait_bounded(child: &mut ChildGuard, what: &str) -> std::process::ExitStatus {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     loop {
         if let Some(status) = child.0.try_wait().expect("try_wait") {
             return status;
@@ -3170,4 +3170,852 @@ async fn writers_for_a_rules_directory_the_broker_cannot_write_in_are_warned_abo
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+// ---------------------------------------------------------------------------------------
+// The jq function (ADR 0086)
+// ---------------------------------------------------------------------------------------
+
+/// What the load error says while `jq` is switched off (ADR 0086 D13).
+const JQ_OFF: &str = "jq is switched off: set `rules.jq = true` to use it (see RULES.md for \
+                      what it needs from the host)";
+
+/// One rule that calls `jq`.
+const JQ_ONE: &str = r#"[rules.shape]
+sql = '''SELECT jq('.a[]', payload) AS r FROM "jq/in"'''
+actions = [{ function = "republish", args = { topic = "jq/out", payload = "${r}" } }]
+"#;
+
+/// The tests below that run jq need a broker built with the jq module, which is built
+/// from pinned sources and not checked in. CI builds it; a laptop without zig does not.
+const JQ_MODULE_HOW: &str =
+    "run crates/mqtt-wasm-sandbox/jq-module/build.sh (zig 0.16.0) and build again";
+
+/// `mqttd_rule_function_errors_total{function="jq",kind}`, as rendered.
+fn jq_errors(kind: &str) -> String {
+    format!(r#"mqttd_rule_function_errors_total{{function="jq",kind="{kind}"}}"#)
+}
+
+const JQ_CALLS: &str = r#"mqttd_rule_function_calls_total{function="jq"}"#;
+
+/// ADR 0086 D13: `jq` is off unless the operator switches it on, and a rules file that
+/// calls it then does not load — in `--check-rules`, in `--rule-test`, at boot — with a
+/// message that names the switch. Nothing here needs the jq module: this is what every
+/// build does by default. A broker that loaded the file and failed the rule on each
+/// message, or refused it as an unknown function, fails the exact-stderr assertions.
+#[test]
+fn jq_is_off_by_default_and_a_rules_file_that_calls_it_does_not_load() {
+    assert_check_rules_refuses(
+        JQ_ONE,
+        &format!("rule `shape`: {JQ_OFF} (line 1, column 8, near `jq('.a[]', payload) AS r`)"),
+    );
+    // Said off as well as left off.
+    let dir = tempfile::tempdir().unwrap();
+    write_rules(dir.path(), JQ_ONE);
+    let path = dir.path().join("rules.toml").display().to_string();
+    let mut cmd = mqttd();
+    cmd.args(["--check-rules", &path])
+        .env("MQTTD_RULES_JQ", "0");
+    let ran = run(cmd);
+    assert_eq!(ran.code, Some(1), "{ran:?}");
+    assert!(ran.stderr.contains(JQ_OFF), "{ran:?}");
+
+    let ran = cli(&[
+        "--rule-test",
+        "--sql",
+        "SELECT jq('.', payload) AS r FROM \"t/#\"",
+    ]);
+    assert_eq!(ran.code, Some(1), "{ran:?}");
+    assert_eq!(
+        ran.stderr,
+        format!("rule test FAILED: {JQ_OFF} (line 1, column 8, near `jq('.', payload) AS r FR`)\n")
+    );
+
+    // The broker does not boot on it.
+    let config = dir.path().join("mqttd.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[security]\nallow_anonymous = true\n\n[durable]\nenabled = false\n\n[rules]\n\
+             file = \"{path}\"\n"
+        ),
+    )
+    .unwrap();
+    let mut ran = None;
+    for _ in 0..3 {
+        let mut cmd = mqttd();
+        cmd.arg("--config")
+            .arg(&config)
+            .env("MQTTD_PLAINTEXT_BIND", band_addr().to_string())
+            .env("RUST_LOG", "mqttd=info");
+        let this = run(cmd);
+        if !this.stderr.contains("Address already in use") {
+            ran = Some(this);
+            break;
+        }
+    }
+    let ran = ran.expect("three band ports in a row were taken");
+    assert_eq!(ran.code, Some(1), "{ran:?}");
+    assert_eq!(
+        ran.stderr,
+        format!(
+            "Error: rules: rule `shape`: {JQ_OFF} (line 1, column 8, near `jq('.a[]', payload) \
+             AS r`)\n"
+        )
+    );
+}
+
+/// `mqttd --rule-test` with `rules.jq` on, as `MQTTD_RULES_JQ=1`.
+fn jq_rule_test(sql: &str, payload: &str, env: &[(&str, &str)]) -> Ran {
+    let mut cmd = mqttd();
+    cmd.args(["--rule-test", "--sql", sql, "--payload", payload])
+        .env("MQTTD_RULES_JQ", "1")
+        // Nothing of the runner's environment reaches jq unless a test lists it.
+        .env("SITE", "plant-7");
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    run(cmd)
+}
+
+/// ADR 0086 D4: `jq/2` and `jq/3` in `mqttd --rule-test`, with what
+/// `emqx_rule_sqltester:test/1` answered on EMQX 6.3.1 for the same statement and
+/// payload (probed 2026-10-11): the outputs as a list, a string input read as JSON text
+/// and any other value encoded first, integers of any size and floats kept apart, an
+/// undefined input as the text `undefined`, and each way a call fails, tag and text.
+/// A result of another shape, or an error EMQX words differently, fails the exact
+/// comparison.
+#[test]
+#[allow(clippy::too_many_lines)] // one row per probed case
+fn rule_test_runs_jq_with_the_results_emqx_gives() {
+    if let Err(why) = mqtt_rules::Jq::built_in() {
+        skip_locally_or_fail_in_ci!("{why}: {JQ_MODULE_HOW}");
+    }
+    let select = |call: &str| format!("SELECT {call} AS r FROM \"t/#\"");
+    for (call, payload, emqx) in [
+        (
+            "jq('.', payload)",
+            r#"{"a":[1,2]}"#,
+            r#"{"r":[{"a":[1,2]}]}"#,
+        ),
+        ("jq('.a[]', payload)", r#"{"a":[1,2]}"#, r#"{"r":[1,2]}"#),
+        ("jq('.', payload, 100)", "1", r#"{"r":[1]}"#),
+        ("jq('.', payload, 0)", "1", r#"{"r":[1]}"#),
+        ("jq('.', payload, 4294967296)", "1", r#"{"r":[1]}"#),
+        ("jq('empty', payload)", "1", r#"{"r":[]}"#),
+        (
+            "jq('.', payload.a)",
+            r#"{"a":{"b":1.0,"c":12345678901234567890123}}"#,
+            r#"{"r":[{"b":1.0,"c":12345678901234567890123}]}"#,
+        ),
+        ("jq('.', nosuch)", "1", r#"{"r":["undefined"]}"#),
+        ("jq('.', true)", "1", r#"{"r":[true]}"#),
+        ("jq('.', 1.5)", "1", r#"{"r":[1.5]}"#),
+        (
+            "jq('.a,.b', payload)",
+            r#"{"a":1,"b":[1.5,true,null]}"#,
+            r#"{"r":[1,[1.5,true,null]]}"#,
+        ),
+    ] {
+        let ran = jq_rule_test(&select(call), payload, &[]);
+        assert_eq!(
+            (ran.code, ran.stdout.as_str()),
+            (Some(0), format!("{emqx}\n").as_str()),
+            "{call} on {payload}: {ran:?}"
+        );
+    }
+    // FOREACH over jq's outputs, and jq in a WHERE.
+    let ran = jq_rule_test(
+        "FOREACH jq('.[]', payload) DO item AS x FROM \"t/#\"",
+        "[1,2]",
+        &[],
+    );
+    assert_eq!(ran.stdout, "{\"x\":1}\n{\"x\":2}\n", "{ran:?}");
+    let ran = jq_rule_test(
+        "SELECT 1 AS x FROM \"t/#\" WHERE jq('.a', payload) = [1]",
+        r#"{"a":1}"#,
+        &[],
+    );
+    assert_eq!(ran.stdout, "{\"x\":1}\n", "{ran:?}");
+
+    // The failures: EMQX's `{jq_exception, {Tag, Message}}`, as `tag: message`.
+    let needs = "bad_timeout_val: Needs positive integer or infinity but got";
+    for (call, payload, emqx) in [
+        ("jq('.x', payload)", "[1]", "jq_err_process: jq error: Cannot index array with string \"x\"".to_string()),
+        ("jq('1, error(\"boom\")', payload)", "1", "jq_err_process: jq error: boom".to_string()),
+        ("jq('.', payload)", "abc", "jq_err_parse: Invalid numeric literal at EOF at line 1, column 3 (while parsing 'abc')".to_string()),
+        ("jq('.', '')", "1", "jq_err_parse: Expected JSON value (while parsing '')".to_string()),
+        (
+            "jq('', payload)",
+            "1",
+            "jq_err_compile: jq: error: Top-level program not given (try \".\")jq: 1 compile error".to_string(),
+        ),
+        (
+            "jq('repeat(.)', payload, 30)",
+            "1",
+            "timeout: jq program canceled as it took too long time to execute (timeout set to 30 ms)".to_string(),
+        ),
+        (
+            "jq('repeat(.)', payload, 0)",
+            "1",
+            "timeout: jq program canceled as it took too long time to execute (timeout set to 0 ms)".to_string(),
+        ),
+        // The timeout is looked at before the program and the input are.
+        ("jq('%%', payload, -1)", "1", format!("{needs} -1")),
+        ("jq('.', payload, 100.0)", "1", format!("{needs} 100.0")),
+        ("jq('.', payload, 1.5)", "1", format!("{needs} 1.5")),
+        ("jq('.', payload, '100')", "1", format!("{needs} <<\"100\">>")),
+        ("jq('.', payload, 'infinity')", "1", format!("{needs} <<\"infinity\">>")),
+        ("jq('.', payload, nosuch)", "1", format!("{needs} undefined")),
+        ("jq('.', payload, true)", "1", format!("{needs} true")),
+        ("jq('.', payload, payload.l)", r#"{"l":[1,2]}"#, format!("{needs} [1,2]")),
+        ("jq('.', payload, -99999999999999999999)", "1", format!("{needs} -99999999999999999999")),
+        // Erlang's timer refuses a time of 2^64 ms or more, and the NIF's match on its
+        // answer fails: EMQX's `{badmatch,{error,badarg}}`.
+        ("jq('.', payload, 99999999999999999999)", "1", "{badmatch,{error,badarg}}".to_string()),
+    ] {
+        let ran = jq_rule_test(&select(call), payload, &[]);
+        assert_eq!(
+            (ran.code, ran.stdout.as_str(), ran.stderr.as_str()),
+            (Some(1), "", format!("rule test FAILED: jq(): {emqx}\n").as_str()),
+            "{call} on {payload}"
+        );
+    }
+    // Where EMQX has no clause for the arguments, or its decoder refuses an output,
+    // the rule fails here too; the text is this engine's.
+    for (call, payload, ours) in [
+        (
+            "jq(1, payload)",
+            "1",
+            "jq(): the program must be a string, got a integer",
+        ),
+        (
+            "jq(nosuch, payload)",
+            "1",
+            "jq(): the program must be a string, got a undefined",
+        ),
+        (
+            "jq('.', payload)",
+            "1e1000",
+            "jq(): an output of the program is not JSON the rule engine reads: invalid JSON: \
+             number out of range",
+        ),
+    ] {
+        let ran = jq_rule_test(&select(call), payload, &[]);
+        assert_eq!(ran.code, Some(1), "{call}: {ran:?}");
+        assert!(ran.stderr.contains(ours), "{call}: {ran:?}");
+    }
+}
+
+/// ADR 0086 D8: `$ENV` and `env` inside jq hold the variables `rules.jq_env` lists, when
+/// they are set, and nothing else — where EMQX shows jq the broker's whole environment.
+/// A broker that passed its environment through would show `PATH` (and any secret
+/// beside it) to a program taken from a payload, and fail the first assertion.
+#[test]
+fn jq_sees_only_the_environment_variables_the_operator_listed() {
+    if let Err(why) = mqtt_rules::Jq::built_in() {
+        skip_locally_or_fail_in_ci!("{why}: {JQ_MODULE_HOW}");
+    }
+    let sql = "SELECT jq('[$ENV.SITE, env.SITE, $ENV.PATH, $ENV.MQTTD_RULES_JQ, ($ENV | keys)]', \
+               payload) AS r FROM \"t/#\"";
+    let ran = jq_rule_test(sql, "1", &[]);
+    assert_eq!(
+        ran.stdout, "{\"r\":[[null,null,null,null,[]]]}\n",
+        "{ran:?}"
+    );
+    // Listed and set, listed and unset.
+    let ran = jq_rule_test(sql, "1", &[("MQTTD_RULES_JQ_ENV", "SITE,REGION")]);
+    assert_eq!(
+        ran.stdout, "{\"r\":[[\"plant-7\",\"plant-7\",null,null,[\"SITE\"]]]}\n",
+        "{ran:?}"
+    );
+}
+
+/// The rules of [`jq_runs_in_the_broker_with_emqx_results_limits_and_metrics`].
+const JQ_RULES: &str = r#"[rules.whole]
+sql = '''SELECT jq('.', payload) AS r FROM "jq/whole"'''
+actions = [{ function = "republish", args = { topic = "jq/out/whole", payload = "${r}" } }]
+
+[rules.each]
+sql = '''FOREACH jq('.a[]', payload) DO item AS x FROM "jq/each"'''
+actions = [{ function = "republish", args = { topic = "jq/out/each", payload = "${x}" } }]
+
+[rules.field]
+sql = '''SELECT jq('.', payload.a, 100) AS r FROM "jq/field"'''
+actions = [{ function = "republish", args = { topic = "jq/out/field", payload = "${r}" } }]
+
+[rules.where]
+sql = '''SELECT jq(payload.p, payload.i) AS r FROM "jq/where" WHERE jq('.a', payload) = [1]'''
+actions = [{ function = "republish", args = { topic = "jq/out/where", payload = "${r}" } }]
+
+[rules.env]
+sql = '''SELECT jq('[$ENV.SITE, $ENV.PATH, ($ENV | keys)]', payload) AS r FROM "jq/env"'''
+actions = [{ function = "republish", args = { topic = "jq/out/env", payload = "${r}" } }]
+
+[rules.slow]
+sql = '''SELECT jq('def f: f; f', payload, 40) AS r FROM "jq/slow"'''
+actions = [{ function = "republish", args = { topic = "jq/out/slow", payload = "${r}" } }]
+
+[rules.index]
+sql = '''SELECT jq('.x', payload) AS r FROM "jq/index"'''
+actions = [{ function = "republish", args = { topic = "jq/out/index", payload = "${r}" } }]
+
+[rules.big]
+sql = '''SELECT jq('[range(1e9)]', payload) AS r FROM "jq/big"'''
+actions = [{ function = "republish", args = { topic = "jq/out/big", payload = "${r}" } }]
+
+[rules.twice]
+sql = '''SELECT jq('"x" * 600000 | length', payload) AS n, jq('"x" * 600000', payload) AS a, jq('"x" * 600000', payload) AS b FROM "jq/twice"'''
+actions = [{ function = "republish", args = { topic = "jq/out/twice", payload = "${n}" } }]
+
+[rules.once]
+sql = '''SELECT jq('"x" * 600000 | length', payload) AS n, jq('"x" * 600000', payload) AS a FROM "jq/once"'''
+actions = [{ function = "republish", args = { topic = "jq/out/once", payload = "${n}" } }]
+"#;
+
+/// The last line the broker logged at WARN for a failed evaluation of `rule`.
+fn rule_failure(broker: &Broker, rule: &str) -> String {
+    broker
+        .log_lines(|l| l.contains("rule SQL failed") && l.contains(&format!("rule={rule} ")))
+        .pop()
+        .unwrap_or_else(|| panic!("no failure of `{rule}` logged:\n{}", broker.log.tail(40)))
+}
+
+/// ADR 0086 D4, D7, D8, D10, through the shipped binary with `[rules] jq = true`: the
+/// results EMQX 6.3.1 gave for the same statements and payloads; a program taken from
+/// the payload; the listed environment; the timeout, the memory cap and the output
+/// budget each failing its rule, with its kind counted and its text logged, while the
+/// message is still delivered and the next call is served; and the per-function and
+/// per-module metrics.
+///
+/// The output budget is the message's: `once` returns 600 KB and passes, `twice`
+/// returns it a second time in the same statement and is refused, because the first
+/// call's output was charged (the budget is 1 MiB per message). A call given the whole
+/// megabyte each time would pass `twice`.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one broker, one scenario per rule
+async fn jq_runs_in_the_broker_with_emqx_results_limits_and_metrics() {
+    if let Err(why) = mqtt_rules::Jq::built_in() {
+        skip_locally_or_fail_in_ci!("{why}: {JQ_MODULE_HOW}");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    write_rules(dir.path(), JQ_RULES);
+    let setup = Setup {
+        toml: "\n[rules]\njq = true\njq_env = [\"SITE\", \"REGION\"]\n".to_string(),
+        env: vec![("SITE", "plant-7".to_string())],
+        rules_by_env: true,
+        ..Setup::default()
+    };
+    let broker = start(dir.path(), "jq-node", &setup).await;
+    // Said once at boot: the switch is on; and the module was compiled when the rules
+    // were loaded, before any message.
+    assert_eq!(
+        broker
+            .log_lines(|l| l.contains("rules.jq is on: rules may call jq"))
+            .len(),
+        1,
+        "{}",
+        broker.log.tail(40)
+    );
+    assert_eq!(
+        broker
+            .log_lines(|l| l.contains("the rules call jq; its WebAssembly module is compiled"))
+            .len(),
+        1
+    );
+    assert_eq!(
+        broker.sample(JQ_CALLS).await,
+        None,
+        "no call before a message"
+    );
+
+    let mut sub = Client::connect(broker.addr, "jq-sub").await;
+    assert_eq!(subscribe(&mut sub, 1, "jq/#", QoS::AtMostOnce).await, [0]);
+    let mut publ = Client::connect(broker.addr, "jq-pub").await;
+    let mut pkid = 0u16;
+    let mut publish = async |publ: &mut Client, topic: &str, payload: &str| {
+        pkid += 1;
+        assert_eq!(
+            publish_acked(publ, topic, payload.as_bytes(), pkid).await,
+            0
+        );
+    };
+
+    // EMQX 6.3.1's answers (emqx_rule_sqltester, 2026-10-11).
+    for (topic, payload, derived) in [
+        (
+            "jq/whole",
+            r#"{"a":[1,2]}"#,
+            vec![("jq/out/whole", r#"[{"a":[1,2]}]"#)],
+        ),
+        (
+            "jq/each",
+            r#"{"a":[1,2]}"#,
+            vec![("jq/out/each", "1"), ("jq/out/each", "2")],
+        ),
+        (
+            "jq/field",
+            r#"{"a":{"b":1.0,"c":12345678901234567890123}}"#,
+            vec![("jq/out/field", r#"[{"b":1.0,"c":12345678901234567890123}]"#)],
+        ),
+        // The program and its input from the payload, and jq deciding the WHERE.
+        (
+            "jq/where",
+            r#"{"a":1,"p":".[] | select(. > 1)","i":[1,2,3]}"#,
+            vec![("jq/out/where", "[2,3]")],
+        ),
+        (
+            "jq/env",
+            "1",
+            vec![("jq/out/env", r#"[["plant-7",null,["SITE"]]]"#)],
+        ),
+    ] {
+        publish(&mut publ, topic, payload).await;
+        assert_eq!(
+            next(&mut sub).await,
+            got(topic, payload, QoS::AtMostOnce, false)
+        );
+        for (out, text) in derived {
+            assert_eq!(next(&mut sub).await, got(out, text, QoS::AtMostOnce, false));
+        }
+    }
+    // The WHERE that does not hold: both calls ran (the SELECT is evaluated first, as in
+    // EMQX) and nothing is derived.
+    publish(&mut publ, "jq/where", r#"{"a":2,"p":".","i":1}"#).await;
+    assert_eq!(
+        next(&mut sub).await,
+        got(
+            "jq/where",
+            r#"{"a":2,"p":".","i":1}"#,
+            QoS::AtMostOnce,
+            false
+        )
+    );
+    assert_eq!(
+        broker.sample(&evaluations("where", "no_result")).await,
+        Some(1)
+    );
+    assert_eq!(broker.sample(JQ_CALLS).await, Some(8));
+
+    // Each limit fails its rule and nothing else: the message arrives, nothing is
+    // derived from it, and the failure is counted by kind and logged with its text.
+    for (topic, rule, kind, text) in [
+        (
+            "jq/slow",
+            "slow",
+            "timeout",
+            "jq(): timeout: jq program canceled as it took too long time to execute (timeout \
+             set to 40 ms)",
+        ),
+        (
+            "jq/index",
+            "index",
+            "process",
+            "jq(): jq_err_process: jq error: Cannot index number with string \"x\"",
+        ),
+        (
+            "jq/big",
+            "big",
+            "memory",
+            "jq(): sandbox_limit (memory): jq stopped: the module reached its memory limit",
+        ),
+        (
+            "jq/twice",
+            "twice",
+            "output",
+            "jq(): sandbox_limit (output): jq output is larger than the limit",
+        ),
+    ] {
+        publish(&mut publ, topic, "1").await;
+        assert_eq!(
+            next(&mut sub).await,
+            got(topic, "1", QoS::AtMostOnce, false)
+        );
+        assert_eq!(
+            broker.sample(&evaluations(rule, "failed")).await,
+            Some(1),
+            "{rule}"
+        );
+        assert_eq!(broker.sample(&jq_errors(kind)).await, Some(1), "{rule}");
+        let logged = rule_failure(&broker, rule);
+        assert!(
+            logged.contains(&format!("error={text}")),
+            "{rule}: {logged}"
+        );
+    }
+    // 600 KB once fits the message's megabyte; the instance that hit the memory cap was
+    // replaced, and the calls after it were served.
+    publish(&mut publ, "jq/once", "1").await;
+    assert_eq!(
+        next(&mut sub).await,
+        got("jq/once", "1", QoS::AtMostOnce, false)
+    );
+    assert_eq!(
+        next(&mut sub).await,
+        got("jq/out/once", "[600000]", QoS::AtMostOnce, false)
+    );
+    sub.expect_silence().await;
+
+    let metrics = broker.metrics().await;
+    // 8 before, one each for slow, index and big, three for twice, two for once.
+    assert_eq!(sample(&metrics, JQ_CALLS), Some(16), "{metrics}");
+    assert_eq!(
+        series_lines(&metrics, "mqttd_rule_function_errors_total{").len(),
+        4,
+        "{metrics}"
+    );
+    let gauge = |name: &str| {
+        sample(&metrics, &format!("{name}{{module=\"jq\"}}"))
+            .unwrap_or_else(|| panic!("no {name}:\n{metrics}"))
+    };
+    assert!(gauge("mqttd_rule_module_instances") >= 1, "{metrics}");
+    assert!(
+        gauge("mqttd_rule_module_memory_bytes") >= 2 << 20,
+        "{metrics}"
+    );
+    assert!(
+        gauge("mqttd_rule_module_instances_replaced_total") >= 1,
+        "the instance stopped at the memory cap was not replaced:\n{metrics}"
+    );
+    assert!(
+        series_lines(
+            &metrics,
+            "mqttd_rule_function_seconds_total{function=\"jq\"}"
+        )
+        .len()
+            == 1,
+        "{metrics}"
+    );
+}
+
+/// One rule whose jq never ends by itself (and prints nothing, so it is the clock that
+/// stops it, not the output budget) and runs under `jq/2`'s default timeout, EMQX's
+/// ten seconds; and nothing on any other topic.
+const JQ_TEN_SECONDS: &str = r#"[rules.endless]
+sql = '''SELECT jq('def f: f; f', payload) AS r FROM "slow/#"'''
+actions = [{ function = "republish", args = { topic = "never", payload = "${r}" } }]
+"#;
+
+/// One `QoS` 1 round trip on `c`: when it was sent and how long the PUBACK took.
+async fn timed_publish(c: &mut Client, topic: &str, pkid: u16) -> (Instant, Duration) {
+    let sent = Instant::now();
+    assert_eq!(publish_acked(c, topic, b"1", pkid).await, 0);
+    (sent, sent.elapsed())
+}
+
+/// ADR 0086 D6: a ten-second jq on one connection does not delay another connection's
+/// publish. The broker runs on ONE runtime worker thread (`TOKIO_WORKER_THREADS=1`), so
+/// a call that kept the worker would hold every connection for ten seconds; after its
+/// first millisecond the call goes on under `block_in_place`, which gives the worker's
+/// other tasks to another thread.
+///
+/// One client publishes into the endless rule at `QoS` 1; its PUBACK waits for the rule,
+/// that is for the timeout. A second client publishes at `QoS` 1 the whole time. When the
+/// first PUBACK arrives, the jq is known to have run for the ten seconds before it: of
+/// the second client's round trips inside that window there must be many, and none may
+/// have taken a second. Without the hand-off there is at most one, ten seconds long.
+#[tokio::test]
+async fn a_ten_second_jq_on_one_connection_does_not_delay_another_connections_publish() {
+    if let Err(why) = mqtt_rules::Jq::built_in() {
+        skip_locally_or_fail_in_ci!("{why}: {JQ_MODULE_HOW}");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    write_rules(dir.path(), JQ_TEN_SECONDS);
+    let setup = Setup {
+        env: vec![
+            ("MQTTD_RULES_JQ", "1".to_string()),
+            ("TOKIO_WORKER_THREADS", "1".to_string()),
+        ],
+        ..Setup::default()
+    };
+    let broker = start(dir.path(), "jq-slow", &setup).await;
+    let mut slow = Client::connect(broker.addr, "slow-pub").await;
+    let mut fast = Client::connect(broker.addr, "fast-pub").await;
+    let mut sub = Client::connect(broker.addr, "fast-sub").await;
+    assert_eq!(subscribe(&mut sub, 1, "fast/#", QoS::AtMostOnce).await, [0]);
+
+    let timeout = Duration::from_secs(10);
+    let started = Instant::now();
+    slow.publish("slow/1", b"1", QoS::AtLeastOnce, Some(1), vec![])
+        .await;
+    // The other connection's publishes, each delivered to its subscriber, until the
+    // slow one is answered.
+    let mut trips = Vec::new();
+    let mut pkid = 0u16;
+    let answered = loop {
+        pkid = pkid.wrapping_add(1).max(1);
+        trips.push(timed_publish(&mut fast, "fast/1", pkid).await);
+        assert_eq!(
+            next(&mut sub).await,
+            got("fast/1", "1", QoS::AtMostOnce, false)
+        );
+        match slow.recv_bounded(Duration::ZERO).await {
+            Recv::Quiet => {}
+            Recv::Packet(Packet::PubAck(ack)) => {
+                assert_eq!((ack.pkid, ack.reason), (1, 0));
+                break Instant::now();
+            }
+            other => panic!("expected the slow publish's PUBACK, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the slow publish was never answered; log tail:\n{}",
+            broker.log.tail(30)
+        );
+    };
+    let held = answered - started;
+    assert!(
+        held >= timeout && held < timeout + Duration::from_secs(5),
+        "the jq rule held its own publisher for {held:?}, not its ten-second timeout"
+    );
+    assert_eq!(broker.sample(&jq_errors("timeout")).await, Some(1));
+    // The jq was running from (answered - 10 s) on.
+    let during: Vec<Duration> = trips
+        .iter()
+        .filter(|(sent, _)| *sent + timeout >= answered)
+        .map(|(_, took)| *took)
+        .collect();
+    let slowest = during.iter().max().copied().unwrap_or_default();
+    assert!(
+        during.len() >= 100 && slowest < Duration::from_secs(1),
+        "while one connection's jq ran for ten seconds, another connection completed {} \
+         publishes, the slowest in {slowest:?}",
+        during.len()
+    );
+    let mut sorted = during.clone();
+    sorted.sort_unstable();
+    eprintln!(
+        "D6 hand-off, one worker thread: {} QoS 1 round trips on another connection during a \
+         ten-second jq; median {:?}, p99 {:?}, slowest {slowest:?}",
+        sorted.len(),
+        sorted[sorted.len() / 2],
+        sorted[sorted.len() * 99 / 100],
+    );
+}
+
+/// A Will into the endless rule, with a timeout the test can wait out.
+const JQ_WILL: &str = r#"[rules.lastwords]
+sql = '''SELECT jq('def f: f; f', payload, 3000) AS r FROM "will/#"'''
+actions = [{ function = "republish", args = { topic = "never", payload = "${r}" } }]
+"#;
+
+/// ADR 0086 D6, amended 2026-10-11: the hub publishes a Will and, since ADR 0083, runs
+/// its rules itself. Rules that call `jq` may run for seconds, and everything waits for
+/// the hub: with such rules loaded a Will's rules run on a task of their own. Here a
+/// client's Will meets a rule whose jq runs for three seconds; every publish of another
+/// client goes through the hub and must be acknowledged promptly throughout. A hub
+/// that evaluated the Will itself would hold one of them for the three seconds.
+#[tokio::test]
+async fn a_will_whose_rules_call_jq_does_not_hold_the_hub() {
+    if let Err(why) = mqtt_rules::Jq::built_in() {
+        skip_locally_or_fail_in_ci!("{why}: {JQ_MODULE_HOW}");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    write_rules(dir.path(), JQ_WILL);
+    let setup = Setup {
+        env: vec![("MQTTD_RULES_JQ", "1".to_string())],
+        ..Setup::default()
+    };
+    let broker = start(dir.path(), "jq-will", &setup).await;
+    let mut other = Client::connect(broker.addr, "bystander").await;
+    let mut watcher = Client::connect(broker.addr, "will-watcher").await;
+    assert_eq!(
+        subscribe(&mut watcher, 1, "will/#", QoS::AtMostOnce).await,
+        [0]
+    );
+    let mut doomed = Client::open(broker.addr, V4).await;
+    doomed
+        .connect_with_will("doomed", "will/doomed", b"1")
+        .await;
+    // The connection is dropped without a DISCONNECT: the hub publishes the Will.
+    drop(doomed);
+    assert_eq!(
+        next(&mut watcher).await,
+        got("will/doomed", "1", QoS::AtMostOnce, false)
+    );
+    let started = Instant::now();
+    let mut slowest = Duration::ZERO;
+    let mut pkid = 0u16;
+    // Publish until the Will's jq has timed out, which the broker counts when it has
+    // (the metrics are read ten times a second, between publishes).
+    let mut read_at = started;
+    loop {
+        pkid = pkid.wrapping_add(1).max(1);
+        slowest = slowest.max(timed_publish(&mut other, "plain/1", pkid).await.1);
+        if read_at.elapsed() < Duration::from_millis(100) {
+            continue;
+        }
+        read_at = Instant::now();
+        if broker.sample(&jq_errors("timeout")).await == Some(1) {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the Will's rule never ran:\n{}",
+            broker.log.tail(30)
+        );
+    }
+    assert!(
+        started.elapsed() >= Duration::from_millis(2500),
+        "the Will's jq ended after {:?}, not its three seconds",
+        started.elapsed()
+    );
+    assert!(
+        slowest < Duration::from_secs(1),
+        "a publish waited {slowest:?} for the hub while a Will's jq ran"
+    );
+    assert_eq!(
+        broker.sample(&evaluations("lastwords", "failed")).await,
+        Some(1)
+    );
+}
+
+/// ADR 0086 D5, D13 with ADR 0084: rules that call `jq` are applied through the admin
+/// API to a running broker. Before the edit the broker has `jq` switched on and no rule
+/// that calls it: nothing of the runtime exists (no module compiled, no jq series). The
+/// applied file is validated and loaded on the admin's own thread, which is where the
+/// module is compiled; the connection that was open all along runs jq on its next
+/// message. A broker with `jq` switched off refuses the same file with the reason — 422,
+/// naming the switch — writes nothing and keeps its rules, through the admin API and on
+/// SIGHUP alike.
+#[tokio::test]
+async fn jq_rules_are_applied_live_through_the_admin_api_and_refused_where_jq_is_off() {
+    if let Err(why) = mqtt_rules::Jq::built_in() {
+        skip_locally_or_fail_in_ci!("{why}: {JQ_MODULE_HOW}");
+    }
+    let compiled = "the rules call jq; its WebAssembly module is compiled";
+    for jq_on in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let pki_dir = tempfile::tempdir().unwrap();
+        write_rules(dir.path(), EDIT_A);
+        let pki = admin_pki(pki_dir.path());
+        let admin = band_addr();
+        let mut env = admin_env(&pki, admin);
+        if jq_on {
+            env.push(("MQTTD_RULES_JQ", "1".to_string()));
+        }
+        let setup = Setup {
+            env,
+            ..Setup::default()
+        };
+        let broker = start(dir.path(), "jq-edit", &setup).await;
+        let mut sub = Client::connect(broker.addr, "jq-edit-sub").await;
+        assert_eq!(subscribe(&mut sub, 1, "out/#", QoS::AtMostOnce).await, [0]);
+        assert_eq!(subscribe(&mut sub, 2, "jq/out", QoS::AtMostOnce).await, [0]);
+        let mut publ = Client::connect(broker.addr, "jq-edit-pub").await;
+        assert_eq!(
+            broker.log_lines(|l| l.contains(compiled)),
+            Vec::<String>::new()
+        );
+
+        let both = format!("{EDIT_A}\n{JQ_ONE}");
+        let next_file = pki_dir.path().join("next.toml");
+        std::fs::write(&next_file, &both).unwrap();
+        let digest = sha256_hex(EDIT_A.as_bytes());
+        let applied = admin_cli(
+            &pki,
+            admin,
+            &[
+                "rules-apply",
+                &next_file.display().to_string(),
+                "--if_match",
+                &digest,
+            ],
+        );
+        let on_disk = std::fs::read_to_string(dir.path().join("rules.toml")).unwrap();
+        if jq_on {
+            assert_eq!(applied.code, Some(0), "{applied:?}");
+            assert_eq!(on_disk, both);
+            assert_eq!(broker.log_lines(|l| l.contains(compiled)).len(), 1);
+            publ.publish(
+                "jq/in",
+                br#"{"a":[1,"two"]}"#,
+                QoS::AtMostOnce,
+                None,
+                vec![],
+            )
+            .await;
+            assert_eq!(
+                next(&mut sub).await,
+                got("jq/out", r#"[1,"two"]"#, QoS::AtMostOnce, false)
+            );
+            broker.wait_metric(JQ_CALLS, 1).await;
+        } else {
+            assert_eq!(applied.code, Some(1), "{applied:?}");
+            assert!(
+                applied.stderr.contains("422 rules-invalid") && applied.stderr.contains(JQ_OFF),
+                "{applied:?}"
+            );
+            assert_eq!(on_disk, EDIT_A, "a refused write wrote the file");
+            // The same file put there by hand and reloaded is rejected the same way.
+            write_rules(dir.path(), &both);
+            broker.signal("HUP");
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while broker
+                .log_lines(|l| l.contains("reload REJECTED") && l.contains(JQ_OFF))
+                .is_empty()
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "the reload was not rejected for jq being off; log tail:\n{}",
+                    broker.log.tail(30)
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(
+                broker.log_lines(|l| l.contains(compiled)),
+                Vec::<String>::new()
+            );
+            assert_eq!(broker.sample(JQ_CALLS).await, None);
+        }
+        // The rule that was running keeps running either way.
+        publ.publish("w/1", br#"{"v":"y"}"#, QoS::AtMostOnce, None, vec![])
+            .await;
+        assert_eq!(
+            next(&mut sub).await,
+            got("out/w/y", "y", QoS::AtMostOnce, false)
+        );
+    }
+}
+
+/// ADR 0086 D13: `mqttd --check-config` says, while `rules.jq` is on, whether this host
+/// lets compiled code run — and says nothing about jq while it is off. The config is
+/// valid either way (exit 0): the check often runs where the broker will not.
+#[test]
+fn check_config_reports_whether_this_host_can_run_jq_while_it_is_switched_on() {
+    let check = |jq: Option<&str>| {
+        let mut cmd = mqttd();
+        cmd.arg("--check-config").env("MQTTD_DURABLE_SESSIONS", "0");
+        if let Some(jq) = jq {
+            cmd.env("MQTTD_RULES_JQ", jq);
+        }
+        run(cmd)
+    };
+    let ok = "config OK: defaults + MQTTD_* env overlay validates (no config file set)\n";
+    for off in [None, Some("0")] {
+        let ran = check(off);
+        assert_eq!((ran.code, ran.stdout.as_str()), (Some(0), ok), "{ran:?}");
+    }
+    let ran = check(Some("1"));
+    assert_eq!(ran.code, Some(0), "{ran:?}");
+    let report = ran
+        .stdout
+        .strip_prefix(ok)
+        .unwrap_or_else(|| panic!("{ran:?}"));
+    match mqtt_rules::Jq::built_in() {
+        // On a host that forbids executable memory this is a warning naming
+        // MemoryDenyWriteExecute; the hosts the tests run on allow it.
+        Ok(()) => assert!(
+            report.starts_with("rules.jq is on: this host allows compiled code (jq module sha256 ")
+                && report.trim_end().ends_with(')'),
+            "{ran:?}"
+        ),
+        Err(why) => assert_eq!(
+            report,
+            format!(
+                "warning: rules.jq is on, but {why}: a rules file that calls jq will not load\n"
+            ),
+            "{ran:?}"
+        ),
+    }
 }

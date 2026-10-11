@@ -1292,7 +1292,7 @@ async fn run_arm(cl: &mut Cluster, cfg: &Cfg, arm: &Arm, tag: &str) -> RunStats 
 
     let mut subs = Vec::new();
     for i in 0..cfg.subs {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_mins(1);
         loop {
             if let Some((mut c, _)) = common::Client::connect_v311_within(
                 sub_addrs[i],
@@ -1345,7 +1345,7 @@ async fn run_arm(cl: &mut Cluster, cfg: &Cfg, arm: &Arm, tag: &str) -> RunStats 
         warm_from.dedup();
         for (w, warm_addr) in warm_from.into_iter().enumerate() {
             let warm = format!("warm-{tag}-shared-{w}").into_bytes();
-            let deadline = Instant::now() + Duration::from_secs(60);
+            let deadline = Instant::now() + Duration::from_mins(1);
             'converge: loop {
                 if let Some((mut p, _)) = common::Client::connect_v311_within(
                     warm_addr,
@@ -1394,7 +1394,7 @@ async fn run_arm(cl: &mut Cluster, cfg: &Cfg, arm: &Arm, tag: &str) -> RunStats 
         warm_from.dedup();
         for (w, warm_addr) in warm_from.into_iter().enumerate() {
             let warm = format!("warm-{tag}-{i}-{w}").into_bytes();
-            let deadline = Instant::now() + Duration::from_secs(60);
+            let deadline = Instant::now() + Duration::from_mins(1);
             loop {
                 if let Some((mut p, _)) = common::Client::connect_v311_within(
                     warm_addr,
@@ -2009,7 +2009,7 @@ async fn degraded_group_does_not_delay_other_groups() {
     if std::env::var("MQTTD_BENCH_PREFLIGHT_SECS").is_err() {
         // A 5-node cluster's ADR 0043 P1 replica-group sweep plateaus below
         // current==tracked (see `preflight`); 60 s is enough to reach the plateau.
-        cfg.preflight = Duration::from_secs(60);
+        cfg.preflight = Duration::from_mins(1);
     }
     let slow_ms: u64 = env_usize("MQTTD_BENCH_SLOW_MS", 1500) as u64;
     let phase = Duration::from_secs(env_usize("MQTTD_BENCH_PHASE_SECS", 25) as u64);
@@ -2158,7 +2158,7 @@ async fn degraded_group_does_not_delay_other_groups() {
     }
     // Keep the subscriber sessions drained for the whole experiment, so nothing
     // measured here is really an unacked-queue effect.
-    let experiment_end = Instant::now() + phase * 4 + Duration::from_secs(120);
+    let experiment_end = Instant::now() + phase * 4 + Duration::from_mins(2);
     let mut drains = Vec::new();
     for c in subs {
         drains.push(tokio::spawn(drainer(c, experiment_end, QoS::AtLeastOnce)));
@@ -2181,7 +2181,7 @@ async fn degraded_group_does_not_delay_other_groups() {
             // hoping for. Polling it means the recovery phase starts when recovery has HAPPENED,
             // so the measurement is of a healed cluster rather than of whatever state 15 s
             // produced on this particular machine.
-            let deadline = Instant::now() + Duration::from_secs(120);
+            let deadline = Instant::now() + Duration::from_mins(2);
             loop {
                 let s = Scrape::of(owner_health).await;
                 if s.get("mqttd_replication_min_actual") >= s.get("mqttd_replication_write_floor") {

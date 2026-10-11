@@ -65,7 +65,7 @@ pub const DEFAULT_SESSION_CACHE: usize = 32 * 1024;
 /// rustls' memory cache holds entries until capacity evicts them, which on a quiet
 /// broker means a resumption secret could stay redeemable for months; an entry past this
 /// age is refused and the client simply performs a full handshake.
-pub const SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+pub const SESSION_TTL: std::time::Duration = std::time::Duration::from_hours(24);
 
 /// [`rustls::server::StoresServerSessions`] wrapper that stamps every entry with its
 /// insertion time and refuses to return one older than `ttl`.

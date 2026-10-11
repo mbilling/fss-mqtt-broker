@@ -2,10 +2,14 @@
 //! need no Wasm toolchain and no jq. What the module's one function does is chosen by
 //! the first letter of the name it is called by (see [`call_body`]).
 
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::jq::{Pool, Tag};
-use crate::{Arg, CallError, Execution, Grants, Limits, LoadError, Reply, Sandbox, ABI_VERSION};
+use crate::jq::{Pool, PoolStats, Tag};
+use crate::{
+    Arg, CallError, Execution, Grants, HandOff, Limits, LoadError, Reply, Sandbox, ABI_VERSION,
+};
 
 fn uleb(mut n: u32, out: &mut Vec<u8>) {
     loop {
@@ -393,6 +397,188 @@ fn a_result_larger_than_the_limit_is_refused_unread() {
     assert!(instance.is_poisoned());
 }
 
+/// A caller with a budget gives a call what is left of it: the same result that fits
+/// the module's bound is refused under the call's own.
+#[test]
+fn a_call_is_held_to_its_own_bound_on_the_result() {
+    let sandbox = sandbox(Limits::default());
+    let mut instance = sandbox.instantiate().unwrap();
+    // `jtrue` is five bytes; the host reads a result of up to the bound and one more.
+    assert_eq!(
+        instance.call_within("t", &[], soon(), 4),
+        Ok(Reply::Json(b"true".to_vec()))
+    );
+    assert_eq!(
+        instance.call_within("t", &[], soon(), 3),
+        Err(CallError::OutputTooLarge)
+    );
+    // The call's bound never raises the module's.
+    let small = Sandbox::load(
+        &module(PLAIN),
+        Limits {
+            max_output_bytes: 3,
+            ..Limits::default()
+        },
+        Grants::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        small
+            .instantiate()
+            .unwrap()
+            .call_within("t", &[], soon(), u32::MAX),
+        Err(CallError::OutputTooLarge)
+    );
+}
+
+/// A hand-off that counts how often it was given the rest of a call, and runs it.
+fn counting_hand_off() -> (HandOff, Arc<AtomicU32>) {
+    let count = Arc::new(AtomicU32::new(0));
+    let theirs = Arc::clone(&count);
+    let hand_off: HandOff = Arc::new(move |rest: &mut dyn FnMut()| {
+        theirs.fetch_add(1, Ordering::SeqCst);
+        rest();
+    });
+    (hand_off, count)
+}
+
+/// ADR 0086 D6: a call that is still running after its first slice is suspended once,
+/// and what is left of it runs inside the module's hand-off, to the same end it would
+/// have had. A call that is done within the slice never meets the hand-off, and neither
+/// does one whose deadline comes before the slice ends.
+#[test]
+fn a_call_that_outlasts_its_first_slice_goes_on_inside_the_hand_off() {
+    let (hand_off, handed) = counting_hand_off();
+    let limits = Limits {
+        first_slice: Duration::from_millis(5),
+        ..Limits::default()
+    };
+    let sandbox = sandbox(limits).with_hand_off(hand_off);
+    let mut instance = sandbox.instantiate().unwrap();
+    assert_eq!(
+        instance.call("t", &[], soon()),
+        Ok(Reply::Json(b"true".to_vec()))
+    );
+    assert_eq!(
+        handed.load(Ordering::SeqCst),
+        0,
+        "a quick call was handed off"
+    );
+
+    // The endless loop: suspended after five milliseconds, stopped at its deadline.
+    let started = Instant::now();
+    let outcome = instance.call("loop", &[], Some(started + Duration::from_millis(80)));
+    let took = started.elapsed();
+    assert_eq!(outcome, Err(CallError::Timeout));
+    assert_eq!(handed.load(Ordering::SeqCst), 1, "handed off once");
+    assert!(
+        took >= Duration::from_millis(80) && took < Duration::from_secs(5),
+        "stopped after {took:?}"
+    );
+
+    // A deadline inside the first slice: the call is over before it could be handed on.
+    let mut instance = sandbox.instantiate().unwrap();
+    let started = Instant::now();
+    let outcome = instance.call("loop", &[], Some(started + Duration::from_millis(2)));
+    assert_eq!(outcome, Err(CallError::Timeout));
+    assert_eq!(handed.load(Ordering::SeqCst), 1);
+
+    // No deadline at all: handed off like any other, and still running until the
+    // memory cap stops it (`g` grows its memory for ever).
+    let slow = Limits {
+        first_slice: Duration::ZERO,
+        ..Limits::default()
+    };
+    let (hand_off, handed) = counting_hand_off();
+    let mut instance = self::sandbox(slow)
+        .with_hand_off(hand_off)
+        .instantiate()
+        .unwrap();
+    assert_eq!(instance.call("grow", &[], None), Err(CallError::Memory));
+    assert!(handed.load(Ordering::SeqCst) <= 1);
+}
+
+/// A hand-off that does not run what it is given, or runs it twice, changes nothing:
+/// the call still runs to its end, once.
+#[test]
+fn a_hand_off_that_misbehaves_does_not_lose_or_repeat_the_call() {
+    let limits = || Limits {
+        first_slice: Duration::from_millis(1),
+        ..Limits::default()
+    };
+    let lazy: HandOff = Arc::new(|_rest: &mut dyn FnMut()| {});
+    let eager: HandOff = Arc::new(|rest: &mut dyn FnMut()| {
+        rest();
+        rest();
+    });
+    for hand_off in [lazy, eager] {
+        let mut instance = sandbox(limits())
+            .with_hand_off(hand_off)
+            .instantiate()
+            .unwrap();
+        let started = Instant::now();
+        let outcome = instance.call("loop", &[], Some(started + Duration::from_millis(30)));
+        assert_eq!(outcome, Err(CallError::Timeout));
+        assert!(started.elapsed() >= Duration::from_millis(30));
+    }
+}
+
+/// The interpreter suspends and resumes a call as compiled code does.
+#[test]
+fn an_interpreted_call_is_handed_off_too() {
+    let (hand_off, handed) = counting_hand_off();
+    let limits = Limits {
+        first_slice: Duration::from_millis(5),
+        ..Limits::default()
+    };
+    let sandbox = Sandbox::load_as(
+        &module(PLAIN),
+        Execution::Interpreted,
+        limits,
+        Grants::default(),
+    )
+    .expect("the test module loads")
+    .with_hand_off(hand_off);
+    let mut instance = sandbox.instantiate().unwrap();
+    assert_eq!(
+        instance.call("t", &[], soon()),
+        Ok(Reply::Json(b"true".to_vec()))
+    );
+    assert_eq!(handed.load(Ordering::SeqCst), 0);
+    let started = Instant::now();
+    let outcome = instance.call("loop", &[], Some(started + Duration::from_millis(60)));
+    assert_eq!(outcome, Err(CallError::Timeout));
+    assert_eq!(handed.load(Ordering::SeqCst), 1);
+    assert!(started.elapsed() >= Duration::from_millis(60));
+}
+
+/// While one call is in its hand-off, calls on other threads are not suspended by its
+/// ticks: each is handed off at the end of its own first slice, and not before.
+#[test]
+fn every_call_is_handed_off_at_the_end_of_its_own_first_slice() {
+    let (hand_off, handed) = counting_hand_off();
+    let limits = Limits {
+        first_slice: Duration::from_millis(200),
+        ..Limits::default()
+    };
+    let sandbox = sandbox(limits).with_hand_off(hand_off);
+    std::thread::scope(|scope| {
+        // Four loops, each stopped at 30 ms: well inside its first slice.
+        for _ in 0..4 {
+            let sandbox = &sandbox;
+            scope.spawn(move || {
+                let mut instance = sandbox.instantiate().unwrap();
+                let deadline = Some(Instant::now() + Duration::from_millis(30));
+                assert_eq!(
+                    instance.call("loop", &[], deadline),
+                    Err(CallError::Timeout)
+                );
+            });
+        }
+    });
+    assert_eq!(handed.load(Ordering::SeqCst), 0);
+}
+
 #[test]
 fn instances_share_no_state() {
     let sandbox = sandbox(Limits::default());
@@ -670,6 +856,72 @@ fn a_pool_compiles_on_first_use_and_shares_warm_instances() {
     });
     assert!((1..=2).contains(&pool.idle()), "{} idle", pool.idle());
     assert!(pool.load().is_ok());
+    assert!(!pool.refused_by_host());
+    // What a broker exports: the instances kept and their memory (one page each for
+    // this module), every instance ever made, none given up.
+    let stats = pool.stats();
+    let kept = u64::try_from(pool.idle()).unwrap();
+    assert_eq!(
+        (stats.instances, stats.memory_bytes, stats.replaced),
+        (kept, kept * 65_536, 0),
+        "{stats:?}"
+    );
+    assert!(stats.made >= kept, "{stats:?}");
+}
+
+/// A pool counts the instances its calls cost: one stopped at its deadline is given
+/// up, and the next call is served by a new one. Its hand-off reaches every instance.
+#[test]
+fn a_pool_replaces_an_instance_a_call_stopped_and_counts_it() {
+    let (hand_off, handed) = counting_hand_off();
+    let limits = Limits {
+        first_slice: Duration::from_millis(1),
+        ..Limits::default()
+    };
+    let pool = Pool::new(
+        module(PLAIN),
+        Execution::Compiled,
+        limits,
+        Grants::default(),
+        1,
+    )
+    .with_hand_off(hand_off);
+    assert_eq!(pool.stats(), PoolStats::default());
+    // The hand-written module's function loops for ever when called `l…`; the pool
+    // calls it `jq`, so the endless call is made on an instance directly.
+    let mut instance = pool.load().unwrap().instantiate().unwrap();
+    let deadline = Some(Instant::now() + Duration::from_millis(20));
+    assert_eq!(
+        instance.call("loop", &[], deadline),
+        Err(CallError::Timeout)
+    );
+    assert_eq!(handed.load(Ordering::SeqCst), 1);
+
+    assert_eq!(pool.eval(b".", Arg::Json("1"), None), Ok(b"true".to_vec()));
+    assert_eq!(pool.compile(b"."), Ok(()));
+    assert_eq!(pool.warm(&[b".", b".a"]), Ok(()));
+    let stats = pool.stats();
+    assert_eq!(
+        (stats.instances, stats.made, stats.replaced),
+        (1, 1, 0),
+        "{stats:?}"
+    );
+    // The result bound of one call, through the pool.
+    let error = pool.eval_within(b".", Arg::Json("1"), None, 2).unwrap_err();
+    assert_eq!((error.tag, error.kind), (Tag::Limit, "output"));
+    let stats = pool.stats();
+    assert_eq!(
+        (
+            stats.instances,
+            stats.made,
+            stats.replaced,
+            stats.memory_bytes
+        ),
+        (0, 1, 1, 0),
+        "the stopped instance is gone, and counted: {stats:?}"
+    );
+    assert_eq!(pool.eval(b".", Arg::Json("1"), None), Ok(b"true".to_vec()));
+    assert_eq!(pool.stats().made, 2);
 }
 
 #[test]
@@ -693,4 +945,8 @@ fn a_pool_whose_module_cannot_load_says_why_on_every_call() {
     assert!(!pool.is_loaded());
     assert!(pool.load().is_err());
     assert_eq!(pool.idle(), 0);
+    // The module's fault, not this host's: no operator setting would load it.
+    assert!(!pool.refused_by_host());
+    assert!(pool.warm(&[b"."]).is_err());
+    assert_eq!(pool.stats(), PoolStats::default());
 }

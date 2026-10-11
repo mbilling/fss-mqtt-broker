@@ -435,7 +435,7 @@ async fn collect(broker: &Broker, watcher: &mut Client, want: Option<usize>) -> 
 
     let mut got = Vec::new();
     let mut sentinel = false;
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     loop {
         let done = match want {
             Some(n) => sentinel && got.len() >= n,

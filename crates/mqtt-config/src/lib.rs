@@ -648,6 +648,23 @@ pub struct Rules {
     /// A writer also needs the `operator` role. Empty (the default) = rules writes off.
     /// Needs the admin listener. Hot-reloadable.
     pub admin_writers: Vec<String>,
+    /// EMQX's `jq` rule function (`MQTTD_RULES_JQ`, `1`/`0`;
+    /// [ADR 0086](../../../docs/adr/0086-wasm-rule-functions.md)). Off by default: a
+    /// rules file that calls `jq` then does not load. On, jq runs as compiled
+    /// WebAssembly, which needs memory the process may map executable: under the
+    /// shipped systemd unit also set `MemoryDenyWriteExecute=false`, or a rules file
+    /// that calls `jq` fails to load and says so. Set it on every node of a cluster.
+    /// Read at startup: a change needs a restart.
+    pub jq: bool,
+    /// Milliseconds `jq/2` may run (`MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS`, default
+    /// 10000, as EMQX's `rule_engine.jq_function_default_timeout`); `jq/3` names its
+    /// own. Read at startup.
+    pub jq_default_timeout_ms: u64,
+    /// The environment variables a jq program may read as `$ENV.NAME` or `env.NAME`
+    /// (`MQTTD_RULES_JQ_ENV`, `,`-separated names). Empty (the default) = none: unlike
+    /// EMQX, which shows jq the broker's whole environment, secrets included. A listed
+    /// variable that is unset is absent. Read at startup.
+    pub jq_env: Vec<String>,
 }
 
 impl Default for Rules {
@@ -658,6 +675,9 @@ impl Default for Rules {
             trace: false,
             trace_rate: 20,
             admin_writers: Vec::new(),
+            jq: false,
+            jq_default_timeout_ms: 10_000,
+            jq_env: Vec::new(),
         }
     }
 }
@@ -1163,6 +1183,20 @@ impl Config {
     /// [`ConfigError::Parse`] if the file is unreadable or malformed; [`ConfigError::Invalid`]
     /// if an env value is unparseable or the result fails validation.
     pub fn load(path: Option<&std::path::Path>) -> Result<Self, ConfigError> {
+        let cfg = Self::load_unvalidated(path)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// [`load`](Self::load) without its validation: what the file and the environment
+    /// say, whether or not a broker could start with it. For a command that needs one
+    /// section and is not about the rest — `mqttd --rule-test` reads `[rules]` to know
+    /// whether `jq` is switched on, and must not refuse a statement because the
+    /// listeners are not configured.
+    ///
+    /// # Errors
+    /// As [`load`](Self::load), except for what validation refuses.
+    pub fn load_unvalidated(path: Option<&std::path::Path>) -> Result<Self, ConfigError> {
         // The unknown-key policy from the ENV layer is peeked before the file
         // parse: env beats file everywhere else, and for THIS knob the file may be
         // exactly the thing that cannot be read strictly (issue #230).
@@ -1182,7 +1216,6 @@ impl Config {
             None => Config::default(),
         };
         cfg.overlay_env()?;
-        cfg.validate()?;
         Ok(cfg)
     }
 
@@ -1652,6 +1685,16 @@ impl Config {
         on!("MQTTD_RULES_ADMIN_WRITERS", v, {
             self.rules.admin_writers = subject_list(&v);
         });
+        // -- the jq rule function (ADR 0086) --
+        on!("MQTTD_RULES_JQ", v, {
+            self.rules.jq = on_off("MQTTD_RULES_JQ", &v)?;
+        });
+        on!("MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS", v, {
+            self.rules.jq_default_timeout_ms = num("MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS", &v)?;
+        });
+        on!("MQTTD_RULES_JQ_ENV", v, {
+            self.rules.jq_env = list(&v);
+        });
         // -- admin API (ADR 0081) --
         on!("MQTTD_ADMIN_BIND", v, {
             self.admin.bind = Some(v);
@@ -2118,6 +2161,23 @@ impl Config {
                     .to_string(),
             );
         }
+        // A name jq could not be given, or a list that is a mistake (ADR 0086 D8).
+        if rules.jq_env.len() > 64 {
+            return Err(format!(
+                "rules.jq_env (MQTTD_RULES_JQ_ENV) lists {} variables; at most 64",
+                rules.jq_env.len()
+            ));
+        }
+        if let Some(bad) = rules
+            .jq_env
+            .iter()
+            .find(|name| name.is_empty() || name.contains(['=', '\0']))
+        {
+            return Err(format!(
+                "rules.jq_env (MQTTD_RULES_JQ_ENV) names {bad:?}: an environment variable's \
+                 name is not empty and has no `=` or NUL (list names, not NAME=value)"
+            ));
+        }
         Ok(())
     }
 }
@@ -2330,6 +2390,10 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_RULES_TRACE",
     "MQTTD_RULES_TRACE_RATE",
     "MQTTD_RULES_ADMIN_WRITERS",
+    // the jq rule function (ADR 0086)
+    "MQTTD_RULES_JQ",
+    "MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS",
+    "MQTTD_RULES_JQ_ENV",
     // admin API (ADR 0081)
     "MQTTD_ADMIN_BIND",
     "MQTTD_ADMIN_CERT",
@@ -2573,6 +2637,56 @@ mod tests {
                 .overlay_from(getter(&[(var, bad)]))
                 .expect_err("an unparseable value must not be ignored");
             assert!(err.to_string().contains(var), "{err}");
+        }
+    }
+
+    /// ADR 0086 D13, D8: `jq` is off unless switched on; `jq/2`'s timeout is EMQX's ten
+    /// seconds; jq sees no environment variable unless it is listed by name.
+    #[test]
+    fn the_jq_keys_load_from_file_and_environment() {
+        let d = Config::default().rules;
+        assert_eq!(
+            (d.jq, d.jq_default_timeout_ms, d.jq_env.len()),
+            (false, 10_000, 0),
+            "off, EMQX's default timeout, an empty environment"
+        );
+        let c = Config::from_toml(
+            "[rules]\njq = true\njq_default_timeout_ms = 250\njq_env = [\"SITE\", \"REGION\"]\n\
+             [durable]\nallow_ephemeral = true\n",
+        )
+        .unwrap();
+        assert!(c.rules.jq);
+        assert_eq!(c.rules.jq_default_timeout_ms, 250);
+        assert_eq!(c.rules.jq_env, vec!["SITE", "REGION"]);
+
+        let mut c = Config::default();
+        c.overlay_from(getter(&[
+            ("MQTTD_RULES_JQ", "on"),
+            ("MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS", "0"),
+            ("MQTTD_RULES_JQ_ENV", "SITE, REGION,"),
+        ]))
+        .unwrap();
+        assert!(c.rules.jq);
+        assert_eq!(c.rules.jq_default_timeout_ms, 0);
+        assert_eq!(c.rules.jq_env, vec!["SITE", "REGION"]);
+
+        for (var, bad) in [
+            ("MQTTD_RULES_JQ", "compiled"),
+            ("MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS", "10s"),
+            ("MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS", "-1"),
+        ] {
+            let err = Config::default()
+                .overlay_from(getter(&[(var, bad)]))
+                .expect_err("an unparseable value must not be ignored");
+            assert!(err.to_string().contains(var), "{err}");
+        }
+        // A list of names, never of NAME=value pairs: a value belongs in the environment.
+        for bad in ["[\"SITE=plant-7\"]", "[\"\"]"] {
+            let err = Config::from_toml(&format!(
+                "[rules]\njq_env = {bad}\n[durable]\nallow_ephemeral = true\n"
+            ))
+            .expect_err("not a variable's name");
+            assert!(err.to_string().contains("MQTTD_RULES_JQ_ENV"), "{err}");
         }
     }
 
@@ -3254,7 +3368,8 @@ mod tests {
             | "MQTTD_TLS_ALLOW_TLS12"
             | "MQTTD_TLS_ALLOW_UNSAFE_TLS12_FEATURES"
             // An explicit on/off (anything else is refused) whose default is off.
-            | "MQTTD_RULES_TRACE" => "1",
+            | "MQTTD_RULES_TRACE"
+            | "MQTTD_RULES_JQ" => "1",
             // Enums: any valid, non-default (default None) member.
             "MQTTD_SWIM_SIGNED" | "MQTTD_SWIM_REPLAY" => "require",
             "MQTTD_QUEUE_OVERFLOW" => "reject-newest",
@@ -3307,7 +3422,8 @@ mod tests {
             | "MQTTD_TLS_SESSION_CACHE"
             | "MQTTD_ADMIN_PEER_PORT"
             | "MQTTD_RULES_SYS_INTERVAL"
-            | "MQTTD_RULES_TRACE_RATE" => "7",
+            | "MQTTD_RULES_TRACE_RATE"
+            | "MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS" => "7",
             // The default is already 7 (backup.keep) / 300 (restore timeout), so "7" would
             // change nothing and the totality sweep would read as a missing mapping.
             // MQTTD_REPLICAS (ADR 0080): a valid factor that is not the default (2).
@@ -3459,8 +3575,10 @@ mod tests {
             // MQTTD_INGRESS_OVERLOAD (ADR 0082 T3),
             // plus MQTTD_RULES_FILE (ADR 0083),
             // plus MQTTD_RULES_SYS_INTERVAL, MQTTD_RULES_TRACE, MQTTD_RULES_TRACE_RATE and
-            // MQTTD_RULES_ADMIN_WRITERS (ADR 0084).
-            117,
+            // MQTTD_RULES_ADMIN_WRITERS (ADR 0084),
+            // plus MQTTD_RULES_JQ, MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS and MQTTD_RULES_JQ_ENV
+            // (ADR 0086).
+            120,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never

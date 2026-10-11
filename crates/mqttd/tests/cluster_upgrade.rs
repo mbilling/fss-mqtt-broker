@@ -159,7 +159,7 @@ async fn roll(proc: &mut proc_common::Proc, i: usize, to: &std::path::Path, labe
         proc.nodes[i].spawn(); // lost the port-rebind race: once more
     }
     assert!(
-        proc.wait_node_serving(i, Duration::from_secs(60)).await,
+        proc.wait_node_serving(i, Duration::from_mins(1)).await,
         "rolled node {id} never re-admitted ({label})"
     );
     // The per-roll numbers OPERATIONS.md cites (issue #248): graceful-stop

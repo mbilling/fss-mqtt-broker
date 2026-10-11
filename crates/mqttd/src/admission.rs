@@ -391,7 +391,7 @@ mod tests {
                 threshold: 2,
                 // Long enough that no scheduling stall can decay a strike away
                 // mid-test; this half is not about decay at all.
-                decay: Duration::from_secs(600),
+                decay: Duration::from_mins(10),
             }),
             None,
             None,
@@ -454,7 +454,7 @@ mod tests {
             None,
             Some(PenaltyConfig {
                 threshold: 100, // never actually penalize; we only exercise the table
-                decay: Duration::from_secs(3600),
+                decay: Duration::from_hours(1),
             }),
             None,
             None,

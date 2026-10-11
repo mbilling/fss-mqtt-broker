@@ -944,9 +944,10 @@ be found. Each is tracked; none is a silent surprise.
 
 ## Supported Rust, platforms, and stability
 
-- **Minimum supported Rust: 1.88** for the broker and its libraries; **1.89** for
-  the `mqttd-operator` crate alone. Both are verified nightly against those exact
-  toolchains rather than asserted — see the `msrv` job in
+- **Minimum supported Rust: 1.96** for the broker and its libraries (what the
+  WebAssembly runtime behind the rule engine's `jq` needs, ADR 0086; it follows that
+  runtime's releases); the `mqttd-operator` crate alone still builds on **1.89**.
+  Both are verified nightly against those exact toolchains rather than asserted — see the `msrv` job in
   [`.github/workflows/nightly.yml`](.github/workflows/nightly.yml).
 - **Builds** are produced with a pinned **1.97.0** toolchain
   ([`rust-toolchain.toml`](rust-toolchain.toml)). That is a *reproducibility*

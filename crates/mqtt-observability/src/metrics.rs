@@ -198,6 +198,28 @@ struct RuleLabel {
     rule: String,
 }
 
+/// `{function}` for the per-function counters of sandboxed rule functions (ADR 0086):
+/// `jq`, and later the functions of the modules an operator's rules file declares.
+/// Bounded by that file.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct FunctionLabel {
+    function: String,
+}
+
+/// `{function, kind}` for `mqttd_rule_function_errors_total` (ADR 0086): a function as
+/// in [`FunctionLabel`], and one of a fixed set of kinds.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct FunctionKindLabel {
+    function: String,
+    kind: String,
+}
+
+/// `{module}` for the per-module gauges of the rule-function sandbox (ADR 0086).
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct ModuleLabel {
+    module: String,
+}
+
 /// One rule's cumulative counts since the process started (ADR 0084), as
 /// `mqttd_rule_evaluations_total` and `mqttd_rule_actions_total` hold them; see
 /// [`Metrics::rule_counts`].
@@ -304,6 +326,12 @@ struct OtelInstruments {
     rule_actions: OtelCounter<u64>,
     rule_recursive_republish: OtelCounter<u64>,
     rule_eval_seconds: OtelCounter<f64>,
+    rule_function_calls: OtelCounter<u64>,
+    rule_function_errors: OtelCounter<u64>,
+    rule_function_seconds: OtelCounter<f64>,
+    rule_module_instances: OtelGauge<i64>,
+    rule_module_memory_bytes: OtelGauge<i64>,
+    rule_module_instances_replaced: OtelCounter<u64>,
     rules_loaded: OtelGauge<i64>,
     rules_info: OtelGauge<i64>,
     swim_keys_accepted: OtelGauge<i64>,
@@ -315,6 +343,7 @@ struct OtelInstruments {
 impl OtelInstruments {
     /// Create every instrument from `meter`, naming each to match its Prometheus
     /// counterpart (the `mqttd` prefix is carried by the OTLP resource `service.name`).
+    #[allow(clippy::too_many_lines)] // one line per instrument
     fn new(meter: &Meter) -> Self {
         Self {
             connections_active: meter.i64_up_down_counter("connections_active").build(),
@@ -405,6 +434,14 @@ impl OtelInstruments {
             rule_actions: meter.u64_counter("rule_actions").build(),
             rule_recursive_republish: meter.u64_counter("rule_recursive_republish").build(),
             rule_eval_seconds: meter.f64_counter("rule_eval_seconds").build(),
+            rule_function_calls: meter.u64_counter("rule_function_calls").build(),
+            rule_function_errors: meter.u64_counter("rule_function_errors").build(),
+            rule_function_seconds: meter.f64_counter("rule_function_seconds").build(),
+            rule_module_instances: meter.i64_gauge("rule_module_instances").build(),
+            rule_module_memory_bytes: meter.i64_gauge("rule_module_memory_bytes").build(),
+            rule_module_instances_replaced: meter
+                .u64_counter("rule_module_instances_replaced")
+                .build(),
             rules_loaded: meter.i64_gauge("rules_loaded").build(),
             rules_info: meter.i64_gauge("rules_info").build(),
             swim_keys_accepted: meter.i64_gauge("swim_keys_accepted").build(),
@@ -598,6 +635,17 @@ pub struct Metrics {
     rule_recursive_republish_total: Family<RuleGuardLabel, Counter>,
     /// Time spent evaluating each rule, in seconds (ADR 0084).
     rule_eval_seconds_total: Family<RuleLabel, Counter<f64, std::sync::atomic::AtomicU64>>,
+    /// Calls of sandboxed rule functions (`jq`, ADR 0086), by function.
+    rule_function_calls_total: Family<FunctionLabel, Counter>,
+    /// Those that failed, by function and kind.
+    rule_function_errors_total: Family<FunctionKindLabel, Counter>,
+    /// Time spent in them, in seconds, by function.
+    rule_function_seconds_total: Family<FunctionLabel, Counter<f64, std::sync::atomic::AtomicU64>>,
+    /// Sandbox instances held per module, and their linear memory (ADR 0086).
+    rule_module_instances: Family<ModuleLabel, Gauge>,
+    rule_module_memory_bytes: Family<ModuleLabel, Gauge>,
+    /// Instances given up after a call, per module.
+    rule_module_instances_replaced_total: Family<ModuleLabel, Counter>,
     /// Enabled rules loaded on this node (ADR 0083).
     rules_loaded: Gauge,
     /// The loaded rules file's checksum (ADR 0083), `config_info`-style: after a
@@ -1330,6 +1378,48 @@ impl Metrics {
              rule's average cost per message; routing a republished message is not in it",
             rule_eval_seconds_total.clone(),
         );
+        let rule_function_calls_total = register_family(
+            &mut registry,
+            "rule_function_calls",
+            "Calls of rule functions that run in the WebAssembly sandbox (ADR 0086), by \
+             function: jq. Live evaluations only (dry runs excluded)",
+        );
+        let rule_function_errors_total = register_family(
+            &mut registry,
+            "rule_function_errors",
+            "Failed calls of sandboxed rule functions (ADR 0086), by function and kind. For \
+             jq: compile, parse, process, timeout, system (EMQX's error tags); memory, \
+             output, stack, compile_timeout (a limit of the sandbox); trap (the module \
+             broke); argument (a program that is not a string, a bad timeout); decode (an \
+             output the rule engine's JSON reader refuses). Each fails its rule, never the \
+             message",
+        );
+        let rule_function_seconds_total =
+            Family::<FunctionLabel, Counter<f64, std::sync::atomic::AtomicU64>>::default();
+        registry.register(
+            "rule_function_seconds",
+            "Time spent in sandboxed rule functions (ADR 0086), in seconds, by function; \
+             part of the calling rule's mqttd_rule_eval_seconds_total",
+            rule_function_seconds_total.clone(),
+        );
+        let rule_module_instances = register_gauge_family(
+            &mut registry,
+            "rule_module_instances",
+            "Sandbox instances a rule-function module holds (ADR 0086), waiting or in a \
+             call, by module; as of the module's last call",
+        );
+        let rule_module_memory_bytes = register_gauge_family(
+            &mut registry,
+            "rule_module_memory_bytes",
+            "Linear memory of a rule-function module's instances (ADR 0086), in bytes, by \
+             module; as of the last call",
+        );
+        let rule_module_instances_replaced_total = register_family(
+            &mut registry,
+            "rule_module_instances_replaced",
+            "Sandbox instances given up after a call (ADR 0086), by module: stopped at a \
+             limit (time, memory, stack) or grown too large to keep",
+        );
         let rules_loaded = register_gauge(
             &mut registry,
             "rules_loaded",
@@ -1483,6 +1573,12 @@ impl Metrics {
             rule_actions_total,
             rule_recursive_republish_total,
             rule_eval_seconds_total,
+            rule_function_calls_total,
+            rule_function_errors_total,
+            rule_function_seconds_total,
+            rule_module_instances,
+            rule_module_memory_bytes,
+            rule_module_instances_replaced_total,
             rules_loaded,
             rules_info,
             rules_info_prev: std::sync::Mutex::new(None),
@@ -2354,6 +2450,82 @@ impl Metrics {
             .add(secs, &[KeyValue::new("rule", rule.to_string())]);
     }
 
+    /// One call of a sandboxed rule function (ADR 0086): how long it took and, when it
+    /// failed, the kind of failure.
+    pub fn rule_function_call(
+        &self,
+        function: &'static str,
+        elapsed: std::time::Duration,
+        error: Option<&'static str>,
+    ) {
+        let label = FunctionLabel {
+            function: function.to_string(),
+        };
+        let secs = elapsed.as_secs_f64();
+        self.rule_function_calls_total.get_or_create(&label).inc();
+        self.rule_function_seconds_total
+            .get_or_create(&label)
+            .inc_by(secs);
+        let of = [KeyValue::new("function", function)];
+        self.otel.rule_function_calls.add(1, &of);
+        self.otel.rule_function_seconds.add(secs, &of);
+        if let Some(kind) = error {
+            self.rule_function_errors_total
+                .get_or_create(&FunctionKindLabel {
+                    function: function.to_string(),
+                    kind: kind.to_string(),
+                })
+                .inc();
+            self.otel.rule_function_errors.add(
+                1,
+                &[
+                    KeyValue::new("function", function),
+                    KeyValue::new("kind", kind),
+                ],
+            );
+        }
+    }
+
+    /// What a rule-function module's instance pool holds now (ADR 0086), and how many
+    /// instances it has given up since it was loaded (`replaced_total`, cumulative: the
+    /// counter is moved up to it, never back).
+    pub fn rule_module(
+        &self,
+        module: &'static str,
+        instances: u64,
+        memory_bytes: u64,
+        replaced_total: u64,
+    ) {
+        let label = ModuleLabel {
+            module: module.to_string(),
+        };
+        let (instances, memory) = (
+            i64::try_from(instances).unwrap_or(i64::MAX),
+            i64::try_from(memory_bytes).unwrap_or(i64::MAX),
+        );
+        self.rule_module_instances
+            .get_or_create(&label)
+            .set(instances);
+        self.rule_module_memory_bytes
+            .get_or_create(&label)
+            .set(memory);
+        let of = [KeyValue::new("module", module)];
+        self.otel.rule_module_instances.record(instances, &of);
+        self.otel.rule_module_memory_bytes.record(memory, &of);
+        // Callers on several threads report the same cumulative count in any order:
+        // whichever moves the counter up accounts for exactly the step it made.
+        let before = self
+            .rule_module_instances_replaced_total
+            .get_or_create(&label)
+            .inner()
+            .fetch_max(replaced_total, std::sync::atomic::Ordering::Relaxed);
+        if replaced_total > before {
+            self.otel
+                .rule_module_instances_replaced
+                .add(replaced_total - before, &of);
+        }
+    }
+
     /// One rule's counts so far (ADR 0084), read back from its three families without
     /// creating a series: a rule that never matched has none, and still reads zeros.
     /// Each lookup's read guard is dropped before the next is taken — the family lock
@@ -2846,6 +3018,37 @@ mod tests {
         );
     }
 
+    /// ADR 0086 D10: per function, calls, errors by kind and time; per module, what its
+    /// instance pool holds and how many instances it gave up.
+    #[test]
+    fn sandboxed_function_calls_are_counted_by_function_and_kind() {
+        let m = Metrics::new("test");
+        assert!(
+            !m.render().contains("function=\"jq\""),
+            "no series before the first call"
+        );
+        m.rule_function_call("jq", std::time::Duration::from_micros(50), None);
+        m.rule_function_call("jq", std::time::Duration::from_micros(150), Some("timeout"));
+        m.rule_function_call("jq", std::time::Duration::from_micros(50), Some("timeout"));
+        m.rule_function_call("jq", std::time::Duration::from_micros(250), Some("memory"));
+        m.rule_module("jq", 2, 7 << 20, 1);
+        // A report that lags another's does not move the counter back.
+        m.rule_module("jq", 3, 9 << 20, 3);
+        m.rule_module("jq", 3, 9 << 20, 2);
+        let text = m.render();
+        for line in [
+            "mqttd_rule_function_calls_total{function=\"jq\"} 4",
+            "mqttd_rule_function_errors_total{function=\"jq\",kind=\"timeout\"} 2",
+            "mqttd_rule_function_errors_total{function=\"jq\",kind=\"memory\"} 1",
+            "mqttd_rule_function_seconds_total{function=\"jq\"} 0.0005",
+            "mqttd_rule_module_instances{module=\"jq\"} 3",
+            "mqttd_rule_module_memory_bytes{module=\"jq\"} 9437184",
+            "mqttd_rule_module_instances_replaced_total{module=\"jq\"} 3",
+        ] {
+            assert!(text.contains(line), "missing {line}:\n{text}");
+        }
+    }
+
     #[test]
     fn render_produces_valid_openmetrics_exposition() {
         let m = Metrics::new("1.2.3");
@@ -3153,7 +3356,7 @@ mod tests {
 
         let endpoint = format!("http://{addr}");
         // Long interval so the only push is the explicit flush below.
-        let m = Metrics::with_otlp("t", &endpoint, Duration::from_secs(3600), "node-test").unwrap();
+        let m = Metrics::with_otlp("t", &endpoint, Duration::from_hours(1), "node-test").unwrap();
         m.connection_opened("5");
         m.gossip_rejected("replay");
         m.flush();
