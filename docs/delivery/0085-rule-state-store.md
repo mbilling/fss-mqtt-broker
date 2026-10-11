@@ -53,6 +53,22 @@ tasks:
     issue: 927
     date: 2026-10-11
     evidence: "PR 933: crates/mqtt-rules/src/state/dict.rs (a Dictionary per evaluating task, the three names in state::FUNCS) and one dictionary per connection in crates/mqttd/src/rules.rs; 99 probes of EMQX 6.3.1 (direct calls, emqx_rule_sqltester, the REST SQL test, and clients on a running node for whose process holds the dictionary per trigger) pinned in mqtt-rules tests_proc_dict (14) and crates/mqttd/tests/rules_proc_dict.rs (10), plus one test each in admin_rules.rs and rules_binary.rs; bounds of 64 keys and 64 KiB with dictionary_full; the ADR amended where the probes contradicted it; the converter carries proc_dict_* rules live."
+  - id: 0085-T12
+    title: "View the contents of the store: each key's type, size, expiry and last-write time in the listing, optionally values, filters by expiry and by last write, kv_store included; a last-write time per key in every namespace"
+    status: planned
+    issue: 940
+  - id: 0085-T13
+    title: "Expire entries manually: a bulk purge of one namespace by prefix, not written for, or already expired; dry run, batches off the publish path, 100,000 keys a call with a cursor, audited; no expiry event unless asked"
+    status: planned
+    issue: 941
+  - id: 0085-T14
+    title: "Change expiry on stored keys: set, extend or clear the expiry of one key or a selection, within max_ttl; dry run, audited; a sooner expiry refused where it would not replicate"
+    status: planned
+    issue: 942
+  - id: 0085-T15
+    title: "CLI and documentation for viewing, purging and changing expiry: state-keys filters, mqttd --admin state-purge and state-expire; ADMIN-API.md, RULES.md, the threat model row"
+    status: planned
+    issue: 943
 ---
 
 # Delivery 0085 — state for rules
@@ -67,7 +83,9 @@ The ADR was accepted on 2026-10-11, after a review against the EMQX evaluation o
 Five choices were decided by default and are listed in the ADR with what the other answer
 costs: `eventual` replicates to every member; `strong` is phase 2 behind a design
 amendment; EMQX's `proc_dict_*` are provided; state needs no switch beyond its ceiling
-(`rules.state_max_bytes`); the names stay `kv_*`. T1, the store and its functions on
+(`rules.state_max_bytes`); the names stay `kv_*`. The user confirmed the last two on
+2026-10-11 and approved the operator's tools on the store (T12 to T15: view the
+contents, purge, change expiry), which the ADR's amendment of that date decides. T1, the store and its functions on
 one node, is done; the table under Progress has where each of the others stands.
 
 ## Plan
@@ -85,11 +103,21 @@ one node, is done; the table under Progress has where each of the others stands.
 | **0085-T9** `strong` (phase 2) | T3, and an amendment to the ADR | First: the ADR is amended with how an evaluation waits for a quorum (the bound on concurrent waits ADR 0086 left open, the timeout, a Will's rules), and accepted. Then: a quorum-acknowledged write survives the leader's loss; a minority partition's calls fail and are counted; no wait holds the hub or another connection. |
 | **0085-T10** Snapshot (phase 3) | T3 | A restarted node restores its `local` and `eventual` namespaces from the last snapshot. |
 | **0085-T11** `proc_dict_*` (D13) | T1 | `proc_dict_put/get/del` return what EMQX 6.3.1 returns (probed there across two publishes of one connection and across a reconnect); the dictionary is the connection's, empty at connect, gone at disconnect, seen by a re-entered rule; a Will and an event without a connection get an empty one; 64 keys and 64 KiB per connection, counted against the store's ceiling; no longer refused at load. |
+| **0085-T12** View the contents (amendment of 2026-10-11) | T6; its `eventual` half T3 | The listing shows `type`, `bytes`, `expires_at` and `written_at` for every key of a declared namespace, a rule's own and `kv_store`, and values only with `values=true` and only to an operator; `expires_within`, `not_written_for` and `no_expiry`, alone and combined with each other and `prefix`, select exactly the keys a test wrote that way, with the store's clock driven; a page with values ends at 1,000 keys or 1 MiB, whichever comes first; every write function sets the last-write time, changed value or not, and no read does; the walk holds a shard's lock for at most 64 keys at a time and runs on no connection's task; the memory a key takes is measured before and after (8 bytes more) and `ENTRY_OVERHEAD` still covers an entry, or is raised and RULES.md's figures with it; the `rule_state` benchmark's cases do not move outside their spread. With T3: a replicated change sets the time on the receiving node (the write's own time for `lww`), nothing new is on the wire, and after a restart `written_known_since` is the node's refill time. |
+| **0085-T13** Purge (amendment of 2026-10-11) | T12; its `eventual` half T3; `events=true` T4 | `prefix`, `not_written_for` and `expired=true`, alone and combined, remove exactly the keys a test wrote that way; a call with no selector is refused; a dry run changes nothing, writes no audit record and answers the count the purge then removes, with a sample of 20 keys and no values; more than 100,000 matching keys take two calls, the second from the first's cursor; a second purge on the node while one runs is refused; a rule's state call during a purge of a full namespace waits for one batch of 64 keys at the most (measured); the `state.purge` audit record carries the subject, the namespace, the selection, the count and whether events were asked for; an operator who is not a listed rules writer is refused, and may still run the dry run; no `$events/state/expired` by default, and with `events=true` one per purged key at the sweep's rate, on the node that ran the purge; `kv_store` can be purged by prefix and by `not_written_for`, and refuses `events=true`. With T3: a purge on one node of an `eventual` namespace removes the keys on every node, stays removed after a partition heals, and its tombstones count toward `max_keys` until the tombstone window has passed. |
+| **0085-T14** Change expiry (amendment of 2026-10-11) | T12; its `eventual` half T3 | `ttl`, `extend` and `clear` on one key and on a selection do what the listing then shows, with the store's clock driven; a result past `max_ttl` is refused for one key and counted as `past_max_ttl` in a selection whose other keys are changed; every call on `kv_store` is refused; a dry run changes nothing and answers the counts the call then reports; a rule's next write with a TTL sets the expiry again; a key whose expiry was moved sooner expires then and, with T4, raises its event; the `state.expire` audit record carries the subject, the namespace, the selection, the change and the counts by outcome; an operator who is not a listed rules writer is refused. With T3, on two nodes: a later expiry and `clear` hold on both after repair for every type; any change of an `lww` key holds on both; a sooner expiry of a key of each other type is refused as `not_shortened` and leaves both copies as they were. |
+| **0085-T15** CLI and documentation of T12–T14 | T13, T14 | `state-keys` takes `--values`, `--expires-within`, `--not-written-for` and `--no-expiry`; `state-purge <ns>` and `state-expire <ns> [<key>]` reach their endpoints with every parameter those take, `--dry-run` included; without `--all` they stop at one call's cap and print the cursor, with it they go on until there is none; `--all-nodes` asks every node; `--json` prints valid JSON and the terminal views print control characters escaped; `mqttd --admin help` lists the verbs. ADMIN-API.md has the endpoints with their parameters, roles, audit records and refusals; RULES.md says what "not written for" means and that it is each node's own answer in an `eventual` namespace, what a purge raises and does not, that a purge there leaves tombstones, and which expiry changes replicate; THREAT-MODEL.md's row for a rules writer's reach names the purge. |
 
 **Order.** T1 first. Then T2, T6 (without the replication series), T7, T11 and the
 single-node half of T4 can run in parallel; T3 and T5 follow T2; the cluster half of T4
 and the replication series of T6 follow T3; T8 closes phase 1. T9 and T10 are later
 phases.
+
+**The operator's tools (T12–T15),** added on 2026-10-11: T12 follows T6; T13 and T14
+follow T12 and can run side by side, each with an `eventual` half that waits for T3 (and
+the purge's `events=true` for T4); T15 follows both. They are not part of what T8
+follows: T8 closes phase 1's documentation and the feature's tracker (#880) as planned,
+and T15 carries the documentation of these three.
 
 ## Progress
 
@@ -107,6 +135,10 @@ phases.
 | 0085-T9 | ⬜ planned | [#925](https://github.com/mbilling/fss-mqtt-broker/issues/925) | — |  |
 | 0085-T10 | ⬜ planned | [#926](https://github.com/mbilling/fss-mqtt-broker/issues/926) | — |  |
 | 0085-T11 | ✅ done | [#927](https://github.com/mbilling/fss-mqtt-broker/issues/927) | 2026-10-11 | "PR 933: crates/mqtt-rules/src/state/dict.rs (a Dictionary per evaluating task, the three names in state::FUNCS) and one dictionary per connection in crates/mqttd/src/rules.rs; 99 probes of EMQX 6.3.1 (direct calls, emqx_rule_sqltester, the REST SQL test, and clients on a running node for whose process holds the dictionary per trigger) pinned in mqtt-rules tests_proc_dict (14) and crates/mqttd/tests/rules_proc_dict.rs (10), plus one test each in admin_rules.rs and rules_binary.rs; bounds of 64 keys and 64 KiB with dictionary_full; the ADR amended where the probes contradicted it; the converter carries proc_dict_* rules live." |
+| 0085-T12 | ⬜ planned | [#940](https://github.com/mbilling/fss-mqtt-broker/issues/940) | — |  |
+| 0085-T13 | ⬜ planned | [#941](https://github.com/mbilling/fss-mqtt-broker/issues/941) | — |  |
+| 0085-T14 | ⬜ planned | [#942](https://github.com/mbilling/fss-mqtt-broker/issues/942) | — |  |
+| 0085-T15 | ⬜ planned | [#943](https://github.com/mbilling/fss-mqtt-broker/issues/943) | — |  |
 <!-- /status-table:0085 -->
 
 ## Changelog
@@ -258,3 +290,25 @@ phases.
     stays.
   - **Left for T3, as planned:** anything on the wire, stamping the writes of an
     `eventual` namespace, tombstones in the store, the refusal count for clock skew.
+- 2026-10-11 — **Admin features approved, two defaults confirmed** (the ADR's amendment
+  "admin features and confirmed defaults").
+  - **Confirmed by the user:** state is on without a switch, under
+    `rules.state_max_bytes` = 256 MiB (`0` turns it off); the names stay `kv_*`. The
+    other three defaults stand; `proc_dict_*` is delivered (#933).
+  - **T12 to T15 are new** (#940 to #943): view the contents, purge, change expiry, and
+    their verbs and documentation. T6 is unchanged and builds D10 as written; T8 is
+    unchanged and does not wait for them.
+  - **Decided with them:** a purge raises no expiry event unless asked; stale means not
+    written for a given time; `kv_store` can be viewed and purged but its keys get no
+    expiry; in an `eventual` namespace a purge or a change of expiry replicates, in a
+    `local` one it is per node; operator and a listed rules writer; 100,000 keys a call
+    with a cursor.
+  - **What the code changed in the plan:** the last-write time was to come from T2's
+    clock stamp in `eventual` namespaces. Only `lww` keys carry the stamp of their last
+    write, and `local` namespaces and `kv_store` carry none, so T12 adds a last-write
+    time to every entry: 8 bytes a key, nothing on the wire, each node's own in an
+    `eventual` namespace.
+  - **Three new choices decided by default** (the ADR's table, 6 to 8): the last-write
+    time is not replicated; moving an expiry sooner on a key that is not `lww` in an
+    `eventual` namespace is refused, because an expiry merges as the later of the two;
+    `clear` is offered although it leaves `max_ttl`.
