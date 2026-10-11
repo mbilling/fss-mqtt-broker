@@ -1203,9 +1203,14 @@ cut). The error's text does tell them apart, in the log, the rule's last error a
 trace: it names the milliseconds the call ran under, which is the ceiling's value and
 not the rule's.
 
-**Cost.** A call computes one more instant when it starts. The benchmark of rules that
-call no sandboxed function is unchanged (`cargo bench -p mqtt-rules`, alternated with
-main's build); so is a `jq` call's own time.
+**Cost.** A sandboxed call computes one more instant when it starts and takes the
+earlier of two; nothing else is on its path, and its time was not measured again. Rules
+that call no sandboxed function do not reach any of it: `cargo bench -p mqtt-rules`,
+four runs alternated with the build of the commit before (Apple M1 Pro, a machine busy
+with other work), has the fastest run of each of its five cases within 5% either way
+(`no_match` 90 ns against 95, `filter_reject` 799 against 836, `filter_republish` 1543
+against 1514, `select_star_republish` 3696 against 3719, `foreach_10` 7113 against
+7029), which is that machine's noise.
 
 **What this closes and what it leaves.** Closed: the timeout a payload may name, which
 was an accepted risk in THREAT-MODEL.md and is now a mitigated row with its test
