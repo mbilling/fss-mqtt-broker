@@ -69,7 +69,9 @@ pub struct Limits {
     /// Most fuel (about one unit per executed instruction) one call may burn,
     /// whatever the clock says: a bound that does not depend on how fast the machine
     /// is. `None` compiles the module without fuel accounting, which is faster, and
-    /// leaves the deadline as the only bound on time.
+    /// leaves the deadline as the only bound on time. Making an instance (its data
+    /// segments, a start function) is not a call and is bounded by `init_timeout`
+    /// alone.
     pub max_fuel: Option<u64>,
 }
 
@@ -475,6 +477,14 @@ impl Sandbox {
         // Data segments and a start function, when the module has one.
         let instance = {
             let _armed = arm(&mut store, Some(within), None, &self.limits).map_err(start)?;
+            // Not a call, and not charged as one: the runtime bills making an
+            // instance to fuel as well (measured for a module of one page on an
+            // arm64 Mac: 16,385 units compiled, 65,537 interpreted), which made a
+            // smaller `max_fuel` refuse every module. `init_timeout` is what bounds
+            // a start function.
+            if self.limits.max_fuel.is_some() {
+                store.set_fuel(u64::MAX).map_err(start)?;
+            }
             on_fiber(self.linker.instantiate_async(&mut store, &self.module))
         }
         .map_err(start)?;

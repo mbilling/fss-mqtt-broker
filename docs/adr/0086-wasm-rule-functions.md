@@ -1,20 +1,20 @@
 # ADR 0086 — Rule functions in a WebAssembly sandbox: the real jq first, operator plugins on the same mechanism
 
-- **Status:** Proposed
-- **Date:** 2026-10-10 (runtime decision and re-measurement: 2026-10-11)
+- **Status:** Accepted
+- **Date:** 2026-10-10 (runtime decision, re-measurement and acceptance: 2026-10-11)
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0086-wasm-rule-functions.md](../delivery/0086-wasm-rule-functions.md) — plan, progress, and changelog
 - **Revisits:** [ADR 0083](0083-rule-engine.md) (functions: `jq` is refused at load). This
-  record proposes how `jq` is provided, with EMQX's results.
+  record decides how `jq` is provided, with EMQX's results.
 - **Related:** [ADR 0084](0084-watching-and-editing-rules-live.md) (live editing, the admin
   rules endpoints and the trace this extends), [ADR 0085](0085-rule-state-store.md) (the
   other proposed extension of the function set), [ADR 0045](0045-release-engineering-and-distribution.md)
   (reproducible builds, which the module's build joins).
 
-> This record states the decision proposed and the measurements it rests on. The
-> prototype is `crates/mqtt-wasm-sandbox`; nothing in the broker depends on it yet.
+> This record states the decision and the measurements it rests on. The sandbox is
+> `crates/mqtt-wasm-sandbox`; nothing in the broker depends on it yet.
 >
-> **Decided so far (2026-10-11), with the record still Proposed as a whole:** the runtime
+> **Accepted on 2026-10-11.** Decided with it: the runtime
 > is **wasmtime, chosen for speed** over the wasmi interpreter the spike first recommended
 > (§3, §8); `$ENV` and `env` inside jq are **empty unless the operator lists variables**
 > (D8); the jq module is **built in the pipeline from pinned sources** and compared with a
@@ -45,7 +45,7 @@ depends on the runtime instead, D11), and the results are jq's own.
 
 If that works for jq, the same sandbox carries any function: an operator could supply a
 function as a `.wasm` file, and it would run under the same limits. This record covers
-both: what the spike measured for jq, and the design proposed for the general mechanism.
+both: what the spike measured for jq, and the design of the general mechanism.
 
 ## The spike: what was built and what it measured
 
@@ -681,9 +681,9 @@ only where `rules.jq`'s requirement is met, under its own `[functions.*]` declar
    prototype on wasmtime; the loader fed a thousand damaged modules and jq four hundred
    programs and inputs drawn at random (tests); the module built in CI from sources and a
    compiler pinned by hash and compared with the recorded hash; the oracle and limit tests
-   in CI; the failure mode on a host without executable memory checked in CI. Still to do:
-   a coverage-guided fuzz target for the loader in the nightly tier (the damage tests are
-   fixed inputs, not a fuzzer).
+   in CI; the failure mode on a host without executable memory checked in CI; a
+   coverage-guided fuzz target for the loader (`module_load`) in the nightly tier, fed
+   module files and function bodies inside a module that is otherwise whole.
 2. **T2 — `jq/2` and `jq/3` in the rule engine**, behind the ABI: the pool (D5), the
    worker hand-off (D6), the budget (D7), the grants (D8), metrics and trace (D10), the
    switch and its load errors (D13), the comment in the systemd unit, the module embedded by the release build,

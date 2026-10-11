@@ -1,4 +1,4 @@
-//! Rule functions as WebAssembly modules, run in a sandbox (ADR 0086, Proposed).
+//! Rule functions as WebAssembly modules, run in a sandbox (ADR 0086).
 //!
 //! Nothing in the broker depends on this crate yet. It is how EMQX's `jq` rule
 //! function can be the real jq — the C library, compiled to WebAssembly — run where it

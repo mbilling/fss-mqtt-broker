@@ -1161,7 +1161,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_no_wildcard_fast_path_returns_exactly_the_named_topic`
 - `tests::unacked_messages_survive_for_replay`
 
-## `crates/mqtt-wasm-sandbox/src/lib.rs` — 24 test(s)
+## `crates/mqtt-wasm-sandbox/src/lib.rs` — 25 test(s)
 
 - `tests::a_call_returns_the_modules_value`
 - `tests::a_call_runs_the_same_interpreted`
@@ -1171,6 +1171,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::a_pool_compiles_on_first_use_and_shares_warm_instances`
 - `tests::a_pool_whose_module_cannot_load_says_why_on_every_call`
 - `tests::a_result_larger_than_the_limit_is_refused_unread`
+- `tests::a_small_fuel_bound_still_loads_and_runs_a_module`
 - `tests::a_trap_ends_the_call`
 - `tests::an_endless_loop_stops_at_the_deadline_and_poisons_only_its_instance`
 - `tests::an_import_on_the_list_is_provided`

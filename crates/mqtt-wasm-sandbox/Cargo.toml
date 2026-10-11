@@ -1,6 +1,6 @@
 [package]
 name = "mqtt-wasm-sandbox"
-description = "ADR 0086 (Proposed): rule functions run as WebAssembly modules in a sandbox — the real jq first"
+description = "ADR 0086: rule functions run as WebAssembly modules in a sandbox — the real jq first"
 version.workspace = true
 edition.workspace = true
 # wasmtime 49 needs 1.96; the workspace as a whole still declares 1.88 (ADR 0086).

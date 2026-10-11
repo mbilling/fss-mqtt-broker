@@ -286,16 +286,50 @@ fn a_fuel_bound_stops_the_same_work_at_the_same_point_every_time() {
         max_fuel: Some(1_000_000),
         ..Limits::default()
     };
-    let sandbox = sandbox(limits);
-    let burnt: Vec<u64> = (0..2)
-        .map(|_| {
-            let mut instance = sandbox.instantiate().unwrap();
-            assert_eq!(instance.call("loop", &[], None), Err(CallError::Fuel));
-            instance.fuel_used()
+    // Compiled or interpreted, the count is the same: fuel is the module's
+    // instructions, not the machine's.
+    let burnt: Vec<u64> = [Execution::Compiled, Execution::Interpreted]
+        .into_iter()
+        .flat_map(|execution| {
+            let sandbox =
+                Sandbox::load_as(&module(PLAIN), execution, limits.clone(), Grants::default())
+                    .expect("the test module loads with a fuel bound");
+            (0..2).map(move |_| {
+                let mut instance = sandbox.instantiate().unwrap();
+                assert_eq!(
+                    instance.call("t", &[], None),
+                    Ok(Reply::Json(b"true".to_vec()))
+                );
+                assert_eq!(instance.call("loop", &[], None), Err(CallError::Fuel));
+                instance.fuel_used()
+            })
         })
         .collect();
-    assert_eq!(burnt[0], burnt[1]);
+    assert!(burnt.iter().all(|&used| used == burnt[0]), "{burnt:?}");
     assert!(burnt[0] >= 1_000_000);
+}
+
+/// Fuel is for calls. The runtime also bills making an instance to it (16,385 units
+/// for this module compiled, 65,537 interpreted), so a bound smaller than that used
+/// to refuse every module at load.
+#[test]
+fn a_small_fuel_bound_still_loads_and_runs_a_module() {
+    let limits = Limits {
+        max_fuel: Some(200),
+        ..Limits::default()
+    };
+    for execution in [Execution::Compiled, Execution::Interpreted] {
+        let sandbox =
+            Sandbox::load_as(&module(PLAIN), execution, limits.clone(), Grants::default())
+                .unwrap_or_else(|e| panic!("{execution:?}: {e}"));
+        let mut instance = sandbox.instantiate().unwrap();
+        assert_eq!(
+            instance.call("t", &[], None),
+            Ok(Reply::Json(b"true".to_vec()))
+        );
+        assert!(instance.fuel_used() <= 200, "{}", instance.fuel_used());
+        assert_eq!(instance.call("loop", &[], None), Err(CallError::Fuel));
+    }
 }
 
 #[test]

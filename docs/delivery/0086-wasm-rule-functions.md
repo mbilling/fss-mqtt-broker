@@ -1,24 +1,28 @@
 ---
 adr: "0086"
 title: "Rule functions in a WebAssembly sandbox: the real jq first, operator plugins on the same mechanism"
-adr_status: Proposed
+adr_status: Accepted
 tasks:
   - id: 0086-T1
     title: "The sandbox crate and the jq module's build: loader fuzzing, the module built in CI from pinned sources and compared with the recorded hash, the EMQX oracle test in CI"
-    status: deferred
-    notes: "Most of it is delivered ahead of the decision (2026-10-11, PR 904): the crate on wasmtime 49.0.2 with its limits, tests and failure mode, and the `wasm sandbox` CI job, which builds jq.wasm with a compiler and sources pinned by sha256, compares it with jq.wasm.sha256 and runs the 285-case EMQX oracle and the limit tests in release mode. Still open, which is why this is not done: a coverage-guided fuzz target for the loader in the nightly tier (what exists are fixed-input damage tests). The release build embedding the module moved to T2, where the broker first links the crate. Waits for the decision on ADR 0086 (Proposed); an issue is opened when the ADR is accepted."
+    status: in-progress
+    issue: 905
+    notes: "PR 904 carries all of it: the crate on wasmtime 49.0.2 with its limits, tests and failure mode; the `wasm sandbox` CI job, which builds jq.wasm with a compiler and sources pinned by sha256, compares it with jq.wasm.sha256, runs the 285-case EMQX oracle and the limit tests in release mode and checks the refusal under the shipped unit's hardening; and the `module_load` fuzz target in the nightly tier (crates/mqtt-wasm-sandbox/fuzz; 71,000 inputs on two hosts before the PR, no finding). The release build embedding the module is T2's, where the broker first links the crate."
   - id: 0086-T2
     title: "jq/2 and jq/3 in the rule engine behind the ABI: the instance pool, the worker hand-off, the per-message budget, grants, the off-by-default switch and its load errors, the module embedded by the release build, metrics and trace, --rule-test"
-    status: deferred
-    notes: "Waits for the decision on ADR 0086 (Proposed), then for T1."
+    status: planned
+    issue: 906
+    notes: "Follows T1."
   - id: 0086-T3
     title: "Operator plugins: [functions.<name>] in the rules file, pinned by sha256, load-time checks, live reload, the admin view, worked examples in Rust and C"
-    status: deferred
-    notes: "Waits for the decision on ADR 0086 (Proposed), then for T2. May follow T2 at a distance: the ABI is the same either way."
+    status: planned
+    issue: 907
+    notes: "Follows T2, and may follow it at a distance: the ABI is the same either way."
   - id: 0086-T4
     title: "Documentation: RULES.md (the function, its limits, its cost), the departures from EMQX, threat model and hardening rows, the cookbook"
-    status: deferred
-    notes: "Waits for the decision on ADR 0086 (Proposed), then for T2."
+    status: planned
+    issue: 908
+    notes: "Follows T2."
 ---
 
 # Delivery 0086 — rule functions in a WebAssembly sandbox
@@ -28,18 +32,18 @@ tasks:
 The plan, progress, and changelog for ADR 0086. Task status lives in the frontmatter
 above; the table below is generated from it.
 
-The ADR is Proposed as a whole. Five things in it are decided (2026-10-11): the runtime is
-wasmtime, chosen for speed; `$ENV` inside jq is empty unless the operator lists variables;
-the jq module is built in the pipeline from pinned sources, not committed; libm's
-last-digit differences are documented, not chased; `jq` is off unless the operator sets
-`rules.jq = true`, and the shipped systemd unit keeps `MemoryDenyWriteExecute=true`, which
-that operator sets to `false`.
+The ADR was accepted on 2026-10-11. Decided with it: the runtime is wasmtime, chosen for
+speed; `$ENV` inside jq is empty unless the operator lists variables; the jq module is
+built in the pipeline from pinned sources, not committed; libm's last-digit differences
+are documented, not chased; `jq` is off unless the operator sets `rules.jq = true`, and the
+shipped systemd unit keeps `MemoryDenyWriteExecute=true`, which that operator sets to
+`false`.
 
 What exists: the crate `crates/mqtt-wasm-sandbox` on wasmtime (nothing in the broker
 depends on it), the jq module's build scripts, the comparison with EMQX 6.3.1, the
-measurements in the ADR, and a CI job that builds the module from pinned sources and runs
-the comparison. Every task stays deferred until the ADR is accepted and its issues are
-opened; T1 is delivered except for one item (below).
+measurements in the ADR, a CI job that builds the module from pinned sources and runs
+the comparison, and a fuzz target for the loader in the nightly tier. That is T1. T2 to
+T4 are planned, each with its issue.
 
 ## Plan
 
@@ -55,10 +59,10 @@ opened; T1 is delivered except for one item (below).
 <!-- status-table:0086 -->
 | Task | Status | Issue | When | Evidence / notes |
 |------|--------|-------|------|------------------|
-| 0086-T1 | 💤 deferred | — | — | "Most of it is delivered ahead of the decision (2026-10-11, PR 904): the crate on wasmtime 49.0.2 with its limits, tests and failure mode, and the `wasm sandbox` CI job, which builds jq.wasm with a compiler and sources pinned by sha256, compares it with jq.wasm.sha256 and runs the 285-case EMQX oracle and the limit tests in release mode. Still open, which is why this is not done: a coverage-guided fuzz target for the loader in the nightly tier (what exists are fixed-input damage tests). The release build embedding the module moved to T2, where the broker first links the crate. Waits for the decision on ADR 0086 (Proposed); an issue is opened when the ADR is accepted." |
-| 0086-T2 | 💤 deferred | — | — | "Waits for the decision on ADR 0086 (Proposed), then for T1." |
-| 0086-T3 | 💤 deferred | — | — | "Waits for the decision on ADR 0086 (Proposed), then for T2. May follow T2 at a distance: the ABI is the same either way." |
-| 0086-T4 | 💤 deferred | — | — | "Waits for the decision on ADR 0086 (Proposed), then for T2." |
+| 0086-T1 | 🚧 in-progress | [#905](https://github.com/mbilling/fss-mqtt-broker/issues/905) | — | "PR 904 carries all of it: the crate on wasmtime 49.0.2 with its limits, tests and failure mode; the `wasm sandbox` CI job, which builds jq.wasm with a compiler and sources pinned by sha256, compares it with jq.wasm.sha256, runs the 285-case EMQX oracle and the limit tests in release mode and checks the refusal under the shipped unit's hardening; and the `module_load` fuzz target in the nightly tier (crates/mqtt-wasm-sandbox/fuzz; 71,000 inputs on two hosts before the PR, no finding). The release build embedding the module is T2's, where the broker first links the crate." |
+| 0086-T2 | ⬜ planned | [#906](https://github.com/mbilling/fss-mqtt-broker/issues/906) | — | "Follows T1." |
+| 0086-T3 | ⬜ planned | [#907](https://github.com/mbilling/fss-mqtt-broker/issues/907) | — | "Follows T2, and may follow it at a distance: the ABI is the same either way." |
+| 0086-T4 | ⬜ planned | [#908](https://github.com/mbilling/fss-mqtt-broker/issues/908) | — | "Follows T2." |
 <!-- /status-table:0086 -->
 
 ## Changelog
@@ -90,3 +94,17 @@ opened; T1 is delivered except for one item (below).
   `$ENV` empty unless listed, the module built in the pipeline, libm documented. T1 stays
   open for a coverage-guided fuzz target; embedding the module in the release build moved
   to T2.
+- 2026-10-11 — ADR accepted. Issues opened for the four tasks (#905 to #908). T1's last
+  item: `module_load`, a cargo-fuzz target in `crates/mqtt-wasm-sandbox/fuzz`, run nightly
+  with the other targets. An input is a module file, or the body of `mqttd_call` inside a
+  module that is otherwise whole (the ABI's exports and seven of the host's imports), so
+  the fuzzer reaches code that runs; compiled or interpreted, bounded by fuel or by the
+  deadline alone. The target asserts that a refused module is never blamed on the host,
+  that an instance is poisoned exactly when a call ended in anything but the function's
+  own answer, and that memory and output stay under their caps. Run before the PR: 55,522
+  inputs in five minutes on macOS arm64 and 15,909 in four on Linux arm64 (under
+  AddressSanitizer; with LeakSanitizer on Linux), no finding. Its first seeds found one
+  defect, fixed with it: with `Limits::max_fuel` set, making an instance was charged to
+  that fuel, and the runtime bills 16,385 units for it compiled and 65,537 interpreted,
+  so a smaller bound refused every module. Making an instance is now bounded by
+  `init_timeout` alone (test `a_small_fuel_bound_still_loads_and_runs_a_module`).
