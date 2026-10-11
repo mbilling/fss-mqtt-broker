@@ -37,8 +37,10 @@ tasks:
     evidence: "PR 948: crates/mqttd/src/rule_state/admin.rs and crates/mqttd/src/admin/state.rs (the overview for a viewer, the paged key listing and single-key read for an operator, the audited delete for an operator who is a listed rules writer, replicated in an eventual namespace), the CLI verbs state, state-keys, state-get and state-del with control characters escaped, the mqttd_rule_state_* series and $SYS/brokers/<node>/rule_state/<namespace> with no key and no value; tests for roles, paging under concurrent writes and merges, the key and value representation round trip, the audit record (key_sha256 and key_bytes) and a three-node delete that converges; the rule_state inspect benchmark."
   - id: 0085-T7
     title: "mqttd --rule-test --sequence: timed sequences replayed through a statement or a rules file against an in-memory store with a driven clock"
-    status: in-progress
+    status: done
     issue: 923
+    date: 2026-10-11
+    evidence: "PR 947 and PR 952: mqttd --rule-test --sequence (crates/mqttd/src/rule_replay.rs) replays a file of JSON lines on a driven clock against a scratch store, for one statement or the configured rules file with its actions, re-entry and [state.*] tables; crates/mqttd/tests/rules_sequence.rs (the kv_held, quota, kv_changed and kv_store_* transcripts, the file format and its errors, the running store untouched) and the RULES.md transcripts run by rules_docs.rs; since PR 952 the replay raises $events/state/expired per key at its expiry time before the step's own message."
   - id: 0085-T8
     title: "Documentation: RULES.md (functions, types, modes, when a state call runs, the worked sequences, the billing example), the departures from EMQX, threat model and hardening rows, the converter"
     status: planned
@@ -134,7 +136,7 @@ and T15 carries the documentation of these three.
 | 0085-T4 | 🚧 in-progress | [#920](https://github.com/mbilling/fss-mqtt-broker/issues/920) | — |  |
 | 0085-T5 | ⬜ planned | [#921](https://github.com/mbilling/fss-mqtt-broker/issues/921) | — |  |
 | 0085-T6 | ✅ done | [#922](https://github.com/mbilling/fss-mqtt-broker/issues/922) | 2026-10-11 | "PR 948: crates/mqttd/src/rule_state/admin.rs and crates/mqttd/src/admin/state.rs (the overview for a viewer, the paged key listing and single-key read for an operator, the audited delete for an operator who is a listed rules writer, replicated in an eventual namespace), the CLI verbs state, state-keys, state-get and state-del with control characters escaped, the mqttd_rule_state_* series and $SYS/brokers/<node>/rule_state/<namespace> with no key and no value; tests for roles, paging under concurrent writes and merges, the key and value representation round trip, the audit record (key_sha256 and key_bytes) and a three-node delete that converges; the rule_state inspect benchmark." |
-| 0085-T7 | 🚧 in-progress | [#923](https://github.com/mbilling/fss-mqtt-broker/issues/923) | — |  |
+| 0085-T7 | ✅ done | [#923](https://github.com/mbilling/fss-mqtt-broker/issues/923) | 2026-10-11 | "PR 947 and PR 952: mqttd --rule-test --sequence (crates/mqttd/src/rule_replay.rs) replays a file of JSON lines on a driven clock against a scratch store, for one statement or the configured rules file with its actions, re-entry and [state.*] tables; crates/mqttd/tests/rules_sequence.rs (the kv_held, quota, kv_changed and kv_store_* transcripts, the file format and its errors, the running store untouched) and the RULES.md transcripts run by rules_docs.rs; since PR 952 the replay raises $events/state/expired per key at its expiry time before the step's own message." |
 | 0085-T8 | ⬜ planned | [#924](https://github.com/mbilling/fss-mqtt-broker/issues/924) | — |  |
 | 0085-T9 | ⬜ planned | [#925](https://github.com/mbilling/fss-mqtt-broker/issues/925) | — |  |
 | 0085-T10 | ⬜ planned | [#926](https://github.com/mbilling/fss-mqtt-broker/issues/926) | — |  |
