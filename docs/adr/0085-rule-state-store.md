@@ -2516,3 +2516,44 @@ on a quiet machine, covers it. What the code says to expect:
 - **T13 and T14 in an `eventual` namespace** (`expire_now`).
 - **T8:** the threat model's row for a namespace held full by owed events now covers
   the members that keep keys for another's event.
+
+### 2026-10-12 — T8: the documentation, and what it decided
+
+T8 wrote the documentation of phase 1 (RULES.md's chapter on state, the cookbook's
+recipes that remember, the threat model's and the hardening baseline's sections, the
+operating, troubleshooting and sizing notes). It built nothing in the broker. One
+question had been left to it, and writing it down settled two smaller ones.
+
+**`PUT /admin/v1/rule` does not gain a `state` field** (open since T1; T6 passed it on).
+The per-rule write keeps a rule's `state` key and cannot set or change one, and that is
+now the documented behaviour, in ADMIN-API.md and RULES.md. Why the field is not added:
+
+- **It would do half of a job.** A `state` key has to name a `[state.<name>]` table, and
+  a per-rule edit never touches those tables: its before-and-after comparison refuses a
+  text in which they changed (`edit::check`). So the field could only point a rule at a
+  namespace some whole-file write had already declared. Declaring a namespace and
+  moving rules into it is one change, and the whole-file `PUT` makes it as one.
+- **It would break the per-rule write's promise.** ADR 0084 D6 has that write change
+  "one `[rules.<id>]` table and nothing else". Changing which namespace a rule's calls
+  work on drops the rule's own namespace with its keys (D1), or leaves the keys it had
+  in the declared one behind. That is a change to stored state made by an edit of a
+  rule's text, which a caller of that endpoint has no reason to expect.
+- **Nothing is lost by it.** A rule inserted by a per-rule write gets a namespace of its
+  own, which is the safe default (D1), and an update keeps what the rule had.
+
+The other answer stays cheap if a use for it appears: an optional field, absent meaning
+"as on disk", refused unless the namespace is declared. An endpoint that declares
+namespaces would be the place to add it.
+
+**The stateful recipes are run by replay, not on a broker.** The cookbook's first
+sixteen recipes are driven through a running broker. Those that keep state depend on
+when messages arrive (ten minutes of silence, five minutes of heat, the next hour), so
+each has a sequence file beside it and is run by `mqttd --rule-test --sequence` on the
+replay's clock, by the same test. What a replay cannot show, it says: one node, no lag.
+The broker's own tests of the same behaviour are T1 to T5's.
+
+**Decided by default, row 9** (a counter keeps a row per run of each node) asked to be
+revisited "before T8 documents it". It is documented as built: the 256-row bound, what
+reaches it, and the advice that follows from it (put the window in the key and let the
+old key expire; do not delete a busy replicated counter to reset it). The row stands by
+default.

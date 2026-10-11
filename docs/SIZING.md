@@ -72,6 +72,10 @@ is running long at that moment, one more instance of up to 64 MiB (`jq`) or the 
 connections publishing to such rules: bound it with those, and leave room for it under
 the cgroup limit.
 
+**Rule state** adds to this only where rules keep state
+([RULES.md](RULES.md#state-what-a-rule-remembers)); it is never more than
+`rules.state_max_bytes` (256 MiB unless set) on a node: [Rule state](#rule-state) below.
+
 The three per-subscriber terms **over**-count rather than under-count: payloads are
 refcounted, so a message counted in both the in-flight table and the outbound channel holds
 one allocation. The `+ 256` is the per-entry envelope the byte accounting charges, and the
@@ -249,6 +253,62 @@ about 245 000 waiting 200-byte publishes. Watch:
   capacity means the hub is the bottleneck and publishers are pausing.
 - `mqttd_ingress_paused_total` and `mqttd_ingress_paused_seconds` for how often publishers
   pause and for how long. Sustained pauses mean the node needs fewer publishers or more hub.
+
+### Rule state
+
+Rules that keep values between messages (`kv_*`, EMQX's `kv_store_*` and `proc_dict_*`)
+hold them in memory, on the heap, counted toward the memory watermark. A rules file that
+uses none holds none. Three bounds nest:
+
+```text
+rules.state_max_bytes                      (256 MiB; every namespace and dictionary on the node; 0 = off)
+  ≥ each namespace: min(max_bytes, what max_keys keys come to)      (64 MiB, 100,000 keys)
+      = keys × (128 + key bytes + what the key holds)               [+ 96 a key if "eventual"]
+```
+
+What a key holds, as the store accounts it:
+
+| Key | Bytes beyond the 128 and the key itself |
+|---|---|
+| A value (`kv_set`, `kv_set_once`, `kv_changed`, `kv_store_put`) | the value as written: a string as its bytes, anything else as JSON text; at most 4,096 |
+| A counter (`kv_incr`), a time (`kv_held`) | 8; in an `eventual` namespace a counter also has 32 and the node's name for each node run beyond the first that incremented it (at most 256 rows) |
+| A maximum or minimum | the number as written |
+| A set (`kv_add`) | each element as written, and 32 more; at most 1,024 elements of 256 bytes (about 295 KiB) |
+| A sketch (`kv_hll_add`) | 128, and four bytes a register while few are set; 12 KiB at the most (from about 3,000 distinct values) |
+| A remembered idempotency key | 1 + the idempotency key + 8 |
+| A deleted key in an `eventual` namespace, for its `tombstone_window` | nothing: 128 + 96 + the key |
+
+**Sizing a namespace.** Count the keys it will hold at once, then the bytes:
+
+```text
+keys  = things keyed by (devices, tenants × windows alive at once, …)
+      + messages counted with an idempotency key per second × dedupe_window     (kv_incr's 4th argument)
+      + deletes per second × tombstone_window                                    ("eventual" only)
+      + keys that expired and whose event has not been raised yet                (a rule on $events/state/expired)
+bytes = keys × (128 [+ 96] + average key + average held)
+```
+
+Worked: "silent for ten minutes" for 50,000 devices, a 12-byte device id as the key, a
+6-byte reading as the value, in an `eventual` namespace: 50,000 × (128 + 96 + 12 + 6) =
+12.1 MB on **every** node. Set `max_keys` to the device count with headroom (60,000) and
+`max_bytes` to "16MiB", not the defaults. A quota counter per tenant and hour with
+idempotency keys, 200 requests a second, a 10-minute `dedupe_window`, 30-byte ids,
+`local`: 200 × 600 = 120,000 remembered keys × (128 + 1 + 30 + 8) = 20 MB, beside which
+the counters themselves are nothing; `max_keys` must be above 120,000 or increments are
+refused.
+
+- **An `eventual` namespace costs its size on every node**, and a changed key is sent to
+  every other node: about 65 bytes for a counter, the value plus about 60 for a value, per
+  peer and per change (several writes of one key within 5 ms are one send).
+- **The ceiling is not reserved.** Memory is used as keys are created. The namespaces'
+  bounds may add up to more than the ceiling; whichever is reached first refuses new
+  keys (`namespace_full`, `store_full`), failing the rule for that message.
+- **`proc_dict_*`:** at most 64 KiB per connection that uses it, counted in the ceiling.
+- **On the memory watermark**, new keys are refused (`brownout`) and existing keys still
+  update: the store stops growing with everything else.
+- **The CPU cost** of a state call is a fraction of a microsecond on the publish path
+  ([RULES.md](RULES.md#what-state-costs), with the conditions those figures were
+  measured under).
 
 ## Disk: the formula
 

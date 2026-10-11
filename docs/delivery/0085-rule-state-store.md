@@ -47,7 +47,7 @@ tasks:
     evidence: "PR 947 and PR 952: mqttd --rule-test --sequence (crates/mqttd/src/rule_replay.rs) replays a file of JSON lines on a driven clock against a scratch store, for one statement or the configured rules file with its actions, re-entry and [state.*] tables; crates/mqttd/tests/rules_sequence.rs (the kv_held, quota, kv_changed and kv_store_* transcripts, the file format and its errors, the running store untouched) and the RULES.md transcripts run by rules_docs.rs; since PR 952 the replay raises $events/state/expired per key at its expiry time before the step's own message."
   - id: 0085-T8
     title: "Documentation: RULES.md (functions, types, modes, when a state call runs, the worked sequences, the billing example), the departures from EMQX, threat model and hardening rows, the converter"
-    status: planned
+    status: in-progress
     issue: 924
   - id: 0085-T9
     title: "strong mode (phase 2): first the design amendment that settles how an evaluation waits, then the durable plane, with partition and failover tests"
@@ -143,7 +143,7 @@ and T15 carries the documentation of these three.
 | 0085-T5 | ✅ done | [#921](https://github.com/mbilling/fss-mqtt-broker/issues/921) | 2026-10-11 | "PR 956: kv_incr(key, by, ttl, idempotency_key) remembers a key of 1 to 255 bytes as an entry of the namespace for its dedupe_window; exact on one node (8 threads presenting 4,000 keys give 4,000 increments, local and eventual), at most once per node inside the replication lag in a cluster, as D8 says; a refused increment is not remembered; a real QoS 1 DUP resend through the broker is counted once with a publisher-given id and every time with the broker's id; replay transcripts in rules_sequence.rs and RULES.md; the rule_state benchmark shows kv_incr without a key unchanged." |
 | 0085-T6 | ✅ done | [#922](https://github.com/mbilling/fss-mqtt-broker/issues/922) | 2026-10-11 | "PR 948: crates/mqttd/src/rule_state/admin.rs and crates/mqttd/src/admin/state.rs (the overview for a viewer, the paged key listing and single-key read for an operator, the audited delete for an operator who is a listed rules writer, replicated in an eventual namespace), the CLI verbs state, state-keys, state-get and state-del with control characters escaped, the mqttd_rule_state_* series and $SYS/brokers/<node>/rule_state/<namespace> with no key and no value; tests for roles, paging under concurrent writes and merges, the key and value representation round trip, the audit record (key_sha256 and key_bytes) and a three-node delete that converges; the rule_state inspect benchmark." |
 | 0085-T7 | ✅ done | [#923](https://github.com/mbilling/fss-mqtt-broker/issues/923) | 2026-10-11 | "PR 947 and PR 952: mqttd --rule-test --sequence (crates/mqttd/src/rule_replay.rs) replays a file of JSON lines on a driven clock against a scratch store, for one statement or the configured rules file with its actions, re-entry and [state.*] tables; crates/mqttd/tests/rules_sequence.rs (the kv_held, quota, kv_changed and kv_store_* transcripts, the file format and its errors, the running store untouched) and the RULES.md transcripts run by rules_docs.rs; since PR 952 the replay raises $events/state/expired per key at its expiry time before the step's own message." |
-| 0085-T8 | ⬜ planned | [#924](https://github.com/mbilling/fss-mqtt-broker/issues/924) | — |  |
+| 0085-T8 | 🚧 in-progress | [#924](https://github.com/mbilling/fss-mqtt-broker/issues/924) | — |  |
 | 0085-T9 | ⬜ planned | [#925](https://github.com/mbilling/fss-mqtt-broker/issues/925) | — |  |
 | 0085-T10 | ⬜ planned | [#926](https://github.com/mbilling/fss-mqtt-broker/issues/926) | — |  |
 | 0085-T11 | ✅ done | [#927](https://github.com/mbilling/fss-mqtt-broker/issues/927) | 2026-10-11 | "PR 933: crates/mqtt-rules/src/state/dict.rs (a Dictionary per evaluating task, the three names in state::FUNCS) and one dictionary per connection in crates/mqttd/src/rules.rs; 99 probes of EMQX 6.3.1 (direct calls, emqx_rule_sqltester, the REST SQL test, and clients on a running node for whose process holds the dictionary per trigger) pinned in mqtt-rules tests_proc_dict (14) and crates/mqttd/tests/rules_proc_dict.rs (10), plus one test each in admin_rules.rs and rules_binary.rs; bounds of 64 keys and 64 KiB with dictionary_full; the ADR amended where the probes contradicted it; the converter carries proc_dict_* rules live." |
@@ -729,3 +729,71 @@ and T15 carries the documentation of these three.
     `sweep/eventual/*`.
   - **Left:** T8's documentation (the threat model's row now covers the members that
     keep keys for another's event).
+- 2026-10-12 — **T8 built** (#924, in review): the documentation of rule state, for
+  someone who has not read the ADR. The ADR's amendment of this date ("T8: the
+  documentation, and what it decided") has the one decision.
+  - **RULES.md** has one chapter, "State: what a rule remembers", where nine changes had
+    each added a part: what state is for, with the recipe for each use; declaring a
+    namespace (every key of `[state.<name>]` in one table, `state`, the two reserved
+    names, the load errors, reload); the thirteen `kv_*` functions with what each
+    returns and fails with; the types and how copies merge; `local` and `eventual`
+    (what is sent, the lag, what two nodes can disagree about, a merge refused at the
+    bounds, what a delete covers, a counter's rows, clocks, restart, the declaration's
+    fingerprint, protocol 14 and upgrading); when a state call runs, with a transcript
+    of the three places a call can stand and the three surprises (a resent QoS 1, a
+    rule's own output, `clientid` of a republished message); counting a message once
+    and the expiry event as T5 and T4 wrote them; EMQX's `kv_store_*` and `proc_dict_*`
+    with their scope and every difference; bounds, what a key is accounted as, and
+    every error with what triggers it and what to do; "not a system of record" with
+    the billing example; testing; cost (the ADR's figures with their conditions,
+    including that most were taken on a shared machine and that the cluster half of T4
+    was not measured); watching and managing, with every metric and what a rising
+    refusal means.
+  - **Stale statements fixed** in RULES.md: "Rules never chain" in Gotchas and step 7
+    of "My rule does not fire" (both from before republished messages re-entered the
+    rules); "In mqttd 1.1.0 and earlier a republished message never re-entered the
+    rules" (no release has the rule engine: it is about builds of `main`); the
+    converter paragraph, which did not say `kv_store_*` and `proc_dict_*` rules are
+    carried live. In the cookbook: recipe 10's "what needs state is not possible in a
+    rule" and the "What rules cannot do" table. In the demo's rules file: four comments
+    that said a rule keeps no state.
+  - **"Differences from EMQX"** has a row each for `kv_store_*`, `proc_dict_*`, the
+    `kv_*` functions (all thirteen; `kv_hll_add` and `kv_hll_count` were missing), the
+    `[state.<name>]` tables with the rule key `state`, and the expiry event, and the
+    testing row names the scratch store and dictionary.
+  - **The cookbook** gains seven recipes that remember (17 to 23), each a rules file
+    with a sequence file beside it in `docs/examples/rules/`: silent for ten minutes,
+    hot for five minutes (with the alarm's start and end by `kv_changed`), forward on
+    change, a quota per tenant and hour with an idempotency key beside its billing
+    record (D12's example), distinct devices per site and hour, enrichment with a value
+    another topic delivered, and an EMQX `kv_store_*` counter. Each is replayed through
+    the real binary by `rules_cookbook.rs`, which pins the lines that are the point of
+    each and holds the page to everything the replay prints; `rules_docs.rs` runs the
+    page's commands as well.
+  - **THREAT-MODEL.md** has a section "State for rules" (ten rows, each citing the
+    tests that fail without the mitigation): exhaustion by payload-chosen keys and
+    values, one publisher crowding out another, payload-derived values read back into
+    other rules, idempotency-key abuse, expiry as a flood and a namespace held full by
+    owed events (the members that keep keys for another member's event included), the
+    publish path, a hostile or buggy peer on the state lane, keys and values in front
+    of operators and in logs, a rules writer's reach, and state as a channel between
+    clients; and six accepted risks (in memory; divergence at the bounds; double counts
+    inside the replication lag; the event at least once; clocks; fairness between
+    publishers).
+  - **HARDENING.md** has H-7.16 to H-7.19 and H-8.6, and a section on how to bound rule
+    state or switch it off and who should be a rules writer.
+  - **OPERATIONS.md, TROUBLESHOOTING.md, SIZING.md, KUBERNETES.md, MIGRATION.md,
+    ADMIN-API.md, the READMEs**: what to watch and what each refusal means; the three
+    usual wrong decisions and the event that does not arrive; the arithmetic for sizing
+    a namespace with two worked examples; state in a pod; the converter's two live
+    rules; the per-rule write and `state`; the feature rows.
+  - **The converter** was run on `fixtures/emqx-rules.conf`: both rules come out live
+    with their `TODO(migrate)` notes and the file passes `--check-rules`. Not changed.
+  - **Checked against the binary:** every error text quoted, every transcript, and each
+    load error, by running them; the test names the threat model cites, against the
+    tree.
+  - **Not verified here:** anything across machines (the lag, a refill, the hand-over
+    of expiry events), which the documents give as the ADR's single-machine figures or
+    as "not measured"; and no benchmark was run for this change.
+  - **Not documented, on purpose:** T13 to T15 (purge, change of expiry) are planned
+    and named only as such.

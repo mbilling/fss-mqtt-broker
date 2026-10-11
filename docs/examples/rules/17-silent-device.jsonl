@@ -1,0 +1,6 @@
+# two devices report; d2 stops after its first reading, d1 after its third
+{"at": 0,     "topic": "devices/d1/telemetry", "payload": {"temp": 20}}
+{"at": "1m",  "topic": "devices/d2/telemetry", "payload": {"temp": 21}}
+{"at": "8m",  "topic": "devices/d1/telemetry", "payload": {"temp": 22}}
+{"at": "15m", "topic": "devices/d1/telemetry", "payload": {"temp": 23}}
+{"at": "1h"}

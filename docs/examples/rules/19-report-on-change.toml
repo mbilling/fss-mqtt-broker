@@ -1,0 +1,30 @@
+# Recipe 19: forward a value only when it changes
+#
+# Machines report their status every few seconds, and a dashboard wants one message
+# when it changes. kv_changed stores the value under the key and answers whether it
+# differs from the one stored before: true the first time, false for a repeat.
+#
+# state_change forwards a machine's status to changes/<machine> when it differs from
+# the last one that machine reported. It stands in the WHERE, where it runs for every
+# message the FROM selects; the SELECT has no state call.
+#
+# "Differs" is exact: 1 and 1.0 are two values, and so are "on" and "ON". Compare what
+# you mean to compare: lower(payload.status), or round(payload.temp) for a deadband of
+# one degree. The 24-hour TTL forgets a machine that stops reporting; its next status
+# is then a change.
+#
+# Replay: docs/examples/rules/19-report-on-change.jsonl (mqttd --rule-test --sequence).
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[rules.state_change]
+description = "A machine's status, only when it differs from the last one"
+sql = '''
+SELECT topic(2) AS machine, lower(payload.status) AS status
+FROM "machines/+/status"
+WHERE is_str(payload.status)
+  AND kv_changed(topic(2), lower(payload.status), '24h')
+'''
+actions = [
+  { function = "republish", args = { topic = "changes/${machine}", qos = 1, retain = true, payload = "${.}" } },
+]

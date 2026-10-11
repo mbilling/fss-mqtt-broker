@@ -1,13 +1,16 @@
 # Rule cookbook
 
-**Dated 2026-10-11.** For the rule engine, which no release has yet: see
+**Dated 2026-10-12.** For the rule engine, which no release has yet: see
 [RULES.md](RULES.md) for how to get a build that has it.
 
-Sixteen working recipes for mqttd's [rule engine](RULES.md). Each one is a rules file in
-[`docs/examples/rules/`](examples/rules/) that you can copy as it is, with the messages to
-publish and the exact output to expect. After them, a section on the `jq` function, which
-is off unless you switch it on: four rules that are worth a `jq` call, and nine common
-statements that are not, each beside the plain rule SQL that does the same.
+Twenty-three working recipes for mqttd's [rule engine](RULES.md). Each one is a rules file
+in [`docs/examples/rules/`](examples/rules/) that you can copy as it is, with the messages
+to publish and the exact output to expect. Recipes 1 to 16 look at one message at a time.
+Recipes 17 to 23 [remember](#rules-that-remember): silence, duration, change, a quota,
+distinct counts, a value from another topic, and a rule moved from EMQX. After them, a
+section on the `jq` function, which is off unless you switch it on: four rules that are
+worth a `jq` call, and nine common statements that are not, each beside the plain rule SQL
+that does the same.
 
 Every recipe on this page is run against the real `mqttd` binary by
 [`crates/mqttd/tests/rules_cookbook.rs`](../crates/mqttd/tests/rules_cookbook.rs). The same
@@ -15,7 +18,9 @@ test checks this page: each rules file is quoted here verbatim, and every code b
 page, every command and every line of output, is generated from what the test publishes and
 receives, so none is missing, stale or extra. The gotchas are tested too: the test runs the
 guarded recipes without their guards and checks that each trap is real. If a recipe stopped
-doing what this page says, the build would fail.
+doing what this page says, the build would fail. The recipes that remember are replayed
+through `mqttd --rule-test --sequence`, which drives its own clock, so ten minutes of
+silence take no time to test.
 
 For the SQL, the fields, the functions and the actions themselves, see
 [RULES.md](RULES.md). For the recipes put together on realistic data (ten simulated
@@ -43,6 +48,14 @@ privacy-safe feeds they derive), see the [rule-engine demo](../demo/rules/README
 - [14. Parse CSV and key=value text](#14-parse-csv-and-keyvalue-text)
 - [15. Decode base64, hex and binary payloads](#15-decode-base64-hex-and-binary-payloads)
 - [16. MQTT 5 user properties in and out](#16-mqtt-5-user-properties-in-and-out)
+- [Rules that remember](#rules-that-remember)
+- [17. Silent for ten minutes](#17-silent-for-ten-minutes)
+- [18. Hot for five minutes](#18-hot-for-five-minutes)
+- [19. Forward a value only when it changes](#19-forward-a-value-only-when-it-changes)
+- [20. A quota, and the billing record beside it](#20-a-quota-and-the-billing-record-beside-it)
+- [21. Count distinct devices](#21-count-distinct-devices)
+- [22. Enrich with the last known value](#22-enrich-with-the-last-known-value)
+- [23. A rule from EMQX that uses kv_store](#23-a-rule-from-emqx-that-uses-kv_store)
 - [jq: when it earns its cost](#jq-when-it-earns-its-cost)
 - [What rules cannot do](#what-rules-cannot-do)
 
@@ -788,17 +801,18 @@ less.
 ```toml
 # Recipe 10: thin out a high-rate stream without state
 #
-# A rule sees one message at a time and remembers nothing, so it can only thin a stream
-# by something in the message itself:
+# The cheapest way to thin a stream is by something in the message itself. It needs no
+# memory, so it costs nothing to keep and decides the same on every node of a cluster:
 #
 # - decimate_by_seq keeps every 10th reading, using the device's own sequence counter,
 #   on vib/<device>/1in10.
 # - fleet_sample keeps every reading from a stable ~25% of the devices (the same ones
 #   every time: the hash of the device id decides), on debug/sample/<device>.
 #
-# What needs state is not possible in a rule: an average or a min/max over a window,
-# counting, deduplication, "only when the value changed" (a deadband), a per-device rate
-# limit, or exactly one message per interval. docs/RULES-COOKBOOK.md says what to use.
+# What needs memory ("only when the value changed", a count, at most one message per
+# device per minute) is done with the state functions: recipes 17 to 23. An average
+# over a time window, and exactly one message per interval, are not a rule's job:
+# docs/RULES-COOKBOOK.md says what to use.
 #
 # In:  vib/pump-1/raw  qos=0 retain=0  {"seq": 10, "v": 0.42}
 # Out: vib/pump-1/1in10  qos=0 retain=0  {"device":"pump-1","seq":10,"v":0.42}
@@ -858,9 +872,10 @@ vib/pump-2/raw  qos=0 retain=0  {"seq": 21, "v": 0.37}
 debug/sample/pump-2  qos=0 retain=0  {"device":"pump-2","bucket":21,"seq":21,"v":0.37}
 ```
 
-**Gotcha:** a rule sees one message at a time and keeps nothing between messages. Averages,
-minimum or maximum over a window, counts, deduplication, "only when the value changed", a
-rate limit per device, or exactly one message per interval all need state. See
+**Gotcha:** these two rules keep nothing between messages, which is why they are cheap.
+"Only when the value changed", a count, deduplication and a rate limit per device need
+memory: [Rules that remember](#rules-that-remember). An average over a time window and
+exactly one message per interval are still not a rule's job: see
 [What rules cannot do](#what-rules-cannot-do).
 
 ---
@@ -1461,6 +1476,921 @@ give it a default with `coalesce()`.
 
 ---
 
+## Rules that remember
+
+Recipes 17 to 23 keep values between messages with the
+[state functions](RULES.md#state-what-a-rule-remembers). Three things hold for all of
+them:
+
+- **State is in memory.** A broker that restarts has forgotten it. A namespace declared
+  `consistency = "eventual"` is held by every node of a cluster and given back to a
+  restarted node by the others; it is still gone when every node stops. Use it to
+  decide, not to keep records ([recipe 20](#20-a-quota-and-the-billing-record-beside-it)).
+- **A state call in `SELECT` runs for every message the `FROM` selects**, whatever the
+  `WHERE` says. Recipes 17 and 18 rely on it; recipes 19 and 21 put the call in the
+  `WHERE`, where the conditions before it decide whether it runs
+  ([RULES.md](RULES.md#when-a-state-call-runs)).
+- **They are tried with a replay, not with `mosquitto_pub`**, because what they do
+  depends on when the messages arrive. Each recipe has a sequence file beside it, one
+  message a line with its time, and `mqttd --rule-test --sequence` runs it through the
+  recipe's rules on a clock of its own. Under each step it prints what every rule did
+  and what the step changed in the store: `+` a new key, `~` a changed value or expiry,
+  `-` a key that is gone ([RULES.md](RULES.md#replay-a-sequence-mqttd---rule-test---sequence)).
+  The times in the output count from the replay's start, 2025-01-01T00:00:00Z. Run the
+  commands from the repository's root, or give your own paths.
+
+To run one on a broker instead, start the broker with the file as in the
+[quick start](#run-any-recipe-in-under-a-minute) and publish the sequence's messages
+yourself, at their times: for recipe 17 that means waiting the ten minutes.
+
+---
+
+## 17. Silent for ten minutes
+
+A rule runs when a message arrives, so on its own it cannot notice a message that did
+not. The state store can: a key with an expiry that every reading moves, and a rule on the
+key's expiry, [`$events/state/expired`](RULES.md#when-a-key-expires-eventsstateexpired).
+File: [`17-silent-device.toml`](examples/rules/17-silent-device.toml).
+
+```toml
+# Recipe 17: alert when a device has been silent for ten minutes
+#
+# A rule runs when a message arrives, so it cannot see a message that did not. The
+# state store can: last_seen sets a key per device on every reading, with a ten-minute
+# expiry that each reading moves, and when a device stops the key expires and the
+# broker raises $events/state/expired. silent turns that event into
+# alerts/silent/<device>, with the last temperature the device sent.
+#
+# The event is sent for every namespace's keys, so silent says which one it means
+# (WHERE namespace = 'seen'). It is raised up to a second after the expiry, never on a
+# node that restarted meanwhile (state is in memory), and a device that has never
+# spoken has no key to expire.
+#
+# Replay: docs/examples/rules/17-silent-device.jsonl (mqttd --rule-test --sequence).
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[state.seen]
+default_ttl = "10m"
+
+[rules.last_seen]
+description = "Remember each device's last reading for ten minutes"
+state = "seen"
+sql = '''
+SELECT kv_set(topic(2), payload.temp, '10m') AS last_temp
+FROM "devices/+/telemetry"
+WHERE is_num(payload.temp)
+'''
+
+[rules.silent]
+description = "A device whose key expired has said nothing for ten minutes"
+sql = '''
+SELECT key AS device, value AS last_temp, expired_at
+FROM "$events/state/expired"
+WHERE namespace = 'seen'
+'''
+actions = [
+  { function = "republish", args = { topic = "alerts/silent/${device}", qos = 1, payload = "${.}" } },
+]
+```
+
+The sequence, [`17-silent-device.jsonl`](examples/rules/17-silent-device.jsonl):
+
+```text
+# two devices report; d2 stops after its first reading, d1 after its third
+{"at": 0,     "topic": "devices/d1/telemetry", "payload": {"temp": 20}}
+{"at": "1m",  "topic": "devices/d2/telemetry", "payload": {"temp": 21}}
+{"at": "8m",  "topic": "devices/d1/telemetry", "payload": {"temp": 22}}
+{"at": "15m", "topic": "devices/d1/telemetry", "payload": {"temp": 23}}
+{"at": "1h"}
+```
+
+Replay it:
+
+```sh
+MQTTD_RULES_FILE=docs/examples/rules/17-silent-device.toml mqttd --rule-test --sequence docs/examples/rules/17-silent-device.jsonl
+```
+
+```text
+#1 +0s devices/d1/telemetry {"temp": 20}
+  last_seen: passed
+  state seen: + "d1" = 20 (lww, expires +600s)
+#2 +60s devices/d2/telemetry {"temp": 21}
+  last_seen: passed
+  state seen: + "d2" = 21 (lww, expires +660s)
+#3 +480s devices/d1/telemetry {"temp": 22}
+  last_seen: passed
+  state seen: ~ "d1" = 22 (lww, expires +1080s)
+#4 +900s devices/d1/telemetry {"temp": 23}
+  event state.expired seen: "d2" at +660s
+    silent: passed
+      republish alerts/silent/d2 qos 1 {"device":"d2","last_temp":21,"expired_at":1735690260000}
+  last_seen: passed
+  state seen: - "d2" (expired +660s)
+  state seen: ~ "d1" = 23 (lww, expires +1500s)
+#5 +3600s (nothing sent)
+  event state.expired seen: "d1" at +1500s
+    silent: passed
+      republish alerts/silent/d1 qos 1 {"device":"d1","last_temp":23,"expired_at":1735691100000}
+  state seen: - "d1" (expired +1500s)
+```
+
+`d2` spoke once, at one minute, and its alert comes at eleven: step 4 is the first step
+after that, so the event is shown there, at its own time (`at +660s`) and before the
+step's reading. `d1`'s reading at eight minutes moved its deadline from ten minutes to
+eighteen, and its last reading, at fifteen, to twenty-five. `last_seen` has no action: it
+only keeps the key.
+
+**Gotchas:**
+
+- **The event is sent for every namespace's keys.** Without `WHERE namespace = 'seen'`
+  the rule would alert for every key that expires anywhere in the file.
+- **A device that has never spoken has no key**, so nothing expires for it. And state is
+  in memory: after a broker restart a device is not watched again until it has spoken
+  once. To catch a device that never shows up, compare against an inventory outside the
+  broker.
+- **On a broker the alert is up to a second late**, and a site that falls silent all at
+  once is reported at `rules.state_expiry_per_sec` (1,000 a second unless set), late
+  rather than lost.
+- **In a cluster**, declare the namespace `consistency = "eventual"` so that a device
+  may reconnect to any node, and ship both rules to every node. One node raises each
+  alert; around a node failure or a partition the same alert can come twice, and a
+  reading that reaches another node within milliseconds of the deadline can come too
+  late to stop it ([RULES.md](RULES.md#when-a-key-expires-eventsstateexpired)).
+- The key is the topic's device level, which is one topic level by construction. A key
+  built from a payload field needs the guard of [recipe 7](#7-route-by-a-payload-field-safely)
+  before it becomes a topic level in the alert.
+
+---
+
+## 18. Hot for five minutes
+
+A threshold alert ([recipe 2](#2-a-threshold-alert)) fires on the first hot reading, and
+on every one after it. `kv_held` fires when the condition has held without a break, and
+`kv_changed` turns "is in alarm" into one message when it starts and one when it ends.
+File: [`18-hot-for-five-minutes.toml`](examples/rules/18-hot-for-five-minutes.toml).
+
+```toml
+# Recipe 18: alert when a reading has stayed above a threshold for five minutes
+#
+# A threshold alert (recipe 02) fires on the first hot reading. kv_held fires when the
+# condition has held without a break: it records when the condition first became true,
+# answers how many whole seconds ago that was, and forgets it on the first reading
+# that is not hot.
+#
+# - hot_sensor publishes every reading of a sensor that has been above 30 for five
+#   minutes or more, with how long, on alerts/hot/<sensor>.
+# - hot_alarm publishes once when that alarm starts and once when it ends, on
+#   alarms/hot/<sensor>: kv_changed passes a message only when the alarm's state
+#   differs from the last one. A sensor's first reading reports its state too.
+#
+# kv_held stands in the SELECT, so it runs on every reading, the ones the WHERE turns
+# away included. That is what records the first hot reading. The one-hour TTL forgets
+# a sensor that stops reporting while it is hot.
+#
+# Replay: docs/examples/rules/18-hot-for-five-minutes.jsonl (mqttd --rule-test --sequence).
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[rules.hot_sensor]
+description = "Every reading of a sensor that has been above 30 for five minutes"
+sql = '''
+SELECT
+  topic(2) AS sensor,
+  payload.temp AS temp,
+  kv_held(topic(2), payload.temp > 30, '1h') AS hot_for
+FROM "sensors/+/data"
+WHERE hot_for >= 300
+'''
+actions = [
+  { function = "republish", args = { topic = "alerts/hot/${sensor}", qos = 1, payload = "${.}" } },
+]
+
+[rules.hot_alarm]
+description = "Once when the alarm starts, once when it ends"
+sql = '''
+SELECT
+  topic(2) AS sensor,
+  (kv_held('hot:' + topic(2), payload.temp > 30, '1h') >= 300) AS alarm
+FROM "sensors/+/data"
+WHERE kv_changed('alarm:' + topic(2), alarm, '1h')
+'''
+actions = [
+  { function = "republish", args = { topic = "alarms/hot/${sensor}", qos = 1, retain = true, payload = "${.}" } },
+]
+```
+
+The sequence, [`18-hot-for-five-minutes.jsonl`](examples/rules/18-hot-for-five-minutes.jsonl):
+
+```text
+# a sensor runs hot for six minutes, cools, and runs hot again for one
+{"at": 0,     "topic": "sensors/s1/data", "payload": {"temp": 31}}
+{"at": "2m",  "topic": "sensors/s1/data", "payload": {"temp": 32}}
+{"at": "5m",  "topic": "sensors/s1/data", "payload": {"temp": 33}}
+{"at": "6m",  "topic": "sensors/s1/data", "payload": {"temp": 34}}
+{"at": "7m",  "topic": "sensors/s1/data", "payload": {"temp": 20}}
+{"at": "8m",  "topic": "sensors/s1/data", "payload": {"temp": 35}}
+{"at": "9m",  "topic": "sensors/s1/data", "payload": {"temp": 36}}
+```
+
+Replay it:
+
+```sh
+MQTTD_RULES_FILE=docs/examples/rules/18-hot-for-five-minutes.toml mqttd --rule-test --sequence docs/examples/rules/18-hot-for-five-minutes.jsonl
+```
+
+```text
+#1 +0s sensors/s1/data {"temp": 31}
+  hot_alarm: passed
+    republish alarms/hot/s1 qos 1 retain {"sensor":"s1","alarm":false}
+  hot_sensor: no_result
+  state rule:hot_alarm: + "alarm:s1" = false (lww, expires +3600s)
+  state rule:hot_alarm: + "hot:s1" = 1735689600000 (first, expires +3600s)
+  state rule:hot_sensor: + "s1" = 1735689600000 (first, expires +3600s)
+#2 +120s sensors/s1/data {"temp": 32}
+  hot_alarm: no_result
+  hot_sensor: no_result
+  state rule:hot_alarm: ~ "alarm:s1" = false (lww, expires +3720s)
+  state rule:hot_alarm: ~ "hot:s1" = 1735689600000 (first, expires +3720s)
+  state rule:hot_sensor: ~ "s1" = 1735689600000 (first, expires +3720s)
+#3 +300s sensors/s1/data {"temp": 33}
+  hot_alarm: passed
+    republish alarms/hot/s1 qos 1 retain {"sensor":"s1","alarm":true}
+  hot_sensor: passed
+    republish alerts/hot/s1 qos 1 {"sensor":"s1","temp":33,"hot_for":300}
+  state rule:hot_alarm: ~ "alarm:s1" = true (lww, expires +3900s)
+  state rule:hot_alarm: ~ "hot:s1" = 1735689600000 (first, expires +3900s)
+  state rule:hot_sensor: ~ "s1" = 1735689600000 (first, expires +3900s)
+#4 +360s sensors/s1/data {"temp": 34}
+  hot_alarm: no_result
+  hot_sensor: passed
+    republish alerts/hot/s1 qos 1 {"sensor":"s1","temp":34,"hot_for":360}
+  state rule:hot_alarm: ~ "alarm:s1" = true (lww, expires +3960s)
+  state rule:hot_alarm: ~ "hot:s1" = 1735689600000 (first, expires +3960s)
+  state rule:hot_sensor: ~ "s1" = 1735689600000 (first, expires +3960s)
+#5 +420s sensors/s1/data {"temp": 20}
+  hot_alarm: passed
+    republish alarms/hot/s1 qos 1 retain {"sensor":"s1","alarm":false}
+  hot_sensor: no_result
+  state rule:hot_alarm: ~ "alarm:s1" = false (lww, expires +4020s)
+  state rule:hot_alarm: - "hot:s1"
+  state rule:hot_sensor: - "s1"
+#6 +480s sensors/s1/data {"temp": 35}
+  hot_alarm: no_result
+  hot_sensor: no_result
+  state rule:hot_alarm: ~ "alarm:s1" = false (lww, expires +4080s)
+  state rule:hot_alarm: + "hot:s1" = 1735690080000 (first, expires +4080s)
+  state rule:hot_sensor: + "s1" = 1735690080000 (first, expires +4080s)
+#7 +540s sensors/s1/data {"temp": 36}
+  hot_alarm: no_result
+  hot_sensor: no_result
+  state rule:hot_alarm: ~ "alarm:s1" = false (lww, expires +4140s)
+  state rule:hot_alarm: ~ "hot:s1" = 1735690080000 (first, expires +4140s)
+  state rule:hot_sensor: ~ "s1" = 1735690080000 (first, expires +4140s)
+```
+
+`hot_sensor` says nothing for the readings at 0 and 2 minutes and publishes at 5 and 6,
+with how long the sensor has been hot. The cool reading at 7 minutes deletes the key
+(`- "s1"`), so the hot readings at 8 and 9 start a new five minutes and publish nothing.
+`hot_alarm` publishes three times: the sensor's first reading (not in alarm), the start
+of the alarm at 5 minutes and its end at 7.
+
+**Gotchas:**
+
+- **`kv_held` must stand where every reading reaches it**: in the `SELECT`, or first in
+  the `WHERE`. Behind `WHERE payload.temp > 30 AND …` it would never see the cool
+  reading that ends the run, and the sensor would be "hot" for ever.
+- **The two rules do not share keys.** Neither has a `state` key, so each has a
+  namespace of its own, and each keeps its own `kv_held` time. To share one, declare a
+  `[state.<name>]` and name it in both.
+- `kv_held` answers `undefined` for a reading that is not hot. `undefined >= 300` is
+  false, which is what the `WHERE` and the `alarm` field rely on.
+- A sensor that stops reporting while hot keeps its key for the TTL (an hour here) and
+  is then forgotten: its next hot reading starts at zero. Its alarm stays retained as
+  `true` meanwhile; [recipe 17](#17-silent-for-ten-minutes) is how to notice the
+  silence.
+- Durations are measured on the broker's clock, from the times the readings *arrived*.
+
+---
+
+## 19. Forward a value only when it changes
+
+Machines report their status every few seconds; a dashboard wants one message when it
+changes. `kv_changed` stores the value and answers whether it differs from the one
+stored before. File:
+[`19-report-on-change.toml`](examples/rules/19-report-on-change.toml).
+
+```toml
+# Recipe 19: forward a value only when it changes
+#
+# Machines report their status every few seconds, and a dashboard wants one message
+# when it changes. kv_changed stores the value under the key and answers whether it
+# differs from the one stored before: true the first time, false for a repeat.
+#
+# state_change forwards a machine's status to changes/<machine> when it differs from
+# the last one that machine reported. It stands in the WHERE, where it runs for every
+# message the FROM selects; the SELECT has no state call.
+#
+# "Differs" is exact: 1 and 1.0 are two values, and so are "on" and "ON". Compare what
+# you mean to compare: lower(payload.status), or round(payload.temp) for a deadband of
+# one degree. The 24-hour TTL forgets a machine that stops reporting; its next status
+# is then a change.
+#
+# Replay: docs/examples/rules/19-report-on-change.jsonl (mqttd --rule-test --sequence).
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[rules.state_change]
+description = "A machine's status, only when it differs from the last one"
+sql = '''
+SELECT topic(2) AS machine, lower(payload.status) AS status
+FROM "machines/+/status"
+WHERE is_str(payload.status)
+  AND kv_changed(topic(2), lower(payload.status), '24h')
+'''
+actions = [
+  { function = "republish", args = { topic = "changes/${machine}", qos = 1, retain = true, payload = "${.}" } },
+]
+```
+
+The sequence, [`19-report-on-change.jsonl`](examples/rules/19-report-on-change.jsonl):
+
+```text
+# two machines; m1 repeats itself, changes, and repeats the change in capitals
+{"at": 0,  "topic": "machines/m1/status", "payload": {"status": "running"}}
+{"at": 5,  "topic": "machines/m1/status", "payload": {"status": "running"}}
+{"at": 10, "topic": "machines/m2/status", "payload": {"status": "running"}}
+{"at": 15, "topic": "machines/m1/status", "payload": {"status": "stopped"}}
+{"at": 20, "topic": "machines/m1/status", "payload": {"status": "STOPPED"}}
+{"at": 25, "topic": "machines/m1/status", "payload": {"status": "running"}}
+```
+
+Replay it:
+
+```sh
+MQTTD_RULES_FILE=docs/examples/rules/19-report-on-change.toml mqttd --rule-test --sequence docs/examples/rules/19-report-on-change.jsonl
+```
+
+```text
+#1 +0s machines/m1/status {"status": "running"}
+  state_change: passed
+    republish changes/m1 qos 1 retain {"machine":"m1","status":"running"}
+  state rule:state_change: + "m1" = "running" (lww, expires +86400s)
+#2 +5s machines/m1/status {"status": "running"}
+  state_change: no_result
+  state rule:state_change: ~ "m1" = "running" (lww, expires +86405s)
+#3 +10s machines/m2/status {"status": "running"}
+  state_change: passed
+    republish changes/m2 qos 1 retain {"machine":"m2","status":"running"}
+  state rule:state_change: + "m2" = "running" (lww, expires +86410s)
+#4 +15s machines/m1/status {"status": "stopped"}
+  state_change: passed
+    republish changes/m1 qos 1 retain {"machine":"m1","status":"stopped"}
+  state rule:state_change: ~ "m1" = "stopped" (lww, expires +86415s)
+#5 +20s machines/m1/status {"status": "STOPPED"}
+  state_change: no_result
+  state rule:state_change: ~ "m1" = "stopped" (lww, expires +86420s)
+#6 +25s machines/m1/status {"status": "running"}
+  state_change: passed
+    republish changes/m1 qos 1 retain {"machine":"m1","status":"running"}
+  state rule:state_change: ~ "m1" = "running" (lww, expires +86425s)
+```
+
+`m1`'s second `running` and its `STOPPED` in capitals are not forwarded; its first
+status, the change to `stopped` and the change back are. `m2` has a key of its own.
+Every message moves the key's expiry (the `~` lines), so a machine is forgotten 24
+hours after its last report, not after its last change.
+
+**Gotchas:**
+
+- **"Differs" is exact.** `1` and `1.0` are two values and so are `on` and `ON`, which
+  is why the rule compares `lower(payload.status)`. For a number that jitters, compare
+  what you mean: `round(payload.temp)` forwards a change of a whole degree.
+- **`is_str` comes first in the `WHERE`**, so a message without a status is turned away
+  before `kv_changed` runs: storing `undefined` would fail the rule (`bad_value`).
+- **In a cluster, a `local` namespace is per node**: a machine that reconnects to
+  another node has no key there and its unchanged status is forwarded once more. Give
+  the rule a namespace declared `consistency = "eventual"` to carry the last value to
+  every node. Two nodes that see the same new value within a few milliseconds of each
+  other both forward it.
+- A QoS 1 status that is sent again is not forwarded twice: it does not differ.
+
+---
+
+## 20. A quota, and the billing record beside it
+
+Count requests per tenant and hour, act when a tenant passes its quota, and bill
+correctly. The last part is why there are two rules: **the count decides, and a durable
+message is the record.** File:
+[`20-quota-and-billing.toml`](examples/rules/20-quota-and-billing.toml).
+
+```toml
+# Recipe 20: a quota per tenant and hour, and the billing record beside it
+#
+# Tenants publish API requests on api/<tenant>/requests at QoS 1, each with a
+# request_id the tenant chose. Two rules, with two different jobs:
+#
+# - billing_event is the record. It republishes every request to billing/<tenant> at
+#   QoS 1, id included, and keeps no state. The billing system consumes that topic
+#   with a persistent session and drops an id it has already seen. This is what you
+#   bill from.
+# - quota is the decision. It counts each tenant's requests in the current hour and
+#   publishes to quota/exceeded/<tenant> for every request past the third. This is
+#   what you act on now, and it is not a ledger: the count is in memory, gone when
+#   the node restarts, and in a cluster two nodes can each count a request that
+#   reaches both before they have heard of each other.
+#
+# The fourth argument of kv_incr is an idempotency key: a request that is sent again
+# (a lost PUBACK, a client retry) is counted once. The tenant is in front of the id,
+# so one tenant cannot use up another's ids. A request without a request_id fails the
+# rule (bad_idempotency_key): it is neither counted twice nor left out without a word.
+#
+# The hour is in the counter's key (timestamp div 3600000 is the hour since 1970), so
+# every hour starts a counter of its own. A TTL alone would not do: kv_incr with an
+# idempotency key always names its TTL, and a write that names a TTL moves the expiry.
+#
+# Replay: docs/examples/rules/20-quota-and-billing.jsonl (mqttd --rule-test --sequence).
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[state.quota]
+max_keys = 200000
+default_ttl = "2h"
+dedupe_window = "10m"
+
+[rules.billing_event]
+description = "The record: every request, to the billing system, at QoS 1"
+sql = '''
+SELECT topic(2) AS tenant, payload.request_id AS request_id, payload.units AS units, timestamp AS at
+FROM "api/+/requests"
+WHERE is_str(payload.request_id)
+'''
+actions = [
+  { function = "republish", args = { topic = "billing/${tenant}", qos = 1, payload = "${.}" } },
+]
+
+[rules.quota]
+description = "The decision: more than three requests from a tenant this hour"
+state = "quota"
+sql = '''
+SELECT
+  topic(2) AS tenant,
+  kv_incr(topic(2) + ':' + str(timestamp div 3600000), 1, '2h',
+          topic(2) + ':' + payload.request_id) AS used
+FROM "api/+/requests"
+WHERE used > 3
+'''
+actions = [
+  { function = "republish", args = { topic = "quota/exceeded/${tenant}", qos = 1, payload = "${.}" } },
+]
+```
+
+The sequence, [`20-quota-and-billing.jsonl`](examples/rules/20-quota-and-billing.jsonl):
+
+```text
+# acme sends four requests and sends the second one twice; the next hour starts at zero
+{"at": 0,    "topic": "api/acme/requests", "qos": 1, "payload": {"request_id": "r-1", "units": 5}}
+{"at": 60,   "topic": "api/acme/requests", "qos": 1, "payload": {"request_id": "r-2", "units": 1}}
+{"at": 62,   "topic": "api/acme/requests", "qos": 1, "payload": {"request_id": "r-2", "units": 1}}
+{"at": 120,  "topic": "api/acme/requests", "qos": 1, "payload": {"request_id": "r-3", "units": 2}}
+{"at": 180,  "topic": "api/acme/requests", "qos": 1, "payload": {"request_id": "r-4", "units": 1}}
+{"at": "1h", "topic": "api/acme/requests", "qos": 1, "payload": {"request_id": "r-5", "units": 1}}
+```
+
+Replay it:
+
+```sh
+MQTTD_RULES_FILE=docs/examples/rules/20-quota-and-billing.toml mqttd --rule-test --sequence docs/examples/rules/20-quota-and-billing.jsonl
+```
+
+```text
+#1 +0s api/acme/requests {"request_id": "r-1", "units": 5}
+  billing_event: passed
+    republish billing/acme qos 1 {"tenant":"acme","request_id":"r-1","units":5,"at":1735689600000}
+  quota: no_result
+  state quota: + idempotency key "acme:r-1" = 1735689600000 (first, expires +600s)
+  state quota: + "acme:482136" = 1 (sum, expires +7200s)
+#2 +60s api/acme/requests {"request_id": "r-2", "units": 1}
+  billing_event: passed
+    republish billing/acme qos 1 {"tenant":"acme","request_id":"r-2","units":1,"at":1735689660000}
+  quota: no_result
+  state quota: + idempotency key "acme:r-2" = 1735689660000 (first, expires +660s)
+  state quota: ~ "acme:482136" = 2 (sum, expires +7260s)
+#3 +62s api/acme/requests {"request_id": "r-2", "units": 1}
+  billing_event: passed
+    republish billing/acme qos 1 {"tenant":"acme","request_id":"r-2","units":1,"at":1735689662000}
+  quota: no_result
+#4 +120s api/acme/requests {"request_id": "r-3", "units": 2}
+  billing_event: passed
+    republish billing/acme qos 1 {"tenant":"acme","request_id":"r-3","units":2,"at":1735689720000}
+  quota: no_result
+  state quota: + idempotency key "acme:r-3" = 1735689720000 (first, expires +720s)
+  state quota: ~ "acme:482136" = 3 (sum, expires +7320s)
+#5 +180s api/acme/requests {"request_id": "r-4", "units": 1}
+  billing_event: passed
+    republish billing/acme qos 1 {"tenant":"acme","request_id":"r-4","units":1,"at":1735689780000}
+  quota: passed
+    republish quota/exceeded/acme qos 1 {"tenant":"acme","used":4}
+  state quota: + idempotency key "acme:r-4" = 1735689780000 (first, expires +780s)
+  state quota: ~ "acme:482136" = 4 (sum, expires +7380s)
+#6 +3600s api/acme/requests {"request_id": "r-5", "units": 1}
+  billing_event: passed
+    republish billing/acme qos 1 {"tenant":"acme","request_id":"r-5","units":1,"at":1735693200000}
+  quota: no_result
+  state quota: - idempotency key "acme:r-1" (expired +600s)
+  state quota: - idempotency key "acme:r-2" (expired +660s)
+  state quota: - idempotency key "acme:r-3" (expired +720s)
+  state quota: - idempotency key "acme:r-4" (expired +780s)
+  state quota: + idempotency key "acme:r-5" = 1735693200000 (first, expires +4200s)
+  state quota: + "acme:482137" = 1 (sum, expires +10800s)
+```
+
+Step 3 is the second request sent again, as a QoS 1 publisher does when its PUBACK is
+lost. `billing_event` republishes it, as it must (the billing system drops the second
+`r-2` by its id); `quota` does not count it: the step changes nothing in the store. The
+fourth distinct request, at step 5, is over the quota. At one hour the key is
+`acme:482137`, a new counter; the old one expires two hours after its last increment.
+
+**Gotchas:**
+
+- **Do not bill from the counter.** It is in memory: a restart forgets it. In a cluster,
+  with `consistency = "eventual"`, a request that reaches two nodes before they have
+  heard of each other is counted by both, and a node that is lost takes its last few
+  milliseconds of increments with it. The billing topic has none of these problems, as
+  long as its consumer has a persistent session and deduplicates by `request_id`
+  ([RULES.md](RULES.md#state-is-not-a-system-of-record)).
+- **Not `id` as the idempotency key.** `id` is new for every PUBLISH the broker receives,
+  a resend included. Use a value the publisher chose, with the tenant in front so that
+  one tenant cannot use up another's ids
+  ([which values serve](RULES.md#counting-a-message-once)).
+- **Size the namespace for the remembered ids.** Each counted request is remembered for
+  the `dedupe_window` and counts as a key: 100 requests a second for ten minutes are
+  60,000 keys, which is why this file raises `max_keys` to 200,000. A full namespace
+  refuses the increment, and the rule fails for that request (`namespace_full`).
+- **A resend later than the `dedupe_window` counts again.** Ten minutes is far longer
+  than a client's retry; the window cannot be longer than an hour.
+- The tenant is a topic level here, so the ACL decides who may publish as which tenant.
+  A tenant taken from the payload would let any publisher spend another's quota.
+
+---
+
+## 21. Count distinct devices
+
+"How many devices reported from each site this hour" is not a count of messages: a
+device that reports a hundred times is one device. `kv_hll_add` counts distinct values
+without remembering them. File:
+[`21-distinct-devices.toml`](examples/rules/21-distinct-devices.toml).
+
+```toml
+# Recipe 21: how many distinct devices reported from each site this hour
+#
+# Counting messages is kv_incr. Counting distinct senders would mean remembering every
+# sender; kv_hll_add does not. It keeps a HyperLogLog sketch, at most 12 KiB however
+# many devices there are, and answers an estimate within about 0.8% (exact for the
+# small numbers below).
+#
+# distinct_devices adds each reading's client id to the sketch of its site and hour,
+# and publishes the estimate, retained, on stats/<site>/devices whenever it goes up:
+# kv_max keeps the largest estimate published so far, and the WHERE passes a reading
+# only when the estimate is that maximum and kv_changed has not seen it before.
+#
+# The hour is in the key (timestamp div 3600000), so each hour has a sketch of its
+# own, forgotten two hours after its last reading. The namespace is replicated: every
+# node of a cluster adds the devices it sees, and the nodes' sketches merge into the
+# sketch of all of them.
+#
+# Replay: docs/examples/rules/21-distinct-devices.jsonl (mqttd --rule-test --sequence).
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[state.sites]
+consistency = "eventual"
+default_ttl = "2h"
+
+[rules.distinct_devices]
+description = "Distinct devices per site and hour, published when the number grows"
+state = "sites"
+sql = '''
+SELECT
+  topic(2) AS site,
+  timestamp div 3600000 AS hour,
+  kv_hll_add('devices:' + topic(2) + ':' + str(hour), clientid, '2h') AS devices
+FROM "sites/+/data"
+WHERE kv_changed('published:' + topic(2) + ':' + str(hour), devices, '2h')
+'''
+actions = [
+  { function = "republish", args = { topic = "stats/${site}/devices", qos = 1, retain = true, payload = "${.}" } },
+]
+```
+
+The sequence, [`21-distinct-devices.jsonl`](examples/rules/21-distinct-devices.jsonl):
+
+```text
+# three devices report from oslo, one of them three times; bergen has one
+{"at": 0,    "topic": "sites/oslo/data",   "clientid": "dev-1", "payload": {"v": 1}}
+{"at": 10,   "topic": "sites/oslo/data",   "clientid": "dev-2", "payload": {"v": 1}}
+{"at": 20,   "topic": "sites/oslo/data",   "clientid": "dev-1", "payload": {"v": 2}}
+{"at": 30,   "topic": "sites/bergen/data", "clientid": "dev-9", "payload": {"v": 1}}
+{"at": 40,   "topic": "sites/oslo/data",   "clientid": "dev-3", "payload": {"v": 1}}
+{"at": 50,   "topic": "sites/oslo/data",   "clientid": "dev-1", "payload": {"v": 3}}
+{"at": "1h", "topic": "sites/oslo/data",   "clientid": "dev-1", "payload": {"v": 4}}
+```
+
+Replay it:
+
+```sh
+MQTTD_RULES_FILE=docs/examples/rules/21-distinct-devices.toml mqttd --rule-test --sequence docs/examples/rules/21-distinct-devices.jsonl
+```
+
+```text
+note: namespace `sites` is replicated in a cluster; a replay is one node, where it behaves as consistency = "local"
+#1 +0s sites/oslo/data {"v": 1}
+  distinct_devices: passed
+    republish stats/oslo/devices qos 1 retain {"site":"oslo","hour":482136,"devices":1}
+  state sites: + "devices:oslo:482136" = 1 (hll, expires +7200s)
+  state sites: + "published:oslo:482136" = 1 (lww, expires +7200s)
+#2 +10s sites/oslo/data {"v": 1}
+  distinct_devices: passed
+    republish stats/oslo/devices qos 1 retain {"site":"oslo","hour":482136,"devices":2}
+  state sites: ~ "devices:oslo:482136" = 2 (hll, expires +7210s)
+  state sites: ~ "published:oslo:482136" = 2 (lww, expires +7210s)
+#3 +20s sites/oslo/data {"v": 2}
+  distinct_devices: no_result
+  state sites: ~ "devices:oslo:482136" = 2 (hll, expires +7220s)
+  state sites: ~ "published:oslo:482136" = 2 (lww, expires +7220s)
+#4 +30s sites/bergen/data {"v": 1}
+  distinct_devices: passed
+    republish stats/bergen/devices qos 1 retain {"site":"bergen","hour":482136,"devices":1}
+  state sites: + "devices:bergen:482136" = 1 (hll, expires +7230s)
+  state sites: + "published:bergen:482136" = 1 (lww, expires +7230s)
+#5 +40s sites/oslo/data {"v": 1}
+  distinct_devices: passed
+    republish stats/oslo/devices qos 1 retain {"site":"oslo","hour":482136,"devices":3}
+  state sites: ~ "devices:oslo:482136" = 3 (hll, expires +7240s)
+  state sites: ~ "published:oslo:482136" = 3 (lww, expires +7240s)
+#6 +50s sites/oslo/data {"v": 3}
+  distinct_devices: no_result
+  state sites: ~ "devices:oslo:482136" = 3 (hll, expires +7250s)
+  state sites: ~ "published:oslo:482136" = 3 (lww, expires +7250s)
+#7 +3600s sites/oslo/data {"v": 4}
+  distinct_devices: passed
+    republish stats/oslo/devices qos 1 retain {"site":"oslo","hour":482137,"devices":1}
+  state sites: + "devices:oslo:482137" = 1 (hll, expires +10800s)
+  state sites: + "published:oslo:482137" = 1 (lww, expires +10800s)
+```
+
+`dev-1`'s second and third readings from Oslo (steps 3 and 6) change nothing and
+publish nothing. Bergen has a count of its own. The reading an hour later starts the
+next hour's sketch at one. The first line says what a replay is: one node, on which a
+replicated namespace behaves as a `local` one.
+
+**Gotchas:**
+
+- **It is an estimate.** Exact for small numbers in practice, within about 0.8% for
+  large ones, and at most 12 KiB a key however many devices there are. Where the exact
+  list matters and is short, `kv_add` keeps a set (at most 1,024 elements).
+- **The rule publishes when the estimate changes**, which is why `kv_changed` on the
+  number is the `WHERE`. Without it every reading would republish the count.
+- **In a cluster every node adds what it sees and the sketches merge**, so each node
+  comes to the same number; while a new device's key is on its way, two nodes can each
+  publish the same new count.
+- `clientid` is what the client chose unless mTLS or the ACL's `connect` rules pin it:
+  a client that connects under many ids counts as many devices.
+
+---
+
+## 22. Enrich with the last known value
+
+A reading says what a device measured. Where the device stands, and what its limit is,
+arrived on another topic when it was commissioned. One rule keeps that, another reads it
+for every reading. File:
+[`22-enrich-with-last-known-value.toml`](examples/rules/22-enrich-with-last-known-value.toml).
+
+```toml
+# Recipe 22: enrich a reading with a value another topic delivered earlier
+#
+# A reading says what a device measured; where the device stands and what its limit is
+# came on another topic, once, when it was commissioned. A rule sees one message, so
+# the two meet in the state store: remember_config keeps each device's configuration,
+# and enrich reads it back for every reading of that device.
+#
+# - remember_config stores what registry/<device>/config says, as the decoded JSON
+#   object, under the device id.
+# - enrich publishes each reading on enriched/<device> with the device's site, and
+#   over_limit says whether the reading is above the device's own limit. A device
+#   whose configuration is not known gets nothing here (the WHERE): route those
+#   readings elsewhere with a rule of their own if they must not be lost.
+#
+# Both rules name the same declared namespace, or neither would see the other's keys.
+# It is replicated ("eventual"), so a configuration published to one node of a cluster
+# is read on whichever node the device is connected to, a few milliseconds later. A
+# key lives for at most 30 days after it was last written (max_ttl): have the registry
+# publish each configuration again more often than that, or after a broker restart.
+#
+# Replay: docs/examples/rules/22-enrich-with-last-known-value.jsonl (mqttd --rule-test --sequence).
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[state.registry]
+consistency = "eventual"
+default_ttl = "30d"
+
+[rules.remember_config]
+description = "Keep each device's configuration"
+state = "registry"
+sql = '''
+SELECT kv_set(topic(2), json_decode(payload)) AS config
+FROM "registry/+/config"
+WHERE is_str(payload.site) AND is_num(payload.limit)
+'''
+
+[rules.enrich]
+description = "Each reading with its device's site and limit"
+state = "registry"
+sql = '''
+SELECT
+  topic(2) AS device,
+  payload.temp AS temp,
+  kv_get(topic(2)) AS config,
+  config.site AS site,
+  (payload.temp > config.limit) AS over_limit
+FROM "devices/+/data"
+WHERE is_num(payload.temp) AND is_map(config)
+'''
+actions = [
+  { function = "republish", args = { topic = "enriched/${device}", payload = '{"device":"${device}","site":"${site}","temp":${temp},"over_limit":${over_limit}}' } },
+]
+```
+
+The sequence, [`22-enrich-with-last-known-value.jsonl`](examples/rules/22-enrich-with-last-known-value.jsonl):
+
+```text
+# d1 is commissioned and reports; d2 reports without a configuration; d1's limit is raised
+{"at": 0,  "topic": "registry/d1/config", "payload": {"site": "oslo", "limit": 30}}
+{"at": 10, "topic": "devices/d1/data",    "payload": {"temp": 28.5}}
+{"at": 20, "topic": "devices/d1/data",    "payload": {"temp": 31}}
+{"at": 30, "topic": "devices/d2/data",    "payload": {"temp": 99}}
+{"at": 40, "topic": "registry/d1/config", "payload": {"site": "oslo", "limit": 35}}
+{"at": 50, "topic": "devices/d1/data",    "payload": {"temp": 31}}
+```
+
+Replay it:
+
+```sh
+MQTTD_RULES_FILE=docs/examples/rules/22-enrich-with-last-known-value.toml mqttd --rule-test --sequence docs/examples/rules/22-enrich-with-last-known-value.jsonl
+```
+
+```text
+note: namespace `registry` is replicated in a cluster; a replay is one node, where it behaves as consistency = "local"
+#1 +0s registry/d1/config {"site": "oslo", "limit": 30}
+  remember_config: passed
+  state registry: + "d1" = {"site":"oslo","limit":30} (lww, expires +2592000s)
+#2 +10s devices/d1/data {"temp": 28.5}
+  enrich: passed
+    republish enriched/d1 qos 0 {"device":"d1","site":"oslo","temp":28.5,"over_limit":false}
+#3 +20s devices/d1/data {"temp": 31}
+  enrich: passed
+    republish enriched/d1 qos 0 {"device":"d1","site":"oslo","temp":31,"over_limit":true}
+#4 +30s devices/d2/data {"temp": 99}
+  enrich: no_result
+#5 +40s registry/d1/config {"site": "oslo", "limit": 35}
+  remember_config: passed
+  state registry: ~ "d1" = {"site":"oslo","limit":35} (lww, expires +2592000s)
+#6 +50s devices/d1/data {"temp": 31}
+  enrich: passed
+    republish enriched/d1 qos 0 {"device":"d1","site":"oslo","temp":31,"over_limit":false}
+```
+
+The same reading of 31 is over the limit at step 3 and under it at step 6, after the
+limit was raised. `d2` has no configuration, so its reading produces nothing here. A
+read changes nothing in the store, so the reading steps show no `state` line.
+
+**Gotchas:**
+
+- **Both rules must name the same declared namespace.** Without `state = "registry"`
+  each would have a namespace of its own and `enrich` would read nothing.
+- **`kv_get` returns `undefined` for a device it does not know**, and `is_map(config)`
+  in the `WHERE` turns those readings away. Without it the template would publish the
+  text `undefined` as the site.
+- **A stored value is at most 4 KiB**, and every key expires: at most 30 days after it
+  was last written. Have the source publish each configuration again more often than
+  that. After a restart of every node the store is empty until it does; a retained
+  configuration topic and a consumer that republishes it at start-up is one way.
+- **This is a lookup the publisher fills.** Whoever may publish to `registry/+/config`
+  decides what every later reading is enriched with: give that topic to the registry
+  alone, in the ACL.
+- The payload template writes `${temp}` and `${over_limit}` bare, as a number and a
+  boolean, and `${site}` in quotes; `is_str(payload.site)` in `remember_config` is what
+  makes that safe, as long as a site name holds no `"`.
+
+---
+
+## 23. A rule from EMQX that uses kv_store
+
+EMQX's rule engine has a table of its own, `kv_store_put`, `kv_store_get` and
+`kv_store_del`. A rule that uses it runs here as it was written, with EMQX's results.
+File: [`23-emqx-kv-store-counter.toml`](examples/rules/23-emqx-kv-store-counter.toml).
+
+```toml
+# Recipe 23: a rule moved from EMQX that keeps a counter in kv_store
+#
+# EMQX's rule engine has a table of its own, written with kv_store_put and read with
+# kv_store_get and kv_store_del. A rule that uses it runs here as it was written, with
+# EMQX's results: this one counts each device's door openings and publishes the count.
+# kv_store_get(key, 0) answers 0 for a device it has not seen, and kv_store_put
+# answers true.
+#
+# The table is EMQX's in every respect a rule can see: one per node, shared by every
+# rule whatever its state key says, never replicated, and its keys never expire. Two
+# things differ. Here it is bounded (100,000 keys and 64 MiB unless [state.kv_store]
+# says otherwise, a key of 256 bytes and a value of 4 KiB), and a put past a bound
+# fails the rule where EMQX would have stored the value. And a dry run (--rule-test,
+# the admin API's rule test) works on an empty table of its own, where EMQX's SQL
+# test writes the node's real one.
+#
+# In a rule you write for mqttd, kv_incr does the same in one call, expires, and can
+# be replicated; see recipe 20. It does not read what kv_store_put wrote.
+#
+# Replay: docs/examples/rules/23-emqx-kv-store-counter.jsonl (mqttd --rule-test --sequence).
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[state.kv_store]
+max_keys = 50000
+
+[rules.door_count]
+description = "Count each device's door openings, as the rule did in EMQX"
+sql = '''
+SELECT
+  clientid,
+  kv_store_put(clientid, kv_store_get(clientid, 0) + 1) AS stored,
+  kv_store_get(clientid) AS openings
+FROM "doors/+/opened"
+'''
+actions = [
+  { function = "republish", args = { topic = "doors/${clientid}/count", payload = "${openings}" } },
+]
+```
+
+The sequence, [`23-emqx-kv-store-counter.jsonl`](examples/rules/23-emqx-kv-store-counter.jsonl):
+
+```text
+# two doors; the front door opens three times
+{"at": 0,  "topic": "doors/front/opened", "clientid": "door-front"}
+{"at": 30, "topic": "doors/front/opened", "clientid": "door-front"}
+{"at": 60, "topic": "doors/back/opened",  "clientid": "door-back"}
+{"at": 90, "topic": "doors/front/opened", "clientid": "door-front"}
+```
+
+Replay it:
+
+```sh
+MQTTD_RULES_FILE=docs/examples/rules/23-emqx-kv-store-counter.toml mqttd --rule-test --sequence docs/examples/rules/23-emqx-kv-store-counter.jsonl
+```
+
+```text
+#1 +0s doors/front/opened {}
+  door_count: passed
+    republish doors/door-front/count qos 0 1
+  state kv_store: + "door-front" = 1 (lww)
+#2 +30s doors/front/opened {}
+  door_count: passed
+    republish doors/door-front/count qos 0 2
+  state kv_store: ~ "door-front" = 2 (lww)
+#3 +60s doors/back/opened {}
+  door_count: passed
+    republish doors/door-back/count qos 0 1
+  state kv_store: + "door-back" = 1 (lww)
+#4 +90s doors/front/opened {}
+  door_count: passed
+    republish doors/door-front/count qos 0 3
+  state kv_store: ~ "door-front" = 3 (lww)
+```
+
+Each door has a count of its own, and the keys have no expiry (`(lww)`, where a `kv_*`
+key shows `expires …`).
+
+**Gotchas:**
+
+- **The table is bounded here**, and in EMQX it is not: 100,000 keys and 64 MiB unless
+  `[state.kv_store]` says otherwise (this file sets 50,000), a key of 256 bytes, a
+  value of 4 KiB. Past a bound the put fails the rule, where EMQX would have stored the
+  value. A table that only ever grows (a key per client id, never deleted) reaches it;
+  `eviction = "lru"` in `[state.kv_store]` drops the least recently used key instead.
+- **It is one table per node, shared by every rule**, as in EMQX: never replicated, and
+  empty after a restart. Two rules that use the same key overwrite each other.
+- **The count is not atomic**: the rule reads and then writes, so two connections that
+  publish for the same key at the same instant can both read 2 and both store 3, here
+  as in EMQX. `kv_incr` is one operation and cannot lose a count; it is the function to
+  use in a rule you write for mqttd, but it does not read what `kv_store_put` wrote.
+- **A dry run works on a table of its own.** `--rule-test` and the admin API's rule test
+  never write the running broker's table; EMQX's SQL test does.
+- `mqttd --check-rules` warns about a file that calls both `kv_store_*` and `kv_*`,
+  since they do not share keys. `proc_dict_*`, EMQX's other memory, is one dictionary
+  per client connection ([RULES.md](RULES.md#emqxs-own-kv_store_-and-proc_dict_)).
+
+---
+
 ## jq: when it earns its cost
 
 `jq(Program, Input)` runs a [jq](https://jqlang.org) program over a value, in a sandbox
@@ -1738,17 +2668,20 @@ or the input is not JSON at all, a function of your own, as a WebAssembly module
 ## What rules cannot do
 
 A rule sees one message, or one client event, at a time. What it keeps between messages
-([state](RULES.md#state-what-a-rule-remembers)) is in memory on the node that evaluated
-it: gone at a restart, and not shared with the other nodes of a cluster. It publishes only
-back into the broker, and calls nothing outside it. These need something else:
+([state](RULES.md#state-what-a-rule-remembers), recipes 17 to 23) is small values in
+memory: gone when the broker restarts, and shared across a cluster only in a namespace
+declared `consistency = "eventual"`, where the nodes' copies converge a few milliseconds
+after a write. A rule publishes only back into the broker, and calls nothing outside it.
+These need something else:
 
-| You need | Why a rule cannot | Use instead |
+| You need | What a rule can do | Use instead |
 |---|---|---|
-| An average or a sum over time, or a count, minimum or maximum that is exact across a cluster or survives a restart | A rule can count (`kv_incr`) and keep a minimum or maximum (`kv_min`, `kv_max`), on one node and in memory; it has no windows | A consumer in a `$share` group ([INTEGRATION.md](INTEGRATION.md)) that aggregates and publishes the result back, or a time-series database fed by Telegraf |
-| Windows: every N seconds, one message per interval | No timers: a rule runs when a message arrives, never by itself | The same consumer, or have the device report at the rate you need |
-| Deduplication, or "only when the value changed", wherever the device connects | `kv_changed` keeps the previous value, on the node the device is connected to and until that node restarts | The same consumer, or report on change at the device |
-| Joining two topics, or looking a value up in a table | A rule sees one message; `maptab_lookup` is not implemented | A consumer with a cache, or put the static data in the topic or the payload at the source |
-| Sending to Kafka, HTTP, a database or another system | There are no sink actions ([ADR 0083](adr/0083-rule-engine.md)) | Republish to a topic and consume it with a `$share` group ([INTEGRATION.md](INTEGRATION.md)); to another MQTT broker, [mqtt-bridge](BRIDGE.md) |
-| Calling out: an HTTP request, a script, a file or an environment variable | Rules do no I/O; `getenv` reads only `EMQXVAR_…` variables, fixed while the broker runs | A consumer service |
-| Dropping or changing the original message | A rule only adds messages | Have devices publish to a raw topic that subscribers cannot read (the ACL), and let a rule republish the cleaned message to the topic they do read |
-| Protobuf, Sparkplug B or a schema registry | Those functions are not implemented ([RULES.md](RULES.md)) | A consumer that decodes and republishes |
+| A count that is exact across a cluster, or that survives a restart: a bill, an audit | Count (`kv_incr`), on one node exactly, across a cluster once the nodes have heard of each other; in memory. See [recipe 20](#20-a-quota-and-the-billing-record-beside-it) for where the line is | A durable QoS 1 message per event, consumed by a `$share` group ([INTEGRATION.md](INTEGRATION.md)) that deduplicates and adds up |
+| An average or a percentile over a time window | Keep a maximum or a minimum (`kv_max`, `kv_min`), a count, and a sum of integers (`kv_incr(key, n)`); put the window in the key (`str(timestamp div 3600000)`). No floating-point sum, no percentile | The same consumer, or a time-series database fed by Telegraf |
+| Exactly one message per interval, or anything at a fixed time | No timers: a rule runs when a message arrives, or when a key expires ([recipe 17](#17-silent-for-ten-minutes)). *At most* one message per device per minute is `WHERE kv_get(k) = undefined AND kv_set(k, 1, 60) = 1` | The same consumer, or have the device report at the rate you need |
+| "Only when the value changed", exactly, wherever the device connects | `kv_changed` ([recipe 19](#19-forward-a-value-only-when-it-changes)); in an `eventual` namespace two nodes that see the same new value within milliseconds both pass it, and a restart of every node forgets the last value | Report on change at the device, or a consumer that keeps the last value durably |
+| Joining two topics, or looking a value up in a table | Keep what one topic delivered and read it for the other ([recipe 22](#22-enrich-with-the-last-known-value)): values of at most 4 KiB that expire within 30 days and are lost at a full restart. `maptab_lookup` is not implemented | A consumer with a cache, or put the static data in the topic or the payload at the source |
+| Sending to Kafka, HTTP, a database or another system | Nothing: there are no sink actions ([ADR 0083](adr/0083-rule-engine.md)) | Republish to a topic and consume it with a `$share` group ([INTEGRATION.md](INTEGRATION.md)); to another MQTT broker, [mqtt-bridge](BRIDGE.md) |
+| Calling out: an HTTP request, a script, a file or an environment variable | Nothing: rules do no I/O; `getenv` reads only `EMQXVAR_…` variables, fixed while the broker runs | A consumer service |
+| Dropping or changing the original message | Nothing: a rule only adds messages | Have devices publish to a raw topic that subscribers cannot read (the ACL), and let a rule republish the cleaned message to the topic they do read |
+| Protobuf, Sparkplug B or a schema registry | Nothing: those functions are not implemented ([RULES.md](RULES.md)) | A consumer that decodes and republishes |

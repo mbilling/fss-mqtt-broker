@@ -1,0 +1,5 @@
+# two doors; the front door opens three times
+{"at": 0,  "topic": "doors/front/opened", "clientid": "door-front"}
+{"at": 30, "topic": "doors/front/opened", "clientid": "door-front"}
+{"at": 60, "topic": "doors/back/opened",  "clientid": "door-back"}
+{"at": 90, "topic": "doors/front/opened", "clientid": "door-front"}

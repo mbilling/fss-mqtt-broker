@@ -658,8 +658,10 @@ actions = [
 #
 # A condition that lasts (an undervoltage, a cold room, a broken heat pump) is re-alerted
 # at most once a minute or once per 5 minutes, by the device's own clock, not on every
-# reading: a rule keeps no state, so it cannot tell the first reading of a condition from
-# the hundredth, but it can thin the reminders. Where the device says when a condition
+# reading. These rules keep no state, so they cannot tell the first reading of a condition
+# from the hundredth, but they can thin the reminders. (A rule that remembers can alert
+# once per condition, with kv_held and kv_changed: docs/RULES-COOKBOOK.md, recipe 18. The
+# two car rules at the end of this file keep state.) Where the device says when a condition
 # began (a heat pump's fault_since), the first reading alerts at once. The retained state
 # is the idempotent view: a dashboard reads the current health of every heat pump the
 # moment it subscribes.
@@ -807,7 +809,7 @@ actions = [
 # and so when people are home (GDPR Recital 26: pseudonymised data that can be linked
 # back to a person stays personal data), so the feed goes only to partners under a
 # data-processing agreement. It is a spot sample, the telegram whose seconds are 00-09 by
-# the meter's clock, not a 1-minute mean: a rule keeps no state and cannot average. A
+# the meter's clock, not a 1-minute mean: a rule cannot average over time. A
 # partner that needs interval means (grid planning works on 15-minute energy) should take
 # them from metered interval data (in Denmark, the 15- or 60-minute values in Energinet's
 # DataHub), or from the operator's own service that averages
@@ -866,7 +868,7 @@ actions = [
 #
 # EN 50160 judges 10-minute means of the r.m.s. voltage, and calls a fall below 90 % that
 # lasts 10 ms to 1 min a voltage dip, which it characterises but does not count against
-# the band. A rule keeps no state, so it cannot average; it looks at one reading a minute
+# the band. A rule cannot average over time; it looks at one reading a minute
 # instead, the telegram whose seconds are 00-09 by the meter's own clock. A sustained
 # undervoltage, which is what the band is about, then alerts once a minute per phase
 # rather than six times, and a dip shorter than a minute alerts only if it happens to
@@ -928,8 +930,9 @@ actions = [
 # can still be short after that, and wants a longer wait. A thermostat that does not
 # report setpoint_since never alerts.
 #
-# A rule keeps no state, so it cannot alert only on the first cold reading. Instead it
-# thins the reminders by the thermostat's own clock: only a reading in the first minute of
+# This rule keeps no state, so it cannot alert only on the first cold reading (one that
+# remembers can: docs/RULES-COOKBOOK.md, recipe 18). Instead it thins the reminders by
+# the thermostat's own clock: only a reading in the first minute of
 # each 5-minute block (ts in seconds, mod 300, below 60) can alert, which is one in five
 # at the 60 s cadence. Widen the block (mod 3600 for hourly) for fewer; deduplicating
 # further belongs to the consumer. The shortfall is computed only when both temperatures

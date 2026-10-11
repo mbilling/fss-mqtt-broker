@@ -1,0 +1,39 @@
+# Recipe 21: how many distinct devices reported from each site this hour
+#
+# Counting messages is kv_incr. Counting distinct senders would mean remembering every
+# sender; kv_hll_add does not. It keeps a HyperLogLog sketch, at most 12 KiB however
+# many devices there are, and answers an estimate within about 0.8% (exact for the
+# small numbers below).
+#
+# distinct_devices adds each reading's client id to the sketch of its site and hour,
+# and publishes the estimate, retained, on stats/<site>/devices whenever it goes up:
+# kv_max keeps the largest estimate published so far, and the WHERE passes a reading
+# only when the estimate is that maximum and kv_changed has not seen it before.
+#
+# The hour is in the key (timestamp div 3600000), so each hour has a sketch of its
+# own, forgotten two hours after its last reading. The namespace is replicated: every
+# node of a cluster adds the devices it sees, and the nodes' sketches merge into the
+# sketch of all of them.
+#
+# Replay: docs/examples/rules/21-distinct-devices.jsonl (mqttd --rule-test --sequence).
+#
+# Tested by crates/mqttd/tests/rules_cookbook.rs; explained in docs/RULES-COOKBOOK.md.
+
+[state.sites]
+consistency = "eventual"
+default_ttl = "2h"
+
+[rules.distinct_devices]
+description = "Distinct devices per site and hour, published when the number grows"
+state = "sites"
+sql = '''
+SELECT
+  topic(2) AS site,
+  timestamp div 3600000 AS hour,
+  kv_hll_add('devices:' + topic(2) + ':' + str(hour), clientid, '2h') AS devices
+FROM "sites/+/data"
+WHERE kv_changed('published:' + topic(2) + ':' + str(hour), devices, '2h')
+'''
+actions = [
+  { function = "republish", args = { topic = "stats/${site}/devices", qos = 1, retain = true, payload = "${.}" } },
+]

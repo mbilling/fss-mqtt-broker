@@ -220,7 +220,7 @@
 
 **0085 — State for rules: a keyed, replicated store read and written from SQL**
 
-- `0085-T8` ⬜ planned ([#924](https://github.com/mbilling/fss-mqtt-broker/issues/924)): "Documentation: RULES.md (functions, types, modes, when a state call runs, the worked sequences, the billing example), the departures from EMQX, threat model and hardening rows, the converter"
+- `0085-T8` 🚧 in-progress ([#924](https://github.com/mbilling/fss-mqtt-broker/issues/924)): "Documentation: RULES.md (functions, types, modes, when a state call runs, the worked sequences, the billing example), the departures from EMQX, threat model and hardening rows, the converter"
 - `0085-T9` ⬜ planned ([#925](https://github.com/mbilling/fss-mqtt-broker/issues/925)): "strong mode (phase 2): first the design amendment that settles how an evaluation waits, then the durable plane, with partition and failover tests"
 - `0085-T10` ⬜ planned ([#926](https://github.com/mbilling/fss-mqtt-broker/issues/926)): "An optional snapshot to disk for local and eventual namespaces (phase 3)"
 - `0085-T13` ⬜ planned ([#941](https://github.com/mbilling/fss-mqtt-broker/issues/941)): "Expire entries manually: a bulk purge of one namespace by prefix, by expiry (expires within, no expiry), or already expired; dry run, batches off the publish path, 100,000 keys a call with a cursor, audited; no expiry event unless asked"

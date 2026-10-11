@@ -2685,12 +2685,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `with_config_watch_an_edited_rules_file_is_picked_up_without_a_signal`
 - `writers_for_a_rules_directory_the_broker_cannot_write_in_are_warned_about` — only when `cfg(unix)`
 
-## `crates/mqttd/tests/rules_cookbook.rs` — 12 test(s)
+## `crates/mqttd/tests/rules_cookbook.rs` — 13 test(s)
 
 - `every_recipe_does_on_the_real_broker_what_the_cookbook_shows`
 - `every_recipe_file_has_a_case_and_every_case_a_file`
 - `every_recipe_header_shows_what_the_recipe_does`
 - `every_recipe_passes_check_rules_with_no_warning`
+- `every_recipe_that_keeps_state_replays_as_the_cookbook_shows`
 - `recipe_01_binary_payloads_log_replacement_characters_and_the_hex_variant_logs_the_bytes`
 - `recipe_01_rule_test_runs_a_statement_offline`
 - `the_gotchas_the_cookbook_states_hold`

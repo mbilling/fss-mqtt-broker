@@ -1,0 +1,8 @@
+# three devices report from oslo, one of them three times; bergen has one
+{"at": 0,    "topic": "sites/oslo/data",   "clientid": "dev-1", "payload": {"v": 1}}
+{"at": 10,   "topic": "sites/oslo/data",   "clientid": "dev-2", "payload": {"v": 1}}
+{"at": 20,   "topic": "sites/oslo/data",   "clientid": "dev-1", "payload": {"v": 2}}
+{"at": 30,   "topic": "sites/bergen/data", "clientid": "dev-9", "payload": {"v": 1}}
+{"at": 40,   "topic": "sites/oslo/data",   "clientid": "dev-3", "payload": {"v": 1}}
+{"at": 50,   "topic": "sites/oslo/data",   "clientid": "dev-1", "payload": {"v": 3}}
+{"at": "1h", "topic": "sites/oslo/data",   "clientid": "dev-1", "payload": {"v": 4}}
