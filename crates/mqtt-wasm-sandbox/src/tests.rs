@@ -263,6 +263,25 @@ fn counting_hand_off() -> (HandOff, Arc<AtomicU32>) {
     (hand_off, count)
 }
 
+/// Asserts that an endless call, stopped at a deadline well after its first slice, was
+/// handed off: `handed` grew by one, or by two.
+///
+/// The hand-off is per entry into the module (ADR 0086, T4 amendment), and the host
+/// enters twice before the loop is stopped: to allocate the argument frame, and to
+/// call. The call outlasts its slice and is handed off. The allocation is handed off
+/// too when its thread loses the processor for a whole slice in the middle of it,
+/// which a loaded CI runner does now and then. Each entry is suspended at most once,
+/// so two is the mechanism's bound and not a tolerance.
+#[track_caller]
+fn assert_handed_off(handed: &AtomicU32, before: u32) {
+    let grew = handed.load(Ordering::SeqCst) - before;
+    assert!(
+        (1..=2).contains(&grew),
+        "an endless call is handed off in its call, and at most once more in its \
+         allocation: {grew} hand-offs"
+    );
+}
+
 /// ADR 0086 D6: a call that is still running after its first slice is suspended once,
 /// and what is left of it runs inside the module's hand-off, to the same end it would
 /// have had. A call that is done within the slice never meets the hand-off, and neither
@@ -274,8 +293,17 @@ fn a_call_that_outlasts_its_first_slice_goes_on_inside_the_hand_off() {
         first_slice: Duration::from_millis(5),
         ..Limits::default()
     };
-    let sandbox = sandbox(limits).with_hand_off(hand_off);
-    let mut instance = sandbox.instantiate().unwrap();
+    // A call done within its slice. The slice is ten seconds here, so that a thread
+    // which loses the processor for a few milliseconds in the middle of the call (a
+    // loaded runner) does not turn a quick call into one that outlasted its slice.
+    let patient = Limits {
+        first_slice: Duration::from_secs(10),
+        ..Limits::default()
+    };
+    let mut instance = self::sandbox(patient)
+        .with_hand_off(Arc::clone(&hand_off))
+        .instantiate()
+        .unwrap();
     assert_eq!(
         instance.call("t", &[], soon()),
         Ok(Reply::Json(b"true".to_vec()))
@@ -286,12 +314,15 @@ fn a_call_that_outlasts_its_first_slice_goes_on_inside_the_hand_off() {
         "a quick call was handed off"
     );
 
+    let sandbox = sandbox(limits).with_hand_off(hand_off);
+    let mut instance = sandbox.instantiate().unwrap();
     // The endless loop: suspended after five milliseconds, stopped at its deadline.
     let started = Instant::now();
     let outcome = instance.call("loop", &[], Some(started + Duration::from_millis(80)));
     let took = started.elapsed();
     assert_eq!(outcome, Err(CallError::Timeout));
-    assert_eq!(handed.load(Ordering::SeqCst), 1, "handed off once");
+    assert_handed_off(&handed, 0);
+    let so_far = handed.load(Ordering::SeqCst);
     assert!(
         took >= Duration::from_millis(80) && took < Duration::from_secs(5),
         "stopped after {took:?}"
@@ -302,7 +333,11 @@ fn a_call_that_outlasts_its_first_slice_goes_on_inside_the_hand_off() {
     let started = Instant::now();
     let outcome = instance.call("loop", &[], Some(started + Duration::from_millis(2)));
     assert_eq!(outcome, Err(CallError::Timeout));
-    assert_eq!(handed.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        handed.load(Ordering::SeqCst),
+        so_far,
+        "a call whose deadline comes before its slice ends was handed off"
+    );
 
     // No deadline at all: handed off like any other, and still running until the
     // memory cap stops it (`g` grows its memory for ever).
@@ -369,11 +404,13 @@ fn an_interpreted_call_is_handed_off_too() {
         instance.call("t", &[], soon()),
         Ok(Reply::Json(b"true".to_vec()))
     );
-    assert_eq!(handed.load(Ordering::SeqCst), 0);
+    // That a quick call is not handed off is the compiled test's to say, with a slice
+    // no stalled thread can outlast; here the count starts from wherever it left it.
+    let before = handed.load(Ordering::SeqCst);
     let started = Instant::now();
     let outcome = instance.call("loop", &[], Some(started + Duration::from_millis(60)));
     assert_eq!(outcome, Err(CallError::Timeout));
-    assert_eq!(handed.load(Ordering::SeqCst), 1);
+    assert_handed_off(&handed, before);
     assert!(started.elapsed() >= Duration::from_millis(60));
 }
 
@@ -720,7 +757,8 @@ fn a_pool_replaces_an_instance_a_call_stopped_and_counts_it() {
         instance.call("loop", &[], deadline),
         Err(CallError::Timeout)
     );
-    assert_eq!(handed.load(Ordering::SeqCst), 1);
+    // The pool's hand-off reached an instance of its module.
+    assert_handed_off(&handed, 0);
 
     assert_eq!(pool.eval(b".", Arg::Json("1"), None), Ok(b"true".to_vec()));
     assert_eq!(pool.compile(b"."), Ok(()));
@@ -988,13 +1026,26 @@ fn making_an_instance_for_a_call_is_under_the_calls_ceiling() {
         ..Shape::default()
     };
     let unbounded = pool_of(&shape, None, true);
-    let started = Instant::now();
-    assert_eq!(
-        unbounded.call("which", &[], Duration::from_millis(1), 64),
-        Ok(Reply::Json(b"true".to_vec())),
-        "without a ceiling the start is not under the call's timeout"
-    );
-    let start = started.elapsed();
+    // The timeout of a millisecond is the call's own, counted from after the start. A
+    // thread that loses the processor for that millisecond inside the call (a loaded
+    // runner) is stopped there, as a timeout, and the call is made again. A start held
+    // to the timeout is a different error, the one asserted below, and fails here.
+    let mut tries = 0;
+    let start = loop {
+        let started = Instant::now();
+        let outcome = unbounded.call("which", &[], Duration::from_millis(1), 64);
+        let took = started.elapsed();
+        tries += 1;
+        if outcome == Err(CallError::Timeout) && tries < 20 {
+            continue;
+        }
+        assert_eq!(
+            outcome,
+            Ok(Reply::Json(b"true".to_vec())),
+            "without a ceiling the start is not under the call's timeout"
+        );
+        break took;
+    };
     assert!(
         start > Duration::from_millis(10),
         "the start was meant to be slow: {start:?}"
