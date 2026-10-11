@@ -899,8 +899,48 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-rules/src/lib.rs` — 227 test(s)
+## `crates/mqtt-rules/src/lib.rs` — 268 test(s)
 
+- `crdt::tests::a_causally_later_lww_write_is_never_lost_whatever_the_wall_clocks_say`
+- `crdt::tests::a_counter_is_the_sum_of_every_nodes_increments_and_decrements`
+- `crdt::tests::a_counter_keeps_counts_of_a_bounded_number_of_nodes`
+- `crdt::tests::a_counter_refuses_what_would_pass_64_bits_and_reads_exactly_when_merged_past_them`
+- `crdt::tests::a_delete_covers_exactly_the_lww_writes_stamped_before_it`
+- `crdt::tests::a_delete_covers_what_a_node_that_had_not_seen_it_wrote_to_an_accumulating_key`
+- `crdt::tests::a_delete_is_not_undone_by_a_copy_from_before_it`
+- `crdt::tests::a_key_written_after_it_expired_starts_afresh_on_every_node`
+- `crdt::tests::a_length_field_is_not_believed_past_the_bytes_that_are_there`
+- `crdt::tests::a_set_is_the_union_in_term_order_and_holds_at_most_1024_elements`
+- `crdt::tests::a_sketch_is_a_list_of_registers_until_that_would_take_as_much_as_all_of_them`
+- `crdt::tests::a_sketchs_estimate_and_bytes_are_the_same_on_every_node_and_release`
+- `crdt::tests::a_stamp_from_another_node_moves_the_clock_past_it`
+- `crdt::tests::a_stamp_too_far_ahead_is_refused_and_leaves_the_clock_alone`
+- `crdt::tests::a_state_cut_short_anywhere_or_with_bytes_after_it_is_refused`
+- `crdt::tests::adding_a_value_again_changes_nothing`
+- `crdt::tests::an_expiry_travels_with_an_lww_write_and_is_the_later_of_two_otherwise`
+- `crdt::tests::bytes_changed_at_random_are_a_canonical_state_or_an_error_and_never_a_panic`
+- `crdt::tests::every_pair_of_concurrent_operations_converges_whatever_the_key_held`
+- `crdt::tests::every_replicated_form_is_within_its_bound`
+- `crdt::tests::first_keeps_the_earliest_write_and_starts_again_after_a_delete`
+- `crdt::tests::max_and_min_keep_the_extreme_of_every_nodes_numbers`
+- `crdt::tests::merge_is_a_join_over_any_states_a_peer_could_send`
+- `crdt::tests::merge_is_a_join_over_states_replicas_reach`
+- `crdt::tests::merged_sketches_are_the_sketch_of_everything_either_saw`
+- `crdt::tests::of_two_concurrent_lww_writes_the_later_stamp_wins_and_a_tie_goes_to_one_node`
+- `crdt::tests::replicas_converge_from_any_interleaving_of_writes_deletes_and_deliveries`
+- `crdt::tests::stamps_taken_by_several_threads_at_once_are_all_different`
+- `crdt::tests::the_clock_follows_the_wall_clock_and_never_goes_back_when_it_does`
+- `crdt::tests::the_counter_carries_into_the_milliseconds_when_one_millisecond_runs_out`
+- `crdt::tests::the_decoder_accepts_only_what_the_encoder_writes`
+- `crdt::tests::the_fuzz_targets_seed_states_are_states`
+- `crdt::tests::the_hash_is_siphash_2_4_and_its_values_are_pinned`
+- `crdt::tests::the_replicated_form_round_trips_every_rule_value`
+- `crdt::tests::the_sketch_counts_within_its_error`
+- `crdt::tests::the_term_order_is_total_where_erlangs_leaves_two_maps_undecided`
+- `crdt::tests::tombstones_are_kept_for_the_window_and_then_forgotten`
+- `crdt::tests::two_types_on_one_key_resolve_to_one_and_a_local_write_of_another_type_is_refused`
+- `crdt::tests::what_a_merge_gives_is_a_state_the_decoder_accepts`
+- `crdt::tests::what_the_form_cannot_carry_is_settled_by_the_node_that_writes`
 - `edit::tests::a_json_rule_body_is_a_rule_edit`
 - `edit::tests::an_insert_appends_the_rule_at_the_end`
 - `edit::tests::an_update_keeps_comments_and_writes_sql_without_escapes`
@@ -1121,6 +1161,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests_state::foreach_calls_run_per_element`
 - `tests_state::the_1025th_state_call_of_a_message_fails_its_rule`
 - `tests_state::the_emqx_functions_answer_as_emqx_does`
+- `tests_state::the_sketch_functions_check_their_arguments_and_hand_the_store_a_hash`
 - `tests_state::the_state_functions_are_built_in`
 - `value::tests::a_json_repair_covers_the_whole_value`
 - `value::tests::floats_render_like_emqx_str`
@@ -1308,7 +1349,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 644 test(s)
+## `crates/mqttd/src/lib.rs` — 649 test(s)
 
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
@@ -1895,6 +1936,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `reload::tests::every_reload_attempt_is_recorded_with_its_repeats`
 - `reload::tests::reload_increments_the_metric_by_outcome`
 - `rule_state::tests::a_brownout_refuses_new_keys_and_nothing_else`
+- `rule_state::tests::a_counter_goes_up_and_down_by_the_largest_step_without_end`
 - `rule_state::tests::a_full_namespace_refuses_new_keys_and_still_updates_existing_ones`
 - `rule_state::tests::a_key_expires_and_reads_as_absent_from_that_moment`
 - `rule_state::tests::a_key_has_the_type_of_the_operation_that_created_it`
@@ -1905,6 +1947,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `rule_state::tests::a_namespace_is_bounded_in_bytes`
 - `rule_state::tests::a_scratch_store_shares_nothing_with_the_running_one`
 - `rule_state::tests::a_select_write_happens_for_a_message_the_where_rejects`
+- `rule_state::tests::a_set_reads_in_one_order_whatever_order_it_was_built_in`
+- `rule_state::tests::a_sketch_counts_within_its_error_and_within_12_kib`
+- `rule_state::tests::a_sketch_is_a_type_of_its_own_and_expires`
 - `rule_state::tests::a_stored_binary_does_not_keep_its_payload_alive`
 - `rule_state::tests::a_write_behind_and_or_or_an_untaken_case_branch_does_not_happen`
 - `rule_state::tests::a_write_stays_when_the_rule_then_fails`
@@ -1919,6 +1964,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `rule_state::tests::kv_add_keeps_a_set_in_term_order`
 - `rule_state::tests::kv_changed_tells_when_a_value_differs_from_the_last_one`
 - `rule_state::tests::kv_held_measures_how_long_a_condition_has_held`
+- `rule_state::tests::kv_hll_add_and_kv_hll_count_estimate_distinct_values`
 - `rule_state::tests::kv_incr_counts_up_and_down`
 - `rule_state::tests::kv_max_and_kv_min_keep_the_extreme`
 - `rule_state::tests::kv_set_get_and_del`

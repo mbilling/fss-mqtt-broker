@@ -1402,7 +1402,7 @@ or `is_empty` of a missing value (below). A function given the wrong type fails 
 | System | `getenv` (`getenv('FOO')` reads the environment variable `EMQXVAR_FOO`; unset is `''`) |
 | UUID | `uuid_v4`, `uuid_v4_no_hyphen` |
 | jq | `jq` (`jq(Program, Input)` and `jq(Program, Input, TimeoutMs)`): off unless the operator switches it on, [below](#jq) |
-| State | EMQX's `kv_store_put`, `kv_store_get`, `kv_store_del` and `proc_dict_put`, `proc_dict_get`, `proc_dict_del`; mqttd's own `kv_get`, `kv_set`, `kv_set_once`, `kv_incr`, `kv_max`, `kv_min`, `kv_add`, `kv_del`, `kv_ttl`, `kv_held`, `kv_changed`: what a rule remembers between messages, [below](#state-what-a-rule-remembers) |
+| State | EMQX's `kv_store_put`, `kv_store_get`, `kv_store_del` and `proc_dict_put`, `proc_dict_get`, `proc_dict_del`; mqttd's own `kv_get`, `kv_set`, `kv_set_once`, `kv_incr`, `kv_max`, `kv_min`, `kv_add`, `kv_del`, `kv_ttl`, `kv_held`, `kv_changed`, `kv_hll_add`, `kv_hll_count`: what a rule remembers between messages, [below](#state-what-a-rule-remembers) |
 | Conditional | `coalesce`, `coalesce_ne` |
 | Legacy accessors | `topic` (`topic(n)` is the nth level, counting from 1: `topic(1)` of `a/b/c` is `a`), `clientid`, `username`, `qos`, `msgid`, `flags`, `flag`, `peerhost`, `clientip`, `payload` (`payload('a.b')` is a path) |
 | Callable in EMQX, undocumented there | `div(a, b)`, `mod(a, b)` (the operators in call form), `eq` (Erlang `==`), `null()` (a missing value), `join_to_sql_values_string`, `contains_topic`, `contains_topic_match` — EMQX's take topic filters as maps with an *atom* key, which no rule value has, so any array gives `false` |
@@ -2046,7 +2046,7 @@ is discarded afterwards**; in EMQX each still sees the client's:
 
 | Function | Returns |
 |---|---|
-| `kv_get(key)` | the value, or `undefined`. A counter reads as its count, a set as an array of its elements |
+| `kv_get(key)` | the value, or `undefined`. A counter reads as its count, a set as an array of its elements, a sketch as its estimate |
 | `kv_set(key, value[, ttl])` | the value written |
 | `kv_set_once(key, value[, ttl])` | the value now held: the new one, or the one already there |
 | `kv_incr(key[, by[, ttl]])` | the count after. `by` is an integer, 1 unless given, and may be negative |
@@ -2056,6 +2056,8 @@ is discarded afterwards**; in EMQX each still sees the client's:
 | `kv_ttl(key)` | whole seconds until the key expires, rounded up; `undefined` for no key |
 | `kv_held(key, condition[, ttl])` | how many whole seconds `condition` has been `true` without a break. It records when it first became true; on anything but `true` it deletes the key and returns `undefined` |
 | `kv_changed(key, value[, ttl])` | whether `value` differs exactly from the one stored, storing it: `true` the first time |
+| `kv_hll_add(key, value[, ttl])` | the estimate of how many distinct values the key has been given, this one included |
+| `kv_hll_count(key)` | that estimate, or `0` for no key |
 
 A key is a string of 1 to 256 bytes. A value is anything but `undefined`, at most 4 KiB as
 JSON (a string as its bytes). A TTL is a whole number of seconds or a duration such as
@@ -2063,6 +2065,13 @@ JSON (a string as its bytes). A TTL is a whole number of seconds or a duration s
 namespace's `default_ttl` and leaves an existing key's expiry alone. A key has the type of
 the function that created it until it is deleted or expires: `kv_incr` on a key `kv_set`
 wrote fails the rule (`wrong_type`). `kv_get`, `kv_ttl` and `kv_del` take any.
+
+`kv_hll_add` counts distinct values without keeping them: a HyperLogLog sketch of 2^14
+registers, at most 12 KiB however many values it is given, with a standard error of about
+0.8% (a count of 100,000 is typically within 800). Two values are one when they are
+exactly equal, as in a set: `1` and `1.0` are two, text and the same bytes one. "How many
+distinct devices reported from this site this hour" is
+`kv_hll_add('devices:' + payload.site, clientid, '1h')`.
 
 **A state call takes effect when evaluation reaches it, and nothing undoes it.** That is
 EMQX's behaviour for `kv_store_put`, and evaluation order is EMQX's: every `SELECT` field,
@@ -2180,7 +2189,8 @@ with a `kv_held`); the store's part of that is 0.11 to 0.14 µs. With every work
 calling at once, each on keys of its own (a key per device), a call takes 0.14 µs on two
 threads, 0.20 µs on four and 0.33 µs on eight; with all of them incrementing **one** key,
 0.19 µs, 0.63 µs and 1.9 µs. A new key in a full `lru` namespace costs an eviction: 0.9 µs
-alone, about 10 µs when eight threads do nothing else.
+alone, about 10 µs when eight threads do nothing else. `kv_hll_add` is the dearest call,
+about twice a `kv_incr` in the store: it works out its estimate each time.
 
 ## Actions
 

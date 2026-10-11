@@ -255,6 +255,10 @@ An expiry merges with its write for `lww` and `first`, and as the later of the t
 the other types. A key is replicated as its whole state, which is small (D9) and merges
 idempotently, so a resent or reordered update is harmless.
 
+*(Amended 2026-10-11, T2: a delete covers exactly the writes stamped before it for `lww`;
+for the other types it also covers the writes of nodes that had not heard of it. `first`'s
+expiry is the later of the two. See [Amendments](#amendments).)*
+
 ### D5. Consistency is chosen per namespace
 
 | Mode | Write | Read | During a partition | Cost on the publish path |
@@ -297,6 +301,10 @@ absolute times on it. `now_timestamp()` is unchanged: EMQX's function, the wall 
 at each call. Durations computed across nodes (a `kv_held` whose device moved, a TTL
 judged by another node) are only as good as the nodes' clock agreement; the documentation
 says so and the rig's clock gate is the reference practice.
+
+*(Amended 2026-10-11, T2: a stamp more than 60 seconds ahead of the receiving node's wall
+clock is refused, not followed; a `local` namespace is not stamped. See
+[Amendments](#amendments).)*
 
 ### D7. Expiry raises an event
 
@@ -885,3 +893,119 @@ client id over does not; a resumed session does not.
   it; the notes task clears its own after every note; a dry run makes one per request.
 - **A wrong argument count** is a load error, as for every function, where EMQX fails
   the rule on each message.
+
+### 2026-10-11 — T2: the merges as built, and what a state of bounded size cannot do
+
+T2 built D4 and D6 as data types, a merge and a clock
+(`crates/mqtt-rules/src/crdt.rs`), proven on one machine; nothing is sent between nodes
+yet (T3). The merge is commutative, associative and idempotent over every state the
+decoder accepts, not only over states a node can reach, because a peer can send any
+bytes. Property tests check it over every type, every pair of concurrent operations and
+300 random interleavings on three nodes whose wall clocks disagree; a fuzz target
+(`state_merge`) checks it over arbitrary bytes and arbitrary scripts.
+
+**Where D4 could not be built as written**
+
+- **A delete "covers every write stamped before it" exactly only for `lww`.** For
+  `first`, D4 asks for "the earliest write that no delete covers". A node that holds two
+  writes of a key cannot know which of them a delete it has not heard of yet will leave,
+  so it would have to keep both, and every write after them: no state of bounded size
+  computes it, and a merge that guesses is not associative (a write at 1, a write at 3
+  and a delete at 2 give different answers by the order they meet in). The same holds
+  for `max` and `min` (the largest of the writes a later delete leaves) and for a
+  counter's increments. What is built: a key's state is **the latest delete it has seen
+  and what was written by nodes that had seen that delete**. Of two states, the one with
+  the later delete replaces the other's content; two with the same delete join by type.
+  So for `first`, `max`, `min`, `sum`, `union` and `hll` a delete covers every write
+  stamped before it (a node that had seen the delete stamps after it) **and also the
+  writes of nodes that had not heard of it yet**, even when the clock put those after
+  it; a write made after hearing of the delete is never covered. `lww` is one stamped
+  write and needs no such rule: it survives every delete stamped before it, whoever had
+  seen what, which is D4 to the letter.
+- **`first`'s expiry is the later of the two,** as for the accumulating types, not "with
+  its write": the write happens once, and `kv_held` and `kv_set_once` set the expiry at
+  every call, so an expiry that travelled with the write would never be refreshed on
+  another node. `lww`'s travels with its write.
+- **An expiry found by a write is a delete.** A write that finds its key expired stamps
+  a delete first and then writes, so the old content cannot come back from a node that
+  still holds it (a counter does not resume at its old count).
+- **For every type but `lww`, a shortened TTL does not travel.** On one node a call
+  with a TTL sets the expiry, sooner or later than it was (D3). Between nodes the later
+  expiry wins, so an expiry moved sooner on one node is moved back by a copy that still
+  has the later one. Refreshing a key, which is what the windows and `kv_held` do, only
+  ever moves it later.
+
+**What the record left open and T2 settled**
+
+- **Two types on one key.** D3's `wrong_type` is one node's answer. Two nodes can create
+  a key at once with different functions: a surviving `lww` write wins, and between the
+  other types the one later in D4's table (`first`, `max`, `min`, `sum`, `union`, `hll`).
+  Every node then refuses the other type's calls alike.
+- **The clock (D6).** 48 bits of milliseconds and a 16-bit counter in one word, taken
+  with one compare-and-swap; the counter carries into the milliseconds after 65,536
+  stamps of one millisecond. When the wall clock stands still or steps back the counter
+  carries on, and what expiries are judged by (the clock's physical part) never goes
+  back. A stamp adds a 64-bit tag of the node (a fixed hash of its id), which only breaks
+  ties; two ids with one tag would make a tie fall to the values, still the same way on
+  every node. **A stamp more than 60 seconds ahead of the receiving node's wall clock is
+  refused:** the state that carries it is not merged and does not move the receiver's
+  clock, and it is accepted once the wall clock has caught up (T3: counted in
+  `mqttd_rule_state_replication_refused_total{reason="clock_skew"}`, retried by repair).
+  Without a bound one node with its clock a year ahead would stamp every other node's
+  writes a year ahead; with it, such a node's writes are not seen elsewhere until its
+  clock is fixed and it is restarted (the clock is in memory). 60 seconds is far above
+  what NTP leaves and far below what a wrong time zone or a dead clock battery gives.
+- **A `local` namespace is not stamped.** Its keys are never merged with another node's
+  and it can never become `eventual` (D1), so its writes take no clock and the publish
+  path pays nothing for one: D6's "expiries are absolute times on the clock" applies to
+  replicated namespaces, and a `local` one keeps the wall clock, as T1 built it.
+- **A counter** keeps, per node, how much it added and how much it took away, each in
+  128 bits. A node's increment is still refused where the count would pass 64 bits (T1),
+  so one node behaves as before; the merged count of several nodes can pass 64 bits and
+  is then read exactly, as an integer of that size. A counter keeps counts of at most
+  256 node ids (D9 said one pair per node id that ever incremented it, which nothing
+  bounded), each id at most 255 bytes; past that a merge keeps the first in order of id
+  and a new node's increment is refused.
+- **A set** merged past 1,024 elements keeps the first 1,024 in its order. That order had
+  to become total: Erlang's term order leaves two maps of one size undecided, and T1
+  kept such elements in the order they arrived in, which two nodes would not share. They
+  are now ordered by their identity. This is the one change to what T1 answered on a
+  single node, and only for a set that holds maps of equal size.
+- **`max` and `min`** of `1` and `1.0` (one number, two values). On one node the number
+  held stays when an equal one is offered, as T1 pinned it: a write replaces only what
+  it is strictly beyond. When two nodes' copies merge, both keep the integer. So which of
+  two equal numbers a node holds can change at a merge, and never changes back.
+- **The sketch.** A value is hashed by its exact identity (as a set tells elements
+  apart) with SipHash-2-4 under a fixed key, written by hand and pinned by the reference
+  vector and by fixed outputs: no node, architecture or release may hash differently,
+  since sketches merge register by register. The upper 14 bits choose the register.
+  Registers are listed (four bytes each in memory) while at most 3,072 are set and
+  become a 12 KiB array after, so a sketch never takes more than 12 KiB. The estimate is
+  Ertl's improved estimator (2017), which needs no correction tables; it uses only
+  additions, halvings and square roots of doubles, so every node computes the same
+  number. Measured error over eight sizes from 1,000 to 300,000: at most 0.6%.
+  `kv_get` reads a sketch as its estimate.
+- **The replicated form.** A version byte, the delete's stamp, the expiry, a type tag,
+  then the type's content; values as ADR 0086 D3 has them. At most 265,246 bytes, which
+  is a full set of the largest elements; a counter of 256 nodes is at most 75 KiB, a
+  sketch 12 KiB, a value 4 KiB. The decoder accepts exactly what the encoder writes (one
+  encoding per state) and nothing longer, and allocates no more than its input holds.
+- **What D3's form cannot carry.** It has no `-0.0` (written `0.0`), no bytes that are
+  not UTF-8 inside an array or a map (written with U+FFFD; a binary on its own keeps its
+  bytes), and no `undefined` inside one (written as the text). A replicated key
+  therefore holds a value as it reads back from that form, settled on the node that
+  writes, so every node holds the same value. T3 applies it in `eventual` namespaces
+  only; `local` ones keep values as they are.
+- **Forgetting.** A key that holds nothing (deleted, or expired) is forgotten once its
+  delete is older than the namespace's tombstone window. Tombstones are therefore
+  bounded by the deletes of one window, and by `max_keys`, which they count toward (D9).
+- **Where it lives.** In `mqtt-rules`, which still holds no state and does no I/O: these
+  are types and functions. The broker's store keeps a key in them from now on.
+
+**Left to T3, with what T2 measured for it.** Stamping writes in an `eventual` namespace
+(a stamp is 4 ns alone and 0.2 to 1 µs with eight threads taking them at once,
+all on one word: a clock per shard would give the same order per key without the shared
+word, if that shows on the rig); storing values as they read back from the replicated
+form; whether `kv_del` of a key the node has never seen leaves a tombstone (the merge
+needs one to cover a concurrent write elsewhere; the bounds may refuse it); the refusal
+count for clock skew.

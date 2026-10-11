@@ -71,6 +71,8 @@ impl StateNamespace for Recorded {
             StateOp::Ttl { key } => ("ttl", key),
             StateOp::Held { key, .. } => ("held", key),
             StateOp::Changed { key, .. } => ("changed", key),
+            StateOp::HllAdd { key, .. } => ("hll_add", key),
+            StateOp::HllCount { key } => ("hll_count", key),
         };
         self.log.lock().unwrap().push(format!(
             "{} {what} {}",
@@ -396,6 +398,8 @@ fn the_state_functions_are_built_in() {
         "kv_ttl",
         "kv_held",
         "kv_changed",
+        "kv_hll_add",
+        "kv_hll_count",
     ] {
         assert!(function_names().contains(&name), "{name}");
         assert_eq!(
@@ -430,7 +434,14 @@ fn the_state_functions_are_built_in() {
             "kv_incr('a', 1, 60, 'idem')",
             "kv_incr() takes 1..=3 argument(s), 4 given",
         ),
-        ("kv_hll_add('a', 1)", "unknown function kv_hll_add()"),
+        (
+            "kv_hll_add('a')",
+            "kv_hll_add() takes 2..=3 argument(s), 1 given",
+        ),
+        (
+            "kv_hll_count('a', 1)",
+            "kv_hll_count() takes 1 argument(s), 2 given",
+        ),
     ] {
         let e = error(&format!("SELECT {call} AS v FROM \"t/#\""), "{}");
         assert!(e.contains(takes), "{call}: {e}");
@@ -598,6 +609,41 @@ fn a_value_is_measured_as_the_rule_engine_writes_it() {
 }
 
 // -- when a call runs ------------------------------------------------------------------
+
+/// D3: the sketch functions are state calls like the others. What reaches the store is
+/// the value's hash, by its exact identity: the value itself is never kept.
+#[test]
+fn the_sketch_functions_check_their_arguments_and_hand_the_store_a_hash() {
+    assert_eq!(
+        calls(
+            "SELECT kv_hll_add('seen', clientid, '1h') AS n, kv_hll_count('seen') AS c FROM \"t/#\"",
+            "{}"
+        ),
+        ["rule:test hll_add seen", "rule:test hll_count seen"]
+    );
+    for (call, reason) in [
+        ("kv_hll_add('k', payload.missing)", "bad_value"),
+        ("kv_hll_add(1, 'v')", "bad_key"),
+        ("kv_hll_add('k', 'v', 0)", "bad_ttl"),
+        ("kv_hll_count('')", "bad_key"),
+    ] {
+        let (out, log) = run(&format!("SELECT {call} AS v FROM \"t/#\""), "{}");
+        let e = out.expect_err(call);
+        assert!(e.contains(reason), "{call}: {e}");
+        assert!(log.is_empty(), "{call}: {log:?}");
+    }
+    // `1` and `1.0` are two values, text and the same bytes one, and a map is the same
+    // value whatever order its keys are in.
+    let hash =
+        |text: &str| crate::crdt::stable_hash(&term_key(&json_decode(text.as_bytes()).unwrap()));
+    assert_ne!(hash("1"), hash("1.0"));
+    assert_ne!(hash("1"), hash("\"1\""));
+    assert_eq!(hash("{\"a\":1,\"b\":2}"), hash("{\"b\":2,\"a\":1}"));
+    assert_eq!(
+        crate::crdt::stable_hash(&term_key(&Value::from("a"))),
+        crate::crdt::stable_hash(&term_key(&Value::Bin(Bytes::from_static(b"a"))))
+    );
+}
 
 /// D3, EMQX's order (`emqx_rule_runtime:evaluate_select/3`): every `SELECT` field left
 /// to right, then the `WHERE`. A call in a field reaches the store for a message the

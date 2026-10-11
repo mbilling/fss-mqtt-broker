@@ -12,6 +12,9 @@
 //!   case: a key per device), `lru_full` each inserting new keys into a full `lru`
 //!   namespace (an eviction per call, which looks at every shard). The time is per
 //!   call, as each thread sees it.
+//! - `clock/stamp/<threads>` — one stamp of the hybrid logical clock (D6), which every
+//!   write to a replicated namespace will take: alone, and with every thread taking
+//!   them. A `local` namespace takes none.
 //!
 //! `cargo bench -p mqttd --bench rule_state`. The numbers in `docs/RULES.md` are from
 //! this.
@@ -23,6 +26,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, Criterion};
 use mqtt_core::AppProperties;
+use mqtt_rules::crdt::{stable_hash, Hlc};
 use mqtt_rules::state::{Eviction, NamespaceSettings, StateNamespace, StateOp, StateStore};
 use mqtt_rules::{Functions, PublishInput, RuleSet, Value};
 use mqttd::rule_state::{stored, Store};
@@ -131,6 +135,31 @@ fn ops(c: &mut Criterion) {
             }))
         });
     });
+    // A sketch that has seen every value already (the steady state of a distinct
+    // count), and one given values it has not seen.
+    let hashes: Vec<u64> = keys.iter().map(|key| stable_hash(key.as_bytes())).collect();
+    let mut at = 0usize;
+    c.bench_function("op/hll_add", |b| {
+        b.iter(|| {
+            at = (at + 1) % hashes.len();
+            black_box(counters.call(&StateOp::HllAdd {
+                key: b"devices:plant-7",
+                hash: hashes[at],
+                ttl: None,
+            }))
+        });
+    });
+    let mut fresh = 0u64;
+    c.bench_function("op/hll_add_new_value", |b| {
+        b.iter(|| {
+            fresh += 1;
+            black_box(counters.call(&StateOp::HllAdd {
+                key: b"devices:plant-8",
+                hash: stable_hash(&fresh.to_be_bytes()),
+                ttl: None,
+            }))
+        });
+    });
     c.bench_function("op/held", |b| {
         b.iter(|| {
             black_box(counters.call(&StateOp::Held {
@@ -235,6 +264,35 @@ fn contended(c: &mut Criterion, name: &str, keys: Keys, threads: usize) {
     });
 }
 
+/// One stamp of the clock, as each of `threads` threads taking them at once sees it.
+fn clock(c: &mut Criterion, threads: usize) {
+    let clock = Hlc::new("node-0");
+    c.bench_function(&format!("clock/stamp/{threads}"), |b| {
+        b.iter_custom(|iters| {
+            let barrier = Barrier::new(threads);
+            let total: Duration = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..threads)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            let started = Instant::now();
+                            for _ in 0..iters {
+                                black_box(clock.now(black_box(1_800_000_000_000)));
+                            }
+                            started.elapsed()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap_or_default())
+                    .sum()
+            });
+            total / u32::try_from(threads).unwrap_or(1)
+        });
+    });
+}
+
 fn bench(c: &mut Criterion) {
     publish(
         c,
@@ -265,6 +323,12 @@ fn bench(c: &mut Criterion) {
         "SELECT clientid, kv_store_get(clientid, 0) + 1 AS n, kv_store_put(clientid, n) AS p \
          FROM \"sensors/+/data\" WHERE payload.temp > 30",
     );
+    publish(
+        c,
+        "kv_hll_add",
+        "SELECT clientid, payload.temp AS temp, kv_hll_add('devices:' + payload.site, clientid) \
+         AS devices FROM \"sensors/+/data\" WHERE payload.temp > 30",
+    );
     ops(c);
     let cores = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
     let mut counts = vec![1, 2, 4, 8, cores];
@@ -275,6 +339,7 @@ fn bench(c: &mut Criterion) {
         contended(c, "hot_key", Keys::Hot, threads);
         contended(c, "own_keys", Keys::Own, threads);
         contended(c, "lru_full", Keys::LruFull, threads);
+        clock(c, threads);
     }
 }
 

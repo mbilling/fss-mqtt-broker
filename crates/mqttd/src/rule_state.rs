@@ -36,7 +36,7 @@
 //! `rules.state_max_bytes` across its namespaces ([`STORE_FULL`]). With
 //! `eviction = "lru"` the namespace's least recently used key makes room instead. A
 //! write to a key that exists is never refused for room: it is bounded per key (a
-//! value of 4 KiB, a set of 1,024 elements of 256 bytes).
+//! value of 4 KiB, a set of 1,024 elements of 256 bytes, a sketch of 12 KiB).
 //!
 //! # Expiry
 //!
@@ -60,6 +60,7 @@ use std::hash::{BuildHasher, RandomState};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
+use mqtt_rules::crdt::{Counts, CountsError, Data, Elements, Hll, SetFull, Stamp};
 use mqtt_rules::state::{
     Eviction, NamespaceSettings, StateError, StateNamespace, StateOp, StateReply, StateStore,
     Stored, BROWNOUT, MAX_SET_ELEMENTS, NAMESPACE_FULL, STORE_FULL, WRONG_TYPE,
@@ -77,6 +78,23 @@ pub const ENTRY_OVERHEAD: usize = 128;
 
 /// What an element of a set is accounted beyond its own bytes.
 const ELEMENT_OVERHEAD: usize = 32;
+
+/// What a sketch is accounted beyond its registers: its histogram and the list's
+/// header.
+const SKETCH_OVERHEAD: usize = 128;
+
+/// What a number read out of the store is charged to the message's build budget: a
+/// counter's count, a sketch's estimate.
+const NUMBER_BYTES: usize = 8;
+
+/// Whose counts a `local` namespace's counters keep: this node's, and nothing tells
+/// nodes apart until a namespace is replicated.
+const LOCAL_NODE: &str = "";
+
+/// The stamp of a write in a `local` namespace: none. Its keys are never merged with
+/// another node's, so nothing orders its writes but the shard's lock, and the publish
+/// path does not pay for a clock.
+const UNSTAMPED: Stamp = Stamp::ZERO;
 
 /// How often, at most, a full namespace that found no expired key in any shard looks
 /// again.
@@ -345,40 +363,12 @@ enum Refusal {
 
 const REFUSALS: usize = 5;
 
-/// What a key holds: the type is its creating operation's (D4).
-#[derive(Debug)]
-enum Data {
-    /// `kv_set`, `kv_changed`, `kv_store_put`.
-    Lww(Value),
-    /// `kv_set_once`, `kv_held`.
-    First(Value),
-    /// `kv_max`.
-    Max(Value),
-    /// `kv_min`.
-    Min(Value),
-    /// `kv_incr`.
-    Sum(i64),
-    /// `kv_add`: the elements in term order, each with its identity.
-    Union(Vec<(Box<[u8]>, Value)>),
-}
-
-impl Data {
-    fn type_name(&self) -> &'static str {
-        match self {
-            Self::Lww(_) => "lww",
-            Self::First(_) => "first",
-            Self::Max(_) => "max",
-            Self::Min(_) => "min",
-            Self::Sum(_) => "sum",
-            Self::Union(_) => "union",
-        }
-    }
-}
-
 #[derive(Debug)]
 struct Entry {
     /// Its key: the one allocation the map and the two orders share.
     key: Arc<[u8]>,
+    /// What it holds, in the type that merges (D4): the type is its creating
+    /// operation's.
     data: Data,
     /// When it expires, in the store's milliseconds; `0`: never.
     expires_ms: u64,
@@ -796,6 +786,43 @@ fn seconds(since_ms: u64, now_ms: u64) -> Value {
     Value::Int(i64::try_from(now_ms.saturating_sub(since_ms) / 1000).unwrap_or(i64::MAX))
 }
 
+/// A sketch's estimate, as a rule reads it.
+fn estimate(sketch: &Hll) -> Value {
+    Value::Int(i64::try_from(sketch.count()).unwrap_or(i64::MAX))
+}
+
+/// A counter that starts at `by` (`kv_incr`).
+fn counter(by: i64) -> Data {
+    let mut counts = Counts::default();
+    // A counter of no node takes any first step.
+    let _: Result<i64, CountsError> = counts.add(LOCAL_NODE, by);
+    Data::Sum(counts)
+}
+
+/// A set of one element (`kv_add`).
+fn set_of(identity: &[u8], element: &Value) -> Data {
+    let mut elements = Elements::default();
+    // An empty set is not full.
+    let _: Result<bool, SetFull> = elements.insert(identity, element, owned);
+    Data::Union(elements)
+}
+
+/// A value written last (`kv_set`, `kv_changed`, `kv_store_put`).
+fn lww(value: &Value) -> Data {
+    Data::Lww {
+        stamp: UNSTAMPED,
+        value: owned(value),
+    }
+}
+
+/// A value written first (`kv_set_once`, `kv_held`).
+fn first(value: Value) -> Data {
+    Data::First {
+        stamp: UNSTAMPED,
+        value,
+    }
+}
+
 fn done(value: Option<Value>) -> Step<StateReply> {
     Step::Done(StateReply {
         value,
@@ -818,7 +845,9 @@ impl Handle {
             | StateOp::Del { key }
             | StateOp::Ttl { key }
             | StateOp::Held { key, .. }
-            | StateOp::Changed { key, .. } => *key,
+            | StateOp::Changed { key, .. }
+            | StateOp::HllAdd { key, .. }
+            | StateOp::HllCount { key } => *key,
         };
         let at = ns.shard_of(key);
         let mut shard = lock_shard(&ns.shards[at]);
@@ -871,14 +900,12 @@ impl Handle {
                 let Some(entry) = shard.map.get_mut(key) else {
                     return Ok(done(None));
                 };
-                let value = match &entry.data {
-                    Data::Lww(v) | Data::First(v) | Data::Max(v) | Data::Min(v) => v.clone(),
-                    Data::Sum(n) => Value::Int(*n),
-                    Data::Union(elements) => {
-                        Value::from(elements.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>())
-                    }
+                let value = entry.data.read();
+                // A sketch reads as its estimate, not as its registers.
+                let read_bytes = match entry.data {
+                    Data::Hll(_) => NUMBER_BYTES,
+                    _ => entry.data_bytes(),
                 };
-                let read_bytes = entry.data_bytes();
                 after!(entry, None);
                 Step::Done(StateReply {
                     value: Some(value),
@@ -887,19 +914,19 @@ impl Handle {
             }
             StateOp::Set { value, ttl, .. } => match shard.map.get_mut(key) {
                 Some(entry) => {
-                    if !matches!(entry.data, Data::Lww(_)) {
+                    if !matches!(entry.data, Data::Lww { .. }) {
                         return Err(ns.wrong_type(&entry.data, "lww"));
                     }
-                    entry.data = Data::Lww(owned(value.value));
+                    entry.data = lww(value.value);
                     ns.resize(entry, ENTRY_OVERHEAD + key.len() + value.bytes);
                     after!(entry, ttl);
                     done(None)
                 }
-                None => insert!(Data::Lww(owned(value.value)), value.bytes, ttl, None),
+                None => insert!(lww(value.value), value.bytes, ttl, None),
             },
             StateOp::SetOnce { value, ttl, .. } => match shard.map.get_mut(key) {
                 Some(entry) => {
-                    let Data::First(held) = &entry.data else {
+                    let Data::First { value: held, .. } = &entry.data else {
                         return Err(ns.wrong_type(&entry.data, "first"));
                     };
                     let held = held.clone();
@@ -911,7 +938,7 @@ impl Handle {
                     })
                 }
                 None => insert!(
-                    Data::First(owned(value.value)),
+                    first(owned(value.value)),
                     value.bytes,
                     ttl,
                     Some(value.value.clone())
@@ -919,19 +946,28 @@ impl Handle {
             },
             StateOp::Incr { by, ttl, .. } => match shard.map.get_mut(key) {
                 Some(entry) => {
-                    let Data::Sum(count) = &mut entry.data else {
+                    let Data::Sum(counts) = &mut entry.data else {
                         return Err(ns.wrong_type(&entry.data, "sum"));
                     };
-                    let Some(sum) = count.checked_add(by) else {
-                        return Err(
-                            ns.refuse(Refusal::Other, "the counter would pass 64 bits".to_string())
-                        );
+                    let sum = match counts.add(LOCAL_NODE, by) {
+                        Ok(sum) => sum,
+                        Err(CountsError::Overflow) => {
+                            return Err(ns.refuse(
+                                Refusal::Other,
+                                "the counter would pass 64 bits".to_string(),
+                            ));
+                        }
+                        Err(CountsError::TooManyNodes | CountsError::NodeId) => {
+                            return Err(ns.refuse(
+                                Refusal::Other,
+                                "the counter holds counts of as many nodes as it may".to_string(),
+                            ));
+                        }
                     };
-                    *count = sum;
                     after!(entry, ttl);
                     done(Some(Value::Int(sum)))
                 }
-                None => insert!(Data::Sum(by), 8, ttl, Some(Value::Int(by))),
+                None => insert!(counter(by), NUMBER_BYTES, ttl, Some(Value::Int(by))),
             },
             StateOp::Extreme {
                 value,
@@ -984,26 +1020,16 @@ impl Handle {
                     let Data::Union(elements) = &mut entry.data else {
                         return Err(ns.wrong_type(&entry.data, "union"));
                     };
-                    let is_new = !elements.iter().any(|(id, _)| &**id == identity);
-                    if is_new {
-                        if elements.len() >= MAX_SET_ELEMENTS {
-                            return Err(ns.refuse(
-                                Refusal::Other,
-                                format!(
-                                    "the set holds {MAX_SET_ELEMENTS} elements, the most a set \
-                                     may"
-                                ),
-                            ));
-                        }
-                        // Term order, and for values that order calls equal (`1` and
-                        // `1.0`) the order of their identities.
-                        let at = elements.partition_point(|(id, held)| {
-                            held.term_cmp(element.value)
-                                .then_with(|| (**id).cmp(identity))
-                                == std::cmp::Ordering::Less
-                        });
-                        elements.insert(at, (Box::from(identity), owned(element.value)));
-                    }
+                    // Kept in term order, and for values that order calls equal (`1`
+                    // and `1.0`) in the order of their identities.
+                    let Ok(is_new) = elements.insert(identity, element.value, owned) else {
+                        return Err(ns.refuse(
+                            Refusal::Other,
+                            format!(
+                                "the set holds {MAX_SET_ELEMENTS} elements, the most a set may"
+                            ),
+                        ));
+                    };
                     let count = Value::Int(i64::try_from(elements.len()).unwrap_or(i64::MAX));
                     if is_new {
                         let bytes = entry.bytes + ELEMENT_OVERHEAD + element.bytes;
@@ -1013,7 +1039,7 @@ impl Handle {
                     done(Some(count))
                 }
                 None => insert!(
-                    Data::Union(vec![(Box::from(identity), owned(element.value))]),
+                    set_of(identity, element.value),
                     ELEMENT_OVERHEAD + element.bytes,
                     ttl,
                     Some(Value::Int(1))
@@ -1033,7 +1059,7 @@ impl Handle {
             }
             StateOp::Held { holds, ttl, .. } => match shard.map.get_mut(key) {
                 Some(entry) => {
-                    let Data::First(since) = &entry.data else {
+                    let Data::First { value: since, .. } = &entry.data else {
                         return Err(ns.wrong_type(&entry.data, "first"));
                     };
                     if holds {
@@ -1055,30 +1081,58 @@ impl Handle {
                 }
                 None if holds => {
                     let since = Value::Int(i64::try_from(now_ms).unwrap_or(i64::MAX));
-                    insert!(Data::First(since), 8, ttl, Some(Value::Int(0)))
+                    insert!(first(since), 8, ttl, Some(Value::Int(0)))
                 }
                 None => done(None),
             },
             StateOp::Changed { value, ttl, .. } => match shard.map.get_mut(key) {
                 Some(entry) => {
-                    let Data::Lww(held) = &entry.data else {
+                    let Data::Lww { value: held, .. } = &entry.data else {
                         return Err(ns.wrong_type(&entry.data, "lww"));
                     };
                     let changed = !held.exact_eq(value.value);
                     if changed {
-                        entry.data = Data::Lww(owned(value.value));
+                        entry.data = lww(value.value);
                         ns.resize(entry, ENTRY_OVERHEAD + key.len() + value.bytes);
                     }
                     after!(entry, ttl);
                     done(Some(Value::Bool(changed)))
                 }
-                None => insert!(
-                    Data::Lww(owned(value.value)),
-                    value.bytes,
-                    ttl,
-                    Some(Value::Bool(true))
-                ),
+                None => insert!(lww(value.value), value.bytes, ttl, Some(Value::Bool(true))),
             },
+            StateOp::HllAdd { hash, ttl, .. } => {
+                if let Some(entry) = shard.map.get_mut(key) {
+                    let Data::Hll(sketch) = &mut entry.data else {
+                        return Err(ns.wrong_type(&entry.data, "hll"));
+                    };
+                    let before = sketch.bytes();
+                    sketch.add(hash);
+                    let (now, count) = (sketch.bytes(), estimate(sketch));
+                    if now != before {
+                        // A sketch only grows, up to its 12 KiB.
+                        let bytes = entry.bytes + now.saturating_sub(before);
+                        ns.resize(entry, bytes);
+                    }
+                    after!(entry, ttl);
+                    done(Some(count))
+                } else {
+                    let mut sketch = Box::<Hll>::default();
+                    sketch.add(hash);
+                    let (bytes, count) = (SKETCH_OVERHEAD + sketch.bytes(), estimate(&sketch));
+                    insert!(Data::Hll(sketch), bytes, ttl, Some(count))
+                }
+            }
+            StateOp::HllCount { .. } => {
+                let Some(entry) = shard.map.get_mut(key) else {
+                    return Ok(done(Some(Value::Int(0))));
+                };
+                let Data::Hll(sketch) = &entry.data else {
+                    return Err(ns.wrong_type(&entry.data, "hll"));
+                };
+                let count = estimate(sketch);
+                after!(entry, None);
+                done(Some(count))
+            }
         };
         Ok(step)
     }

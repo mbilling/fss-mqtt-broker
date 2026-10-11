@@ -256,6 +256,22 @@ pub enum StateOp<'a> {
         /// The expiry to set, in seconds.
         ttl: Option<u64>,
     },
+    /// `kv_hll_add`: add a value to the sketch of distinct values (type `hll`). Replies
+    /// with the estimate of how many distinct values it has seen.
+    HllAdd {
+        /// The key.
+        key: &'a [u8],
+        /// The value's hash ([`stable_hash`](crate::crdt::stable_hash) of its
+        /// [`term_key`]): two values are one when they are exactly equal.
+        hash: u64,
+        /// The expiry to set, in seconds.
+        ttl: Option<u64>,
+    },
+    /// `kv_hll_count`: the sketch's estimate; `0` for no key.
+    HllCount {
+        /// The key.
+        key: &'a [u8],
+    },
 }
 
 /// What a state call answers.
@@ -1024,6 +1040,27 @@ fn kv_changed(a: &[Value], cx: &FnCtx) -> Result<Value, EvalError> {
     call(cx, &op).map(answer)
 }
 
+/// `kv_hll_add(key, value[, ttl])`: Redis's `PFADD`. The sketch keeps no value, only
+/// what the value's hash raises in its registers; the hash is of the value's exact
+/// identity, so `1` and `1.0` are two values and a string and a binary of the same
+/// bytes are one, as in a set.
+fn kv_hll_add(a: &[Value], cx: &FnCtx) -> Result<Value, EvalError> {
+    let binding = begin(cx)?;
+    stored(&a[1], MAX_VALUE_BYTES, "a value")?;
+    let op = StateOp::HllAdd {
+        key: key(&a[0])?,
+        hash: crate::crdt::stable_hash(&term_key(&a[1])),
+        ttl: ttl(a.get(2), binding)?,
+    };
+    call(cx, &op).map(answer)
+}
+
+/// `kv_hll_count(key)`: Redis's `PFCOUNT`.
+fn kv_hll_count(a: &[Value], cx: &FnCtx) -> Result<Value, EvalError> {
+    begin(cx)?;
+    call(cx, &StateOp::HllCount { key: key(&a[0])? }).map(answer)
+}
+
 /// A `kv_store_*` key: any value, of at most [`MAX_KEY_BYTES`] bytes as written,
 /// matched exactly.
 fn store_key(v: &Value) -> Result<Vec<u8>, EvalError> {
@@ -1119,6 +1156,8 @@ pub(crate) static FUNCS: &[Func] = &[
     func("kv_ttl", 1, 1, kv_ttl),
     func("kv_held", 2, 3, kv_held),
     func("kv_changed", 2, 3, kv_changed),
+    func("kv_hll_add", 2, 3, kv_hll_add),
+    func("kv_hll_count", 1, 1, kv_hll_count),
 ];
 
 /// The family of a state function; `None` for any other function.

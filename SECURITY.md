@@ -89,7 +89,9 @@ Security is asserted continuously, not audited once
   parser): `packet_decode` (MQTT codec), `peer_decode` (peer frames),
   `swim_message` and `gossip_open` (gossip plane), `crl_parse` and `acl_parse`
   (config/auth), `rules_parse` and `rules_eval` (the rule engine's rules file, and
-  its evaluation over publisher-controlled payloads), `module_load` (the WebAssembly
+  its evaluation over publisher-controlled payloads), `state_merge` (a rule-state key
+  as a peer sends it: the decoder, and that copies merge to one value in any order),
+  `module_load` (the WebAssembly
   sandbox: a module file, and the calls into one it accepted). Committed seed corpora live under each crate's `fuzz/seeds/`;
   the nightly CI tier runs every target and any finding becomes a regression.
 - **The acked-facts oracle** across in-process and out-of-process fault

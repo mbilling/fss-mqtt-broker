@@ -36,4 +36,12 @@ test = false
 doc = false
 bench = false
 
+# The replicated form of a rule's state and its merge (ADR 0085 D4): bytes a peer sends.
+[[bin]]
+name = "state_merge"
+path = "fuzz_targets/state_merge.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
