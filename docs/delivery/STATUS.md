@@ -92,7 +92,7 @@
 | [0082](../adr/0082-bounded-hub-ingress.md) | # 0082. Bounded hub ingress: a control lane that never waits behind data, and byte credits that push back on publishers | Accepted | [6/6 done](0082-bounded-hub-ingress.md) | — |
 | [0083](../adr/0083-rule-engine.md) | A rule engine on the publish path: EMQX rule SQL, evaluated once per message where it lands | Accepted | [17/17 done](0083-rule-engine.md) | — |
 | [0084](../adr/0084-watching-and-editing-rules-live.md) | Watching and editing rules live | Accepted | [10/10 done](0084-watching-and-editing-rules-live.md) | — |
-| [0085](../adr/0085-rule-state-store.md) | State for rules: a keyed, replicated store read and written from SQL | Proposed | [0/10 done](0085-rule-state-store.md) | 10 open |
+| [0085](../adr/0085-rule-state-store.md) | State for rules: a keyed, replicated store read and written from SQL | Accepted | [0/11 done](0085-rule-state-store.md) | 11 open |
 | [0086](../adr/0086-wasm-rule-functions.md) | Rule functions in a WebAssembly sandbox: the real jq first, operator plugins on the same mechanism | Accepted | [4/4 done](0086-wasm-rule-functions.md) | — |
 
 ## Open and deferred work
@@ -220,13 +220,14 @@
 
 **0085 — State for rules: a keyed, replicated store read and written from SQL**
 
-- `0085-T1` ⬜ planned ([#880](https://github.com/mbilling/fss-mqtt-broker/issues/880)): "The store and its SQL functions on local namespaces: the StateStore trait, kv_* functions incl. kv_held and kv_changed, namespaces in the rules file, bounds and memory accounting"
-- `0085-T2` ⬜ planned ([#880](https://github.com/mbilling/fss-mqtt-broker/issues/880)): "Typed merges as CRDTs (lww, first, max, min, sum, union, hll, tombstones) on a per-node hybrid logical clock"
-- `0085-T3` ⬜ planned ([#880](https://github.com/mbilling/fss-mqtt-broker/issues/880)): "eventual mode: CRDT deltas to the key's replica set over the peer bus, anti-entropy after partitions and restarts"
-- `0085-T4` ⬜ planned ([#880](https://github.com/mbilling/fss-mqtt-broker/issues/880)): "Expiry and $events/state/expired, fired once by the key's owner, at least once around membership changes"
-- `0085-T5` ⬜ planned ([#880](https://github.com/mbilling/fss-mqtt-broker/issues/880)): "kv_incr idempotency keys and the namespace dedupe window"
-- `0085-T6` ⬜ planned ([#880](https://github.com/mbilling/fss-mqtt-broker/issues/880)): "Observability and admin: state metrics, per-namespace $SYS statistics, mqttd --admin state get|list|del"
-- `0085-T7` ⬜ planned ([#880](https://github.com/mbilling/fss-mqtt-broker/issues/880)): "mqttd --rule-test --sequence: timed sequences replayed through a rule against an in-memory store"
-- `0085-T8` ⬜ planned ([#880](https://github.com/mbilling/fss-mqtt-broker/issues/880)): "Documentation: RULES.md (functions, merges, modes, the evaluation-order rule, the billing worked example), the departures from EMQX, threat model and hardening rows"
-- `0085-T9` ⬜ planned ([#880](https://github.com/mbilling/fss-mqtt-broker/issues/880)): "strong mode on the durable plane (phase 2), with partition and failover tests"
-- `0085-T10` ⬜ planned ([#880](https://github.com/mbilling/fss-mqtt-broker/issues/880)): "An optional snapshot to disk for local and eventual namespaces (phase 3)"
+- `0085-T1` ⬜ planned ([#917](https://github.com/mbilling/fss-mqtt-broker/issues/917)): "The store and its SQL functions on local namespaces: the StateStore trait handed over in Functions, [state.*] and the rule key state, EMQX's kv_store_* with EMQX's behaviour, the kv_* functions incl. kv_held and kv_changed, state calls in EMQX's evaluation order, bounds, the store's ceiling and memory accounting, dry runs on a scratch store"
+- `0085-T2` ⬜ planned ([#918](https://github.com/mbilling/fss-mqtt-broker/issues/918)): "Typed merges as CRDTs (lww, first, max, min, sum, union, hll, deletes) on a per-node hybrid logical clock, and the replicated form of a key"
+- `0085-T3` ⬜ planned ([#919](https://github.com/mbilling/fss-mqtt-broker/issues/919)): "eventual mode: every member holds the namespace; changed keys sent per peer link at peer protocol 14, applied off the hub, repaired by anti-entropy after partitions and restarts"
+- `0085-T4` ⬜ planned ([#920](https://github.com/mbilling/fss-mqtt-broker/issues/920)): "Expiry and $events/state/expired: selected by its own name only, raised by one member, rate-bounded and late rather than lost, at least once around membership changes"
+- `0085-T5` ⬜ planned ([#921](https://github.com/mbilling/fss-mqtt-broker/issues/921)): "kv_incr idempotency keys, remembered as entries of the namespace for its dedupe window"
+- `0085-T6` ⬜ planned ([#922](https://github.com/mbilling/fss-mqtt-broker/issues/922)): "Observability and admin: state metrics, per-namespace $SYS statistics, the admin state endpoints and the mqttd --admin state verbs"
+- `0085-T7` ⬜ planned ([#923](https://github.com/mbilling/fss-mqtt-broker/issues/923)): "mqttd --rule-test --sequence: timed sequences replayed through a statement or a rules file against an in-memory store with a driven clock"
+- `0085-T8` ⬜ planned ([#924](https://github.com/mbilling/fss-mqtt-broker/issues/924)): "Documentation: RULES.md (functions, types, modes, when a state call runs, the worked sequences, the billing example), the departures from EMQX, threat model and hardening rows, the converter"
+- `0085-T9` ⬜ planned ([#925](https://github.com/mbilling/fss-mqtt-broker/issues/925)): "strong mode (phase 2): first the design amendment that settles how an evaluation waits, then the durable plane, with partition and failover tests"
+- `0085-T10` ⬜ planned ([#926](https://github.com/mbilling/fss-mqtt-broker/issues/926)): "An optional snapshot to disk for local and eventual namespaces (phase 3)"
+- `0085-T11` ⬜ planned ([#927](https://github.com/mbilling/fss-mqtt-broker/issues/927)): "EMQX's proc_dict_* as a dictionary per evaluating task, with EMQX's return values, bounded per connection"

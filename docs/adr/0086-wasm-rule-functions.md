@@ -8,7 +8,8 @@
   record decides how `jq` is provided, with EMQX's results.
 - **Related:** [ADR 0084](0084-watching-and-editing-rules-live.md) (live editing, the admin
   rules endpoints and the trace this extends), [ADR 0085](0085-rule-state-store.md) (the
-  other proposed extension of the function set), [ADR 0045](0045-release-engineering-and-distribution.md)
+  other extension of the function set, accepted 2026-10-11; its D14 says how a state
+  call fits this record's evaluation model, and that a module cannot call state), [ADR 0045](0045-release-engineering-and-distribution.md)
   (reproducible builds, which the module's build joins).
 
 > This record states the decision and the measurements it rests on. The sandbox is

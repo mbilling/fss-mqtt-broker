@@ -414,6 +414,10 @@ lexer and parser, and the OTP 28 modules they call. Each value below was probed 
   messages in a node-local table. That is the state ADR 0085 designs as a replicated,
   namespaced store behind a trait; implementing EMQX's unreplicated table now would
   preempt it, so they stay refused at load and ADR 0085 decides their mapping.
+  (Decided 2026-10-11, ADR 0085 D13: both are provided under EMQX's names with EMQX's
+  behaviour, `kv_store_*` as a table per node and `proc_dict_*` as a dictionary per
+  connection task, each bounded. They stay refused until its tasks T1 and T11 deliver
+  them.)
 
 ## Amendment (2026-10-10): regular expressions are PCRE2 in byte mode, as in EMQX
 
