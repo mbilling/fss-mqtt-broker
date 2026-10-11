@@ -47,7 +47,7 @@ tasks:
     issue: 926
   - id: 0085-T11
     title: "EMQX's proc_dict_* as a dictionary per evaluating task, with EMQX's return values, bounded per connection"
-    status: planned
+    status: in-progress
     issue: 927
 ---
 
@@ -64,7 +64,7 @@ Five choices were decided by default and are listed in the ADR with what the oth
 costs: `eventual` replicates to every member; `strong` is phase 2 behind a design
 amendment; EMQX's `proc_dict_*` are provided; state needs no switch beyond its ceiling
 (`rules.state_max_bytes`); the names stay `kv_*`. T1, the store and its functions on
-one node, is built and in review; nothing after it is started.
+one node, is done; the table under Progress has where each of the others stands.
 
 ## Plan
 
@@ -102,7 +102,7 @@ phases.
 | 0085-T8 | ⬜ planned | [#924](https://github.com/mbilling/fss-mqtt-broker/issues/924) | — |  |
 | 0085-T9 | ⬜ planned | [#925](https://github.com/mbilling/fss-mqtt-broker/issues/925) | — |  |
 | 0085-T10 | ⬜ planned | [#926](https://github.com/mbilling/fss-mqtt-broker/issues/926) | — |  |
-| 0085-T11 | ⬜ planned | [#927](https://github.com/mbilling/fss-mqtt-broker/issues/927) | — |  |
+| 0085-T11 | 🚧 in-progress | [#927](https://github.com/mbilling/fss-mqtt-broker/issues/927) | — |  |
 <!-- /status-table:0085 -->
 
 ## Changelog
@@ -172,3 +172,35 @@ phases.
     the admin verbs (T6; the refusal counts exist in the store and are not exported yet);
     the expiry sweep and its event (T4: until then an expired key is removed by the call
     that finds it, or when its namespace needs room).
+- 2026-10-11 — **T11 built** (#927, in review): EMQX's `proc_dict_put`, `proc_dict_get`
+  and `proc_dict_del`.
+  - **EMQX 6.3.1 probed:** 99 probes, of what the functions answer and of which process's
+    dictionary each kind of trigger works on (clients on a running node, and a scan of
+    every process's dictionary). The answers are as the ADR had them. Two things were
+    not: the dictionary lives as long as the *process*, which a session that outlives
+    its connection keeps until it is resumed; and `message_dropped` is evaluated by
+    whoever published the message, a rule's republish and a Will included. The ADR's
+    amendment of this date has the table of triggers.
+  - **The engine's half** (`crates/mqtt-rules/src/state/dict.rs`): a `Dictionary` that
+    whoever evaluates owns and hands over (`RuleSet::on_publish_in`, `on_event_in`,
+    `evaluate_one_on`); the three names in the one table of state functions; 64 keys
+    and 64 KiB, `dictionary_full` past either; the bytes counted in the store
+    (`StateStore::dictionary_grow`, `dictionary_shrink`). It is `Send` and not `Sync`:
+    nothing can share one between tasks.
+  - **The broker's half:** one dictionary per connection, in its `ConnRules`, for
+    everything that connection's task evaluates; an empty one per Will and per note of
+    the notes task; a scratch one per dry run. The store refuses a dictionary room at
+    its ceiling and in a brownout, and counts it.
+  - **Three evaluations differ from EMQX** and are listed in RULES.md: a Will, an event
+    about a session without a connection, and `message_dropped` for a message a rule
+    republished or a Will. Each gets an empty dictionary where EMQX's sees the client's.
+  - **The converter** carries a rule that calls `proc_dict_*` live, with a note on the
+    bounds and those three.
+  - **Measured** (`cargo bench -p mqtt-rules`, Apple M1 Pro): the per-publish benchmark,
+    which has no state rule, with `main`'s binary and this change's run alternately, four
+    times each, taking the fastest sample of each case: `no_match` 109.2 to 109.7 ns,
+    `filter_reject` 964 to 959 ns, `filter_republish` 1.788 to 1.780 µs,
+    `select_star_republish` 4.519 to 4.513 µs, `foreach_10` 8.127 to 8.148 µs. Between
+    −0.5% and +0.5%, which is inside the spread from one run to the next. (The machine
+    was busy, so the figures are higher than T1's; the comparison is like for like.) An
+    evaluation that is handed no dictionary makes none unless a rule calls `proc_dict_*`.

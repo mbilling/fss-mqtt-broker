@@ -8,7 +8,7 @@
 //! file is loaded, so an evaluation does no lookup by name, and a file that calls a
 //! state function where there is no store does not load.
 //!
-//! Two families of functions, which do not share keys:
+//! Three families of functions, which do not share keys:
 //!
 //! * **EMQX's** `kv_store_put/2`, `kv_store_get/1,2` and `kv_store_del/1`, with what
 //!   `emqx_rule_funcs` does (probed on EMQX 6.3.1): one table per node, shared by
@@ -16,6 +16,10 @@
 //!   `1.0` and `'1'` are three keys, `0.0` and `-0.0` two), `undefined` storable,
 //!   `put` and `del` always `true`. They live in the reserved namespace
 //!   [`KV_STORE_NAMESPACE`].
+//! * **EMQX's** `proc_dict_put/2`, `proc_dict_get/1` and `proc_dict_del/1`: the
+//!   dictionary of whoever evaluates the rule, which in the broker is the client's
+//!   connection task ([`Dictionary`]). In no namespace and in no store: the store
+//!   only counts their bytes against its ceiling.
 //! * **mqttd's** `kv_*` (the names are in [`FUNCS`], and nowhere else), on the
 //!   namespace the rule names with its `state` key, or one of its own.
 //!
@@ -36,6 +40,10 @@ use serde::Deserialize;
 use crate::funcs::{FnCtx, Func, MAX_BUILT_BYTES};
 use crate::value::Value;
 use crate::EvalError;
+
+mod dict;
+
+pub use dict::{Dictionary, DICTIONARY_FULL, MAX_DICT_BYTES, MAX_DICT_KEYS};
 
 /// EMQX's table (`kv_store_*`): a reserved namespace name.
 pub const KV_STORE_NAMESPACE: &str = "kv_store";
@@ -303,6 +311,17 @@ pub trait StateStore: Send + Sync + std::fmt::Debug {
         name: &str,
         settings: &NamespaceSettings,
     ) -> Result<Arc<dyn StateNamespace>, String>;
+
+    /// Count `bytes` more against the ceiling for what a [`Dictionary`] holds
+    /// (`proc_dict_*`), outside any namespace. `Err`: there is no room ([`STORE_FULL`],
+    /// [`BROWNOUT`]) and nothing was counted; the call fails its rule. A store that
+    /// keeps no such count accepts everything.
+    fn dictionary_grow(&self, _bytes: u64) -> Result<(), StateError> {
+        Ok(())
+    }
+
+    /// Give back `bytes` that [`dictionary_grow`](Self::dictionary_grow) counted.
+    fn dictionary_shrink(&self, _bytes: u64) {}
 }
 
 /// Whether the rules being loaded may keep state.
@@ -522,6 +541,8 @@ pub(crate) enum Family {
     Emqx,
     /// mqttd's `kv_*`: the rule's namespace.
     Own,
+    /// EMQX's `proc_dict_*`: the evaluating task's [`Dictionary`], in no namespace.
+    Dict,
 }
 
 /// The state of one rules file while it loads: its declarations, and the namespaces
@@ -665,9 +686,16 @@ impl StateLoading {
     }
 
     /// The namespace a call of a `family` function in the rule being compiled works
-    /// on, or why the file cannot be loaded.
-    pub(crate) fn binding(&mut self, family: Family) -> Result<Arc<StateBinding>, String> {
+    /// on (`None` for `proc_dict_*`, which work on no namespace), or why the file
+    /// cannot be loaded.
+    pub(crate) fn binding(&mut self, family: Family) -> Result<Option<Arc<StateBinding>>, String> {
         let name = match family {
+            Family::Dict => {
+                // A dictionary's bytes count against the store's ceiling, so these
+                // too load only where there is a store.
+                self.switch.store()?;
+                return Ok(None);
+            }
             Family::Emqx => {
                 self.called_emqx = true;
                 KV_STORE_NAMESPACE.to_string()
@@ -680,7 +708,7 @@ impl StateLoading {
                 }
             }
         };
-        self.open(&name)
+        self.open(&name).map(Some)
     }
 
     /// Every namespace the file holds: the declared ones and the ones its rules use.
@@ -849,12 +877,18 @@ fn call(cx: &FnCtx, op: &StateOp<'_>) -> Result<StateReply, EvalError> {
         .ctx
         .state_call(binding, op)?
         .map_err(|e| EvalError::new(e.to_string()))?;
-    if reply.read_bytes > 0 {
+    charge_read(cx, reply.read_bytes)?;
+    Ok(reply)
+}
+
+/// Charge `bytes` read out of state to the message's build budget.
+fn charge_read(cx: &FnCtx, bytes: usize) -> Result<(), EvalError> {
+    if bytes > 0 {
         let total = cx
             .ctx
             .built
             .get()
-            .checked_add(reply.read_bytes)
+            .checked_add(bytes)
             .filter(|&total| total <= MAX_BUILT_BYTES)
             .ok_or_else(|| {
                 EvalError::new(format!(
@@ -865,7 +899,7 @@ fn call(cx: &FnCtx, op: &StateOp<'_>) -> Result<StateReply, EvalError> {
             })?;
         cx.ctx.built.set(total);
     }
-    Ok(reply)
+    Ok(())
 }
 
 fn binding<'a>(cx: &'a FnCtx) -> Result<&'a StateBinding, EvalError> {
@@ -1057,8 +1091,9 @@ const fn func(
     }
 }
 
-/// The prefix of EMQX's own state functions: what tells the two families apart.
+/// The prefixes of EMQX's own state functions: what tells the families apart.
 const EMQX_PREFIX: &str = "kv_store_";
+const DICT_PREFIX: &str = "proc_dict_";
 
 /// The state functions. **The one place their names are written**: mqttd's own are
 /// `kv_*` beside EMQX's `kv_store_*` (ADR 0085, decided by default), and a rename is a
@@ -1068,6 +1103,9 @@ pub(crate) static FUNCS: &[Func] = &[
     func("kv_store_put", 2, 2, kv_store_put),
     func("kv_store_get", 1, 2, kv_store_get),
     func("kv_store_del", 1, 1, kv_store_del),
+    func("proc_dict_put", 2, 2, dict::proc_dict_put),
+    func("proc_dict_get", 1, 1, dict::proc_dict_get),
+    func("proc_dict_del", 1, 1, dict::proc_dict_del),
     // -- mqttd's
     func("kv_get", 1, 1, kv_get),
     func("kv_set", 2, 3, kv_set),
@@ -1088,6 +1126,8 @@ pub(crate) fn family(func: &Func) -> Option<Family> {
     FUNCS.iter().any(|f| std::ptr::eq(f, func)).then(|| {
         if func.name.starts_with(EMQX_PREFIX) {
             Family::Emqx
+        } else if func.name.starts_with(DICT_PREFIX) {
+            Family::Dict
         } else {
             Family::Own
         }

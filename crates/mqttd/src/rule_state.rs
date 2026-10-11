@@ -128,6 +128,8 @@ pub struct Store {
     /// wrote for the next. `None` for the broker's store, whose namespaces live while
     /// loaded rules hold them.
     kept: Option<Mutex<Vec<Arc<Namespace>>>>,
+    /// How often a connection's dictionary was refused room.
+    dictionary_refused: AtomicU64,
 }
 
 /// One namespace's counts ([`Store::stats`]).
@@ -189,6 +191,7 @@ impl Store {
             }),
             namespaces: Mutex::new(HashMap::new()),
             kept: None,
+            dictionary_refused: AtomicU64::new(0),
         })
     }
 
@@ -198,10 +201,17 @@ impl Store {
         self.shared.brownout.store(on, Relaxed);
     }
 
-    /// Bytes accounted across every namespace.
+    /// Bytes accounted across every namespace and every connection's dictionary.
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.shared.bytes.load(Relaxed)
+    }
+
+    /// How often a connection's dictionary (`proc_dict_*`) was refused room: at the
+    /// ceiling, or in a brownout.
+    #[must_use]
+    pub fn dictionary_refused(&self) -> u64 {
+        self.dictionary_refused.load(Relaxed)
     }
 
     /// The namespaces loaded rule sets hold now, in name order.
@@ -261,6 +271,38 @@ impl StateStore for Store {
             namespace,
             settings: settings.clone(),
         }))
+    }
+
+    /// What connections' dictionaries hold (`proc_dict_*`, D13) is in no namespace,
+    /// and counts against the ceiling like any key: refused past it, and in a brownout.
+    fn dictionary_grow(&self, bytes: u64) -> Result<(), StateError> {
+        let refused = |reason, message: String| {
+            self.dictionary_refused.fetch_add(1, Relaxed);
+            Err(StateError { reason, message })
+        };
+        if self.shared.brownout.load(Relaxed) {
+            return refused(
+                BROWNOUT,
+                "the broker is over its memory watermark: a connection's dictionary cannot \
+                 grow until it is back under"
+                    .to_string(),
+            );
+        }
+        if !add_within(&self.shared.bytes, bytes, self.shared.max_bytes) {
+            return refused(
+                STORE_FULL,
+                format!(
+                    "rule state is at its ceiling of {} bytes (`rules.state_max_bytes`), which \
+                     the connections' dictionaries count against",
+                    self.shared.max_bytes
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    fn dictionary_shrink(&self, bytes: u64) {
+        self.shared.bytes.fetch_sub(bytes, Relaxed);
     }
 }
 

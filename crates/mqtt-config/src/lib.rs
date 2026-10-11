@@ -672,12 +672,13 @@ pub struct Rules {
     /// broker's environment. Empty (the default) = none. Read at startup.
     pub functions_env: Vec<String>,
     /// The most bytes the state rules keep between messages may take on this node,
-    /// across every namespace (`MQTTD_RULES_STATE_MAX_BYTES`, default 268435456 = 256
-    /// MiB; [ADR 0085](../../../docs/adr/0085-rule-state-store.md)). Using state is the
+    /// across every namespace and every connection's dictionary
+    /// (`MQTTD_RULES_STATE_MAX_BYTES`, default 268435456 = 256 MiB;
+    /// [ADR 0085](../../../docs/adr/0085-rule-state-store.md)). Using state is the
     /// switch: a rules file that declares no `[state.<name>]` and calls no state function
-    /// (`kv_store_*`, `kv_*`) holds none. A rules file cannot raise this ceiling; `0`
-    /// switches rule state off, and a rules file that uses it then does not load. Read
-    /// at startup: a change needs a restart.
+    /// (`kv_store_*`, `proc_dict_*`, `kv_*`) holds none. A rules file cannot raise this
+    /// ceiling; `0` switches rule state off, and a rules file that uses it then does not
+    /// load. Read at startup: a change needs a restart.
     pub state_max_bytes: u64,
 }
 

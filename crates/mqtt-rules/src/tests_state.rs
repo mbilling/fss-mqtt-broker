@@ -405,11 +405,6 @@ fn the_state_functions_are_built_in() {
         );
         assert!(!emqx_only_function_names().contains(&name), "{name}");
     }
-    // EMQX's `proc_dict_*` stay refused (ADR 0085 D13, a later task), and the sketch
-    // functions are not here yet.
-    for name in ["proc_dict_put", "proc_dict_get", "proc_dict_del"] {
-        assert!(emqx_only_function_names().contains(&name));
-    }
     for (call, takes) in [
         (
             "kv_store_put('a')",

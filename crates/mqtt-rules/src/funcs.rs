@@ -8,10 +8,10 @@
 //! failure), as EMQX's does.
 //!
 //! Deliberately absent (docs/RULES.md lists them): schema registry and Sparkplug
-//! functions, `maptab_lookup`, the `MongoDB` date helpers, the process-dictionary
-//! functions (`proc_dict_*`, ADR 0085 D13), and `term_encode` / `term_decode`.
+//! functions, `maptab_lookup`, the `MongoDB` date helpers, and `term_encode` /
+//! `term_decode`.
 //!
-//! The state functions (EMQX's `kv_store_*` and mqttd's `kv_*`) are in
+//! The state functions (EMQX's `kv_store_*` and `proc_dict_*`, mqttd's `kv_*`) are in
 //! [`crate::state`]: they work on a store whoever loads the rules supplies (ADR 0085).
 //!
 //! `jq` is here and is not like the others: it runs in a WebAssembly sandbox

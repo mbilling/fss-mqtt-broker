@@ -1402,7 +1402,7 @@ or `is_empty` of a missing value (below). A function given the wrong type fails 
 | System | `getenv` (`getenv('FOO')` reads the environment variable `EMQXVAR_FOO`; unset is `''`) |
 | UUID | `uuid_v4`, `uuid_v4_no_hyphen` |
 | jq | `jq` (`jq(Program, Input)` and `jq(Program, Input, TimeoutMs)`): off unless the operator switches it on, [below](#jq) |
-| State | EMQX's `kv_store_put`, `kv_store_get`, `kv_store_del`; mqttd's own `kv_get`, `kv_set`, `kv_set_once`, `kv_incr`, `kv_max`, `kv_min`, `kv_add`, `kv_del`, `kv_ttl`, `kv_held`, `kv_changed`: what a rule remembers between messages, [below](#state-what-a-rule-remembers) |
+| State | EMQX's `kv_store_put`, `kv_store_get`, `kv_store_del` and `proc_dict_put`, `proc_dict_get`, `proc_dict_del`; mqttd's own `kv_get`, `kv_set`, `kv_set_once`, `kv_incr`, `kv_max`, `kv_min`, `kv_add`, `kv_del`, `kv_ttl`, `kv_held`, `kv_changed`: what a rule remembers between messages, [below](#state-what-a-rule-remembers) |
 | Conditional | `coalesce`, `coalesce_ne` |
 | Legacy accessors | `topic` (`topic(n)` is the nth level, counting from 1: `topic(1)` of `a/b/c` is `a`), `clientid`, `username`, `qos`, `msgid`, `flags`, `flag`, `peerhost`, `clientip`, `payload` (`payload('a.b')` is a path) |
 | Callable in EMQX, undocumented there | `div(a, b)`, `mod(a, b)` (the operators in call form), `eq` (Erlang `==`), `null()` (a missing value), `join_to_sql_values_string`, `contains_topic`, `contains_topic_match` — EMQX's take topic filters as maps with an *atom* key, which no rule value has, so any array gives `false` |
@@ -1481,11 +1481,9 @@ Traps that EMQX's reference states only in passing, each checked against this en
 **Not implemented:** schema registry and Sparkplug B
 (`schema_encode`, `schema_decode`, `schema_check`, `sparkplug_encode`,
 `sparkplug_decode`); `maptab_lookup`; the MongoDB date helpers; `term_encode` and
-`term_decode`; and, for now, EMQX's `proc_dict_put`, `proc_dict_get` and `proc_dict_del`,
-which keep values in the publisher's process
-([ADR 0085](adr/0085-rule-state-store.md) provides them, in a later delivery; until then a
-rule that calls one is refused at load). EMQX's `kv_store_*` are provided:
-[State](#state-what-a-rule-remembers). `getenv` reads only variables named
+`term_decode`. A rule that calls one is refused at load. EMQX's `kv_store_*` and
+`proc_dict_*` are provided: [State](#state-what-a-rule-remembers). `getenv` reads only
+variables named
 `EMQXVAR_…`, as EMQX's does, so the operator chooses what a rule can see.
 
 ### `jq`
@@ -1991,10 +1989,11 @@ lives **in memory, on the node that evaluated the rule**, and starts empty at ev
 restart. Replication between nodes, an event when a key expires, metrics and the admin
 verbs are not built yet; this section will grow with them.
 
-There are two families, and they do not share keys (`kv_get('x')` does not read what
-`kv_store_put('x', …)` wrote; `--check-rules` warns about a file that calls both):
+There are three families, and they do not share keys (`kv_get('x')` does not read what
+`kv_store_put('x', …)` wrote, and `--check-rules` warns about a file that calls both;
+neither reads what `proc_dict_put('x', …)` wrote):
 
-**EMQX's own**, with EMQX's results (probed on EMQX 6.3.1), for rules ported from it:
+**EMQX's table**, with EMQX's results (probed on EMQX 6.3.1), for rules ported from it:
 
 | Function | Returns |
 |---|---|
@@ -2006,6 +2005,42 @@ One table per node, shared by every rule, as in EMQX. A key and a value may be o
 type, and a key is matched exactly: `1`, `1.0` and `'1'` are three keys, `0.0` and `-0.0`
 two, a map is the same key whatever order it was written in. `undefined` is a value like
 any other: `kv_store_get(key, default)` returns it, not the default.
+
+**EMQX's process dictionary**, with EMQX's results (probed on EMQX 6.3.1), for rules
+ported from it:
+
+| Function | Returns |
+|---|---|
+| `proc_dict_put(key, value)` | the value held before, or `undefined` |
+| `proc_dict_get(key)` | the value, or `undefined` |
+| `proc_dict_del(key)` | the value held before, or `undefined` |
+
+In EMQX these work on the dictionary of the process that evaluates the rule, and that
+process is the client's connection. Here it is **one dictionary per client connection**,
+with the same reach:
+
+- It is empty when the client connects and gone when the connection ends. A reconnect, a
+  session that is resumed and a connection that takes the client id over all start with an
+  empty one, as they do in EMQX.
+- Everything that connection evaluates works on it: the client's publishes and the
+  messages their rules republish, its `client/…`, `auth/…` and `session/…` events
+  (`client/disconnected` still sees it), `message/delivered` and `message/acked` for the
+  deliveries to it, and `message/dropped` and `message/delivery_dropped` about its
+  publishes and deliveries while it is connected. So a rule on `client/connected` can put
+  a value that a rule on the client's publishes reads.
+- No other client's rules see it, and neither does a rule on another node.
+
+A key and a value may be of any type, and a key is matched exactly, as for `kv_store_*`.
+A key that holds `undefined` and a key that is not there answer alike, as in EMQX.
+
+Three evaluations run where there is no connection, and work on an **empty dictionary that
+is discarded afterwards**; in EMQX each still sees the client's:
+
+- a Will's rules (EMQX evaluates them in the connection's process as it ends);
+- an event about a session that has no connection, such as `message/delivery_dropped` for
+  an offline session (EMQX keeps the process, and its dictionary, for as long as the
+  session waits to be resumed);
+- `message/dropped` for a message that a rule republished, or for a Will.
 
 **mqttd's own** (an mqttd extension: EMQX has no function of these names):
 
@@ -2115,12 +2150,20 @@ memory watermark (`brownout`). Existing keys still update. One message may make 
 it reads from state counts against its 1 MiB function budget. A refused call fails the
 rule, counted and logged like any SQL error; it is never "no result". EMQX's table has no
 bounds of its own; here a `kv_store_put` key is at most 256 bytes as JSON and a value
-4 KiB.
+4 KiB. Nor has EMQX's process dictionary; here a connection's dictionary holds at most
+64 keys, and 64 KiB of keys and values together (each as JSON, a string as its bytes). A
+`proc_dict_put` past either fails the rule (`dictionary_full`) and leaves what was held;
+`proc_dict_del` frees a key. What the dictionaries hold counts against
+`rules.state_max_bytes` like any key (`store_full`), a dictionary does not grow while the
+broker is over its memory watermark (`brownout`), and every `proc_dict_*` call is one of
+the message's 1,024.
 
 **Testing.** `mqttd --rule-test`, `mqttd --check-rules` and the admin API's rule test work
 on an empty store of their own that is dropped afterwards: they never read or write the
-state the running rules keep (EMQX's SQL test writes the node's real table). Within one
-test a later call sees an earlier one:
+state the running rules keep (EMQX's SQL test writes the node's real table). `proc_dict_*`
+work on an empty dictionary of the test's own, never a connection's (as in EMQX, where
+each SQL test over the API runs in a process of its own). Within one test a later call
+sees an earlier one:
 
 ```console
 $ mqttd --rule-test --sql 'SELECT kv_incr(clientid) AS first, kv_incr(clientid) AS second, kv_changed(topic, qos) AS changed FROM "t/#"'
@@ -2128,7 +2171,9 @@ $ mqttd --rule-test --sql 'SELECT kv_incr(clientid) AS first, kv_incr(clientid) 
 ```
 
 **Cost.** A state call is one operation on an in-memory map under a lock held for that
-operation only; it never waits, and a rules file that calls none pays nothing. Measured
+operation only; it never waits, and a rules file that calls none pays nothing. A
+`proc_dict_*` call takes no lock at all: the dictionary belongs to the connection that
+is evaluating. Measured
 (`cargo bench -p mqttd --bench rule_state`, Apple M1 Pro, 2026-10): one call adds 0.35 to
 0.5 µs to the evaluation of a publish (1.38 µs without, 1.74 µs with a `kv_incr`, 1.88 µs
 with a `kv_held`); the store's part of that is 0.11 to 0.14 µs. With every worker thread
@@ -2347,8 +2392,9 @@ EMQX fails on each message, and statements only mqttd accepts.
 | Message events | Raised by the subscriber's session (`delivered`, `acked`, `delivery_dropped`) and by the broker on the node that found no subscriber (`dropped`). The message keeps its publisher everywhere, on disk included. A session keeps its client's username and address while offline. `delivery_dropped` reasons `expired`, `no_local`, `subscription_filter`, `qos0_msg`, `queue_full`; nothing for a packet too large for its subscriber | The same events, fields and nodes ([Message events](#message-events)). A message read back from disk, or forwarded by a node running an older release, has lost its publisher: `from_clientid` and `from_username` are `undefined`. An offline session's `delivery_dropped` has no `username` or address. Reasons `expired`, `no_local`, `queue_full`, and mqttd's own `too_large`; an offline queue's `drop-oldest` eviction raises none. Rules chained through these events stop 32 republishes deep |
 | `authz_source` | The source that decided: `file`, `built_in_database`, `http`, …, `superuser`, `default`, and `cache` for a decision its authorization cache answered | `file` or `default`: mqttd has the ACL file only, no superusers and no authorization cache |
 | Data-integration sources (`$bridges/…`, `$sources/…`) | Yes | No: refused at load |
-| Functions | 124 in the built-in reference, plus `jq`; every other export of `emqx_rule_funcs` is callable too | 120 of those 124, plus `jq`, plus 26 EMQX exports without documenting (147 in all), `kv_store_put`, `kv_store_get` and `kv_store_del` among them. `maptab_lookup`, `mongo_date`, `schema_encode`, `schema_decode`, `term_encode`/`term_decode` are refused at load, and so, until [ADR 0085](adr/0085-rule-state-store.md) delivers them, are `proc_dict_put`, `proc_dict_get` and `proc_dict_del`. |
+| Functions | 124 in the built-in reference, plus `jq`; every other export of `emqx_rule_funcs` is callable too | 120 of those 124, plus `jq`, plus 29 EMQX exports without documenting (150 in all), `kv_store_put`, `kv_store_get`, `kv_store_del`, `proc_dict_put`, `proc_dict_get` and `proc_dict_del` among them. `maptab_lookup`, `mongo_date`, `schema_encode`, `schema_decode`, `term_encode`/`term_decode` are refused at load. |
 | `kv_store_put`, `kv_store_get`, `kv_store_del` | One table per node that grows until the node runs out of memory; a wrong argument count fails the rule on each message; the SQL test writes the node's real table | The same table and the same results, but bounded: a key of at most 256 bytes and a value of at most 4 KiB as JSON, 100,000 keys and 64 MiB unless `[state.kv_store]` says otherwise, under `rules.state_max_bytes`; past a bound the call fails the rule, where EMQX would have stored the value. A wrong argument count fails the load, as for every function. A dry run (`--rule-test`, the admin API's rule test) works on an empty table of its own. `rules.state_max_bytes = 0` switches it off: a rules file that calls them then does not load ([State](#state-what-a-rule-remembers)) |
+| `proc_dict_put`, `proc_dict_get`, `proc_dict_del` | The dictionary of the process that evaluates the rule: the client's connection process, for its publishes and what their rules republish, its events, the deliveries to it and its Will. It grows until the node runs out of memory. A session that outlives its connection keeps the process and the dictionary until it is resumed. A wrong argument count fails the rule on each message | The same results on one dictionary per client connection, for everything that connection evaluates, but bounded: 64 keys, and 64 KiB of keys and values as JSON, counted against `rules.state_max_bytes`; past a bound the call fails the rule, where EMQX would have stored the value. The dictionary is gone when the connection ends. Three evaluations have no connection to run on and get an empty dictionary that is discarded afterwards, where EMQX's still see the client's: a Will's rules; an event about a session that has no connection (`delivery_dropped` for an offline session); `message/dropped` for a message a rule republished, or for a Will. A wrong argument count fails the load, as for every function. A dry run works on an empty dictionary of its own, as each SQL test over EMQX's API does. `rules.state_max_bytes = 0` switches them off: a rules file that calls them then does not load ([State](#state-what-a-rule-remembers)) |
 | State of mqttd's own (mqttd-only extension) | None. `kv_get`, `kv_set`, `kv_set_once`, `kv_incr`, `kv_max`, `kv_min`, `kv_add`, `kv_del`, `kv_ttl`, `kv_held` and `kv_changed` are unknown functions, and `[state.<name>]` and the rule key `state` are not EMQX configuration | Typed, expiring, bounded keys in namespaces the rules file declares. A rule that uses them does not port back to EMQX |
 | `jq` | A NIF in the broker's own process: always on, with no limit on memory, output or stack, the broker's whole environment in `$ENV`, and a timeout that cannot stop a program inside one long C call | The same jq in a WebAssembly sandbox, with EMQX's results, tags and texts, but **off unless `rules.jq = true`** (a rules file that calls it then fails to load), and needing a host that allows executable memory. 64 MiB of memory, 4 MiB of stack, an output charged to the message's 1 MiB build budget, a 5 s bound on compiling a program, `$ENV` empty unless variables are listed in `rules.jq_env` (a ported rule that reads `$ENV.X` gets `null` until `X` is listed), a timeout that always stops the call, a wrong number of arguments refused at load instead of on each message; the last one or two digits of some transcendental functions differ (musl's libm against glibc's), `strptime` fails on `%z`, `strftime("%Z")` of a UTC time is `UTC` where EMQX's is `GMT`, and local time is UTC. Each limit fails the rule for that message, with its kind counted ([Limits of jq](#limits-of-jq-and-what-happens-at-each), [the whole table](#jq)) |
 | Functions supplied as modules (mqttd-only extension) | None. A rules file with a `[functions.<name>]` table is not EMQX configuration | A rules file may declare WebAssembly modules, each pinned by its SHA-256, whose functions rules call; they run in the sandbox under time, memory, output and stack limits. A module cannot take the name of a built-in function or of any function of EMQX's rule engine, so it never changes what a rule written for EMQX means. A module is read only from under the rules file's directory, sees no file, socket or host function, the clock only with `clock = true` and only the environment variables `rules.functions_env` allows. A rules file that declares one does not load in EMQX ([Your own functions](#your-own-functions-functionsname)) |

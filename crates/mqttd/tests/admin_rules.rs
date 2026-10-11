@@ -1757,3 +1757,69 @@ async fn a_rules_body_is_read_only_from_a_role_that_may_send_one() {
         .await;
     assert_eq!((status, code(&body)), (403, "forbidden"), "{body}");
 }
+
+const DICTIONARY: &str = r#"[rules.a_put]
+sql = '''SELECT proc_dict_put('n', payload.v) AS before, proc_dict_get('n') AS now FROM "t/#"'''
+actions = [{ function = "console" }]
+
+[rules.b_get]
+sql = '''SELECT proc_dict_get('n') AS seen FROM "t/#"'''
+actions = [{ function = "console" }]
+"#;
+
+/// ADR 0085 D11, D13: `POST /admin/v1/rules/test` evaluates EMQX's `proc_dict_*` on a
+/// scratch dictionary of the request's own, in which its rules see each other's puts
+/// (as the rules one connection's message matches do) and which is gone with the
+/// request: never a connection's, and counted in no running store.
+#[tokio::test]
+async fn a_dry_run_works_on_a_scratch_dictionary_of_its_own() {
+    let n = Node::start(DICTIONARY).await;
+    let store = n
+        .rules
+        .state()
+        .expect("rule state is on by default")
+        .clone();
+    // A connection that put a value: its dictionary holds `n` and one digit.
+    let conn = n.rules.for_connection();
+    let publish = |payload: &'static [u8]| {
+        let _ = conn.on_publish(&PublishFacts {
+            client: &ClientId("c1".into()),
+            publisher: &Publisher::default(),
+            topic: "t/1",
+            payload: &Bytes::from_static(payload),
+            qos: QoS::AtMostOnce,
+            retain: false,
+            app: &AppProperties::default(),
+            message_expiry: None,
+        });
+    };
+    publish(br#"{"v":7}"#);
+    assert_eq!(store.bytes(), 2);
+    for _ in 0..2 {
+        let (status, body) = n
+            .call(
+                &n.operator,
+                "POST",
+                "/admin/v1/rules/test",
+                Some(&json!({"topic": "t/1", "payload": "{\"v\":\"a dry run's value\"}"})),
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            body["results"],
+            json!([
+                {"rule": "a_put", "enabled": true, "result": "passed", "error": null,
+                 "outputs": [{"action": "console",
+                              "output": {"before": "undefined", "now": "a dry run's value"}}]},
+                {"rule": "b_get", "enabled": true, "result": "passed", "error": null,
+                 "outputs": [{"action": "console", "output": {"seen": "a dry run's value"}}]},
+            ])
+        );
+        // The connection's dictionary is as it was, and nothing else is counted.
+        assert_eq!(store.bytes(), 2);
+    }
+    publish(br#"{"v":"four"}"#);
+    assert_eq!(store.bytes(), 5);
+    drop(conn);
+    assert_eq!(store.bytes(), 0);
+}

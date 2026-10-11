@@ -4281,8 +4281,8 @@ fn check_rules_refuses_a_module_that_fails_a_check_and_says_why() {
                 .to_string(),
         ),
         (
-            module_table("m", "good.wasm", &sha, &["proc_dict_put"], ""),
-            "a module cannot provide `proc_dict_put`: EMQX has a function of that name, and a \
+            module_table("m", "good.wasm", &sha, &["term_encode"], ""),
+            "a module cannot provide `term_encode`: EMQX has a function of that name, and a \
              module must not change what a rule written for EMQX means"
                 .to_string(),
         ),
@@ -5016,6 +5016,46 @@ fn rule_test_runs_the_state_functions_on_a_store_of_its_own() {
         "--rule-test",
         "--sql",
         "SELECT kv_get('k') AS a FROM \"t/#\"",
+    ])
+    .env("MQTTD_RULES_STATE_MAX_BYTES", "0");
+    let ran = run(off);
+    assert_eq!(ran.code, Some(1), "{ran:?}");
+    assert!(
+        ran.stderr.starts_with(
+            "rule test FAILED: rule state is switched off: `rules.state_max_bytes` is 0"
+        ),
+        "{ran:?}"
+    );
+}
+
+/// `mqttd --rule-test` runs EMQX's `proc_dict_*` on a dictionary of its own, as each
+/// SQL test over EMQX's API runs in a process of its own (ADR 0085 D13): within one
+/// statement a later call sees an earlier one (what EMQX 6.3.1 answers for the same
+/// statement), and nothing is left for the next run. Where rule state is switched off
+/// the statement does not load: a dictionary counts against the store's ceiling.
+#[test]
+fn rule_test_runs_proc_dict_on_a_dictionary_of_its_own() {
+    let sql = "SELECT proc_dict_put('a', 1) AS p1, proc_dict_put('a', payload.v) AS p2, \
+               proc_dict_get('a') AS g, proc_dict_del('a') AS d, proc_dict_del('a') AS d2, \
+               proc_dict_get('a') AS g2, proc_dict_put('left', 1) AS l FROM \"t/#\"";
+    let want = "{\"p1\":\"undefined\",\"p2\":1,\"g\":{\"on\":true},\"d\":{\"on\":true},\
+                \"d2\":\"undefined\",\"g2\":\"undefined\",\"l\":\"undefined\"}\n";
+    for _ in 0..2 {
+        let ran = cli(&[
+            "--rule-test",
+            "--sql",
+            sql,
+            "--payload",
+            r#"{"v":{"on":true}}"#,
+        ]);
+        assert_eq!((ran.code, ran.stdout.as_str()), (Some(0), want), "{ran:?}");
+        assert_eq!(ran.stderr, "");
+    }
+    let mut off = mqttd();
+    off.args([
+        "--rule-test",
+        "--sql",
+        "SELECT proc_dict_get('k') AS a FROM \"t/#\"",
     ])
     .env("MQTTD_RULES_STATE_MAX_BYTES", "0");
     let ran = run(off);
