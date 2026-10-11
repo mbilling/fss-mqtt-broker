@@ -178,6 +178,11 @@ struct Shard {
     /// The furthest any link has read. A key changed after that is still ahead of
     /// every link, and changing it again does not move it.
     read_to: u64,
+    /// How often a key was put into or taken out of `map`, by a rule's write, a merge
+    /// or forgetting: what tells an operator's listing, which walks the map a few
+    /// keys per hold of the lock, that the map changed under it (D10). **Every
+    /// `map.insert` and `map.remove` in this file counts here.**
+    changes: u64,
 }
 
 /// What a shard tells readers that do not take its lock. A cache line of its own:
@@ -190,6 +195,10 @@ struct Marks {
     /// Raised by every change to the shard, a merge included: what a digest is
     /// good for.
     mutations: AtomicU64,
+    /// The rules' calls answered on this shard's keys, by operation
+    /// ([`OPS`](super::OPS)): counted beside the shard, so counting shares nothing
+    /// between shards (D10).
+    ops: [AtomicU64; super::OPS.len()],
 }
 
 /// A link's place in each shard's order of change: everything up to it has been
@@ -231,6 +240,9 @@ pub(super) struct Replica {
     repairing: Mutex<Option<(u64, Instant)>>,
     refused: [AtomicU64; Refused::ALL.len()],
     merged: AtomicU64,
+    /// Keys forgotten whose value had expired (D10's `expired`): not the deleted
+    /// ones, whose tombstone's window ran out.
+    expired: AtomicU64,
 }
 
 /// What a link that wants to start a repair is told ([`Replica::repair_begin`]).
@@ -342,6 +354,7 @@ fn remove(ns: &Namespace, shard: &mut Shard, key: &[u8]) {
     let Some(entry) = shard.map.remove(key) else {
         return;
     };
+    shard.changes = shard.changes.wrapping_add(1);
     if entry.changed != 0 {
         shard.changed.remove(&entry.changed);
     }
@@ -388,6 +401,7 @@ impl Replica {
             repairing: Mutex::new(None),
             refused: Default::default(),
             merged: AtomicU64::new(0),
+            expired: AtomicU64::new(0),
         }
     }
 
@@ -417,6 +431,19 @@ impl Replica {
     /// shard's lock. A write is stamped, and its key takes its place in the order
     /// of change; the links are told afterwards, with the lock released.
     pub(super) fn call(&self, handle: &Handle, op: &StateOp<'_>) -> Result<StateReply, StateError> {
+        let reply = self.apply(handle, op)?;
+        let at = handle.namespace.shard_of(op_key(op));
+        self.marks[at].ops[super::admin::op_index(op)].fetch_add(1, Relaxed);
+        Ok(reply)
+    }
+
+    /// [`call`](Self::call), not counted as a rule's: also what an operator's delete
+    /// is (D10), which is a `kv_del` in every other respect, stamped and sent.
+    pub(super) fn apply(
+        &self,
+        handle: &Handle,
+        op: &StateOp<'_>,
+    ) -> Result<StateReply, StateError> {
         let mut made_room = false;
         loop {
             let refusal = match self.attempt(handle, op)? {
@@ -656,6 +683,7 @@ impl Replica {
                 }
             }
             let key: Arc<[u8]> = Arc::from(key);
+            shard.changes = shard.changes.wrapping_add(1);
             shard.map.insert(
                 key.clone(),
                 Entry {
@@ -675,6 +703,7 @@ impl Replica {
             due,
             last,
             read_to,
+            ..
         } = &mut *shard;
         let Some(entry) = map.get_mut(key) else {
             return Ok(Step::NeedRoom(Refusal::Other));
@@ -797,6 +826,9 @@ impl Replica {
             }
             entry.due = 0;
             if entry.state.forgettable(now_ms, window_ms) {
+                if entry.state.data().is_some() {
+                    self.expired.fetch_add(1, Relaxed);
+                }
                 remove(ns, shard, &key);
                 any = true;
             } else {
@@ -901,6 +933,7 @@ impl Replica {
             };
             let slot = due_slot(&entry.state, window_ms);
             set_due(&mut shard.due, &mut entry, slot);
+            shard.changes = shard.changes.wrapping_add(1);
             shard.map.insert(key, entry);
             return Ok(true);
         };
@@ -1179,6 +1212,74 @@ impl Replica {
                 })
             }));
         }
+    }
+
+    // -- what an operator sees (D10) ---------------------------------------------------
+
+    /// The time this copy judges expiries by.
+    pub(super) fn now_ms(ns: &Namespace) -> u64 {
+        ns.shared.node().clock.physical_ms(ns.shared.clock.now_ms())
+    }
+
+    /// One hold of shard `at`'s lock for an operator's listing: `each` is shown the
+    /// next `batch` keys of the map after the first `seen`, those that hold a value
+    /// now (a deleted key this copy still remembers is not a key to list). How many
+    /// were looked at; `None` when the map changed since the hold that set `changes`.
+    pub(super) fn look(
+        &self,
+        at: usize,
+        seen: usize,
+        batch: usize,
+        changes: &mut Option<u64>,
+        now_ms: u64,
+        each: &mut dyn FnMut(&Arc<[u8]>, &'static str),
+    ) -> Option<usize> {
+        let shard = lock_shard(&self.shards[at]);
+        if *changes.get_or_insert(shard.changes) != shard.changes {
+            return None;
+        }
+        let mut looked = 0;
+        for entry in shard.map.values().skip(seen).take(batch) {
+            looked += 1;
+            if let Some(data) = entry.state.live(now_ms) {
+                each(&entry.key, data.type_name());
+            }
+        }
+        Some(looked)
+    }
+
+    /// What `key` holds now, for an operator's read: its type, what `kv_get` would
+    /// read, and its expiry. Not a write, so nothing is stamped or sent.
+    pub(super) fn peek(&self, ns: &Namespace, key: &[u8]) -> Option<(&'static str, Value, u64)> {
+        let now_ms = Self::now_ms(ns);
+        let shard = lock_shard(&self.shards[ns.shard_of(key)]);
+        let entry = shard.map.get(key)?;
+        let data = entry.state.live(now_ms)?;
+        Some((data.type_name(), data.read(), entry.state.expires_ms()))
+    }
+
+    /// The rules' calls answered, by operation; keys forgotten whose value had
+    /// expired; and keys that can be forgotten now and are still held.
+    pub(super) fn counts(&self, ns: &Namespace) -> ([u64; super::OPS.len()], u64, u64) {
+        let now_ms = Self::now_ms(ns);
+        let mut ops = [0; super::OPS.len()];
+        let mut backlog = 0u64;
+        for (shard, marks) in self.shards.iter().zip(self.marks.iter()) {
+            for (total, n) in ops.iter_mut().zip(&marks.ops) {
+                *total += n.load(Relaxed);
+            }
+            // The order of forgetting is by second: a few entries a hold.
+            let shard = lock_shard(shard);
+            backlog += wide(
+                shard
+                    .due
+                    .iter()
+                    .take(COUNTED * 16)
+                    .take_while(|(slot, _)| slot.saturating_mul(1000) <= now_ms)
+                    .count(),
+            );
+        }
+        (ops, self.expired.load(Relaxed), backlog)
     }
 
     /// How replication stands, the wall clock reading `wall_ms`.

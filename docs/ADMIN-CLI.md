@@ -2,7 +2,9 @@
 
 **Verified against `main` after `v1.0.18` (2026-09-30)**, every example below captured from a
 live three-node cluster (`scripts/admin-e2e.sh`), except the
-[rules verbs](#rules-rules-source-rules-apply-rule-delete) (2026-10-08). The HTTP interface behind each command is
+[rules verbs](#rules-rules-source-rules-apply-rule-delete) (2026-10-08) and the
+[state verbs](#state-state-keys-state-get-state-del) (2026-10-11; their examples are
+written out in the formats the tests pin, not captured from that cluster). The HTTP interface behind each command is
 [ADMIN-API.md](ADMIN-API.md); the decision record is [ADR 0081](adr/0081-admin-api.md).
 
 `mqttd --admin <verb>` asks a running broker's admin API a question or tells it to act, and
@@ -20,7 +22,8 @@ kubectl exec mqttd-0 -- mqttd --admin cluster
   [clients and sessions](#clients-session-subscribers-backlog-retained) ·
   [authorization](#authz) · [config and reload](#config-reload) ·
   [kick and purge](#kick-purge) · [cordon](#cordon-uncordon) · [logging](#log-level-log-override-log-reset) ·
-  [rules](#rules-rules-source-rules-apply-rule-delete)
+  [rules](#rules-rules-source-rules-apply-rule-delete) ·
+  [rule state](#state-state-keys-state-get-state-del)
 - [Recipes](#recipes)
 - [Other `mqttd` commands for operators](#other-mqttd-commands-for-operators)
 - [Try it without a deployment](#try-it-without-a-deployment)
@@ -38,9 +41,9 @@ or `admin.operators`. The broker side is in
 
 | Role | Can |
 |---|---|
-| `viewer` | every read: `whoami`, `node`, `cluster`, `placement`, `clients`, `session`, `subscribers`, `backlog`, `retained`, `authz`, `config`, `log-level`, `rules` (without SQL or error text) |
-| `operator` | everything a viewer can, plus the actions: `reload`, `kick`, `purge`, `cordon`, `uncordon`, `log-override`, `log-reset`, and `rules-source` |
-| `operator` listed in `[rules] admin_writers` | also the rules writes: `rules-apply`, `rule-delete` |
+| `viewer` | every read: `whoami`, `node`, `cluster`, `placement`, `clients`, `session`, `subscribers`, `backlog`, `retained`, `authz`, `config`, `log-level`, `rules` (without SQL or error text), `state` |
+| `operator` | everything a viewer can, plus the actions: `reload`, `kick`, `purge`, `cordon`, `uncordon`, `log-override`, `log-reset`, and `rules-source`, `state-keys`, `state-get` |
+| `operator` listed in `[rules] admin_writers` | also the rules writes: `rules-apply`, `rule-delete`, and `state-del` |
 
 Every request is written to the broker's audit log (`admin.request`) with your certificate
 subject, role, the command and its outcome.
@@ -450,6 +453,94 @@ file is kept beside it as `<file>.prev`; a file sent unchanged writes nothing
 
 The per-rule `PUT`, `check` and `test` take JSON bodies and have no verb; call them over
 HTTPS ([ADMIN-API.md § Rules](ADMIN-API.md#rules)).
+
+### `state`, `state-keys`, `state-get`, `state-del`
+
+What the rules on **this node** remember between messages
+([RULES.md § State](RULES.md#state-what-a-rule-remembers),
+[ADR 0085](adr/0085-rule-state-store.md)): how full each namespace is, which keys it holds,
+what one key holds, and a delete.
+
+| Verb | Role | Does |
+|---|---|---|
+| `state` | viewer | a row per state namespace: its mode, bounds, keys, bytes and counts. No key and no value |
+| `state-keys <ns> [--prefix <text>] [--prefix_encoding utf8\|base64] [--limit <n>] [--cursor <next_cursor>]` | operator | the keys of namespace `<ns>`, each with its type; 100 a page unless `--limit` says otherwise, at most 1,000 |
+| `state-get <ns> <key> [--key_encoding utf8\|base64\|term]` | operator | one key's value, type and expiry |
+| `state-del <ns> <key> [--key_encoding utf8\|base64\|term]` | operator, listed in `[rules] admin_writers` | delete one key; the next message's rule finds none |
+
+```text
+$ mqttd --admin state
+mqttd-1: 2 namespaces, 2048 of 268435456 bytes; dictionaries 64 bytes, 0 refused
+
+NAMESPACE  MODE   EVICTION  KEYS  MAX_KEYS  BYTES  MAX_BYTES  CALLS  REFUSED  EXPIRED  BACKLOG  EVICTED  DELETED
+alerts     local  fail      12    100000    1984   67108864   340    2        5        1        0        3
+rule:hot   local  lru       0     10        0      4096       0      0        0        0        0        0
+```
+
+A namespace is one the rules file declares (`[state.<name>]`), `kv_store` (EMQX's table,
+when a rule calls `kv_store_*`) or `rule:<id>` (a rule that keeps state without naming a
+namespace). `CALLS` are state calls answered and `REFUSED` those the store refused, each
+of which failed its rule (`--json` has them by reason: `namespace_full`, `store_full`,
+`brownout`, `wrong_type`, `refused`). `BACKLOG` is keys past their expiry that are still
+held; `DELETED` is keys deleted with `state-del`. For an `eventual` namespace (`MODE`)
+`KEYS` includes the deleted keys it still remembers, `--json` adds how its replication
+stands, and a `state-del` there reaches every node. The first line adds `, BROWNOUT (new keys
+refused)` while the broker is over its memory watermark.
+
+```text
+$ mqttd --admin state-keys alerts --prefix hot:
+count        2
+namespace    alerts
+next_cursor  -
+node         mqttd-1
+
+keys:
+KEY        KEY_ENCODING  TYPE
+hot:dev-1  utf8          first
+hot:dev-2  utf8          first
+
+$ mqttd --admin state-get alerts hot:dev-1
+expires_at      2026-10-11T13:00:00.000Z
+key             hot:dev-1
+key_encoding    utf8
+namespace       alerts
+node            mqttd-1
+type            first
+value           1791720000000
+value_encoding  utf8
+value_type      integer
+
+$ mqttd --admin state-del alerts hot:dev-1
+deleted       true
+key           hot:dev-1
+key_encoding  utf8
+namespace     alerts
+node          mqttd-1
+```
+
+**A key is whatever a rule built it from**: a client id, a topic level, a payload field.
+Every control character in a key or a value (ESC, CR, the C1 set, the line separators) is
+printed as its escape (`\u{1b}`, `\r`), in the tables and, as `\u001b`, in `--json`, so
+what a publisher sent cannot drive your terminal. Name a key as it is, not as it is
+printed: quote it for your shell, or take `key` and `key_encoding` from
+`state-keys --json`.
+
+- A key that is not UTF-8 is listed with `KEY_ENCODING` `base64`; pass
+  `--key_encoding base64` with it.
+- In `kv_store` a key can be any value, matched exactly (`1`, `1.0` and `'1'` are three
+  keys). A string key is listed like any other. Any other is listed with `KEY_ENCODING`
+  `term` and a `TERM` column that shows it (`1.0`, `[1,"x"]`); pass the `KEY` cell with
+  `--key_encoding term`.
+- A key that starts with `--` cannot be given as it is: pass it as base64
+  (`--key_encoding base64`).
+
+`state-keys` pages: while `next_cursor` is not `-`, pass it as `--cursor` for the next
+page. A page can be short, or empty, and still have one. Keys written while you page are
+neither repeated nor allowed to hide a key that stays
+([ADMIN-API.md § Rule state](ADMIN-API.md#rule-state)).
+
+A `state-del` is audited (`state.delete`). The audit log names the key by its SHA-256 and
+length, never by itself, and so does the record of every `state-get` and `state-keys`.
 
 ## Recipes
 

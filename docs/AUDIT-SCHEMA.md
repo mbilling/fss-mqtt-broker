@@ -93,6 +93,7 @@ the stream proves itself (the external-anchoring model; see the
 | `security.evict` | identity | A live session's grants tightened/evicted on reload |
 | `security.penalty` | source addr | Auth-failure penalty box engaged for a source (ADR 0041 T2) |
 | `admin.request` | certificate subject | An admin API request was answered (ADR 0081); `detail` is `role=<role> <METHOD> <target> -> <status>`, refusals included |
+| `state.delete` | certificate subject | The admin API deleted a key of the rule state store (ADR 0085 D10); `detail` is `ns=<namespace> key_sha256=<sha256 of the key's bytes> key_bytes=<their length> deleted=<true\|false>` (`false`: no value was there). The key is payload-derived data and is never recorded itself; the `admin.request` record of a `rules/state/keys` or `rules/state/key` request carries `key_sha256`, `key_bytes`, `prefix_sha256` and `prefix_bytes` in place of `key` and `prefix` for the same reason |
 | `rules.write` | certificate subject | The admin API replaced the rules file (ADR 0084), recorded after the new file is in place and its reload has run; `detail` is `op=<put-file\|put-rule\|delete-rule> rule=<id, or - for put-file> old=<sha256, or - when there was no file> new=<sha256> applied=<true\|false>`. A write refused before the new file is in place leaves only its `admin.request`; one whose reload is refused (`409 reload-rejected`) is recorded with `applied=false`. A write that changes nothing on disk (`written: false`) records no `rules.write` |
 
 ## Verification

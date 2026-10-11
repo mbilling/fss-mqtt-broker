@@ -30,6 +30,7 @@ mod routes;
 pub mod rules;
 pub mod scope;
 pub mod sessions;
+pub mod state;
 
 pub use roles::{Caller, Role};
 
@@ -323,7 +324,14 @@ async fn handle(stream: TcpStream, acceptor: TlsAcceptor, state: AdminState) {
 fn audit_target(request: &http::Request) -> String {
     let path: Vec<String> = request.path.split('/').map(http::percent_encode).collect();
     let mut target = format!("{} {}", request.method, path.join("/"));
-    for (i, (k, v)) in request.query.iter().enumerate() {
+    // A rule state key is payload data: named by its hash (ADR 0085 D10).
+    let redacted = state::audit_query(request);
+    for (i, (k, v)) in redacted
+        .as_deref()
+        .unwrap_or(&request.query)
+        .iter()
+        .enumerate()
+    {
         target.push(if i == 0 { '?' } else { '&' });
         target.push_str(&http::percent_encode(k));
         target.push('=');

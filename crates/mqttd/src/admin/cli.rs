@@ -276,6 +276,44 @@ const VERBS: &[Verb] = &[
         source_file: None,
         help: "rules writer: remove rule <id> from the rules file and reload",
     },
+    Verb {
+        name: "state",
+        method: "GET",
+        path: "/admin/v1/rules/state",
+        required: &[],
+        optional: &[],
+        source_file: None,
+        help: "the state the rules keep: each namespace's mode, bounds, keys, bytes and counts",
+    },
+    Verb {
+        name: "state-keys",
+        method: "GET",
+        path: "/admin/v1/rules/state/keys",
+        required: &["ns"],
+        optional: &["prefix", "prefix_encoding", "limit", "cursor"],
+        source_file: None,
+        help: "operator: the keys of namespace <ns> with their types (paged: --cursor takes \
+               next_cursor)",
+    },
+    Verb {
+        name: "state-get",
+        method: "GET",
+        path: "/admin/v1/rules/state/key",
+        required: &["ns", "key"],
+        optional: &["key_encoding"],
+        source_file: None,
+        help: "operator: one key's value, type and expiry; --key_encoding as state-keys shows \
+               it (utf8, base64, term)",
+    },
+    Verb {
+        name: "state-del",
+        method: "DELETE",
+        path: "/admin/v1/rules/state/key",
+        required: &["ns", "key"],
+        optional: &["key_encoding"],
+        source_file: None,
+        help: "rules writer: delete one key of namespace <ns>",
+    },
 ];
 
 /// The verbs that take `--all-nodes` (`scope=cluster`): ask every node and merge.
@@ -370,8 +408,13 @@ fn parse(args: &[String]) -> Result<Invocation, String> {
                 .next()
                 .filter(|v| !v.is_empty() && !v.starts_with("--"))
                 .ok_or_else(|| format!("{arg} requires a value"))?;
-            let seen = inv.options.iter().any(|(k, _)| k == arg)
-                || inv.params.iter().any(|(k, _)| k == name);
+            // A global option and a verb's parameter can share a name: `--key` is the
+            // client's key file, and `state-get <ns> <key>` has a parameter `key`.
+            let seen = if is_global {
+                inv.options.iter().any(|(k, _)| k == arg)
+            } else {
+                inv.params.iter().any(|(k, _)| k == name)
+            };
             if seen {
                 return Err(format!("repeated option: {arg}"));
             }
@@ -687,6 +730,7 @@ pub fn render_for(verb: &str, value: &Value) -> String {
     let custom = match verb {
         "cluster" => render_cluster(value),
         "rules" => render_rules(value),
+        "state" => render_state(value),
         // Verbatim, so `mqttd --admin rules-source > rules.toml` writes the file as it is.
         "rules-source" => value
             .get("source")
@@ -695,6 +739,78 @@ pub fn render_for(verb: &str, value: &Value) -> String {
         _ => None,
     };
     custom.unwrap_or_else(|| render(value))
+}
+
+/// The state the rules keep (ADR 0085 D10) in a terminal's width: the store's total
+/// against its ceiling, what the connections' dictionaries hold, then one row per
+/// namespace. The refusals by reason and the TTLs are in `--json`.
+fn render_state(value: &Value) -> Option<String> {
+    let namespaces = value.get("namespaces")?.as_array()?;
+    let at = |pointer: &str| {
+        value
+            .pointer(pointer)
+            .map_or_else(|| "-".to_string(), scalar)
+    };
+    let mut out = String::new();
+    if value.get("enabled") == Some(&Value::Bool(false)) {
+        let _ = writeln!(
+            out,
+            "{}: rule state is switched off (rules.state_max_bytes = 0)",
+            at("/node")
+        );
+        return Some(out);
+    }
+    let _ = writeln!(
+        out,
+        "{}: {} namespaces, {} of {} bytes{}; dictionaries {} bytes, {} refused",
+        at("/node"),
+        namespaces.len(),
+        at("/store/bytes"),
+        at("/store/max_bytes"),
+        if value.pointer("/store/brownout") == Some(&Value::Bool(true)) {
+            ", BROWNOUT (new keys refused)"
+        } else {
+            ""
+        },
+        at("/dictionaries/bytes"),
+        at("/dictionaries/refused"),
+    );
+    if namespaces.is_empty() {
+        return Some(out);
+    }
+    out.push('\n');
+    let columns = [
+        ("NAMESPACE", "namespace"),
+        ("MODE", "consistency"),
+        ("EVICTION", "eviction"),
+        ("KEYS", "keys"),
+        ("MAX_KEYS", "max_keys"),
+        ("BYTES", "bytes"),
+        ("MAX_BYTES", "max_bytes"),
+        ("CALLS", "calls"),
+        ("REFUSED", "refused"),
+        ("EXPIRED", "expired"),
+        ("BACKLOG", "expiry_backlog"),
+        ("EVICTED", "evicted"),
+        ("DELETED", "deleted"),
+    ];
+    let cells: Vec<Vec<String>> = namespaces
+        .iter()
+        .map(|ns| {
+            columns
+                .iter()
+                .map(|(_, field)| ns.get(*field).map_or_else(|| "-".to_string(), scalar))
+                .collect()
+        })
+        .collect();
+    out.push_str(&grid(
+        &columns
+            .iter()
+            .map(|(c, _)| (*c).to_string())
+            .collect::<Vec<_>>(),
+        &cells,
+    ));
+    Some(out)
 }
 
 /// The widest `LAST_ERROR` cell; the whole text is in `--json`.
@@ -1481,6 +1597,144 @@ mod tests {
         clean(&out);
         assert!(out.contains("\\u009b\\u2028"), "{out}");
         assert_eq!(serde_json::from_str::<Value>(&out).unwrap(), answer);
+    }
+
+    /// ADR 0085 D10: the state verbs follow their endpoints, a namespace and a key being
+    /// positional.
+    #[test]
+    fn the_state_verbs_take_a_namespace_and_a_key() {
+        assert!(validate(&args("state")).is_ok());
+        assert!(validate(&args("state --json")).is_ok());
+        assert!(validate(&args("state extra")).is_err());
+        assert!(validate(&args("state-keys")).is_err());
+        assert!(validate(&args("state-keys alerts --prefix hot: --limit 10")).is_ok());
+        assert!(validate(&args("state-keys alerts --cursor 1-00-0-")).is_ok());
+        assert!(validate(&args("state-keys alerts --key_encoding base64")).is_err());
+        assert!(validate(&args("state-get alerts")).is_err());
+        assert!(validate(&args("state-del alerts")).is_err());
+        assert!(validate(&args("state-del alerts k --if_match x")).is_err());
+        let inv = parse(&args("state-get alerts hot:dev-1 --key_encoding utf8")).unwrap();
+        assert_eq!(
+            inv.params,
+            [
+                ("ns".to_string(), "alerts".to_string()),
+                ("key".to_string(), "hot:dev-1".to_string()),
+                ("key_encoding".to_string(), "utf8".to_string()),
+            ]
+        );
+        // The parameter `key` is not the client's `--key`, and each is given once.
+        let inv = parse(&args("state-del alerts k --key client.key --cert c.pem")).unwrap();
+        assert_eq!(inv.params[1], ("key".to_string(), "k".to_string()));
+        assert_eq!(inv.option("--key"), Some("client.key"));
+        assert!(validate(&args("state-del alerts k --key a.key --key b.key")).is_err());
+        let verb = |name: &str| VERBS.iter().find(|v| v.name == name).unwrap();
+        assert_eq!(
+            (verb("state-del").method, verb("state-del").path),
+            ("DELETE", "/admin/v1/rules/state/key")
+        );
+        assert_eq!(verb("state-get").method, "GET");
+    }
+
+    /// The overview is a line for the store and a row per namespace.
+    #[test]
+    fn the_state_view_is_a_table_of_namespaces() {
+        let answer = json!({
+            "node": "n1", "enabled": true,
+            "store": {"bytes": 2048, "max_bytes": 268_435_456_u64, "brownout": false},
+            "dictionaries": {"bytes": 64, "refused": 0},
+            "namespaces": [
+                {"namespace": "alerts", "kind": "declared", "consistency": "local",
+                 "eviction": "fail", "max_keys": 100_000, "max_bytes": 67_108_864,
+                 "default_ttl_secs": 3600, "max_ttl_secs": 2_592_000, "keys": 12,
+                 "bytes": 1984, "calls": 340, "refused": 2,
+                 "refused_by": {"namespace_full": 2}, "expired": 5, "expiry_backlog": 1,
+                 "evicted": 0, "deleted": 3},
+                {"namespace": "rule:hot", "kind": "rule", "consistency": "local",
+                 "eviction": "lru", "max_keys": 10, "max_bytes": 4096, "keys": 0, "bytes": 0,
+                 "calls": 0, "refused": 0, "expired": 0, "expiry_backlog": 0, "evicted": 0,
+                 "deleted": 0},
+            ],
+        });
+        let out = render_for("state", &answer);
+        assert_eq!(
+            out,
+            "n1: 2 namespaces, 2048 of 268435456 bytes; dictionaries 64 bytes, 0 refused\n\
+             \n\
+             NAMESPACE  MODE   EVICTION  KEYS  MAX_KEYS  BYTES  MAX_BYTES  CALLS  REFUSED  EXPIRED  BACKLOG  EVICTED  DELETED\n\
+             alerts     local  fail      12    100000    1984   67108864   340    2        5        1        0        3\n\
+             rule:hot   local  lru       0     10        0      4096       0      0        0        0        0        0\n"
+        );
+        let mut browned = answer.clone();
+        browned["store"]["brownout"] = json!(true);
+        assert!(render_for("state", &browned).contains("bytes, BROWNOUT (new keys refused);"));
+        assert_eq!(
+            render_for(
+                "state",
+                &json!({"node": "n1", "enabled": false, "namespaces": []})
+            ),
+            "n1: rule state is switched off (rules.state_max_bytes = 0)\n"
+        );
+    }
+
+    /// ADR 0085 D10: a key and a value are built from what clients sent. Every control
+    /// character in them (C0, DEL, the C1 set, the line separators) reaches the
+    /// terminal as its escape, in the listing, in one key's view, in a delete's answer
+    /// and in the overview; `--json` carries the same characters as `\u` escapes and
+    /// reads back as the same JSON.
+    #[test]
+    fn the_state_verbs_print_control_characters_escaped() {
+        let hostile = "\u{1b}]0;PWNED\u{7}\u{1b}[2J\rX\u{7f}\u{9b}\u{2028}\n";
+        let escaped = "\\u{1b}]0;PWNED\\u{7}\\u{1b}[2J\\rX\\u{7f}\\u{9b}\\u{2028}\\n";
+        let clean = |out: &str| {
+            assert!(!out.chars().any(|c| c != '\n' && unprintable(c)), "{out:?}");
+        };
+        let keys = json!({
+            "node": "n1", "namespace": "alerts", "count": 2, "next_cursor": null,
+            "keys": [
+                {"key": format!("hot:{hostile}"), "key_encoding": "utf8", "type": "first"},
+                {"key": "AQ==", "key_encoding": "term", "type": "lww",
+                 "term": format!("[\"{hostile}\"]")},
+            ],
+        });
+        let out = render_for("state-keys", &keys);
+        clean(&out);
+        assert!(
+            out.contains(&format!("\nhot:{escaped}  utf8          first  -\n")),
+            "{out}"
+        );
+        assert!(out.contains(&format!("[\"{escaped}\"]")), "{out}");
+        let one = json!({
+            "node": "n1", "namespace": "alerts", "key": format!("hot:{hostile}"),
+            "key_encoding": "utf8", "type": "lww", "value": format!("{{\"v\":\"{hostile}\"}}"),
+            "value_encoding": "utf8", "value_type": "map", "expires_at": null,
+        });
+        let out = render_for("state-get", &one);
+        clean(&out);
+        assert!(
+            out.contains(&format!("key             hot:{escaped}\n")),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("value           {{\"v\":\"{escaped}\"}}\n")),
+            "{out}"
+        );
+        let deleted = json!({"node": "n1", "namespace": "alerts", "deleted": true,
+                             "key": hostile, "key_encoding": "utf8"});
+        let out = render_for("state-del", &deleted);
+        clean(&out);
+        assert!(out.contains(&format!("key           {escaped}\n")), "{out}");
+        // A namespace's name is the operator's own, and is escaped all the same.
+        let overview = json!({"node": hostile, "enabled": true,
+            "store": {"bytes": 0, "max_bytes": 1, "brownout": false},
+            "dictionaries": {"bytes": 0, "refused": 0},
+            "namespaces": [{"namespace": hostile, "consistency": "local"}]});
+        clean(&render_for("state", &overview));
+        for answer in [&keys, &one, &deleted, &overview] {
+            let out = json_text(answer);
+            clean(&out);
+            assert!(out.contains("\\u001b") && out.contains("\\u009b"), "{out}");
+            assert_eq!(&serde_json::from_str::<Value>(&out).unwrap(), answer);
+        }
     }
 
     /// `rules-source` prints the file and nothing else, so redirecting it keeps the file.

@@ -69,6 +69,11 @@ impl RulesAccess {
             work: Arc::new(Semaphore::new(1)),
         }
     }
+
+    /// The rule engine, for the state endpoints (ADR 0085 D10).
+    pub(super) fn rules(&self) -> &crate::rules::Rules {
+        &self.rules
+    }
 }
 
 /// A refusal that names the node, with `extra`'s fields beside the error.
@@ -1050,7 +1055,7 @@ pub async fn delete_rule(state: &AdminState, caller: &Caller, req: &Request) -> 
 /// Why `caller` may not write the rules here, if they may not: writes are off (no
 /// writers listed), or they are not one of the writers. Asked before anything about the
 /// request itself is answered.
-fn writer_refusal(state: &AdminState, caller: &Caller) -> Option<Answer> {
+pub(super) fn writer_refusal(state: &AdminState, caller: &Caller) -> Option<Answer> {
     let none_listed = state
         .live_config
         .read()

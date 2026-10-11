@@ -31,7 +31,7 @@ tasks:
     issue: 921
   - id: 0085-T6
     title: "Observability and admin: state metrics, per-namespace $SYS statistics, the admin state endpoints and the mqttd --admin state verbs"
-    status: planned
+    status: in-progress
     issue: 922
   - id: 0085-T7
     title: "mqttd --rule-test --sequence: timed sequences replayed through a statement or a rules file against an in-memory store with a driven clock"
@@ -131,7 +131,7 @@ and T15 carries the documentation of these three.
 | 0085-T3 | ✅ done | [#919](https://github.com/mbilling/fss-mqtt-broker/issues/919) | 2026-10-11 | "PR 950: crates/mqttd/src/rule_state/replica.rs and link.rs (changed keys read per link with no per-link queue, repair by a 1,024-part digest, refusals counted by reason), peer protocol 14 with StateKeys, StateDigest and StateWant pinned in crates/mqtt-cluster/src/peer.rs; tests_replica and crates/mqttd/tests/rules_state_cluster.rs (convergence, restart refill, declaration mismatch, bounds, a v13 peer sent nothing); the rule_state benchmark (publish with one kv_incr 1.80 us local, 1.84 us eventual; 100k keys caught up in 0.14 s on loopback, Apple M1 Pro); the ADR amended for what T3 decided." |
 | 0085-T4 | ⬜ planned | [#920](https://github.com/mbilling/fss-mqtt-broker/issues/920) | — |  |
 | 0085-T5 | ⬜ planned | [#921](https://github.com/mbilling/fss-mqtt-broker/issues/921) | — |  |
-| 0085-T6 | ⬜ planned | [#922](https://github.com/mbilling/fss-mqtt-broker/issues/922) | — |  |
+| 0085-T6 | 🚧 in-progress | [#922](https://github.com/mbilling/fss-mqtt-broker/issues/922) | — |  |
 | 0085-T7 | 🚧 in-progress | [#923](https://github.com/mbilling/fss-mqtt-broker/issues/923) | — |  |
 | 0085-T8 | ⬜ planned | [#924](https://github.com/mbilling/fss-mqtt-broker/issues/924) | — |  |
 | 0085-T9 | ⬜ planned | [#925](https://github.com/mbilling/fss-mqtt-broker/issues/925) | — |  |
@@ -432,3 +432,54 @@ and T15 carries the documentation of these three.
   - **Left for later tasks:** the expiry sweep and which member raises the event (T4);
     the admin listing and lookup of an `eventual` namespace's keys, which are kept apart
     from a `local` one's (T6); the documentation beyond what keeps RULES.md true (T8).
+- 2026-10-11 — **T6 built** (#922, in review): what an operator sees of the store, and
+  one key's delete. The ADR's amendment "T6: what an operator sees, as built" has what
+  D10 left open.
+  - **Metrics:** `mqttd_rule_state_keys`, `_bytes`, `_expired_total` and
+    `_expiry_backlog` by namespace, `mqttd_rule_state_ops_total` by namespace, operation
+    and result (`ok`, or the store's reason for refusing), and two for the connections'
+    dictionaries, which T11 left counted and unexported
+    (`mqttd_rule_state_dictionary_bytes`, `_dictionary_refused_total`). The store counts
+    an answered call in its shard, under the lock the call holds, and a scrape reads the
+    counts; no label is ever a key.
+  - **`$SYS`:** one message per namespace per `sys_interval_secs` on
+    `$SYS/brokers/<node>/rule_state/<namespace>`, a subtree a grant on the rule
+    statistics does not cover: mode, bounds, counts, rates. No key, no value.
+  - **The trace** already carried a refused call as its rule's error
+    (`kv_set(): namespace_full: …`); a test pins it.
+  - **The admin API** (`crates/mqttd/src/admin/state.rs`): `GET /admin/v1/rules/state`
+    (viewer: counts only), `GET …/state/keys` and `GET …/state/key` (operator),
+    `DELETE …/state/key` (operator and a listed rules writer, audited as
+    `state.delete`). A key is shown and addressed as `key` with `key_encoding` (`utf8`,
+    `base64`, and `term` for a `kv_store` key that is not a string), so what a listing
+    shows is what a read and a delete take; a value as the rule engine writes it. The
+    audit log names a key by its SHA-256 and length, in `state.delete` and in the
+    requests' own records.
+  - **The listing** (`crates/mqttd/src/rule_state/admin.rs`) is in the store's order,
+    shard by shard and by the key's bytes within one, with a cursor that is a place in
+    it: a key that stays is listed exactly once and no key twice, whatever is written
+    meanwhile. A page is at most 1,000 keys, 256 KiB of keys and 50 ms. Looking is not
+    using: nothing is moved in an `lru` namespace's order and nothing is removed.
+  - **The CLI:** `mqttd --admin state`, `state-keys <ns>`, `state-get <ns> <key>`,
+    `state-del <ns> <key>`; control characters in a key or a value are printed escaped,
+    in the tables and in `--json`.
+  - **Measured** (`cargo bench -p mqttd --bench rule_state -- inspect`, Apple M1 Pro;
+    one run on a shared machine at a quieter hour; earlier rounds under load were within
+    20% to 40%). A call on the publish path, each thread on keys
+    of its own, in a namespace of 100,000 keys: 0.14 µs alone, 0.30 µs while another
+    thread lists every key over and over, 0.24 µs while one reads the counts over and
+    over; with four threads calling 0.35, 0.49 and 0.45 µs; with eight 0.63, 0.98 and
+    0.73 µs. At 1,000,000 keys: 0.26, 2.6 and 0.34 µs alone, 0.62, 3.0 and 0.68 µs with
+    four, 1.14, 3.1 and 1.23 µs with eight. The listing looks at a shard 64 keys per
+    hold of its lock; the first build took one hold per shard and cost a call 1.2 to
+    6.2 µs at 100,000 keys, which is why it was changed. One reading of the counts is
+    0.8 µs; one page of 1,000 keys 0.3 ms at 100,000 keys.
+  - **With T3 merged** (#950, while this was in review): `eventual` namespaces are in
+    the overview and on `$SYS` with their tombstone window and how replication stands
+    (links, pending, lag, merged, refused by reason); their keys are listed and read
+    with the same cursor and the same promise, tombstones left out; and an operator's
+    delete there is a replicated delete, as a rule's `kv_del`, which a test on three
+    nodes sees converge and an old copy fail to undo. T3 exports the replication
+    series; the two tasks' series share one label type and no name.
+  - **Not in T6:** a `state` field for `PUT /admin/v1/rule`, left to T8; and T12's finer
+    walk, on which the ADR's amendment has a note.

@@ -26,6 +26,15 @@
 //!   beside one that holds 100,000 keys, timed until it holds them all;
 //!   `write_to_read` one write on one node, timed until the other reads it. The
 //!   bytes a key takes on the wire are printed once, for a few kinds of key.
+//! - `inspect/<keys>/*` — what an operator's look costs (D10), in a namespace of
+//!   `<keys>` keys: `page` is one page of a key listing (1,000 keys), `shard_pass` one
+//!   shard's part of it (the longest a listing holds one lock), `counts` one reading of
+//!   the namespace's counts (a scrape, a `$SYS` tick).
+//! - `inspected/<keys>/<what>/<threads>` — the publish path while an operator looks:
+//!   every thread incrementing keys of its own, as in `contended/own_keys`, in a
+//!   namespace of `<keys>` keys, with nothing else running (`idle`), with another thread
+//!   listing every key over and over (`listing`), and with one reading the counts over
+//!   and over (`counting`). The difference from `idle` is what the look costs a publish.
 //!
 //! `cargo bench -p mqttd --bench rule_state`. The numbers in `docs/RULES.md` are from
 //! this.
@@ -42,7 +51,7 @@ use mqtt_rules::state::{
     term_key, Consistency, Eviction, NamespaceSettings, StateNamespace, StateOp, StateStore,
 };
 use mqtt_rules::{Functions, PublishInput, RuleSet, Value};
-use mqttd::rule_state::{stored, StateLink, Store};
+use mqttd::rule_state::{stored, Limits, Selector, StateLink, Store};
 
 const CEILING: u64 = 1 << 30;
 
@@ -289,6 +298,147 @@ fn contended(c: &mut Criterion, name: &str, keys: Keys, threads: usize) {
             total / u32::try_from(threads).unwrap_or(1)
         });
     });
+}
+
+/// A namespace `bench` of `keys` keys, as a device fleet's state is: a short value
+/// under a key that names its device.
+fn filled(keys: usize) -> (Arc<Store>, Arc<dyn StateNamespace>) {
+    let store = Store::new(CEILING);
+    let settings = NamespaceSettings {
+        max_keys: mqtt_rules::state::MAX_MAX_KEYS,
+        max_bytes: CEILING,
+        ..NamespaceSettings::defaults(CEILING)
+    };
+    let ns = namespace(&store, &settings);
+    let one = Value::Int(1);
+    for i in 0..keys {
+        let key = format!("state:device-{i:07}");
+        ns.call(&StateOp::Set {
+            key: key.as_bytes(),
+            value: stored(&one),
+            ttl: Some(3600),
+        })
+        .expect("room to fill");
+    }
+    (store, ns)
+}
+
+/// Every key of the namespace, page by page; how many there were.
+fn list_all(store: &Store, limits: &Limits) -> usize {
+    let all = Selector::prefix(b"");
+    let (mut listed, mut from) = (0, None);
+    loop {
+        let page = store
+            .keys("bench", &all, from.as_ref(), limits)
+            .expect("the namespace is there");
+        listed += page.keys.len();
+        match page.next {
+            Some(next) => from = Some(next),
+            None => return listed,
+        }
+    }
+}
+
+/// What one look of an operator's costs in a namespace of `keys` keys.
+fn inspect(c: &mut Criterion, keys: usize) {
+    let (store, _ns) = filled(keys);
+    let all = Selector::prefix(b"");
+    c.bench_function(&format!("inspect/{keys}/page"), |b| {
+        b.iter(|| black_box(store.keys("bench", &all, None, &Limits::default())));
+    });
+    // No time at all: a page stops after the first shard it looks through.
+    let one_shard = Limits {
+        time: Duration::ZERO,
+        ..Limits::default()
+    };
+    c.bench_function(&format!("inspect/{keys}/shard_pass"), |b| {
+        b.iter(|| black_box(store.keys("bench", &all, None, &one_shard)));
+    });
+    c.bench_function(&format!("inspect/{keys}/counts"), |b| {
+        b.iter(|| black_box(store.counts("bench")));
+    });
+}
+
+/// What runs beside the publish path.
+#[derive(Clone, Copy, PartialEq)]
+enum Looking {
+    /// Nothing.
+    Idle,
+    /// A thread listing every key, over and over.
+    Listing,
+    /// A thread reading the namespace's counts, over and over.
+    Counting,
+}
+
+/// A call on the publish path, as each of `threads` threads sees it, in a namespace of
+/// `keys` keys, while an operator looks at it or not.
+fn inspected(c: &mut Criterion, keys: usize, looking: Looking, threads: usize) {
+    let (store, ns) = filled(keys);
+    let name = match looking {
+        Looking::Idle => "idle",
+        Looking::Listing => "listing",
+        Looking::Counting => "counting",
+    };
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let looks = std::sync::atomic::AtomicU64::new(0);
+    std::thread::scope(|scope| {
+        if looking != Looking::Idle {
+            let (store, stop, looks) = (&store, &stop, &looks);
+            scope.spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    match looking {
+                        Looking::Listing => {
+                            black_box(list_all(store, &Limits::default()));
+                        }
+                        _ => {
+                            black_box(store.counts("bench"));
+                        }
+                    }
+                    looks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        }
+        c.bench_function(&format!("inspected/{keys}/{name}/{threads}"), |b| {
+            b.iter_custom(|iters| {
+                let barrier = Arc::new(Barrier::new(threads));
+                let total: Duration = std::thread::scope(|scope| {
+                    let handles: Vec<_> = (0..threads)
+                        .map(|t| {
+                            let (ns, barrier) = (ns.clone(), barrier.clone());
+                            scope.spawn(move || {
+                                let own: Vec<String> =
+                                    (0..1_000).map(|i| format!("count:{t}:{i}")).collect();
+                                barrier.wait();
+                                let started = Instant::now();
+                                for i in 0..iters {
+                                    let n = usize::try_from(i).unwrap_or(0);
+                                    black_box(ns.call(&StateOp::Incr {
+                                        key: own[n % own.len()].as_bytes(),
+                                        by: 1,
+                                        ttl: None,
+                                    }))
+                                    .ok();
+                                }
+                                started.elapsed()
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().unwrap_or_default())
+                        .sum()
+                });
+                total / u32::try_from(threads).unwrap_or(1)
+            });
+        });
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+    if looking != Looking::Idle {
+        eprintln!(
+            "inspected/{keys}/{name}/{threads}: {} whole looks ran beside the calls",
+            looks.load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
 }
 
 /// One stamp of the clock, as each of `threads` threads taking them at once sees it.
@@ -801,6 +951,15 @@ fn bench(c: &mut Criterion) {
     eventual_ops(c, false);
     eventual_ops(c, true);
     replication(c);
+    // An operator's look (D10), at a namespace's default bound and at the most it may be.
+    for keys in [100_000, 1_000_000] {
+        inspect(c, keys);
+        for threads in [1, 4, 8] {
+            for looking in [Looking::Idle, Looking::Listing, Looking::Counting] {
+                inspected(c, keys, looking, threads);
+            }
+        }
+    }
     let cores = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
     let mut counts = vec![1, 2, 4, 8, cores];
     counts.retain(|threads| *threads <= cores);

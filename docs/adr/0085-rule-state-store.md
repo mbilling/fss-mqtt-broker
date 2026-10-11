@@ -419,6 +419,10 @@ model's rule for payload-driven work):
 - **CLI** (ADR 0084 D7's style): `mqttd --admin state`, `state-keys <ns>`,
   `state-get <ns> <key>`, `state-del <ns> <key>`.
 
+*(Amended 2026-10-11, T6: what the metrics' labels are, how a key and a value are
+written, the order of a listing and what a concurrent write does to it, and that the
+audit log names a key by its hash. See [Amendments](#amendments).)*
+
 *(Amended 2026-10-11: the listing gains each key's type, size and expiry and its
 filters; a bulk purge and a change of expiry are added, with their verbs. T6 builds this
 section as written; T12 to T15 build the additions. No last-write time is kept. See
@@ -1555,3 +1559,192 @@ Apple M1 Pro, eight cores, the best of three rounds on a machine other work was 
   and tombstones on time instead of when room is needed or a digest is made.
 - **A node without a store** (`rules.state_max_bytes = 0`) that is sent state frames
   drops them without a count: it has no store to count in.
+### 2026-10-11 — T6: what an operator sees, as built
+
+T6 built D10 as written: the metrics, the `$SYS` statistics, the trace's reason, the four
+endpoints and the four verbs. The replication series (lag, pending, refused frames) are
+exported by T3, which merged while T6 was in review; T6 then took `eventual` namespaces
+into everything below. This lists what D10 left open and T6 settled.
+
+**Metrics**
+
+- **`op`** is the store's operation: `get`, `set`, `set_once`, `incr`, `max`, `min`,
+  `add`, `del`, `ttl`, `held`, `changed`, `hll_add`, `hll_count`. EMQX's `kv_store_put`,
+  `kv_store_get` and `kv_store_del` are the store's `set`, `get` and `del`, in the
+  namespace `kv_store`.
+- **`result`** is `ok`, or why the store refused the call: `namespace_full`,
+  `store_full`, `brownout`, `wrong_type`, or `refused` for anything else (a full set, a
+  counter past 64 bits). **A call the rule engine refuses for its arguments never
+  reaches the store and is not counted here**: a key or a value past its bound, a bad
+  TTL, the message's 1,025th call. It is its rule's failed evaluation
+  (`mqttd_rule_evaluations_total{result="failed"}`) and its trace record.
+- **Where a call is counted.** An answered call is counted in its shard, under the lock
+  the call already holds, so counting shares no cache line between shards and adds no
+  atomic to the publish path; a refusal, the rare path, in the namespace. The series are
+  brought up to date from those counts when `/metrics` is scraped, and every 15 seconds
+  for the OTLP export.
+- **`mqttd_rule_state_expiry_backlog`** is the keys whose expiry has passed and that are
+  still held. Until D7's sweep (T4) they are removed by the call that finds them or
+  needs room, so the gauge can stay above zero for as long as nothing calls.
+  `mqttd_rule_state_expired_total` counts each as it is removed.
+- **A namespace that is dropped** (D1) loses its gauges and keeps its counters; one
+  declared again carries on from them.
+- **Two series beyond D10's list,** which T11 asked for: `mqttd_rule_state_dictionary_bytes`
+  and `mqttd_rule_state_dictionary_refused_total`, for what the connections'
+  dictionaries hold and how often one was refused room. They are in no namespace, so
+  they have no label.
+- **Not exported:** evictions of an `lru` namespace and an operator's deletes. Both are
+  in the admin overview and on `$SYS`; D10 lists no series for them.
+
+**`$SYS`.** One message per namespace per interval on
+`$SYS/brokers/<node>/rule_state/<namespace>`, after the rule statistics of the same tick
+and under the same rules (QoS 0, live only, node-pool credit, the rest of a tick skipped
+when the pool is short). It carries what the admin overview says of the namespace, the
+node, the time, and the rates of calls, refusals, expiries and evictions over the last
+interval. `<namespace>` is a declared name, `kv_store` or `rule:<id>`, each one topic
+level.
+
+**The trace** needed nothing new: a refused call fails its rule with
+`<function>(): <reason>: <what happened>`, which is the record's `error`. No reason's
+text holds a key or a value.
+
+**The admin API**
+
+- **The overview** (viewer) lists the namespaces the running rules hold, `kv_store`
+  among them when a rule calls `kv_store_*`, with the declaration the running file gives
+  each; the store's total against its ceiling and whether it is in a brownout; and the
+  dictionaries' total. With rule state switched off it says so and lists nothing.
+- **A key is bytes, and is shown and addressed the same way**: `key` with
+  `key_encoding`, `utf8` (the default) or `base64` for one that is not UTF-8. In
+  `kv_store`, where a key is any term matched exactly, a string key is shown like any
+  other, and any other key as the base64 of the bytes the store matches it by
+  (`key_encoding=term`) with `term`, the key as the rule engine writes it, to read. What
+  a listing shows of a key is what a read and a delete take.
+- **A value is shown as the rule engine writes it** (ADR 0086 D3's form, D3): a string
+  or a binary as its bytes, anything else as JSON text, carried as text or, for bytes
+  that are not UTF-8, as base64 (`value_encoding`), with what it is (`value_type`). JSON
+  text, not a JSON value, so that an integer past 64 bits keeps its digits and a map its
+  order through any client, the CLI included. A counter reads as its count, a set as its
+  elements, a sketch as its estimate: what `kv_get` returns.
+- **The listing is in the store's order,** shard by shard and within a shard by the
+  key's bytes: stable, and not sorted across the namespace. A cursor is a place in it
+  (the shard and the last key listed from it), and names the namespace it was given by,
+  because a namespace that is dropped and declared again spreads its keys anew
+  (`409 cursor-stale`). **What a concurrent write does to a listing:** a key that is
+  there from the first page to the last is listed exactly once; no key is listed twice;
+  a key inserted meanwhile is listed exactly when its place is after the cursor; a key
+  deleted before the listing reaches its place is not listed.
+- **A page is bounded** at 1,000 keys (100 unless `limit` says otherwise, as every list
+  of the API), 256 KiB of keys and 50 ms of looking. One that reaches a bound early is
+  short, or empty, and still has a cursor.
+- **Each listed key is an object** (`key`, `key_encoding`, `type`; `term` in `kv_store`),
+  and one function in the store decides which keys a walk selects, so what a listing
+  says of a key and what it selects by can grow (T12).
+- **Looking is not using.** A listing and a read of one key leave an `lru` namespace's
+  order of use as it was, count as no call, and remove nothing: a key past its expiry is
+  not listed and reads as `404`, and stays held for the call, or the sweep, that removes
+  it and (T4) raises its event.
+- **The delete** removes a key of any type and says whether one was there. It needs the
+  operator role and a listed rules writer, checked before anything about the request is
+  answered, as for a rules write. In a `local` namespace it is this node's.
+
+**An `eventual` namespace** (T3 keeps its keys apart from a `local` one's, as states
+that merge) is seen and managed the same way:
+
+- **The overview and `$SYS`** add its tombstone window and how its replication stands:
+  the links that carry it, the most keys any link has yet to send, how long the link
+  furthest behind has had something to send, the states merged in, and the states and
+  frames refused, by reason. Its `keys` count the deleted keys it still remembers, as
+  its bounds do (D9).
+- **The listing has the same order, the same cursor and the same promise.** A key's
+  shard is chosen the same way, so a cursor is again the shard and the last key listed
+  from it; a key that is there from the first page to the last is listed exactly once
+  and none twice, whether what changes meanwhile is a rule's write here or a state
+  merged in from another node. A deleted key that is still remembered is not listed,
+  and reads as `404`. A read stamps nothing and sends nothing.
+- **A shard there counts what puts a key into its map and takes one out too** (a rule's
+  write, a merge, forgetting), which is what lets the walk go 64 keys per hold.
+- **The delete is a replicated delete,** exactly a rule's `kv_del` (D4): stamped by the
+  node's clock, kept as a tombstone for the namespace's window, sent to every member. A
+  copy from before it cannot bring the key back, and a write made after hearing of it
+  stands. As `kv_del`, it leaves alone a key the node that was asked does not hold: no
+  tombstone is made, so ask a node that holds the key (in a cluster that has
+  converged, any). It is audited the same way, on the node that was asked.
+- **Its counts.** The rules' calls are counted beside each shard. `expired` is the
+  keys forgotten whose value had expired (not the deleted ones, whose window ran out);
+  `expiry_backlog` is the keys that can be forgotten now and are still held, which for
+  an expired key is from the later of its expiry and its last delete's window.
+
+**The audit log names a key by its hash.** D10 said a delete is audited as
+`state.delete` and not what the record holds. It holds the namespace, the key's SHA-256,
+its length and whether a value was there. A key is built from client ids, topic levels
+and payload fields; values are shown to operators only, and the audit log is read by
+more people than that and is exported (ADR 0066). For the same reason the
+`admin.request` record of the three key endpoints carries `key_sha256` and `key_bytes`
+(and `prefix_sha256`, `prefix_bytes`) in place of the parameters, which ADR 0081
+otherwise records whole: without that the key would be in the log anyway. The hash is
+plain SHA-256 of the key's bytes, so whoever knows a key can find what was done to it,
+on any node and after a restart; a keyed hash would hide a guessable key better and
+could not be checked outside the broker.
+
+**The CLI.** `state`, `state-keys <ns>`, `state-get <ns> <key>` and `state-del <ns>
+<key>`, with `--prefix`, `--prefix_encoding`, `--limit`, `--cursor` and `--key_encoding`
+as the parameters are named. A verb's parameter may now share a name with one of the
+CLI's own options (`key`, beside `--key` for the client's key file). Every control
+character in a key, a term or a value is printed as its escape, as ADR 0084 D7 has it.
+
+**What a look costs the publish path**
+
+Nothing an operator does is on the publish path, and all of it takes the shards' locks,
+so it was measured beside publishes (`cargo bench -p mqttd --bench rule_state --
+inspect`, Apple M1 Pro, one run on a machine that was shared but quieter than for the
+first rounds, which had been within 20% to 40% of these).
+
+- **How a listing holds a lock.** A hash map cannot be walked in order, so a listing
+  looks at every key of a shard to pick the next ones. It does so 64 keys per hold of the
+  shard's lock, taking a reference to each key it selects and sorting with no lock held.
+  A shard counts each key put in or taken out; a walk that finds the count moved between
+  two holds starts that shard again, and after four starts walks it under one hold. A
+  hold also passes over the keys already looked at, about 2 ns each, so in a namespace
+  of 1,000,000 keys (15,600 a shard) the last holds of a shard last about 30 µs, and in
+  one of 100,000 about 3 µs.
+- **A call on the publish path** (each thread incrementing keys of its own), with
+  nothing else running, with a thread listing every key over and over, and with a thread
+  reading the counts over and over:
+
+  | Keys in the namespace | Threads calling | Alone | While listing | While counting |
+  |---|---|---|---|---|
+  | 100,000 | 1 | 0.14 µs | 0.30 µs | 0.24 µs |
+  | 100,000 | 4 | 0.35 µs | 0.49 µs | 0.45 µs |
+  | 100,000 | 8 | 0.63 µs | 0.98 µs | 0.73 µs |
+  | 1,000,000 | 1 | 0.26 µs | 2.6 µs | 0.34 µs |
+  | 1,000,000 | 4 | 0.62 µs | 3.0 µs | 0.68 µs |
+  | 1,000,000 | 8 | 1.14 µs | 3.1 µs | 1.23 µs |
+
+  A listing that never stops costs a call 0.15 to 0.35 µs at a namespace's default
+  bound and 2 to 2.5 µs at the most a namespace may hold. Reading the counts as fast as
+  a thread can costs about 0.1 µs; a scrape reads them once.
+- **What a look costs itself.** One reading of a namespace's counts: 0.8 to 0.9 µs. One
+  page of keys: 0.3 ms at 100,000 keys. At 1,000,000 keys one shard's part takes 2.7 ms, because
+  each hold passes over what the earlier ones looked at; a page stops looking after
+  50 ms and says where to go on.
+- **Looking under one hold instead,** which T6 built first, cost a call 1.2 µs alone and
+  4.5 to 6.2 µs at four and eight threads at 100,000 keys, and 10 to 35 µs at 1,000,000:
+  the walk in batches is what the figures above are for.
+
+**Left open**
+
+- **`PUT /admin/v1/rule` still cannot set a rule's `state` key** (T1's open point). T6
+  did not add the field: it is a change to ADR 0084's rule body, not to what an
+  operator sees of the store, and a writer can name a namespace by writing the file.
+  T8 decides it with the documentation.
+- **How many of an `eventual` namespace's keys are tombstones** is not counted apart:
+  `keys` includes them, and a listing that is shorter than `keys` is the only sign.
+- **T12's walk.** The amendment "admin features" has T12's filters walk a namespace "a
+  shard's lock for at most 64 keys at a time". T6's listing does that, at the price
+  above: a hold looks at 64 keys and passes over the ones before them, and the whole
+  shard is looked at for every page that comes from it, so a listing of a namespace at
+  its largest is slow (about a fifth of a second of looking for the whole of it, in
+  pages of 50 ms). An order a shard could be walked in without starting over would
+  remove both, and would cost every insert and delete on the publish path; T12, whose
+  filters walk whole namespaces, is where that is weighed.

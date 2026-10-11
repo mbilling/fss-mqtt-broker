@@ -1344,3 +1344,296 @@ fn concurrent_writers_a_reader_and_a_merger_lose_nothing() {
     assert_eq!(net.nodes[1].get("0:7"), (EACH / 200).to_string());
     assert_eq!(net.nodes[1].keys(), 1 + THREADS * 200);
 }
+
+// -- what an operator sees of an `eventual` namespace (D10) ----------------------------
+
+/// Every page of a listing of [`NS`] on `store`, start to end.
+fn listed(store: &Store, prefix: &[u8], page: usize) -> Vec<String> {
+    let limits = super::Limits {
+        keys: page,
+        ..super::Limits::default()
+    };
+    let (mut keys, mut from) = (Vec::new(), None);
+    loop {
+        let got = store
+            .keys(NS, &super::Selector::prefix(prefix), from.as_ref(), &limits)
+            .unwrap();
+        assert!(got.keys.len() <= page);
+        keys.extend(
+            got.keys
+                .iter()
+                .map(|k| String::from_utf8(k.key.to_vec()).unwrap()),
+        );
+        match got.next {
+            Some(next) => from = Some(next),
+            None => return keys,
+        }
+    }
+}
+
+/// D10 for an `eventual` namespace: its keys are listed, read and counted as a `local`
+/// one's are, with the same cursor (the shard and the last key listed from it) and
+/// the same promise: a key that stays is listed exactly once, none twice, whatever is
+/// written or merged in meanwhile. A deleted key this copy still remembers (a
+/// tombstone) counts as a key and is not listed, and neither is a key past its expiry.
+#[test]
+fn an_operator_lists_reads_and_counts_an_eventual_namespace() {
+    let n = node("a");
+    for i in 0..3_000 {
+        n.set(&format!("key:{i:04}"), "v");
+    }
+    n.incr("counter", 5);
+    n.set_for("short", "v", 10);
+    // Every tenth key is deleted: each leaves a tombstone.
+    for i in (0..3_000).step_by(10) {
+        assert_eq!(n.del(&format!("key:{i:04}")), "true");
+    }
+    assert_eq!(n.keys(), 3_002, "the tombstones count as keys");
+    let keys = listed(&n.store, b"", 250);
+    let distinct: std::collections::BTreeSet<&String> = keys.iter().collect();
+    assert_eq!(distinct.len(), keys.len(), "no key is listed twice");
+    assert_eq!(keys.len(), 2_700 + 2);
+    assert!(!distinct.contains(&"key:0010".to_string()), "a tombstone");
+    assert!(distinct.contains(&"key:0011".to_string()));
+    assert_eq!(listed(&n.store, b"", 1000), keys, "the same order again");
+    assert_eq!(listed(&n.store, b"key:001", 3).len(), 9);
+    assert_eq!(listed(&n.store, b"count", 3), ["counter"]);
+
+    // One key: its type, what a rule would read, its expiry. A read stamps nothing
+    // and sends nothing.
+    let before = n.snapshot();
+    let view = n.store.key(NS, b"counter").unwrap().unwrap();
+    assert_eq!(
+        (
+            view.type_name,
+            view.value.to_json().unwrap(),
+            view.expires_ms
+        ),
+        ("sum", "5".to_string(), START_MS + 24 * 3600 * 1000)
+    );
+    assert_eq!(
+        n.store.key(NS, b"short").unwrap().unwrap().expires_ms,
+        START_MS + 10_000
+    );
+    assert!(n.store.key(NS, b"key:0010").unwrap().is_none(), "deleted");
+    assert!(n.store.key(NS, b"never").unwrap().is_none());
+    assert_eq!(n.snapshot(), before);
+
+    // A write in the middle of a listing: keys that stay are listed once, a key
+    // deleted before the listing reaches it is not listed, none is listed twice.
+    let limits = super::Limits {
+        keys: 500,
+        ..super::Limits::default()
+    };
+    let all = super::Selector::prefix(b"");
+    let first = n.store.keys(NS, &all, None, &limits).unwrap();
+    let mut seen: Vec<String> = first
+        .keys
+        .iter()
+        .map(|k| String::from_utf8(k.key.to_vec()).unwrap())
+        .collect();
+    let on_first: std::collections::BTreeSet<String> = seen.iter().cloned().collect();
+    let gone: Vec<String> = (0..3_000)
+        .filter(|i| i % 10 == 5)
+        .map(|i| format!("key:{i:04}"))
+        .collect();
+    for key in &gone {
+        n.del(key);
+    }
+    for i in 0..500 {
+        n.set(&format!("new:{i}"), "v");
+    }
+    let mut from = first.next;
+    while let Some(cursor) = from {
+        let page = n.store.keys(NS, &all, Some(&cursor), &limits).unwrap();
+        seen.extend(
+            page.keys
+                .iter()
+                .map(|k| String::from_utf8(k.key.to_vec()).unwrap()),
+        );
+        from = page.next;
+    }
+    let distinct: std::collections::BTreeSet<&String> = seen.iter().collect();
+    assert_eq!(distinct.len(), seen.len(), "no key is listed twice");
+    for i in 0..3_000 {
+        let key = format!("key:{i:04}");
+        match i % 10 {
+            0 => assert!(!distinct.contains(&key)),
+            5 => assert_eq!(distinct.contains(&key), on_first.contains(&key), "{key}"),
+            _ => assert!(distinct.contains(&key), "{key} stayed and was not listed"),
+        }
+    }
+
+    // A key past its expiry reads as absent and is not listed.
+    n.advance_ms(10_000);
+    assert!(n.store.key(NS, b"short").unwrap().is_none());
+    assert!(listed(&n.store, b"short", 10).is_empty());
+
+    // The counts: the rules' calls by operation, and none of the operator's looks.
+    let counts = n.store.counts(NS).unwrap();
+    let op = |name: &str| super::OPS.iter().position(|o| *o == name).unwrap();
+    assert_eq!(counts.ok[op("set")], 3_000 + 1 + 500);
+    assert_eq!(counts.ok[op("incr")], 1);
+    assert_eq!(counts.ok[op("del")], 300 + 300);
+    assert_eq!(counts.ok[op("get")], 0);
+    assert_eq!(counts.keys, n.keys() as u64);
+    // Another type's call is refused and counted by its reason.
+    assert_eq!(
+        n.call(&StateOp::Incr {
+            key: b"key:0001",
+            by: 1,
+            ttl: None
+        }),
+        Err("wrong_type".to_string())
+    );
+    let counts = n.store.counts(NS).unwrap();
+    assert_eq!(counts.refused().iter().sum::<u64>(), 1);
+    assert_eq!(counts.ok[op("incr")], 1);
+}
+
+/// D10: an operator's delete in an `eventual` namespace is a replicated delete, as a
+/// rule's `kv_del` there: it reaches every node, a copy from before it cannot bring
+/// the key back, and a write made after it stands. A key this node does not hold is
+/// left alone, with no tombstone made for it.
+#[test]
+fn an_operators_delete_of_an_eventual_key_reaches_every_node() {
+    let mut net = Net::new(vec![node("a"), node("b"), node("c")]);
+    net.connect_all();
+    net.nodes[0].set("k", "v1");
+    net.nodes[0].set("kept", "v1");
+    net.nodes[0].incr("count", 3);
+    net.settle();
+    net.assert_converged();
+    assert_eq!(net.nodes[1].get("k"), "\"v1\"");
+
+    // C is cut off with what it has; the operator deletes on B.
+    net.disconnect(0, 2);
+    net.disconnect(1, 2);
+    net.advance_ms(10);
+    assert_eq!(net.nodes[1].store.delete_key(NS, b"k"), Ok(true));
+    assert_eq!(net.nodes[1].store.delete_key(NS, b"count"), Ok(true));
+    assert_eq!(net.nodes[1].store.delete_key(NS, b"kept"), Ok(true));
+    // Gone at once on the node that was asked, and a second delete finds nothing.
+    assert_eq!(net.nodes[1].get("k"), "undefined");
+    assert_eq!(net.nodes[1].store.delete_key(NS, b"k"), Ok(false));
+    // A key B has never held: nothing to delete, and no tombstone for it.
+    let keys = net.nodes[1].keys();
+    assert_eq!(net.nodes[1].store.delete_key(NS, b"never"), Ok(false));
+    assert_eq!(net.nodes[1].keys(), keys);
+    assert!(
+        net.nodes[1].replication().pending > 0,
+        "the deletes wait for A"
+    );
+    net.settle();
+    assert_eq!(net.nodes[0].get("k"), "undefined", "it reached A");
+    assert_eq!(net.nodes[0].get("count"), "undefined");
+    // A rule on A writes one of the keys again, after hearing of the delete.
+    net.advance_ms(10);
+    net.nodes[0].set("kept", "v2");
+
+    // C comes back with its copy from before the deletes: it cannot undo them.
+    net.connect_all();
+    net.repair();
+    net.assert_converged();
+    for node in &net.nodes {
+        assert_eq!(node.get("k"), "undefined", "{}", node.id);
+        assert_eq!(node.get("count"), "undefined", "{}", node.id);
+        assert_eq!(node.get("kept"), "\"v2\"", "{}", node.id);
+        assert!(node.store.key(NS, b"k").unwrap().is_none());
+        assert_eq!(listed(&node.store, b"", 10), ["kept"], "{}", node.id);
+    }
+    // Counted as the operator's on the node that was asked, and as no rule's call.
+    let counts = net.nodes[1].store.counts(NS).unwrap();
+    let del = super::OPS.iter().position(|o| *o == "del").unwrap();
+    assert_eq!((counts.deleted, counts.ok[del]), (3, 0));
+    assert_eq!(net.nodes[0].store.counts(NS).unwrap().deleted, 0);
+    // The tombstones go when their window has passed, on every node.
+    net.advance_ms(3_601_000);
+    net.repair();
+    for node in &net.nodes {
+        assert_eq!(node.keys(), 1, "{}", node.id);
+    }
+}
+
+/// A listing cannot miss a key, whatever puts keys into and takes them out of the
+/// shards while it walks them a few keys per hold: rules on other threads writing and
+/// deleting, and a peer's states being merged in. Every key that stays is in every
+/// listing, once.
+#[test]
+fn a_listing_of_an_eventual_namespace_misses_no_key_while_rules_write_and_states_merge() {
+    const LISTINGS: usize = 12;
+    let mut net = Net::new(vec![node("a"), node("b")]);
+    net.connect_all();
+    let stable: Vec<String> = (0..2_000).map(|i| format!("stable:{i:04}")).collect();
+    for key in &stable {
+        net.nodes[0].set(key, "v");
+    }
+    net.settle();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let merged_before = net.nodes[0].replication().merged;
+    {
+        let Net {
+            nodes, links, now, ..
+        } = &mut net;
+        let (a, b) = (nodes[0].ns.clone(), nodes[1].ns.clone());
+        let store = nodes[0].store.clone();
+        std::thread::scope(|scope| {
+            let stop = &stop;
+            // A rule on this node: keys come and go.
+            scope.spawn(move || {
+                let value = Value::from("v");
+                let mut i = 0usize;
+                while !stop.load(Relaxed) {
+                    let key = format!("churn:a:{}", i % 300);
+                    let _ = a.call(&StateOp::Set {
+                        key: key.as_bytes(),
+                        value: stored(&value),
+                        ttl: None,
+                    });
+                    i += 1;
+                }
+            });
+            // A rule on the other node, whose keys arrive here as merges.
+            scope.spawn(move || {
+                let value = Value::from("v");
+                let mut i = 0usize;
+                while !stop.load(Relaxed) {
+                    let key = format!("churn:b:{i}");
+                    let _ = b.call(&StateOp::Set {
+                        key: key.as_bytes(),
+                        value: stored(&value),
+                        ttl: None,
+                    });
+                    i += 1;
+                    if i >= 20_000 {
+                        break;
+                    }
+                }
+            });
+            scope.spawn(move || {
+                while !stop.load(Relaxed) {
+                    for (from, to) in [(0, 1), (1, 0)] {
+                        let frame = links.get_mut(&(from, to)).and_then(|link| link.poll(*now));
+                        if let (Some(frame), Some(link)) = (frame, links.get_mut(&(to, from))) {
+                            link.receive_at(frame, *now);
+                        }
+                    }
+                    *now += Duration::from_millis(10);
+                }
+            });
+            for _ in 0..LISTINGS {
+                let keys = listed(&store, b"", 200);
+                let distinct: std::collections::BTreeSet<&String> = keys.iter().collect();
+                assert_eq!(distinct.len(), keys.len(), "no key is listed twice");
+                for key in &stable {
+                    assert!(distinct.contains(key), "{key} stayed and was not listed");
+                }
+            }
+            stop.store(true, Relaxed);
+        });
+    }
+    assert!(
+        net.nodes[0].replication().merged > merged_before,
+        "states were merged in while the listings ran"
+    );
+}

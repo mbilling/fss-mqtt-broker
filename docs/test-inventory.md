@@ -879,7 +879,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tls::tls12_hardening_tests::the_tls12_suites_are_exactly_the_allowlist`
 - `tls::tls12_hardening_tests::tls12_session_tickets_are_off`
 
-## `crates/mqtt-observability/src/lib.rs` — 20 test(s)
+## `crates/mqtt-observability/src/lib.rs` — 21 test(s)
 
 - `audit_export::tests::a_full_queue_sheds_and_counts_instead_of_blocking`
 - `audit_export::tests::frames_reach_a_tcp_listener_and_flush_waits`
@@ -891,6 +891,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `metrics::tests::otlp_export_posts_to_the_endpoint`
 - `metrics::tests::render_produces_valid_openmetrics_exposition`
 - `metrics::tests::rule_counts_read_back_without_creating_a_series`
+- `metrics::tests::rule_state_is_exported_by_namespace_operation_and_result`
 - `metrics::tests::rule_state_replication_is_reported_per_namespace`
 - `metrics::tests::sandboxed_function_calls_are_counted_by_function_and_kind`
 - `metrics::tests::scaling_metrics_render_with_their_documented_names`
@@ -902,7 +903,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-rules/src/lib.rs` — 277 test(s)
+## `crates/mqtt-rules/src/lib.rs` — 278 test(s)
 
 - `crdt::tests::a_causally_later_lww_write_is_never_lost_whatever_the_wall_clocks_say`
 - `crdt::tests::a_counter_is_the_sum_of_every_nodes_increments_and_decrements`
@@ -1156,6 +1157,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests_state::a_file_declares_at_most_64_namespaces`
 - `tests_state::a_file_that_uses_state_is_refused_where_there_is_no_store`
 - `tests_state::a_kv_store_key_is_the_exact_term`
+- `tests_state::a_kv_store_key_reads_back_as_its_term`
 - `tests_state::a_namespace_declaration_is_checked_when_the_file_loads`
 - `tests_state::a_per_rule_edit_keeps_the_rules_state_key`
 - `tests_state::a_read_is_charged_to_the_build_budget`
@@ -1364,7 +1366,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 671 test(s)
+## `crates/mqttd/src/lib.rs` — 693 test(s)
 
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
@@ -1379,6 +1381,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `admin::cli::tests::the_rules_verbs_are_validated_without_reading_the_file`
 - `admin::cli::tests::the_rules_view_is_a_table_of_counts_and_last_errors`
 - `admin::cli::tests::the_rules_view_lists_the_declared_modules_under_the_rules`
+- `admin::cli::tests::the_state_verbs_print_control_characters_escaped`
+- `admin::cli::tests::the_state_verbs_take_a_namespace_and_a_key`
+- `admin::cli::tests::the_state_view_is_a_table_of_namespaces`
 - `admin::client::tests::responses_split_into_status_and_body`
 - `admin::client::tests::urls_need_https_and_a_port`
 - `admin::cluster::tests::a_silent_node_is_a_row_with_its_reason_not_a_healthy_one`
@@ -1399,6 +1404,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `admin::scope::tests::client_pages_merge_by_client_id_and_page_across_the_cluster`
 - `admin::scope::tests::only_node_and_cluster_are_scopes_and_a_forward_is_always_node_scope`
 - `admin::scope::tests::subscribers_merge_with_their_node_and_honour_the_limit`
+- `admin::state::tests::a_key_that_names_none_is_refused`
+- `admin::state::tests::a_shown_key_addresses_the_key_it_was_shown_for`
+- `admin::state::tests::a_value_is_shown_as_the_rule_engine_writes_it`
+- `admin::state::tests::the_audit_log_names_a_state_key_by_its_hash`
 - `admission::tests::a_cordon_refuses_new_connections_until_lifted`
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1952,6 +1961,18 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `reload::tests::committed_config_never_returns_a_rejected_candidate`
 - `reload::tests::every_reload_attempt_is_recorded_with_its_repeats`
 - `reload::tests::reload_increments_the_metric_by_outcome`
+- `rule_state::admin::tests::a_cursor_reads_back_and_a_stale_or_broken_one_is_refused`
+- `rule_state::admin::tests::a_large_backlog_is_counted_whole`
+- `rule_state::admin::tests::a_listing_pages_through_every_key_exactly_once`
+- `rule_state::admin::tests::a_page_is_bounded_in_bytes_and_in_time`
+- `rule_state::admin::tests::a_prefix_in_emqxs_table_is_of_a_string_keys_text`
+- `rule_state::admin::tests::a_write_during_a_listing_neither_repeats_nor_hides_a_key_that_stays`
+- `rule_state::admin::tests::an_expired_key_is_absent_to_an_operator_and_counted_as_backlog`
+- `rule_state::admin::tests::an_operators_delete_removes_a_key_of_any_type`
+- `rule_state::admin::tests::calls_are_counted_by_operation_and_result`
+- `rule_state::admin::tests::listings_stay_exact_for_stable_keys_while_other_threads_write`
+- `rule_state::admin::tests::reading_a_key_is_not_a_use_and_counts_as_no_call`
+- `rule_state::admin::tests::the_totals_tell_namespaces_from_dictionaries`
 - `rule_state::tests::a_brownout_refuses_new_keys_and_nothing_else`
 - `rule_state::tests::a_counter_goes_up_and_down_by_the_largest_step_without_end`
 - `rule_state::tests::a_full_namespace_refuses_new_keys_and_still_updates_existing_ones`
@@ -1996,6 +2017,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `rule_state::tests_replica::a_full_eventual_namespace_refuses_a_rules_new_key`
 - `rule_state::tests_replica::a_key_expires_on_every_node_at_once_and_nothing_is_sent_for_it`
 - `rule_state::tests_replica::a_key_written_many_times_while_a_link_is_slow_is_sent_once`
+- `rule_state::tests_replica::a_listing_of_an_eventual_namespace_misses_no_key_while_rules_write_and_states_merge`
 - `rule_state::tests_replica::a_merge_keeps_to_the_namespaces_bounds_and_the_stores_ceiling`
 - `rule_state::tests_replica::a_namespace_cannot_change_its_mode_under_the_rules_that_hold_it`
 - `rule_state::tests_replica::a_node_joins_and_a_node_leaves`
@@ -2004,6 +2026,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `rule_state::tests_replica::a_store_without_an_eventual_namespace_sends_nothing`
 - `rule_state::tests_replica::a_write_that_changes_nothing_is_not_sent`
 - `rule_state::tests_replica::an_eventual_namespace_answers_a_rule_as_a_local_one_does`
+- `rule_state::tests_replica::an_operator_lists_reads_and_counts_an_eventual_namespace`
+- `rule_state::tests_replica::an_operators_delete_of_an_eventual_key_reaches_every_node`
 - `rule_state::tests_replica::concurrent_writers_a_reader_and_a_merger_lose_nothing`
 - `rule_state::tests_replica::copies_converge_whatever_is_reordered_repeated_or_lost`
 - `rule_state::tests_replica::copies_that_differ_in_a_few_keys_exchange_a_few_parts`
@@ -2099,7 +2123,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `the_authorization_dry_run_never_allows_a_publish_into_sys`
 - `the_cluster_view_compares_every_nodes_rules_digest`
 
-## `crates/mqttd/tests/admin_rules.rs` — 18 test(s)
+## `crates/mqttd/tests/admin_rules.rs` — 25 test(s)
 
 - `a_dry_run_and_a_check_leave_the_running_rule_state_untouched`
 - `a_dry_run_works_on_a_scratch_dictionary_of_its_own`
@@ -2108,16 +2132,23 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_rules_body_is_read_only_from_a_role_that_may_send_one`
 - `a_rules_file_written_where_there_was_none_is_private` — only when `cfg(unix)`
 - `a_symlinked_rules_file_has_its_target_replaced` — only when `cfg(unix)`
+- `a_viewer_reads_counts_an_operator_keys_and_values_and_a_writer_deletes`
 - `a_whole_file_write_is_a_writers_and_replaces_the_file_and_what_runs`
 - `a_write_into_a_read_only_directory_is_refused_and_changes_nothing` — only when `cfg(unix)`
+- `an_eventual_namespace_is_seen_and_managed_like_a_local_one`
 - `applied_means_the_written_rules_are_the_ones_running`
 - `check_says_whether_text_would_load_and_where_it_would_not`
+- `every_key_a_listing_shows_can_be_read_and_deleted_as_shown`
 - `if_match_and_every_edit_are_about_the_file_on_disk`
 - `one_rule_is_edited_in_place_and_the_rest_of_the_file_kept_byte_for_byte`
 - `the_dry_run_answers_a_console_output_as_the_rule_rendered_it`
 - `the_dry_run_shows_what_the_rules_would_do_and_changes_nothing`
+- `the_keys_of_a_namespace_are_listed_in_pages_of_at_most_a_thousand`
 - `the_rules_file_is_read_verbatim_by_an_operator_only`
 - `the_running_rules_are_read_whole_by_an_operator_and_redacted_for_a_viewer`
+- `the_state_endpoints_refuse_what_names_nothing`
+- `the_state_metrics_are_exported_by_namespace`
+- `the_trace_carries_a_failed_state_calls_reason`
 - `two_writes_naming_the_same_digest_cannot_both_win`
 
 ## `crates/mqttd/tests/audit.rs` — 4 test(s)
@@ -2517,7 +2548,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `rules_republishing_into_each_other_stop_at_the_depth_cap`
 - `the_original_s_limits_cover_the_whole_chain`
 
-## `crates/mqttd/tests/rules_binary.rs` — 70 test(s)
+## `crates/mqttd/tests/rules_binary.rs` — 71 test(s)
 
 - `a_broker_keeps_rule_state_between_publishes`
 - `a_closed_stdout_leaves_probe_and_backup_their_exit_status`
@@ -2542,6 +2573,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_will_whose_rules_call_jq_does_not_hold_the_hub`
 - `an_acl_denied_publish_runs_no_rules`
 - `an_admin_rules_edit_applies_to_the_next_message`
+- `an_operator_sees_and_deletes_rule_state_from_the_command_line`
 - `check_config_reports_whether_this_host_can_run_jq_while_it_is_switched_on`
 - `check_rules_accepts_a_valid_file_and_lists_every_rule`
 - `check_rules_exits_2_on_a_usage_error`
@@ -2706,13 +2738,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_restarted_node_is_refilled_from_the_others`
 - `rules_on_every_node_count_one_counter_and_every_node_reads_the_same`
 
-## `crates/mqttd/tests/rules_sys.rs` — 17 test(s)
+## `crates/mqttd/tests/rules_sys.rs` — 18 test(s)
 
 - `a_secret_in_a_config_error_or_in_a_rule_never_reaches_sys`
 - `a_tick_the_pool_cannot_carry_is_skipped_and_counted`
 - `a_trace_record_carries_a_console_output_as_the_rule_rendered_it`
 - `a_trace_record_lists_sixteen_outputs_and_counts_the_rest`
 - `an_interval_change_applies_at_once`
+- `each_state_namespace_has_its_statistics_in_a_subtree_of_its_own`
 - `every_sys_message_carries_a_message_expiry`
 - `last_active_is_kept_across_a_reload_and_set_only_when_a_rule_runs`
 - `last_errors_by_kind_and_a_synthesized_delivery_entry`
