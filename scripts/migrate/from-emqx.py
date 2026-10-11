@@ -2630,11 +2630,45 @@ def collect_bridge_tls(up: BridgeUpstream, body: dict, where: str) -> None:
 # same set, and `mqttd --check-rules` refuses a rule calling one). A rule using one is
 # emitted COMMENTED OUT with a TODO rather than live: a rules file loads all-or-nothing,
 # so one unsupported call would otherwise make the broker refuse every rule.
+#
+# jq() is not in this list: mqttd has it (ADR 0086), but OFF unless the operator sets
+# `[rules] jq = true`, and a rules file that calls it does not load while it is off. A
+# rule calling it is commented out for the same all-or-nothing reason, with what to do.
+#
+# kv_store_put/get/del and proc_dict_put/get/del are not in it either: mqttd has them,
+# with EMQX's results (ADR 0085), and a rule calling them is carried live, with a note on
+# what differs.
 RULE_FUNCS_UNSUPPORTED = (
-    "jq", "byteszie", "schema_encode", "schema_decode", "schema_check",
+    "byteszie", "schema_encode", "schema_decode", "schema_check",
     "sparkplug_encode", "sparkplug_decode", "maptab_lookup", "mongo_date",
-    "str_utf16_le_decode", "term_encode", "term_decode", "kv_store_get",
-    "kv_store_put", "kv_store_del", "proc_dict_get", "proc_dict_put", "proc_dict_del",
+    "str_utf16_le_decode", "term_encode", "term_decode",
+)
+
+# EMQX's own state functions, which mqttd provides (ADR 0085 D13).
+RULE_FUNCS_KV_STORE = ("kv_store_put", "kv_store_get", "kv_store_del")
+
+# What a carried rule that calls one of them is told.
+RULE_KV_STORE_NOTE = (
+    "calls kv_store_*, which mqttd provides with EMQX's results, in one table per node, "
+    "in memory (it starts empty at every restart, as EMQX's does). Unlike EMQX's, the "
+    "table is BOUNDED: a key of at most 256 bytes, a value of at most 4 KiB, 100,000 keys "
+    "and 64 MiB unless a [state.kv_store] table in the rules file says otherwise, under "
+    "[rules] state_max_bytes; past a bound the call fails the rule, where EMQX would have "
+    "stored the value (docs/RULES.md)"
+)
+
+RULE_FUNCS_PROC_DICT = ("proc_dict_put", "proc_dict_get", "proc_dict_del")
+
+RULE_PROC_DICT_NOTE = (
+    "calls proc_dict_*, which mqttd provides with EMQX's results, on one dictionary per "
+    "client connection: empty at connect, gone at disconnect, shared by everything that "
+    "connection evaluates (the client's publishes and what their rules republish, its "
+    "events, the deliveries to it), as in EMQX. Unlike EMQX's, a dictionary is BOUNDED: "
+    "64 keys, and 64 KiB of keys and values, counted against [rules] state_max_bytes; "
+    "past a bound the call fails the rule. And three evaluations that EMQX runs in the "
+    "client's process run on an EMPTY dictionary here, discarded afterwards: a Will's, "
+    "an event's about a session that has no connection, and message_dropped's for a "
+    "message a rule republished (docs/RULES.md)"
 )
 
 # Every `$events/...` topic EMQX accepts in a FROM (emqx_rule_events:event_topics_enum/0,
@@ -2725,6 +2759,12 @@ def _rule_sql_blockers(sql: str) -> str | None:
     for fn in RULE_FUNCS_UNSUPPORTED:
         if re.search(rf"\b{fn}\s*\(", sql):
             return f"it calls {fn}(), which mqttd's rule engine does not implement"
+    if re.search(r"\bjq\s*\(", sql):
+        return (
+            "it calls jq(), which mqttd runs only where it is switched on: set `[rules] "
+            "jq = true` (MQTTD_RULES_JQ=1) on every node, read what it needs from the host "
+            "in docs/RULES.md, and then uncomment this rule"
+        )
     return None
 
 
@@ -2771,10 +2811,16 @@ def convert_rules(tree: dict, conv: Conversion) -> None:
                 "sees no other $SYS message — EMQX's default (true) apart from that one "
                 "topic; `false` has no equivalent"
             )
+        elif key == "jq_function_default_timeout":
+            conv.rule_todos.append(
+                f"rule_engine.{key} = {value!r}: mqttd's is `[rules] jq_default_timeout_ms` "
+                "(milliseconds; default 10000, as EMQX's 10s). jq() is off unless `[rules] "
+                "jq = true`; set the timeout by hand if you switch it on"
+            )
         elif key.startswith("jq_"):
             conv.rule_todos.append(
-                f"rule_engine.{key}: mqttd's rule engine has no jq() function, so there is "
-                "nothing to configure"
+                f"rule_engine.{key} = {value!r}: no mqttd equivalent (mqttd's jq() keeps 32 "
+                "compiled programs per sandbox instance; ADR 0086)"
             )
         else:
             conv.rule_todos.append(f"rule_engine.{key} = {value!r}: no mqttd equivalent")
@@ -2801,6 +2847,14 @@ def convert_rules(tree: dict, conv: Conversion) -> None:
             )
         else:
             blocked = _rule_sql_blockers(sql)
+            if blocked is None and any(
+                re.search(rf"\b{fn}\s*\(", sql) for fn in RULE_FUNCS_KV_STORE
+            ):
+                todos.append(f"rule {rid}: {RULE_KV_STORE_NOTE}")
+            if blocked is None and any(
+                re.search(rf"\b{fn}\s*\(", sql) for fn in RULE_FUNCS_PROC_DICT
+            ):
+                todos.append(f"rule {rid}: {RULE_PROC_DICT_NOTE}")
         for k, v in body.items():
             if k not in ("sql", "actions", "enable", "description", "metadata", "name"):
                 todos.append(f"rule {rid}: {k} = {v!r} has no mqttd equivalent and was not carried")

@@ -739,7 +739,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `publish_codec_round_trip_clears_the_floor`
 
-## `crates/mqtt-config/src/lib.rs` — 45 test(s)
+## `crates/mqtt-config/src/lib.rs` — 48 test(s)
 
 - `tests::a_backup_dir_inside_the_data_dir_is_a_config_error`
 - `tests::a_bad_enum_value_is_rejected`
@@ -774,11 +774,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::rules_writers_need_the_admin_listener`
 - `tests::the_admin_listener_needs_tls_a_role_and_its_own_bind`
 - `tests::the_env_surface_is_a_deduplicated_curated_list`
+- `tests::the_functions_env_key_loads_from_file_and_environment`
 - `tests::the_gossip_key_is_inline_xor_by_reference`
+- `tests::the_jq_keys_load_from_file_and_environment`
 - `tests::the_new_per_subscriber_bounds_are_refused_out_of_range`
 - `tests::the_refound_guard_defaults_on_and_env_can_disable_it`
 - `tests::the_refusal_lists_all_unknown_keys`
 - `tests::the_replication_factor_is_bounded_and_bounds_the_floor`
+- `tests::the_rule_state_ceiling_loads_from_file_and_environment`
 - `tests::the_rules_watch_keys_load_from_file_and_environment`
 - `tests::the_rules_watch_ranges_are_refused_outside_their_bounds`
 - `tests::the_shared_local_bias_is_a_fraction_stored_as_permille`
@@ -874,7 +877,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tls::tls12_hardening_tests::the_tls12_suites_are_exactly_the_allowlist`
 - `tls::tls12_hardening_tests::tls12_session_tickets_are_off`
 
-## `crates/mqtt-observability/src/lib.rs` — 18 test(s)
+## `crates/mqtt-observability/src/lib.rs` — 19 test(s)
 
 - `audit_export::tests::a_full_queue_sheds_and_counts_instead_of_blocking`
 - `audit_export::tests::frames_reach_a_tcp_listener_and_flush_waits`
@@ -886,6 +889,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `metrics::tests::otlp_export_posts_to_the_endpoint`
 - `metrics::tests::render_produces_valid_openmetrics_exposition`
 - `metrics::tests::rule_counts_read_back_without_creating_a_series`
+- `metrics::tests::sandboxed_function_calls_are_counted_by_function_and_kind`
 - `metrics::tests::scaling_metrics_render_with_their_documented_names`
 - `tests::a_restart_is_a_new_chain_not_a_truncation`
 - `tests::audit_log_hash_chains_recorded_events`
@@ -895,7 +899,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-rules/src/lib.rs` — 169 test(s)
+## `crates/mqtt-rules/src/lib.rs` — 227 test(s)
 
 - `edit::tests::a_json_rule_body_is_a_rule_edit`
 - `edit::tests::an_insert_appends_the_rule_at_the_end`
@@ -921,6 +925,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `template::tests::the_literal_prefix_is_the_text_before_the_first_placeholder`
 - `template::tests::this_is_the_whole_output`
 - `tests::a_bad_rendered_topic_fails_the_action_not_the_rule`
+- `tests::a_build_without_jq_says_why_the_switch_has_nothing_to_turn_on`
 - `tests::a_failing_select_field_fails_the_rule_even_when_the_where_is_false`
 - `tests::a_file_may_compile_only_so_many_distinct_regular_expressions`
 - `tests::a_literal_qos_or_retain_that_can_never_be_valid_fails_the_load`
@@ -932,6 +937,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::a_pattern_that_is_not_utf8_means_its_own_bytes`
 - `tests::a_republish_into_sys_fails_its_action`
 - `tests::a_rule_never_sees_the_dup_flag`
+- `tests::a_rules_file_that_calls_jq_does_not_load_while_jq_is_switched_off`
 - `tests::addresses_print_as_emqx_prints_them`
 - `tests::an_invalid_pattern_loads_with_a_warning_and_fails_each_call`
 - `tests::arithmetic_follows_erlang`
@@ -1022,6 +1028,15 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::user_properties_and_pub_props_emqx_docs`
 - `tests::where_filters_and_can_use_select_aliases`
 - `tests::wildcard_event_filters_select_what_emqx_s_match_selects`
+- `tests_conditions::a_bare_operand_of_and_or_or_reads_as_not_true_unless_it_is`
+- `tests_conditions::a_bare_value_as_a_condition_passes_only_when_it_is_true`
+- `tests_conditions::a_case_when_takes_any_expression_and_goes_on_unless_it_is_true`
+- `tests_conditions::a_case_with_an_operand_takes_a_logical_when_as_a_boolean`
+- `tests_conditions::a_function_that_does_not_return_a_boolean_reads_as_not_true`
+- `tests_conditions::an_incase_reads_its_condition_as_a_where_does`
+- `tests_conditions::not_in_and_not_over_and_or_not_are_evaluated`
+- `tests_conditions::the_portable_forms_give_the_same_in_both_engines`
+- `tests_conditions::true_and_false_are_booleans_in_any_case`
 - `tests_emqx_examples::array_functions_match_emqx_examples`
 - `tests_emqx_examples::bit_functions_match_emqx_examples`
 - `tests_emqx_examples::bit_sequence_functions_match_emqx_examples`
@@ -1053,6 +1068,30 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests_message_events::every_event_about_a_message_reports_the_same_id`
 - `tests_message_events::the_flags_are_the_delivery_s`
 - `tests_message_events::the_sql_test_has_a_sample_of_each_message_event`
+- `tests_modules::a_fresh_instance_per_call_keeps_no_state_between_messages`
+- `tests_modules::a_module_is_granted_only_environment_the_broker_lists`
+- `tests_modules::a_module_is_only_read_from_under_the_rules_files_directory`
+- `tests_modules::a_module_that_fails_a_check_fails_the_load_with_the_reason`
+- `tests_modules::a_modules_limits_fail_the_rule_and_are_counted_by_kind`
+- `tests_modules::a_names_count_of_replaced_instances_goes_on_when_its_module_changes`
+- `tests_modules::a_reload_swaps_a_module_and_a_call_in_flight_finishes_on_the_old_one`
+- `tests_modules::a_rules_file_declares_a_module_by_path_and_sha256_and_its_rules_call_it`
+- `tests_modules::a_statement_on_its_own_calls_the_modules_a_rules_file_declares`
+- `tests_modules::every_built_in_and_every_emqx_function_name_is_reserved`
+- `tests_proc_dict::a_call_counts_against_the_messages_state_calls_and_build_budget`
+- `tests_proc_dict::a_call_runs_when_evaluation_reaches_it_and_is_never_undone`
+- `tests_proc_dict::a_dictionary_counts_against_the_stores_ceiling_and_gives_its_bytes_back`
+- `tests_proc_dict::a_dictionary_holds_64_keys`
+- `tests_proc_dict::a_dictionary_holds_64_kib`
+- `tests_proc_dict::a_dictionary_is_one_tasks_from_one_message_to_the_next`
+- `tests_proc_dict::a_dry_run_works_on_a_scratch_dictionary`
+- `tests_proc_dict::a_held_undefined_reads_as_no_key_and_takes_none`
+- `tests_proc_dict::a_key_is_the_exact_term`
+- `tests_proc_dict::a_value_of_any_type_is_held_as_it_is`
+- `tests_proc_dict::an_evaluation_without_a_dictionary_gets_an_empty_one`
+- `tests_proc_dict::foreach_calls_run_per_element`
+- `tests_proc_dict::put_and_del_answer_the_value_held_before_and_get_the_value`
+- `tests_proc_dict::the_functions_are_built_in_and_load_only_with_a_store`
 - `tests_republish::a_message_republished_from_an_event_has_no_dup_flag`
 - `tests_republish::a_republished_message_is_seen_as_emqx_shows_it`
 - `tests_republish::a_rule_does_not_republish_its_own_republished_message`
@@ -1060,6 +1099,29 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests_republish::republishing_stops_at_the_depth_cap`
 - `tests_republish::select_star_shows_an_undefined_username`
 - `tests_republish::the_budget_spans_every_reentry`
+- `tests_state::a_call_behind_and_or_or_an_untaken_case_branch_does_not_run`
+- `tests_state::a_call_in_a_select_field_runs_for_a_message_the_where_rejects`
+- `tests_state::a_call_with_a_bad_key_value_or_ttl_fails_the_rule_before_the_store`
+- `tests_state::a_case_operand_is_evaluated_after_each_when_as_emqx_does`
+- `tests_state::a_condition_emqx_fails_goes_on_to_the_calls_behind_it`
+- `tests_state::a_dry_run_never_touches_the_store_the_rules_were_loaded_with`
+- `tests_state::a_file_declares_at_most_64_namespaces`
+- `tests_state::a_file_that_uses_state_is_refused_where_there_is_no_store`
+- `tests_state::a_kv_store_key_is_the_exact_term`
+- `tests_state::a_namespace_declaration_is_checked_when_the_file_loads`
+- `tests_state::a_per_rule_edit_keeps_the_rules_state_key`
+- `tests_state::a_read_is_charged_to_the_build_budget`
+- `tests_state::a_republished_message_counts_its_state_calls_in_the_originals_budget`
+- `tests_state::a_rule_names_its_namespace_and_a_key_never_selects_one`
+- `tests_state::a_state_key_must_name_a_declared_namespace`
+- `tests_state::a_statement_alone_takes_the_files_default_settings`
+- `tests_state::a_value_is_measured_as_the_rule_engine_writes_it`
+- `tests_state::a_write_stays_when_a_later_field_fails_the_rule`
+- `tests_state::an_in_list_is_evaluated_whole`
+- `tests_state::foreach_calls_run_per_element`
+- `tests_state::the_1025th_state_call_of_a_message_fails_its_rule`
+- `tests_state::the_emqx_functions_answer_as_emqx_does`
+- `tests_state::the_state_functions_are_built_in`
 - `value::tests::a_json_repair_covers_the_whole_value`
 - `value::tests::floats_render_like_emqx_str`
 - `value::tests::json_of_bytes_that_are_not_utf8_is_repaired_as_jiffy_repairs_it`
@@ -1161,14 +1223,20 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_no_wildcard_fast_path_returns_exactly_the_named_topic`
 - `tests::unacked_messages_survive_for_replay`
 
-## `crates/mqtt-wasm-sandbox/src/lib.rs` — 25 test(s)
+## `crates/mqtt-wasm-sandbox/src/lib.rs` — 34 test(s)
 
+- `tests::a_call_is_held_to_its_own_bound_on_the_result`
 - `tests::a_call_returns_the_modules_value`
 - `tests::a_call_runs_the_same_interpreted`
+- `tests::a_call_that_outlasts_its_first_slice_goes_on_inside_the_hand_off`
 - `tests::a_fuel_bound_stops_the_same_work_at_the_same_point_every_time`
+- `tests::a_hand_off_that_misbehaves_does_not_lose_or_repeat_the_call`
+- `tests::a_module_pool_keeps_warm_instances_and_replaces_one_a_call_stopped`
+- `tests::a_module_pool_told_to_keeps_no_instance_between_calls`
 - `tests::a_module_without_the_abi_is_refused_at_load`
 - `tests::a_modules_own_error_is_its_status_and_message_and_the_instance_lives_on`
 - `tests::a_pool_compiles_on_first_use_and_shares_warm_instances`
+- `tests::a_pool_replaces_an_instance_a_call_stopped_and_counts_it`
 - `tests::a_pool_whose_module_cannot_load_says_why_on_every_call`
 - `tests::a_result_larger_than_the_limit_is_refused_unread`
 - `tests::a_small_fuel_bound_still_loads_and_runs_a_module`
@@ -1176,14 +1244,17 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::an_endless_loop_stops_at_the_deadline_and_poisons_only_its_instance`
 - `tests::an_import_on_the_list_is_provided`
 - `tests::an_import_outside_the_list_is_refused_at_load`
+- `tests::an_interpreted_call_is_handed_off_too`
 - `tests::another_abi_version_is_refused_at_load`
 - `tests::bytes_that_are_not_a_module_are_refused_at_load`
 - `tests::damaged_modules_are_refused_or_run_under_the_limits`
 - `tests::endless_recursion_overflows_the_modules_stack_and_not_the_hosts`
+- `tests::every_call_is_handed_off_at_the_end_of_its_own_first_slice`
 - `tests::every_call_stops_at_its_own_deadline_and_a_call_without_one_is_left_alone`
 - `tests::instances_share_no_state`
 - `tests::memory_growth_stops_at_the_cap`
 - `tests::the_arguments_arrive_as_one_counted_frame`
+- `tests::the_test_plugin_describes_its_functions_and_returns_an_argument_as_it_came`
 - `tests::this_host_runs_both_kinds_of_code`
 - `timer::tests::a_deadline_ticks_when_it_passes_and_not_before`
 - `timer::tests::an_overdue_call_is_ticked_until_it_is_gone_and_then_nothing_ticks`
@@ -1237,7 +1308,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 605 test(s)
+## `crates/mqttd/src/lib.rs` — 644 test(s)
 
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
@@ -1251,6 +1322,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `admin::cli::tests::the_rules_source_prints_the_file_verbatim`
 - `admin::cli::tests::the_rules_verbs_are_validated_without_reading_the_file`
 - `admin::cli::tests::the_rules_view_is_a_table_of_counts_and_last_errors`
+- `admin::cli::tests::the_rules_view_lists_the_declared_modules_under_the_rules`
 - `admin::client::tests::responses_split_into_status_and_body`
 - `admin::client::tests::urls_need_https_and_a_port`
 - `admin::cluster::tests::a_silent_node_is_a_row_with_its_reason_not_a_healthy_one`
@@ -1263,6 +1335,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `admin::http::tests::the_body_cap_is_chosen_per_method_and_path`
 - `admin::roles::tests::operator_wins_and_cluster_certificates_are_peers`
 - `admin::roles::tests::subjects_map_to_roles`
+- `admin::rules::tests::a_declared_module_is_listed_whole_for_an_operator_and_redacted_for_a_viewer`
 - `admin::rules::tests::a_rule_body_leaves_out_what_the_file_already_says`
 - `admin::rules::tests::a_write_the_filesystem_refuses_is_a_conflict_and_any_other_failure_the_servers`
 - `admin::rules::tests::writers_with_an_unwritable_directory_are_warned_about`
@@ -1821,9 +1894,46 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `reload::tests::committed_config_never_returns_a_rejected_candidate`
 - `reload::tests::every_reload_attempt_is_recorded_with_its_repeats`
 - `reload::tests::reload_increments_the_metric_by_outcome`
+- `rule_state::tests::a_brownout_refuses_new_keys_and_nothing_else`
+- `rule_state::tests::a_full_namespace_refuses_new_keys_and_still_updates_existing_ones`
+- `rule_state::tests::a_key_expires_and_reads_as_absent_from_that_moment`
+- `rule_state::tests::a_key_has_the_type_of_the_operation_that_created_it`
+- `rule_state::tests::a_kv_store_key_is_any_term_matched_exactly`
+- `rule_state::tests::a_kv_store_value_is_any_term_and_comes_back_as_it_was`
+- `rule_state::tests::a_later_rule_sees_an_earlier_rules_write`
+- `rule_state::tests::a_load_that_fails_leaves_the_store_as_it_was`
+- `rule_state::tests::a_namespace_is_bounded_in_bytes`
+- `rule_state::tests::a_scratch_store_shares_nothing_with_the_running_one`
+- `rule_state::tests::a_select_write_happens_for_a_message_the_where_rejects`
+- `rule_state::tests::a_stored_binary_does_not_keep_its_payload_alive`
+- `rule_state::tests::a_write_behind_and_or_or_an_untaken_case_branch_does_not_happen`
+- `rule_state::tests::a_write_stays_when_the_rule_then_fails`
+- `rule_state::tests::across_a_reload_a_namespace_keeps_changes_or_drops_its_keys`
+- `rule_state::tests::an_in_list_a_list_literal_and_a_default_are_evaluated_whole`
+- `rule_state::tests::an_lru_namespace_evicts_for_bytes_too`
+- `rule_state::tests::an_lru_namespace_evicts_the_least_recently_used_key`
+- `rule_state::tests::concurrent_callers_keep_counts_and_bounds_exact`
+- `rule_state::tests::concurrent_callers_of_an_lru_namespace_stay_within_its_bound`
+- `rule_state::tests::expired_keys_make_room_when_a_namespace_is_full`
+- `rule_state::tests::foreach_writes_happen_per_element`
+- `rule_state::tests::kv_add_keeps_a_set_in_term_order`
+- `rule_state::tests::kv_changed_tells_when_a_value_differs_from_the_last_one`
+- `rule_state::tests::kv_held_measures_how_long_a_condition_has_held`
+- `rule_state::tests::kv_incr_counts_up_and_down`
+- `rule_state::tests::kv_max_and_kv_min_keep_the_extreme`
+- `rule_state::tests::kv_set_get_and_del`
+- `rule_state::tests::kv_set_once_keeps_the_first_value`
+- `rule_state::tests::kv_store_answers_what_emqx_answers`
+- `rule_state::tests::kv_store_is_one_table_for_every_rule_and_apart_from_kv`
+- `rule_state::tests::kv_store_keeps_its_values_from_one_message_to_the_next`
+- `rule_state::tests::the_stores_ceiling_refuses_across_namespaces`
+- `rules::tests::a_declared_module_needs_no_switch_and_is_read_beside_the_rules_file`
 - `rules::tests::a_publish_carries_an_origin_only_while_a_message_event_is_wanted`
 - `rules::tests::a_rule_definition_hash_is_keyed_per_process`
 - `rules::tests::gated_derived_actions_are_counted_by_their_fate`
+- `rules::tests::jq_is_not_asked_for_unless_the_config_switches_it_on`
+- `rules::tests::the_hand_off_just_goes_on_where_there_is_no_worker_to_free`
+- `rules::tests::the_hand_off_lets_the_workers_other_tasks_run`
 - `rules::tests::the_insecure_trace_line_is_logged_once_per_change`
 - `rules::tests::the_publisher_hears_exactly_the_originals_answer`
 - `rules_sys::tests::a_payload_is_text_when_it_is_and_base64_when_not`
@@ -1906,8 +2016,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `the_authorization_dry_run_never_allows_a_publish_into_sys`
 - `the_cluster_view_compares_every_nodes_rules_digest`
 
-## `crates/mqttd/tests/admin_rules.rs` — 16 test(s)
+## `crates/mqttd/tests/admin_rules.rs` — 18 test(s)
 
+- `a_dry_run_and_a_check_leave_the_running_rule_state_untouched`
+- `a_dry_run_works_on_a_scratch_dictionary_of_its_own`
 - `a_last_error_is_shown_only_for_the_definition_it_was_about`
 - `a_rejected_reload_says_the_file_was_written_and_what_still_runs`
 - `a_rules_body_is_read_only_from_a_role_that_may_send_one`
@@ -2322,14 +2434,17 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `rules_republishing_into_each_other_stop_at_the_depth_cap`
 - `the_original_s_limits_cover_the_whole_chain`
 
-## `crates/mqttd/tests/rules_binary.rs` — 47 test(s)
+## `crates/mqttd/tests/rules_binary.rs` — 63 test(s)
 
+- `a_broker_keeps_rule_state_between_publishes`
 - `a_closed_stdout_leaves_probe_and_backup_their_exit_status`
 - `a_closed_stdout_neither_panics_a_command_nor_changes_its_exit_status`
+- `a_declared_module_runs_in_the_broker_under_its_limits_and_stays_pinned`
 - `a_failing_action_is_counted_failed_and_warned`
 - `a_failing_rule_never_affects_the_original_and_is_counted_failed`
 - `a_graceful_shutdown_forwards_every_shutdown_event_to_a_watcher_on_another_node`
 - `a_graceful_shutdown_keeps_every_shutdown_event_for_an_offline_watcher`
+- `a_live_edit_swaps_a_module_while_a_publish_in_flight_finishes_on_the_old_one`
 - `a_qos1_derived_message_is_queued_for_an_offline_persistent_session`
 - `a_qos1_puback_is_released_only_once_each_derived_message_is_stored`
 - `a_reload_turns_rule_watching_on_and_off_and_a_rejected_one_changes_nothing`
@@ -2338,15 +2453,20 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_rule_written_into_the_main_config_is_refused_with_where_rules_go`
 - `a_rules_file_that_does_not_load_on_sighup_is_rejected_and_the_old_rules_keep_working`
 - `a_shared_group_receives_derived_messages_balanced_across_members`
+- `a_ten_second_jq_on_one_connection_does_not_delay_another_connections_publish`
 - `a_will_runs_the_rules_in_force_when_the_broker_publishes_it`
+- `a_will_whose_rules_call_jq_does_not_hold_the_hub`
 - `an_acl_denied_publish_runs_no_rules`
 - `an_admin_rules_edit_applies_to_the_next_message`
+- `check_config_reports_whether_this_host_can_run_jq_while_it_is_switched_on`
 - `check_rules_accepts_a_valid_file_and_lists_every_rule`
 - `check_rules_exits_2_on_a_usage_error`
 - `check_rules_loads_1024_rules_and_refuses_1025`
 - `check_rules_loads_16_actions_and_refuses_17`
 - `check_rules_loads_64_kib_of_sql_and_refuses_more`
+- `check_rules_loads_rule_state_and_refuses_it_where_it_is_switched_off`
 - `check_rules_refuses_a_literal_qos_of_3`
+- `check_rules_refuses_a_module_that_fails_a_check_and_says_why`
 - `check_rules_refuses_a_sink_action`
 - `check_rules_refuses_a_sql_syntax_error_with_its_position`
 - `check_rules_refuses_an_event_mqttd_does_not_raise`
@@ -2357,6 +2477,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `client_disconnected_reports_normal_tcp_closed_and_a_v5_reason_by_its_emqx_name`
 - `env_configured_rule_statistics_and_trace_reach_a_subscriber`
 - `in_a_two_process_cluster_a_publish_is_evaluated_once_on_its_landing_node`
+- `jq_is_off_by_default_and_a_rules_file_that_calls_it_does_not_load`
+- `jq_rules_are_applied_live_through_the_admin_api_and_refused_where_jq_is_off`
+- `jq_runs_in_the_broker_with_emqx_results_limits_and_metrics`
+- `jq_sees_only_the_environment_variables_the_operator_listed`
 - `no_local_does_not_suppress_a_derived_message_for_its_publisher`
 - `rule_test_event_picks_among_several_events`
 - `rule_test_prints_an_output_exactly_as_the_rule_renders_it`
@@ -2364,15 +2488,19 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `rule_test_refuses_an_input_the_rule_would_never_see`
 - `rule_test_runs_a_topics_and_events_statement_against_a_publish_unless_event_is_given`
 - `rule_test_runs_an_events_statement_against_a_sample_event`
+- `rule_test_runs_jq_with_the_results_emqx_gives`
+- `rule_test_runs_proc_dict_on_a_dictionary_of_its_own`
+- `rule_test_runs_the_state_functions_on_a_store_of_its_own`
 - `session_subscribed_fires_once_per_granted_filter`
 - `session_unsubscribed_fires_once_per_filter_actually_removed`
 - `sighup_swaps_the_rules_for_a_client_that_stays_connected`
 - `the_broker_refuses_to_boot_on_a_rules_file_that_does_not_load`
+- `the_worked_example_modules_run_in_the_broker_with_their_grants`
 - `two_rules_failing_on_every_message_each_log_one_warn_per_ten_seconds`
 - `with_config_watch_an_edited_rules_file_is_picked_up_without_a_signal`
 - `writers_for_a_rules_directory_the_broker_cannot_write_in_are_warned_about` — only when `cfg(unix)`
 
-## `crates/mqttd/tests/rules_cookbook.rs` — 11 test(s)
+## `crates/mqttd/tests/rules_cookbook.rs` — 12 test(s)
 
 - `every_recipe_does_on_the_real_broker_what_the_cookbook_shows`
 - `every_recipe_file_has_a_case_and_every_case_a_file`
@@ -2382,6 +2510,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `recipe_01_rule_test_runs_a_statement_offline`
 - `the_gotchas_the_cookbook_states_hold`
 - `the_header_check_rejects_a_header_that_does_not_match`
+- `the_jq_recipes_and_their_plain_sql_rewrites_print_what_the_cookbook_shows`
 - `the_page_shows_exactly_the_blocks_this_suite_runs`
 - `the_pattern_matcher_checks_rendered_times`
 - `without_their_guards_the_recipes_do_what_the_cookbook_warns`
@@ -2403,10 +2532,12 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `the_simulator_is_deterministic`
 - `the_simulators_mqtt_client_bounds_its_waits_and_reads_while_idle`
 
-## `crates/mqttd/tests/rules_docs.rs` — 5 test(s)
+## `crates/mqttd/tests/rules_docs.rs` — 7 test(s)
 
+- `documented_jq_transcripts_match_the_binary`
 - `documented_rule_test_and_check_rules_transcripts_match_the_binary`
 - `documented_rules_snippets_load`
+- `documented_rules_snippets_that_call_jq_load_where_jq_is_on`
 - `the_extraction_finds_every_documented_rules_file_and_snippet`
 - `the_extraction_recognises_every_documented_form`
 - `the_extraction_refuses_what_it_cannot_run`
@@ -2432,6 +2563,28 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `an_unrouted_publish_is_dropped_on_the_node_it_arrived_at`
 - `only_the_selected_event_is_raised`
 - `the_legacy_spellings_and_the_wildcard_select_the_events`
+
+## `crates/mqttd/tests/rules_proc_dict.rs` — 10 test(s)
+
+- `a_clients_events_and_deliveries_work_on_its_dictionary`
+- `a_connections_dictionary_holds_64_keys`
+- `a_connections_dictionary_lasts_from_one_publish_to_the_next_and_is_its_own`
+- `a_dropped_publish_works_on_its_publishers_dictionary_and_a_rules_on_an_empty_one`
+- `a_memory_brownout_refuses_a_dictionary_room_to_grow`
+- `a_reconnect_starts_with_an_empty_dictionary`
+- `a_resumed_session_starts_with_an_empty_dictionary`
+- `a_takeover_does_not_carry_the_dictionary`
+- `a_wills_rules_get_an_empty_dictionary`
+- `the_dictionaries_count_against_the_stores_ceiling`
+
+## `crates/mqttd/tests/rules_state.rs` — 6 test(s)
+
+- `a_later_rule_and_a_re_entered_rule_see_a_write`
+- `a_memory_brownout_refuses_new_keys_and_existing_ones_still_update`
+- `a_reload_keeps_a_declared_namespace_and_drops_one_that_is_gone`
+- `a_rule_keeps_state_between_publishes_and_counts_what_its_where_rejects`
+- `a_wills_rules_call_the_same_store`
+- `kv_store_counts_across_messages_and_is_shared_by_every_rule`
 
 ## `crates/mqttd/tests/rules_sys.rs` — 17 test(s)
 

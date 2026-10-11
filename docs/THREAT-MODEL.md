@@ -1,6 +1,6 @@
 # Threat model
 
-**Verified against `v1.1.0` (2026-10-07); ADR 0084's surfaces added 2026-10-08.** This is the one-document answer to "what
+**Verified against `v1.1.0` (2026-10-07); ADR 0084's surfaces added 2026-10-08, ADR 0086's (rule functions in a WebAssembly sandbox) 2026-10-11.** This is the one-document answer to "what
 is your threat model?" (ADR 0066 T1). It consolidates — it does not invent: every
 mitigation row names the ADR that decided it and the code that enforces it, and every
 accepted risk is quoted from the record that accepted it. The maintenance rule: a PR
@@ -88,6 +88,39 @@ The client listener carries broker-originated data only when the operator turns 
 | A rules file built to be expensive to load (thousands of worst-case regular expressions) | Identical regex literals are compiled once and a file holds at most 512 distinct ones, 256 KiB together, so a worst-case load stays under a second and about 100 MiB; past either the load fails before the next pattern is compiled. It applies to boot, reload, `--check-rules` and the admin API alike; PCRE2 bounds each compiled pattern itself (64K code units, as in OTP) | ADR 0084 D3, ADR 0083 amendment 2026-10-10; `mqtt-rules/src/parser.rs` |
 | Rule work driven by payloads (deep JSON, hostile regex patterns, `FOREACH` fan-out, payload fields passed as function sizes) | Rules evaluate on the publisher's own connection task, never the hub loop; payload JSON is decoded once, in time linear in its keys, with serde_json's recursion limit; regular expressions are PCRE2 as in EMQX (backtracking), bounded per match by OTP's match and depth limits (10,000,000 each per start position; reaching one is no match, as in EMQX) and a 64 MiB backtracking-heap limit, with PCRE2's own compiled-size limit, and a pattern from the payload is compiled once per message; a `FOREACH` iterates at most 10,000 elements and produces at most 256 outputs, and a publish at most 1,024 derived messages carrying together at most 4 MiB beyond four times its payload — counting what its republished messages lead to through other rules, a chain stopping 32 republishes deep and a rule never republishing its own output — all charged to the publisher's ingress credit (what a client/session event or a Will derives is held to the same per-event bounds but charged to no credit — an accepted risk below); a message's functions may build at most 1 MiB beyond their inputs, together (pad lengths, replacements and separators repeated per match or item), `map_put`/`mput` paths have at most 64 segments, timestamps must be renderable in every offset (chrono panics past its range), decimals are Erlang's 0..=253; checked arithmetic; expressions deeper than 256 levels, or nested deeper than 64, are refused at load; an evaluation error fails the rule, never the message or the connection; a publish waiting for its derived messages' credit gives back its own first and waits parked, so waiting connections hold no credit between them; a connection's parked acks are bounded in hub gates. Both untrusted inputs (the rules file, payloads under fixed rules, with payload-supplied sizes) are nightly fuzz targets | ADR 0083 §8; `mqtt-rules`, `mqtt-rules/fuzz` |
 
+### Rule functions in the WebAssembly sandbox (ADR 0086)
+
+Two things run in the sandbox, and neither exists in a broker that did not ask for it:
+the rule engine's `jq` function (EMQX's jq, C compiled to WebAssembly), **off unless
+`rules.jq = true`**, and the functions of modules a rules file declares
+(`[functions.<name>]`), of which there are none by default. With neither, no runtime is
+created: no compiler runs, no thread starts, no fault handler is installed, no page is
+mapped executable, and every row and risk below is moot. A build without the `jq` cargo
+feature does not contain the runtime at all (HARDENING.md H-7.12).
+
+The untrusted input is the **payload**: a value a publisher chose, handed to a program the
+operator wrote. The **module** (jq's, or an operator's) is code the operator vouches for;
+the rows about it are about how far that trust has to reach and what bounds a mistake.
+"Tests" names the test that fails if the mitigation is removed: `jq_module.rs` is
+`crates/mqtt-wasm-sandbox/tests/jq_module.rs` (run in CI's `wasm sandbox` job against the
+module built there), `sandbox tests` is `crates/mqtt-wasm-sandbox/src/tests.rs`,
+`tests_modules.rs` is in `crates/mqtt-rules/src/`, and `rules_binary.rs` is
+`crates/mqttd/tests/rules_binary.rs`, which drives the shipped binary.
+
+| Threat | Mitigation | Where |
+|---|---|---|
+| **A hostile payload driving `jq`: CPU.** A publisher sends input that makes a rule's program run without end (or, where the rule takes its program from the payload, sends the program) | Every call has a deadline that always stops it: `jq/3`'s timeout or `rules.jq_default_timeout_ms`. Compiled code checks a counter in every loop and at every function entry; at the deadline the program is asked to stop, and 2 ms later it is stopped by a trap and its instance dropped, which also ends a program inside one long C call (a regular-expression match), where EMQX's own timeout cannot. Compiling a program is bounded separately, at 5 s. The call runs on its publisher's connection task for its first millisecond and after that with the worker thread's other connections handed to another thread, so it delays its own publisher and nobody else; a Will's rules leave the hub while the loaded rules call a sandboxed function. A stopped call is a failed rule, counted (`mqttd_rule_function_errors_total{kind="timeout"}`), never a dropped message or connection | ADR 0086 D6, D7 and its T2 amendment; `mqtt-wasm-sandbox/src/sandbox.rs`, `timer.rs`, `mqttd/src/rules.rs` (`hand_off`). Tests: `a_runaway_program_stops_at_the_timeout_and_the_next_call_is_unaffected`, `a_program_that_cannot_be_asked_to_stop_is_stopped_anyway` (`jq_module.rs`); `a_ten_second_jq_on_one_connection_does_not_delay_another_connections_publish`, `a_will_whose_rules_call_jq_does_not_hold_the_hub` (`rules_binary.rs`) |
+| **A hostile payload driving `jq`: memory, output, stack.** Input that makes the program build gigabytes (`[range(1e9)]`), print them, or nest without end | 64 MiB of linear memory per instance: the growth that would pass it traps. A call's output is charged whole to the message's 1 MiB build budget, which all function calls of the message share; the module is told the bound before it runs and the host refuses to read a larger result. A call runs on a stack of its own, 4 MiB with a guard page below it, whatever the calling thread has left; the module's C stack is 1 MiB inside its own memory. Reaching any of them fails the rule for that message, counted by kind, and the instance is dropped; the next call is served by a new one. An instance that grew past 16 MiB is not kept. EMQX has none of these bounds | ADR 0086 D7; `mqtt-wasm-sandbox/src/sandbox.rs`, `jq.rs`, `mqtt-rules/src/jq.rs`. Tests: `memory_and_output_are_bounded` (`jq_module.rs`); `memory_growth_stops_at_the_cap`, `endless_recursion_overflows_the_modules_stack_and_not_the_hosts`, `a_result_larger_than_the_limit_is_refused_unread` (sandbox tests); `jq_runs_in_the_broker_with_emqx_results_limits_and_metrics` (`rules_binary.rs`) |
+| **A hostile payload reaching a memory-safety bug in jq's C code** (jq 1.8.1, oniguruma, decNumber: parsers and a regular-expression engine on publisher-chosen bytes). In EMQX this code is linked into the broker, and `reduce range(20000) as $i (null; [.])` ends a 6.3.1 node | The C code is a guest: it has one linear memory and cannot name anything outside it, so a wild write damages the instance and nothing else. A fault is a trap, the trap is a failed rule, and the instance is dropped. That program returns its result here, and a deeper one fails the call. 400 programs and inputs drawn at random each end in outputs or an error, with the next call served | ADR 0086 D1, D11, spike §4 and §7; `mqtt-wasm-sandbox/src/sandbox.rs`. Tests: `the_module_answers_as_emqx_does_except_where_recorded` (the 285-case oracle, the node-ending case among them), `garbage_programs_and_inputs_end_in_an_answer_or_an_error` (`jq_module.rs`); `a_trap_ends_the_call` (sandbox tests) |
+| **`jq` as a way to read the broker's secrets**: `$ENV` and `env` (in EMQX, the broker's whole environment), files through `include` and `import`, and the output republished to a topic the publisher can read | A program sees no environment variable unless the operator lists it in `rules.jq_env`, read at startup. Of the sixteen WASI functions the module imports, none reaches the operating system: every path and descriptor is refused (`include "/etc/passwd"` answers jq's "module not found"), there are no sockets and no randomness, and standard output and error are discarded | ADR 0086 D8 (the one knowing departure from EMQX); `mqtt-wasm-sandbox/src/wasi.rs`. Tests: `the_module_sees_only_what_it_is_granted` (`jq_module.rs`); `jq_sees_only_the_environment_variables_the_operator_listed` (`rules_binary.rs`) |
+| **One message's data reaching another's evaluation** through a warm instance, or a publisher filling an instance with programs it sends | A jq instance keeps compiled programs between calls and nothing else: fourteen calls give the same answers on one instance as on fourteen. It keeps at most 32 programs, the most recently used | ADR 0086 spike §5; `jq-module/shim.c`. Tests: `one_call_leaves_nothing_for_the_next`, `the_program_cache_is_bounded` (`jq_module.rs`); `instances_share_no_state` (sandbox tests) |
+| **A hostile or broken module** (`[functions.<name>]`): code that loops, allocates without end, traps, returns garbage, or tries to reach the host | It is loaded only if it imports nothing but the sixteen provided functions, exports the ABI at this broker's version, describes the functions the table names, and uses only the WebAssembly features a C module needs (no SIMD, threads, tail calls, 64-bit memories, garbage collector or component model, which keeps whole areas of the compiler out of its reach); a file is at most 16 MiB and a rules file declares at most 16. Running, it can burn its `timeout_ms` (at most 10 s) and its `memory_mib` (at most 64) on each call it gets, and return any value. It cannot read or write memory outside its own, reach a file or a socket, read the clock without `clock = true` or an environment variable outside both its table and the broker's `rules.functions_env`, keep the broker from stopping it, survive its own trap, or see another module's or instance's memory. A thousand damaged variants of a module are each refused or run under the limits, and a coverage-guided fuzz target feeds the loader module files nightly | ADR 0086 D2, D9, D11 and its T3 amendment; `mqtt-wasm-sandbox/src/sandbox.rs`, `mqtt-rules/src/plugin.rs`. Tests: `an_import_outside_the_list_is_refused_at_load`, `another_abi_version_is_refused_at_load`, `damaged_modules_are_refused_or_run_under_the_limits` (sandbox tests); `a_modules_limits_fail_the_rule_and_are_counted_by_kind`, `a_module_is_granted_only_environment_the_broker_lists` (`tests_modules.rs`); `a_declared_module_runs_in_the_broker_under_its_limits_and_stays_pinned` (`rules_binary.rs`); fuzz target `crates/mqtt-wasm-sandbox/fuzz` `module_load` |
+| **A module correlating the messages it is called with**: state kept in its memory from one publisher's message to the next | Not prevented by default: a warm instance serves many messages, and the sandbox isolates the module from the broker, not one call from the next. `fresh_instance = true` gives every call a new instance, so nothing survives a call, at the cost of an instantiation each | ADR 0086 D11. Test: `a_fresh_instance_per_call_keeps_no_state_between_messages` (`tests_modules.rs`) |
+| **A module file replaced on disk, or rules text naming a file as code** | The control-plane row "Rules text as a way to make the broker load a file as code" (Surface 5): a module is read only from under the rules file's directory, pinned by a SHA-256 that is checked on every load and never disclosed by an error | ADR 0086 D9 and its T3 amendment; `mqtt-rules/src/plugin.rs`. Tests: `a_module_is_only_read_from_under_the_rules_files_directory` (`tests_modules.rs`); `check_rules_refuses_a_module_that_fails_a_check_and_says_why` (`rules_binary.rs`) |
+| **The jq module's supply chain**: the one part of the broker that is not Rust (jq, oniguruma and decNumber sources; a C compiler and its libc) | Nothing binary is committed. The module is built in the pipeline from source tarballs pinned by SHA-256, by a compiler (zig) pinned by version and by its archive's SHA-256, and the result is byte-reproducible: the tree records its hash (`jq-module/jq.wasm.sha256`), CI builds it on every change to its inputs and fails on another hash, the broker's build script refuses to embed a file with another hash, and the release recipe builds it under `target/` on every run and requires it, so the release's build-twice comparison covers it. The release notes state the module's hash and the source commits. Whatever those sources contain still runs as a guest of the sandbox, under the rows above | ADR 0086 D11, spike §1 and §2; `crates/mqtt-wasm-sandbox/jq-module/build.sh`, `fetch-zig.sh`, `crates/mqtt-wasm-sandbox/build.rs`, `scripts/release/build-repro.sh`. Tests: `the_module_is_the_recorded_build` (`jq_module.rs`); CI job `wasm sandbox` |
+| **The runtime's supply chain**: wasmtime and its Cranelift compiler, 54 lockfile entries | `cargo deny` (licenses, sources, bans) and `cargo audit` (advisories against `wasmtime` and `cranelift-codegen` among them) gate every change. Only the runtime's safe API is used: machine code is never loaded from a file or from bytes (`Module::deserialize` is not called and there is no on-disk code cache, so nobody who can write a directory gets code executed), and the features taken leave out the component model, the WASI crate, the garbage collector, threads and profiling hooks | ADR 0086 §3, D1, D11; `crates/mqtt-wasm-sandbox/Cargo.toml`, `deny.toml`; CI job `supply-chain audit` |
+| **Rules as a way to make the broker spend start-up work**: loading rules that call `jq` compiles its module, and a declared module is compiled when its table is loaded | The jq module is compiled once per process (0.6 to 0.8 s), by the first load that calls `jq`, on the thread doing that load, never on a publisher's connection and never at the first message. A module file is at most 16 MiB and a file declares at most 16; a table that did not change keeps its compiled module across reloads. Only the operator's file, a listed rules writer and an operator's dry run can cause a load, and rules text through the admin API is parsed one at a time per node, off the async workers | ADR 0086 D5, §8; `mqtt-rules/src/plugin.rs`, `mqttd/src/admin/rules.rs`. Tests: `a_pool_compiles_on_first_use_and_shares_warm_instances` (sandbox tests); `a_reload_swaps_a_module_and_a_call_in_flight_finishes_on_the_old_one` (`tests_modules.rs`) |
+
 ### Accepted risks (client surface)
 
 - **A backtracking regular expression can cost CPU in proportion to its subject** —
@@ -145,6 +178,55 @@ The client listener carries broker-originated data only when the operator turns 
   what that rule selects, past its own ACL. The operator decides who; the broker cannot
   narrow it to the subscriber's own grants without evaluating the ACL per record and
   subscriber. (ADR 0084 D5.)
+- **With `jq` on, or a module declared, a compiler is in the trust base.** The rows of
+  "Rule functions in the WebAssembly sandbox" hold as long as wasmtime is sound, and
+  since the module runs as machine code that includes its compiler, Cranelift: a
+  miscompilation is a sandbox escape, and such bugs have been published as advisories.
+  What stands against it: the configuration used is the runtime's default and most
+  fuzzed one, the WebAssembly features a module may use are cut to the few a C module
+  needs, the bytes compiled are a module built from pinned sources or one the operator
+  pinned by hash, and a payload reaches compiled code only as data, never as
+  WebAssembly: no publisher can hand the compiler input. `cargo audit` gates the
+  advisories, and the runtime's minimum Rust version moves the workspace's. Not
+  mitigated beyond that; an installation that will not carry it leaves the feature off,
+  or out of the build. (ADR 0086 D11, Open question 1.)
+- **Once a module is loaded the process has executable pages and process-wide fault
+  handlers.** Compiled code needs memory mapped executable (written first, then made
+  read-and-execute, never both at once), which is why the shipped systemd unit's
+  `MemoryDenyWriteExecute=true` has to be given up for it. The runtime installs handlers
+  for `SIGSEGV`, `SIGBUS`, `SIGILL` and `SIGFPE` (Mach exception ports on macOS) when its
+  engine is first made, and they stay for the life of the process; a fault that is not in
+  compiled module code is passed on to the previous handler. The broker installs none of
+  these itself. One timer thread per loaded module runs while calls have deadlines.
+  (ADR 0086 §8, D11, D13.)
+- **Concurrent long sandbox calls are not capped.** A call that outlasts its first
+  millisecond occupies a thread, up to the async runtime's limit on blocking threads
+  (tokio's default, 512, which mqttd does not change), and an instance of up to its
+  memory limit (64 MiB for `jq`; a module's `memory_mib`, 16 MiB by default) beyond the
+  warm ones. A publisher runs one call at a time, so the worst case is as many such
+  calls as there are connections publishing to a rule's topics at once, each for as long
+  as its timeout allows: with EMQX's ten-second default and a program a payload can make
+  slow, that is a memory and thread lever in the hands of whoever may publish there. A
+  cap (queueing, or failing the rule past it) is **not decided**. The operator's
+  mitigations: a low `rules.jq_default_timeout_ms` and module `timeout_ms`, a low
+  `memory_mib`, the ACL on the topics such rules select, and a memory limit on the
+  process (the shipped unit's `MemoryMax`, a container limit). Watch
+  `mqttd_rule_module_instances` and `mqttd_rule_function_errors_total{kind="timeout"}`.
+  (ADR 0086 T2 and T3 amendments, "Left open".)
+- **A `jq` rule may take its program and its timeout from the payload**, as in EMQX:
+  `jq(payload.program, payload.data, payload.ms)` is legal rule SQL. Whoever may publish
+  to such a rule's topics then chooses what runs and for how long, up to the limits
+  above, and with `rules.jq_env` set, reads the listed variables. The loader cannot tell
+  an intended use from a mistake; the rule author decides. (ADR 0086 D4, D5.)
+- **A long sandbox call in a rule on events about offline clients delays the events
+  behind it.** Those events (`$events/message/dropped` for a session that is not
+  connected, and the like) are evaluated by one task; a flood that outruns it is shed and
+  logged. The hub and every connection are unaffected. (ADR 0086 T2 amendment.)
+- **The jq module's source tarballs come from GitHub's archive endpoint**, whose bytes
+  are stable in practice and not by contract. A change there fails the build (the
+  tarballs are checked against recorded hashes) and never passes other sources; CI caches
+  the built module, so an outage fails only a run that has to rebuild. (ADR 0086 Open
+  question 8.)
 
 ---
 
@@ -262,6 +344,7 @@ short, fixed list of audited actions:
 | An admin reload as a config-injection path | `POST /admin/v1/reload` takes no input (the rules writes, below, are the one input path, and only for the rules file): it runs the same validate-before-swap reload as `SIGHUP` over the config file; operator role only; serialized with the other triggers; audited twice (`admin.request`, `security.reload trigger=admin`) | ADR 0081 §4/§5; `mqttd/src/admin/config.rs`, `reload.rs` |
 | A rules write as a policy-injection path | Off unless `[rules] admin_writers` names subjects; a write needs the operator role **and** a listed subject (a kick-and-cordon operator cannot write rules). The new text is loaded all-or-nothing before anything is written; `if_match` against the on-disk digest (required for a whole file) stops a lost update, and writes are serialized per node, so two writes naming the same digest cannot both win; the write is node-local and never forwarded; every write is a `rules.write` audit record (subject, operation, rule, old and new digest, applied) and the previous file stays as `<file>.prev` for investigation and rollback | ADR 0084 D6; `mqttd/src/admin/rules.rs` |
 | The rules write path abused on the filesystem | The path comes from the live config, never the request. The configured path is canonicalized, so a symlink's target is replaced, never the link; the temporary file is created exclusively (`create_new`) with a pid-and-random name in the target's directory, with the old file's mode and, where the broker may set it, its group; when it cannot keep the group, the group permission bits are cleared rather than carried to another group, and a file the API creates is 0600; write, fsync, rename, directory fsync; the temporary file is removed on every error; a read-only or foreign mount answers `409 rules-file-unwritable` with the OS error, and a WARN at boot and on reload names a configured but unwritable directory. Keep a writable rules file in a directory of its own, never beside the config, ACL or password files | ADR 0084 D6; `mqttd/src/admin/rules.rs` |
+| Rules text as a way to make the broker load a file as code (a `[functions.<name>]` table naming a WebAssembly module, whether the text comes from the file, a rules write, a `check` or a `test`) | A module is read only from under the directory of the configured rules file: a relative path of plain names ending in `.wasm` that still lies there after every symlink is resolved, a regular file of at most 16 MiB. The broker writes nothing there that is a module (only the rules file, which is TOML, its `.prev` and a temporary file), so a caller can name only a file the operator placed, and only by a SHA-256 they already know: the error for another hash never states the file's own. The file is hashed on every load. What loads runs in the WebAssembly sandbox: no file, socket or host function, the clock only if the table says so, per-call time, memory, output and stack limits; and the environment variables a table may grant are only those the broker's own `rules.functions_env` lists, which no rules text widens. Residual: a rules writer (or an operator, by a dry run) can run any module the operator placed whose hash they know, under the names it describes; module files should not be writable by the broker's user; and the sandbox is as sound as its runtime and compiler ([Rule functions in the WebAssembly sandbox](#rule-functions-in-the-webassembly-sandbox-adr-0086) has the rows for what a loaded module can and cannot do, and the accepted risks under it) | ADR 0086 D9, D11 and its T3 amendment; `mqtt-rules/src/plugin.rs` |
 | Rules text disclosing secrets (pseudonym salts in SQL) | The rules file's text, the SQL and actions, error text and `test` (which computes a salted pseudonym for any input: an oracle) are operator-only; a viewer's `GET /admin/v1/rules` is redacted to ids, descriptions, FROM filters and events, counts, definition hashes and error kinds: no SQL, actions, load warnings or error text; `$SYS` never carries them. A definition hash is keyed per process, so it is no oracle. The whole file's digest is an unsalted SHA-256 on `/metrics`, `/statusz`, `$SYS` and the admin API, so a secret in the rules file must be high-entropy random (`openssl rand -hex 16`), never a guessable name | ADR 0084 D4/D6; `mqttd/src/admin/rules.rs`, `rules.rs` |
 | Payload text reaching an operator's terminal (a last error quoting a payload with terminal escapes) | `mqttd --admin` prints every control character in text the server sends (C0, DEL, C1, U+2028/U+2029) as its escape: `\u{1b}`, `\r`, `\u{9b}` in the terminal views, `\u001b`, `\u009b` in `--json`; `rules-source` is verbatim | ADR 0084 D7; `mqttd/src/admin/cli.rs` |
 | A dry run disturbing the running rules | `check` and `test` evaluate with a no-op report: no counter, no `last_error`, no trace record, no WARN slot, no console log line | ADR 0084 D6 |
@@ -297,7 +380,11 @@ short, fixed list of audited actions:
   publisher's ACL for the derived copy, and can amplify one publish into up to 1,024.
   That is the ACL file's trust level, held by the same operator. (ADR 0083.) A subject in
   `[rules] admin_writers` holds the same trust over mTLS: data-plane read and write of
-  every topic through rules and their trace. (ADR 0084.)
+  every topic through rules and their trace. (ADR 0084.) With modules in the rules
+  file's directory, the same subject, and any operator through a dry run, can also run
+  any of them whose SHA-256 they know, under the names it describes and with limits up
+  to the ceilings (10 s, 64 MiB). They cannot bring a module of their own. (ADR 0086 T3
+  amendment.)
 - **Rules writes are per node.** A write changes the node that answered; the others keep
   their file until written too. `same_rules` and `mqttd_rules_info` show the drift; nothing
   prevents it. A ConfigMap or GitOps pipeline that owns the file overwrites a write on its
@@ -332,6 +419,12 @@ consolidated from the ADRs that accepted them:
    vocabulary, the drop policy, and the verify tool are scheduled, not shipped.
 5. **Mid-roll protocol skew windows** are documented per feature (e.g. a proto<7
    link answers brownout the v3.1.1 way). (ADR 0041 §5.)
+6. **Rule functions in the WebAssembly sandbox are opt-in, and opting in adds a
+   compiler to what the broker's memory safety rests on.** Off by default and absent
+   unless used; on, the sandbox is as sound as wasmtime and Cranelift, the process maps
+   executable pages and carries process-wide fault handlers, and concurrent long calls
+   are bounded only by the runtime's thread limit and each call's own time and memory
+   limits: a cap is not decided. (ADR 0086; Surface 1, accepted risks.)
 
 Corrections to this document follow the same rule as COMPARISON.md: versioned,
 dated, and cited — a threat model that drifts from the code is worse than none.

@@ -21,7 +21,11 @@
 //!   compare equal); a number against a string converts the string (a non-numeric string
 //!   is an error); a boolean against a string compares their text; anything else uses
 //!   Erlang term order.
-//! - **Conditions pass only on boolean `true`.**
+//! - **Conditions pass only on boolean `true`.** This is wider than EMQX, whose
+//!   `match_conditions/2` fails the rule on a condition that is a bare value, on
+//!   `NOT IN` and on `NOT` over `AND`/`OR`/`NOT`: kept as documented differences
+//!   (ADR 0083, amendment of 2026-10-11; `tests_conditions.rs` has EMQX's outcome per
+//!   form).
 
 use std::cell::OnceCell;
 use std::sync::Arc;
@@ -57,10 +61,25 @@ pub struct EvalCtx<'a> {
     /// Bytes this message's functions have built beyond their inputs so far (see
     /// `funcs::MAX_BUILT_BYTES`).
     pub(crate) built: std::cell::Cell<usize>,
+    /// The calls of sandboxed functions the rule being evaluated has made, for its
+    /// report ([`Outcome::Function`](crate::Outcome::Function)).
+    pub(crate) calls: std::cell::RefCell<Vec<crate::jq::FunctionCall>>,
     /// Where name lookup stops falling through ([`lookup`]): frames from this index on,
     /// with the input after them, are one merged map. `usize::MAX` (a `SELECT`): every
     /// frame and the input fall through in turn. Set per clause by [`merged_from`].
     merged_from: std::cell::Cell<usize>,
+    /// The original message's budget, which its state calls are counted in
+    /// ([`within`](Self::within)); without one, this context counts its own.
+    budget: Option<&'a crate::Budget>,
+    own_state_calls: std::cell::Cell<usize>,
+    /// For a dry run: the scratch store its state calls go to instead of the one the
+    /// rules were loaded with ([`dry_run`](Self::dry_run)).
+    scratch: Option<crate::state::Scratch<'a>>,
+    /// The dictionary `proc_dict_*` work on: the evaluating task's
+    /// ([`on`](Self::on)); without one, an empty one of this context's own, made when
+    /// a call first asks for it.
+    dictionary: Option<&'a crate::state::Dictionary>,
+    own_dictionary: OnceCell<crate::state::Dictionary>,
 }
 
 /// Patterns and the result of compiling each, most recent first.
@@ -83,8 +102,78 @@ impl<'a> EvalCtx<'a> {
             rule_id: std::cell::RefCell::new(Arc::from("")),
             regex_cache: std::cell::RefCell::new(Vec::new()),
             built: std::cell::Cell::new(0),
+            calls: std::cell::RefCell::new(Vec::new()),
             merged_from: std::cell::Cell::new(usize::MAX),
+            budget: None,
+            own_state_calls: std::cell::Cell::new(0),
+            scratch: None,
+            dictionary: None,
+            own_dictionary: OnceCell::new(),
         }
+    }
+
+    /// The same context, evaluated by the task that owns `dictionary`: what
+    /// `proc_dict_*` read and write (ADR 0085 D13).
+    #[must_use]
+    pub fn on(mut self, dictionary: &'a crate::state::Dictionary) -> Self {
+        self.dictionary = Some(dictionary);
+        self
+    }
+
+    /// The dictionary `proc_dict_*` work on.
+    pub(crate) fn dictionary(&self) -> &crate::state::Dictionary {
+        self.dictionary.unwrap_or_else(|| {
+            self.own_dictionary
+                .get_or_init(crate::state::Dictionary::new)
+        })
+    }
+
+    /// The same context, counting its state calls in `budget`: the original message's,
+    /// shared by every rule it matches and every message its rules republish.
+    #[must_use]
+    pub fn within(mut self, budget: &'a crate::Budget) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
+    /// The same context for a dry run: its state calls go to `scratch`, never to the
+    /// store the rules were loaded with (ADR 0085 D11). Without a scratch store a
+    /// state call fails its rule.
+    #[must_use]
+    pub fn dry_run(mut self, scratch: Option<&'a dyn crate::state::StateStore>) -> Self {
+        self.scratch = Some(crate::state::Scratch::new(scratch));
+        self
+    }
+
+    /// Count one state call against the original message's
+    /// [`MAX_STATE_CALLS_PER_TRIGGER`](crate::state::MAX_STATE_CALLS_PER_TRIGGER),
+    /// refusing the one past it.
+    pub(crate) fn charge_state_call(&self) -> Result<(), EvalError> {
+        let calls = self
+            .budget
+            .map_or(&self.own_state_calls, |budget| &budget.state_calls);
+        if calls.get() >= crate::state::MAX_STATE_CALLS_PER_TRIGGER {
+            return Err(EvalError::new(format!(
+                "this message already made {} state calls (across every rule it matched and \
+                 every message they republished); the rest fail",
+                crate::state::MAX_STATE_CALLS_PER_TRIGGER
+            )));
+        }
+        calls.set(calls.get() + 1);
+        Ok(())
+    }
+
+    /// One call on `binding`'s namespace: the store's the rules were loaded with, or
+    /// a dry run's scratch store's.
+    pub(crate) fn state_call(
+        &self,
+        binding: &crate::state::StateBinding,
+        op: &crate::state::StateOp<'_>,
+    ) -> Result<Result<crate::state::StateReply, crate::state::StateError>, EvalError> {
+        Ok(match &self.scratch {
+            None => binding.namespace().call(op),
+            Some(scratch) => scratch.namespace(binding)?.call(op),
+        })
     }
 
     /// The decoded payload (cached). An undecodable payload is an error for whichever
@@ -454,13 +543,14 @@ pub(crate) fn eval(e: &Expr, ctx: &EvalCtx, frames: Frames) -> Result<Value, Eva
             list,
             negated,
         } => {
+            // EMQX evaluates the whole list before it looks for the value
+            // (`lists:member(eval(Var), [eval(V) || V <- Vals])`, probed on 6.3.1): an
+            // element after the match still fails the rule, and a state call in one
+            // still runs.
             let v = eval(expr, ctx, frames)?;
             let mut found = false;
             for x in list {
-                if strict_eq(&v, &eval(x, ctx, frames)?) {
-                    found = true;
-                    break;
-                }
+                found |= strict_eq(&v, &eval(x, ctx, frames)?);
             }
             Value::Bool(found != *negated)
         }
@@ -469,11 +559,17 @@ pub(crate) fn eval(e: &Expr, ctx: &EvalCtx, frames: Frames) -> Result<Value, Eva
             whens,
             otherwise,
         } => {
-            let on = on.as_ref().map(|x| eval(x, ctx, frames)).transpose()?;
             for (when, then) in whens {
-                let hit = match &on {
-                    // `CASE x WHEN v` is an exact match (Erlang pattern match).
-                    Some(v) => strict_eq(v, &eval(when, ctx, frames)?),
+                let hit = match on {
+                    // `CASE x WHEN v` is an exact match (Erlang pattern match). EMQX's
+                    // `eval_switch_clauses` evaluates `v` and then `x`, for each `WHEN`
+                    // it comes to (probed on 6.3.1): a call in `x` runs once per `WHEN`
+                    // tried, after that `WHEN`'s own, and not at all when the first
+                    // `v` fails.
+                    Some(on) => {
+                        let v = eval(when, ctx, frames)?;
+                        strict_eq(&eval(on, ctx, frames)?, &v)
+                    }
                     None => eval(when, ctx, frames)?.is_true(),
                 };
                 if hit {
@@ -485,7 +581,14 @@ pub(crate) fn eval(e: &Expr, ctx: &EvalCtx, frames: Frames) -> Result<Value, Eva
                 None => Value::Undefined,
             }
         }
-        Expr::Call { func, args, regex } => {
+        Expr::Call {
+            func,
+            args,
+            regex,
+            jq,
+            module,
+            state,
+        } => {
             let args = args
                 .iter()
                 .map(|x| eval(x, ctx, frames))
@@ -493,8 +596,12 @@ pub(crate) fn eval(e: &Expr, ctx: &EvalCtx, frames: Frames) -> Result<Value, Eva
             let fcx = FnCtx {
                 ctx,
                 regex: regex.as_ref(),
+                jq: jq.as_deref(),
+                module: module.as_ref(),
+                state: state.as_deref(),
             };
-            (func.f)(&args, &fcx).map_err(|err| err.in_fn(func.name))?
+            let name = module.as_ref().map_or(func.name, |m| &m.function.name);
+            (func.f)(&args, &fcx).map_err(|err| err.in_fn(name))?
         }
     })
 }

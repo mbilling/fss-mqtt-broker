@@ -1,6 +1,6 @@
 # Rule engine
 
-**Dated 2026-10-08.** Unreleased: no release has the rule engine yet
+**Dated 2026-10-11.** Unreleased: no release has the rule engine yet
 ([ADR 0083](adr/0083-rule-engine.md)). Rules filter, transform and re-route messages as
 they pass through the broker. They are written in **EMQX's rule SQL**, with EMQX's
 `republish` and `console` actions. A rule written for EMQX's rule engine runs here
@@ -28,7 +28,7 @@ the admin API. The rest of this page is the reference.
 
 No release has the rule engine yet. `v1.1.0` and every earlier release do not: the
 binaries, the `ghcr.io/mbilling/fss-mqtt-broker` images and the Helm chart's default
-image. Until the next release, build from source (Rust ≥ 1.88; the first build takes a few
+image. Until the next release, build from source (Rust ≥ 1.96; the first build takes a few
 minutes):
 
 ```sh
@@ -222,7 +222,9 @@ run, start [`demo/rules-live/up.sh`](../demo/rules-live/README.md).
 - [The rules file](#the-rules-file)
 - [SQL](#sql)
 - [Fields](#fields)
-- [Functions](#functions)
+- [Functions](#functions): [`jq`](#jq) (what it needs from the host, its limits, its cost),
+  [your own functions](#your-own-functions-functionsname) as WebAssembly modules, and
+  [state](#state-what-a-rule-remembers): what a rule remembers between messages
 - [Actions](#actions)
 - [Operating rules](#operating-rules)
 - [Performance](#performance)
@@ -384,6 +386,10 @@ double-quote one in particular): run `--check-rules` on the file for those, and 
   | `mqttd_rule_actions_total{rule,result}` | `ok`: a console line logged, or a republish the broker accepted and routed. `failed`: see [Operating rules](#operating-rules). |
   | `mqttd_rule_recursive_republish_total{rule,guard}` | `republish` actions not run because their message would loop: `same_rule`, the message is one the rule republished itself (EMQX's `recursive_republish_detected`; counted `ok` in `mqttd_rule_actions_total`, as EMQX counts it); `depth`, it is 32 republishes from its original (counted `failed`). See [Republished messages](#republished-messages). |
   | `mqttd_rule_eval_seconds_total{rule}` | Time spent evaluating the rule, summed over every live evaluation: its statement plus rendering its actions, not routing what it republishes. Dry runs (`POST /admin/v1/rules/test`) are not counted. Divided by the evaluations it is the rule's cost per message, below. |
+  | `mqttd_rule_function_calls_total{function}` | Calls of [`jq`](#jq), the function that runs in the sandbox. |
+  | `mqttd_rule_function_errors_total{function,kind}` | Those that failed, by kind: `compile`, `parse`, `process`, `timeout`, `system` (EMQX's error tags); `memory`, `output`, `stack`, `compile_timeout` (a limit of the sandbox); `trap`; `argument` (a program that is not a string, a bad timeout); `decode` (an output that is not JSON a rule can hold). Each is also a `failed` evaluation of its rule. |
+  | `mqttd_rule_function_seconds_total{function}` | Time spent in those calls; part of the rule's `mqttd_rule_eval_seconds_total`. |
+  | `mqttd_rule_module_instances{module}`, `mqttd_rule_module_memory_bytes{module}`, `mqttd_rule_module_instances_replaced_total{module}` | The sandbox instances `jq` holds, their memory, and how many were given up after a call stopped at a limit. As of the last call. |
   | `mqttd_rules_loaded` | Enabled rules loaded on this node. |
   | `mqttd_rules_info{checksum}` | The loaded file's SHA-256, at 1. A checksum replaced by a reload stays exported at 0. |
 
@@ -859,7 +865,9 @@ and its MQTT 5 recipe guards a user property the same way.
   Will about 0.17 µs; one that matches costs what it costs any publish (see
   [Performance](#performance)), on top of the Will's own routing. A mass disconnect
   (a partition, a load-balancer restart) brings the Wills at once, so rules that match
-  Will topics add to that burst.
+  Will topics add to that burst. The exception: while the loaded rules call
+  [`jq`](#jq), which may run for as long as its timeout allows, the hub hands a Will's
+  rules to a task of their own and goes on.
 - **A publish and its derived messages reach the hub as one command**, with every
   message they lead to through other rules. The hub routes the original first, then its
   derived messages, and only if it accepted the original: a refused publish produces
@@ -977,7 +985,14 @@ sql = '''...'''       # required: one SELECT or FOREACH statement
 actions = [ ... ]     # zero or more; see Actions
 enable = true         # default true; a disabled rule is loaded and listed by --check-rules, never run
 description = ""      # optional
+state = "<namespace>" # optional: the declared [state.<namespace>] its kv_* calls work on
 ```
+
+Beside the rules a file may declare functions of its own, supplied as WebAssembly
+modules: `[functions.<name>]`, an mqttd extension
+([Your own functions](#your-own-functions-functionsname)), and namespaces for the state
+its rules keep between messages: `[state.<name>]`, with the rule key `state`, an mqttd
+extension too ([State](#state-what-a-rule-remembers)).
 
 Loading is **all-or-nothing**: one rule that does not parse rejects the file. At
 startup the broker refuses to boot, and on a reload the running rules stay in force.
@@ -1016,7 +1031,10 @@ rule, every `FOREACH` output — not to each call:
   `replace` or `regex_replace` that substitutes a longer string at every match, a
   `join_to_string` separator);
 - `map_put` / `mput` take a key path of at most 64 segments, and a timestamp must lie
-  within the date range every time zone can render.
+  within the date range every time zone can render;
+- all of a message's rules make at most 1,024 [state](#state-what-a-rule-remembers) calls,
+  counting the rules its republished messages run, and what they read from state is part
+  of the 1 MiB above.
 
 Past a limit the function or action fails, so the rule fails (or the action does) and
 is counted; the message itself is still routed. And whatever a message derives is
@@ -1099,7 +1117,10 @@ Within the same meaning, mqttd accepts a little more than EMQX: `AND`/`OR`/`NOT`
 `SELECT`, keywords as path segments (`payload.from`), field access on a computed value
 (`json_decode(payload).a`), and `1e5` float literals. Every statement EMQX accepts loads
 in mqttd, but a statement that uses one of these does not load in EMQX:
-[Differences from EMQX](#differences-from-emqx) lists them all.
+[Differences from EMQX](#differences-from-emqx) lists them all. A condition is read more
+widely too: `WHERE payload.flag`, `x NOT IN (…)` and `NOT (a AND b)` work in mqttd, where
+EMQX creates the rule and fails it on each message
+([Conditions EMQX fails](#conditions-emqx-fails-and-mqttd-evaluates)).
 
 ## Fields
 
@@ -1380,6 +1401,8 @@ or `is_empty` of a missing value (below). A function given the wrong type fails 
 | Time | `now_timestamp`, `now_rfc3339`, `unix_ts_to_rfc3339`, `rfc3339_to_unix_ts`, `timezone_to_offset_seconds` (alias `timezone_to_second`), `format_date` (without the time argument: now), `date_to_unix_ts` |
 | System | `getenv` (`getenv('FOO')` reads the environment variable `EMQXVAR_FOO`; unset is `''`) |
 | UUID | `uuid_v4`, `uuid_v4_no_hyphen` |
+| jq | `jq` (`jq(Program, Input)` and `jq(Program, Input, TimeoutMs)`): off unless the operator switches it on, [below](#jq) |
+| State | EMQX's `kv_store_put`, `kv_store_get`, `kv_store_del` and `proc_dict_put`, `proc_dict_get`, `proc_dict_del`; mqttd's own `kv_get`, `kv_set`, `kv_set_once`, `kv_incr`, `kv_max`, `kv_min`, `kv_add`, `kv_del`, `kv_ttl`, `kv_held`, `kv_changed`: what a rule remembers between messages, [below](#state-what-a-rule-remembers) |
 | Conditional | `coalesce`, `coalesce_ne` |
 | Legacy accessors | `topic` (`topic(n)` is the nth level, counting from 1: `topic(1)` of `a/b/c` is `a`), `clientid`, `username`, `qos`, `msgid`, `flags`, `flag`, `peerhost`, `clientip`, `payload` (`payload('a.b')` is a path) |
 | Callable in EMQX, undocumented there | `div(a, b)`, `mod(a, b)` (the operators in call form), `eq` (Erlang `==`), `null()` (a missing value), `join_to_sql_values_string`, `contains_topic`, `contains_topic_match` — EMQX's take topic filters as maps with an *atom* key, which no rule value has, so any array gives `false` |
@@ -1455,14 +1478,709 @@ Traps that EMQX's reference states only in passing, each checked against this en
   decompression stops, failing the rule, once its output would pass the 1 MiB per-message
   growth budget, so a small payload cannot inflate into gigabytes.
 
-**Not implemented:** `jq`; schema registry and Sparkplug B
+**Not implemented:** schema registry and Sparkplug B
 (`schema_encode`, `schema_decode`, `schema_check`, `sparkplug_encode`,
 `sparkplug_decode`); `maptab_lookup`; the MongoDB date helpers; `term_encode` and
-`term_decode`; and EMQX's state functions (`kv_store_get`, `kv_store_put`,
-`kv_store_del`, `proc_dict_*`), which keep values between messages in a node-local table
-— rule state is designed separately, replicated, in
-[ADR 0085](adr/0085-rule-state-store.md). `getenv` reads only variables named
+`term_decode`. A rule that calls one is refused at load. EMQX's `kv_store_*` and
+`proc_dict_*` are provided: [State](#state-what-a-rule-remembers). `getenv` reads only
+variables named
 `EMQXVAR_…`, as EMQX's does, so the operator chooses what a rule can see.
+
+### `jq`
+
+`jq(Program, Input)` and `jq(Program, Input, TimeoutMs)` run a [jq](https://jqlang.org)
+program over a value and return the array of its outputs, as EMQX's do:
+
+```sql
+SELECT jq('.readings | map(select(.temp > 50)) | length', payload) AS hot
+FROM "sensors/+/data"
+```
+
+`hot` is `[2]` for a payload with two such readings: one element per output of the
+program, so a program with one output still gives an array of one. `first(jq(…))` takes
+that one, and `FOREACH jq(…)` makes one output of the rule per output of the program:
+
+```console
+$ MQTTD_RULES_JQ=1 mqttd --rule-test --sql "SELECT jq('.a, .b', payload) AS both, first(jq('.a + .b', payload)) AS sum FROM \"t/#\"" --payload '{"a": 1, "b": 2}'
+{"both":[1,2],"sum":3}
+```
+
+It is the real jq, built from the sources EMQX's own jq is built from (its fork
+of jq 1.8.1), compiled to WebAssembly and run in a sandbox inside the broker
+([ADR 0086](adr/0086-wasm-rule-functions.md)). A fault in jq fails the rule; it cannot
+reach the broker's memory, files, sockets or environment.
+
+**What it is for.** What rule SQL has no way to say: a sum, an average or a maximum over
+an array, grouping, a payload whose shape is not known in advance, a change at every
+depth of a document. And rules that arrive from EMQX with `jq` in them, which then run
+unchanged. It is not for reading a field, filtering or splitting an array: rule SQL does
+those in a microsecond or two, and a `jq` call costs tens of them
+([What jq costs](#what-jq-costs)). The cookbook has both: jq rules worth their cost, and the plain SQL
+for the common cases ([RULES-COOKBOOK.md](RULES-COOKBOOK.md#jq-when-it-earns-its-cost)).
+
+**It is off by default**, and a rules file that calls it does not load while it is off:
+
+```console
+$ mqttd --rule-test --sql "SELECT jq('.a', payload) AS a FROM \"t/#\""
+rule test FAILED: jq is switched off: set `rules.jq = true` to use it (see RULES.md for what it needs from the host) (line 1, column 8, near `jq('.a', payload) AS a F`)
+```
+
+Switch it on in the broker's configuration, on every node (rules are a per-node file, and a
+node with it off refuses a rules file its neighbours load):
+
+```toml
+[rules]
+jq = true                        # MQTTD_RULES_JQ=1
+# jq_default_timeout_ms = 10000  # what jq/2 runs under: EMQX's default, ten seconds
+# jq_env = ["SITE"]              # the only variables $ENV and env show a program
+```
+
+| Key | Environment | Default | |
+|---|---|---|---|
+| `rules.jq` | `MQTTD_RULES_JQ` | `false` | Whether rules may call `jq`. |
+| `rules.jq_default_timeout_ms` | `MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS` | `10000` | The timeout of `jq/2`, in milliseconds; `jq/3` names its own. |
+| `rules.jq_env` | `MQTTD_RULES_JQ_ENV` (`,`-separated) | empty | The environment variables a program reads as `$ENV.NAME` or `env.NAME`. |
+
+All three are read at startup; a reload reports a change to them as needing a restart.
+`--check-rules` and `--rule-test` read them from the effective configuration (`--config`,
+`MQTTD_*`), so a file or a statement is checked as the broker would load it.
+
+Ten seconds is EMQX's default, kept so that a rule ported from EMQX behaves the same. It
+is far more than a program over one message needs (a call on a 1 KB payload takes well
+under a millisecond), and a call holds a thread and an instance's memory for as long as
+it runs ([Long jq calls](#long-jq-calls)). Unless a ported rule depends on it, set
+`jq_default_timeout_ms` to what your slowest program needs, with room: `100` is generous.
+
+#### What jq needs from the host
+
+jq runs as machine code, compiled from the module when
+rules that call it are first loaded: at boot, on a reload or on an admin API write, never
+when a message arrives. That needs memory the process may map executable, which some
+hardening forbids. By packaging:
+
+| Where the broker runs | What to do beyond `rules.jq = true` |
+|---|---|
+| A plain process | Nothing. |
+| The systemd unit this repository ships | Set `MemoryDenyWriteExecute=false` in a drop-in (below). The unit ships with `true`, and under it a rules file that calls `jq` does not load. |
+| The container image, as `deploy/compose` runs it | Nothing. Read-only root file system, all capabilities dropped, `no-new-privileges`, uid 65532 and Docker's default seccomp profile all leave executable memory alone. Checked with a static build of this tree in the release image's base image, run with those settings (Docker 28.5, Linux arm64): `--check-config` reports that the host allows compiled code, and a `jq` rule evaluates. |
+| Kubernetes, the Helm chart | Nothing. The chart's security context (non-root, no privilege escalation, read-only root file system, all capabilities dropped) does not forbid it, and the chart sets no seccomp profile. Adding `seccompProfile: {type: RuntimeDefault}`, which the "restricted" Pod Security Standard asks for, does not forbid it either. Checked on a kind cluster (Kubernetes 1.36, containerd 2.3, Linux arm64) with pods carrying the chart's security context, with and without `RuntimeDefault`. **Not tested on a managed cluster**, nor on nodes with SELinux enforcing or a seccomp profile of your own: run the check below there. |
+| A seccomp profile that denies `mprotect(PROT_EXEC)`, or an SELinux policy that denies the broker's domain `execmem` | Lift that rule for the broker, or do without `jq`: there is no slower mode that runs under it. |
+
+Under systemd, three steps, on every node:
+
+```sh
+sudo systemctl edit mqttd          # opens /etc/systemd/system/mqttd.service.d/override.conf
+```
+
+```ini
+[Service]
+MemoryDenyWriteExecute=false
+```
+
+```sh
+echo 'MQTTD_RULES_JQ=1' | sudo tee -a /etc/mqttd/mqttd.env
+sudo systemctl restart mqttd       # rules.jq is read at startup; a reload does not apply it
+systemctl show mqttd -p MemoryDenyWriteExecute      # MemoryDenyWriteExecute=no
+```
+
+In a container the switch is the environment variable: `MQTTD_RULES_JQ: "1"` beside
+`MQTTD_RULES_FILE` in the Compose overlay or the chart's `extraEnv`
+([Shipping the rules file](#shipping-the-rules-file)).
+
+To see what a host allows before any rule depends on it, run `mqttd --check-config` with
+the switch on, **under the settings the broker itself runs under** (the service's unit
+properties, the pod's security context). It prints one of two lines after `config OK` and
+exits 0 either way, because the configuration is valid on both hosts:
+
+> `rules.jq is on: this host allows compiled code (jq module sha256 728129fa…)`
+
+> ``warning: rules.jq is on, but the WebAssembly compiler cannot run on this host (it needs memory it may map executable): unable to make memory executable: failed to make memory executable: Permission denied (os error 13). A rules file that calls jq will not load here: under systemd set `MemoryDenyWriteExecute=false` for the service (`systemctl edit mqttd`), or lift the seccomp or SELinux rule that forbids executable memory``
+
+With `jq` on and the host still forbidding it, a rules file that calls `jq` **fails to
+load**: at boot (the broker does not start), on a reload and through the admin API (the
+running rules stay), and in `--check-rules`, with
+
+> ``rules INVALID (rules.toml): rule `shape`: jq is not available: the WebAssembly compiler cannot run on this host (it needs memory it may map executable): … Compiled code needs memory the process may map executable: under systemd set `MemoryDenyWriteExecute=false` for the service (`systemctl edit mqttd`), or lift the seccomp or SELinux rule that forbids it; see RULES.md``
+
+Nothing crashes, and rules that do not call `jq` load as before. CI runs the broker under
+the shipped unit's hardening properties with `systemd-run` and requires exactly these
+messages, and requires the same rules to load and run once `MemoryDenyWriteExecute` is
+`false` (the `wasm sandbox` job).
+
+A broker with `jq` off, or with no rule that calls it, creates nothing of this: no
+compiler run, no extra thread, no fault handler, no executable page.
+
+**What is EMQX's, exactly** (EMQX 6.3.1 is the oracle): the program must be a string; an
+input that is a string is read by jq as JSON text and any other value is encoded first
+(a missing field is the text `undefined`, as in EMQX); every output is returned, in
+order, and outputs before an error are gone with it; program and input end at their first
+NUL; integers of any size and floats come back as jq printed them. An error fails the
+rule with EMQX's tag and text (`jq_err_compile`, `jq_err_parse`, `jq_err_process`,
+`timeout`). The third argument is a whole number of milliseconds, zero or more; anything
+else fails the rule with EMQX's `bad_timeout_val` (`'infinity'` included: a rule cannot
+write EMQX's atom). The timeout does not cover compiling a program, as in EMQX.
+
+Three of these surprise people, here as in EMQX:
+
+- **A string input is parsed, not passed.** `jq('.', payload.name)` with the name `kim`
+  fails with `jq_err_parse`, because `kim` is not JSON. Pass the whole payload and select
+  inside the program (`jq('.name', payload)`), or encode the string first
+  (`jq('.', json_encode(payload.name))`).
+- **`first()` of no output fails the rule** (`first(): first([]) is undefined`). A
+  program that may produce nothing needs an alternative inside it: `(…) // null`.
+- **The program and the timeout may come from the message**:
+  `jq(payload.program, payload.data, payload.ms)` is legal. Whoever may publish to that
+  rule's topics then chooses what runs and for how long, within the limits below. Write
+  programs as literals unless you mean to offer that.
+
+**Writing a program in a rules file.** A program sits in a rule SQL string, which is
+single-quoted and has no escape for a quote, inside a TOML string. Use a TOML literal
+string (`'''…'''`) for `sql`, so that jq's own `"`, `\(…)` and `$name` need no escaping,
+and write a single quote inside a program as `\u0027` in a jq string:
+
+```toml
+[rules.label]
+sql = '''
+SELECT first(jq('"\(.site)\u0027s reading: \(.temp)"', payload)) AS label, topic(2) AS device
+FROM "sensors/+/data"
+'''
+actions = [{ function = "republish", args = { topic = "labels/${device}", payload = "${label}" } }]
+```
+
+A literal program is compiled when the rules are loaded. One that does not compile is a
+load **warning**, not an error, because EMQX accepts such a rule too: every call then
+fails the rule with `jq_err_compile`. `mqttd --check-rules` prints the warning.
+
+#### Limits of jq, and what happens at each
+
+Every limit is an evaluation error like any other:
+the rule fails for this message, the message itself is routed as usual, and the failure
+is counted by kind in `mqttd_rule_function_errors_total{function="jq",kind}` and
+reported with its text in the log, the rule's last error and the trace. A limit never
+turns into "no result", so a `WHERE` is never passed because a call was cut off.
+
+| Limit | Value | The rule's error | `kind` |
+|---|---|---|---|
+| Time | `jq/2`: `rules.jq_default_timeout_ms`. `jq/3`: its third argument. A call always gets one millisecond, so a timeout of `0` still runs what is quick, as in EMQX | `jq(): timeout: jq program canceled as it took too long time to execute (timeout set to 50 ms)` (EMQX's text) | `timeout` |
+| Compiling a program | 5 s per program; outside the timeout above, as in EMQX. One compilation takes about a millisecond | `jq(): sandbox_limit (compile_timeout): jq stopped: compiling the program took longer than 5000 ms` | `compile_timeout` |
+| Memory | 64 MiB per instance, which is per call: one call runs in one instance | `jq(): sandbox_limit (memory): jq stopped: the module reached its memory limit` | `memory` |
+| Output | What is left of the message's 1 MiB build budget, which all function calls of one message share. A call's output is charged whole, so `jq('.', payload)` on a 600 KB payload passes once in a statement and fails the second time | `jq(): sandbox_limit (output): jq output is larger than the limit` | `output` |
+| Stack | 4 MiB of call stack, and 1 MiB of C stack inside the module's memory. `reduce range(20000) as $i (null; [.]) \| 1`, which ends an EMQX 6.3.1 node, returns `[1]`; at 300,000 deep the call fails | `jq(): sandbox_limit (stack): …`, or, when it is the C stack that runs out, `jq(): jq_err_system: the module trapped: … out of bounds memory access` | `stack`, `trap` |
+
+After a timeout the program is asked to stop and usually does within the same instance.
+After a memory or stack error, a trap, or a program that did not stop within 2 ms of being
+asked (one long regular expression match), the instance is dropped and the next call gets
+a new one, counted in `mqttd_rule_module_instances_replaced_total{module="jq"}`. The call
+that follows a dropped instance pays for a new instance and for compiling its program
+again, about a millisecond together.
+
+The other kinds are jq's own answers, not limits: `compile`, `parse`, `process` and
+`system` (EMQX's tags), `argument` (a program that is not a string, a bad timeout) and
+`decode` (an output the rule engine's JSON reader refuses, such as `1E+1000`, as in
+EMQX).
+
+**What differs from EMQX:**
+
+| | EMQX | mqttd |
+|---|---|---|
+| Switch | Always on | Off unless `rules.jq = true` |
+| `$ENV`, `env` | The broker's whole environment | Empty unless a variable is listed in `rules.jq_env`: a program can come from a payload, and its output can be republished. A ported rule that reads `$ENV.X` gets `null` until `X` is listed |
+| Memory | Unbounded: a program can take the node's memory | 64 MiB per call; the rule fails |
+| Output | Unbounded | What is left of the message's 1 MiB build budget, which every function call of the message shares; the output of each call is charged to it |
+| Stack | The NIF's C stack: `reduce range(20000) as $i (null; [.])` ends an EMQX 6.3.1 node | 4 MiB; that program returns its result, and a deeper one fails the rule |
+| Compiling a program | Unbounded | 5 s per program (one takes about a millisecond) |
+| The timeout | Seen only between two steps of a program: one long regex match is never stopped | Always stops the call |
+| A wrong number of arguments | Fails the rule on each message | Fails the load |
+| Transcendental functions | glibc's | musl's: of 135 probed values, 18 differ in the last one or two digits (`tgamma`, `cbrt`, `exp10`, `j0`, `lgamma`, `y0`, `log10`, `tan`). `pow`, `sqrt`, `sin`, `cos`, `exp`, `log`, `atan`, the rounding functions and all arithmetic gave the same digits |
+| `strptime` with `%z` | Parses the offset | Fails the rule (`jq_err_process: … does not match format …`) |
+| `strftime("%Z")` of a UTC time | `GMT` | `UTC` |
+| `now`, `localtime`, `mktime` | The node's clock and time zone | The node's clock, in UTC |
+| Compiled programs kept | 500 per scheduler thread | 32 per instance, the most recently used; only the cost of a program taken from a payload can show it |
+
+Of 285 programs and inputs run on EMQX 6.3.1, 278 give the same bytes here; the rest are
+the transcendental and the two time-format rows and the program that ends the EMQX node.
+
+#### What jq costs
+
+Measured on an Apple M1 Pro, release build, one thread, unless a row names
+another host ([ADR 0086](adr/0086-wasm-rule-functions.md), §3 to §8, with the method):
+
+| | Cost | When |
+|---|---|---|
+| One call, 1 KB payload | 27 to 102 µs, for six programs from `.a.b` to a regular-expression `select` over an array: 1.9 to 3.1 times native jq, which is what EMQX runs. One core evaluates ten to thirty-five thousand such messages a second | Every call, on the publisher's connection task |
+| One call, 100 KB payload | 2.6 to 10.8 ms for the same programs | Every call |
+| The same work in rule SQL | 1.4 to 1.8 µs for a `WHERE` and a republish on a small payload ([Performance](#performance)) | |
+| Compiling the module | 0.56 s; about 0.8 s on Linux arm64 and on GitHub's amd64 runner. The broker logs it with the time it took: `rules: the rules call jq; its WebAssembly module is compiled (once per process, ADR 0086) took_ms=…` | Once per process, by the first load of rules that call `jq` (boot, a reload, an admin API write, `--check-rules`, `--rule-test`), on the thread doing that load |
+| Compiling a program | About 1 ms | Literal programs: when the rules are loaded. A program from a payload: on its first use in each instance |
+| A new instance | 52 µs | When the rules are loaded, and after a call that was stopped |
+| Memory, once | 7 MiB on Linux arm64 with musl's allocator, 28 MiB with glibc on GitHub's amd64 runner, 42 MiB on macOS: the machine code and what the allocator keeps of the compiler's working memory. Measured with the sandbox crate's own program, not the broker | From the first load on |
+| Memory, per instance | 3.4 to 3.8 MiB of linear memory, of which about 1.1 MiB is resident on Linux (1.5 MiB on macOS). The broker keeps one warm instance per runtime worker thread (per core, by default). A 100 KB payload leaves an instance at 5.4 to 6.3 MiB; an instance never shrinks, and one grown past 16 MiB is dropped after its call | While rules that call `jq` are loaded |
+| Address space | 4 GiB and a guard region reserved per instance. It is address space, not memory, but a process limited by `ulimit -v` or systemd's `LimitAS=` has to allow for it | Per instance |
+| Binary size | A static, stripped `aarch64-unknown-linux-musl` release `mqttd` built from this tree: 16.9 MB without the `jq` cargo feature, 24.3 MB with it, the 985 kB module included. On x86_64 the runtime's share is about 3 MB larger (ADR 0086 §8, measured on the sandbox alone) | |
+
+#### Long jq calls
+
+A rule is evaluated on its publisher's connection task. A `jq` call that
+is still running after one millisecond is suspended once and continued with the worker
+thread's other connections handed to another thread, so a call that runs long holds its
+own publisher's connection for that time and nobody else's: a QoS 1 publisher waits for
+its PUBACK, and its next packets wait behind it. Measured with one worker thread: while
+one connection's `jq` ran into the ten-second timeout, another completed 6,974 QoS 1
+publishes, median 152 µs, slowest 6.2 ms (Apple M1 Pro, debug build).
+
+**There is no cap on how many calls run long at once.** Each occupies a thread, up to the
+runtime's limit on blocking threads (tokio's default of 512; mqttd does not change it),
+and an instance of up to 64 MiB, beyond the warm ones. A publisher runs one call at a
+time, so the bound in practice is how many connections may publish to a rule's topics at
+the same moment, each for as long as its timeout allows. What keeps that small is yours
+to set: a low `rules.jq_default_timeout_ms`, literal timeouts in `jq/3`, programs written
+in the rules file and not taken from payloads, the ACL on the topics such rules select,
+and a memory limit on the service (the shipped unit's `MemoryMax`, a container limit).
+A Will's rules run on a task of their own while the loaded rules call `jq`. Message
+events about clients that are not connected are evaluated by one task, so a long call in
+such a rule delays the events queued behind it and nothing else.
+
+#### jq metrics
+
+On `/metrics`:
+
+| Series | Meaning |
+|---|---|
+| `mqttd_rule_function_calls_total{function="jq"}` | Calls. Live evaluations only: dry runs are not counted |
+| `mqttd_rule_function_errors_total{function="jq",kind}` | Failed calls, by the kinds above. Each is also its rule's failure in `mqttd_rule_evaluations_total{result="failed"}` |
+| `mqttd_rule_function_seconds_total{function="jq"}` | Time spent in calls; part of the calling rule's `mqttd_rule_eval_seconds_total` |
+| `mqttd_rule_module_instances{module="jq"}` | Instances held, waiting or in a call. More than the number of worker threads means calls are running long at once |
+| `mqttd_rule_module_memory_bytes{module="jq"}` | Their linear memory, as of each one's last call |
+| `mqttd_rule_module_instances_replaced_total{module="jq"}` | Instances given up: stopped at a limit, or grown too large to keep |
+
+```promql
+# Mean time of a jq call. Tens of microseconds is normal; milliseconds means large payloads or a slow program.
+rate(mqttd_rule_function_seconds_total{function="jq"}[5m]) / rate(mqttd_rule_function_calls_total{function="jq"}[5m])
+# Calls stopped by a limit: a program or a payload is larger than you planned for.
+sum by (kind) (rate(mqttd_rule_function_errors_total{function="jq",kind=~"timeout|memory|output|stack|trap|compile_timeout"}[5m])) > 0
+```
+
+A failed call is also its rule's failure, with its text, in the log, the statistics and
+the trace ([Watch a running rule](#watch-a-running-rule)).
+
+**In a cluster** the switch is per node, like the rules file. Set it, and whatever the
+host needs, on every node before any rules file calls `jq`: a node with it off refuses
+the file its neighbours load. At boot that node does not start; on a reload it keeps its
+old rules, and `mqttd_rules_info{checksum}` and `summary.same_rules` of
+`mqttd --admin cluster --json` show the difference ([Operating rules](#operating-rules)).
+The same module is in every release binary, so the same program gives the same bytes on
+every node and every platform.
+
+**Builds.** Release binaries and images carry the jq module. A build from source carries
+it when `crates/mqtt-wasm-sandbox/jq-module/jq.wasm` exists when it is built
+(`crates/mqtt-wasm-sandbox/jq-module/build.sh` builds it, with zig 0.16.0; an image built
+from a checkout carries it if the file was there when `docker build` ran); without it the
+build is whole, and `rules.jq = true` then says that this build has no jq.
+`cargo build --no-default-features` leaves the WebAssembly runtime out altogether:
+`rules.jq = true` then answers ``this mqttd was built without jq (the `jq` cargo feature is off)``, and a `[functions.<name>]` table does not load ([HARDENING.md](HARDENING.md)).
+
+### Your own functions: `[functions.<name>]`
+
+A rules file can add functions of your own, supplied as WebAssembly modules and run in
+the sandbox `jq` runs in ([ADR 0086](adr/0086-wasm-rule-functions.md) D9). **This is an
+mqttd extension: EMQX has nothing like it, and a rules file that uses it does not load
+there.** A module is declared by a table beside the rules:
+
+```toml
+[functions.geo]                  # the module's name here: a lower-case letter, then letters, digits, `_`
+wasm = "plugins/geo.wasm"        # under the directory of the rules file
+sha256 = "88aa6c6d…"             # the file's SHA-256, 64 hex digits: any other content fails the load
+functions = ["geo_distance", "geo_within"]   # the functions rules may call, among those the module describes
+timeout_ms = 50                  # how long one call may run; default 100, at most 10000
+memory_mib = 16                  # the most memory one instance may hold; default 16, at most 64
+clock = false                    # true: the module reads the wall clock; false: every clock reads 0
+env = []                         # environment variables the module sees; see below
+fresh_instance = false           # true: every call gets a new instance, and no state survives a call
+```
+
+`wasm`, `sha256` and `functions` are required. A rule then calls a function like any other:
+
+```sql
+SELECT geo_distance(payload.lat, payload.lon, 55.6761, 12.5683) AS metres
+FROM "trackers/+/position"
+WHERE geo_within(payload.lat, payload.lon, 55.6761, 12.5683, 5000)
+```
+
+Declaring a module is what switches it on: there is no key for it in the broker's
+configuration, and `rules.jq` does not have to be set. A broker whose rules file declares
+none creates nothing of the WebAssembly runtime. A module needs from the host what `jq`
+needs, memory the process may map executable
+([What jq needs from the host](#what-jq-needs-from-the-host), which holds for a module
+word for word): under the shipped systemd unit, `MemoryDenyWriteExecute=false`; in the
+container image and under the Helm chart's security context, nothing.
+
+**When to write one.** In this order:
+
+1. **Rule SQL**, whenever it can say it. It costs a microsecond or two and needs nothing
+   from the host.
+2. **`jq`**, for reshaping and aggregating JSON that rule SQL cannot express. Nothing to
+   build or to place on the nodes; tens of microseconds a call, and it reads its input as
+   JSON text every time.
+3. **A module**, for what neither does, or does too slowly: a computation over bytes
+   that are not JSON (a checksum, a vendor's binary frame), arithmetic jq makes awkward
+   (the distance between two coordinates), a function called on every message of a busy
+   topic. The two worked examples are one of each kind. A module is code you build, pin,
+   place on every node and keep building: it is the last resort, not the first.
+
+A module computes from its arguments and nothing else. It cannot look anything up,
+keep state the rules can rely on (an instance may be replaced at any call), publish, or
+reach a file or a socket; a function that needs one of those is not a rule function
+([What rules cannot do](RULES-COOKBOOK.md#what-rules-cannot-do)).
+
+**What is checked when the rules are loaded**, at boot, on a reload, through the admin
+API and in `mqttd --check-rules`. Each is a load error with its reason, and the running
+rules stay:
+
+| Check | The error |
+|---|---|
+| The file has the pinned hash | ``functions `geo`: wasm = "plugins/geo.wasm": the file does not have the sha256 the table pins (…); `sha256sum` prints the file's`` |
+| It exports the function ABI | `the module does not export the function ABI: …` |
+| It speaks this broker's ABI version | `the module speaks ABI version 2, this host 1` |
+| It imports nothing but what the sandbox provides | `the module imports env.system, which is not provided` |
+| It describes every function the table names | ``the module does not provide `geo_area` (it describes: geo_distance, geo_within)`` |
+| No function has a built-in function's name, or the name of any function of EMQX's rule engine (those mqttd refuses included) | ``a module cannot provide `upper`: a built-in function has that name, and a module must not change what a rule written for EMQX means`` |
+| The path stays under the rules file's directory | ``a module is named by a relative path under the rules file's directory, without `..` ``; `a symlink leads out of the rules file's directory` |
+
+The file is read and compared with its hash on every load, so a file replaced on disk
+under an unchanged rules file fails the next reload. A rule that calls a function with a
+number of arguments the module does not describe fails the load too, as for a built-in
+function. A file declares at most 16 modules, each at most 16 MiB.
+
+**Who may name a file.** A module is code, so where it may come from is fixed: only from
+under the directory of the configured rules file, by a relative path of plain names that
+ends in `.wasm`, wherever the rules text came from. A rules writer of the admin API
+(`[rules] admin_writers`), and an operator checking or dry-running rules text, can
+therefore name only a file you placed in that directory, and only by a hash they already
+know: the error for a wrong hash does not say what the file's hash is. Keep the module
+files owned by another user than the broker's and not writable by it. A module's
+environment is held the same way. A table's `env` may name only variables the broker's own
+configuration lists:
+
+| Key | Environment | Default | |
+|---|---|---|---|
+| `rules.functions_env` | `MQTTD_RULES_FUNCTIONS_ENV` (`,`-separated) | empty | The environment variables a module may be shown. Read at startup. |
+
+**What a module can and cannot do.** It computes: its functions take values and return a
+value. It has one memory of its own and no way to name anything outside it: no file, no
+socket, no randomness, no other function, nothing of the broker or of another module. It
+reads the clock only with `clock = true` and sees only the environment variables its
+table lists. A fault in it fails the rule, never the broker. It can keep state in its
+memory between calls, and the same instance serves many messages; use
+`fresh_instance = true` where that must not happen (an instantiation per call: 52 µs for the jq module). All of this
+rests on the WebAssembly runtime and its compiler being sound; a module is code you
+vouch for, pinned by its hash.
+
+**Limits.** Each is an evaluation error: the rule fails for this message, counted by
+kind, and the message is still routed.
+
+| Limit | Value | The error, counted as |
+|---|---|---|
+| Time | `timeout_ms` per call | `sandbox_limit (timeout): the call ran past its 50 ms …`, `timeout` |
+| Memory | `memory_mib` per instance | `sandbox_limit (memory): …`, `memory` |
+| Output | what is left of the message's 1 MiB build budget; each call's result is charged to it whole | `sandbox_limit (output): …`, `output` |
+| Stack | 4 MiB of call stack | `sandbox_limit (stack): …`, `stack` |
+| The function's own refusal | any status but 0 | `status 1: <the module's message>`, `module` |
+| A trap, or a broken reply | | `the module trapped: …`, `trap` |
+
+A call that runs for more than a millisecond holds its own publisher's connection and
+nobody else's, as for `jq`, and as for `jq` nothing caps how many such calls run at once:
+each holds a thread and an instance of up to `memory_mib`
+([Long jq calls](#long-jq-calls)). Keep `timeout_ms` and `memory_mib` at what the function
+needs; the defaults (100 ms, 16 MiB) are already far below the ceilings (10 s, 64 MiB).
+
+The series are `jq`'s, with the function's and the module's
+names: `mqttd_rule_function_calls_total{function}`,
+`mqttd_rule_function_errors_total{function,kind}`,
+`mqttd_rule_function_seconds_total{function}`, and per module
+`mqttd_rule_module_instances{module}`, `mqttd_rule_module_memory_bytes{module}` and
+`mqttd_rule_module_instances_replaced_total{module}`.
+
+**Changing a module while the broker runs.** Put the new file beside the old one, change
+`wasm` and `sha256` in the rules file, and reload (or write the rules through the admin
+API). The new module is loaded beside the running one; messages evaluated from then on
+call it, and a call that is in flight finishes on the module it started on, which is let
+go when the last such call has returned. A table that did not change keeps its loaded
+module and its warm instances. `mqttd --admin rules` lists each module under the rules:
+its version and hash, its functions, its limits, and its instances with the memory they
+hold (`GET /admin/v1/rules`, `modules[]`; the module's bytes are never served).
+`mqttd --check-rules` lists what it loaded, and `mqttd --rule-test` runs a statement with
+the functions the configured rules file (`rules.file`) declares.
+
+**In a cluster** rules are a per-node file, and so are modules: place the same file on
+every node. The hash in the rules file is what makes that checkable: a node holding
+another file under the same name does not load the rules, and
+[the rules digest](#operating-rules) covers the table.
+
+**Who can make the broker run what.** Stated once, in one place:
+
+- **You**, by placing a file in the rules file's directory and pinning it in the rules
+  file. A module is code you vouch for, as you vouch for the rules.
+- **A rules writer of the admin API** (`[rules] admin_writers`), and **any operator of the
+  admin API** through a `check` or a `test` of rules text: a module you placed there,
+  whose SHA-256 they already know, under the names it describes, with limits up to the
+  ceilings above and the environment variables `rules.functions_env` lists. Not a file of
+  their own: the API writes no module, and reads none from anywhere else.
+- **A publisher**: the arguments of the calls your rules make, never the code.
+- **Nobody**, through the peer bus: rules and modules do not travel between nodes.
+
+What stands behind "runs in the sandbox" is the WebAssembly runtime and its compiler:
+[THREAT-MODEL.md](THREAT-MODEL.md#rule-functions-in-the-webassembly-sandbox-adr-0086) says
+what is mitigated and what is left.
+
+**Writing one.** The ABI is six exports and one frame format. A module exports its
+linear memory as `memory`, and:
+
+| Export | What the broker does with it |
+|---|---|
+| `mqttd_abi_version() -> u32` | Must return `1`; anything else fails the load |
+| `mqttd_alloc(len: u32) -> address` | Asks for `len` bytes to write the call's name and arguments into. `0` fails the call (counted as `memory`) |
+| `mqttd_free(address)` | Gives back what `mqttd_alloc` returned, and each result once it has been read |
+| `mqttd_describe(ret)` | Called once at load. The module leaves JSON at `ret`: `{"module":"geo","version":"0.1.0","functions":[{"name":"geo_distance","min_args":4,"max_args":4}]}`. Unknown keys are ignored. The arities are what a rule's call is checked against when the rules are loaded |
+| `mqttd_call(name, name_len, args, args_len, max_out, ret) -> status` | One call of the function `name`. Status `0`: the result at `ret` is the value. Any other status fails the rule, with the bytes at `ret` as its message (counted as `module`). A result longer than `max_out` bytes is refused unread (counted as `output`) |
+| `mqttd_cancel()` | Optional. Called at the deadline; a call still running 2 ms later is stopped and its instance dropped |
+
+`ret` is the address of two little-endian `u32`: the module writes there the address and
+the length of the bytes it answers with, and the broker reads them and frees them with
+`mqttd_free`. `_initialize`, when exported (a C or Rust reactor has it), is run once per
+instance.
+
+The argument frame at `args` is a `u32` count, then for each argument one tag byte, a
+`u32` length and that many bytes, all integers little-endian. The tag says how the value
+crossed:
+
+| Tag | The value | Its bytes |
+|---|---|---|
+| `b` | A string or a payload | As they are, UTF-8 or not |
+| `j` | Anything else: a number, a boolean, an array, a map, a missing value | The JSON text the rule engine writes, so an integer of any size and a float both arrive exact (`1` and `1.0` stay different) |
+
+A result is one value in the same form, a tag byte and then the bytes: `b` and the bytes
+of a string, or `j` and JSON text, which is read with the rule engine's own reader.
+
+Argument types are not declared: a function checks what it was given and refuses what it
+cannot use with a status and a message, as `geo_distance` does for a latitude of 91
+(`geo_distance(): status 1: a latitude is from -90 to 90, got 91`). A module may use the
+WebAssembly features a C compiler needs for `wasm32-wasi` (bulk memory, multi-value, sign
+extension, non-trapping conversions, mutable globals) and no others: no SIMD, no threads,
+no tail calls; `build.sh` holds the compiler flags that keep to them.
+
+[`examples/rule-plugins`](../examples/rule-plugins/) has two worked examples with the ABI
+written out, one in Rust (no dependencies, built for `wasm32-unknown-unknown`) and one in
+C (built with `zig cc -target wasm32-wasi`), and the script that builds them:
+
+```sh
+examples/rule-plugins/build.sh        # out/geo.wasm, out/telemetry.wasm, and each one's sha256
+```
+
+A C module may link its C library: the sixteen WASI functions wasi-libc calls are
+provided, and none of them reaches a file or a socket. A build without the WebAssembly
+runtime (`cargo build --no-default-features`) cannot load a module and says so.
+
+### State: what a rule remembers
+
+A rule sees one message at a time. The state functions let it keep values between
+messages: a count, the last value, when a condition first held
+([ADR 0085](adr/0085-rule-state-store.md)). This is the first part of that work: state
+lives **in memory, on the node that evaluated the rule**, and starts empty at every
+restart. Replication between nodes, an event when a key expires, metrics and the admin
+verbs are not built yet; this section will grow with them.
+
+There are three families, and they do not share keys (`kv_get('x')` does not read what
+`kv_store_put('x', …)` wrote, and `--check-rules` warns about a file that calls both;
+neither reads what `proc_dict_put('x', …)` wrote):
+
+**EMQX's table**, with EMQX's results (probed on EMQX 6.3.1), for rules ported from it:
+
+| Function | Returns |
+|---|---|
+| `kv_store_put(key, value)` | `true` |
+| `kv_store_get(key)`, `kv_store_get(key, default)` | the value; `undefined`, or `default`, when there is no such key |
+| `kv_store_del(key)` | `true`, whether or not the key was there |
+
+One table per node, shared by every rule, as in EMQX. A key and a value may be of any
+type, and a key is matched exactly: `1`, `1.0` and `'1'` are three keys, `0.0` and `-0.0`
+two, a map is the same key whatever order it was written in. `undefined` is a value like
+any other: `kv_store_get(key, default)` returns it, not the default.
+
+**EMQX's process dictionary**, with EMQX's results (probed on EMQX 6.3.1), for rules
+ported from it:
+
+| Function | Returns |
+|---|---|
+| `proc_dict_put(key, value)` | the value held before, or `undefined` |
+| `proc_dict_get(key)` | the value, or `undefined` |
+| `proc_dict_del(key)` | the value held before, or `undefined` |
+
+In EMQX these work on the dictionary of the process that evaluates the rule, and that
+process is the client's connection. Here it is **one dictionary per client connection**,
+with the same reach:
+
+- It is empty when the client connects and gone when the connection ends. A reconnect, a
+  session that is resumed and a connection that takes the client id over all start with an
+  empty one, as they do in EMQX.
+- Everything that connection evaluates works on it: the client's publishes and the
+  messages their rules republish, its `client/…`, `auth/…` and `session/…` events
+  (`client/disconnected` still sees it), `message/delivered` and `message/acked` for the
+  deliveries to it, and `message/dropped` and `message/delivery_dropped` about its
+  publishes and deliveries while it is connected. So a rule on `client/connected` can put
+  a value that a rule on the client's publishes reads.
+- No other client's rules see it, and neither does a rule on another node.
+
+A key and a value may be of any type, and a key is matched exactly, as for `kv_store_*`.
+A key that holds `undefined` and a key that is not there answer alike, as in EMQX.
+
+Three evaluations run where there is no connection, and work on an **empty dictionary that
+is discarded afterwards**; in EMQX each still sees the client's:
+
+- a Will's rules (EMQX evaluates them in the connection's process as it ends);
+- an event about a session that has no connection, such as `message/delivery_dropped` for
+  an offline session (EMQX keeps the process, and its dictionary, for as long as the
+  session waits to be resumed);
+- `message/dropped` for a message that a rule republished, or for a Will.
+
+**mqttd's own** (an mqttd extension: EMQX has no function of these names):
+
+| Function | Returns |
+|---|---|
+| `kv_get(key)` | the value, or `undefined`. A counter reads as its count, a set as an array of its elements |
+| `kv_set(key, value[, ttl])` | the value written |
+| `kv_set_once(key, value[, ttl])` | the value now held: the new one, or the one already there |
+| `kv_incr(key[, by[, ttl]])` | the count after. `by` is an integer, 1 unless given, and may be negative |
+| `kv_max(key, value[, ttl])`, `kv_min(key, value[, ttl])` | the larger (smaller) of `value` and the number held, which is stored |
+| `kv_add(key, element[, ttl])` | the number of elements in the set after (at most 1,024, each at most 256 bytes) |
+| `kv_del(key)` | whether a value was there |
+| `kv_ttl(key)` | whole seconds until the key expires, rounded up; `undefined` for no key |
+| `kv_held(key, condition[, ttl])` | how many whole seconds `condition` has been `true` without a break. It records when it first became true; on anything but `true` it deletes the key and returns `undefined` |
+| `kv_changed(key, value[, ttl])` | whether `value` differs exactly from the one stored, storing it: `true` the first time |
+
+A key is a string of 1 to 256 bytes. A value is anything but `undefined`, at most 4 KiB as
+JSON (a string as its bytes). A TTL is a whole number of seconds or a duration such as
+`'10m'` (`s`, `m`, `h`, `d`), at least one second; a write without one gives a new key the
+namespace's `default_ttl` and leaves an existing key's expiry alone. A key has the type of
+the function that created it until it is deleted or expires: `kv_incr` on a key `kv_set`
+wrote fails the rule (`wrong_type`). `kv_get`, `kv_ttl` and `kv_del` take any.
+
+**A state call takes effect when evaluation reaches it, and nothing undoes it.** That is
+EMQX's behaviour for `kv_store_put`, and evaluation order is EMQX's: every `SELECT` field,
+left to right, then the `WHERE`.
+
+- A call in a `SELECT` field runs for **every message the `FROM` selects**, whether or not
+  the `WHERE` then passes. `SELECT kv_incr('n') AS n … WHERE payload.ok = true` counts every
+  message, not the ones that pass.
+- `AND` and `OR` stop at the operand that decides, and a `CASE` evaluates only the branch
+  it takes. To write only for messages that match, put the condition first:
+  `WHERE payload.temp > 30 AND kv_incr('hot') > 5`, or
+  `CASE WHEN payload.temp > 30 THEN kv_incr('hot') END AS hot`. An `IN` list is evaluated
+  whole, as in EMQX.
+- A `CASE x WHEN v THEN …` evaluates `v` and then `x`, again for each `WHEN` it comes to,
+  as EMQX does: a call in `x` runs once per `WHEN` tried, so
+  `CASE kv_incr('n') WHEN 5 THEN … WHEN 10 THEN …` counts twice on a message that matches
+  neither. Count in a field of its own and compare the field:
+  `SELECT kv_incr('n') AS n, CASE n WHEN 5 THEN … END AS step`.
+- In a `FOREACH`, a call in the `INCASE` runs once per element, one in the `DO` once per
+  element that passed.
+- A write stays when a later field fails the rule, when the `WHERE` is false, and when an
+  action fails. A QoS 1 publish that is sent again is evaluated again and writes again.
+- A later rule the message matches, and the rules a republished message re-enters, see the
+  write. A rule also runs on its own republished output, so one that counts and republishes
+  into its own `FROM` counts twice.
+
+`kv_held` and `kv_changed` are made for this order: they run on every message and carry
+their own reset. "Above 30 for five minutes", and "only when the state flips":
+
+```toml
+[rules.hot_sensor]
+sql = '''
+SELECT clientid, payload.temp AS temp,
+       kv_held('hot:' + clientid, payload.temp > 30, 3600) AS hot_for
+FROM "sensors/+/data"
+WHERE hot_for >= 300
+'''
+actions = [{ function = "republish", args = { topic = "alerts/hot", payload = "${.}" } }]
+
+[rules.state_flip]
+sql = '''
+SELECT clientid, payload.state AS state
+FROM "machines/+/status"
+WHERE kv_changed('state:' + clientid, payload.state)
+'''
+actions = [{ function = "republish", args = { topic = "changes/state", payload = "${.}" } }]
+```
+
+**Namespaces.** `kv_*` keys live in a namespace. Without anything else it is the rule's
+own, so two rules cannot clobber each other's keys by accident. Rules share state by
+naming a namespace the file declares; the namespace is never read out of a key, since
+keys are built from values a publisher chooses.
+
+```toml
+[state.fleet]              # a lower-case letter, then up to 63 lower-case letters, digits or `_`
+max_keys = 50000           # default 100,000; at most 1,000,000
+max_bytes = "32MiB"        # default 64 MiB; at most the broker's rules.state_max_bytes
+default_ttl = "1h"         # default 24 hours
+max_ttl = "7d"             # default and at most 30 days
+eviction = "fail"          # or "lru": the least recently used key makes room
+
+[rules.count_reports]
+state = "fleet"
+sql = 'SELECT clientid, kv_incr(clientid) AS reports FROM "reports/#"'
+actions = [{ function = "console" }]
+```
+
+`[state.default]` sets the bounds of the rules' own namespaces and `[state.kv_store]` those
+of EMQX's table (which has no expiry: a TTL there is refused); a file declares at most 64
+others. `consistency = "local"` is the only mode this release has: `"eventual"` and
+`"strong"` are refused at load. Across a reload a namespace that is still declared, and
+the namespace of a rule that kept its id, keeps its keys, and changed bounds apply at once
+(lowering `max_keys` evicts nothing; it refuses new keys until the count is below it); a
+namespace that is no longer declared, and the namespace of a rule that is gone or renamed,
+is dropped with its keys.
+
+**Bounds.** Keys carry client ids, topic levels and payload fields, so everything a
+message can make the broker hold is bounded. A key that does not exist yet is refused,
+failing the rule, when its namespace is full (`namespace_full`; with `eviction = "lru"`
+the least recently used key goes instead), when all namespaces together hold
+`rules.state_max_bytes` (`store_full`; 256 MiB unless configured, and `0` switches rule
+state off: a rules file that uses it then does not load), or while the broker is over its
+memory watermark (`brownout`). Existing keys still update. One message may make at most
+1,024 state calls across every rule it matches and every message they republish, and what
+it reads from state counts against its 1 MiB function budget. A refused call fails the
+rule, counted and logged like any SQL error; it is never "no result". EMQX's table has no
+bounds of its own; here a `kv_store_put` key is at most 256 bytes as JSON and a value
+4 KiB. Nor has EMQX's process dictionary; here a connection's dictionary holds at most
+64 keys, and 64 KiB of keys and values together (each as JSON, a string as its bytes). A
+`proc_dict_put` past either fails the rule (`dictionary_full`) and leaves what was held;
+`proc_dict_del` frees a key. What the dictionaries hold counts against
+`rules.state_max_bytes` like any key (`store_full`), a dictionary does not grow while the
+broker is over its memory watermark (`brownout`), and every `proc_dict_*` call is one of
+the message's 1,024.
+
+**Testing.** `mqttd --rule-test`, `mqttd --check-rules` and the admin API's rule test work
+on an empty store of their own that is dropped afterwards: they never read or write the
+state the running rules keep (EMQX's SQL test writes the node's real table). `proc_dict_*`
+work on an empty dictionary of the test's own, never a connection's (as in EMQX, where
+each SQL test over the API runs in a process of its own). Within one test a later call
+sees an earlier one:
+
+```console
+$ mqttd --rule-test --sql 'SELECT kv_incr(clientid) AS first, kv_incr(clientid) AS second, kv_changed(topic, qos) AS changed FROM "t/#"'
+{"first":1,"second":2,"changed":true}
+```
+
+**Cost.** A state call is one operation on an in-memory map under a lock held for that
+operation only; it never waits, and a rules file that calls none pays nothing. A
+`proc_dict_*` call takes no lock at all: the dictionary belongs to the connection that
+is evaluating. Measured
+(`cargo bench -p mqttd --bench rule_state`, Apple M1 Pro, 2026-10): one call adds 0.35 to
+0.5 µs to the evaluation of a publish (1.38 µs without, 1.74 µs with a `kv_incr`, 1.88 µs
+with a `kv_held`); the store's part of that is 0.11 to 0.14 µs. With every worker thread
+calling at once, each on keys of its own (a key per device), a call takes 0.14 µs on two
+threads, 0.20 µs on four and 0.33 µs on eight; with all of them incrementing **one** key,
+0.19 µs, 0.63 µs and 1.9 µs. A new key in a full `lru` namespace costs an eviction: 0.9 µs
+alone, about 10 µs when eight threads do nothing else.
 
 ## Actions
 
@@ -1622,6 +2340,14 @@ a release has the rule engine, each one also needs a binary or image built from 
 - **Kubernetes** (the Helm chart): a ConfigMap mounted through the chart's extra volume
   values ([KUBERNETES.md](KUBERNETES.md#rules)).
 
+A rules file that calls [`jq`](#jq) needs its switch wherever `MQTTD_RULES_FILE` is set:
+`MQTTD_RULES_JQ=1` in the same environment file, Compose overlay or `extraEnv`, on every
+node, before the file that needs it arrives; under systemd it also needs the drop-in
+([What jq needs from the host](#what-jq-needs-from-the-host)). A module a rules file
+declares is shipped with it, into the same directory: beside `rules.toml` in
+`/etc/mqttd/` (owned by root and readable by the `mqttd` group, as that file is), in the mounted `rules/` directory, or in
+the same ConfigMap.
+
 Each of these is read-only to the broker, which is right for a file you ship: keep
 `[rules] admin_writers` empty with them. Writing rules through the admin API needs a
 directory the broker owns ([Through the admin API](#through-the-admin-api)).
@@ -1646,12 +2372,17 @@ across the connection tasks. These are microbenchmarks of the engine, not a clus
 benchmark. A derived message costs what any publish costs to route, so a rule that
 doubles your message count doubles the routing load.
 
+A [state](#state-what-a-rule-remembers) call adds 0.35 to 0.5 µs to the evaluation of a
+publish, and more when every worker thread calls the store at once; the figures, and the
+machine they were measured on, are in that section. A rules file that calls no state
+function pays nothing for them.
+
 ## Differences from EMQX
 
 Verified against EMQX's rule engine source and documentation (emqx/emqx and
 emqx/emqx-docs, release 6.2). Each row is a behaviour a rule written for EMQX could
-notice, except the last, which is what a rule written for mqttd could: statements only
-mqttd accepts.
+notice, except the last two, which are what a rule written for mqttd could: conditions
+EMQX fails on each message, and statements only mqttd accepts.
 
 | | EMQX | mqttd |
 |---|---|---|
@@ -1661,7 +2392,12 @@ mqttd accepts.
 | Message events | Raised by the subscriber's session (`delivered`, `acked`, `delivery_dropped`) and by the broker on the node that found no subscriber (`dropped`). The message keeps its publisher everywhere, on disk included. A session keeps its client's username and address while offline. `delivery_dropped` reasons `expired`, `no_local`, `subscription_filter`, `qos0_msg`, `queue_full`; nothing for a packet too large for its subscriber | The same events, fields and nodes ([Message events](#message-events)). A message read back from disk, or forwarded by a node running an older release, has lost its publisher: `from_clientid` and `from_username` are `undefined`. An offline session's `delivery_dropped` has no `username` or address. Reasons `expired`, `no_local`, `queue_full`, and mqttd's own `too_large`; an offline queue's `drop-oldest` eviction raises none. Rules chained through these events stop 32 republishes deep |
 | `authz_source` | The source that decided: `file`, `built_in_database`, `http`, …, `superuser`, `default`, and `cache` for a decision its authorization cache answered | `file` or `default`: mqttd has the ACL file only, no superusers and no authorization cache |
 | Data-integration sources (`$bridges/…`, `$sources/…`) | Yes | No: refused at load |
-| Functions | 124 in the built-in reference, plus `jq`; every other export of `emqx_rule_funcs` is callable too | 120 of those 124, plus 23 EMQX exports without documenting (143 in all). `maptab_lookup`, `mongo_date`, `schema_encode`, `schema_decode`, `jq`, `term_encode`/`term_decode` and the state functions (`kv_store_*`, `proc_dict_*`; [ADR 0085](adr/0085-rule-state-store.md)) are refused at load. |
+| Functions | 124 in the built-in reference, plus `jq`; every other export of `emqx_rule_funcs` is callable too | 120 of those 124, plus `jq`, plus 29 EMQX exports without documenting (150 in all), `kv_store_put`, `kv_store_get`, `kv_store_del`, `proc_dict_put`, `proc_dict_get` and `proc_dict_del` among them. `maptab_lookup`, `mongo_date`, `schema_encode`, `schema_decode`, `term_encode`/`term_decode` are refused at load. |
+| `kv_store_put`, `kv_store_get`, `kv_store_del` | One table per node that grows until the node runs out of memory; a wrong argument count fails the rule on each message; the SQL test writes the node's real table | The same table and the same results, but bounded: a key of at most 256 bytes and a value of at most 4 KiB as JSON, 100,000 keys and 64 MiB unless `[state.kv_store]` says otherwise, under `rules.state_max_bytes`; past a bound the call fails the rule, where EMQX would have stored the value. A wrong argument count fails the load, as for every function. A dry run (`--rule-test`, the admin API's rule test) works on an empty table of its own. `rules.state_max_bytes = 0` switches it off: a rules file that calls them then does not load ([State](#state-what-a-rule-remembers)) |
+| `proc_dict_put`, `proc_dict_get`, `proc_dict_del` | The dictionary of the process that evaluates the rule: the client's connection process, for its publishes and what their rules republish, its events, the deliveries to it and its Will. It grows until the node runs out of memory. A session that outlives its connection keeps the process and the dictionary until it is resumed. A wrong argument count fails the rule on each message | The same results on one dictionary per client connection, for everything that connection evaluates, but bounded: 64 keys, and 64 KiB of keys and values as JSON, counted against `rules.state_max_bytes`; past a bound the call fails the rule, where EMQX would have stored the value. The dictionary is gone when the connection ends. Three evaluations have no connection to run on and get an empty dictionary that is discarded afterwards, where EMQX's still see the client's: a Will's rules; an event about a session that has no connection (`delivery_dropped` for an offline session); `message/dropped` for a message a rule republished, or for a Will. A wrong argument count fails the load, as for every function. A dry run works on an empty dictionary of its own, as each SQL test over EMQX's API does. `rules.state_max_bytes = 0` switches them off: a rules file that calls them then does not load ([State](#state-what-a-rule-remembers)) |
+| State of mqttd's own (mqttd-only extension) | None. `kv_get`, `kv_set`, `kv_set_once`, `kv_incr`, `kv_max`, `kv_min`, `kv_add`, `kv_del`, `kv_ttl`, `kv_held` and `kv_changed` are unknown functions, and `[state.<name>]` and the rule key `state` are not EMQX configuration | Typed, expiring, bounded keys in namespaces the rules file declares. A rule that uses them does not port back to EMQX |
+| `jq` | A NIF in the broker's own process: always on, with no limit on memory, output or stack, the broker's whole environment in `$ENV`, and a timeout that cannot stop a program inside one long C call | The same jq in a WebAssembly sandbox, with EMQX's results, tags and texts, but **off unless `rules.jq = true`** (a rules file that calls it then fails to load), and needing a host that allows executable memory. 64 MiB of memory, 4 MiB of stack, an output charged to the message's 1 MiB build budget, a 5 s bound on compiling a program, `$ENV` empty unless variables are listed in `rules.jq_env` (a ported rule that reads `$ENV.X` gets `null` until `X` is listed), a timeout that always stops the call, a wrong number of arguments refused at load instead of on each message; the last one or two digits of some transcendental functions differ (musl's libm against glibc's), `strptime` fails on `%z`, `strftime("%Z")` of a UTC time is `UTC` where EMQX's is `GMT`, and local time is UTC. Each limit fails the rule for that message, with its kind counted ([Limits of jq](#limits-of-jq-and-what-happens-at-each), [the whole table](#jq)) |
+| Functions supplied as modules (mqttd-only extension) | None. A rules file with a `[functions.<name>]` table is not EMQX configuration | A rules file may declare WebAssembly modules, each pinned by its SHA-256, whose functions rules call; they run in the sandbox under time, memory, output and stack limits. A module cannot take the name of a built-in function or of any function of EMQX's rule engine, so it never changes what a rule written for EMQX means. A module is read only from under the rules file's directory, sees no file, socket or host function, the clock only with `clock = true` and only the environment variables `rules.functions_env` allows. A rules file that declares one does not load in EMQX ([Your own functions](#your-own-functions-functionsname)) |
 | Regular expressions | Erlang `re`: PCRE2 10.47 (OTP 28) on bytes, compiled per call | PCRE2 10.46 on bytes, with OTP's compile options, match and depth limits and global-match loop: the same syntax and results ([above](#functions)). A match needing more than 64 MiB of backtracking memory is no match (OTP allows 20 GB); a pattern nesting parentheses more than 250 deep does not compile (OTP's limit is 10,000, though PCRE2's own workspace stops most such patterns below 2,000). A literal pattern is compiled once, when the file loads (one that does not compile warns), and a rules file holds at most 512 distinct ones, 256 KiB together. |
 | `sprintf` `~p` / `~P` of a long list, map or non-printable binary | `io_lib_pretty` breaks it across lines once it reaches the line width (80 columns, or the field width) | Printed on one line (`~0p`, which never breaks, is the same in both) |
 | `subbits` results Erlang has and this engine cannot hold | A bit string of any length | Fail the rule: a bit string that is not whole bytes |
@@ -1671,13 +2407,42 @@ mqttd accepts.
 | Unaliased computed field | Stored under a generated `_v_…` key | Stored under the expression's source text |
 | Ack semantics | Rules run synchronously in the publisher's channel, in the `message.publish` hook, before the original is routed; a republish is routed inside that call. The PUBACK follows, but never waits for delivery or durability, and a republish's outcome never changes its reason code | A QoS ≥ 1 republish holds the publisher's PUBACK/PUBREC until its fate is known; the answer is still the original's own, and a failed republish is a failed action ([above](#delivery-guarantees-qos-0-1-and-2)) |
 | A refused publish | Rules do not run on a publish refused by authorization, quota, publish caps, schema validation or message transformation. Only a hook running after the rule engine (ExHook, node rebalance) can refuse it afterwards, and then the republish has already been routed | The hub routes none of its derived messages (unless the refusal is a peer's, arriving later) |
-| Limits on payload-driven work | None beyond the Erlang process's memory | A `FOREACH` iterates at most 10,000 elements; a function may build at most 1 MiB beyond its inputs, and integers past 64 bits draw on the same budget; an integer has at most 8192 bits (2,466 digits: a JSON payload with a longer one is not JSON to a rule, and arithmetic past it fails the rule); `map_put`/`mput` paths have at most 64 segments; timestamps must be renderable in every time zone; expressions at most 256 levels deep and nested at most 64 levels ([The rules file](#the-rules-file)) |
+| Limits on payload-driven work | None beyond the Erlang process's memory | A `FOREACH` iterates at most 10,000 elements; a function may build at most 1 MiB beyond its inputs, and integers past 64 bits draw on the same budget; an integer has at most 8192 bits (2,466 digits: a JSON payload with a longer one is not JSON to a rule, and arithmetic past it fails the rule); `map_put`/`mput` paths have at most 64 segments; timestamps must be renderable in every time zone; expressions at most 256 levels deep and nested at most 64 levels; a message makes at most 1,024 state calls ([The rules file](#the-rules-file)) |
 | Where it runs | Every node, once per message at the node that received it; a forwarded copy does not run the publish hook. Rules are cluster-wide configuration | The same placement. Rules are a per-node file: each node runs the file it was given |
 | `$SYS` messages | The broker's own `$SYS` messages run rules only with `rule_engine.ignore_sys_message = false` (default `true`). The default ACL denies only subscribing to `$SYS/#`, so a client may publish to `$SYS/x`, and that message runs rules whatever `ignore_sys_message` says (it checks only the flag the broker sets on its own) | Never run rules. Clients cannot publish to `$SYS`, except a Mosquitto bridge's `$SYS/broker/connection/<id>/state`, so a `FROM` on any other `$SYS` topic never matches. The broker publishes only opt-in rule statistics and trace there ([above](#watch-and-edit-rules-live)) |
 | Rule statistics | The dashboard and the REST API | `/metrics`; with `sys_interval_secs`, `$SYS/brokers/<node>/rules/<id>`; `GET /admin/v1/rules` |
 | Changing rules | The dashboard and the REST API, applied across the cluster | The rules file, reloaded; for a listed writer, the admin API writes that file, on the node it asks |
-| Testing a rule | The dashboard's SQL test | `mqttd --rule-test` (the statement only), or `POST /admin/v1/rules/test` (the statement and the rendered actions) |
+| Testing a rule | The dashboard's SQL test, which calls the real functions: a test of `kv_store_put` writes the node's table | `mqttd --rule-test` (the statement only), or `POST /admin/v1/rules/test` (the statement and the rendered actions); a state call in a test never touches the running rules' state |
+| Conditions EMQX's runtime has no clause for (mqttd-only): a bare value as a condition or as an operand of `AND`/`OR`, `NOT IN`, `NOT` over `AND`/`OR`/`NOT`, a function that does not return a boolean, `AND`/`OR`/`NOT`/`IN` in `CASE x WHEN …`, `TRUE`/`FALSE` in upper case | The rule is created, with nothing said, and fails on each message that reaches the form (`failed`, `failed.exception`); `TRUE` and `FALSE` are field names, `undefined` (EMQX 6.3.1) | Evaluated: a condition passes exactly when it is the boolean `true`, `NOT IN` is the negation of `IN`, `TRUE` is `true`. No rule that works in EMQX holds one of these, so none behaves differently here; a rule that relies on one does not port back to EMQX ([the table below](#conditions-emqx-fails-and-mqttd-evaluates), with the form to write for both) |
 | Statements only mqttd accepts (mqttd-only extensions) | A parse error: the rule is not created (EMQX 6.3.1, rulesql 0.2.1) | Accepted, each with the meaning it has where EMQX allows it: `AND`, `OR`, `NOT`, `IN` and `NOT IN` outside `WHERE`/`INCASE`/`WHEN` (in `SELECT`, `DO`, a function argument, an array); a comparison in parentheses or in an array (`(a > 1) AS ok`); `CASE` inside a larger expression (`1 + CASE … END`); a keyword as a path segment (`payload.from`, which EMQX takes as `payload.'from'`); field or index access on a computed value (`json_decode(payload).a`, `nth(1, l).b`); a name starting with `_`; a float literal with an exponent and no fraction (`1e5`, `10e5`) or with an `f`/`d` suffix (`1.5f`). Every statement EMQX accepts loads in mqttd; leave these out of a rule that must also load in EMQX. |
+
+### Conditions EMQX fails and mqttd evaluates
+
+A condition is what follows `WHERE`, `INCASE`, and the `WHEN` of a `CASE`. EMQX's grammar
+takes any expression there; its runtime takes only a comparison, `x IN (…)`, a function
+call, `true`, `false`, `AND` and `OR` of those, and `NOT` of a value, a comparison or a
+function call. Anything else is created as a rule without a word and then fails on every
+message that reaches it (probed on EMQX 6.3.1; counted `failed` and `failed.exception`).
+mqttd evaluates all of it, with one reading: **a condition passes exactly when it is the
+boolean `true`**.
+
+So every rule that works in EMQX gives the same here, and the difference is one-way: a
+rule written for mqttd that relies on a form below does not port back to EMQX. It loads
+there and fails (the last row: runs with another result). `mqttd --check-rules` does not
+warn about these forms.
+
+| Written in a condition | EMQX | mqttd | For a rule that must also run in EMQX |
+|---|---|---|---|
+| A bare value as the whole condition: `WHERE payload.flag`, `INCASE item`, `CASE WHEN flag THEN …`, `WHERE 1`, `WHERE 'true'`, `WHERE a + 1` | The rule fails on every message, even when the value is `true` | Passes when the value is the boolean `true`; false (`no_result`) for anything else | `payload.flag IN (true)` passes only the boolean, as mqttd's bare value does; `payload.flag = true` also passes the string `'true'` (a boolean against a string compares their text) |
+| A bare value as an operand of `AND`/`OR`: `payload.flag AND …`, `… OR payload.flag` | The rule fails when the operand is reached: on the left, every message, before the right side runs; on the right, only the messages the left side lets through (`n > 5 AND flag` fails when `n` is above 5) | The operand reads as "not true" unless it is the boolean `true`. On the left of an `OR` that means going on to the right operand, its function calls and their effects included | The same: `payload.flag IN (true) AND …` |
+| `x NOT IN (a, b)`, `NOT (x IN (a, b))` | The rule fails when it is reached, before `x` or the list is evaluated | The negation of `IN`; the list is evaluated whole, as for `IN` | `NOT contains(x, [a, b])`: `contains` matches exactly, as `IN` does, and evaluates the list whole |
+| `NOT (a AND b)`, `NOT (a OR b)`, `NOT NOT a` | The rule fails when it is reached, before any of it is evaluated | Evaluated; `NOT` of anything but a boolean is `false`, as in EMQX | `NOT a OR NOT b`, `NOT a AND NOT b`; for a boolean `a`, `a = true` |
+| A function that does not return a boolean: `WHERE abs(payload.x)`, `INCASE abs(item)`, `abs(payload.x) AND …`, `… AND abs(payload.x)` when reached | The rule fails (`failed.exception`). Only as a whole `CASE WHEN`, or on the right of its `AND`/`OR`, does EMQX go on to the next `WHEN` | "Not true": the condition is false (`no_result`), so as a whole `WHERE`/`INCASE` or on the right of an `AND` only the counter differs; on the left of an `OR` the right operand runs | A comparison: `abs(payload.x) > 0` |
+| `AND`, `OR`, `NOT` or `IN` as the `WHEN` of a `CASE` with an operand: `CASE x WHEN y IN (1, 2) THEN …` | The rule fails in the `WHEN` that is reached: that `WHEN` is a value to match `x` against, and only a comparison is a value there | The `WHEN` is its boolean, matched against `x` | A `CASE WHEN <condition> THEN …` |
+| `TRUE`, `True`, `FALSE`: any spelling but lower case | A field of that name, which no message has: `undefined`. `WHERE TRUE` fails the rule, but `WHERE payload.ok = TRUE` and `SELECT TRUE AS a` run: the first is true only for a message *without* `ok`, the second gives `undefined` | The booleans, as `true` and `false` are | `true`, `false` |
+
+`CASE x WHEN v THEN …` itself is evaluated as EMQX evaluates it: `v`, then `x`, again for
+each `WHEN` it comes to ([When a call runs](#state-what-a-rule-remembers)).
 
 ## Migrating rules from EMQX
 
@@ -1693,7 +2458,26 @@ action is dropped with a `TODO(migrate)` line, and its rule stays live with its 
 actions: a rule left with none runs and produces nothing, so give it a `republish` (and a
 consumer, [INTEGRATION.md](INTEGRATION.md)) or delete it. A rule that selects a
 data-bridge source or an event mqttd does not raise, or calls a function it does not
-implement, is written **commented out** with the reason, so the file still loads. The CI
+implement, is written **commented out** with the reason, so the file still loads.
+
+**A rule that calls `jq` is commented out too**, although mqttd has `jq`: it is off by
+default, and one call in a file that is loaded all-or-nothing would keep every other rule
+from loading. Its `TODO(migrate)` line says what to do. In full:
+
+1. Set `[rules] jq = true` on every node, and give the host what it needs
+   ([What jq needs from the host](#what-jq-needs-from-the-host): under the shipped
+   systemd unit, `MemoryDenyWriteExecute=false`).
+2. EMQX's `rule_engine.jq_function_default_timeout` is not converted; it is reported.
+   Set `[rules] jq_default_timeout_ms` (milliseconds; the default is EMQX's ten seconds).
+3. List in `[rules] jq_env` every variable your programs read through `$ENV` or `env`:
+   EMQX shows a program the broker's whole environment, mqttd none unless listed.
+4. Uncomment the rule and run `mqttd --check-rules`, with the switch on, on a host like
+   the broker's.
+5. Read [what differs from EMQX](#jq) once: programs that lean on unbounded memory or
+   output, on `strptime` with `%z`, or on the last digit of `tgamma` or `cbrt` will
+   notice.
+
+The CI
 fixture is part EMQX's own documented rule examples and part rules written for the
 converter's gaps, each marked as such in the file
 ([MIGRATION.md](MIGRATION.md#emqx--mqttd)).

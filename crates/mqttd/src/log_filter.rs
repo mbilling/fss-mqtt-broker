@@ -19,7 +19,7 @@ use tracing_subscriber::reload;
 use tracing_subscriber::{EnvFilter, Registry};
 
 /// The longest an override may last.
-pub const MAX_TTL: Duration = Duration::from_secs(3600);
+pub const MAX_TTL: Duration = Duration::from_hours(1);
 
 /// The target audit records are logged under; an override never touches it.
 const AUDIT_TARGET: &str = "audit";
@@ -232,7 +232,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_override_applies_then_expires_back_to_the_base() {
         let (f, _layer) = leaked_filter("info");
-        let effective = f.set("mqttd::hub=debug", Duration::from_secs(60)).unwrap();
+        let effective = f.set("mqttd::hub=debug", Duration::from_mins(1)).unwrap();
         assert_eq!(effective, "mqttd::hub=debug,audit=info");
         assert!(current(f).contains("mqttd::hub=debug"), "{}", current(f));
         assert!(current(f).contains("audit=info"), "{}", current(f));

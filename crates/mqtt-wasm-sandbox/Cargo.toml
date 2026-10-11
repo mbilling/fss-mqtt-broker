@@ -3,10 +3,10 @@ name = "mqtt-wasm-sandbox"
 description = "ADR 0086: rule functions run as WebAssembly modules in a sandbox — the real jq first"
 version.workspace = true
 edition.workspace = true
-# wasmtime 49 needs 1.96; the workspace as a whole still declares 1.88 (ADR 0086).
-rust-version = "1.96"
+rust-version.workspace = true
 license.workspace = true
 publish = false
+build = "build.rs"
 
 [dependencies]
 # The runtime (Apache-2.0 WITH LLVM-exception, MSRV 1.96): Cranelift compiles a module
@@ -21,18 +21,28 @@ publish = false
 # backtraces.
 wasmtime = { version = "49.0.2", default-features = false, features = ["runtime", "cranelift", "async", "pulley", "std"] }
 
+[build-dependencies]
+# build.rs compares the jq module it embeds with `jq-module/jq.wasm.sha256`. Already
+# in the broker's graph (mqtt-rules).
+sha2 = "0.11"
+
 [dev-dependencies]
 # The rule engine's exact JSON writer and reader: the jq tests marshal as a rule would.
-mqtt-rules = { path = "../mqtt-rules" }
+# Without its `jq` feature, which is this crate.
+mqtt-rules = { path = "../mqtt-rules", default-features = false }
 # Reads the EMQX oracle file (programs and outputs are base64 there).
 base64 = "0.23"
 # The module file's hash against the recorded one.
 sha2 = "0.11"
 
 [features]
-# The tests and examples that need jq.wasm (`jq-module/build.sh`, not checked in).
-# Off by default, so a build without the Wasm toolchain stays whole.
+# The tests and examples that read jq.wasm from its file (`jq-module/build.sh`, not
+# checked in). Off by default, so a build without the Wasm toolchain stays whole. This
+# is not what embeds the module in a build: build.rs does, when it finds the file.
 jq-module = []
+# The hand-written module of `test_module`: what the tests of the crates that load
+# operator modules (mqtt-rules, mqttd) run without a Wasm toolchain. Test builds only.
+test-module = []
 
 [[test]]
 name = "jq_module"

@@ -329,6 +329,31 @@ queue_overflow = "drop-oldest"       # or "reject-newest"
 # off. A writer holds the ACL file's trust: rules read and publish any topic. Needs the
 # admin listener and a rules file in a directory of its own that the broker can write.
 # admin_writers = []
+# EMQX's jq() rule function (ADR 0086, docs/RULES.md "jq"). OFF by default: a rules file
+# that calls jq() then does not load. On, jq runs as WebAssembly compiled to machine code
+# in a sandbox, which needs memory the process may map executable: under the shipped
+# systemd unit ALSO set MemoryDenyWriteExecute=false (a drop-in), or a rules file that
+# calls jq() fails to load and says so. Set it on every node. These three keys are read
+# at startup (a reload reports a change as requires-restart).
+# jq = false
+# What jq(Program, Input) runs under, in ms (EMQX's jq_function_default_timeout, 10 s);
+# jq(Program, Input, TimeoutMs) names its own.
+# jq_default_timeout_ms = 10000
+# The environment variables a jq program may read ($ENV.NAME, env.NAME). Empty = none:
+# unlike EMQX, which shows jq the broker's whole environment, secrets included.
+# jq_env = []
+# The environment variables a module declared in the rules file ([functions.<name>],
+# docs/RULES.md "Your own functions") may be shown. A table's `env` may name only
+# these, so whoever writes rules cannot show a module the rest of the broker's
+# environment. Empty = none. Read at startup.
+# functions_env = []
+# The most bytes the state rules keep between messages may take on this node, across
+# every namespace (ADR 0085, docs/RULES.md "State"): EMQX's kv_store_* table and mqttd's
+# kv_* functions, in memory. Using state is the switch: a rules file that declares no
+# [state.<name>] and calls no state function holds none. A rules file cannot raise this
+# ceiling; 0 switches rule state off, and a rules file that uses it then does not load.
+# Read at startup.
+# state_max_bytes = 268435456
 
 [observability]
 # OTLP/HTTP push export (ADR 0020). Unset = Prometheus /metrics endpoint only.

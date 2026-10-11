@@ -391,10 +391,13 @@ fn check(
         id: id.to_string(),
         why,
     };
+    // A per-rule edit does not touch the rule's `state` key (ADR 0085): it reads back
+    // as it was.
+    let kept = old.rules.get(id).and_then(|r| r.state.clone());
     if text == source {
         // Nothing changed, which is right only for an update to what is already there.
         return match (want, old.rules.get(id)) {
-            (Some(w), Some(r)) if *r == schema(w) => Ok(()),
+            (Some(w), Some(r)) if *r == schema(w, kept.clone()) => Ok(()),
             _ => Err(failed("the text did not change".into())),
         };
     }
@@ -412,20 +415,24 @@ fn check(
     {
         return Err(failed(format!("rule `{k}` would appear")));
     }
+    if new.state != old.state {
+        return Err(failed("the [state] tables would change".into()));
+    }
     match (want, new.rules.get(id)) {
-        (Some(w), Some(r)) if *r == schema(w) => Ok(()),
+        (Some(w), Some(r)) if *r == schema(w, kept) => Ok(()),
         (None, None) => Ok(()),
         (Some(_), _) => Err(failed("it would not read back as requested".into())),
         (None, Some(_)) => Err(failed("it would still be there".into())),
     }
 }
 
-fn schema(r: &RuleEdit) -> RuleSchema {
+fn schema(r: &RuleEdit, state: Option<String>) -> RuleSchema {
     RuleSchema {
         sql: r.sql.clone(),
         actions: r.actions.clone(),
         enable: r.enable,
         description: r.description.clone(),
+        state,
     }
 }
 

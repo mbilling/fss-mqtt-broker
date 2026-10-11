@@ -1,0 +1,28 @@
+name: Build the jq module
+description: >
+  Builds crates/mqtt-wasm-sandbox/jq-module/jq.wasm from pinned sources with the pinned
+  compiler (ADR 0086 D11) and fails unless it is byte for byte the build the tree
+  records. The broker's build embeds the file when it is there, so a job that tests
+  jq() through the broker runs this first.
+runs:
+  using: composite
+  steps:
+    # The module is a pure function of these files (the script names the source
+    # commits and their tarball hashes; fetch-zig.sh the compiler's), so the cache
+    # key is their content. A hit skips the build, never the comparison below.
+    - name: Cache the built module
+      id: module
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: crates/mqtt-wasm-sandbox/jq-module/jq.wasm
+        key: jq-wasm-${{ hashFiles('crates/mqtt-wasm-sandbox/jq-module/build.sh', 'crates/mqtt-wasm-sandbox/jq-module/fetch-zig.sh', 'crates/mqtt-wasm-sandbox/jq-module/shim.c', 'crates/mqtt-wasm-sandbox/jq-module/compat.c', 'crates/mqtt-wasm-sandbox/jq-module/compat.h', 'crates/mqtt-wasm-sandbox/jq-module/jq.wasm.sha256') }}
+    - name: Build jq.wasm from pinned sources with the pinned compiler
+      if: steps.module.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        ZIG="$(crates/mqtt-wasm-sandbox/jq-module/fetch-zig.sh "$RUNNER_TEMP/zig" | tail -n 1)"
+        ZIG="$ZIG" JQ_WASM_WORK="$RUNNER_TEMP/jq-wasm" crates/mqtt-wasm-sandbox/jq-module/build.sh
+    - name: The module is byte for byte the recorded build
+      shell: bash
+      working-directory: crates/mqtt-wasm-sandbox/jq-module
+      run: sha256sum --check --strict jq.wasm.sha256

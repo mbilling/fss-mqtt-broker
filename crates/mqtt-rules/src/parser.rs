@@ -27,7 +27,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::funcs::{self, Compiled, Func};
+use crate::jq::{Functions, Jq, JqSwitch};
 use crate::lexer::{lex, Kw, Spanned, Tok};
+use crate::plugin::{Module, ModuleCall};
 use crate::value::Value;
 use crate::{ParseError, MAX_REGEX_LITERALS_PER_FILE, MAX_REGEX_LITERAL_BYTES_PER_FILE};
 
@@ -111,6 +113,14 @@ pub(crate) enum Expr {
         /// The pattern of a regex function, compiled at load time when it is a literal
         /// (or why it does not compile: the call fails, as in EMQX).
         regex: Option<Compiled>,
+        /// For `jq`: what runs it (ADR 0086), which the rules were loaded with.
+        jq: Option<Arc<Jq>>,
+        /// For a function of an operator's module (ADR 0086 D9): the module and the
+        /// function. `func` is then the one that calls it.
+        module: Option<ModuleCall>,
+        /// For a state function (ADR 0085): the namespace it works on, resolved when
+        /// the rules were loaded.
+        state: Option<Arc<crate::state::StateBinding>>,
     },
 }
 
@@ -142,10 +152,11 @@ pub(crate) struct Statement {
 }
 
 /// Parse one statement. Returns it with any warnings worth showing the author. Its
-/// literal regex patterns are compiled through `regexes`, which a whole rules file shares.
+/// literal regex patterns are compiled through `loading`, which a whole rules file
+/// shares, and its calls of `jq` are resolved against what the file is loaded with.
 pub(crate) fn parse(
     sql: &str,
-    regexes: &mut RegexPool,
+    loading: &mut Loading<'_>,
 ) -> Result<(Statement, Vec<String>), ParseError> {
     let toks = lex(sql)?;
     let mut p = Parser {
@@ -154,10 +165,77 @@ pub(crate) fn parse(
         pos: 0,
         warnings: Vec::new(),
         nest: 0,
-        regexes,
+        loading,
     };
     let stmt = p.statement()?;
     Ok((stmt, p.warnings))
+}
+
+/// What one rules file is loaded with and what its statements have used so far.
+#[derive(Debug)]
+pub(crate) struct Loading<'f> {
+    /// The literal regex patterns compiled so far.
+    pub regexes: RegexPool,
+    /// What the file may call beyond the built-in functions.
+    pub functions: &'f Functions,
+    /// The `jq` the file's statements call, once one does.
+    pub jq: Option<Arc<Jq>>,
+    /// The jq programs the statements spell out, each once.
+    pub jq_programs: Vec<Arc<str>>,
+    /// The modules whose functions the statements may call: the file's own
+    /// `[functions.<name>]` tables.
+    pub modules: Vec<Arc<Module>>,
+    /// Whether a statement calls one.
+    pub calls_module: bool,
+    /// The file's state: its namespaces, and the rule being compiled (ADR 0085).
+    pub state: crate::state::StateLoading,
+}
+
+impl<'f> Loading<'f> {
+    pub(crate) fn new(functions: &'f Functions) -> Self {
+        Self {
+            regexes: RegexPool::default(),
+            functions,
+            jq: None,
+            jq_programs: Vec::new(),
+            modules: functions.declared.clone(),
+            calls_module: false,
+            state: crate::state::StateLoading::new(
+                &functions.state,
+                functions.declared_state.clone(),
+            ),
+        }
+    }
+
+    /// The module function called `name`, when a module of the file provides one.
+    fn module_function(&mut self, name: &str) -> Option<ModuleCall> {
+        let call = self.modules.iter().find_map(|module| {
+            let function = module.functions().iter().find(|f| &*f.name == name)?;
+            Some(ModuleCall {
+                module: module.clone(),
+                function: function.clone(),
+            })
+        })?;
+        self.calls_module = true;
+        Some(call)
+    }
+
+    /// What runs a call of `jq` in the file being loaded, or why the file cannot be
+    /// loaded (ADR 0086 D13). The first call compiles the module, when no earlier
+    /// load of this process has.
+    fn jq(&mut self) -> Result<Arc<Jq>, String> {
+        if let Some(jq) = &self.jq {
+            return Ok(jq.clone());
+        }
+        let jq = match &self.functions.jq {
+            JqSwitch::Off => return Err(crate::jq::SWITCHED_OFF.to_string()),
+            JqSwitch::Unavailable(why) => return Err(format!("jq is not available: {why}")),
+            JqSwitch::On(jq) => jq,
+        };
+        jq.load()?;
+        self.jq = Some(jq.clone());
+        Ok(jq.clone())
+    }
 }
 
 /// The literal regex patterns one rules file has compiled (ADR 0084 D3), each once.
@@ -214,18 +292,18 @@ const MAX_NESTING: usize = 64;
 /// A parsed expression and its height.
 type Parsed = Result<(Expr, usize), ParseError>;
 
-struct Parser<'a> {
+struct Parser<'a, 'f> {
     sql: &'a str,
     toks: Vec<Spanned>,
     pos: usize,
     warnings: Vec<String>,
     /// Current recursion depth (see [`MAX_NESTING`]).
     nest: usize,
-    /// Where literal regex patterns are compiled (see [`RegexPool`]).
-    regexes: &'a mut RegexPool,
+    /// Where literal regex patterns are compiled (see [`RegexPool`]), and what `jq` is.
+    loading: &'a mut Loading<'f>,
 }
 
-impl Parser<'_> {
+impl Parser<'_, '_> {
     fn peek(&self) -> &Tok {
         &self.toks[self.pos].tok
     }
@@ -793,6 +871,22 @@ impl Parser<'_> {
         ))
     }
 
+    /// For a state function: the namespace of the rule being loaded that it works on.
+    /// A file that cannot have one is refused here (ADR 0085 D2).
+    fn state_binding(
+        &mut self,
+        func: &'static Func,
+        start: usize,
+    ) -> Result<Option<Arc<crate::state::StateBinding>>, ParseError> {
+        let Some(family) = crate::state::family(func) else {
+            return Ok(None);
+        };
+        self.loading
+            .state
+            .binding(family)
+            .map_err(|e| ParseError::at(self.sql, start, e))
+    }
+
     fn call(&mut self, name: &str, start: usize) -> Parsed {
         let mut args = Vec::new();
         let mut h = 0;
@@ -807,22 +901,33 @@ impl Parser<'_> {
             }
             self.expect(&Tok::RParen, "')' closing the argument list")?;
         }
-        let Some(func) = funcs::lookup(name) else {
-            return Err(ParseError::at(
-                self.sql,
-                start,
-                format!(
-                    "unknown function {name}() — see docs/RULES.md for the supported functions"
-                ),
-            ));
+        // A built-in function first; a module cannot take a built-in's name.
+        let (func, module) = match funcs::lookup(name) {
+            Some(func) => (func, None),
+            None => match self.loading.module_function(name) {
+                Some(call) => (funcs::module_func(), Some(call)),
+                None => {
+                    return Err(ParseError::at(
+                        self.sql,
+                        start,
+                        format!(
+                            "unknown function {name}() — see docs/RULES.md for the supported \
+                             functions"
+                        ),
+                    ));
+                }
+            },
         };
-        if args.len() < func.min || args.len() > func.max {
-            let expected = if func.min == func.max {
-                func.min.to_string()
-            } else if func.max == usize::MAX {
-                format!("at least {}", func.min)
+        let (min, max) = module.as_ref().map_or((func.min, func.max), |m| {
+            (m.function.min_args, m.function.max_args)
+        });
+        if args.len() < min || args.len() > max {
+            let expected = if min == max {
+                min.to_string()
+            } else if max == usize::MAX {
+                format!("at least {min}")
             } else {
-                format!("{}..={}", func.min, func.max)
+                format!("{min}..={max}")
             };
             return Err(ParseError::at(
                 self.sql,
@@ -836,6 +941,7 @@ impl Parser<'_> {
         let regex = match func.regex_arg.and_then(|i| args.get(i)) {
             Some(Expr::Const(Value::Str(pattern))) => {
                 let re = self
+                    .loading
                     .regexes
                     .get(pattern)
                     .map_err(|e| ParseError::at(self.sql, start, e))?;
@@ -850,8 +956,43 @@ impl Parser<'_> {
             }
             _ => None,
         };
+        let jq = if func.name == "jq" {
+            let jq = self
+                .loading
+                .jq()
+                .map_err(|e| ParseError::at(self.sql, start, e))?;
+            if let Some(Expr::Const(Value::Str(program))) = args.first() {
+                if !self.loading.jq_programs.contains(program) {
+                    // EMQX accepts a rule whose program does not compile and fails it on
+                    // every message; so does this engine, and says so at load.
+                    if let Err(e) = jq.check_program(program.as_bytes()) {
+                        self.warnings
+                            .push(format!("jq(): {e}; every call fails the rule, as in EMQX"));
+                    }
+                    self.loading.jq_programs.push(program.clone());
+                }
+            }
+            Some(jq)
+        } else {
+            None
+        };
+        let state = if module.is_none() {
+            self.state_binding(func, start)?
+        } else {
+            None
+        };
         let h = self.node(h)?;
-        Ok((Expr::Call { func, args, regex }, h))
+        Ok((
+            Expr::Call {
+                func,
+                args,
+                regex,
+                jq,
+                module,
+                state,
+            },
+            h,
+        ))
     }
 }
 

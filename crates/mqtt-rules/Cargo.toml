@@ -6,8 +6,17 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = ["jq"]
+# EMQX's `jq` function, run in the WebAssembly sandbox (ADR 0086): links the runtime
+# (wasmtime, a compiler). Off: the runtime is not in the build at all, and a rules file
+# that calls `jq` is refused with that as the reason, whatever `rules.jq` says.
+jq = ["dep:mqtt-wasm-sandbox"]
+
 [dependencies]
 mqtt-core = { path = "../mqtt-core", version = "1.0.0" }
+# The sandbox `jq` runs in, and the jq module when the build found it (ADR 0086).
+mqtt-wasm-sandbox = { path = "../mqtt-wasm-sandbox", version = "1.0.0", optional = true }
 bytes.workspace = true
 thiserror.workspace = true
 serde = { workspace = true, features = ["derive"] }
@@ -70,6 +79,11 @@ blake2 = "0.11"
 
 [dev-dependencies]
 criterion = { workspace = true }
+# A module written out by hand, for the tests of `[functions.<name>]` (ADR 0086 D9):
+# they need no Wasm toolchain.
+mqtt-wasm-sandbox = { path = "../mqtt-wasm-sandbox", features = ["test-module"] }
+# A rules directory with module files in it. Already in the tree (mqttd's tests).
+tempfile = "3"
 
 [lints]
 workspace = true

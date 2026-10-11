@@ -34,8 +34,8 @@ audit it · contribute*.
 | [TEST-PLAN.md](TEST-PLAN.md) | Contributor | Living integration-test strategy and sunshine/darksky catalogue. |
 | [CONTRIBUTING-agent.md](CONTRIBUTING-agent.md) | Contributor (agent sessions) | Git/MCP workflow for automated sessions. |
 | [BRIDGE.md](BRIDGE.md) | Operator (boundary) | Single-instance vs HA pair topologies for the zone-crossing bridge. |
-| [RULES.md](RULES.md) | Application developer / migrator | The rule engine: EMQX-compatible rule SQL, functions, republish semantics at every QoS, and every difference from EMQX. |
-| [RULES-COOKBOOK.md](RULES-COOKBOOK.md) | Application developer | Sixteen working rule recipes, each a copyable file in `examples/rules/` that a test runs against the real broker. |
+| [RULES.md](RULES.md) | Application developer / migrator | The rule engine: EMQX-compatible rule SQL, functions (`jq` in a WebAssembly sandbox and functions of your own as modules among them: what they need from the host, their limits and cost), republish semantics at every QoS, and every difference from EMQX. |
+| [RULES-COOKBOOK.md](RULES-COOKBOOK.md) | Application developer | Sixteen working rule recipes, each a copyable file in `examples/rules/` that a test runs against the real broker; and when `jq` is worth its cost, with the plain rule SQL for the cases where it is not. |
 | [../demo/rules/](../demo/rules/README.md) | Application developer / evaluator | The rule engine on realistic data: simulated power plants, homes and cars, 22 rules, and what they derive, replayed by a test. |
 | [../demo/rules-live/](../demo/rules-live/README.md) | Application developer / evaluator | The same rules, live: the simulators running without end, each rule's statistics and trace on `$SYS`, and a local page that edits the rules through the admin API while they run (ADR 0084). |
 | [INTEGRATION.md](INTEGRATION.md) | Application developer | External consumers (Kafka/webhook/DB) as an ordinary `$share` group; the rule engine has no sinks. |

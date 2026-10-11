@@ -64,15 +64,18 @@ jobs:
               *) CODE=true; break ;;
             esac
           done <<< "$FILES"
-          # The sandbox lane's inputs: the crate, the rule engine whose JSON reader and
-          # writer its tests marshal with, the dependency graph, the toolchain, and
-          # this file.
+          # The sandbox lane's inputs: the crate, the rule engine that calls it (and whose
+          # JSON reader and writer its tests marshal with), the broker's wiring of jq,
+          # the dependency graph, the toolchain, the shipped unit, and this file.
           SANDBOX=false
           while IFS= read -r f; do
             case "$f" in
               crates/mqtt-wasm-sandbox/*|crates/mqtt-rules/*) SANDBOX=true; break ;;
+              crates/mqttd/src/rules.rs|crates/mqttd/src/main.rs) SANDBOX=true; break ;;
               Cargo.lock|Cargo.toml|rust-toolchain.toml|deny.toml) SANDBOX=true; break ;;
-              .github/workflows/ci.yml|deploy/systemd/mqttd.service) SANDBOX=true; break ;;
+              .github/workflows/ci.yml|.github/actions/jq-module/*) SANDBOX=true; break ;;
+              examples/rule-plugins/*|.github/actions/rule-plugins/*) SANDBOX=true; break ;;
+              deploy/systemd/mqttd.service) SANDBOX=true; break ;;
             esac
           done <<< "$FILES"
           echo "code=$CODE" >> "$GITHUB_OUTPUT"
@@ -87,6 +90,13 @@ jobs:
     # Hard ceiling ~3x the normal duration: a hung apt mirror once held this
     # workflow's default 6-hour leash (2026-08-18); no job gets that again.
     timeout-minutes: 45
+    env:
+      # The broker embeds the jq module when its build finds it (ADR 0086 D4), and the
+      # tests of jq() through the broker run only in a build that has it — skipping
+      # locally, failing here. So this job builds the module first (cached; a miss is
+      # the compiler download and ~100 C files), and every cargo step below REQUIRES
+      # it: a build that lost the module fails rather than testing a broker without jq.
+      MQTTD_JQ_WASM_REQUIRED: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master; `with:` selects the toolchain
@@ -94,6 +104,11 @@ jobs:
           toolchain: stable
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: ./.github/actions/jq-module
+      # The two worked examples of operator modules (ADR 0086 D9), one in Rust and one
+      # in C: built here (cached), then declared in a rules file and called through the
+      # shipped binary by the tests below, which fail without them rather than skip.
+      - uses: ./.github/actions/rule-plugins
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
@@ -167,7 +182,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.sandbox == 'true'
     runs-on: ubuntu-latest
-    # ADR 0086 T1. Two things no other lane does: it BUILDS the jq module — EMQX's
+    # ADR 0086 T1, T2. Three things no other lane does (the third, further down: the
+    # broker itself under the shipped systemd unit's hardening). First: it BUILDS the jq module — EMQX's
     # jq, C, compiled to WebAssembly — from sources and a compiler pinned by hash,
     # and fails unless the result is byte for byte the file whose sha256 the tree
     # records; and it runs that module through the sandbox against 285 answers
@@ -183,23 +199,11 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: wasm-sandbox
-      # The module is a pure function of these files (the script names the source
-      # commits and their tarball hashes; fetch-zig.sh the compiler's), so the cache
-      # key is their content. A hit skips the build, never the comparison below.
-      - name: Cache the built module
-        id: module
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: crates/mqtt-wasm-sandbox/jq-module/jq.wasm
-          key: jq-wasm-${{ hashFiles('crates/mqtt-wasm-sandbox/jq-module/build.sh', 'crates/mqtt-wasm-sandbox/jq-module/fetch-zig.sh', 'crates/mqtt-wasm-sandbox/jq-module/shim.c', 'crates/mqtt-wasm-sandbox/jq-module/compat.c', 'crates/mqtt-wasm-sandbox/jq-module/compat.h', 'crates/mqtt-wasm-sandbox/jq-module/jq.wasm.sha256') }}
-      - name: Build jq.wasm from pinned sources with the pinned compiler
-        if: steps.module.outputs.cache-hit != 'true'
-        run: |
-          ZIG="$(crates/mqtt-wasm-sandbox/jq-module/fetch-zig.sh "$RUNNER_TEMP/zig" | tail -n 1)"
-          ZIG="$ZIG" JQ_WASM_WORK="$RUNNER_TEMP/jq-wasm" crates/mqtt-wasm-sandbox/jq-module/build.sh
-      - name: The module is byte for byte the recorded build
-        working-directory: crates/mqtt-wasm-sandbox/jq-module
-        run: sha256sum --check --strict jq.wasm.sha256
+      # Built from pinned sources with the pinned compiler, and compared with the
+      # recorded hash (the steps are shared with the `test` job).
+      - uses: ./.github/actions/jq-module
+      # The example operator modules (ADR 0086 D9), for the hardening step below.
+      - uses: ./.github/actions/rule-plugins
       # Release mode: the tests include two programs that run into EMQX's own
       # ten-second timeout, and the whole oracle a second time in the interpreter.
       - name: Sandbox tests, the EMQX oracle and the limits (release)
@@ -227,6 +231,135 @@ jobs:
           esac
           sudo systemd-run --wait --pipe --collect --quiet "${PROPS[@]}" \
             "$PWD/target/release/examples/probe" compiled=refused interpreted=runs
+          printf '%s\n' "${PROPS[@]}" > "$RUNNER_TEMP/unit-hardening"
+      # The same question asked of the broker itself (ADR 0086 D13), built as a release
+      # builds it, with the module required. With `rules.jq` on, a rules file that calls
+      # jq() loads and runs on this runner; under the shipped unit's hardening the SAME
+      # file FAILS TO LOAD — an exit code and a message naming
+      # MemoryDenyWriteExecute=false, not a crash and not a slower mode — while a rules
+      # file that does not call jq() loads there as it always did, and --check-config
+      # says which host it is on.
+      - name: The broker refuses rules that call jq under the shipped unit's hardening, and says why
+        env:
+          MQTTD_JQ_WASM_REQUIRED: "1"
+        run: |
+          cargo build --release --locked -p mqttd
+          BIN="$PWD/target/release/mqttd"
+          WORK="$(mktemp -d)"
+          chmod 755 "$WORK"
+          cat > "$WORK/jq.toml" <<'RULES'
+          [rules.shape]
+          sql = '''SELECT jq('.a[]', payload) AS r FROM "t/#"'''
+          RULES
+          cat > "$WORK/plain.toml" <<'RULES'
+          [rules.plain]
+          sql = 'SELECT payload.a AS a FROM "t/#"'
+          RULES
+          chmod 644 "$WORK"/*.toml
+          mapfile -t PROPS < "$RUNNER_TEMP/unit-hardening"
+          hardened() {
+            sudo systemd-run --wait --pipe --collect --quiet "${PROPS[@]}" \
+              -E MQTTD_RULES_JQ=1 -E MQTTD_DURABLE_SESSIONS=0 "$BIN" "$@"
+          }
+
+          echo "::group::jq is off by default: the file does not load, and the switch is named"
+          if "$BIN" --check-rules "$WORK/jq.toml" 2> "$WORK/off.err"; then
+            echo "a rules file that calls jq loaded with rules.jq off"; exit 1
+          fi
+          cat "$WORK/off.err"
+          grep -qF 'jq is switched off: set `rules.jq = true`' "$WORK/off.err"
+          echo "::endgroup::"
+
+          echo "::group::switched on, on this runner: it loads and runs"
+          MQTTD_RULES_JQ=1 "$BIN" --check-rules "$WORK/jq.toml"
+          OUT="$(MQTTD_RULES_JQ=1 "$BIN" --rule-test \
+            --sql "SELECT jq('.a[]', payload) AS r FROM \"t/#\"" --payload '{"a":[1,"two"]}')"
+          echo "$OUT"
+          [ "$OUT" = '{"r":[1,"two"]}' ]
+          MQTTD_RULES_JQ=1 MQTTD_DURABLE_SESSIONS=0 "$BIN" --check-config | tee "$WORK/host.out"
+          grep -qF 'rules.jq is on: this host allows compiled code' "$WORK/host.out"
+          echo "::endgroup::"
+
+          echo "::group::switched on, under the unit's hardening: the load fails with the reason"
+          set +e
+          hardened --check-rules "$WORK/jq.toml" > "$WORK/hard.out" 2> "$WORK/hard.err"
+          code=$?
+          set -e
+          cat "$WORK/hard.out" "$WORK/hard.err"
+          if [ "$code" -ne 1 ]; then
+            echo "expected exit 1 (rules INVALID), got $code — a signal or a crash is ${code}"; exit 1
+          fi
+          grep -qF 'rules INVALID' "$WORK/hard.err"
+          grep -qF 'jq is not available: the WebAssembly compiler cannot run on this host' "$WORK/hard.err"
+          grep -qF 'MemoryDenyWriteExecute=false' "$WORK/hard.err"
+          echo "::endgroup::"
+
+          echo "::group::...rules that do not call jq are untouched, and --check-config reports the host"
+          hardened --check-rules "$WORK/plain.toml"
+          hardened --check-config | tee "$WORK/hard-host.out"
+          grep -qF 'config OK' "$WORK/hard-host.out"
+          grep -qF 'warning: rules.jq is on, but' "$WORK/hard-host.out"
+          grep -qF 'MemoryDenyWriteExecute=false' "$WORK/hard-host.out"
+          echo "::endgroup::"
+
+          # A module a rules file declares (ADR 0086 D9) needs the same of the host and
+          # no switch: with rules.jq off it loads on this runner, and under the unit's
+          # hardening the same file fails to load with the same reason and way out.
+          echo "::group::a declared module: loads here with rules.jq off, refused under the hardening"
+          mkdir "$WORK/modules"
+          cp examples/rule-plugins/out/geo.wasm "$WORK/modules/geo.wasm"
+          cat > "$WORK/modules/rules.toml" <<RULES
+          [functions.geo]
+          wasm = "geo.wasm"
+          sha256 = "$(sha256sum "$WORK/modules/geo.wasm" | cut -d' ' -f1)"
+          functions = ["geo_distance"]
+
+          [rules.far]
+          sql = 'SELECT geo_distance(payload.lat, payload.lon, 0, 0) AS metres FROM "t/#"'
+          RULES
+          chmod 755 "$WORK/modules"
+          chmod 644 "$WORK/modules"/*
+          "$BIN" --check-rules "$WORK/modules/rules.toml"
+          set +e
+          sudo systemd-run --wait --pipe --collect --quiet "${PROPS[@]}" \
+            -E MQTTD_DURABLE_SESSIONS=0 "$BIN" --check-rules "$WORK/modules/rules.toml" \
+            > "$WORK/module.out" 2> "$WORK/module.err"
+          code=$?
+          set -e
+          cat "$WORK/module.out" "$WORK/module.err"
+          if [ "$code" -ne 1 ]; then
+            echo "expected exit 1 (rules INVALID), got $code"; exit 1
+          fi
+          grep -qF 'rules INVALID' "$WORK/module.err"
+          grep -qF 'functions `geo`: the WebAssembly compiler cannot run on this host' "$WORK/module.err"
+          grep -qF 'MemoryDenyWriteExecute=false' "$WORK/module.err"
+          echo "::endgroup::"
+
+          # The way out the messages above and the documentation give (docs/RULES.md,
+          # deploy/systemd/README.md): the SAME hardening with that one property set to
+          # false, as a drop-in sets it. Checked rather than assumed, because the unit's
+          # other restrictions (the system-call filter among them) must leave the compiler
+          # alone, or the documented one-line change would not be enough.
+          echo "::group::the documented drop-in: the unit's hardening with MemoryDenyWriteExecute=false runs jq and a module"
+          RELAXED=("${PROPS[@]/MemoryDenyWriteExecute=true/MemoryDenyWriteExecute=false}")
+          echo "systemd-run ${RELAXED[*]}"
+          case " ${RELAXED[*]} " in
+            *" MemoryDenyWriteExecute=false "*) ;;
+            *) echo "MemoryDenyWriteExecute was not set to false"; exit 1 ;;
+          esac
+          relaxed() {
+            sudo systemd-run --wait --pipe --collect --quiet "${RELAXED[@]}" \
+              -E MQTTD_RULES_JQ=1 -E MQTTD_DURABLE_SESSIONS=0 "$BIN" "$@"
+          }
+          relaxed --check-rules "$WORK/jq.toml"
+          relaxed --rule-test --sql "SELECT jq('.a[]', payload) AS r FROM \"t/#\"" \
+            --payload '{"a":[1,"two"]}' > "$WORK/relaxed.out"
+          cat "$WORK/relaxed.out"
+          [ "$(cat "$WORK/relaxed.out")" = '{"r":[1,"two"]}' ]
+          relaxed --check-config | tee "$WORK/relaxed-host.out"
+          grep -qF 'rules.jq is on: this host allows compiled code' "$WORK/relaxed-host.out"
+          relaxed --check-rules "$WORK/modules/rules.toml"
+          echo "::endgroup::"
       # What loading costs on this runner (the compile a broker pays once, when rules
       # that call jq are loaded), for the record in the log.
       - name: Measurements (module load, instantiate, timeouts, limits)

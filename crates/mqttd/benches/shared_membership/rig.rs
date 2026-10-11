@@ -39,7 +39,7 @@ const DEADLINE: Duration = Duration::from_secs(10);
 /// past `DEADLINE`. This bound is a failure bound on the SETUP, never a latency
 /// result.
 #[allow(dead_code)]
-const SETTLE_DEADLINE: Duration = Duration::from_secs(60);
+const SETTLE_DEADLINE: Duration = Duration::from_mins(1);
 
 #[derive(Clone, Copy, Debug)]
 pub struct Shape {

@@ -32,7 +32,9 @@ mqtt-storage = { path = "../mqtt-storage", version = "1.0.0" }
 mqtt-cluster = { path = "../mqtt-cluster", version = "1.0.0" }
 mqtt-observability = { path = "../mqtt-observability", version = "1.0.0" }
 mqtt-config = { path = "../mqtt-config", version = "1.0.0" }
-mqtt-rules = { path = "../mqtt-rules", version = "1.0.0" }
+# Without its defaults: whether the `jq` function's runtime is linked is this crate's
+# `jq` feature.
+mqtt-rules = { path = "../mqtt-rules", version = "1.0.0", default-features = false }
 # `mqttd --print-config` renders the redacted config as TOML, and `--check-tls` reads
 # certificate validity, names and CRLs (ADR 0081 T11/T12). Both already in the tree via
 # mqtt-config and mqtt-auth — not new supply-chain crates.
@@ -58,6 +60,12 @@ rustix = { version = "1", features = ["process", "fs"] }
 
 
 [features]
+default = ["jq"]
+# EMQX's `jq` rule function, run in a WebAssembly sandbox (ADR 0086): links the runtime
+# (wasmtime, a compiler; about 6 MB on aarch64 and 9 MB on x86_64). It is still OFF at
+# run time unless `rules.jq = true`. Built with `--no-default-features` the broker has
+# no WebAssembly runtime at all, and the switch says so.
+jq = ["mqtt-rules/jq"]
 # FIPS 140-3 build variant (ADR 0068): swaps the crypto to the validated
 # AWS-LC module across the whole graph. A variant, not a default: heavier
 # build (cmake + Go), narrower platform matrix.
@@ -89,6 +97,9 @@ rustls-pki-types.workspace = true
 # `test-util` enables tokio's paused-clock test helpers (start_paused) for the
 # time-based session-expiry tests (ADR 0009).
 tokio = { workspace = true, features = ["test-util"] }
+# A module written out by hand, for the tests of `[functions.<name>]` through the binary
+# (ADR 0086 D9): they need no Wasm toolchain.
+mqtt-wasm-sandbox = { path = "../mqtt-wasm-sandbox", features = ["test-module"] }
 # Per-node surviving data dirs for the crash/restart stress vocabulary (ADR 0042 T4).
 # Already in the tree via mqtt-cluster's dev-dependencies.
 tempfile = "3"
@@ -102,6 +113,11 @@ workspace = true
 
 [[bench]]
 name = "shared_plan"
+harness = false
+
+# What a rule's state call costs, alone and under contention (ADR 0085 D14).
+[[bench]]
+name = "rule_state"
 harness = false
 
 [[bench]]

@@ -26,6 +26,7 @@ pub mod memory_watch;
 pub mod oidc;
 pub mod peer;
 pub mod reload;
+pub mod rule_state;
 pub mod rules;
 pub mod rules_sys;
 pub mod runtime_probe;

@@ -29,7 +29,7 @@ use crate::rules::{rule_def, TraceOutput, TracePayload};
 use crate::rules_sys::{counts_json, output_json, rfc3339_millis, ShownOutput};
 use bytes::Bytes;
 use mqtt_rules::edit::{EditError, RuleEdit};
-use mqtt_rules::{Effect, EventKind, Input, LoadError, Loaded, Outcome, Rule, RuleSet};
+use mqtt_rules::{Effect, EventKind, Functions, Input, LoadError, Loaded, Outcome, Rule, RuleSet};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -228,6 +228,7 @@ pub async fn list(state: &AdminState, caller: &Caller, role: Role) -> Answer {
             "in_sync": file_digest.as_deref() == Some(set.digest()),
             "writable": writable,
             "rules": set.rules().iter().map(|r| rule_json(&access, r, operator)).collect::<Vec<_>>(),
+            "modules": set.modules().iter().map(|m| module_json(m, operator)).collect::<Vec<_>>(),
             "reload": access.last_reload.get().map(|r| {
                 let mut v = json!({
                     "at": rfc3339_millis(r.at),
@@ -252,6 +253,45 @@ pub async fn list(state: &AdminState, caller: &Caller, role: Role) -> Answer {
     })
     .await
     .unwrap_or_else(|e| error(503, "unavailable", &format!("the rules task failed: {e}")))
+}
+
+/// One module the running rules declare (`[functions.<name>]`, ADR 0086 D9), as
+/// [`list`] shows it: what it is, the functions rules may call, the limits and grants
+/// its calls run under, and its instances with their memory. Never the module's bytes.
+/// A viewer's answer leaves out where the file is and which variables it is shown.
+fn module_json(module: &mqtt_rules::Module, operator: bool) -> Value {
+    let stats = module.stats();
+    let env: Vec<&str> = module.environment().collect();
+    let mut v = json!({
+        "name": &**module.name(),
+        "module": module.described_name(),
+        "version": module.version(),
+        "sha256": module.sha256(),
+        "functions": module.functions().iter().map(|f| json!({
+            "name": &*f.name,
+            "min_args": f.min_args,
+            "max_args": f.max_args,
+        })).collect::<Vec<_>>(),
+        "limits": {
+            "timeout_ms": u64::try_from(module.timeout().as_millis()).unwrap_or(u64::MAX),
+            "memory_bytes": module.memory_limit_bytes(),
+        },
+        "grants": {"clock": module.clock(), "env_count": env.len()},
+        "fresh_instance": module.fresh_instance(),
+        "instances": {
+            "count": stats.instances,
+            "in_call": stats.in_call,
+            "memory_bytes": stats.memory_bytes,
+            "replaced": stats.replaced,
+        },
+    });
+    if operator {
+        v["wasm"] = json!(module.wasm());
+        v["grants"]["env"] = json!(env);
+    } else {
+        v["redacted"] = json!(true);
+    }
+    v
 }
 
 /// One running rule, as [`list`] shows it.
@@ -462,6 +502,8 @@ fn invalid(node: &str, text: &str, e: &LoadError) -> Answer {
         } => json!({"scope": "sql", "rule": id, "line": line, "column": sql_column}),
         // About the rule but not its SQL: its id, its actions, how many it has.
         LoadError::Rule { id, .. } => json!({"scope": "rule", "rule": id}),
+        // A `[functions.<name>]` table whose module does not load (ADR 0086 D9).
+        LoadError::Function { name, .. } => json!({"scope": "function", "function": name}),
     };
     (
         422,
@@ -473,9 +515,20 @@ fn invalid(node: &str, text: &str, e: &LoadError) -> Answer {
     )
 }
 
-/// Parse `text` as the broker would load it, or answer `422 rules-invalid`.
-fn parse(node: &str, text: &str) -> Result<Loaded, Answer> {
-    RuleSet::parse(text).map_err(|e| invalid(node, text, &e))
+/// Parse `text` as the broker would load it — with what this node's rules may call
+/// (`jq`, where it is switched on; ADR 0086) — or answer `422 rules-invalid`.
+///
+/// A module the text declares (`[functions.<name>]`) is read from under the directory
+/// of the configured rules file and nowhere else, whoever sent the text: a caller of
+/// this API names a file the operator placed there, by a hash they have to know, or
+/// nothing (ADR 0086 D9).
+fn parse(state: &AdminState, text: &str, functions: &Functions) -> Result<Loaded, Answer> {
+    let functions = match configured_file(state) {
+        Some(file) => functions.beside(Path::new(&file)),
+        None => functions.clone(),
+    };
+    crate::rules::noting_the_jq_module(&functions, || RuleSet::parse_with(text, &functions))
+        .map_err(|e| invalid(&state.node_id, text, &e))
 }
 
 /// The text a check or a dry run is about: `source`, or `rule` spliced into the file on
@@ -531,12 +584,12 @@ pub async fn check(state: &AdminState, req: &Request) -> Answer {
         return bad_request(&state.node_id, "give source or rule, not both");
     }
     let state = state.clone();
-    one_at_a_time(&access, move || {
+    one_at_a_time(&access.clone(), move || {
         let (text, _) = match candidate(&state, checked.source, checked.rule) {
             Ok(c) => c,
             Err(refusal) => return refusal,
         };
-        let loaded = match parse(&state.node_id, &text) {
+        let loaded = match parse(&state, &text, access.rules.functions()) {
             Ok(l) => l,
             Err(refusal) => return refusal,
         };
@@ -683,6 +736,14 @@ pub async fn test(state: &AdminState, req: &Request) -> Answer {
     };
     let state = state.clone();
     let running = access.rules.current();
+    let functions = access.rules.functions().clone();
+    // A scratch store, dropped with this request: a dry run never reads or writes the
+    // state the running rules keep (ADR 0085 D11). `None` where rule state is off, and
+    // no rule that calls it loads.
+    let scratch = access
+        .rules
+        .state()
+        .map(|running| crate::rule_state::Store::scratch(Some(running)));
     one_at_a_time(&access, move || {
         let (set, alone) = if t.source.is_none() && t.rule.is_none() {
             (running, t.only)
@@ -691,7 +752,7 @@ pub async fn test(state: &AdminState, req: &Request) -> Answer {
                 Ok(c) => c,
                 Err(refusal) => return refusal,
             };
-            match parse(&node, &text) {
+            match parse(&state, &text, &functions) {
                 Ok(loaded) => (Arc::new(loaded.rules), spliced.or(t.only)),
                 Err(refusal) => return refusal,
             }
@@ -705,7 +766,13 @@ pub async fn test(state: &AdminState, req: &Request) -> Answer {
                 json!({}),
             );
         }
-        let results = dry_run(&set, alone.as_deref(), &trigger, &node);
+        let results = dry_run(
+            &set,
+            alone.as_deref(),
+            &trigger,
+            &node,
+            scratch.as_deref().map(|s| s as &dyn mqtt_rules::StateStore),
+        );
         let answer = TestAnswer {
             node: &node,
             results,
@@ -717,7 +784,13 @@ pub async fn test(state: &AdminState, req: &Request) -> Answer {
 
 /// Evaluate `trigger` against `alone`, or every enabled rule of `set` whose `FROM`
 /// selects it, with a report of its own: nothing outside this function sees it.
-fn dry_run(set: &RuleSet, alone: Option<&str>, trigger: &Trigger, node: &str) -> Vec<Tested> {
+fn dry_run(
+    set: &RuleSet,
+    alone: Option<&str>,
+    trigger: &Trigger,
+    node: &str,
+    scratch: Option<&dyn mqtt_rules::StateStore>,
+) -> Vec<Tested> {
     let props = mqtt_core::AppProperties::default();
     let mut message = mqtt_rules::PublishInput::new(
         &trigger.clientid,
@@ -759,9 +832,13 @@ fn dry_run(set: &RuleSet, alone: Option<&str>, trigger: &Trigger, node: &str) ->
             .map(|r| &**r.id())
             .collect(),
     };
+    // A scratch dictionary too, for EMQX's `proc_dict_*`: this request's own, as each
+    // of EMQX's SQL tests over its API runs in a process of its own. Never a
+    // connection's.
+    let dictionary = mqtt_rules::state::Dictionary::new();
     ids.into_iter()
         .filter_map(|id| set.get(id))
-        .map(|rule| evaluate(set, rule, input))
+        .map(|rule| evaluate(set, rule, input, scratch, &dictionary))
         .collect()
 }
 
@@ -794,7 +871,13 @@ struct Tested {
     rule: String,
 }
 
-fn evaluate(set: &RuleSet, rule: &Rule, input: &dyn Input) -> Tested {
+fn evaluate(
+    set: &RuleSet,
+    rule: &Rule,
+    input: &dyn Input,
+    scratch: Option<&dyn mqtt_rules::StateStore>,
+    dictionary: &mqtt_rules::state::Dictionary,
+) -> Tested {
     let id = &**rule.id();
     if let Some(reason) = rule.from_mismatch(input) {
         return Tested {
@@ -810,9 +893,11 @@ fn evaluate(set: &RuleSet, rule: &Rule, input: &dyn Input) -> Tested {
     // Each output runs every action in order; an `ActionOk` is followed by its effect.
     let (mut actions, mut rendered, per_output) = (0usize, 0usize, rule.action_count().max(1));
     let mut effects = Vec::new();
-    set.evaluate_one(
+    set.evaluate_one_on(
         id,
         input,
+        scratch,
+        dictionary,
         &mut |_, outcome| match outcome {
             Outcome::Passed => result = "passed",
             Outcome::NoResult => result = "no_result",
@@ -832,8 +917,9 @@ fn evaluate(set: &RuleSet, rule: &Rule, input: &dyn Input) -> Tested {
             // A dry run's input is never a republished message, so no republish is
             // skipped as a loop; were one, it would show nothing.
             Outcome::Recursive(_) => actions += 1,
-            // A dry run is not timed (`evaluate_one` never reports it).
-            Outcome::Elapsed(_) => {}
+            // A dry run is not timed (`evaluate_one` never reports it), and its calls
+            // of `jq` are not counted as traffic.
+            Outcome::Elapsed(_) | Outcome::Function(_) => {}
         },
         &mut effects,
     );
@@ -1067,7 +1153,7 @@ impl RulesWrite<'_> {
             Ok(text) => text,
             Err(e) => return edit_refused(node, &e),
         };
-        let loaded = match parse(node, &text) {
+        let loaded = match parse(state, &text, self.rules.functions()) {
             Ok(l) => l,
             Err(refusal) => return refusal,
         };
@@ -1238,5 +1324,86 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         rules.file = Some(dir.path().join("rules.toml").display().to_string());
         assert_eq!(unwritable_warning(&rules), None, "a writable directory");
+    }
+
+    /// ADR 0086 D9: what `GET /admin/v1/rules` says of a declared module — its name,
+    /// version and hash, its functions, limits and grants, its instances and their
+    /// memory — and what a viewer's answer leaves out: where the file is, and which
+    /// environment variables the module is shown. Never the module's bytes.
+    #[cfg(feature = "jq")]
+    #[test]
+    fn a_declared_module_is_listed_whole_for_an_operator_and_redacted_for_a_viewer() {
+        let dir = tempfile::tempdir().unwrap();
+        let wasm = mqtt_wasm_sandbox::test_module::plugin("3.1", b"j1");
+        std::fs::write(dir.path().join("site.wasm"), &wasm).unwrap();
+        let sha = sha256_hex(&wasm);
+        let text = format!(
+            "[functions.site]\nwasm = \"site.wasm\"\nsha256 = \"{sha}\"\nfunctions = \
+             [\"which\"]\ntimeout_ms = 250\nmemory_mib = 8\nclock = true\nenv = \
+             [\"SITE\"]\n[rules.r]\nsql = 'SELECT which() AS n FROM \"t\"'\n"
+        );
+        let functions = Functions::default()
+            .with_modules(mqtt_rules::ModuleSettings {
+                environment: vec![("SITE".to_string(), Some("a-secret-value".to_string()))],
+                instances: 1,
+                hand_off: None,
+            })
+            .beside(&dir.path().join("rules.toml"));
+        let set = RuleSet::parse_with(&text, &functions).unwrap().rules;
+        let module = &set.modules()[0];
+        let whole = json!({
+            "name": "site",
+            "module": "test",
+            "version": "3.1",
+            "sha256": sha,
+            "functions": [{"name": "which", "min_args": 0, "max_args": 8}],
+            "limits": {"timeout_ms": 250, "memory_bytes": 8 << 20},
+            "fresh_instance": false,
+            "instances": {"count": 0, "in_call": 0, "memory_bytes": 0, "replaced": 0},
+        });
+        let with = |extra: Value| {
+            let mut v = whole.clone();
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            v
+        };
+        assert_eq!(
+            module_json(module, true),
+            with(json!({
+                "wasm": "site.wasm",
+                "grants": {"clock": true, "env_count": 1, "env": ["SITE"]},
+            }))
+        );
+        assert_eq!(
+            module_json(module, false),
+            with(json!({
+                "grants": {"clock": true, "env_count": 1},
+                "redacted": true,
+            }))
+        );
+        // Neither holds a variable's value, or anything of the file but its hash.
+        for operator in [true, false] {
+            assert!(!module_json(module, operator)
+                .to_string()
+                .contains("a-secret-value"));
+        }
+        // A module that does not load is a `function` error naming its table.
+        let wrong = text.replace(&sha, &"0".repeat(64));
+        let error = RuleSet::parse_with(&wrong, &functions).expect_err("another hash");
+        let (status, body) = invalid("n1", &wrong, &error);
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status, 422);
+        assert_eq!(
+            body["error"]["details"],
+            json!({"scope": "function", "function": "site"})
+        );
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("functions `site`: wasm = \"site.wasm\": the file does not have"),
+            "{body}"
+        );
     }
 }

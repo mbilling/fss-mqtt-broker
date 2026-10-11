@@ -21,15 +21,23 @@ members = [
 # cargo-deny and cargo-audit on every push and its lockfile is what the SBOM is cut from.
 # A feature flag would not achieve this — it removes a crate from the artifact, not from
 # Cargo.lock. The boundary has to be the lockfile.
-exclude = ["tools/mqttui"]
+#
+# `examples/rule-plugins/rust` is a workspace of its own too: a worked example of a
+# rule-function module (ADR 0086 D9), which is guest code built for WebAssembly and run
+# inside the broker's sandbox. It needs `unsafe` to implement the function ABI, and this
+# workspace forbids `unsafe`; it has no dependencies.
+exclude = ["tools/mqttui", "examples/rule-plugins/rust"]
 
 [workspace.package]
 version = "1.1.0"
 edition = "2021"
 # Raised from 1.75 by the OTLP/HTTP metric exporter (ADR 0020 T9: the OpenTelemetry
 # SDK + reqwest stack requires Rust 1.85), then from 1.85 by jsonwebtoken 11
-# (rust-version 1.88; taken for its aws_lc_rs backend — ADR 0053 staged prep).
-rust-version = "1.88"
+# (rust-version 1.88; taken for its aws_lc_rs backend — ADR 0053 staged prep), then
+# from 1.88 by wasmtime 49 (rust-version 1.96), the runtime the `jq` rule function's
+# sandbox is built on (ADR 0086 §8). wasmtime's minimum is the stable compiler and the
+# two before it, so its security updates will keep moving this.
+rust-version = "1.96"
 license = "Apache-2.0"
 repository = "https://github.com/mbilling/fss-mqtt-broker"
 authors = ["mqtt-broker contributors"]
@@ -121,6 +129,31 @@ criterion = "0.8"
 # gain (failures are diagnosed from logs + file:line backtraces).
 [profile.dev]
 debug = "line-tables-only"
+
+# The compiler behind the `jq` rule function (ADR 0086): Cranelift turns the jq module
+# into machine code when rules that call jq are first loaded, in every process that
+# loads them. Unoptimised, that compiler takes six to seven seconds over the module
+# where the optimised one takes half a second, and every test that starts a broker with
+# a jq rule would pay it. So the crates that do the work are optimised in dev and test
+# builds too. Nothing else is, and release builds are untouched.
+[profile.dev.package.cranelift-codegen]
+opt-level = 3
+[profile.dev.package.cranelift-frontend]
+opt-level = 3
+[profile.dev.package.cranelift-entity]
+opt-level = 3
+[profile.dev.package.cranelift-bforest]
+opt-level = 3
+[profile.dev.package.cranelift-bitset]
+opt-level = 3
+[profile.dev.package.regalloc2]
+opt-level = 3
+[profile.dev.package.wasmparser]
+opt-level = 3
+[profile.dev.package.wasmtime-environ]
+opt-level = 3
+[profile.dev.package.wasmtime-internal-cranelift]
+opt-level = 3
 
 [profile.release]
 lto = "thin"

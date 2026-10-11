@@ -342,7 +342,7 @@ Plaintext + anonymous: a first look, never a deployment. Secured version (TLS 1.
 | Integrations | |
 |---|---|
 | Bridge | `mqtt-bridge`: separate signed binary/image, deny-by-default directional rules, loop prevention, bounded spool, HA pairs |
-| Rule engine | EMQX-compatible rule SQL: filter, transform and re-route at QoS 0/1/2, evaluated once per message on the node it arrived at; opt-in per-rule statistics and trace on `$SYS`, rules editable through the admin API; unreleased ([RULES.md](docs/RULES.md), [cookbook](docs/RULES-COOKBOOK.md), [live demo](demo/rules-live/README.md)) |
+| Rule engine | EMQX-compatible rule SQL: filter, transform and re-route at QoS 0/1/2, evaluated once per message on the node it arrived at; opt-in per-rule statistics and trace on `$SYS`, rules editable through the admin API; EMQX's `jq` function (the real jq, in a WebAssembly sandbox, off unless switched on) and functions of your own as WebAssembly modules pinned by hash; unreleased ([RULES.md](docs/RULES.md), [cookbook](docs/RULES-COOKBOOK.md), [live demo](demo/rules-live/README.md)) |
 | Kafka / webhook / DB | `$share` consumer group on durable sessions ([INTEGRATION.md](docs/INTEGRATION.md)); the rule engine has no sinks, by design |
 | Migration | converters for Mosquitto, EMQX, HiveMQ configs + ACLs → reviewed draft ([MIGRATION.md](docs/MIGRATION.md)) |
 | Plugins | HTTP auth hook; `Authenticator` / `Authorizer` traits; no dynamic loader |
@@ -519,7 +519,7 @@ Bare metal: [`deploy/systemd/`](deploy/systemd/) · tutorial: [SECURED-CLUSTER-T
 
 **Binaries:** [GitHub Releases](https://github.com/mbilling/fss-mqtt-broker/releases) (`mqttd-*`, `mqttd-fips-*`, `mqtt-bridge-*`)
 
-**Source** (Rust ≥ 1.88)
+**Source** (Rust ≥ 1.96)
 ```sh
 git clone https://github.com/mbilling/fss-mqtt-broker && cd fss-mqtt-broker
 cargo build --release --bin mqttd
@@ -678,7 +678,7 @@ endpoint, roles, errors).
 | `mqtt-observability` | Prometheus/OTLP metrics, hash-chained audit |
 | `mqtt-config` | typed config, secure defaults |
 | `mqtt-rules` | rule engine: EMQX-compatible rule SQL, republish/console actions |
-| `mqtt-wasm-sandbox` | ADR 0086: rule functions as WebAssembly modules in a sandbox (wasmtime), the real jq first; not linked into the broker |
+| `mqtt-wasm-sandbox` | ADR 0086: rule functions as WebAssembly modules in a sandbox (wasmtime); runs the rule engine's `jq`, the real jq, where `rules.jq` switches it on |
 | `mqtt-bridge` | zone-crossing bridge: spool, QoS 1 replay |
 | `mqttd` | the broker binary: hub, connections, peer mesh |
 | `mqttd-operator` | Kubernetes operator for `MqttdCluster` |

@@ -122,7 +122,7 @@ fn spawn_stats(
 
 /// The next `$SYS` message, within an hour of (paused) time.
 async fn next_sys(rx: &mut mpsc::UnboundedReceiver<HubCommand>) -> (String, Value) {
-    let cmd = timeout(Duration::from_secs(3600), rx.recv())
+    let cmd = timeout(Duration::from_hours(1), rx.recv())
         .await
         .expect("a $SYS message within an hour");
     match cmd {
@@ -353,7 +353,7 @@ async fn last_active_is_kept_across_a_reload_and_set_only_when_a_rule_runs() {
     // Off, a run nobody sees, and on again.
     w.observe.apply(&settings(0, false, 20), None);
     assert!(
-        timeout(Duration::from_secs(60), sys.recv()).await.is_err(),
+        timeout(Duration::from_mins(1), sys.recv()).await.is_err(),
         "off: no tick"
     );
     publish(&conn, "t/1", br#"{"v":5}"#);
@@ -385,9 +385,7 @@ async fn an_interval_change_applies_at_once() {
 
     w.observe.apply(&settings(0, false, 20), None);
     assert!(
-        timeout(Duration::from_secs(7200), sys.recv())
-            .await
-            .is_err(),
+        timeout(Duration::from_hours(2), sys.recv()).await.is_err(),
         "off: no tick in two hours"
     );
     let off_for = Instant::now();
@@ -399,7 +397,7 @@ async fn an_interval_change_applies_at_once() {
 /// The next `$SYS` message's topic and Message Expiry Interval, within an hour of
 /// (paused) time.
 async fn next_expiry(rx: &mut mpsc::UnboundedReceiver<HubCommand>) -> (String, u32) {
-    match timeout(Duration::from_secs(3600), rx.recv()).await {
+    match timeout(Duration::from_hours(1), rx.recv()).await {
         Ok(Some(HubCommand::SysPublish {
             topic,
             message_expiry,
@@ -1142,7 +1140,7 @@ async fn records_queued_before_the_trace_turned_off_are_not_published() {
         CancellationToken::new(),
     ));
     assert!(
-        timeout(Duration::from_secs(60), hub_rx.recv())
+        timeout(Duration::from_mins(1), hub_rx.recv())
             .await
             .is_err(),
         "a record was published after the trace was turned off"

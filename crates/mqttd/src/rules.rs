@@ -8,7 +8,15 @@
 //!   so rule work scales with connections and with nodes exactly as ingress does — the
 //!   single-threaded hub never runs SQL for client publishes. A forwarded copy arriving
 //!   from a peer is never re-evaluated: its landing node already did. Wills are the one
-//!   exception (the hub publishes them, so the hub evaluates them; they are rare).
+//!   exception (the hub publishes them, so the hub evaluates them; they are rare) —
+//!   unless the rules call `jq`, which may run for as long as its timeout allows: then
+//!   a Will's rules run on a task of their own ([`Rules::calls_sandbox`], ADR 0086 D6).
+//! - **`jq`** ([ADR 0086](../../../docs/adr/0086-wasm-rule-functions.md)) runs in a
+//!   WebAssembly sandbox, where `rules.jq` switches it on ([`functions_from_config`]).
+//!   A call that has run for a millisecond is suspended once and goes on under
+//!   `tokio::task::block_in_place` ([`hand_off`]): the worker it occupies gives its
+//!   other connections to another worker first, so a ten-second jq holds its own
+//!   publisher and nobody else.
 //! - **What a republish is.** An ordinary publish into the hub — routed, forwarded,
 //!   retained, queued for offline sessions and quorum-replicated exactly like a client
 //!   one — but with **no publisher** (so No Local does not apply, as in EMQX where the
@@ -47,6 +55,15 @@
 //!   events say about a message's publisher travels with the message as its
 //!   [`Origin`], stamped at the publish only while a rule here or on a peer selects one
 //!   of them ([`Rules::origin_wanted`]).
+//! - **The dictionary** ([ADR 0085](../../../docs/adr/0085-rule-state-store.md) D13).
+//!   EMQX's `proc_dict_*` work on the dictionary of the process that evaluates the
+//!   rule, which there is the client's connection process. Here it is the connection
+//!   task's: a [`Dictionary`] in its [`ConnRules`], handed to everything that task
+//!   evaluates (its publishes and what they republish, its events, the deliveries to
+//!   it, the hub's notes about either), empty at connect and dropped with the
+//!   connection. No other task can reach it, so no call takes a lock for it. A Will
+//!   (the hub's, or its own task's) and the notes task evaluate on an empty dictionary
+//!   that is dropped afterwards.
 //! - **Watching it** ([ADR 0084](../../../docs/adr/0084-watching-and-editing-rules-live.md)).
 //!   [`RulesObserve`] holds the live `[rules]` settings for the `$SYS` statistics and
 //!   the trace, each rule's last error, and the trace's queue. With the trace off an
@@ -64,9 +81,10 @@ use bytes::Bytes;
 use mqtt_codec::QoS;
 use mqtt_core::{AppProperties, ClientId, Origin};
 use mqtt_observability::metrics::Metrics;
+use mqtt_rules::state::Dictionary;
 use mqtt_rules::{
-    Budget, Effect, EventInput, EventKind, EventMessage, Input, Outcome, PublishInput, Recursion,
-    Republish, Rule, RuleSet,
+    Budget, Effect, EventInput, EventKind, EventMessage, Functions, Input, JqSettings, JqSwitch,
+    ModuleSettings, Outcome, PublishInput, Recursion, Republish, Rule, RuleSet,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
@@ -90,6 +108,12 @@ pub struct Rules {
     /// publish here then carries its [`Origin`], for that peer's rules. Written by the
     /// hub when a peer's answer changes, read by every publish.
     peers_want_origin: Arc<AtomicBool>,
+    /// What a rules file may call beyond the built-in functions on this node (`jq`,
+    /// ADR 0086): what every load of one is given, the admin API's included.
+    functions: Functions,
+    /// The store the running rules keep their state in (ADR 0085); `None` where rule
+    /// state is switched off. The same store `functions` carries.
+    state: Option<Arc<crate::rule_state::Store>>,
 }
 
 impl std::fmt::Debug for Rules {
@@ -332,6 +356,21 @@ fn report(
             }
             return;
         }
+        // A call of `jq` or of a module's function (ADR 0086 D10). One that failed has
+        // failed its rule, which the
+        // `Failed` that follows reports with the function's own error text.
+        Outcome::Function(call) => {
+            if let Some(m) = metrics {
+                m.rule_function_call(&call.function, call.elapsed, call.error);
+                m.rule_module(
+                    &call.module,
+                    call.stats.instances,
+                    call.stats.memory_bytes,
+                    call.stats.replaced,
+                );
+            }
+            return;
+        }
         Outcome::Passed => (Some("passed"), None),
         Outcome::NoResult => (Some("no_result"), None),
         Outcome::Failed(e) => {
@@ -465,6 +504,8 @@ struct Engine<'a> {
     observe: Option<&'a RulesObserve>,
     /// Whether the messages it derives carry an [`Origin`].
     origin_wanted: bool,
+    /// The evaluating task's dictionary (`proc_dict_*`).
+    dictionary: &'a Dictionary,
 }
 
 impl Engine<'_> {
@@ -480,22 +521,25 @@ impl Engine<'_> {
             set,
             metrics,
             observe,
+            dictionary,
             ..
         } = self;
         let mut effects = Vec::new();
         // The trace's gate: one relaxed load, then the plain report or the capturing one.
         match observe.filter(|o| o.tracing()) {
-            None => set.on_publish_within(
+            None => set.on_publish_in(
                 input,
                 budget,
+                dictionary,
                 &mut |r, o| report(metrics, observe, r, o),
                 &mut effects,
             ),
             Some(o) => {
                 let mut capture = Capture::new(o.trace_rate());
-                set.on_publish_within(
+                set.on_publish_in(
                     input,
                     budget,
+                    dictionary,
                     &mut |r, out| {
                         capture.see(r, out);
                         report(metrics, observe, r, out);
@@ -546,9 +590,11 @@ impl Engine<'_> {
 /// Evaluate a publish against `set`, and what it republishes in turn. `origin` is the
 /// publish's own, when it carries one: its rules then see the `id` and
 /// `publish_received_at` the message events will report for it, and what they
-/// republish carries an origin too.
+/// republish carries an origin too. `dictionary` is the evaluating task's.
+#[allow(clippy::too_many_arguments)] // one evaluation's facts, passed once
 fn evaluate(
     set: &RuleSet,
+    dictionary: &Dictionary,
     node: &str,
     metrics: Option<&Metrics>,
     observe: Option<&RulesObserve>,
@@ -575,6 +621,7 @@ fn evaluate(
         metrics,
         observe,
         origin_wanted: origin.is_some(),
+        dictionary,
     };
     let budget = Budget::new(f.payload.len());
     let effects = engine.publish(&input, &budget, || TraceTrigger::message(trigger, f));
@@ -591,7 +638,46 @@ impl Rules {
             metrics,
             observe: None,
             peers_want_origin: Arc::new(AtomicBool::new(false)),
+            functions: Functions::default(),
+            state: None,
         }
+    }
+
+    /// The same engine, knowing the store its rules keep their state in: the one
+    /// [`with_functions`](Self::with_functions) was given
+    /// ([`functions_and_state_from_config`]).
+    #[must_use]
+    pub fn with_state(mut self, state: Option<Arc<crate::rule_state::Store>>) -> Self {
+        self.state = state;
+        self
+    }
+
+    /// The store the running rules keep their state in, where rule state is on.
+    #[must_use]
+    pub fn state(&self) -> Option<&Arc<crate::rule_state::Store>> {
+        self.state.as_ref()
+    }
+
+    /// The same engine on a node whose rules may call `functions`
+    /// ([`functions_from_config`]).
+    #[must_use]
+    pub fn with_functions(mut self, functions: Functions) -> Self {
+        self.functions = functions;
+        self
+    }
+
+    /// What a rules file loaded on this node may call beyond the built-in functions.
+    #[must_use]
+    pub fn functions(&self) -> &Functions {
+        &self.functions
+    }
+
+    /// Whether the rules in force call a function that runs in the sandbox (`jq`),
+    /// and so may take as long as its timeout allows: the hub then does not evaluate
+    /// a Will itself (ADR 0086 D6).
+    #[must_use]
+    pub fn calls_sandbox(&self) -> bool {
+        self.rx.borrow().calls_sandbox()
     }
 
     /// Record whether any linked peer's rules select a message event (the hub's call,
@@ -626,7 +712,11 @@ impl Rules {
         hub: mpsc::UnboundedSender<HubCommand>,
     ) -> mpsc::Sender<Box<MessageNote>> {
         let (tx, mut rx) = mpsc::channel::<Box<MessageNote>>(NOTE_QUEUE);
-        let rules = self.for_connection();
+        // No connection's task: each note is evaluated on an empty dictionary.
+        let rules = ConnRules {
+            keeps_dictionary: false,
+            ..self.for_connection()
+        };
         let mut reloaded = self.rx.clone();
         reloaded.mark_unchanged();
         tokio::spawn(async move {
@@ -702,8 +792,24 @@ impl Rules {
         let mut rx = self.rx.clone();
         let set = rx.borrow_and_update().clone();
         ConnRules {
+            view: Mutex::new(View {
+                rx,
+                set,
+                dictionary: self.dictionary(),
+            }),
             engine: self.clone(),
-            view: Mutex::new(View { rx, set }),
+            keeps_dictionary: true,
+        }
+    }
+
+    /// An empty dictionary for one evaluating task (`proc_dict_*`, ADR 0085 D13),
+    /// whose bytes count against the ceiling of the store the rules keep their state
+    /// in. Where rule state is off no rule that calls `proc_dict_*` loads, and the
+    /// dictionary stays empty.
+    fn dictionary(&self) -> Dictionary {
+        match &self.state {
+            Some(store) => Dictionary::counted_in(store.clone()),
+            None => Dictionary::new(),
         }
     }
 
@@ -728,8 +834,12 @@ impl Rules {
         origin: Option<&Origin>,
         send: impl Fn(HubCommand),
     ) {
+        // EMQX evaluates a Will in the dying connection's process, which still holds
+        // its dictionary. Here the connection's task has ended: an empty one, dropped
+        // after this (ADR 0085 D13, a listed difference).
         let derived = evaluate(
             &self.current(),
+            &self.dictionary(),
             &self.node,
             self.metrics.as_deref(),
             self.observe.as_deref(),
@@ -746,15 +856,18 @@ impl Rules {
 struct View {
     rx: RulesWatch,
     set: Arc<RuleSet>,
+    /// The connection task's dictionary (`proc_dict_*`): beside the rule set, behind
+    /// the connection's own lock, which an evaluation already holds. Empty, it is
+    /// a few words and no allocation.
+    dictionary: Dictionary,
 }
 
 impl View {
-    fn fresh(&mut self) -> &RuleSet {
+    fn refresh(&mut self) {
         // `has_changed` loads the watch's version: no shared write per publish.
         if self.rx.has_changed().unwrap_or(false) {
             self.set = self.rx.borrow_and_update().clone();
         }
-        &self.set
     }
 }
 
@@ -769,6 +882,10 @@ impl View {
 pub struct ConnRules {
     engine: Rules,
     view: Mutex<View>,
+    /// Whether what `proc_dict_*` wrote stays for the next evaluation: yes for a
+    /// connection, whose dictionary lives as long as it does; no for the notes task,
+    /// which evaluates for clients that have no connection.
+    keeps_dictionary: bool,
 }
 
 impl std::fmt::Debug for ConnRules {
@@ -780,12 +897,17 @@ impl std::fmt::Debug for ConnRules {
 }
 
 impl ConnRules {
-    fn with_set<T>(&self, f: impl FnOnce(&RuleSet) -> T) -> T {
+    fn with_set<T>(&self, f: impl FnOnce(&RuleSet, &Dictionary) -> T) -> T {
         let mut view = self
             .view
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        f(view.fresh())
+        view.refresh();
+        let result = f(&view.set, &view.dictionary);
+        if !self.keeps_dictionary {
+            view.dictionary.clear();
+        }
+        result
     }
 
     /// Evaluate a client publish. Returns the messages its rules republish, in rule
@@ -797,10 +919,11 @@ impl ConnRules {
         let metrics = self.engine.metrics.as_deref();
         let observe = self.engine.observe.as_deref();
         let peers = self.engine.peers_want_origin.load(Relaxed);
-        self.with_set(|set| {
+        self.with_set(|set, dictionary| {
             let origin = (peers || set.wants_message_events()).then(|| client_origin(f));
             let derived = evaluate(
                 set,
+                dictionary,
                 &self.engine.node,
                 metrics,
                 observe,
@@ -816,20 +939,20 @@ impl ConnRules {
     /// held — for a connection that is idle but alive (its PINGREQ), so a series of
     /// reloads does not keep a series of old rule sets in memory.
     pub fn refresh(&self) {
-        self.with_set(|_| ());
+        self.with_set(|_, _| ());
     }
 
     /// Whether any rule selects `kind` (checked before building the event).
     #[must_use]
     pub fn wants(&self, kind: mqtt_rules::EventKind) -> bool {
-        self.with_set(|set| set.wants_event(kind))
+        self.with_set(|set, _| set.wants_event(kind))
     }
 
     /// Which message events the rules select: what a connection reads once per batch
     /// of deliveries it writes, so a batch no rule watches costs one uncontended lock.
     #[must_use]
     pub fn message_wants(&self) -> MessageWants {
-        self.with_set(MessageWants::of)
+        self.with_set(|set, _| MessageWants::of(set))
     }
 
     /// This node's id, the `node` of every event.
@@ -925,23 +1048,25 @@ impl ConnRules {
         let observe = self.engine.observe.as_deref();
         let node = &self.engine.node;
         let peers = self.engine.peers_want_origin.load(Relaxed);
-        let derived = self.with_set(|set| {
+        let derived = self.with_set(|set, dictionary| {
             let budget = Budget::new(input.payload().map_or(0, Bytes::len));
             let mut effects = Vec::new();
             match observe.filter(|o| o.tracing()) {
                 None => {
-                    set.on_event_within(
+                    set.on_event_in(
                         input,
                         &budget,
+                        dictionary,
                         &mut |r, o| report(metrics, observe, r, o),
                         &mut effects,
                     );
                 }
                 Some(o) => {
                     let mut capture = Capture::new(o.trace_rate());
-                    set.on_event_within(
+                    set.on_event_in(
                         input,
                         &budget,
+                        dictionary,
                         &mut |r, out| {
                             capture.see(r, out);
                             report(metrics, observe, r, out);
@@ -957,6 +1082,7 @@ impl ConnRules {
                 metrics,
                 observe,
                 origin_wanted: peers || set.wants_message_events(),
+                dictionary,
             };
             engine.reenter(effects, input.republish_depth(), &budget)
         });
@@ -1823,8 +1949,9 @@ impl Capture {
 
     fn see(&mut self, rule: &Rule, outcome: Outcome<'_>) {
         let (result, error) = match outcome {
-            // The rule's cost is in its statistics, not in each trace record.
-            Outcome::Elapsed(_) => return,
+            // The rule's cost is in its statistics, not in each trace record; a failed
+            // function call is the `Failed` that follows it, with its kind and text.
+            Outcome::Elapsed(_) | Outcome::Function(_) => return,
             Outcome::Passed => (TraceResult::Passed, None),
             Outcome::NoResult => (TraceResult::NoResult, None),
             Outcome::Failed(e) => (TraceResult::Failed, Some(e)),
@@ -1913,16 +2040,175 @@ impl Capture {
     }
 }
 
-/// Load the configured rules file. `None` path = no rules. Warnings are logged.
+/// Load the configured rules file, with `jq` switched off. `None` path = no rules.
+/// Warnings are logged.
 pub fn load(path: Option<&str>) -> Result<RuleSet, String> {
+    load_with(path, &Functions::default())
+}
+
+/// Load the configured rules file as this node loads it: `functions` is what its rules
+/// may call beyond the built-in functions ([`functions_from_config`]). A file that
+/// calls `jq` fails to load where `jq` is off or cannot run, with the reason; the first
+/// one that loads compiles the jq module, on this thread (ADR 0086 D5).
+pub fn load_with(path: Option<&str>, functions: &Functions) -> Result<RuleSet, String> {
     let Some(path) = path else {
         return Ok(RuleSet::empty());
     };
-    let loaded = RuleSet::load(std::path::Path::new(path)).map_err(|e| e.to_string())?;
+    let loaded = noting_the_jq_module(functions, || {
+        RuleSet::load_with(std::path::Path::new(path), functions)
+    })
+    .map_err(|e| e.to_string())?;
     for w in &loaded.warnings {
         warn!(file = %path, "rules: {w}");
     }
+    for module in loaded.rules.modules() {
+        info!(
+            file = %path,
+            module = %module.name(),
+            sha256 = %module.sha256(),
+            version = %module.version(),
+            functions = module.functions().len(),
+            "rules: the file declares a WebAssembly module (ADR 0086 D9)"
+        );
+    }
     Ok(loaded.rules)
+}
+
+/// Runs `load`, which loads rules with `functions`, and says so in the log when it was
+/// the load that compiled the jq module: the first in this process of rules that call
+/// `jq`, wherever it came from (boot, a reload, the admin API). The one moment the
+/// WebAssembly runtime comes into being, and half a second an operator may wonder about.
+pub fn noting_the_jq_module<T>(functions: &Functions, load: impl FnOnce() -> T) -> T {
+    let was_loaded = functions.jq().is_some_and(|jq| jq.is_loaded());
+    let started = std::time::Instant::now();
+    let loaded = load();
+    if !was_loaded && functions.jq().is_some_and(|jq| jq.is_loaded()) {
+        info!(
+            took_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "rules: the rules call jq; its WebAssembly module is compiled (once per process, \
+             ADR 0086)"
+        );
+    }
+    loaded
+}
+
+/// What rules may call beyond the built-in functions on this node, from `[rules]`
+/// (ADR 0086 D13): nothing unless `rules.jq` is on. Read once, at startup — nothing of
+/// the WebAssembly runtime exists until a rules file that calls `jq` is loaded.
+///
+/// `jq`'s environment is the listed variables that are set, with the values they have
+/// now (D8); its warm instances are as many as the runtime has workers (D5).
+///
+/// A module the rules file declares (`[functions.<name>]`, D9) needs no switch: its
+/// declaration is the switch, and it is loaded when a rules file that declares it is.
+/// What is read here is what such a module may be given: the variables
+/// `rules.functions_env` lists, the same number of warm instances, the same hand-off.
+/// A module is read from under the directory of `rules.file`.
+///
+/// Rule state (ADR 0085) needs no switch either: using it is the switch, under
+/// `rules.state_max_bytes`. Every call of this makes a store of its own, empty: the
+/// commands that check a rules file or try a statement (`--check-rules`, `--rule-test`,
+/// `--check-config`) therefore work on a scratch store. The broker makes its one
+/// store with [`functions_and_state_from_config`].
+#[must_use]
+pub fn functions_from_config(rules: &mqtt_config::Rules) -> Functions {
+    functions_and_state_from_config(rules).0
+}
+
+/// [`functions_from_config`], and the store the functions carry: the broker's, which
+/// its rules keep their state in for as long as it runs. `None` where
+/// `rules.state_max_bytes` is `0`: a rules file that uses state then does not load.
+#[must_use]
+pub fn functions_and_state_from_config(
+    rules: &mqtt_config::Rules,
+) -> (Functions, Option<Arc<crate::rule_state::Store>>) {
+    let value = |key: &str, name: &String| match std::env::var(name) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            warn!(variable = %name, "{key}: the variable's value is not UTF-8; it is not shown");
+            None
+        }
+    };
+    let workers = tokio::runtime::Handle::try_current().map_or_else(
+        |_| std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
+        |runtime| runtime.metrics().num_workers(),
+    );
+    let functions = if rules.jq {
+        Functions::with_jq(JqSettings {
+            default_timeout: std::time::Duration::from_millis(rules.jq_default_timeout_ms),
+            environment: rules
+                .jq_env
+                .iter()
+                .filter_map(|name| Some((name.clone(), value("rules.jq_env", name)?)))
+                .collect(),
+            instances: workers,
+            hand_off: Some(Arc::new(hand_off)),
+        })
+    } else {
+        Functions::default()
+    };
+    let functions = functions.with_modules(ModuleSettings {
+        environment: rules
+            .functions_env
+            .iter()
+            .map(|name| (name.clone(), value("rules.functions_env", name)))
+            .collect(),
+        instances: workers,
+        hand_off: Some(Arc::new(hand_off)),
+    });
+    let state =
+        (rules.state_max_bytes > 0).then(|| crate::rule_state::Store::new(rules.state_max_bytes));
+    let functions = match &state {
+        Some(store) => functions.with_state(store.clone()),
+        None => functions.without_state(),
+    };
+    let functions = match &rules.file {
+        Some(file) => functions.beside(std::path::Path::new(file)),
+        None => functions,
+    };
+    (functions, state)
+}
+
+/// One line on what `rules.jq = true` means on this host, for `mqttd --check-config`:
+/// whether this build has jq, and whether the host lets compiled code run (ADR 0086
+/// D13). `Err` is the line when it cannot. Asking compiles and runs one function, so a
+/// running broker does not ask: it finds out when rules that call `jq` are loaded.
+#[must_use]
+pub fn jq_host_report(functions: &Functions) -> Option<Result<String, String>> {
+    match &functions.jq {
+        JqSwitch::Off => None,
+        JqSwitch::Unavailable(why) => Some(Err(format!(
+            "rules.jq is on, but {why}: a rules file that calls jq will not load"
+        ))),
+        JqSwitch::On(_) => Some(match mqtt_rules::Jq::probe() {
+            Ok(()) => Ok(format!(
+                "rules.jq is on: this host allows compiled code (jq module sha256 {})",
+                mqtt_rules::Jq::module_sha256().unwrap_or("unknown")
+            )),
+            Err(why) => Err(format!(
+                "rules.jq is on, but {why}. A rules file that calls jq will not load here: \
+                 under systemd set `MemoryDenyWriteExecute=false` for the service \
+                 (`systemctl edit mqttd`), or lift the seccomp or SELinux rule that forbids \
+                 executable memory"
+            )),
+        }),
+    }
+}
+
+/// What a `jq` call that has run for a millisecond goes on under (ADR 0086 D6): on a
+/// worker thread of the multi-threaded runtime, `block_in_place`, which first gives
+/// the worker's other tasks — every other connection it was serving — to another
+/// thread. Anywhere else (a blocking thread, the main thread of a command-line check,
+/// a single-threaded test runtime) there is nothing to hand over, and the call goes on.
+pub fn hand_off(rest: &mut dyn FnMut()) {
+    let on_worker = tokio::runtime::Handle::try_current()
+        .is_ok_and(|rt| rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    if on_worker {
+        tokio::task::block_in_place(rest);
+    } else {
+        rest();
+    }
 }
 
 #[cfg(test)]
@@ -2172,6 +2458,128 @@ enable = false
         tracing::subscriber::with_default(subscriber, f);
         let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
         text.lines().map(str::to_string).collect()
+    }
+
+    /// ADR 0086 D6: on a worker thread of the multi-threaded runtime the hand-off gives
+    /// the worker's other tasks to another thread before it goes on. One worker, two
+    /// tasks: the first blocks inside the hand-off until the second has run. Were the
+    /// rest simply run where it was, the only worker would be in it and the second task
+    /// would never run: [`heard_from_the_other_task`] would reach its deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn the_hand_off_lets_the_workers_other_tasks_run() {
+        let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
+        let blocked = tokio::spawn(async move {
+            let mut heard = "";
+            hand_off(&mut || heard = heard_from_the_other_task(&rx));
+            heard
+        });
+        let other = tokio::spawn(async move {
+            let _ = tx.send("the other task ran");
+        });
+        assert_eq!(blocked.await.unwrap(), "the other task ran");
+        other.await.unwrap();
+    }
+
+    /// Blocks this thread until the other task has sent its word. Bounded: fails when
+    /// it has not within twenty seconds.
+    fn heard_from_the_other_task(rx: &std::sync::mpsc::Receiver<&'static str>) -> &'static str {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if let Ok(word) = rx.try_recv() {
+                return word;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the other task never ran: the hand-off kept the only worker"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// Off a runtime worker there is nothing to hand over: the rest of the call runs
+    /// where it is, on a single-threaded runtime and with no runtime at all.
+    #[test]
+    fn the_hand_off_just_goes_on_where_there_is_no_worker_to_free() {
+        let mut ran = 0;
+        hand_off(&mut || ran += 1);
+        assert_eq!(ran, 1);
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async { hand_off(&mut || ran += 1) });
+        assert_eq!(ran, 2);
+    }
+
+    /// ADR 0086 D13: with `rules.jq` off (the default) the configuration asks for no
+    /// function beyond the built-in ones, and nothing is said about the host.
+    #[test]
+    fn jq_is_not_asked_for_unless_the_config_switches_it_on() {
+        let off = functions_from_config(&mqtt_config::Rules::default());
+        assert!(matches!(off.jq, JqSwitch::Off));
+        assert!(jq_host_report(&off).is_none());
+        // Switched on, it is there or the build says why it is not; either way
+        // nothing has been compiled by asking.
+        let on = functions_from_config(&mqtt_config::Rules {
+            jq: true,
+            jq_default_timeout_ms: 250,
+            ..mqtt_config::Rules::default()
+        });
+        match (&on.jq, mqtt_rules::Jq::built_in()) {
+            (JqSwitch::On(jq), Ok(())) => {
+                assert_eq!(jq.default_timeout(), std::time::Duration::from_millis(250));
+                assert!(!jq.is_loaded());
+            }
+            (JqSwitch::Unavailable(why), Err(built)) => assert_eq!(*why, built),
+            (switch, built) => panic!("{switch:?} in a build where jq is {built:?}"),
+        }
+        assert!(jq_host_report(&on).is_some());
+    }
+
+    /// ADR 0086 D9, D13: a module needs no switch — declaring it in the rules file is
+    /// the switch — so every configuration can load one, from under the directory of
+    /// its rules file and nowhere else; and a configuration without a rules file has
+    /// no directory, and loads none. With `rules.jq` off, `jq` stays off beside it.
+    #[cfg(feature = "jq")]
+    #[test]
+    fn a_declared_module_needs_no_switch_and_is_read_beside_the_rules_file() {
+        let outer = tempfile::tempdir().unwrap();
+        let dir = outer.path().join("rules");
+        std::fs::create_dir(&dir).unwrap();
+        let wasm = mqtt_wasm_sandbox::test_module::plugin("1", b"j7");
+        std::fs::write(dir.join("m.wasm"), &wasm).unwrap();
+        std::fs::write(outer.path().join("m.wasm"), &wasm).unwrap();
+        let text = format!(
+            "[functions.m]\nwasm = \"m.wasm\"\nsha256 = \"{}\"\nfunctions = [\"which\"]\n\
+             [rules.r]\nsql = 'SELECT which() AS n FROM \"t\"'\n",
+            crate::reload::sha256_hex(&wasm)
+        );
+        let file = dir.join("rules.toml");
+        std::fs::write(&file, &text).unwrap();
+        let config = mqtt_config::Rules {
+            file: Some(file.display().to_string()),
+            ..mqtt_config::Rules::default()
+        };
+        let functions = functions_from_config(&config);
+        assert!(matches!(functions.jq, JqSwitch::Off));
+        let set = load_with(config.file.as_deref(), &functions).expect("the module loads");
+        assert_eq!(set.modules().len(), 1);
+        assert!(set.calls_sandbox());
+        // Text that did not come from the file (the admin API's) is held to the same
+        // directory.
+        assert!(RuleSet::parse_with(&text, &functions).is_ok());
+        let up = text.replace("\"m.wasm\"", "\"../m.wasm\"");
+        assert!(RuleSet::parse_with(&up, &functions)
+            .expect_err("outside the directory")
+            .to_string()
+            .contains("a relative path under the rules file's directory"));
+        // No rules file, no directory, no module.
+        let error = RuleSet::parse_with(
+            &text,
+            &functions_from_config(&mqtt_config::Rules::default()),
+        )
+        .expect_err("no rules file is configured")
+        .to_string();
+        assert!(error.contains("this text is loaded without one"), "{error}");
     }
 
     /// ADR 0084: the `INSECURE:` line says that anyone may read the trace, and why. It is

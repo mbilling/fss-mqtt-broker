@@ -2,6 +2,11 @@
 //! limits: time (an epoch deadline, raised by a timer thread that sleeps until the
 //! next deadline), memory, stack and output size.
 //!
+//! A call that outlasts its first slice ([`Limits::first_slice`]) is suspended once and
+//! the rest of it is run through the module's [`HandOff`], when it has one: the place a
+//! caller on an async runtime's worker thread hands that thread's other work to another
+//! worker before it goes on (ADR 0086 D6).
+//!
 //! The module is compiled by Cranelift when it is loaded ([`Sandbox::load`]), with the
 //! safe API only: nothing is ever read back from disk as code. [`Execution`] chooses
 //! what it is compiled to: machine code, or bytecode for the runtime's own
@@ -73,7 +78,16 @@ pub struct Limits {
     /// segments, a start function) is not a call and is bounded by `init_timeout`
     /// alone.
     pub max_fuel: Option<u64>,
+    /// How long a call runs before it is suspended once and the rest of it is given to
+    /// the module's [`HandOff`]. Nothing is suspended in a module without one.
+    pub first_slice: Duration,
 }
+
+/// What a caller wraps the rest of a long call in ([`Sandbox::with_hand_off`]): it is
+/// given the rest of the call as a closure and runs it, once, before it returns. A
+/// broker passes `tokio::task::block_in_place` here, so the worker thread a long call
+/// occupies gives its other tasks to another worker first.
+pub type HandOff = Arc<dyn Fn(&mut dyn FnMut()) + Send + Sync>;
 
 impl Default for Limits {
     fn default() -> Self {
@@ -85,6 +99,7 @@ impl Default for Limits {
             cancel_grace: Duration::from_millis(2),
             init_timeout: Duration::from_secs(5),
             max_fuel: None,
+            first_slice: Duration::from_millis(1),
         }
     }
 }
@@ -106,9 +121,12 @@ impl Execution {
             let module = Module::new(&engine, &wasm)?;
             let mut store = Store::new(&engine, ());
             store.set_epoch_deadline(1);
-            let instance = on_fiber(wasmtime::Instance::new_async(&mut store, &module, &[]))?;
+            let instance = on_fiber(
+                wasmtime::Instance::new_async(&mut store, &module, &[]),
+                None,
+            )?;
             let one = instance.get_typed_func::<(), i32>(&mut store, "f")?;
-            on_fiber(one.call_async(&mut store, ()))
+            on_fiber(one.call_async(&mut store, ()), None)
         };
         match answer() {
             Ok(1) => Ok(()),
@@ -268,6 +286,12 @@ pub(crate) struct Host {
     timer: Arc<Timer>,
     /// When the running call is to be stopped. `None`: never.
     deadline: Option<Instant>,
+    /// When the running call is to be suspended for its [`HandOff`]. `None`: it has
+    /// none, or has been suspended already.
+    yield_at: Option<Instant>,
+    /// The timer's registration for the running call: of `yield_at` while that is
+    /// ahead, of `deadline` after.
+    armed: Option<crate::timer::Armed>,
     /// `mqttd_cancel`, when the module has it and has not been asked yet in this call.
     cancel: Option<TypedFunc<(), ()>>,
     cancel_grace: Duration,
@@ -326,6 +350,7 @@ pub struct Sandbox {
     limits: Limits,
     grants: Grants,
     description: Vec<u8>,
+    hand_off: Option<HandOff>,
 }
 
 impl fmt::Debug for Sandbox {
@@ -431,6 +456,7 @@ impl Sandbox {
             limits,
             grants,
             description: Vec::new(),
+            hand_off: None,
         };
         let mut first = sandbox.instantiate()?;
         let within = Some(Instant::now() + first.limits.init_timeout);
@@ -456,6 +482,14 @@ impl Sandbox {
         &self.limits
     }
 
+    /// The same module, whose instances made from here on give the rest of a call
+    /// that outlasts [`Limits::first_slice`] to `hand_off`.
+    #[must_use]
+    pub fn with_hand_off(mut self, hand_off: HandOff) -> Self {
+        self.hand_off = Some(hand_off);
+        self
+    }
+
     /// A fresh instance: its own memory, nothing shared with any other.
     pub fn instantiate(&self) -> Result<Instance, LoadError> {
         let host = Host {
@@ -466,6 +500,8 @@ impl Sandbox {
             },
             timer: Arc::clone(&self.timer),
             deadline: None,
+            yield_at: None,
+            armed: None,
             cancel: None,
             cancel_grace: self.limits.cancel_grace,
         };
@@ -476,7 +512,7 @@ impl Sandbox {
         let start = |e: wasmtime::Error| LoadError::Start(classify(&e));
         // Data segments and a start function, when the module has one.
         let instance = {
-            let _armed = arm(&mut store, Some(within), None, &self.limits).map_err(start)?;
+            arm(&mut store, Some(within), None, &self.limits, false).map_err(start)?;
             // Not a call, and not charged as one: the runtime bills making an
             // instance to fuel as well (measured for a module of one page on an
             // arm64 Mac: 16,385 units compiled, 65,537 interpreted), which made a
@@ -485,7 +521,12 @@ impl Sandbox {
             if self.limits.max_fuel.is_some() {
                 store.set_fuel(u64::MAX).map_err(start)?;
             }
-            on_fiber(self.linker.instantiate_async(&mut store, &self.module))
+            let made = on_fiber(
+                self.linker.instantiate_async(&mut store, &self.module),
+                None,
+            );
+            disarm(&mut store);
+            made
         }
         .map_err(start)?;
         let export = |e: wasmtime::Error| LoadError::Export(chain(&e));
@@ -523,6 +564,7 @@ impl Sandbox {
             module: instance,
             store,
             limits: self.limits.clone(),
+            hand_off: self.hand_off.clone(),
             poisoned: false,
             fuel_used: 0,
         };
@@ -536,15 +578,41 @@ impl Sandbox {
 
 /// Runs a call into a module to its end. The runtime gives such a call a stack of
 /// its own (a fiber, with a guard page below it), so how deep a module may go never
-/// depends on how much stack the calling thread happens to have left. Nothing here
-/// ever suspends: the host's imports are all synchronous and the deadline callback
-/// never yields, so the first poll finishes the call.
-fn on_fiber<F: Future>(call: F) -> F::Output {
+/// depends on how much stack the calling thread happens to have left.
+///
+/// The host's imports are all synchronous, so the first poll finishes the call unless
+/// the deadline callback suspended it: which it does once, when the call has used its
+/// first slice and has a [`HandOff`]. The rest of the call is then polled inside the
+/// hand-off, on this same thread.
+fn on_fiber<F: Future>(call: F, hand_off: Option<&HandOff>) -> F::Output {
     let mut call = pin!(call);
     let mut context = Context::from_waker(Waker::noop());
+    if let Poll::Ready(output) = call.as_mut().poll(&mut context) {
+        return output;
+    }
+    let mut output = None;
+    {
+        let mut rest = || {
+            // A hand-off that calls this twice finds the call finished.
+            while output.is_none() {
+                match call.as_mut().poll(&mut context) {
+                    Poll::Ready(done) => output = Some(done),
+                    Poll::Pending => std::thread::yield_now(),
+                }
+            }
+        };
+        match hand_off {
+            Some(hand_off) => hand_off(&mut rest),
+            None => rest(),
+        }
+    }
     loop {
-        if let Poll::Ready(output) = call.as_mut().poll(&mut context) {
+        // Only a hand-off that did not run the rest gets here with nothing.
+        if let Some(output) = output.take() {
             return output;
+        }
+        if let Poll::Ready(done) = call.as_mut().poll(&mut context) {
+            return done;
         }
         std::thread::yield_now();
     }
@@ -574,12 +642,27 @@ fn classify(error: &wasmtime::Error) -> CallError {
 /// The store's answer to a tick of the timer. A tick that is not this call's (another
 /// instance's deadline) is passed over. At this call's deadline a module that can be
 /// asked to stop is asked, once, and given the grace; after that the call is ended.
+///
+/// Before that, a call with a [`HandOff`] is suspended once, when its first slice is
+/// used up: the runtime returns to whoever polls the call, which is [`on_fiber`].
 fn at_epoch(mut store: wasmtime::StoreContextMut<'_, Host>) -> wasmtime::Result<UpdateDeadline> {
     let host = store.data_mut();
+    let now = Instant::now();
+    if let Some(at) = host.yield_at {
+        if now < at {
+            return Ok(UpdateDeadline::Continue(1));
+        }
+        // From here the timer watches the deadline (the new registration is made
+        // before the slice's is dropped: the timer never sees the call unwatched).
+        host.yield_at = None;
+        host.armed = Some(host.timer.arm(host.deadline));
+        if host.deadline.is_none_or(|deadline| now < deadline) {
+            return Ok(UpdateDeadline::Yield(1));
+        }
+    }
     let Some(deadline) = host.deadline else {
         return Ok(UpdateDeadline::Continue(1));
     };
-    let now = Instant::now();
     if now < deadline {
         return Ok(UpdateDeadline::Continue(1));
     }
@@ -597,24 +680,39 @@ fn at_epoch(mut store: wasmtime::StoreContextMut<'_, Host>) -> wasmtime::Result<
 }
 
 /// Sets a store up for one call: its deadline with the timer, its `mqttd_cancel`, its
-/// fuel. The returned guard takes the deadline off the timer again.
+/// fuel, and with `hand_off` the end of its first slice. [`disarm`] takes the call off
+/// the timer again.
 fn arm(
     store: &mut Store<Host>,
     deadline: Option<Instant>,
     cancel: Option<&TypedFunc<(), ()>>,
     limits: &Limits,
-) -> wasmtime::Result<crate::timer::Armed> {
-    let deadline = deadline.map(|at| at.max(Instant::now() + limits.min_run));
+    hand_off: bool,
+) -> wasmtime::Result<()> {
+    let now = Instant::now();
+    let deadline = deadline.map(|at| at.max(now + limits.min_run));
+    // A call whose deadline comes first is never suspended: it is over by then.
+    let yield_at = hand_off
+        .then(|| now + limits.first_slice)
+        .filter(|at| deadline.is_none_or(|deadline| *at < deadline));
     // The epoch first, the timer second: a tick between the two is then seen.
     store.set_epoch_deadline(1);
     let host = store.data_mut();
     host.deadline = deadline;
+    host.yield_at = yield_at;
     host.cancel = cancel.cloned();
-    let armed = host.timer.arm(deadline);
+    host.armed = Some(host.timer.arm(yield_at.or(deadline)));
     if let Some(fuel) = limits.max_fuel {
         store.set_fuel(fuel)?;
     }
-    Ok(armed)
+    Ok(())
+}
+
+/// Takes the call that just ended off the timer.
+fn disarm(store: &mut Store<Host>) {
+    let host = store.data_mut();
+    host.armed = None;
+    host.yield_at = None;
 }
 
 /// One instance of a module: one linear memory, used by one caller at a time.
@@ -630,6 +728,7 @@ pub struct Instance {
     /// `mqttd_cancel`, when the module has it.
     cancel: Option<TypedFunc<(), ()>>,
     limits: Limits,
+    hand_off: Option<HandOff>,
     poisoned: bool,
     fuel_used: u64,
 }
@@ -707,15 +806,19 @@ impl Instance {
         params: P,
         deadline: Option<Instant>,
     ) -> Result<R, CallError> {
-        let armed = arm(
+        arm(
             &mut self.store,
             deadline,
             self.cancel.as_ref(),
             &self.limits,
+            self.hand_off.is_some(),
         )
         .map_err(|e| CallError::Trap(chain(&e)))?;
-        let result = on_fiber(func.call_async(&mut self.store, params));
-        drop(armed);
+        let result = on_fiber(
+            func.call_async(&mut self.store, params),
+            self.hand_off.as_ref(),
+        );
+        disarm(&mut self.store);
         if let Some(granted) = self.limits.max_fuel {
             let left = self.store.get_fuel().unwrap_or(0);
             self.fuel_used = self.fuel_used.saturating_add(granted.saturating_sub(left));
@@ -749,11 +852,16 @@ impl Instance {
 
     /// Reads the (address, length) pair a function left at `ret`, takes the bytes
     /// and frees them in the module.
-    fn take_result(&mut self, ret: u32, deadline: Option<Instant>) -> Result<Vec<u8>, CallError> {
+    fn take_result(
+        &mut self,
+        ret: u32,
+        deadline: Option<Instant>,
+        max_output: u32,
+    ) -> Result<Vec<u8>, CallError> {
         let pair = self.read(ret, 8)?;
         let at = u32::from_le_bytes([pair[0], pair[1], pair[2], pair[3]]);
         let len = u32::from_le_bytes([pair[4], pair[5], pair[6], pair[7]]);
-        if len > self.limits.max_output_bytes.saturating_add(1) {
+        if len > max_output.saturating_add(1) {
             return Err(CallError::OutputTooLarge);
         }
         let bytes = if at == 0 {
@@ -770,7 +878,7 @@ impl Instance {
     fn describe(&mut self, deadline: Option<Instant>) -> Result<Vec<u8>, CallError> {
         let ret = self.run(self.alloc.clone(), 8, deadline)?;
         self.run(self.describe.clone(), ret, deadline)?;
-        let text = self.take_result(ret, deadline)?;
+        let text = self.take_result(ret, deadline, self.limits.max_output_bytes)?;
         self.run(self.free.clone(), ret, deadline)?;
         Ok(text)
     }
@@ -784,7 +892,20 @@ impl Instance {
         args: &[Arg<'_>],
         deadline: Option<Instant>,
     ) -> Result<Reply, CallError> {
-        let result = self.call_inner(name, args, deadline);
+        self.call_within(name, args, deadline, self.limits.max_output_bytes)
+    }
+
+    /// [`call`](Self::call) with this call's own bound on the result, at most
+    /// [`Limits::max_output_bytes`]: what a caller with a budget has left of it.
+    pub fn call_within(
+        &mut self,
+        name: &str,
+        args: &[Arg<'_>],
+        deadline: Option<Instant>,
+        max_output: u32,
+    ) -> Result<Reply, CallError> {
+        let max_output = max_output.min(self.limits.max_output_bytes);
+        let result = self.call_inner(name, args, deadline, max_output);
         // Whatever went wrong outside the function's own refusal, the instance's
         // memory is not to be relied on any more.
         if !matches!(result, Ok(_) | Err(CallError::Module { .. })) {
@@ -798,6 +919,7 @@ impl Instance {
         name: &str,
         args: &[Arg<'_>],
         deadline: Option<Instant>,
+        max_output: u32,
     ) -> Result<Reply, CallError> {
         if self.poisoned {
             return Err(CallError::Poisoned);
@@ -838,12 +960,12 @@ impl Instance {
                 name_len,
                 name_at.wrapping_add(name_len),
                 frame_len,
-                self.limits.max_output_bytes,
+                max_output,
                 base,
             ),
             deadline,
         )?;
-        let bytes = self.take_result(base, deadline)?;
+        let bytes = self.take_result(base, deadline, max_output)?;
         self.run(self.free.clone(), base, deadline)?;
         if status != 0 {
             return Err(CallError::Module {

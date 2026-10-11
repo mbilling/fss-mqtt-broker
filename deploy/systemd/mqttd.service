@@ -54,6 +54,18 @@ RestrictSUIDSGID=true
 RestrictRealtime=true
 RestrictNamespaces=true
 LockPersonality=true
+# No page of the broker is ever writable and then executable. This is what the rule
+# engine's jq() function cannot live with: jq runs as WebAssembly compiled to machine
+# code (ADR 0086), which is memory the process writes and then maps executable. jq is
+# off by default (`[rules] jq`, MQTTD_RULES_JQ), and this line stays as it is for every
+# installation that does not use it. If you switch jq on, also set this to false, in a
+# drop-in (`systemctl edit mqttd`):
+#     [Service]
+#     MemoryDenyWriteExecute=false
+# With jq on and this still true, a rules file that calls jq() fails to load and says
+# so (nothing crashes; rules that do not call jq() are unaffected). The two exclude
+# each other: there is no slower mode that keeps both. `mqttd --check-config` run under
+# the unit's settings reports which it is.
 MemoryDenyWriteExecute=true
 RemoveIPC=true
 # IPv4/IPv6 + unix only: no raw sockets, no exotic families.

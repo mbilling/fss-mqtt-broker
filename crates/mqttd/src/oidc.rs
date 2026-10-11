@@ -26,7 +26,7 @@ use tracing::{info, warn};
 /// Floor between two network fetches, whatever the hint pressure (anti-stampede).
 const MIN_FETCH_GAP: Duration = Duration::from_secs(5);
 /// Backoff ceiling for discovery/fetch retries.
-const RETRY_MAX: Duration = Duration::from_secs(60);
+const RETRY_MAX: Duration = Duration::from_mins(1);
 /// Per-request timeout.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 

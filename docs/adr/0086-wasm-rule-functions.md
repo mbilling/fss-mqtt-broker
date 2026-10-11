@@ -8,11 +8,15 @@
   record decides how `jq` is provided, with EMQX's results.
 - **Related:** [ADR 0084](0084-watching-and-editing-rules-live.md) (live editing, the admin
   rules endpoints and the trace this extends), [ADR 0085](0085-rule-state-store.md) (the
-  other proposed extension of the function set), [ADR 0045](0045-release-engineering-and-distribution.md)
+  other extension of the function set, accepted 2026-10-11; its D14 says how a state
+  call fits this record's evaluation model, and that a module cannot call state), [ADR 0045](0045-release-engineering-and-distribution.md)
   (reproducible builds, which the module's build joins).
 
 > This record states the decision and the measurements it rests on. The sandbox is
-> `crates/mqtt-wasm-sandbox`; nothing in the broker depends on it yet.
+> `crates/mqtt-wasm-sandbox`; since T2 the rule engine calls `jq` through it, and since T3
+> the modules a rules file declares. What building T2 and T3 settled, measured and
+> corrected, and what T4 checked while documenting it, is in [Amendments](#amendments)
+> at the end.
 >
 > **Accepted on 2026-10-11.** Decided with it: the runtime
 > is **wasmtime, chosen for speed** over the wasmi interpreter the spike first recommended
@@ -751,16 +755,307 @@ and the operator who switches `jq` on sets it to `false`; D13).
 1. **The compiler in the trust base** (D11). Accepted with the runtime decision; recorded
    here because it is the part of that decision that cannot be measured.
 2. **The workspace's Rust version** has to go from 1.88 to 1.96 when the broker links the
-   crate, and will follow wasmtime's from then on (§8).
+   crate, and will follow wasmtime's from then on (§8). *Done with T2, 2026-10-11.*
 3. **The worker hand-off (D6)** is designed, not measured, and now rests on wasmtime's
-   fibers.
+   fibers. *Closed 2026-10-11: built and measured, with one correction (a Will); see
+   [Amendments](#amendments).*
 4. **`OptLevel::None`** would take a quarter off the half-second load at no measured cost
    (§6). Left at the default.
 5. **Program cache size.** 32 per instance in the prototype against EMQX's 500 per thread;
    at 15 KiB per program 500 would cost about 7 MiB per instance.
 6. **Operator plugins now or later** (T3), and whether ABI 1 should already carry a way to
-   declare argument types so that arity and type errors are load errors.
+   declare argument types so that arity and type errors are load errors. *Plugins built
+   with T3, 2026-10-11 ([Amendments](#amendments)); arity is a load error, argument types
+   are still not declared.*
 8. The pinned source tarballs come from GitHub's archive endpoint, whose bytes are stable
    in practice but not by contract; a mirror of the tarballs as a release asset would
    remove that. (CI caches the built module, so an outage there fails only a run that has
    to rebuild.)
+
+## Amendments
+
+### 2026-10-11 — T2: what building `jq` into the rule engine settled, and the one place the design was wrong
+
+T2 built D3 to D8, D10 and D13 as they are written above. This section records what was
+decided where the text left a choice, what was measured where it said "to prove", and one
+correction.
+
+**D6 holds, with one correction: the hub does evaluate rules, for a Will.** D6 says "the
+hub loop is never involved". ADR 0083 (decision 1) has one hub-side evaluation: the hub
+publishes a Will and runs its rules itself, because Wills are rare and their rules were
+microseconds. With `jq` a Will's rule may run for ten seconds, and everything waits for
+the hub. The smallest change that keeps both records true: **while the loaded rules call
+a sandboxed function, the hub hands a Will's rules to a task of its own** and goes on;
+what they derive is posted back to the hub exactly as before (`HubCommand::RuleDerived`,
+already asynchronous). Rules that do not call `jq` are evaluated where they always were.
+A test publishes through the hub while a Will's jq runs for three seconds and requires
+every round trip to stay under a second.
+
+The hand-off itself is as designed, with the suspension spelled out: a call is suspended
+**once**, when its first millisecond is used up (`Limits::first_slice`,
+`UpdateDeadline::Yield`), and the rest of it is polled inside
+`tokio::task::block_in_place`, on the same thread. One timer registration per call, as
+before: of the end of the slice first, of the deadline after. Off a worker of the
+multi-threaded runtime (a blocking thread, a command-line check, a single-threaded test
+runtime) there is nothing to hand over and the call simply goes on. The sandbox crate
+knows nothing of tokio: the broker gives the pool a closure.
+
+Measured (Apple M1 Pro, debug build of the broker, **one runtime worker thread**,
+`TOKIO_WORKER_THREADS=1`): while one connection's `jq('def f: f; f', payload)` ran into
+the ten-second default timeout, a second connection completed 6,974 QoS 1 publishes, each
+delivered to a subscriber: median round trip 152 µs, 99th percentile 339 µs, slowest
+6.2 ms. With the hand-off taken out, the second connection's first publish was still
+unanswered after two seconds, the test's bound: the only worker was inside jq. That test
+is in the suite (`a_ten_second_jq_on_one_connection_does_not_delay_another_connections_publish`).
+
+Two limits of the hand-off, recorded rather than solved:
+
+- **Concurrent long calls are no longer bounded by the worker count.** Each connection
+  whose call has passed its first millisecond runs on a thread of its own, up to the
+  runtime's blocking-thread limit, and each may hold an instance of up to 64 MiB. Short
+  calls, the usual case, never leave their worker. A cap on instances in a call (queueing
+  or failing the rule past it) would be a new decision.
+- **Message events for clients without a connection** (`$events/message/dropped` for an
+  offline session, and the like) are evaluated by one task (ADR 0083). A long jq in such
+  a rule delays the events queued behind it, not the hub and not any connection.
+
+**D7: a call's output is charged whole.** The built-in functions charge what they build
+*beyond their inputs*; `jq`'s output is charged in full, as D7's table says ("what is left
+of the message's 1 MiB build budget"), because the module is told the bound before it
+runs and cannot know what part of its output repeats its input. `jq('.', payload)` on a
+600 KB payload therefore passes once per message and fails the second time. In the
+departures table.
+
+**D4: `jq/3`'s timeout, as probed on EMQX 6.3.1.** An integer of zero or more is the
+timeout. Anything else fails the rule with EMQX's `bad_timeout_val` and its text
+(`Needs positive integer or infinity but got …`, the value printed as Erlang's `~p`
+prints it), checked before the program and the input are looked at. The atom `infinity`
+cannot be written in rule SQL: the string `'infinity'` is a binary, and EMQX answers
+`bad_timeout_val` for it; so does this engine. An integer of 2^64 or more makes
+`timer:apply_after/4` fail and the NIF's match on it with it (`{badmatch,{error,badarg}}`);
+below that, any timeout no clock can hold is none. An undefined input is the text
+`undefined`, as `emqx_utils_json:encode/1` writes the atom. A program that is not a
+binary has no clause in EMQX (`bad_sql_function_argument`); here it fails the rule too,
+in this engine's words. A wrong number of arguments fails the load here and each message
+there, as for every function.
+
+**D5: what is compiled when.** The module is compiled by the first load, in the process,
+of rules that call `jq`, on the thread doing that load, and the broker logs it once with
+the time it took. The pool keeps as many warm instances as the runtime has workers.
+The programs a rules file spells out are compiled into every warm instance at load; one
+that does not compile is a load-time warning ("every call fails the rule, as in EMQX"),
+as for a literal regular expression.
+
+**D8, D13: the switch and its companions are read at startup.** `rules.jq`,
+`rules.jq_default_timeout_ms` and `rules.jq_env` (`MQTTD_RULES_JQ`,
+`MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS`, `MQTTD_RULES_JQ_ENV`) are not live: a reload that
+changes them reports `rules.jq` as needing a restart, and the running broker keeps what
+it started with. `jq_env` lists names; the values are the ones the broker's environment
+had when it started. `mqttd --check-rules` and `mqttd --rule-test` read `[rules]` from the
+effective configuration without validating the rest of it, so a file or a statement is
+checked as the broker would load it on machines where no broker could start.
+`mqttd --check-config` adds one line while the switch is on (this host allows compiled
+code, or a warning that it does not and what to set) and still exits 0: the config is
+valid either way and the check often runs where the broker will not. With `--preflight`
+the rules file is loaded, and a file that calls `jq` on a host that refuses fails it.
+
+**D10: the series.** `mqttd_rule_function_calls_total{function}`,
+`mqttd_rule_function_errors_total{function,kind}` and
+`mqttd_rule_function_seconds_total{function}`; per module
+`mqttd_rule_module_instances{module}`, `mqttd_rule_module_memory_bytes{module}` and
+`mqttd_rule_module_instances_replaced_total{module}`, as of the module's last call. The
+kinds for `jq`: `compile`, `parse`, `process`, `timeout`, `system` (EMQX's tags);
+`memory`, `output`, `stack`, `compile_timeout` (the sandbox's limits); `trap`; `argument`;
+`decode`. A failed call is its rule's failure: the error text (`jq(): <tag>: <EMQX's
+message>`, or `jq(): sandbox_limit (<kind>): …`) is what the log, the rule's last error
+and the trace record carry.
+
+**D4, D11: a build without the module.** The module is not in the tree, and a plain
+`cargo build` must work without zig. So the sandbox crate's build script looks for the
+module (`crates/mqtt-wasm-sandbox/jq-module/jq.wasm`, or the file `MQTTD_JQ_WASM` names):
+
+- found: its sha256 is compared with `jq.wasm.sha256` (a mismatch fails the build), and
+  it is embedded;
+- not found: the build is whole without it. `rules.jq = true` then answers "this mqttd
+  was built without the jq module", in the startup log, in `--check-config` and as the
+  reason a rules file that calls `jq` does not load;
+- `MQTTD_JQ_WASM_REQUIRED=1` makes "not found" a build error. The release recipe sets it,
+  and so do CI's `test` and `wasm sandbox` jobs, so a release cannot ship, and the suite
+  cannot pass, without the module by accident.
+
+The cargo feature of D4 is `jq` (on by default, on `mqttd` and `mqtt-rules`): without it
+the runtime is not linked at all. The tests of `jq` through the broker skip on a laptop
+whose build has no module and fail under CI, where the module is built first.
+
+`scripts/release/build-repro.sh` builds the module itself on every run, under `target/`
+(the compiler fetched and checked by `fetch-zig.sh`), so the pipeline's clean second build
+builds it a second time and the byte comparison of the two brokers covers it. The release
+notes state the module's sha256 and the source commits.
+
+**§8: what it cost.** The workspace declares Rust 1.96 (`mqttd-operator`, which links
+none of this, still declares and is checked on 1.89). A release `mqttd` for
+`aarch64-apple-darwin` grew from 19.9 MB to 28.4 MB (+8.5 MB; stripped:
+16.5 MB to 23.5 MB), the module's 985 kB included. In dev and test builds
+the Cranelift crates are optimised (`[profile.dev.package.*]`): unoptimised, the compiler
+takes 6.5 s over the module where the optimised one takes 0.6 s, in every test process
+that loads rules calling `jq`.
+
+**§7: the two time formats stay.** `strptime` with `%z` and `strftime("%Z")` are recorded
+in RULES.md's table with the libm digits, not closed: closing them means carrying a
+time-zone parser and glibc's zone abbreviations in the module's shim, for two formats of
+a function whose results otherwise match.
+
+**Open questions 2 and 3 are closed** by the above. Left for T4: the threat-model and
+hardening rows, the cookbook, and RULES.md beyond the section T2 needed.
+
+### 2026-10-11 — T3: operator modules, and what D9 left to decide
+
+T3 built D9 on the mechanism T2 put in the rule engine: `[functions.<name>]` in the rules
+file, the load-time checks, the reload, the admin view, and two worked examples. This
+section records what was decided where the text above left a choice.
+
+**Declaring a module is the switch (D13).** D13's last sentence says a plugin "loads only
+where `rules.jq`'s requirement is met, under its own `[functions.*]` declaration". Read
+as written: the requirement is the host's (memory the process may map executable), not
+the key. A rules file that declares a module loads it whether or not `rules.jq` is set,
+and no key in the broker's configuration switches modules on or off: the default is that
+none is declared, and then nothing of the runtime exists. On a host that forbids
+executable memory the file fails to load with the compiler's reason and
+`MemoryDenyWriteExecute=false` as the way out, as for `jq`. A build without the runtime
+(the `jq` cargo feature off) refuses a declaration and says so.
+
+**Who may point the broker at a file (D9, D11).** D9 says "relative to the rules file".
+Rules text does not only come from the operator's disk: a rules writer of the admin API
+(ADR 0084) replaces the file, and any operator may have rules text checked or dry-run.
+A `[functions.*]` table in that text names a file and a hash, both chosen by the caller,
+so the hash alone protects nothing against the caller. What does:
+
+- **A module is read only from under the directory of the configured rules file**
+  (`rules.file`; for `mqttd --check-rules <file>`, that file's directory): a relative path
+  of plain names (no root, no `.`, no `..`) ending in `.wasm`, which must still lie under
+  that directory once every symlink in it is resolved, and be a regular file of at most
+  16 MiB. Text loaded with no rules file configured declares no module.
+- **Every file there is the operator's.** The broker writes one kind of file into that
+  directory, the rules file (and its `.prev` copy and a temporary file, ADR 0084), and
+  writes it only after it has loaded as a rules file: it is TOML, which is never a
+  WebAssembly module. So no caller of the API can put a module there.
+- **The pin is a secret the caller must already hold.** The error for another hash names
+  the hash that was asked for and never the file's own. Whoever declares a module has to
+  know its content; the API does not tell them what lies in the directory beyond whether a
+  name ending in `.wasm` exists.
+- **The file is hashed on every load**, not only the first: a file replaced under an
+  unchanged rules file fails the next reload, and the module already loaded keeps running.
+
+What remains, stated: a rules writer, and an operator through a dry run, can load any
+module the operator placed in that directory whose hash they know, under any of the names
+it describes, with any limits up to the ceilings below. That is within the rules file's
+trust (ADR 0083, 0084). The check-then-open of the path is not atomic: someone who can
+write the directory can race it, and that someone is the operator. RULES.md says to keep
+module files unwritable by the broker's user.
+
+**The environment grant has a ceiling in the broker's configuration (D8).** D9's table has
+`env = []` and D8 says "empty unless listed". Listed by whom was open, and the rules file
+alone is the wrong answer for the reason above: a rules writer could list
+`MQTTD_…` variables for a module that returns what it reads. So there is one new key,
+`rules.functions_env` (`MQTTD_RULES_FUNCTIONS_ENV`), read at startup like `rules.jq_env`:
+the variables any module may be shown. A table's `env` may name only those (another name
+fails the load), and a listed variable that is not set is not given. `clock` needs no
+such ceiling.
+
+**The description (D2).** `mqttd_describe` answers
+`{"module": …, "version": …, "functions": [{"name": …, "min_args": …, "max_args": …}]}`,
+the shape the jq module already had; unknown keys are ignored. `functions` in the table is
+required and not empty, so every name a file adds to rule SQL is written in the file.
+
+**Names (D9).** A module's name and its functions' names are a lower-case letter followed
+by up to 63 lower-case letters, digits or `_`. A function may not be called what a built-in
+function is, nor what any function of EMQX's rule engine is: the exports of
+`emqx_rule_funcs` in EMQX 6.3.1 (read from its `module_info(exports)`), the names it
+resolves without exporting (the schema registry's and Sparkplug's, `maptab_lookup`), and
+two names earlier releases exported (`byteszie`, `str_utf16_le_decode`); nor a word of rule
+SQL; nor what another module of the file provides. A test holds the list against the
+exports. The module name `jq` is the built-in module's.
+
+**Limits (D7).** `timeout_ms` is 100 by default and at most 10000 (what `jq/2` gets);
+`memory_mib` is 16 by default and at most 64 (the ceiling: a `jq` instance's); a file
+declares at most 16 modules. Output and stack are D7's. A module's own non-zero status
+fails the rule with its message and is counted as `module`; the sandbox's limits as
+`timeout`, `memory`, `output`, `stack`; anything else that ends a call as `trap`. A module
+keeps as many warm instances as the runtime has workers, like `jq`, and with
+`fresh_instance = true` none.
+
+**The reload (D9).** A rule set holds its modules, and an evaluation holds its rule set, so
+"in-flight calls finish on the old one" needs no mechanism of its own: the old module is
+dropped when the last rule set that declared it is. What the host adds is that a
+declaration that did not change (same name, path, hash, functions, limits and grants)
+keeps its loaded module and warm instances across a reload; a changed one is loaded anew
+beside the old. Two tests hold a call in flight across a swap: one in the rule engine,
+suspended in the hand-off of D6, and one through the binary and the admin API, where a
+two-second call returns the old module's answer after the new module has answered a
+later message.
+
+**The cluster.** Nothing crosses the peer bus and its protocol is unchanged. Rules and
+modules are per-node files; the rules digest covers the `[functions]` table, and a node
+whose file has another hash does not load the rules.
+
+**The admin view (D9).** `GET /admin/v1/rules` has `modules[]`: the table's name, the
+module's own name and version, sha256, functions with their arities, `timeout_ms` and the
+memory limit, the grants, and the instances (how many, how many in a call, their linear
+memory, how many were replaced). A viewer's answer leaves out the path and the names of
+the granted variables. `mqttd --admin rules` prints them as a second table.
+
+**`--rule-test`.** A statement on its own may call the functions of the modules the
+configured rules file declares; the file's modules are loaded for it.
+
+**The examples and `unsafe`.** `examples/rule-plugins` has `geo` in Rust and `telemetry` in
+C. The Rust one is a crate outside the broker's workspace, on purpose: a guest cannot
+implement the ABI without `unsafe` (it is handed addresses in its own linear memory and
+must read what lies there, and its exports need fixed names), and the workspace forbids
+`unsafe` for the broker's code. That code runs inside the sandbox; a mistake in it is a
+trap, and the rule fails. It is three marked blocks and the five exports, in one module of the example. CI
+builds both examples (cached) and the broker's tests call them through the shipped
+binary.
+
+**Left open.** The cap on concurrent long calls that T2 recorded is still not decided,
+and modules make it matter more: each connection whose call has passed its first
+millisecond occupies a blocking thread and an instance of up to `memory_mib`. ABI 1 still
+declares no argument types (open question 6). The threat-model and hardening chapters are
+T4's; T3 adds the one row its path decision needs.
+
+### 2026-10-11 — T4: what documenting it checked, and two sentences made exact
+
+T4 wrote the documentation (RULES.md, the cookbook, THREAT-MODEL.md, HARDENING.md, the
+deployment guides) and changed no behaviour. Three things belong in this record.
+
+**§8's table, checked again with the broker itself.** The rows "the release image, run as
+`deploy/compose` does" and "Kubernetes with the chart's `securityContext`" were measured
+with the sandbox's examples. With a static `aarch64-unknown-linux-musl` build of `mqttd`
+in the release image's base image: under Compose's settings `mqttd --check-config`
+reports that the host allows compiled code and a `jq` statement evaluates; and on a kind
+cluster (Kubernetes 1.36, containerd 2.3) the same holds for pods with the chart's pod
+and container security context, with and without `seccompProfile: RuntimeDefault`. A
+managed cluster was not tested. D13's instruction for the shipped unit (the drop-in that
+sets `MemoryDenyWriteExecute=false`) is now checked where the refusal is: CI runs the
+broker under the unit's hardening properties with that one set to `false` and requires
+rules that call `jq`, and a rules file that declares a module, to load and run. That
+static binary is 24.3 MB with the `jq` cargo feature and 16.9 MB without: 7.4 MB for
+the runtime and the module on aarch64, where §8 estimated 6.0 MB and 985 kB from the
+sandbox alone.
+
+**The hand-off is per entry into the module, not per call of a function** (D6 and the T2
+amendment say "a call is suspended once" and "one timer registration per call"). The host
+enters a module several times to make one call of a rule function: to allocate the
+argument frame, to call, and to free what it read. Each entry is armed on its own, with
+its own first slice, and is suspended at most once. In practice only the call itself
+outlasts a millisecond, so a long call is handed off once; an allocation is handed off
+too only if its thread loses the processor for a millisecond in the middle of it, and
+then the cost is one `block_in_place` around a few microseconds of work. The test of the
+hand-off allows two for a call that fails in its second entry
+(`a_call_that_outlasts_its_first_slice_goes_on_inside_the_hand_off`: with a first slice
+of zero the timer's tick may already be there when the allocation starts, which CI's
+runners showed and a laptop does not). That bound is the mechanism's, not a tolerance.
+
+**The cap on concurrent long calls is still not decided.** T2 and T3 left it "to T3 or
+T4"; T4 documents the behaviour as it is, as an accepted risk in THREAT-MODEL.md with
+the operator's mitigations, and as H-7.14 in HARDENING.md. Deciding it (a bound on
+instances in a call, with queueing or a failed rule past it) remains open.

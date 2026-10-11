@@ -6,7 +6,7 @@ Source of truth: `mqtt_config::ENV_VARS` and `Config::overlay_from` in `crates/m
 
 The annotated template is [`mqttd.example.toml`](mqttd.example.toml). Capacity arithmetic lives in [SIZING.md](SIZING.md); day-2 procedures in [OPERATIONS.md](OPERATIONS.md). This page is the inventory of knobs, not the runbook.
 
-Documented overlay variables: **117** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) and any experimental side-channel knobs below.
+Documented overlay variables: **122** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) and any experimental side-channel knobs below.
 
 ## Node identity
 
@@ -189,6 +189,11 @@ Documented overlay variables: **117** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) 
 | `MQTTD_RULES_TRACE` | `rules.trace` | The opt-in rule trace (`MQTTD_RULES_TRACE`, `1`/`0`): each evaluation's trigger (topic, client id, username, up to 1 KiB of payload) and rendered outputs, on `$SYS/brokers/<node>/trace/rules/<id>`. Off by default — it copies payloads onto `$SYS`, so a subscribe grant on a rule's trace topic is a read grant on everything its `FROM` matches. Hot-reloadable. |
 | `MQTTD_RULES_TRACE_RATE` | `rules.trace_rate` | Trace records per rule per second (`MQTTD_RULES_TRACE_RATE`, default 20, 1..=1000); `no_result` evaluations have a budget of their own. Hot-reloadable. |
 | `MQTTD_RULES_ADMIN_WRITERS` | `rules.admin_writers` | Admin certificate subjects that may write the rules file through the admin API (`MQTTD_RULES_ADMIN_WRITERS`, `;`-separated, same syntax as `Admin::operators`). A writer also needs the `operator` role. Empty (the default) = rules writes off. Needs the admin listener. Hot-reloadable. |
+| `MQTTD_RULES_JQ` | `rules.jq` | EMQX's `jq` rule function (`MQTTD_RULES_JQ`, `1`/`0`; [ADR 0086](adr/0086-wasm-rule-functions.md)). Off by default: a rules file that calls `jq` then does not load. On, jq runs as compiled WebAssembly, which needs memory the process may map executable: under the shipped systemd unit also set `MemoryDenyWriteExecute=false`, or a rules file that calls `jq` fails to load and says so. Set it on every node of a cluster. Read at startup: a change needs a restart. |
+| `MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS` | `rules.jq_default_timeout_ms` | Milliseconds `jq/2` may run (`MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS`, default 10000, as EMQX's `rule_engine.jq_function_default_timeout`); `jq/3` names its own. Read at startup. |
+| `MQTTD_RULES_JQ_ENV` | `rules.jq_env` | The environment variables a jq program may read as `$ENV.NAME` or `env.NAME` (`MQTTD_RULES_JQ_ENV`, `,`-separated names). Empty (the default) = none: unlike EMQX, which shows jq the broker's whole environment, secrets included. A listed variable that is unset is absent. Read at startup. |
+| `MQTTD_RULES_FUNCTIONS_ENV` | `rules.functions_env` | The environment variables a module declared in the rules file (`[functions.<name>]`, ADR 0086 D9) may be shown (`MQTTD_RULES_FUNCTIONS_ENV`, `,`-separated names). A table's `env` may name only these, so whoever writes rules cannot show a module the rest of the broker's environment. Empty (the default) = none. Read at startup. |
+| `MQTTD_RULES_STATE_MAX_BYTES` | `rules.state_max_bytes` | The most bytes the state rules keep between messages may take on this node, across every namespace and every connection's dictionary (`MQTTD_RULES_STATE_MAX_BYTES`, default 268435456 = 256 MiB; [ADR 0085](adr/0085-rule-state-store.md)). Using state is the switch: a rules file that declares no `[state.<name>]` and calls no state function (`kv_store_*`, `proc_dict_*`, `kv_*`) holds none. A rules file cannot raise this ceiling; `0` switches rule state off, and a rules file that uses it then does not load. Read at startup: a change needs a restart. |
 
 ## Meta (not a config field)
 

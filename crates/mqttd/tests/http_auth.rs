@@ -80,6 +80,8 @@ async fn stub_hook(answer: Answer) -> (SocketAddr, Arc<AtomicUsize>) {
                     Answer::ServerError => {
                         b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"
                     }
+                    // Written in seconds: the settling-delay census reads the length.
+                    #[allow(clippy::duration_suboptimal_units)]
                     Answer::Hang => {
                         // SETTLE(http-auth-hang-stub): this is not a wait for anything — it IS
                         // the fault being injected. `Answer::Hang` models an upstream that never

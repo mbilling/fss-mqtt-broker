@@ -18,7 +18,9 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 bytes = "1"
 mqtt-core = { path = "../../mqtt-core" }
-mqtt-rules = { path = ".." }
+# Without `jq`: that is a WebAssembly runtime and a compiler (ADR 0086), which has a fuzz
+# target of its own (crates/mqtt-wasm-sandbox/fuzz). These targets fuzz the rule engine.
+mqtt-rules = { path = "..", default-features = false }
 
 [[bin]]
 name = "rules_parse"

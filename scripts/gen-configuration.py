@@ -251,6 +251,9 @@ def render(env_vars: list[str], toml_keys: dict[str, str], docs: dict[str, str])
         lines += [f"## {title}", "", "| Variable | TOML key | Purpose |", "|---|---|---|"]
         for var, key, desc in rows:
             desc = desc.replace("|", "\\|").replace("\n", " ")
+            # A doc comment links to docs/ relative to its crate's source; this file
+            # lives in docs/, where that prefix leads out of the repository.
+            desc = desc.replace("](../../../docs/", "](")
             lines.append(f"| `{var}` | `{key}` | {desc} |")
         lines.append("")
 

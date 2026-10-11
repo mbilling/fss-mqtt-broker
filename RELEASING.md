@@ -197,6 +197,16 @@ determinism recipe (pinned toolchain, locked deps, path remapping,
 `SOURCE_DATE_EPOCH`) lives in
 [`scripts/release/build-repro.sh`](scripts/release/build-repro.sh).
 
+The broker carries one thing that is not Rust: the WebAssembly module behind the rule
+engine's `jq()` (EMQX's jq, C; [ADR 0086](docs/adr/0086-wasm-rule-functions.md)). It is
+not in the repository. The same script builds it first, from two source tarballs and a
+compiler (zig 0.16.0, downloaded from ziglang.org) each checked against a sha256 in the
+tree, and the broker's build embeds it only when its own sha256 is the one recorded in
+`crates/mqtt-wasm-sandbox/jq-module/jq.wasm.sha256`. So the module is covered by the
+same rebuild: the release notes state its hash and the source commits, and
+`crates/mqtt-wasm-sandbox/jq-module/build.sh` alone reproduces it on Linux or macOS.
+Set `ZIG=/path/to/zig` (0.16.0) to use a compiler you already have.
+
 ### 3. Verify the container image
 
 ```sh

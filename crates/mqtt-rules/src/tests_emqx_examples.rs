@@ -1121,6 +1121,16 @@ const SYSTEM: &[Ex] = &[
 // --- emqx_rule_funcs.erl: exported, so callable, but not in the reference ------------
 
 const UNDOCUMENTED: &[Ex] = &[
+    // `jq` is off unless the broker's operator switches it on (ADR 0086 D13): here,
+    // as in a broker with the default configuration, the statement does not load.
+    // What it returns once it is on is pinned against EMQX in
+    // `crates/mqttd/tests/rules_jq.rs`.
+    fails(
+        "emqx_rule_funcs.erl jq/2",
+        "jq('.a', payload)",
+        "jq is switched off: set `rules.jq = true` to use it (see RULES.md for what it needs \
+         from the host) (line 1, column 8, near `jq('.a', payload) AS r F`)",
+    ),
     eq("emqx_rule_funcs.erl div/2", "div(7, 2)", "3"),
     eq("emqx_rule_funcs.erl div/2", "div(-7, 2)", "-3"),
     eq("emqx_rule_funcs.erl mod/2", "mod(-7, 2)", "-1"),
@@ -1842,6 +1852,11 @@ fn undocumented_emqx_functions_match_emqx_source() {
 /// tests". Every function
 /// the engine implements is called in some row above, so a function added without an
 /// example from EMQX's reference (or its source) fails here, naming it.
+///
+/// The state functions are the exception: they need a store, which this crate does not
+/// have. EMQX's `kv_store_*` are pinned to what EMQX 6.3.1 answered in the broker's
+/// tests of its store (`mqttd`, `rule_state`), and what the engine does with every one
+/// of them is in `tests_state`.
 #[test]
 fn every_implemented_function_has_an_example() {
     let mut called = std::collections::BTreeSet::new();
@@ -1865,6 +1880,7 @@ fn every_implemented_function_has_an_example() {
     let missing: Vec<&str> = function_names()
         .into_iter()
         .filter(|f| !called.contains(*f))
+        .filter(|f| !crate::state::FUNCS.iter().any(|s| s.name == *f))
         .collect();
     assert!(
         missing.is_empty(),

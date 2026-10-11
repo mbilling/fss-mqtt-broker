@@ -19,6 +19,8 @@
 //! the broker decides where evaluation runs (on the connection task that read the
 //! publish, so it scales with connections and nodes) and how a republished message is
 //! delivered (through the same acknowledgement gate as the message that caused it).
+//! What a rule remembers between messages ([`state`], ADR 0085) lives in a store the
+//! broker supplies, behind a trait.
 //!
 //! The SQL dialect, the function set and every known difference from EMQX are
 //! documented in `docs/RULES.md`.
@@ -38,10 +40,13 @@ pub mod edit;
 mod eval;
 mod funcs;
 mod input;
+mod jq;
 mod json;
 mod lexer;
 mod num;
 mod parser;
+mod plugin;
+pub mod state;
 mod template;
 mod value;
 
@@ -53,6 +58,13 @@ pub use input::{
     reason_code_name, ClientInfo, ConnInfo, EventInput, EventKind, EventMatch, EventMessage,
     PublishInput, EMQX_EVENT_TOPICS,
 };
+pub use jq::{FunctionCall, Functions, HandOff, Jq, JqSettings, JqSwitch, ModuleStats};
+pub use plugin::{
+    emqx_only_function_names, reserved as reserved_function_name, Module, ModuleFunction,
+    ModuleHost, ModuleSettings, DEFAULT_MEMORY_MIB, DEFAULT_TIMEOUT_MS, MAX_FUNCTIONS_PER_MODULE,
+    MAX_MEMORY_MIB, MAX_MODULES, MAX_MODULE_BYTES, MAX_TIMEOUT_MS,
+};
+pub use state::{StateStore, StateSwitch, MAX_STATE_CALLS_PER_TRIGGER};
 pub use value::{json_decode, Map, Value};
 
 /// The most rules one file may define.
@@ -200,6 +212,14 @@ pub enum LoadError {
         /// The 1-based column (in characters) of a SQL error.
         sql_column: Option<usize>,
     },
+    /// One `[functions.<name>]` table: a module that cannot be loaded (ADR 0086 D9).
+    #[error("functions `{name}`: {message}")]
+    Function {
+        /// The table's name.
+        name: String,
+        /// Why its module is not loaded.
+        message: String,
+    },
 }
 
 impl LoadError {
@@ -281,6 +301,11 @@ pub enum Outcome<'a> {
     /// [`RuleSet::on_publish`] and [`RuleSet::on_event`], never by a dry run
     /// ([`RuleSet::evaluate_one`]), so it describes live traffic only.
     Elapsed(std::time::Duration),
+    /// The rule's SQL called a sandboxed function (`jq` or an operator's module, ADR
+    /// 0086): how long the call
+    /// took and how it ended. Reported after the SQL has run and before its
+    /// `Passed`, `NoResult` or `Failed`, once per call, in call order.
+    Function(&'a FunctionCall),
 }
 
 /// Why a `republish` action was not run on a republished message.
@@ -307,8 +332,9 @@ impl Recursion {
 }
 
 /// What every effect of one original message — a client's publish, a Will, an event —
-/// may use together: [`MAX_EFFECTS_PER_TRIGGER`] effects and [`MAX_DERIVED_BYTES`] plus
-/// four times the original's payload. Shared by the evaluation of the original and of
+/// may use together: [`MAX_EFFECTS_PER_TRIGGER`] effects, [`MAX_DERIVED_BYTES`] plus
+/// four times the original's payload, and [`MAX_STATE_CALLS_PER_TRIGGER`] state calls
+/// (ADR 0085 D9). Shared by the evaluation of the original and of
 /// every message its rules republish that re-enters the rule engine, so a chain or a
 /// loop of rules multiplies a publish no more than one rule can.
 #[derive(Debug)]
@@ -316,6 +342,7 @@ pub struct Budget {
     effects: std::cell::Cell<usize>,
     bytes: std::cell::Cell<usize>,
     limit: usize,
+    pub(crate) state_calls: std::cell::Cell<usize>,
 }
 
 impl Budget {
@@ -326,7 +353,14 @@ impl Budget {
             effects: std::cell::Cell::new(0),
             bytes: std::cell::Cell::new(0),
             limit: MAX_DERIVED_BYTES.saturating_add(payload_len.saturating_mul(4)),
+            state_calls: std::cell::Cell::new(0),
         }
+    }
+
+    /// State calls counted so far.
+    #[must_use]
+    pub fn state_calls(&self) -> usize {
+        self.state_calls.get()
     }
 
     /// Effects charged so far.
@@ -350,6 +384,8 @@ pub struct Rule {
     enabled: bool,
     sql: String,
     stmt: parser::Statement,
+    /// The namespace its `state` key names (ADR 0085 D1).
+    state: Option<String>,
     actions: Vec<action::Action>,
     /// The `actions` entries as the file wrote them.
     action_specs: Vec<toml::Value>,
@@ -421,6 +457,13 @@ impl Rule {
     #[must_use]
     pub fn sql(&self) -> &str {
         &self.sql
+    }
+
+    /// The declared namespace its `state` key names (ADR 0085 D1); `None` for a rule
+    /// that keeps its state, if any, in a namespace of its own.
+    #[must_use]
+    pub fn state(&self) -> Option<&str> {
+        self.state.as_deref()
     }
 
     /// The topic filters in its `FROM`.
@@ -496,6 +539,16 @@ pub struct RuleSet {
     by_event: [Vec<usize>; EventKind::COUNT],
     digest: String,
     warnings: Vec<String>,
+    /// Whether any rule, enabled or not, calls a sandboxed function.
+    sandboxed: bool,
+    /// The modules the file declares (`[functions.<name>]`), in name order. Held for
+    /// as long as the set is: an evaluation on this set runs on these modules, whatever
+    /// a later load has put in their place.
+    modules: Vec<Arc<Module>>,
+    /// The state namespaces the file holds: the ones it declares and the ones its
+    /// rules call (ADR 0085). Held for as long as the set is, and a namespace lives
+    /// while a set that holds it does.
+    state: Vec<Arc<state::StateBinding>>,
 }
 
 /// A successfully loaded rules file and what the author should be told about it.
@@ -512,6 +565,34 @@ pub struct Loaded {
 struct FileSchema {
     #[serde(default)]
     rules: BTreeMap<String, RuleSchema>,
+    /// Operator modules (ADR 0086 D9); an mqttd extension.
+    #[serde(default)]
+    functions: BTreeMap<String, plugin::ModuleSchema>,
+    /// State namespaces (ADR 0085 D1); an mqttd extension.
+    #[serde(default)]
+    state: BTreeMap<String, state::StateSchema>,
+}
+
+/// A rules file's modules and its `[state.<name>]` tables.
+pub(crate) type Declared = (Vec<Arc<Module>>, BTreeMap<String, state::StateSchema>);
+
+/// What the rules file `text` declares for a statement on its own: its modules, loaded
+/// as [`RuleSet::parse_with`] loads them, and its `[state.<name>]` tables.
+pub(crate) fn declared(text: &str, functions: &Functions) -> Result<Declared, LoadError> {
+    let file: FileSchema = toml::from_str(text).map_err(|e| LoadError::File {
+        message: e.to_string(),
+        span: e.span(),
+    })?;
+    Ok((load_modules(&file, functions)?, file.state))
+}
+
+fn load_modules(file: &FileSchema, functions: &Functions) -> Result<Vec<Arc<Module>>, LoadError> {
+    plugin::load_all(
+        &file.functions,
+        functions.module_host().map(|host| &**host),
+        functions.dir(),
+    )
+    .map_err(|(name, message)| LoadError::Function { name, message })
 }
 
 fn yes() -> bool {
@@ -528,6 +609,10 @@ struct RuleSchema {
     enable: bool,
     #[serde(default)]
     description: String,
+    /// The declared namespace the rule's `kv_*` calls work on (ADR 0085 D1); without
+    /// it they work on a namespace of the rule's own.
+    #[serde(default)]
+    state: Option<String>,
 }
 
 /// Whether `id` is a valid rule id: a letter or `_` followed by up to 63 letters, digits,
@@ -614,13 +699,13 @@ fn event_sources(from: &str, warnings: &mut Vec<String>) -> Result<Vec<EventKind
     Ok(m.kinds)
 }
 
-/// Compile one statement and its `FROM` list, its literal regex patterns through
-/// `regexes`.
-fn compile(sql: &str, regexes: &mut parser::RegexPool) -> Result<Compiled, CompileError> {
+/// Compile one statement and its `FROM` list, its literal regex patterns and its calls
+/// of `jq` through `loading`.
+fn compile(sql: &str, loading: &mut parser::Loading<'_>) -> Result<Compiled, CompileError> {
     if sql.len() > MAX_SQL_BYTES {
         return Err(format!("sql is longer than {MAX_SQL_BYTES} bytes").into());
     }
-    let (stmt, mut warnings) = parser::parse(sql, regexes).map_err(|e| CompileError {
+    let (stmt, mut warnings) = parser::parse(sql, loading).map_err(|e| CompileError {
         message: e.to_string(),
         at: Some((e.line, e.column)),
     })?;
@@ -678,8 +763,20 @@ impl RuleSet {
         Self::default()
     }
 
-    /// Load a rules file's text. All-or-nothing.
+    /// Load a rules file's text, with `jq` switched off. All-or-nothing.
     pub fn parse(text: &str) -> Result<Loaded, LoadError> {
+        Self::parse_with(text, &Functions::default())
+    }
+
+    /// Load a rules file's text. All-or-nothing. `functions` is what its rules may
+    /// call beyond the built-in functions: a file that calls `jq` loads only where
+    /// that is switched on and this host can run it (ADR 0086). The first such load of
+    /// a process compiles the jq module, which takes about half a second.
+    ///
+    /// A file that declares modules (`[functions.<name>]`) loads only with `functions`
+    /// that can load them and know the rules file's directory
+    /// ([`Functions::with_modules`], [`Functions::beside`]).
+    pub fn parse_with(text: &str, functions: &Functions) -> Result<Loaded, LoadError> {
         let file: FileSchema = toml::from_str(text).map_err(|e| LoadError::File {
             message: e.to_string(),
             span: e.span(),
@@ -697,8 +794,17 @@ impl RuleSet {
             ..RuleSet::default()
         };
         let mut warnings = Vec::new();
-        // One pool for the whole file: the regex budget is file-wide (ADR 0084 D3).
-        let mut regexes = parser::RegexPool::default();
+        // The modules first: a rule's call of a module's function is resolved against
+        // them, and a module that cannot be loaded fails the file whether or not a
+        // rule calls it.
+        set.modules = load_modules(&file, functions)?;
+        // One for the whole file: the regex budget is file-wide (ADR 0084 D3).
+        let mut loading = parser::Loading::new(functions);
+        loading.modules.clone_from(&set.modules);
+        // The namespaces the file declares, before any rule names one: a file that
+        // declares state where there is no store does not load (ADR 0085 D2).
+        loading.state = state::StateLoading::new(&functions.state, file.state);
+        loading.state.declare().map_err(LoadError::file)?;
         for (id, r) in file.rules {
             let fail = |e: CompileError| LoadError::Rule {
                 id: id.clone(),
@@ -721,12 +827,16 @@ impl RuleSet {
                     .into(),
                 ));
             }
+            loading
+                .state
+                .rule(&id, r.state.as_deref())
+                .map_err(|e| fail(e.into()))?;
             let Compiled {
                 stmt,
                 topics,
                 events,
                 warnings: w,
-            } = compile(&r.sql, &mut regexes).map_err(fail)?;
+            } = compile(&r.sql, &mut loading).map_err(fail)?;
             warnings.extend(w.into_iter().map(|w| format!("rule `{id}`: {w}")));
             let mut actions = Vec::with_capacity(r.actions.len());
             let mut aw = Vec::new();
@@ -740,6 +850,7 @@ impl RuleSet {
                 enabled: r.enable,
                 sql: r.sql,
                 stmt,
+                state: r.state,
                 actions,
                 action_specs: r.actions,
                 topics,
@@ -749,19 +860,23 @@ impl RuleSet {
                 no_result_window: AtomicU64::new(0),
             });
         }
-        for (i, rule) in set.rules.iter().enumerate() {
-            if !rule.enabled {
-                continue;
-            }
-            for t in &rule.topics {
-                let key: FilterKey = Arc::from(t.as_str());
-                set.topic_index.insert(&key);
-                set.by_filter.entry(key).or_default().push(i);
-            }
-            for e in &rule.events {
-                set.by_event[e.index()].push(i);
-            }
+        set.index();
+        if let Some(jq) = &loading.jq {
+            set.sandboxed = true;
+            // The programs the file spells out, compiled into every warm instance now:
+            // no publisher pays for that (ADR 0086 D5).
+            let programs: Vec<&[u8]> = loading.jq_programs.iter().map(|p| p.as_bytes()).collect();
+            jq.warm(&programs);
         }
+        set.sandboxed |= loading.calls_module;
+        if loading.state.called_emqx && loading.state.called_own {
+            warnings.push(
+                "the file calls both EMQX's kv_store_* functions and mqttd's kv_* functions: \
+                 they do not share keys (kv_get does not read what kv_store_put wrote)"
+                    .to_string(),
+            );
+        }
+        set.state = loading.state.into_bindings();
         set.warnings.clone_from(&warnings);
         Ok(Loaded {
             rules: set,
@@ -769,11 +884,57 @@ impl RuleSet {
         })
     }
 
-    /// Load a rules file from disk.
+    /// Index the enabled rules by what their `FROM` selects.
+    fn index(&mut self) {
+        for (i, rule) in self.rules.iter().enumerate() {
+            if !rule.enabled {
+                continue;
+            }
+            for t in &rule.topics {
+                let key: FilterKey = Arc::from(t.as_str());
+                self.topic_index.insert(&key);
+                self.by_filter.entry(key).or_default().push(i);
+            }
+            for e in &rule.events {
+                self.by_event[e.index()].push(i);
+            }
+        }
+    }
+
+    /// Load a rules file from disk, with `jq` switched off.
     pub fn load(path: &std::path::Path) -> Result<Loaded, LoadError> {
+        Self::load_with(path, &Functions::default())
+    }
+
+    /// Load a rules file from disk ([`parse_with`](Self::parse_with)).
+    pub fn load_with(path: &std::path::Path, functions: &Functions) -> Result<Loaded, LoadError> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| LoadError::file(format!("{}: {e}", path.display())))?;
-        Self::parse(&text)
+        Self::parse_with(&text, &functions.beside(path))
+    }
+
+    /// Whether any rule of the file, enabled or not, calls a function that runs in the
+    /// sandbox (`jq`, or an operator's module): such a rule may take as long as its
+    /// timeout allows, so whoever evaluates it must not be something everything else
+    /// waits for.
+    #[must_use]
+    pub fn calls_sandbox(&self) -> bool {
+        self.sandboxed
+    }
+
+    /// The modules the file declares (`[functions.<name>]`, ADR 0086 D9), in name
+    /// order.
+    #[must_use]
+    pub fn modules(&self) -> &[Arc<Module>] {
+        &self.modules
+    }
+
+    /// The state namespaces the file holds, in name order (ADR 0085): the ones it
+    /// declares, EMQX's `kv_store` when a rule calls `kv_store_*`, and `rule:<id>` for
+    /// each rule that keeps state without naming a namespace. Empty for a file that
+    /// uses no state.
+    pub fn state_namespaces(&self) -> impl Iterator<Item = (&str, &state::NamespaceSettings)> + '_ {
+        self.state.iter().map(|b| (&*b.name, &b.settings))
     }
 
     /// Every loaded rule (enabled or not), in id order.
@@ -861,25 +1022,58 @@ impl RuleSet {
         report: &mut dyn FnMut(&Rule, Outcome<'_>),
         out: &mut Vec<(Arc<str>, Effect)>,
     ) {
-        if self.topic_index.is_empty() {
+        let hits = self.matching(input.topic);
+        if hits.is_empty() {
             return;
         }
+        let ctx = EvalCtx::new(input).within(budget);
+        for i in hits {
+            apply_timed(&self.rules[i], &ctx, budget, report, out);
+        }
+    }
+
+    /// [`on_publish_within`](Self::on_publish_within), evaluated by the task that owns
+    /// `dictionary`: what EMQX's `proc_dict_*` read and write (ADR 0085 D13). The
+    /// broker hands a connection's own dictionary to everything that connection's task
+    /// evaluates; without one (the other entry points) the rules get an empty
+    /// dictionary that is dropped with the evaluation.
+    pub fn on_publish_in(
+        &self,
+        input: &PublishInput<'_>,
+        budget: &Budget,
+        dictionary: &state::Dictionary,
+        report: &mut dyn FnMut(&Rule, Outcome<'_>),
+        out: &mut Vec<(Arc<str>, Effect)>,
+    ) {
+        let hits = self.matching(input.topic);
+        if hits.is_empty() {
+            return;
+        }
+        let ctx = EvalCtx::new(input).within(budget).on(dictionary);
+        for i in hits {
+            apply_timed(&self.rules[i], &ctx, budget, report, out);
+        }
+    }
+
+    /// The enabled rules whose `FROM` matches `topic`, in id order; none allocates
+    /// nothing.
+    #[inline]
+    fn matching(&self, topic: &str) -> Vec<usize> {
         let mut hits: Vec<usize> = Vec::new();
-        self.topic_index.for_each_matching(input.topic, |f| {
+        if self.topic_index.is_empty() {
+            return hits;
+        }
+        self.topic_index.for_each_matching(topic, |f| {
             if let Some(rules) = self.by_filter.get(f) {
                 hits.extend_from_slice(rules);
             }
         });
-        if hits.is_empty() {
-            return;
-        }
         // A rule whose FROM lists several matching filters fires once.
-        hits.sort_unstable();
-        hits.dedup();
-        let ctx = EvalCtx::new(input);
-        for i in hits {
-            apply_timed(&self.rules[i], &ctx, budget, report, out);
+        if hits.len() > 1 {
+            hits.sort_unstable();
+            hits.dedup();
         }
+        hits
     }
 
     /// Evaluate every enabled rule selecting this event.
@@ -905,7 +1099,27 @@ impl RuleSet {
         if hits.is_empty() {
             return;
         }
-        let ctx = EvalCtx::new(input);
+        let ctx = EvalCtx::new(input).within(budget);
+        for &i in hits {
+            apply_timed(&self.rules[i], &ctx, budget, report, out);
+        }
+    }
+
+    /// [`on_event_within`](Self::on_event_within), evaluated by the task that owns
+    /// `dictionary` ([`on_publish_in`](Self::on_publish_in)).
+    pub fn on_event_in(
+        &self,
+        input: &EventInput,
+        budget: &Budget,
+        dictionary: &state::Dictionary,
+        report: &mut dyn FnMut(&Rule, Outcome<'_>),
+        out: &mut Vec<(Arc<str>, Effect)>,
+    ) {
+        let hits = &self.by_event[input.kind().index()];
+        if hits.is_empty() {
+            return;
+        }
+        let ctx = EvalCtx::new(input).within(budget).on(dictionary);
         for &i in hits {
             apply_timed(&self.rules[i], &ctx, budget, report, out);
         }
@@ -917,11 +1131,36 @@ impl RuleSet {
     /// asks [`Rule::from_mismatch`] first. Returns `false` when there is no such rule.
     ///
     /// Nothing about the rule changes: `report` is the caller's, and neither the failure
-    /// report gate nor the trace windows are touched.
+    /// report gate nor the trace windows are touched. **Nor is the store the rules were
+    /// loaded with** (ADR 0085 D11): the rule's state calls go to `scratch`, a store
+    /// the caller made for the dry run and drops after it, where each namespace has the
+    /// name and settings it has here. Rules evaluated on one scratch store see each
+    /// other's writes, as rules on one message do. With `None`, a state call fails the
+    /// rule.
+    ///
+    /// EMQX's `proc_dict_*` work on an empty dictionary that is dropped with this call;
+    /// [`evaluate_one_on`](Self::evaluate_one_on) takes one that several rules share.
     pub fn evaluate_one(
         &self,
         id: &str,
         input: &dyn Input,
+        scratch: Option<&dyn StateStore>,
+        report: &mut dyn FnMut(&Rule, Outcome<'_>),
+        out: &mut Vec<(Arc<str>, Effect)>,
+    ) -> bool {
+        self.evaluate_one_on(id, input, scratch, &state::Dictionary::new(), report, out)
+    }
+
+    /// [`evaluate_one`](Self::evaluate_one) with the dry run's own `dictionary`: the
+    /// scratch one the caller made for it, never a connection's. Rules evaluated on one
+    /// see each other's `proc_dict_put`, as the rules a connection's message matches
+    /// do.
+    pub fn evaluate_one_on(
+        &self,
+        id: &str,
+        input: &dyn Input,
+        scratch: Option<&dyn StateStore>,
+        dictionary: &state::Dictionary,
         report: &mut dyn FnMut(&Rule, Outcome<'_>),
         out: &mut Vec<(Arc<str>, Effect)>,
     ) -> bool {
@@ -929,7 +1168,11 @@ impl RuleSet {
             return false;
         };
         let budget = Budget::new(input.payload().map_or(0, Bytes::len));
-        apply(rule, &EvalCtx::new(input), &budget, report, out);
+        let ctx = EvalCtx::new(input)
+            .within(&budget)
+            .dry_run(scratch)
+            .on(dictionary);
+        apply(rule, &ctx, &budget, report, out);
         true
     }
 }
@@ -960,7 +1203,12 @@ fn apply(
 ) {
     *ctx.rule_id.borrow_mut() = rule.id.clone();
     let mut outputs = Vec::new();
-    if let Err(e) = eval::run(&rule.stmt, ctx, &mut outputs) {
+    let ran = eval::run(&rule.stmt, ctx, &mut outputs);
+    let calls = std::mem::take(&mut *ctx.calls.borrow_mut());
+    for call in &calls {
+        report(rule, Outcome::Function(call));
+    }
+    if let Err(e) = ran {
         report(rule, Outcome::Failed(&e));
         return;
     }
@@ -1031,12 +1279,20 @@ fn charge_derived(budget: &Budget, effect: Effect) -> Result<Effect, EvalError> 
 
 /// What one statement's `FROM` selects: its topic filters and its events.
 pub fn statement_sources(sql: &str) -> Result<(Vec<String>, Vec<EventKind>), String> {
-    compile_alone(sql).map(|c| (c.topics, c.events))
+    statement_sources_with(sql, &Functions::default())
+}
+
+/// [`statement_sources`] for a statement that may call what `functions` has.
+pub fn statement_sources_with(
+    sql: &str,
+    functions: &Functions,
+) -> Result<(Vec<String>, Vec<EventKind>), String> {
+    compile_alone(sql, functions).map(|c| (c.topics, c.events))
 }
 
 /// [`compile`] for a statement on its own, with a regex budget of its own.
-fn compile_alone(sql: &str) -> Result<Compiled, String> {
-    compile(sql, &mut parser::RegexPool::default()).map_err(|e| e.message)
+fn compile_alone(sql: &str, functions: &Functions) -> Result<Compiled, String> {
+    compile(sql, &mut parser::Loading::new(functions)).map_err(|e| e.message)
 }
 
 /// Why a rule selecting `topics` and `events` would never run on `input`; `None` when
@@ -1081,12 +1337,22 @@ fn from_mismatch(topics: &[String], events: &[EventKind], input: &dyn Input) -> 
 /// than evaluated: a message whose topic no `FROM` filter matches, a message given to a
 /// statement that selects only events, or an event its `FROM` does not name.
 pub fn test_sql(sql: &str, input: &dyn Input) -> Result<Vec<String>, String> {
+    test_sql_with(sql, input, &Functions::default())
+}
+
+/// [`test_sql`] for a statement that may call what `functions` has (`jq`, where it is
+/// switched on).
+pub fn test_sql_with(
+    sql: &str,
+    input: &dyn Input,
+    functions: &Functions,
+) -> Result<Vec<String>, String> {
     let Compiled {
         stmt,
         topics,
         events,
         ..
-    } = compile_alone(sql)?;
+    } = compile_alone(sql, functions)?;
     if let Some(why) = from_mismatch(&topics, &events, input) {
         return Err(why);
     }
@@ -1102,14 +1368,22 @@ pub fn test_sql(sql: &str, input: &dyn Input) -> Result<Vec<String>, String> {
 
 /// Validate one statement without running it; returns its warnings.
 pub fn check_sql(sql: &str) -> Result<Vec<String>, String> {
-    compile_alone(sql).map(|c| c.warnings)
+    compile_alone(sql, &Functions::default()).map(|c| c.warnings)
 }
 
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_conditions;
+#[cfg(test)]
 mod tests_emqx_examples;
 #[cfg(test)]
 mod tests_message_events;
+#[cfg(all(test, feature = "jq"))]
+mod tests_modules;
+#[cfg(test)]
+mod tests_proc_dict;
 #[cfg(test)]
 mod tests_republish;
+#[cfg(test)]
+mod tests_state;
