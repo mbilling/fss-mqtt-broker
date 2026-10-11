@@ -1132,6 +1132,11 @@ async fn main() -> Result<(), StartupError> {
     // Earlier than this there is nothing to drain, and the default action keeps a stuck
     // startup killable.
     let (mut stop, mut decommission) = (StopSignals::install(), DecommissionSignal::install());
+    // SIGHUP's default action ends the process too. Registered only when the reload task
+    // first ran, a reload sent in the rest of startup (or before that task was scheduled)
+    // killed a node already serving clients; registered here it is kept until the reloader
+    // is ready to take it.
+    let reload_signal = ReloadSignal::install();
     let hub_for_shutdown = hub_tx.clone();
     start_client_listeners(
         &config,
@@ -1157,7 +1162,7 @@ async fn main() -> Result<(), StartupError> {
 
     // SIGHUP reloads the security policy (ACL + authenticator + TLS material) in place
     // (ADR 0032) — no restart, no dropped connections; a bad file keeps the running policy.
-    spawn_reload_handler(reloader.clone());
+    spawn_reload_handler(reloader.clone(), reload_signal);
     let reloader_for_admin = reloader.clone();
 
     // Optional filesystem watcher (ADR 0033): MQTTD_CONFIG_WATCH=<seconds> auto-reloads when a
@@ -1786,16 +1791,11 @@ fn authorizer_from_config(
 /// Install the SIGHUP handler that drives [`reload::Reloader::reload`] for the process
 /// lifetime (ADR 0032). Non-Unix has no SIGHUP, so reload is unavailable there (logged).
 #[cfg(unix)]
-fn spawn_reload_handler(reloader: std::sync::Arc<reload::Reloader>) {
-    use tokio::signal::unix::{signal, SignalKind};
+fn spawn_reload_handler(reloader: std::sync::Arc<reload::Reloader>, signal: ReloadSignal) {
+    let Some(mut hup) = signal.hup else {
+        return;
+    };
     tokio::spawn(async move {
-        let mut hup = match signal(SignalKind::hangup()) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(error = %e, "cannot install SIGHUP handler; security reload disabled");
-                return;
-            }
-        };
         while hup.recv().await.is_some() {
             info!("SIGHUP received — reloading configuration (ADR 0046 T4) + security policy");
             reloader.reload("signal");
@@ -1804,7 +1804,7 @@ fn spawn_reload_handler(reloader: std::sync::Arc<reload::Reloader>) {
 }
 
 #[cfg(not(unix))]
-fn spawn_reload_handler(_reloader: std::sync::Arc<reload::Reloader>) {
+fn spawn_reload_handler(_reloader: std::sync::Arc<reload::Reloader>, _signal: ReloadSignal) {
     warn!("security policy reload (SIGHUP) is unavailable on this platform");
 }
 
@@ -6038,6 +6038,31 @@ async fn graceful_shutdown(
     // the process exits (no-op without an exporter).
     audit.flush(Duration::from_secs(3));
     info!("shutdown complete");
+}
+
+/// `SIGHUP`, the reload request (ADR 0032), registered once at startup with the stop signals
+/// (see [`StopSignals`]): its default action ends the process, and a signal that arrives
+/// before the reloader is built is kept for it.
+struct ReloadSignal {
+    #[cfg(unix)]
+    hup: Option<tokio::signal::unix::Signal>,
+}
+
+impl ReloadSignal {
+    fn install() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let hup = signal(SignalKind::hangup())
+                .inspect_err(|e| {
+                    warn!(error = %e, "cannot install SIGHUP handler; security reload disabled");
+                })
+                .ok();
+            Self { hup }
+        }
+        #[cfg(not(unix))]
+        Self {}
+    }
 }
 
 /// `SIGUSR1`, the decommission request (ADR 0043 P3), registered once at startup (see

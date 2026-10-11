@@ -3333,6 +3333,9 @@ async fn writers_for_a_rules_directory_the_broker_cannot_write_in_are_warned_abo
     write_rules(dir.path(), EDIT_A);
     let read_only = dir.path().join("ro");
     std::fs::create_dir(&read_only).unwrap();
+    // The broker names the directory by its real path; a temporary directory behind a
+    // symlink (macOS: /var -> /private/var) would not match the warning expected below.
+    let read_only = std::fs::canonicalize(&read_only).unwrap();
     std::fs::write(read_only.join("rules.toml"), EDIT_A).unwrap();
     std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o555)).unwrap();
     if std::fs::write(read_only.join("probe"), "").is_ok() {
