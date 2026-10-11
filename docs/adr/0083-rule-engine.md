@@ -839,7 +839,7 @@ and `failed.no_result`. None is refused, or mentioned, when the rule is created.
 | The same forms in an `INCASE` | yes | the same failures, per element (`match_incase_error`): the rule fails at the first element that reaches the form, after the `DO` of the elements before it | the element passes when the condition is `true` | kept |
 | The same forms in a `CASE WHEN c THEN …` | yes | `eval_case_clauses` takes the branch on `true` and goes on to the next `WHEN` on *anything else*, so a function's number is "not true" there as it is here; a bare value, a non-boolean on the left of `AND`/`OR`, and `NOT` over the four still fail | takes the branch on `true`, goes on otherwise | kept |
 | `CASE x WHEN v THEN …` with `v` an `AND`, `OR`, `NOT` or `IN` | yes | fails: `v` is evaluated with `eval/2` (a comparison is a value there, the four are not), before `x` | `v` is its boolean, matched against `x` | kept |
-| `TRUE`, `True`, `FALSE` | yes, as a field name (`sql_lex.xrl` has the two words in lower case only) | `undefined`: as a whole `WHERE` it fails; `x = TRUE` is true only when `x` is `undefined`; `SELECT TRUE AS a` gives `undefined` | the boolean | kept, and the one row where EMQX *runs* the rule and gives another result |
+| `TRUE`, `True`, `FALSE` | yes, as a field name (`sql_lex.xrl` has the two words in lower case only) | `undefined`: as a whole `WHERE` it fails; `x = TRUE` is true only when `x` is `undefined`; `SELECT TRUE AS a` gives `undefined` | the boolean | kept, and the one row where EMQX *runs* the rule and gives another result. **Overridden the same day: a field name here too** ([the next amendment](#amendment-2026-10-11-true-and-false-in-capitals-are-field-names-as-in-emqx)) |
 | `CASE … END` as a condition or beside a comparison operator, `(a = 1) = true`, `f(NOT a)`, `f(a IN (1))` | no | the rule is not created | accepted | unchanged: "statements only mqttd accepts" (the amendment on JSON text, `coalesce`, and what only mqttd accepts) |
 | `a = b = c`, `LIKE`, `BETWEEN`, `IS NULL`, `!a`, `&&`, `IN ()`, `IN [1]` | no | the rule is not created | refused | nothing to do |
 
@@ -881,3 +881,77 @@ gives, with EMQX's outcome beside it), and in `tests_state.rs` by
 `a_condition_emqx_fails_goes_on_to_the_calls_behind_it` (the side effects of the kept
 forms). RULES.md lists the forms under [Conditions EMQX fails and mqttd
 evaluates](../RULES.md#conditions-emqx-fails-and-mqttd-evaluates).
+
+## Amendment (2026-10-11): `TRUE` and `FALSE` in capitals are field names, as in EMQX
+
+The amendment above kept one difference in which EMQX *runs* the rule and gives another
+result: `TRUE`, `True`, `FALSE` and every other spelling but the lower-case one were the
+booleans here and field names there. It called that row the weakest of its exemptions
+and the one to revisit. The maintainer decided it the same day (2026-10-11): match EMQX.
+This overrides the `TRUE` row of that amendment's table and its paragraph on `TRUE`;
+every other row stands.
+
+**Why this row and not the others.** The standing rule protects a rule moved from EMQX:
+it must give here what it gives there. Every other kept form fails in EMQX, so no working
+rule holds one. `WHERE payload.ok = TRUE` does not fail there. It runs, and passes
+exactly the messages *without* `ok`; here it passed the messages whose `ok` is `true`.
+A rule could not tell the engines apart by any of the other rows, and could by this one.
+
+**What EMQX does** (rulesql 0.2.1, read and probed on EMQX 6.3.1 with 98 more
+statements). The lexer has no token for a boolean. `unwrap_var/1` in `rulesql.yrl` turns
+the *name* `true` or `false`, matched exactly, into a constant, wherever the grammar
+takes a name; any other spelling is `{var, <<"TRUE">>}`, a field. So in every place a
+value is read (a `SELECT` or `DO` field, a `WHERE`, an `INCASE`, a `CASE`'s operand,
+`WHEN`, `THEN` and `ELSE`, a function's argument, an `IN` list, an array, a computed
+index, the array of a `FOREACH`) `TRUE` is the field `TRUE`: `undefined`, unless the
+statement selected something under that name (`SELECT 1 AS TRUE … WHERE TRUE = 1`
+passes). `TRUE.x` and `payload.TRUE` are paths, and `AS TRUE` an alias, as they already
+were here.
+
+**Decision.** The parser makes the boolean of `true` and `false` in lower case only, and
+reads any other spelling as the field it is in EMQX. Nothing else changes: where EMQX
+fails the rule on the bare field (`WHERE TRUE`, `… AND TRUE` when reached,
+`CASE WHEN TRUE`), it is a bare value as a condition, kept as the amendment above keeps
+every bare value (not the boolean `true`, so the condition is false).
+
+**The other words, checked so the fix is whole.** None has the same problem:
+
+| Words | EMQX | mqttd |
+|---|---|---|
+| `null`, `NULL`, `Null`, `undefined`, `UNDEFINED` | no such literal: field names in any case, `undefined` | the same, before and after |
+| `SELECT`, `FROM`, `WHERE`, `AS`, `AND`, `OR`, `NOT`, `IN`, `CASE`, `WHEN`, `THEN`, `ELSE`, `END`, `FOREACH`, `DO`, `INCASE` | keywords in any case (`^(?i)(AND)$`) | the same |
+| `div`, `mod` | operators in lower case only; `DIV` is a name, so `7 DIV 2` does not parse and `DIV(7, 2)` is an unknown function | the same |
+| Function names | case-sensitive: `ABS(-1)` fails the rule on each message | case-sensitive: refused at load, as every unknown function is |
+| `IF`, `ELSIF`, in any case | reserved by the lexer and used by no grammar rule: a statement that holds one is not created | names (mqttd-only, listed in RULES.md) |
+| `true`, `false` where a name belongs: `payload.true`, `true.x`, `AS x.true` | not created (`merge_path/2` has no clause for a constant) | the name (mqttd-only, listed) |
+| `1 AS true` | created, and fails on every message (`nested_put` has no clause for a constant) | the key `true` (mqttd-only, listed) |
+
+The last three are statements that do not work in EMQX, so they stay with the superset.
+
+**A warning at load.** This changes what a statement means that loaded before, without
+failing it. No release has the rule engine (`v1.1.0` does not), so the rules files it can
+reach were written for a build of `main`; for those, and for anyone who writes `TRUE` out
+of SQL habit, a load says so through the warnings channel (`--check-rules`, startup, a
+reload, the admin API), once per spelling and rule:
+
+```text
+rule `r`: `TRUE` is a field name here, as in EMQX; write `true` for the boolean
+```
+
+It is drawn only for a bare name that is `true` or `false` in another case and is read
+as a value; not for a path, an alias or a quoted name, not for a statement that selects
+that name itself, and not for `null` or any other field. This is not the load warning
+the amendment above declined: that one would have fired on forms that work in mqttd and
+on the demo's own rules, and this one fires on a word that almost never means what it
+says, in either engine. No rule in the repository draws it.
+
+The converter carries such a statement as it is: it means here what it meant in EMQX.
+
+Pinned by `crates/mqtt-rules/src/tests_conditions.rs`:
+`true_and_false_in_capitals_are_field_names_as_in_emqx` and
+`true_and_false_in_capitals_are_fields_wherever_a_value_is_read` (EMQX's outcome per
+position),
+`true_and_false_as_an_alias_a_path_or_a_quoted_name_draw_no_warning`,
+`a_field_spelt_like_a_boolean_is_warned_about_once_and_no_other_name_is` and
+`lower_case_booleans_and_if_are_names_where_emqx_takes_no_name`. RULES.md has it under
+[Gotchas](../RULES.md#gotchas), with the note for rules files written before this.
