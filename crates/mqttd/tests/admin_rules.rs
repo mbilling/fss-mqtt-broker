@@ -228,17 +228,22 @@ impl Node {
                     Ok(policy())
                 }
             });
-        let initial = Arc::new(RuleSet::parse(text).unwrap().rules);
+        // As the broker does it: what the rules may call, and the one store they keep
+        // their state in (ADR 0085), made once and given to every load.
+        let (functions, rule_state) =
+            mqttd::rules::functions_and_state_from_config(&live.read().unwrap().rules);
+        let initial = Arc::new(RuleSet::parse_with(text, &functions).unwrap().rules);
         let (rules_tx, rules_rx) = watch::channel(initial);
         let load_instead = Arc::new(Mutex::new(None::<PathBuf>));
         reloader.attach_rules(rules_tx, {
             let (live, instead) = (live.clone(), load_instead.clone());
+            let functions = functions.clone();
             move || {
                 let path = match instead.lock().unwrap().clone() {
                     Some(other) => Some(other.display().to_string()),
                     None => live.read().unwrap().rules.file.clone(),
                 };
-                mqttd::rules::load(path.as_deref()).map(Arc::new)
+                mqttd::rules::load_with(path.as_deref(), &functions).map(Arc::new)
             }
         });
         let last_reload = Arc::new(LastReload::default());
@@ -255,7 +260,9 @@ impl Node {
             None,
         );
         let rules = Rules::new(rules_rx, Arc::from("rules-node"), Some(metrics.clone()))
-            .with_observe(observe.clone());
+            .with_observe(observe.clone())
+            .with_functions(functions)
+            .with_state(rule_state);
 
         let ca = mint_ca(pki_dir.path());
         let (server_cert, server_key) = mint_leaf(&ca, "server");
@@ -806,6 +813,108 @@ async fn the_dry_run_answers_a_console_output_as_the_rule_rendered_it() {
         "{text}"
     );
     assert!(doc["results"][0].get("reason").is_none(), "{text}");
+}
+
+const STATEFUL: &str = r#"[state.s]
+max_keys = 10
+
+[rules.count]
+state = "s"
+sql = '''SELECT kv_incr('n') AS n, kv_store_put('p', 'dry') AS p, kv_store_get('seen', 'no') AS seen FROM "t/#"'''
+actions = [{ function = "console" }]
+
+[rules.read]
+state = "s"
+sql = '''SELECT kv_get('n') AS n FROM "t/#"'''
+actions = [{ function = "console" }]
+"#;
+
+/// ADR 0085 D11: a dry run, and a check, never read or write the state the running
+/// rules keep. `POST /admin/v1/rules/test` evaluates on a scratch store of its own, in
+/// which the rules of one request see each other's writes, and which is gone with the
+/// request.
+#[tokio::test]
+async fn a_dry_run_and_a_check_leave_the_running_rule_state_untouched() {
+    use mqtt_rules::state::{NamespaceSettings, StateOp, StateStore};
+    let n = Node::start(STATEFUL).await;
+    let store = n
+        .rules
+        .state()
+        .expect("rule state is on by default")
+        .clone();
+    // What the running store holds under `key` of namespace `ns`, read beside the rules.
+    let held = |ns: &str, key: &[u8]| {
+        let settings = NamespaceSettings::defaults(store.max_bytes());
+        let handle = store.open(ns, &settings).unwrap();
+        handle
+            .call(&StateOp::Get { key })
+            .unwrap()
+            .value
+            .map(|v| v.to_json().unwrap())
+    };
+    let snapshot = || {
+        (
+            store.namespaces(),
+            store.bytes(),
+            store.stats("s"),
+            store.stats("kv_store"),
+        )
+    };
+    // Live traffic: two messages counted, and EMQX's table written.
+    n.publish("t/1", b"{}");
+    n.publish("t/1", b"{}");
+    assert_eq!(held("s", b"n").as_deref(), Some("2"));
+    assert_eq!(store.namespaces(), ["kv_store", "s"]);
+    let before = snapshot();
+    // The dry run of the running set: an empty store, so the count starts at 1, and the
+    // second rule of the same request reads what the first wrote there.
+    for _ in 0..2 {
+        let (status, body) = n
+            .call(
+                &n.operator,
+                "POST",
+                "/admin/v1/rules/test",
+                Some(&json!({"topic": "t/1", "payload": "{}"})),
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            body["results"],
+            json!([
+                {"rule": "count", "enabled": true, "result": "passed", "error": null,
+                 "outputs": [{"action": "console", "output": {"n": 1, "p": true, "seen": "no"}}]},
+                {"rule": "read", "enabled": true, "result": "passed", "error": null,
+                 "outputs": [{"action": "console", "output": {"n": 1}}]},
+            ])
+        );
+    }
+    // A dry run of other text: its namespaces are that text's, in the scratch store.
+    let other = STATEFUL.replace("[state.s]", "[state.s]\n[state.fresh]");
+    let (status, body) = n
+        .call(
+            &n.operator,
+            "POST",
+            "/admin/v1/rules/test",
+            Some(&json!({"source": other, "only": "count", "topic": "t/1", "payload": "{}"})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["results"][0]["outputs"][0]["output"]["n"], 1, "{body}");
+    // A check of text that would hold more state.
+    let (status, body) = n
+        .call(
+            &n.operator,
+            "POST",
+            "/admin/v1/rules/check",
+            Some(&json!({"source": other})),
+        )
+        .await;
+    assert_eq!((status, &body["valid"]), (200, &json!(true)), "{body}");
+    // Nothing of it reached the running store.
+    assert_eq!(snapshot(), before);
+    assert_eq!(held("s", b"n").as_deref(), Some("2"));
+    n.publish("t/1", b"{}");
+    assert_eq!(held("s", b"n").as_deref(), Some("3"));
 }
 
 /// `POST /admin/v1/rules/test`: what the running set, a `source` or one `rule` would do with

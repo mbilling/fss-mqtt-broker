@@ -1737,15 +1737,16 @@ or the input is not JSON at all, a function of your own, as a WebAssembly module
 
 ## What rules cannot do
 
-A rule sees one message, or one client event, at a time. It keeps nothing between messages,
-publishes only back into the broker, and calls nothing outside it. These need something
-else:
+A rule sees one message, or one client event, at a time. What it keeps between messages
+([state](RULES.md#state-what-a-rule-remembers)) is in memory on the node that evaluated
+it: gone at a restart, and not shared with the other nodes of a cluster. It publishes only
+back into the broker, and calls nothing outside it. These need something else:
 
 | You need | Why a rule cannot | Use instead |
 |---|---|---|
-| An average, sum, count, minimum or maximum over time | No memory between messages | A consumer in a `$share` group ([INTEGRATION.md](INTEGRATION.md)) that aggregates and publishes the result back, or a time-series database fed by Telegraf |
-| Windows: every N seconds, one message per interval, a rate limit per device | No timers and no state | The same consumer, or have the device report at the rate you need |
-| Deduplication, or "only when the value changed" | Needs the previous value | The same consumer, or report on change at the device |
+| An average or a sum over time, or a count, minimum or maximum that is exact across a cluster or survives a restart | A rule can count (`kv_incr`) and keep a minimum or maximum (`kv_min`, `kv_max`), on one node and in memory; it has no windows | A consumer in a `$share` group ([INTEGRATION.md](INTEGRATION.md)) that aggregates and publishes the result back, or a time-series database fed by Telegraf |
+| Windows: every N seconds, one message per interval | No timers: a rule runs when a message arrives, never by itself | The same consumer, or have the device report at the rate you need |
+| Deduplication, or "only when the value changed", wherever the device connects | `kv_changed` keeps the previous value, on the node the device is connected to and until that node restarts | The same consumer, or report on change at the device |
 | Joining two topics, or looking a value up in a table | A rule sees one message; `maptab_lookup` is not implemented | A consumer with a cache, or put the static data in the topic or the payload at the source |
 | Sending to Kafka, HTTP, a database or another system | There are no sink actions ([ADR 0083](adr/0083-rule-engine.md)) | Republish to a topic and consume it with a `$share` group ([INTEGRATION.md](INTEGRATION.md)); to another MQTT broker, [mqtt-bridge](BRIDGE.md) |
 | Calling out: an HTTP request, a script, a file or an environment variable | Rules do no I/O; `getenv` reads only `EMQXVAR_…` variables, fixed while the broker runs | A consumer service |

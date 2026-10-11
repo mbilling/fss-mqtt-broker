@@ -671,6 +671,14 @@ pub struct Rules {
     /// only these, so whoever writes rules cannot show a module the rest of the
     /// broker's environment. Empty (the default) = none. Read at startup.
     pub functions_env: Vec<String>,
+    /// The most bytes the state rules keep between messages may take on this node,
+    /// across every namespace (`MQTTD_RULES_STATE_MAX_BYTES`, default 268435456 = 256
+    /// MiB; [ADR 0085](../../../docs/adr/0085-rule-state-store.md)). Using state is the
+    /// switch: a rules file that declares no `[state.<name>]` and calls no state function
+    /// (`kv_store_*`, `kv_*`) holds none. A rules file cannot raise this ceiling; `0`
+    /// switches rule state off, and a rules file that uses it then does not load. Read
+    /// at startup: a change needs a restart.
+    pub state_max_bytes: u64,
 }
 
 impl Default for Rules {
@@ -685,6 +693,7 @@ impl Default for Rules {
             jq_default_timeout_ms: 10_000,
             jq_env: Vec::new(),
             functions_env: Vec::new(),
+            state_max_bytes: 256 << 20,
         }
     }
 }
@@ -1705,6 +1714,10 @@ impl Config {
         on!("MQTTD_RULES_FUNCTIONS_ENV", v, {
             self.rules.functions_env = list(&v);
         });
+        // -- rule state (ADR 0085) --
+        on!("MQTTD_RULES_STATE_MAX_BYTES", v, {
+            self.rules.state_max_bytes = num("MQTTD_RULES_STATE_MAX_BYTES", &v)?;
+        });
         // -- admin API (ADR 0081) --
         on!("MQTTD_ADMIN_BIND", v, {
             self.admin.bind = Some(v);
@@ -2410,6 +2423,8 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS",
     "MQTTD_RULES_JQ_ENV",
     "MQTTD_RULES_FUNCTIONS_ENV",
+    // rule state (ADR 0085)
+    "MQTTD_RULES_STATE_MAX_BYTES",
     // admin API (ADR 0081)
     "MQTTD_ADMIN_BIND",
     "MQTTD_ADMIN_CERT",
@@ -2708,6 +2723,27 @@ mod tests {
 
     /// ADR 0086 D8, D9: a module declared in the rules file sees no environment
     /// variable unless the broker's own configuration lists it by name.
+    #[test]
+    fn the_rule_state_ceiling_loads_from_file_and_environment() {
+        assert_eq!(Config::default().rules.state_max_bytes, 256 << 20);
+        let c = Config::from_toml(
+            "[rules]\nstate_max_bytes = 1048576\n[durable]\nallow_ephemeral = true\n",
+        )
+        .unwrap();
+        assert_eq!(c.rules.state_max_bytes, 1 << 20);
+        let mut c = Config::default();
+        c.overlay_from(getter(&[("MQTTD_RULES_STATE_MAX_BYTES", "0")]))
+            .unwrap();
+        assert_eq!(c.rules.state_max_bytes, 0, "0 switches rule state off");
+        let err = Config::default()
+            .overlay_from(getter(&[("MQTTD_RULES_STATE_MAX_BYTES", "64MiB")]))
+            .expect_err("a number of bytes");
+        assert!(
+            err.to_string().contains("MQTTD_RULES_STATE_MAX_BYTES"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn the_functions_env_key_loads_from_file_and_environment() {
         assert!(Config::default().rules.functions_env.is_empty());
@@ -3466,7 +3502,8 @@ mod tests {
             | "MQTTD_ADMIN_PEER_PORT"
             | "MQTTD_RULES_SYS_INTERVAL"
             | "MQTTD_RULES_TRACE_RATE"
-            | "MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS" => "7",
+            | "MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS"
+            | "MQTTD_RULES_STATE_MAX_BYTES" => "7",
             // The default is already 7 (backup.keep) / 300 (restore timeout), so "7" would
             // change nothing and the totality sweep would read as a missing mapping.
             // MQTTD_REPLICAS (ADR 0080): a valid factor that is not the default (2).
@@ -3620,8 +3657,9 @@ mod tests {
             // plus MQTTD_RULES_SYS_INTERVAL, MQTTD_RULES_TRACE, MQTTD_RULES_TRACE_RATE and
             // MQTTD_RULES_ADMIN_WRITERS (ADR 0084),
             // plus MQTTD_RULES_JQ, MQTTD_RULES_JQ_DEFAULT_TIMEOUT_MS, MQTTD_RULES_JQ_ENV
-            // and MQTTD_RULES_FUNCTIONS_ENV (ADR 0086).
-            121,
+            // and MQTTD_RULES_FUNCTIONS_ENV (ADR 0086),
+            // plus MQTTD_RULES_STATE_MAX_BYTES (ADR 0085).
+            122,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never

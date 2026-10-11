@@ -101,6 +101,9 @@ pub struct Rules {
     /// What a rules file may call beyond the built-in functions on this node (`jq`,
     /// ADR 0086): what every load of one is given, the admin API's included.
     functions: Functions,
+    /// The store the running rules keep their state in (ADR 0085); `None` where rule
+    /// state is switched off. The same store `functions` carries.
+    state: Option<Arc<crate::rule_state::Store>>,
 }
 
 impl std::fmt::Debug for Rules {
@@ -618,7 +621,23 @@ impl Rules {
             observe: None,
             peers_want_origin: Arc::new(AtomicBool::new(false)),
             functions: Functions::default(),
+            state: None,
         }
+    }
+
+    /// The same engine, knowing the store its rules keep their state in: the one
+    /// [`with_functions`](Self::with_functions) was given
+    /// ([`functions_and_state_from_config`]).
+    #[must_use]
+    pub fn with_state(mut self, state: Option<Arc<crate::rule_state::Store>>) -> Self {
+        self.state = state;
+        self
+    }
+
+    /// The store the running rules keep their state in, where rule state is on.
+    #[must_use]
+    pub fn state(&self) -> Option<&Arc<crate::rule_state::Store>> {
+        self.state.as_ref()
     }
 
     /// The same engine on a node whose rules may call `functions`
@@ -2027,8 +2046,24 @@ pub fn noting_the_jq_module<T>(functions: &Functions, load: impl FnOnce() -> T) 
 /// What is read here is what such a module may be given: the variables
 /// `rules.functions_env` lists, the same number of warm instances, the same hand-off.
 /// A module is read from under the directory of `rules.file`.
+///
+/// Rule state (ADR 0085) needs no switch either: using it is the switch, under
+/// `rules.state_max_bytes`. Every call of this makes a store of its own, empty: the
+/// commands that check a rules file or try a statement (`--check-rules`, `--rule-test`,
+/// `--check-config`) therefore work on a scratch store. The broker makes its one
+/// store with [`functions_and_state_from_config`].
 #[must_use]
 pub fn functions_from_config(rules: &mqtt_config::Rules) -> Functions {
+    functions_and_state_from_config(rules).0
+}
+
+/// [`functions_from_config`], and the store the functions carry: the broker's, which
+/// its rules keep their state in for as long as it runs. `None` where
+/// `rules.state_max_bytes` is `0`: a rules file that uses state then does not load.
+#[must_use]
+pub fn functions_and_state_from_config(
+    rules: &mqtt_config::Rules,
+) -> (Functions, Option<Arc<crate::rule_state::Store>>) {
     let value = |key: &str, name: &String| match std::env::var(name) {
         Ok(value) => Some(value),
         Err(std::env::VarError::NotPresent) => None,
@@ -2064,10 +2099,17 @@ pub fn functions_from_config(rules: &mqtt_config::Rules) -> Functions {
         instances: workers,
         hand_off: Some(Arc::new(hand_off)),
     });
-    match &rules.file {
+    let state =
+        (rules.state_max_bytes > 0).then(|| crate::rule_state::Store::new(rules.state_max_bytes));
+    let functions = match &state {
+        Some(store) => functions.with_state(store.clone()),
+        None => functions.without_state(),
+    };
+    let functions = match &rules.file {
         Some(file) => functions.beside(std::path::Path::new(file)),
         None => functions,
-    }
+    };
+    (functions, state)
 }
 
 /// One line on what `rules.jq = true` means on this host, for `mqttd --check-config`:

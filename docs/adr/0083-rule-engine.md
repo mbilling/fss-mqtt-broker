@@ -774,3 +774,24 @@ operator sets `rules.jq = true`):
 Pinned by `a_will_whose_rules_call_jq_does_not_hold_the_hub` and
 `a_ten_second_jq_on_one_connection_does_not_delay_another_connections_publish`
 (`tests/rules_binary.rs`).
+
+## Amendment (2026-10-11): EMQX's `kv_store_*` are provided, and an `IN` list is evaluated whole
+
+[ADR 0085](0085-rule-state-store.md) decided the mapping this record left open, and its
+first task built it:
+
+- **Functions.** `kv_store_put`, `kv_store_get` and `kv_store_del` are no longer refused.
+  They are EMQX's, with EMQX's results (probed on 6.3.1), on a store the broker supplies
+  to the rule engine through `Functions`; the crate still holds no broker state. A rules
+  file that calls them where there is no store is refused at load, with the reason.
+  `proc_dict_*` stay refused until ADR 0085's task for them.
+- **`IN`.** EMQX evaluates the whole list before it looks for the value
+  (`emqx_rule_runtime:match_conditions/2`: `lists:member(eval(Var), [eval(V) || V <- Vals])`).
+  This engine stopped at the first match, so `1 IN (1, abs('x'))` passed where EMQX fails
+  the rule, and a function with an effect in a later element did not run. It now evaluates
+  every element. Pinned by `an_in_list_is_evaluated_whole` and, against EMQX's own
+  `kv_store_put`, `an_in_list_a_list_literal_and_a_default_are_evaluated_whole`.
+
+The candidate for lowering rule cost (the `WHERE` first, where that cannot change an
+output, an error or a counter) is still only a candidate, and ADR 0085 adds a condition
+to it: no `SELECT` field calls a state function.

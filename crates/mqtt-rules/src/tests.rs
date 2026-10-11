@@ -2042,12 +2042,13 @@ fn one_rule_can_be_evaluated_whether_or_not_it_is_enabled() {
     assert!(set.evaluate_one(
         "off",
         &m,
+        None,
         &mut |r, o| log.push(format!("{}:{}", r.id(), matches!(o, Outcome::Passed))),
         &mut out
     ));
     assert_eq!(log, ["off:true", "off:false"], "passed, then its action");
     assert_eq!(republished(&out[0].1).topic, "o/5");
-    assert!(!set.evaluate_one("missing", &m, &mut |_, _| {}, &mut Vec::new()));
+    assert!(!set.evaluate_one("missing", &m, None, &mut |_, _| {}, &mut Vec::new()));
 
     let off = set.get("off").unwrap();
     assert_eq!(off.from_mismatch(&m), None);
@@ -2262,6 +2263,7 @@ fn every_evaluated_rule_reports_its_time_once_after_its_outcomes() {
     assert!(set.evaluate_one(
         "pass",
         &m,
+        None,
         &mut |_, o| dry.push(outcome_kind(o)),
         &mut Vec::new()
     ));
@@ -2971,6 +2973,7 @@ fn regex_calls(subject: &[u8], pattern: &[u8], literal: bool) -> RegexResults {
             regex,
             jq: None,
             module: None,
+            state: None,
         };
         (func.f)(args, &cx).map_err(|_| ())
     };

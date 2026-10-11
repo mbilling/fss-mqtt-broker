@@ -118,6 +118,9 @@ pub(crate) enum Expr {
         /// For a function of an operator's module (ADR 0086 D9): the module and the
         /// function. `func` is then the one that calls it.
         module: Option<ModuleCall>,
+        /// For a state function (ADR 0085): the namespace it works on, resolved when
+        /// the rules were loaded.
+        state: Option<Arc<crate::state::StateBinding>>,
     },
 }
 
@@ -184,6 +187,8 @@ pub(crate) struct Loading<'f> {
     pub modules: Vec<Arc<Module>>,
     /// Whether a statement calls one.
     pub calls_module: bool,
+    /// The file's state: its namespaces, and the rule being compiled (ADR 0085).
+    pub state: crate::state::StateLoading,
 }
 
 impl<'f> Loading<'f> {
@@ -195,6 +200,10 @@ impl<'f> Loading<'f> {
             jq_programs: Vec::new(),
             modules: functions.declared.clone(),
             calls_module: false,
+            state: crate::state::StateLoading::new(
+                &functions.state,
+                functions.declared_state.clone(),
+            ),
         }
     }
 
@@ -862,6 +871,23 @@ impl Parser<'_, '_> {
         ))
     }
 
+    /// For a state function: the namespace of the rule being loaded that it works on.
+    /// A file that cannot have one is refused here (ADR 0085 D2).
+    fn state_binding(
+        &mut self,
+        func: &'static Func,
+        start: usize,
+    ) -> Result<Option<Arc<crate::state::StateBinding>>, ParseError> {
+        let Some(family) = crate::state::family(func) else {
+            return Ok(None);
+        };
+        self.loading
+            .state
+            .binding(family)
+            .map(Some)
+            .map_err(|e| ParseError::at(self.sql, start, e))
+    }
+
     fn call(&mut self, name: &str, start: usize) -> Parsed {
         let mut args = Vec::new();
         let mut h = 0;
@@ -951,6 +977,11 @@ impl Parser<'_, '_> {
         } else {
             None
         };
+        let state = if module.is_none() {
+            self.state_binding(func, start)?
+        } else {
+            None
+        };
         let h = self.node(h)?;
         Ok((
             Expr::Call {
@@ -959,6 +990,7 @@ impl Parser<'_, '_> {
                 regex,
                 jq,
                 module,
+                state,
             },
             h,
         ))

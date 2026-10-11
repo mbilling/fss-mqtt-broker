@@ -649,8 +649,8 @@ PYEOF2
 "$MQTTD_BIN" --check-rules "$WORK/rules.toml" >"$WORK/rules.out" 2>"$WORK/rules.err" \
   || { echo "  FAIL — the broker REJECTED the translated rules file:";
        sed 's/^/         /' "$WORK/rules.err"; exit 1; }
-grep -q 'rules OK: .*: 8 rule(s), 7 enabled' "$WORK/rules.out" \
-  || fail "the translated rules file did not load the 8 live rules (7 enabled): $(cat "$WORK/rules.out")"
+grep -q 'rules OK: .*: 9 rule(s), 8 enabled' "$WORK/rules.out" \
+  || fail "the translated rules file did not load the 9 live rules (8 enabled): $(cat "$WORK/rules.out")"
 "$MQTTD_BIN" --check-config --config "$WORK/rules-mqttd.toml" >/dev/null 2>"$WORK/check.err" \
   || { echo "  FAIL — the broker REJECTED the config naming the rules file:";
        sed 's/^/         /' "$WORK/check.err"; exit 1; }
@@ -673,7 +673,14 @@ todo 'receive_msgs_from_remote_mqtt_broker is COMMENTED OUT .*data-bridge source
 todo 'jq_rule is COMMENTED OUT .*jq()' "$WORK/rules.toml"
 todo 'alarm_rule is COMMENTED OUT .*sys/alarm_activated' "$WORK/rules.toml"
 todo 'ignore_sys_message = .*own \$SYS messages .* never run rules' "$WORK/rules.toml"
+todo 'proc_dict_rule is COMMENTED OUT .*proc_dict_put()' "$WORK/rules.toml"
 grep -q '^\[rules.jq_rule\]' "$WORK/rules.toml" && fail "an unsupported rule was left LIVE"
+grep -q '^\[rules.proc_dict_rule\]' "$WORK/rules.toml" && fail "a rule calling proc_dict_put() was left LIVE"
+# EMQX's kv_store_* are mqttd's too (ADR 0085): a rule calling them is carried live, with
+# what differs (the table is bounded), and it counts as it does in EMQX.
+grep -q '^\[rules.kv_store_rule\]' "$WORK/rules.toml" \
+  || fail "a rule calling kv_store_* was not carried live"
+todo 'kv_store_rule: calls kv_store_\*, which mqttd provides .*BOUNDED' "$WORK/rules.toml"
 grep -q '^\[rules.alarm_rule\]' "$WORK/rules.toml" && fail "a rule on an event mqttd does not raise was left LIVE"
 # The message events are raised (ADR 0083): a rule on one, in either spelling, is live.
 grep -q '^\[rules.delivered_rule\]' "$WORK/rules.toml" \

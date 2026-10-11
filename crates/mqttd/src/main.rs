@@ -1636,7 +1636,7 @@ fn client_policy(
     // does not load refuses the boot, exactly as an ACL file that does not parse does —
     // and re-read by every reload, validate-before-swap, from whatever path the live
     // config names then.
-    let (functions, initial_rules) = rules_at_startup(live)?;
+    let (functions, rule_state, initial_rules) = rules_at_startup(live)?;
     metrics.set_rules_loaded(
         reload::enabled_rules(&initial_rules),
         initial_rules.digest(),
@@ -1662,7 +1662,8 @@ fn client_policy(
     let rules =
         mqttd::rules::Rules::new(rules_rx, Arc::from(node.0.as_str()), Some(metrics.clone()))
             .with_observe(observe)
-            .with_functions(functions.clone());
+            .with_functions(functions.clone())
+            .with_state(rule_state);
     reloader.attach_rules(rules_tx, {
         let live = live.clone();
         move || -> reload::RulesBuildResult {
@@ -4275,13 +4276,24 @@ fn runtime_precheck(config: &Config) -> Result<(), String> {
 /// the WebAssembly runtime exists until a rules file that calls `jq` is loaded, so the
 /// host is not asked here whether it could run it: a file that calls `jq` where it is
 /// off, or cannot run, fails to load with the reason, and that refuses the boot.
+///
+/// So is the store the rules keep their state in (ADR 0085): one for the life of the
+/// process, under `rules.state_max_bytes`, or none where that is `0`.
+#[allow(clippy::type_complexity)]
 fn rules_at_startup(
     live: &Arc<RwLock<Config>>,
-) -> Result<(mqtt_rules::Functions, mqtt_rules::RuleSet), String> {
+) -> Result<
+    (
+        mqtt_rules::Functions,
+        Option<Arc<mqttd::rule_state::Store>>,
+        mqtt_rules::RuleSet,
+    ),
+    String,
+> {
     let snap = live
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let functions = mqttd::rules::functions_from_config(&snap.rules);
+    let (functions, rule_state) = mqttd::rules::functions_and_state_from_config(&snap.rules);
     match &functions.jq {
         mqtt_rules::JqSwitch::Off => {}
         mqtt_rules::JqSwitch::Unavailable(why) => {
@@ -4298,7 +4310,16 @@ fn rules_at_startup(
     }
     let rules = mqttd::rules::load_with(snap.rules.file.as_deref(), &functions)
         .map_err(|e| format!("rules: {e}"))?;
-    Ok((functions, rules))
+    let namespaces: Vec<&str> = rules.state_namespaces().map(|(name, _)| name).collect();
+    if !namespaces.is_empty() {
+        info!(
+            namespaces = namespaces.len(),
+            max_bytes = snap.rules.state_max_bytes,
+            "rules: the rules keep state between messages, in memory on this node (ADR 0085): \
+             it starts empty and is bounded by rules.state_max_bytes"
+        );
+    }
+    Ok((functions, rule_state, rules))
 }
 
 /// The config sections that changed between `old` and `new` **and are not live-swappable** — i.e.
@@ -4384,6 +4405,10 @@ fn requires_restart(old: &Config, new: &Config) -> Vec<&'static str> {
     // So is what a declared module may be shown of the environment (D9).
     if o.rules.functions_env != n.rules.functions_env {
         changed.push("rules.functions_env");
+    }
+    // The rule state's ceiling is the store's, which is made at startup (ADR 0085 D1).
+    if o.rules.state_max_bytes != n.rules.state_max_bytes {
+        changed.push("rules.state_max_bytes");
     }
     changed
 }

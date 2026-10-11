@@ -694,3 +694,97 @@ longer true, what was inconsistent, and what was missing.
 **Tasks.** T1 gains EMQX's `kv_store_*`, the order tests and the ceilings; T3 the
 every-member replication and protocol 14; T9 is gated on an amendment; T11 (`proc_dict_*`)
 is new. The delivery doc's changelog has the rest.
+
+### 2026-10-11 — T1: what EMQX 6.3.1 answered, and what building it settled
+
+D13 was written from EMQX's source. T1 probed it on EMQX 6.3.1 (`emqx/emqx:latest`):
+141 probes, `emqx_rule_funcs` called directly and statements run through
+`emqx_rule_sqltester:test/1`, each effect read back from the node's table. They are
+pinned as tests of the broker's store (`crates/mqttd/src/rule_state/tests.rs`), which
+name each probe.
+
+**Nothing in D3 or D13 was contradicted.** `kv_store_put` is `true`, `kv_store_get` the
+value or `undefined` or the default, `kv_store_del` `true` either way; a write in a
+`SELECT` field is in the table after a false `WHERE`; `AND`, `OR` and `CASE` evaluate
+what they need and no more; a write stays when a later field or the `WHERE` fails the
+rule, and a field that fails first stops the write after it; in a `FOREACH` the
+collection's calls run before the `WHERE`, the `INCASE` per element, the `DO` per element
+that passed; three messages through `kv_store_get('n', 0) + 1` count 1, 2, 3; the SQL
+test writes the real table.
+
+**What the probes added**
+
+- **Exactness goes further than `1` and `1.0`.** `0.0` and `-0.0` are two keys (OTP's
+  `=:=` since 27); `true` and `null` are not the strings `'true'` and `'null'`;
+  `undefined` is a key; a map is the same key whatever order it was written in, and one
+  with `1.0` where another has `1` is not; an integer past 64 bits is a key and not the
+  float of the same value.
+- **A stored `undefined` is a value:** `kv_store_get(Key, Default)` returns it, not the
+  default. The default is for a missing key only, and is evaluated whether or not it is
+  used, like any argument.
+- **A wrong argument count** is a failure on every message in EMQX
+  (`sql_function_not_supported`); in mqttd it is a load error, as for every function
+  (ADR 0083). Listed under "Differences from EMQX".
+- **An `IN` list is evaluated whole** (`lists:member(eval(Var), [eval(V) || V <- Vals])`):
+  `1 IN (1, kv_store_put('k', 1))` writes, and `1 IN (1, abs('x'))` fails the rule.
+  mqttd's evaluator stopped at the first match, which no test could see before a function
+  had an effect. It now evaluates the list whole: the write happens, and the rule fails
+  where EMQX's does (ADR 0083, amended the same day).
+
+**Seen while probing, and left as it is** (neither is about state; both are the
+maintainer's to decide): in a `WHERE`, EMQX fails the rule (`function_clause`) on
+`x NOT IN (…)` and on an `AND`/`OR` operand that is a bare value rather than a comparison
+or a call (`payload.flag AND …`); mqttd evaluates `NOT IN`, and reads a bare operand as
+"not `true`" unless it is `true`. Where the left operand of an `OR` is such a value, mqttd
+therefore goes on to the right operand, state calls included, where EMQX has already
+failed the rule.
+
+**What the record left open and T1 settled**
+
+- **A non-`local` declaration in this build:** `consistency = "eventual"` is refused at
+  load ("not available yet"), as `"strong"` is. A rules file written for T3 does not load
+  on a T1 build, and says why.
+- **Where the settings live.** The store holds namespaces weakly and each loaded rule set
+  holds the ones it uses, with its own settings. That is the whole of D1's reload rule:
+  a namespace two sets hold is one namespace (it keeps its keys), the new set's bounds
+  apply to the new set's calls, and a namespace no set holds any more goes with the last
+  set that held it. A load that fails, or a candidate the admin API only checks, leaves
+  nothing behind.
+- **A dry run is told its store.** `RuleSet::evaluate_one` takes the scratch store and
+  resolves each namespace in it by name; given none, a state call fails the rule. The
+  running store cannot be reached from a dry run by forgetting an argument.
+- **`kv_ttl` rounds up,** so a key that is still held never reads `0`.
+- **`kv_incr` counts in 64 bits;** `by` is a 64-bit integer, and a count that would pass
+  64 bits fails the rule and keeps the count (T2's per-node vectors may widen it).
+- **A set's elements** are one when they are exactly equal (`1` and `1.0` are two), and
+  read back in term order, exact identity deciding between values that order calls equal.
+- **`kv_held` on a key `kv_set_once` wrote** (both type `first`) fails as `wrong_type`
+  when the value is not a time `kv_held` recorded.
+- **Accounting.** A key is accounted as its bytes, its value's, and 128 bytes for the
+  entry; an element of a set as its bytes and 32. Without that a namespace of small
+  values would hold several times its `max_bytes`.
+- **Expiry before D7's sweep.** A key past its expiry reads as absent at once and is
+  removed by the call that finds it; when a namespace needs room, expired keys are removed
+  first (each shard keeps its keys in order of expiry, to the second, which is the order
+  the sweep will walk).
+- **`lru`.** A read is a use. Eviction is of the namespace's least recently used key,
+  also when the store's ceiling, not the namespace's bound, is what is in the way; in a
+  brownout nothing is evicted and a new key is refused.
+- **The brownout** is the memory watermark's (ADR 0041 T8). The disk watermark does not
+  refuse state.
+- **A `kv_store_*` key's size** is measured as the rule engine writes the key (a string as
+  its bytes, anything else as JSON text): at most 256 bytes.
+
+**The concurrency structure** (D14 asked for a sharded map): 64 shards per namespace, each
+a map behind its own mutex, a key's hash choosing the shard; counts and bytes in atomics
+that a new key reserves with a compare-and-swap that never passes a bound. A call takes
+one shard's lock for one map operation, trying it a few times before it waits, because
+the lock is held for about a hundred nanoseconds. Measured on eight cores, each thread on
+keys of its own: 0.12 µs for a call alone, 0.20 µs with four threads calling, 0.33 µs
+with eight. All of them on one key: 0.19 µs with two, 0.63 µs with four, 1.9 µs with
+eight. RULES.md carries the figures.
+
+**Still open after T1.** The admin API's per-rule edit (`PUT /admin/v1/rule`) keeps a
+rule's `state` key but cannot set one, since ADR 0084's rule body has no such field: a
+writer declares namespaces and names them by writing the whole file. T6 or T8 decides
+whether the body gains the field.

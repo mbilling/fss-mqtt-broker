@@ -99,6 +99,11 @@ pub struct Functions {
     dir: Option<PathBuf>,
     /// The modules a statement on its own may call ([`declaring`](Self::declaring)).
     pub(crate) declared: Vec<Arc<Module>>,
+    /// Whether rules may keep state, and in which store (ADR 0085 D2).
+    pub state: crate::state::StateSwitch,
+    /// The `[state.<name>]` tables a statement on its own is loaded under
+    /// ([`declaring`](Self::declaring)).
+    pub(crate) declared_state: std::collections::BTreeMap<String, crate::state::StateSchema>,
 }
 
 impl Functions {
@@ -125,6 +130,23 @@ impl Functions {
         self
     }
 
+    /// The same, with the store rules keep their state in (ADR 0085 D2). Nothing is
+    /// allocated by this: a namespace comes into being when a rules file that uses it
+    /// is loaded.
+    #[must_use]
+    pub fn with_state(mut self, store: Arc<dyn crate::state::StateStore>) -> Self {
+        self.state = crate::state::StateSwitch::On(store);
+        self
+    }
+
+    /// The same, on a broker whose store is switched off (`rules.state_max_bytes =
+    /// 0`): a rules file that uses state does not load, and the error names the key.
+    #[must_use]
+    pub fn without_state(mut self) -> Self {
+        self.state = crate::state::StateSwitch::Off;
+        self
+    }
+
     /// The same, for rules text that belongs in the file `rules_file`: the modules it
     /// declares are read from under that file's directory, and nowhere else.
     /// [`RuleSet::load_with`](crate::RuleSet::load_with) does this itself.
@@ -141,11 +163,14 @@ impl Functions {
     }
 
     /// The same, for a statement on its own (`mqttd --rule-test`): it may call the
-    /// functions of the modules the rules file `text` declares, which are loaded now.
+    /// functions of the modules the rules file `text` declares, which are loaded now,
+    /// and its state calls are under the file's `[state.default]` and
+    /// `[state.kv_store]` settings.
     pub fn declaring(&self, text: &str) -> Result<Self, crate::LoadError> {
-        let declared = crate::declared_modules(text, self)?;
+        let (declared, declared_state) = crate::declared(text, self)?;
         Ok(Self {
             declared,
+            declared_state,
             ..self.clone()
         })
     }

@@ -4281,8 +4281,8 @@ fn check_rules_refuses_a_module_that_fails_a_check_and_says_why() {
                 .to_string(),
         ),
         (
-            module_table("m", "good.wasm", &sha, &["kv_store_put"], ""),
-            "a module cannot provide `kv_store_put`: EMQX has a function of that name, and a \
+            module_table("m", "good.wasm", &sha, &["proc_dict_put"], ""),
+            "a module cannot provide `proc_dict_put`: EMQX has a function of that name, and a \
              module must not change what a rule written for EMQX means"
                 .to_string(),
         ),
@@ -4827,6 +4827,203 @@ async fn the_worked_example_modules_run_in_the_broker_with_their_grants() {
     assert_eq!(
         (ran.code, ran.stdout.as_str()),
         (Some(0), "{\"label\":\"/pump\",\"at\":0,\"crc\":19255}\n"),
+        "{ran:?}"
+    );
+}
+
+/// A rules file that keeps state (ADR 0085): a declared namespace two rules share, and
+/// EMQX's `kv_store_*`.
+const STATE_RULES: &str = r#"[state.fleet]
+max_keys = 1000
+default_ttl = "1h"
+
+[rules.count]
+state = "fleet"
+sql = '''SELECT clientid AS c, kv_incr('n:' + clientid) AS n, kv_store_put('last', clientid) AS p FROM "in/#" WHERE payload.pass = true'''
+actions = [{ function = "republish", args = { topic = "out/${c}", payload = "${.}" } }]
+
+[rules.read]
+state = "fleet"
+sql = '''SELECT kv_get('n:' + clientid) AS n, kv_store_get('last') AS last FROM "ask"'''
+actions = [{ function = "republish", args = { topic = "out/ask", payload = "${.}" } }]
+"#;
+
+/// ADR 0085 through the binary: a broker started on a rules file that keeps state loads
+/// it without any switch, and its rules remember from one publish to the next: a call
+/// in a `SELECT` field counts a message the `WHERE` turns away (EMQX's order), another
+/// rule reads the same namespace, and EMQX's `kv_store_*` table is written and read. A
+/// broker that forgot between messages, or wrote only for messages that pass, answers
+/// another count.
+#[tokio::test]
+async fn a_broker_keeps_rule_state_between_publishes() {
+    let dir = tempfile::tempdir().unwrap();
+    write_rules(dir.path(), STATE_RULES);
+    let broker = start(dir.path(), "state", &Setup::default()).await;
+    let mut sub = Client::connect(broker.addr, "state-sub").await;
+    assert_eq!(
+        subscribe(&mut sub, 1, "out/#", QoS::AtMostOnce).await,
+        vec![0]
+    );
+    let mut dev = Client::connect(broker.addr, "dev-7").await;
+    for payload in [r#"{"pass":false}"#, r#"{"pass":false}"#, r#"{"pass":true}"#] {
+        dev.publish("in/a", payload.as_bytes(), QoS::AtMostOnce, None, vec![])
+            .await;
+    }
+    assert_eq!(
+        next(&mut sub).await,
+        got(
+            "out/dev-7",
+            r#"{"c":"dev-7","n":3,"p":true}"#,
+            QoS::AtMostOnce,
+            false
+        )
+    );
+    dev.publish("ask", b"{}", QoS::AtMostOnce, None, vec![])
+        .await;
+    assert_eq!(
+        next(&mut sub).await,
+        got(
+            "out/ask",
+            r#"{"n":3,"last":"dev-7"}"#,
+            QoS::AtMostOnce,
+            false
+        )
+    );
+    broker
+        .wait_log(
+            "rules: the rules keep state between messages, in memory on this node (ADR 0085): \
+             it starts empty and is bounded by rules.state_max_bytes namespaces=2 \
+             max_bytes=268435456",
+        )
+        .await;
+}
+
+/// `mqttd --check-rules` loads a file that keeps state as the broker would, warns about
+/// one that calls both families of functions, and refuses it where rule state is
+/// switched off, naming the key (`rules.state_max_bytes`), as the broker refuses to
+/// boot on it. Neither `kv_store_*` nor `[state.<name>]` is an unknown function or key
+/// any more.
+#[test]
+fn check_rules_loads_rule_state_and_refuses_it_where_it_is_switched_off() {
+    let dir = tempfile::tempdir().unwrap();
+    write_rules(dir.path(), STATE_RULES);
+    let path = dir.path().join("rules.toml").display().to_string();
+    let ran = cli(&["--check-rules", &path]);
+    assert_eq!(ran.code, Some(0), "{ran:?}");
+    assert_eq!(
+        ran.stderr,
+        "warning: the file calls both EMQX's kv_store_* functions and mqttd's kv_* functions: \
+         they do not share keys (kv_get does not read what kv_store_put wrote)\n"
+    );
+    assert!(
+        ran.stdout
+            .starts_with(&format!("rules OK: {path}: 2 rule(s), 2 enabled, sha256 ")),
+        "{ran:?}"
+    );
+
+    let mut off = mqttd();
+    off.args(["--check-rules", &path])
+        .env("MQTTD_RULES_STATE_MAX_BYTES", "0");
+    let ran = run(off);
+    assert_eq!(ran.code, Some(1), "{ran:?}");
+    assert_eq!(ran.stdout, "");
+    assert_eq!(
+        ran.stderr,
+        format!(
+            "rules INVALID ({path}): rules file: [state.fleet]: rule state is switched off: \
+             `rules.state_max_bytes` is 0 (set it above 0 for rules to keep state; see \
+             RULES.md)\n"
+        )
+    );
+    // A file that only calls a state function, with nothing declared: the rule is named.
+    write_rules(
+        dir.path(),
+        "[rules.put]\nsql = 'SELECT kv_store_put(clientid, payload) AS p FROM \"t/#\"'\n",
+    );
+    assert_eq!(cli(&["--check-rules", &path]).code, Some(0));
+    let mut off = mqttd();
+    off.args(["--check-rules", &path])
+        .env("MQTTD_RULES_STATE_MAX_BYTES", "0");
+    let ran = run(off);
+    assert_eq!(ran.code, Some(1), "{ran:?}");
+    assert_eq!(
+        ran.stderr,
+        format!(
+            "rules INVALID ({path}): rule `put`: rule state is switched off: \
+             `rules.state_max_bytes` is 0 (set it above 0 for rules to keep state; see \
+             RULES.md) (line 1, column 8, near `kv_store_put(clientid, p`)\n"
+        )
+    );
+    // What this release does with a mode it does not have yet.
+    assert_check_rules_refuses(
+        "[state.shared]\nconsistency = \"eventual\"\n",
+        "rules file: [state.shared]: consistency = \"eventual\" is not available yet: this \
+         release has \"local\" namespaces only (ADR 0085)",
+    );
+    assert_check_rules_refuses(
+        "[state.shared]\nconsistency = \"strong\"\n",
+        "rules file: [state.shared]: consistency = \"strong\" is not available: it is a later \
+         phase (ADR 0085 D5); use \"local\"",
+    );
+}
+
+/// `mqttd --rule-test` runs every state function, on a store of its own: within one
+/// statement a later call sees an earlier one, and nothing is left for the next run
+/// (ADR 0085 D11: a test never touches a running store, and there is none to touch
+/// here). The `kv_store_*` values are EMQX 6.3.1's for the same calls.
+#[test]
+fn rule_test_runs_the_state_functions_on_a_store_of_its_own() {
+    let sql = "SELECT kv_store_put('a', 1) AS p, kv_store_get('a') AS g, \
+               kv_store_get('nope', 'dflt') AS d, kv_store_del('a') AS x, \
+               kv_set('k', payload.v, '10m') AS s, kv_get('k') AS k, kv_ttl('k') AS t, \
+               kv_set_once('o', 1) AS o1, kv_set_once('o', 2) AS o2, \
+               kv_incr('n') AS n1, kv_incr('n', 5) AS n2, \
+               kv_max('hi', 3) AS hi, kv_min('lo', 3) AS lo, \
+               kv_add('s', 'b') AS a1, kv_add('s', 'a') AS a2, kv_get('s') AS set, \
+               kv_held('h', payload.v.on) AS held, kv_changed('c', 1) AS c1, \
+               kv_changed('c', 1) AS c2, kv_del('k') AS del, kv_get('k') AS gone \
+               FROM \"t/#\"";
+    let want = "{\"p\":true,\"g\":1,\"d\":\"dflt\",\"x\":true,\"s\":{\"on\":true},\
+                \"k\":{\"on\":true},\"t\":600,\"o1\":1,\"o2\":1,\"n1\":1,\"n2\":6,\"hi\":3,\
+                \"lo\":3,\"a1\":1,\"a2\":2,\"set\":[\"a\",\"b\"],\"held\":0,\"c1\":true,\
+                \"c2\":false,\"del\":true,\"gone\":\"undefined\"}\n";
+    for _ in 0..2 {
+        let ran = cli(&[
+            "--rule-test",
+            "--sql",
+            sql,
+            "--payload",
+            r#"{"v":{"on":true}}"#,
+        ]);
+        assert_eq!((ran.code, ran.stdout.as_str()), (Some(0), want), "{ran:?}");
+        assert_eq!(ran.stderr, "");
+    }
+    // A refused call fails the statement with the reason, and where rule state is
+    // switched off the statement does not load.
+    let ran = cli(&[
+        "--rule-test",
+        "--sql",
+        "SELECT kv_set('k', 1) AS a, kv_incr('k') AS b FROM \"t/#\"",
+    ]);
+    assert_eq!(ran.code, Some(1), "{ran:?}");
+    assert_eq!(
+        ran.stderr,
+        "rule test FAILED: kv_incr(): wrong_type: the key holds a value of type `lww`, and \
+         this is an operation on type `sum` (kv_del deletes a key of any type)\n"
+    );
+    let mut off = mqttd();
+    off.args([
+        "--rule-test",
+        "--sql",
+        "SELECT kv_get('k') AS a FROM \"t/#\"",
+    ])
+    .env("MQTTD_RULES_STATE_MAX_BYTES", "0");
+    let ran = run(off);
+    assert_eq!(ran.code, Some(1), "{ran:?}");
+    assert!(
+        ran.stderr.starts_with(
+            "rule test FAILED: rule state is switched off: `rules.state_max_bytes` is 0"
+        ),
         "{ran:?}"
     );
 }
