@@ -2434,6 +2434,7 @@ dependencies = [
  "lz4",
  "md4",
  "mqtt-core",
+ "mqtt-wasm-sandbox",
  "num-bigint 0.5.1",
  "num-traits",
  "pcre2",

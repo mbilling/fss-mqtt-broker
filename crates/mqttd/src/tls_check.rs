@@ -508,7 +508,7 @@ mod tests {
         c
     }
 
-    const DAY: Duration = Duration::from_secs(86_400);
+    const DAY: Duration = Duration::from_hours(24);
 
     #[test]
     fn valid_material_passes_and_reports_names() {

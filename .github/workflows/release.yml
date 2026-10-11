@@ -547,6 +547,15 @@ jobs:
             printf '**Image:** `%s/%s:%s`\n' "$REGISTRY" "$IMAGE_NAME" "$VERSION"
             printf '(digest `%s`)\n\n' "$IMG_DIGEST"
             printf '**Operator image:** `%s/%s:%s` — install via the `deploy/helm/mqttd-operator` chart.\n\n' "$REGISTRY" "$OPERATOR_IMAGE_NAME" "$VERSION"
+            # The jq module inside the broker (ADR 0086 D11): what it was built from, and
+            # the hash anyone rebuilding it must get. Read from the tree at this tag.
+            JQ_DIR=crates/mqtt-wasm-sandbox/jq-module
+            printf '**jq module** (the rule engine'"'"'s `jq()`, off unless `rules.jq = true`): sha256 `%s`, built in this pipeline from `emqx/jqc@%s` (jq 1.8.1) and `kkos/oniguruma@%s` with zig %s — `%s/build.sh` reproduces it byte for byte.\n\n' \
+              "$(cut -d' ' -f1 "$JQ_DIR/jq.wasm.sha256")" \
+              "$(sed -n 's/^JQC_COMMIT=//p' "$JQ_DIR/build.sh")" \
+              "$(sed -n 's/^ONIG_COMMIT=//p' "$JQ_DIR/build.sh")" \
+              "$(sed -n 's/^ZIG_VERSION=//p' "$JQ_DIR/build.sh")" \
+              "$JQ_DIR"
             printf 'Every asset below is cosign-signed (keyless, transparency-logged)\n'
             printf 'and the binaries are byte-reproducible from this tag. See\n'
             printf 'RELEASING.md for the one-command verify path.\n'

@@ -1130,7 +1130,7 @@ impl Proc {
             .collect::<Vec<_>>()
             .join(",");
         self.nodes[dead].spawn();
-        let ready = self.wait_node_serving(dead, Duration::from_secs(60)).await;
+        let ready = self.wait_node_serving(dead, Duration::from_mins(1)).await;
         if !ready {
             self.nodes[dead].kill().await;
             // No grace for file handles: `kill()` awaits `child.wait()`, so the process has
@@ -1139,7 +1139,7 @@ impl Proc {
             // (`mqtt_storage::open::create_with_lock_retry`).
             self.nodes[dead].spawn();
             assert!(
-                self.wait_node_serving(dead, Duration::from_secs(60)).await,
+                self.wait_node_serving(dead, Duration::from_mins(1)).await,
                 "restarted node {id} never began serving"
             );
         }
@@ -1174,7 +1174,7 @@ impl Proc {
     pub async fn quiesce(&mut self) {
         let expect = self.alive_nodes().len();
         let started = Instant::now();
-        let deadline = started + Duration::from_secs(60);
+        let deadline = started + Duration::from_mins(1);
         loop {
             let mut all = true;
             let mut observed = Vec::new();
@@ -1248,9 +1248,9 @@ pub fn convergence_budget(restoring_seen: bool) -> Duration {
         // ADR 0062's documented restore window (`restore_timeout_secs`, default
         // 300s) plus one ordinary formation budget. While a node is provably
         // mid-restore, NotReady is the DESIGNED state, not a stall (#597).
-        Duration::from_secs(300 + 60)
+        Duration::from_mins(6)
     } else {
-        Duration::from_secs(60)
+        Duration::from_mins(1)
     }
 }
 

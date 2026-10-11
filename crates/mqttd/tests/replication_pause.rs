@@ -61,7 +61,7 @@ struct Sample {
 }
 
 async fn persistent_subscriber(addr: std::net::SocketAddr, id: &str, topic: &str) {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     loop {
         if let Some((mut c, _)) =
             common::Client::connect_v311_within(addr, id, false, Duration::from_secs(10)).await

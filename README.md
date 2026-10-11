@@ -519,7 +519,7 @@ Bare metal: [`deploy/systemd/`](deploy/systemd/) · tutorial: [SECURED-CLUSTER-T
 
 **Binaries:** [GitHub Releases](https://github.com/mbilling/fss-mqtt-broker/releases) (`mqttd-*`, `mqttd-fips-*`, `mqtt-bridge-*`)
 
-**Source** (Rust ≥ 1.88)
+**Source** (Rust ≥ 1.96)
 ```sh
 git clone https://github.com/mbilling/fss-mqtt-broker && cd fss-mqtt-broker
 cargo build --release --bin mqttd
@@ -678,7 +678,7 @@ endpoint, roles, errors).
 | `mqtt-observability` | Prometheus/OTLP metrics, hash-chained audit |
 | `mqtt-config` | typed config, secure defaults |
 | `mqtt-rules` | rule engine: EMQX-compatible rule SQL, republish/console actions |
-| `mqtt-wasm-sandbox` | ADR 0086: rule functions as WebAssembly modules in a sandbox (wasmtime), the real jq first; not linked into the broker |
+| `mqtt-wasm-sandbox` | ADR 0086: rule functions as WebAssembly modules in a sandbox (wasmtime); runs the rule engine's `jq`, the real jq, where `rules.jq` switches it on |
 | `mqtt-bridge` | zone-crossing bridge: spool, QoS 1 replay |
 | `mqttd` | the broker binary: hub, connections, peer mesh |
 | `mqttd-operator` | Kubernetes operator for `MqttdCluster` |

@@ -613,7 +613,7 @@ impl Stress {
         // Generous: a resume that lands inside a takeover window legitimately
         // waits out SWIM confirmation, raft re-election, lease reassignment and
         // the group's first-touch recovery, on a machine also running the soak.
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_mins(1);
         loop {
             let Some(owner) = self.owner_of(&self.subs[i].id) else {
                 self.fail("no alive node resolves a placement owner");
@@ -1449,7 +1449,7 @@ async fn a_full_cluster_stop_start_recovers_every_acked_fact() {
         // Retried: the first CONNECT for a fresh id can be refused while its
         // session group's first-ever lease grants (reconcile-driven).
         let addr = owner_addr(&[&a, &b, &c]);
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_mins(1);
         let (mut sub, present) = loop {
             if let Some(ok) =
                 common::Client::connect_v311_within(addr, sub_id, false, Duration::from_secs(10))
@@ -1477,7 +1477,7 @@ async fn a_full_cluster_stop_start_recovers_every_acked_fact() {
     // until its PUBACK arrives — acked means durably owed) and one retained set.
     let nodes = [&a, &b, &c];
     for (i, payload) in [b"fc-m1".as_slice(), b"fc-m2", b"fc-m3"].iter().enumerate() {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_mins(1);
         'acked: loop {
             if let Some((mut publisher, _)) = common::Client::connect_v311_within(
                 nodes[i % 3].client_addr,
@@ -1504,7 +1504,7 @@ async fn a_full_cluster_stop_start_recovers_every_acked_fact() {
         }
     }
     {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_mins(1);
         'acked: loop {
             if let Some((mut publisher, _)) = common::Client::connect_v311_within(
                 b.client_addr,
@@ -1548,7 +1548,7 @@ async fn a_full_cluster_stop_start_recovers_every_acked_fact() {
 
     // Recovery honesty + acked durability: the session is PRESENT and replays
     // every acked payload; the acked retained value is served cluster-wide.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     let resume_addr = owner_addr(&[&a, &b, &c]);
     let (mut sub, present) = loop {
         if let Some(ok) =
@@ -1628,7 +1628,7 @@ async fn growing_one_node_to_three_back_fills_and_survives_the_founder() {
     // then goes OFFLINE. On a single node, that node owns everything.
     let sub_id = "gw-sub";
     {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_mins(1);
         let (mut sub, present) = loop {
             // Retried: a fresh single node grants its first lease (and stamps its
             // boot catch-up watermark) within its first driver ticks.
@@ -1661,7 +1661,7 @@ async fn growing_one_node_to_three_back_fills_and_survives_the_founder() {
     // Acked facts, all committed at replica-set {a} / quorum 1 — history that
     // exists NOWHERE else until the catch-up back-fills it.
     for (i, payload) in [b"gw-m1".as_slice(), b"gw-m2", b"gw-m3"].iter().enumerate() {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_mins(1);
         'acked: loop {
             if let Some((mut publisher, _)) = common::Client::connect_v311_within(
                 a.client_addr,
@@ -1688,7 +1688,7 @@ async fn growing_one_node_to_three_back_fills_and_survives_the_founder() {
         }
     }
     {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_mins(1);
         'acked: loop {
             if let Some((mut publisher, _)) = common::Client::connect_v311_within(
                 a.client_addr,
@@ -1870,7 +1870,7 @@ async fn growth_migrates_moved_sessions_eagerly_and_acks_stay_honest() {
     // --- the laptop: establish the durable session, ack two payloads ---
     let a = start_stress_node("em-a", vec![], &dir("a")).await;
     {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_mins(1);
         let (mut sub, _present) = loop {
             if let Some(ok) = common::Client::connect_v311_within(
                 a.client_addr,
@@ -1897,7 +1897,7 @@ async fn growth_migrates_moved_sessions_eagerly_and_acks_stay_honest() {
         sub.disconnect().await;
     }
     let publish_acked = |addr: SocketAddr, pub_id: String, payload: &'static [u8]| async move {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_mins(1);
         'acked: loop {
             if let Some((mut publisher, _)) =
                 common::Client::connect_v311_within(addr, &pub_id, true, Duration::from_secs(20))
@@ -1957,7 +1957,7 @@ async fn growth_migrates_moved_sessions_eagerly_and_acks_stay_honest() {
         .find(|n| n.node_id == owner)
         .expect("owner is a live node")
         .client_addr;
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     let (mut sub, present) = loop {
         if let Some(ok) =
             common::Client::connect_v311_within(owner_addr, &sub_id, false, Duration::from_secs(10))
@@ -2031,7 +2031,7 @@ async fn a_decommissioned_nodes_departure_loses_nothing() {
     // onto it. Poll the 256 group owners, not client ids: a client-id scan per
     // poll burns a core and starves the other cluster tests in this binary.
     {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_mins(1);
         loop {
             let owns = {
                 let p = leaver.placement.read().unwrap();
@@ -2055,7 +2055,7 @@ async fn a_decommissioned_nodes_departure_loses_nothing() {
             .expect("some session is owned by the leaver")
     };
     {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_mins(1);
         let (mut sub, _present) = loop {
             if let Some(ok) = common::Client::connect_v311_within(
                 leaver.client_addr,
@@ -2086,7 +2086,7 @@ async fn a_decommissioned_nodes_departure_loses_nothing() {
     // acked retained value.
     let nodes = [&a, &b, &c, &leaver];
     for (i, payload) in [b"dc-m1".as_slice(), b"dc-m2", b"dc-m3"].iter().enumerate() {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_mins(1);
         'acked: loop {
             if let Some((mut publisher, _)) = common::Client::connect_v311_within(
                 nodes[i % 4].client_addr,
@@ -2113,7 +2113,7 @@ async fn a_decommissioned_nodes_departure_loses_nothing() {
         }
     }
     {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_mins(1);
         'acked: loop {
             if let Some((mut publisher, _)) = common::Client::connect_v311_within(
                 b.client_addr,
@@ -2147,7 +2147,7 @@ async fn a_decommissioned_nodes_departure_loses_nothing() {
         .expect("plane alive")
         .decommission_drain(leaver.node_id.clone());
     let status = drain.status();
-    tokio::time::timeout(Duration::from_secs(120), drain.run())
+    tokio::time::timeout(Duration::from_mins(2), drain.run())
         .await
         .expect("the drain must converge on a healthy cluster");
     assert!(
@@ -2232,7 +2232,7 @@ async fn a_decommissioned_nodes_departure_loses_nothing() {
 /// retry, since first-lease grants take a few reconcile ticks), durable-
 /// SUBSCRIBE (retried through 0x80), disconnect.
 async fn establish_offline_subscriber(nodes: &[&StressNode], sub_id: &str, topic: &str) {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     let (mut sub, _present) = loop {
         let owner = nodes[0].placement.read().unwrap().owner(sub_id);
         let addr = nodes
@@ -2292,7 +2292,7 @@ async fn publish_qos1_until_acked(
     what: &str,
 ) {
     let started = Instant::now();
-    let deadline = started + Duration::from_secs(60);
+    let deadline = started + Duration::from_mins(1);
     let mut attempts: u32 = 0;
     let mut history: Vec<String> = Vec::new();
     'acked: loop {
@@ -2490,7 +2490,7 @@ async fn decommission_node(node: &mut StressNode) {
         .expect("plane alive")
         .decommission_drain(node.node_id.clone());
     let status = drain.status();
-    tokio::time::timeout(Duration::from_secs(120), drain.run())
+    tokio::time::timeout(Duration::from_mins(2), drain.run())
         .await
         .expect("the drain must converge on a healthy cluster");
     assert!(status.complete.load(std::sync::atomic::Ordering::Acquire));
@@ -2500,7 +2500,7 @@ async fn decommission_node(node: &mut StressNode) {
 /// Wait until every node in `nodes` agrees the membership is exactly `n`.
 async fn wait_members(nodes: &[&StressNode], n: usize) {
     assert!(
-        wait_until(Duration::from_secs(60), || {
+        wait_until(Duration::from_mins(1), || {
             nodes
                 .iter()
                 .all(|node| node.placement.read().unwrap().member_count() == n)
@@ -2773,7 +2773,7 @@ async fn a_browned_out_session_owner_refuses_the_publisher_rather_than_owing_a_l
             .expect("the owner is one of the three")
     };
     {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_mins(1);
         let (mut sub, present) = loop {
             if let Some(ok) = common::Client::connect_v311_within(
                 nodes[owner_idx].client_addr,
@@ -2809,7 +2809,7 @@ async fn a_browned_out_session_owner_refuses_the_publisher_rather_than_owing_a_l
     // Wait until the publisher's node actually routes to the owner: the offline session's
     // interest is materialized by the owner's inherited-session scan and gossiped from
     // there, and a publish issued before that arrives has nothing to forward.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     let acked_once = loop {
         assert!(
             Instant::now() < deadline,
@@ -2875,7 +2875,7 @@ async fn a_browned_out_session_owner_refuses_the_publisher_rather_than_owing_a_l
             on: false,
         })
         .expect("the owner's hub is alive");
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     loop {
         assert!(Instant::now() < deadline, "recovery never restored the ack");
         if let Some((mut p, _)) = common::Client::connect_v311_within(
@@ -2899,7 +2899,7 @@ async fn a_browned_out_session_owner_refuses_the_publisher_rather_than_owing_a_l
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     let (mut sub, present) = loop {
         if let Some(ok) = common::Client::connect_v311_within(
             nodes[owner_idx].client_addr,
@@ -2980,7 +2980,7 @@ async fn a_v5_publisher_on_a_healthy_node_is_told_0x97_when_the_session_owning_p
             .expect("the owner is one of the three")
     };
     {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_mins(1);
         let (mut sub, _) = loop {
             if let Some(ok) = common::Client::connect_v311_within(
                 nodes[owner_idx].client_addr,
@@ -3014,7 +3014,7 @@ async fn a_v5_publisher_on_a_healthy_node_is_told_0x97_when_the_session_owning_p
     // healthy the very same v5 publish must be acked with reason 0. It also proves the
     // publisher's node has learned the offline session's interest — a publish issued
     // before that has nothing to forward and would pass for the wrong reason.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     loop {
         assert!(
             Instant::now() < deadline,
@@ -3086,7 +3086,7 @@ async fn a_v5_publisher_on_a_healthy_node_is_told_0x97_when_the_session_owning_p
             on: false,
         })
         .expect("the owner's hub is alive");
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     let (mut sub, present) = loop {
         if let Some(ok) = common::Client::connect_v311_within(
             nodes[owner_idx].client_addr,
@@ -3187,7 +3187,7 @@ async fn a_cross_node_shared_subscriber_is_never_bypassed_by_an_ack() {
 
     // The group's first member: ONLINE and PERSISTENT (a shared subscriber is a persistent
     // subscriber, #164) on the node about to be browned out.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     let started = Instant::now();
     let mut attempts = Vec::new();
     let (mut member_b, _) = loop {
@@ -3227,7 +3227,7 @@ async fn a_cross_node_shared_subscriber_is_never_bypassed_by_an_ack() {
 
     // Warm-up + control: the group member on the to-be-browned-out node receives, and the
     // publisher is acked. This establishes that the origin routes the shared group there.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     loop {
         assert!(
             Instant::now() < deadline,
@@ -3444,7 +3444,7 @@ async fn the_replication_factor_changes_live_both_ways_without_losing_an_acked_m
     let nodes = [&a, &b, &c];
     // 120 s: CI runs every cluster test of this binary at once on a few vCPUs.
     assert!(
-        wait_factor(&nodes, 2, Duration::from_secs(120)).await,
+        wait_factor(&nodes, 2, Duration::from_mins(2)).await,
         "the cluster never founded at 2"
     );
     wait_members(&nodes, 3).await;
@@ -3481,7 +3481,7 @@ async fn the_replication_factor_changes_live_both_ways_without_losing_an_acked_m
             n.plane.as_ref().unwrap().replica_change().propose(to);
         }
         // Keep publishing while the change runs.
-        let deadline = Instant::now() + Duration::from_secs(120);
+        let deadline = Instant::now() + Duration::from_mins(2);
         loop {
             let (addr, payload) = publish(published);
             publish_until_acked(
@@ -3519,7 +3519,7 @@ async fn the_replication_factor_changes_live_both_ways_without_losing_an_acked_m
     }
 
     // Collection: every node lets go of the groups the shrink took it out of.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     loop {
         let left: usize = nodes
             .iter()
@@ -3563,7 +3563,7 @@ async fn wait_cluster_ready(nodes: &[&StressNode]) {
     // ADR 0080: every node follows the factor the harness founded, so a run with
     // MQTTD_REPLICAS=2 proves it ran at 2 instead of assuming it.
     let replicas = usize::from(common::expected_replicas());
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     loop {
         let members = nodes.iter().all(|n| {
             let p = n.placement.read().unwrap();
@@ -3606,7 +3606,7 @@ async fn seeded_fault_schedules_hold_the_catalog_post_quiesce() {
 async fn wait_fleet_ready(nodes: &[&StressNode], voter_cap: usize) {
     let expected = nodes.len();
     let want_voters = expected.min(voter_cap);
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + Duration::from_mins(2);
     loop {
         let members = nodes
             .iter()
@@ -3880,7 +3880,7 @@ async fn no_node_keeps_a_stamp_for_a_group_it_left() {
     let b = start_stress_node_at("st-b", vec![a.swim_addr.clone()], &dir("b"), 2).await;
     let c = start_stress_node_at("st-c", vec![a.swim_addr.clone()], &dir("c"), 2).await;
     let nodes = [&a, &b, &c];
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     loop {
         let adopted = nodes
             .iter()

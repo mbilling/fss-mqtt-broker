@@ -102,11 +102,11 @@ fn restore_lines(nodes: &[ProcNode]) -> String {
 fn the_extended_budget_follows_observed_restore_state() {
     assert_eq!(
         proc_common::convergence_budget(false),
-        Duration::from_secs(60)
+        Duration::from_mins(1)
     );
     assert_eq!(
         proc_common::convergence_budget(true),
-        Duration::from_secs(360)
+        Duration::from_mins(6)
     );
     assert!(proc_common::convergence_budget(true) > proc_common::convergence_budget(false));
 }
@@ -479,7 +479,7 @@ async fn a_live_cluster_export_restores_sessions_retained_and_acked_facts() {
     nodes[0].terminate().await;
     let mark = log_mark(&nodes[0].log_path);
     nodes[0].spawn();
-    let restarted = wait_ready(&nodes[0], mark, Duration::from_secs(60)).await;
+    let restarted = wait_ready(&nodes[0], mark, Duration::from_mins(1)).await;
     assert!(
         restarted,
         "a node did not come back over its own data dir straight after an export — check for \
@@ -977,7 +977,7 @@ async fn sigusr2_on_a_node_with_no_backup_dir_is_a_no_op_not_a_death() {
     let mut node = Standalone::new(root.path(), "nobackup", &[]);
     node.spawn();
     assert!(
-        node.wait_ready(Duration::from_secs(60)).await,
+        node.wait_ready(Duration::from_mins(1)).await,
         "the node never became ready:\n{}",
         node.log()
     );
@@ -1041,7 +1041,7 @@ async fn a_restored_node_restarts_with_its_own_unchanged_environment() {
     let mut source = Standalone::new(root.path(), "source", &[("MQTTD_BACKUP_DIR", &backup_env)]);
     source.spawn();
     assert!(
-        source.wait_ready(Duration::from_secs(60)).await,
+        source.wait_ready(Duration::from_mins(1)).await,
         "source node never ready:\n{}",
         source.log()
     );

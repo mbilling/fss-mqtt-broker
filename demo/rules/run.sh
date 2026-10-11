@@ -47,7 +47,7 @@ elif [ -x "$ROOT/target/debug/mqttd" ]; then
 elif [ -f "$ROOT/Cargo.toml" ]; then
   command -v cargo >/dev/null || {
     echo "run.sh: no mqttd build in $ROOT/target, and no cargo to make one." >&2
-    echo "  Install Rust 1.88 or later (https://rustup.rs) and run this again, or set MQTTD to" >&2
+    echo "  Install Rust 1.96 or later (https://rustup.rs) and run this again, or set MQTTD to" >&2
     echo "  an mqttd built from a checkout that has the rule engine (docs/RULES.md, step 1)." >&2
     exit 2
   }

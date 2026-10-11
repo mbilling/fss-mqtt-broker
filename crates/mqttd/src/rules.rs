@@ -8,7 +8,15 @@
 //!   so rule work scales with connections and with nodes exactly as ingress does — the
 //!   single-threaded hub never runs SQL for client publishes. A forwarded copy arriving
 //!   from a peer is never re-evaluated: its landing node already did. Wills are the one
-//!   exception (the hub publishes them, so the hub evaluates them; they are rare).
+//!   exception (the hub publishes them, so the hub evaluates them; they are rare) —
+//!   unless the rules call `jq`, which may run for as long as its timeout allows: then
+//!   a Will's rules run on a task of their own ([`Rules::calls_sandbox`], ADR 0086 D6).
+//! - **`jq`** ([ADR 0086](../../../docs/adr/0086-wasm-rule-functions.md)) runs in a
+//!   WebAssembly sandbox, where `rules.jq` switches it on ([`functions_from_config`]).
+//!   A call that has run for a millisecond is suspended once and goes on under
+//!   `tokio::task::block_in_place` ([`hand_off`]): the worker it occupies gives its
+//!   other connections to another worker first, so a ten-second jq holds its own
+//!   publisher and nobody else.
 //! - **What a republish is.** An ordinary publish into the hub — routed, forwarded,
 //!   retained, queued for offline sessions and quorum-replicated exactly like a client
 //!   one — but with **no publisher** (so No Local does not apply, as in EMQX where the
@@ -65,8 +73,8 @@ use mqtt_codec::QoS;
 use mqtt_core::{AppProperties, ClientId, Origin};
 use mqtt_observability::metrics::Metrics;
 use mqtt_rules::{
-    Budget, Effect, EventInput, EventKind, EventMessage, Input, Outcome, PublishInput, Recursion,
-    Republish, Rule, RuleSet,
+    Budget, Effect, EventInput, EventKind, EventMessage, Functions, Input, JqSettings, JqSwitch,
+    Outcome, PublishInput, Recursion, Republish, Rule, RuleSet,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
@@ -90,6 +98,9 @@ pub struct Rules {
     /// publish here then carries its [`Origin`], for that peer's rules. Written by the
     /// hub when a peer's answer changes, read by every publish.
     peers_want_origin: Arc<AtomicBool>,
+    /// What a rules file may call beyond the built-in functions on this node (`jq`,
+    /// ADR 0086): what every load of one is given, the admin API's included.
+    functions: Functions,
 }
 
 impl std::fmt::Debug for Rules {
@@ -329,6 +340,20 @@ fn report(
         Outcome::Elapsed(d) => {
             if let Some(m) = metrics {
                 m.rule_eval_time(rule.id(), d);
+            }
+            return;
+        }
+        // A call of `jq` (ADR 0086 D10). One that failed has failed its rule, which the
+        // `Failed` that follows reports with the function's own error text.
+        Outcome::Function(call) => {
+            if let Some(m) = metrics {
+                m.rule_function_call(call.function, call.elapsed, call.error);
+                m.rule_module(
+                    call.function,
+                    call.module.instances,
+                    call.module.memory_bytes,
+                    call.module.replaced,
+                );
             }
             return;
         }
@@ -591,7 +616,30 @@ impl Rules {
             metrics,
             observe: None,
             peers_want_origin: Arc::new(AtomicBool::new(false)),
+            functions: Functions::default(),
         }
+    }
+
+    /// The same engine on a node whose rules may call `functions`
+    /// ([`functions_from_config`]).
+    #[must_use]
+    pub fn with_functions(mut self, functions: Functions) -> Self {
+        self.functions = functions;
+        self
+    }
+
+    /// What a rules file loaded on this node may call beyond the built-in functions.
+    #[must_use]
+    pub fn functions(&self) -> &Functions {
+        &self.functions
+    }
+
+    /// Whether the rules in force call a function that runs in the sandbox (`jq`),
+    /// and so may take as long as its timeout allows: the hub then does not evaluate
+    /// a Will itself (ADR 0086 D6).
+    #[must_use]
+    pub fn calls_sandbox(&self) -> bool {
+        self.rx.borrow().calls_sandbox()
     }
 
     /// Record whether any linked peer's rules select a message event (the hub's call,
@@ -1823,8 +1871,9 @@ impl Capture {
 
     fn see(&mut self, rule: &Rule, outcome: Outcome<'_>) {
         let (result, error) = match outcome {
-            // The rule's cost is in its statistics, not in each trace record.
-            Outcome::Elapsed(_) => return,
+            // The rule's cost is in its statistics, not in each trace record; a failed
+            // function call is the `Failed` that follows it, with its kind and text.
+            Outcome::Elapsed(_) | Outcome::Function(_) => return,
             Outcome::Passed => (TraceResult::Passed, None),
             Outcome::NoResult => (TraceResult::NoResult, None),
             Outcome::Failed(e) => (TraceResult::Failed, Some(e)),
@@ -1913,16 +1962,123 @@ impl Capture {
     }
 }
 
-/// Load the configured rules file. `None` path = no rules. Warnings are logged.
+/// Load the configured rules file, with `jq` switched off. `None` path = no rules.
+/// Warnings are logged.
 pub fn load(path: Option<&str>) -> Result<RuleSet, String> {
+    load_with(path, &Functions::default())
+}
+
+/// Load the configured rules file as this node loads it: `functions` is what its rules
+/// may call beyond the built-in functions ([`functions_from_config`]). A file that
+/// calls `jq` fails to load where `jq` is off or cannot run, with the reason; the first
+/// one that loads compiles the jq module, on this thread (ADR 0086 D5).
+pub fn load_with(path: Option<&str>, functions: &Functions) -> Result<RuleSet, String> {
     let Some(path) = path else {
         return Ok(RuleSet::empty());
     };
-    let loaded = RuleSet::load(std::path::Path::new(path)).map_err(|e| e.to_string())?;
+    let loaded = noting_the_jq_module(functions, || {
+        RuleSet::load_with(std::path::Path::new(path), functions)
+    })
+    .map_err(|e| e.to_string())?;
     for w in &loaded.warnings {
         warn!(file = %path, "rules: {w}");
     }
     Ok(loaded.rules)
+}
+
+/// Runs `load`, which loads rules with `functions`, and says so in the log when it was
+/// the load that compiled the jq module: the first in this process of rules that call
+/// `jq`, wherever it came from (boot, a reload, the admin API). The one moment the
+/// WebAssembly runtime comes into being, and half a second an operator may wonder about.
+pub fn noting_the_jq_module<T>(functions: &Functions, load: impl FnOnce() -> T) -> T {
+    let was_loaded = functions.jq().is_some_and(|jq| jq.is_loaded());
+    let started = std::time::Instant::now();
+    let loaded = load();
+    if !was_loaded && functions.jq().is_some_and(|jq| jq.is_loaded()) {
+        info!(
+            took_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "rules: the rules call jq; its WebAssembly module is compiled (once per process, \
+             ADR 0086)"
+        );
+    }
+    loaded
+}
+
+/// What rules may call beyond the built-in functions on this node, from `[rules]`
+/// (ADR 0086 D13): nothing unless `rules.jq` is on. Read once, at startup — nothing of
+/// the WebAssembly runtime exists until a rules file that calls `jq` is loaded.
+///
+/// `jq`'s environment is the listed variables that are set, with the values they have
+/// now (D8); its warm instances are as many as the runtime has workers (D5).
+#[must_use]
+pub fn functions_from_config(rules: &mqtt_config::Rules) -> Functions {
+    if !rules.jq {
+        return Functions::default();
+    }
+    let environment = rules
+        .jq_env
+        .iter()
+        .filter_map(|name| match std::env::var(name) {
+            Ok(value) => Some((name.clone(), value)),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                warn!(variable = %name, "rules.jq_env: the variable's value is not UTF-8; \
+                      jq does not see it");
+                None
+            }
+        })
+        .collect();
+    let workers = tokio::runtime::Handle::try_current().map_or_else(
+        |_| std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
+        |runtime| runtime.metrics().num_workers(),
+    );
+    Functions::with_jq(JqSettings {
+        default_timeout: std::time::Duration::from_millis(rules.jq_default_timeout_ms),
+        environment,
+        instances: workers,
+        hand_off: Some(Arc::new(hand_off)),
+    })
+}
+
+/// One line on what `rules.jq = true` means on this host, for `mqttd --check-config`:
+/// whether this build has jq, and whether the host lets compiled code run (ADR 0086
+/// D13). `Err` is the line when it cannot. Asking compiles and runs one function, so a
+/// running broker does not ask: it finds out when rules that call `jq` are loaded.
+#[must_use]
+pub fn jq_host_report(functions: &Functions) -> Option<Result<String, String>> {
+    match &functions.jq {
+        JqSwitch::Off => None,
+        JqSwitch::Unavailable(why) => Some(Err(format!(
+            "rules.jq is on, but {why}: a rules file that calls jq will not load"
+        ))),
+        JqSwitch::On(_) => Some(match mqtt_rules::Jq::probe() {
+            Ok(()) => Ok(format!(
+                "rules.jq is on: this host allows compiled code (jq module sha256 {})",
+                mqtt_rules::Jq::module_sha256().unwrap_or("unknown")
+            )),
+            Err(why) => Err(format!(
+                "rules.jq is on, but {why}. A rules file that calls jq will not load here: \
+                 under systemd set `MemoryDenyWriteExecute=false` for the service \
+                 (`systemctl edit mqttd`), or lift the seccomp or SELinux rule that forbids \
+                 executable memory"
+            )),
+        }),
+    }
+}
+
+/// What a `jq` call that has run for a millisecond goes on under (ADR 0086 D6): on a
+/// worker thread of the multi-threaded runtime, `block_in_place`, which first gives
+/// the worker's other tasks — every other connection it was serving — to another
+/// thread. Anywhere else (a blocking thread, the main thread of a command-line check,
+/// a single-threaded test runtime) there is nothing to hand over, and the call goes on.
+pub fn hand_off(rest: &mut dyn FnMut()) {
+    let on_worker = tokio::runtime::Handle::try_current()
+        .is_ok_and(|rt| rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    if on_worker {
+        tokio::task::block_in_place(rest);
+    } else {
+        rest();
+    }
 }
 
 #[cfg(test)]
@@ -2172,6 +2328,81 @@ enable = false
         tracing::subscriber::with_default(subscriber, f);
         let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
         text.lines().map(str::to_string).collect()
+    }
+
+    /// ADR 0086 D6: on a worker thread of the multi-threaded runtime the hand-off gives
+    /// the worker's other tasks to another thread before it goes on. One worker, two
+    /// tasks: the first blocks inside the hand-off until the second has run. Were the
+    /// rest simply run where it was, the only worker would be in it and the second task
+    /// would never run: [`heard_from_the_other_task`] would reach its deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn the_hand_off_lets_the_workers_other_tasks_run() {
+        let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
+        let blocked = tokio::spawn(async move {
+            let mut heard = "";
+            hand_off(&mut || heard = heard_from_the_other_task(&rx));
+            heard
+        });
+        let other = tokio::spawn(async move {
+            let _ = tx.send("the other task ran");
+        });
+        assert_eq!(blocked.await.unwrap(), "the other task ran");
+        other.await.unwrap();
+    }
+
+    /// Blocks this thread until the other task has sent its word. Bounded: fails when
+    /// it has not within twenty seconds.
+    fn heard_from_the_other_task(rx: &std::sync::mpsc::Receiver<&'static str>) -> &'static str {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if let Ok(word) = rx.try_recv() {
+                return word;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the other task never ran: the hand-off kept the only worker"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// Off a runtime worker there is nothing to hand over: the rest of the call runs
+    /// where it is, on a single-threaded runtime and with no runtime at all.
+    #[test]
+    fn the_hand_off_just_goes_on_where_there_is_no_worker_to_free() {
+        let mut ran = 0;
+        hand_off(&mut || ran += 1);
+        assert_eq!(ran, 1);
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async { hand_off(&mut || ran += 1) });
+        assert_eq!(ran, 2);
+    }
+
+    /// ADR 0086 D13: with `rules.jq` off (the default) the configuration asks for no
+    /// function beyond the built-in ones, and nothing is said about the host.
+    #[test]
+    fn jq_is_not_asked_for_unless_the_config_switches_it_on() {
+        let off = functions_from_config(&mqtt_config::Rules::default());
+        assert!(matches!(off.jq, JqSwitch::Off));
+        assert!(jq_host_report(&off).is_none());
+        // Switched on, it is there or the build says why it is not; either way
+        // nothing has been compiled by asking.
+        let on = functions_from_config(&mqtt_config::Rules {
+            jq: true,
+            jq_default_timeout_ms: 250,
+            ..mqtt_config::Rules::default()
+        });
+        match (&on.jq, mqtt_rules::Jq::built_in()) {
+            (JqSwitch::On(jq), Ok(())) => {
+                assert_eq!(jq.default_timeout(), std::time::Duration::from_millis(250));
+                assert!(!jq.is_loaded());
+            }
+            (JqSwitch::Unavailable(why), Err(built)) => assert_eq!(*why, built),
+            (switch, built) => panic!("{switch:?} in a build where jq is {built:?}"),
+        }
+        assert!(jq_host_report(&on).is_some());
     }
 
     /// ADR 0084: the `INSECURE:` line says that anyone may read the trace, and why. It is

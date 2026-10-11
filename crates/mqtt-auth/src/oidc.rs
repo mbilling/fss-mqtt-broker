@@ -52,7 +52,7 @@ impl OidcConfig {
             issuer,
             audience,
             groups_claim: "groups".to_string(),
-            max_stale: Duration::from_secs(24 * 3600),
+            max_stale: Duration::from_hours(24),
             leeway_secs: 60,
         }
     }
@@ -410,7 +410,7 @@ mod tests {
     async fn staleness_beyond_the_window_fails_closed_then_reinstall_recovers() {
         let (a, rx) = authenticator();
         a.install_jwks(JWKS).unwrap();
-        a.age_keys_for_test(Duration::from_secs(25 * 3600));
+        a.age_keys_for_test(Duration::from_hours(25));
         assert!(a.is_stale());
         let err = auth(&a, &mint("t1", &good_claims())).await.unwrap_err();
         assert!(matches!(err, AuthError::Backend(_)));

@@ -57,6 +57,9 @@ pub struct EvalCtx<'a> {
     /// Bytes this message's functions have built beyond their inputs so far (see
     /// `funcs::MAX_BUILT_BYTES`).
     pub(crate) built: std::cell::Cell<usize>,
+    /// The calls of sandboxed functions the rule being evaluated has made, for its
+    /// report ([`Outcome::Function`](crate::Outcome::Function)).
+    pub(crate) calls: std::cell::RefCell<Vec<crate::jq::FunctionCall>>,
     /// Where name lookup stops falling through ([`lookup`]): frames from this index on,
     /// with the input after them, are one merged map. `usize::MAX` (a `SELECT`): every
     /// frame and the input fall through in turn. Set per clause by [`merged_from`].
@@ -83,6 +86,7 @@ impl<'a> EvalCtx<'a> {
             rule_id: std::cell::RefCell::new(Arc::from("")),
             regex_cache: std::cell::RefCell::new(Vec::new()),
             built: std::cell::Cell::new(0),
+            calls: std::cell::RefCell::new(Vec::new()),
             merged_from: std::cell::Cell::new(usize::MAX),
         }
     }
@@ -485,7 +489,12 @@ pub(crate) fn eval(e: &Expr, ctx: &EvalCtx, frames: Frames) -> Result<Value, Eva
                 None => Value::Undefined,
             }
         }
-        Expr::Call { func, args, regex } => {
+        Expr::Call {
+            func,
+            args,
+            regex,
+            jq,
+        } => {
             let args = args
                 .iter()
                 .map(|x| eval(x, ctx, frames))
@@ -493,6 +502,7 @@ pub(crate) fn eval(e: &Expr, ctx: &EvalCtx, frames: Frames) -> Result<Value, Eva
             let fcx = FnCtx {
                 ctx,
                 regex: regex.as_ref(),
+                jq: jq.as_deref(),
             };
             (func.f)(&args, &fcx).map_err(|err| err.in_fn(func.name))?
         }

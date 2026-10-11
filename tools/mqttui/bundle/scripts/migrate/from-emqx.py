@@ -2630,8 +2630,12 @@ def collect_bridge_tls(up: BridgeUpstream, body: dict, where: str) -> None:
 # same set, and `mqttd --check-rules` refuses a rule calling one). A rule using one is
 # emitted COMMENTED OUT with a TODO rather than live: a rules file loads all-or-nothing,
 # so one unsupported call would otherwise make the broker refuse every rule.
+#
+# jq() is not in this list: mqttd has it (ADR 0086), but OFF unless the operator sets
+# `[rules] jq = true`, and a rules file that calls it does not load while it is off. A
+# rule calling it is commented out for the same all-or-nothing reason, with what to do.
 RULE_FUNCS_UNSUPPORTED = (
-    "jq", "byteszie", "schema_encode", "schema_decode", "schema_check",
+    "byteszie", "schema_encode", "schema_decode", "schema_check",
     "sparkplug_encode", "sparkplug_decode", "maptab_lookup", "mongo_date",
     "str_utf16_le_decode", "term_encode", "term_decode", "kv_store_get",
     "kv_store_put", "kv_store_del", "proc_dict_get", "proc_dict_put", "proc_dict_del",
@@ -2725,6 +2729,12 @@ def _rule_sql_blockers(sql: str) -> str | None:
     for fn in RULE_FUNCS_UNSUPPORTED:
         if re.search(rf"\b{fn}\s*\(", sql):
             return f"it calls {fn}(), which mqttd's rule engine does not implement"
+    if re.search(r"\bjq\s*\(", sql):
+        return (
+            "it calls jq(), which mqttd runs only where it is switched on: set `[rules] "
+            "jq = true` (MQTTD_RULES_JQ=1) on every node, read what it needs from the host "
+            "in docs/RULES.md, and then uncomment this rule"
+        )
     return None
 
 
@@ -2771,10 +2781,16 @@ def convert_rules(tree: dict, conv: Conversion) -> None:
                 "sees no other $SYS message — EMQX's default (true) apart from that one "
                 "topic; `false` has no equivalent"
             )
+        elif key == "jq_function_default_timeout":
+            conv.rule_todos.append(
+                f"rule_engine.{key} = {value!r}: mqttd's is `[rules] jq_default_timeout_ms` "
+                "(milliseconds; default 10000, as EMQX's 10s). jq() is off unless `[rules] "
+                "jq = true`; set the timeout by hand if you switch it on"
+            )
         elif key.startswith("jq_"):
             conv.rule_todos.append(
-                f"rule_engine.{key}: mqttd's rule engine has no jq() function, so there is "
-                "nothing to configure"
+                f"rule_engine.{key} = {value!r}: no mqttd equivalent (mqttd's jq() keeps 32 "
+                "compiled programs per sandbox instance; ADR 0086)"
             )
         else:
             conv.rule_todos.append(f"rule_engine.{key} = {value!r}: no mqttd equivalent")

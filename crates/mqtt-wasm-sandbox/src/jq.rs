@@ -15,13 +15,44 @@
 //! [`Jq`] is the function for one caller, with one warm instance. [`Pool`] is what a
 //! broker holds: the module, compiled on first use, and the warm instances its
 //! callers take turns on.
+//!
+//! The module itself is not in the source tree: `jq-module/build.sh` builds it from
+//! pinned sources, and a build of this crate that finds the file embeds it
+//! ([`embedded`]).
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
-use crate::sandbox::{Arg, CallError, Execution, Instance, Limits, LoadError, Reply, Sandbox};
+use crate::sandbox::{
+    Arg, CallError, Execution, HandOff, Instance, Limits, LoadError, Reply, Sandbox,
+};
 use crate::wasi::Grants;
+
+/// The jq module this build carries: the file `jq-module/build.sh` writes (or the one
+/// `MQTTD_JQ_WASM` named when this crate was built), which the build script found and
+/// compared with the hash the tree records. `None` in a build made without it.
+#[must_use]
+pub fn embedded() -> Option<&'static [u8]> {
+    #[cfg(jq_wasm)]
+    {
+        Some(include_bytes!(concat!(env!("OUT_DIR"), "/jq.wasm")))
+    }
+    #[cfg(not(jq_wasm))]
+    {
+        None
+    }
+}
+
+/// The sha256 of the module this revision's `jq-module/build.sh` builds, in hex.
+#[must_use]
+pub fn recorded_sha256() -> &'static str {
+    include_str!("../jq-module/jq.wasm.sha256")
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+}
 
 /// `rule_engine.jq_function_default_timeout`: what `jq/2` runs under.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -77,6 +108,20 @@ pub struct JqError {
     pub tag: Tag,
     /// The message, byte for byte EMQX's for EMQX's tags.
     pub message: Vec<u8>,
+    /// What to count the failure under: `compile`, `parse`, `process`, `timeout` and
+    /// `system` for EMQX's tags; `memory`, `output`, `stack`, `fuel` and
+    /// `compile_timeout` for the sandbox's limits; `trap` for a module that broke.
+    pub kind: &'static str,
+}
+
+impl JqError {
+    fn system(message: impl Into<Vec<u8>>) -> Self {
+        Self {
+            tag: Tag::System,
+            message: message.into(),
+            kind: "system",
+        }
+    }
 }
 
 impl fmt::Display for JqError {
@@ -111,8 +156,13 @@ pub struct Jq {
     instance: Option<Instance>,
     /// Instances made so far (the first, and one after every stopped call).
     pub instances: u64,
+    /// Instances given up so far: stopped by a call, or grown past
+    /// [`RECYCLE_ABOVE_BYTES`].
+    pub replaced: u64,
     /// Parts of the last call.
     pub last: Timing,
+    /// The memory a [`Pool`] has counted for this caller's instance.
+    accounted: u64,
 }
 
 impl Jq {
@@ -140,7 +190,9 @@ impl Jq {
             sandbox,
             instance: None,
             instances: 0,
+            replaced: 0,
             last: Timing::default(),
+            accounted: 0,
         }
     }
 
@@ -179,18 +231,63 @@ impl Jq {
         input: Arg<'_>,
         timeout: Option<Duration>,
     ) -> Result<Vec<u8>, JqError> {
+        self.eval_within(program, input, timeout, u32::MAX)
+    }
+
+    /// [`eval`](Self::eval) with this call's own bound on the size of the result (it
+    /// is never more than the module's [`Limits::max_output_bytes`]).
+    pub fn eval_within(
+        &mut self,
+        program: &[u8],
+        input: Arg<'_>,
+        timeout: Option<Duration>,
+        max_output: u32,
+    ) -> Result<Vec<u8>, JqError> {
         let started = Instant::now();
-        let deadline = timeout.map(|t| started + t);
+        // A timeout no clock can hold (EMQX accepts any integer below 2^64) is none.
+        let deadline = timeout.and_then(|t| started.checked_add(t));
         self.last = Timing::default();
-        let result = self.eval_on_instance(program, input, deadline, timeout);
+        let result = self.eval_on_instance(program, input, deadline, timeout, max_output);
+        self.let_go_of_a_stopped_instance();
+        result
+    }
+
+    /// Compiles `program` into the warm instance's cache without running it: what a
+    /// broker does with the programs its rules spell out, when the rules are loaded.
+    pub fn compile(&mut self, program: &[u8]) -> Result<(), JqError> {
+        let result = self
+            .warm_instance()
+            .and_then(|instance| compile(instance, program, None));
+        self.let_go_of_a_stopped_instance();
+        result.map(|_| ())
+    }
+
+    fn let_go_of_a_stopped_instance(&mut self) {
         let stopped = self
             .instance
             .as_ref()
             .is_some_and(|i| i.is_poisoned() || i.memory_bytes() > RECYCLE_ABOVE_BYTES);
         if stopped {
             self.instance = None;
+            self.replaced += 1;
         }
-        result
+    }
+
+    /// The warm instance, made now when there is none.
+    fn warm_instance(&mut self) -> Result<&mut Instance, JqError> {
+        if self.instance.is_none() {
+            let at = Instant::now();
+            let made = self
+                .sandbox
+                .instantiate()
+                .map_err(|e| JqError::system(e.to_string()))?;
+            self.instance = Some(made);
+            self.instances += 1;
+            self.last.instantiate = at.elapsed();
+        }
+        self.instance
+            .as_mut()
+            .ok_or_else(|| JqError::system("no instance"))
     }
 
     fn eval_on_instance(
@@ -199,26 +296,13 @@ impl Jq {
         input: Arg<'_>,
         deadline: Option<Instant>,
         timeout: Option<Duration>,
+        max_output: u32,
     ) -> Result<Vec<u8>, JqError> {
-        if self.instance.is_none() {
-            let at = Instant::now();
-            let made = self.sandbox.instantiate().map_err(|e| JqError {
-                tag: Tag::System,
-                message: e.to_string().into_bytes(),
-            })?;
-            self.instance = Some(made);
-            self.instances += 1;
-            self.last.instantiate = at.elapsed();
-        }
-        let Some(instance) = self.instance.as_mut() else {
-            return Err(JqError {
-                tag: Tag::System,
-                message: b"no instance".to_vec(),
-            });
-        };
+        let instance = self.warm_instance()?;
         let args = [Arg::Binary(program), input];
         let at = Instant::now();
-        let mut reply = instance.call("jq", &args, deadline);
+        let mut reply = instance.call_within("jq", &args, deadline, max_output);
+        let mut compiling = Duration::ZERO;
         if matches!(
             &reply,
             Err(CallError::Module {
@@ -226,66 +310,97 @@ impl Jq {
                 ..
             })
         ) {
-            let compiled = instance.call("jq_compile", &args[..1], Some(at + COMPILE_TIMEOUT));
-            self.last.compile = at.elapsed();
-            compiled.map_err(|e| match e {
-                CallError::Timeout => JqError {
-                    tag: Tag::Limit,
-                    message: format!(
-                        "jq stopped: compiling the program took longer than {} ms",
-                        COMPILE_TIMEOUT.as_millis()
-                    )
-                    .into_bytes(),
-                },
-                e => error(e, timeout),
-            })?;
-            let at = Instant::now();
-            reply = instance.call("jq", &args, deadline);
-            self.last.run = at.elapsed();
-        } else {
-            self.last.run = at.elapsed();
+            compiling = compile(instance, program, timeout)?;
+            reply = instance.call_within("jq", &args, deadline, max_output);
         }
+        self.last.compile = compiling;
+        self.last.run = at.elapsed().saturating_sub(compiling);
         match reply {
             Ok(Reply::Json(text)) => Ok(text),
-            Ok(Reply::Binary(_)) => Err(JqError {
-                tag: Tag::System,
-                message: b"the jq module returned a binary".to_vec(),
-            }),
+            Ok(Reply::Binary(_)) => Err(JqError::system("the jq module returned a binary")),
             Err(e) => Err(error(e, timeout)),
         }
     }
 }
 
+/// Compiles `program` into `instance`'s cache, under [`COMPILE_TIMEOUT`]; how long it
+/// took.
+fn compile(
+    instance: &mut Instance,
+    program: &[u8],
+    timeout: Option<Duration>,
+) -> Result<Duration, JqError> {
+    let at = Instant::now();
+    let compiled = instance.call(
+        "jq_compile",
+        &[Arg::Binary(program)],
+        Some(at + COMPILE_TIMEOUT),
+    );
+    compiled.map_err(|e| match e {
+        CallError::Timeout => JqError {
+            tag: Tag::Limit,
+            message: format!(
+                "jq stopped: compiling the program took longer than {} ms",
+                COMPILE_TIMEOUT.as_millis()
+            )
+            .into_bytes(),
+            kind: "compile_timeout",
+        },
+        e => error(e, timeout),
+    })?;
+    Ok(at.elapsed())
+}
+
 /// A sandbox error as the `jq` function reports it.
 fn error(e: CallError, timeout: Option<Duration>) -> JqError {
-    let (tag, message) = match e {
+    let limit = |kind, e: &CallError| (Tag::Limit, kind, format!("jq stopped: {e}").into_bytes());
+    let (tag, kind, message) = match e {
         CallError::Module { status, message } => {
-            let tag = match status {
+            let (tag, kind) = match status {
                 // The program saw the cancel flag and ended by itself.
                 7 => return error(CallError::Timeout, timeout),
-                4 => Tag::Compile,
-                5 => Tag::Parse,
-                6 => Tag::Process,
-                8 => Tag::Limit,
-                _ => Tag::System,
+                4 => (Tag::Compile, "compile"),
+                5 => (Tag::Parse, "parse"),
+                6 => (Tag::Process, "process"),
+                8 => (Tag::Limit, "output"),
+                _ => (Tag::System, "system"),
             };
-            (tag, message)
+            (tag, kind, message)
         }
         // The NIF's text, completed by `emqx_rule_funcs:jq/3`.
         CallError::Timeout => (
             Tag::Timeout,
+            "timeout",
             format!(
                 "jq program canceled as it took too long time to execute (timeout set to {} ms)",
                 timeout.map_or(0, |t| t.as_millis())
             )
             .into_bytes(),
         ),
-        CallError::Memory | CallError::Stack | CallError::Fuel | CallError::OutputTooLarge => {
-            (Tag::Limit, format!("jq stopped: {e}").into_bytes())
+        CallError::Memory => limit("memory", &e),
+        CallError::Stack => limit("stack", &e),
+        CallError::Fuel => limit("fuel", &e),
+        CallError::OutputTooLarge => limit("output", &e),
+        CallError::Trap(_) | CallError::Poisoned => {
+            (Tag::System, "trap", e.to_string().into_bytes())
         }
-        CallError::Trap(_) | CallError::Poisoned => (Tag::System, e.to_string().into_bytes()),
     };
-    JqError { tag, message }
+    JqError { tag, message, kind }
+}
+
+/// What a [`Pool`] holds and has done, for a broker's metrics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PoolStats {
+    /// Instances the pool holds now: those waiting and those in a call.
+    pub instances: u64,
+    /// Linear memory of those instances, in bytes, as of the end of each one's last
+    /// call.
+    pub memory_bytes: u64,
+    /// Instances made since the module was loaded.
+    pub made: u64,
+    /// Instances given up after a call: stopped at a limit, or grown past
+    /// [`RECYCLE_ABOVE_BYTES`].
+    pub replaced: u64,
 }
 
 /// The `jq` function for a whole broker: the module's bytes, compiled when first
@@ -295,15 +410,37 @@ fn error(e: CallError, timeout: Option<Duration>) -> JqError {
 /// [`eval`](Self::eval)) compiles the module to machine code, once: a broker whose
 /// rules never call `jq` never pays for it, and one whose rules do pays when the rules
 /// are loaded, not when a message arrives.
-#[derive(Debug)]
 pub struct Pool {
     wasm: Vec<u8>,
     execution: Execution,
     limits: Limits,
     grants: Grants,
-    loaded: OnceLock<Result<Sandbox, String>>,
+    hand_off: Option<HandOff>,
+    /// The module, or why it was not loaded and whether that was the host refusing
+    /// the compiler ([`LoadError::Engine`]).
+    loaded: OnceLock<Result<Sandbox, (String, bool)>>,
     idle: Mutex<Vec<Jq>>,
     max_idle: usize,
+    /// Instances out with a caller.
+    busy: AtomicU64,
+    /// Memory of every instance the pool holds, waiting or out.
+    memory: AtomicU64,
+    made: AtomicU64,
+    replaced: AtomicU64,
+}
+
+impl fmt::Debug for Pool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Pool")
+            .field("loaded", &self.is_loaded())
+            .field("max_idle", &self.max_idle)
+            .field("stats", &self.stats())
+            .finish_non_exhaustive()
+    }
+}
+
+fn bytes(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
 }
 
 impl Pool {
@@ -322,10 +459,24 @@ impl Pool {
             execution,
             limits,
             grants,
+            hand_off: None,
             loaded: OnceLock::new(),
             idle: Mutex::new(Vec::new()),
             max_idle,
+            busy: AtomicU64::new(0),
+            memory: AtomicU64::new(0),
+            made: AtomicU64::new(0),
+            replaced: AtomicU64::new(0),
         }
+    }
+
+    /// The same pool, whose calls give what is left of them after
+    /// [`Limits::first_slice`] to `hand_off` ([`Sandbox::with_hand_off`]). Set before
+    /// the first call.
+    #[must_use]
+    pub fn with_hand_off(mut self, hand_off: HandOff) -> Self {
+        self.hand_off = Some(hand_off);
+        self
     }
 
     /// Compiles the module if no call has yet, and says why it cannot be: the reason
@@ -340,13 +491,21 @@ impl Pool {
                     self.limits.clone(),
                     self.grants.clone(),
                 )
-                .map_err(|e| e.to_string())
+                .map(|sandbox| match &self.hand_off {
+                    Some(hand_off) => sandbox.with_hand_off(hand_off.clone()),
+                    None => sandbox,
+                })
+                .map_err(|e| (e.to_string(), matches!(e, LoadError::Engine(_))))
             })
             .as_ref()
-            .map_err(|reason| JqError {
-                tag: Tag::System,
-                message: format!("jq is not available: {reason}").into_bytes(),
-            })
+            .map_err(|(reason, _)| JqError::system(format!("jq is not available: {reason}")))
+    }
+
+    /// Whether [`load`](Self::load) failed because this host does not let the
+    /// compiler run: no executable memory, or no thread for the timer.
+    #[must_use]
+    pub fn refused_by_host(&self) -> bool {
+        matches!(self.loaded.get(), Some(Err((_, true))))
     }
 
     /// Whether the module has been compiled (by [`load`](Self::load) or a call).
@@ -365,6 +524,24 @@ impl Pool {
         self.idle.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// What the pool holds and has done so far.
+    #[must_use]
+    pub fn stats(&self) -> PoolStats {
+        // A caller's place in the pool is kept when its call stopped its instance; the
+        // instance itself is made again by the next call, and counts from then.
+        let waiting = self
+            .idle_instances()
+            .iter()
+            .filter(|jq| jq.instance.is_some())
+            .count();
+        PoolStats {
+            instances: bytes(waiting) + self.busy.load(Relaxed),
+            memory_bytes: self.memory.load(Relaxed),
+            made: self.made.load(Relaxed),
+            replaced: self.replaced.load(Relaxed),
+        }
+    }
+
     /// [`Jq::eval`] on a warm instance of the pool, or on a new one when every one is
     /// in use. The instance goes back to the pool afterwards.
     pub fn eval(
@@ -373,16 +550,102 @@ impl Pool {
         input: Arg<'_>,
         timeout: Option<Duration>,
     ) -> Result<Vec<u8>, JqError> {
+        self.eval_within(program, input, timeout, u32::MAX)
+    }
+
+    /// [`Jq::eval_within`] on an instance of the pool.
+    pub fn eval_within(
+        &self,
+        program: &[u8],
+        input: Arg<'_>,
+        timeout: Option<Duration>,
+        max_output: u32,
+    ) -> Result<Vec<u8>, JqError> {
+        let mut jq = self.take()?;
+        let result = jq.eval_within(program, input, timeout, max_output);
+        self.put_back(jq);
+        result
+    }
+
+    /// Compiles `programs` into every instance the pool keeps warm (making them, up to
+    /// the pool's size): the first message that meets one of them does not pay for
+    /// it. A program that does not compile is skipped; a call with it says why. The
+    /// first error other than that, such as a module that cannot be loaded, ends it.
+    pub fn warm(&self, programs: &[&[u8]]) -> Result<(), JqError> {
+        if programs.is_empty() {
+            return Ok(());
+        }
+        let mut out = Vec::with_capacity(self.max_idle);
+        let mut result = Ok(());
+        for _ in 0..self.max_idle {
+            match self.take() {
+                Ok(jq) => out.push(jq),
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            }
+        }
+        for jq in &mut out {
+            for program in programs {
+                match jq.compile(program) {
+                    Ok(()) => {}
+                    Err(e) if e.tag == Tag::Compile => {}
+                    Err(e) => result = result.and(Err(e)),
+                }
+            }
+        }
+        for jq in out {
+            self.put_back(jq);
+        }
+        result
+    }
+
+    /// Compiles one program in one instance of the pool, and says why it does not
+    /// compile.
+    pub fn compile(&self, program: &[u8]) -> Result<(), JqError> {
+        let mut jq = self.take()?;
+        let result = jq.compile(program);
+        self.put_back(jq);
+        result
+    }
+
+    /// A warm instance for one caller, or a new one when every one is out.
+    fn take(&self) -> Result<Jq, JqError> {
         let taken = self.idle_instances().pop();
-        let mut jq = match taken {
+        let jq = match taken {
             Some(jq) => jq,
             None => Jq::from_sandbox(self.load()?.clone()),
         };
-        let result = jq.eval(program, input, timeout);
+        self.busy.fetch_add(1, Relaxed);
+        Ok(jq)
+    }
+
+    /// Takes the caller's instance back, or lets it go when the pool is full, and
+    /// accounts for what its call did.
+    fn put_back(&self, mut jq: Jq) {
+        self.made
+            .fetch_add(std::mem::take(&mut jq.instances), Relaxed);
+        self.replaced
+            .fetch_add(std::mem::take(&mut jq.replaced), Relaxed);
+        let memory = bytes(jq.memory_bytes());
         let mut idle = self.idle_instances();
-        if idle.len() < self.max_idle {
+        let kept = idle.len() < self.max_idle;
+        // An instance the pool lets go of counts for nothing from here on.
+        let now = if kept { memory } else { 0 };
+        let before = std::mem::replace(&mut jq.accounted, now);
+        if kept {
             idle.push(jq);
         }
-        result
+        drop(idle);
+        self.busy.fetch_sub(1, Relaxed);
+        if now >= before {
+            self.memory.fetch_add(now - before, Relaxed);
+        } else {
+            // Saturating: the gauge is never left wrapped.
+            let _ = self
+                .memory
+                .fetch_update(Relaxed, Relaxed, |m| Some(m.saturating_sub(before - now)));
+        }
     }
 }

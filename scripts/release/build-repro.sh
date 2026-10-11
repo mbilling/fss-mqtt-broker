@@ -15,6 +15,10 @@
 #      logical roots so the binary does not embed the machine it was built on.
 #   4. SOURCE_DATE_EPOCH pinned to the commit time, and incremental compilation
 #      off, so nothing time- or cache-dependent leaks in.
+#   5. The jq module the broker embeds (the rule engine's jq(), ADR 0086) is BUILT
+#      HERE, from source tarballs pinned by sha256 with a compiler pinned by sha256,
+#      under target/ so that a clean rebuild builds it again — and the broker's build
+#      refuses any file but the one whose hash the tree records.
 #
 # codegen-units=1 and lto=thin are already set in [profile.release] (Cargo.toml).
 #
@@ -68,6 +72,41 @@ rustup target add "$TARGET" >&2 2>/dev/null || true
 PACKAGES=("${@:2}")
 if [ "${#PACKAGES[@]}" -eq 0 ]; then
   PACKAGES=(mqttd mqtt-bridge)
+fi
+
+# ── the jq module (ADR 0086 D4, D11) ─────────────────────────────────────────
+#
+# The broker's jq() is EMQX's jq, C compiled to WebAssembly, run in a sandbox. The
+# module is not in the repository: it is built here, every time, from the two source
+# tarballs build.sh names (each checked against its sha256) with zig 0.16.0 (fetched
+# by fetch-zig.sh and checked against ITS sha256; `ZIG=…` names one you already
+# have, of that version). The result is byte-reproducible across hosts, and
+# crates/mqtt-wasm-sandbox/build.rs embeds it only if its sha256 is the one in
+# jq-module/jq.wasm.sha256 — so the module inside a release binary is exactly the one
+# anyone gets from this commit, and a release cannot be cut without it
+# (MQTTD_JQ_WASM_REQUIRED). It lives under target/, which the reproducibility proof
+# cleans, so the second build of that proof builds the module a second time too.
+needs_jq=0
+for pkg in "${PACKAGES[@]}"; do
+  case "$pkg" in mqttd | mqttd-fips) needs_jq=1 ;; esac
+done
+if [ "$needs_jq" = 1 ]; then
+  JQ_DIR="${REPO_ROOT}/target/jq-module"
+  JQ_SRC="${REPO_ROOT}/crates/mqtt-wasm-sandbox/jq-module"
+  mkdir -p "$JQ_DIR"
+  if [ -z "${ZIG:-}" ]; then
+    ZIG="$("$JQ_SRC/fetch-zig.sh" "$JQ_DIR/zig" | tail -n 1)"
+  fi
+  ZIG="$ZIG" JQ_WASM_WORK="$JQ_DIR/work" "$JQ_SRC/build.sh" "$JQ_DIR/jq.wasm" >&2
+  JQ_WANT="$(cut -d' ' -f1 "$JQ_SRC/jq.wasm.sha256")"
+  JQ_GOT="$(sha256sum "$JQ_DIR/jq.wasm" | cut -d' ' -f1)"
+  if [ "$JQ_GOT" != "$JQ_WANT" ]; then
+    echo "jq module: built sha256 $JQ_GOT, the tree records $JQ_WANT" >&2
+    exit 1
+  fi
+  echo "jq module: sha256 $JQ_GOT (the recorded build)" >&2
+  export MQTTD_JQ_WASM="$JQ_DIR/jq.wasm"
+  export MQTTD_JQ_WASM_REQUIRED=1
 fi
 for pkg in "${PACKAGES[@]}"; do
   if [ "$pkg" = "mqttd-fips" ]; then

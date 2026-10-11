@@ -29,7 +29,7 @@ use crate::rules::{rule_def, TraceOutput, TracePayload};
 use crate::rules_sys::{counts_json, output_json, rfc3339_millis, ShownOutput};
 use bytes::Bytes;
 use mqtt_rules::edit::{EditError, RuleEdit};
-use mqtt_rules::{Effect, EventKind, Input, LoadError, Loaded, Outcome, Rule, RuleSet};
+use mqtt_rules::{Effect, EventKind, Functions, Input, LoadError, Loaded, Outcome, Rule, RuleSet};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -473,9 +473,11 @@ fn invalid(node: &str, text: &str, e: &LoadError) -> Answer {
     )
 }
 
-/// Parse `text` as the broker would load it, or answer `422 rules-invalid`.
-fn parse(node: &str, text: &str) -> Result<Loaded, Answer> {
-    RuleSet::parse(text).map_err(|e| invalid(node, text, &e))
+/// Parse `text` as the broker would load it — with what this node's rules may call
+/// (`jq`, where it is switched on; ADR 0086) — or answer `422 rules-invalid`.
+fn parse(node: &str, text: &str, functions: &Functions) -> Result<Loaded, Answer> {
+    crate::rules::noting_the_jq_module(functions, || RuleSet::parse_with(text, functions))
+        .map_err(|e| invalid(node, text, &e))
 }
 
 /// The text a check or a dry run is about: `source`, or `rule` spliced into the file on
@@ -531,12 +533,12 @@ pub async fn check(state: &AdminState, req: &Request) -> Answer {
         return bad_request(&state.node_id, "give source or rule, not both");
     }
     let state = state.clone();
-    one_at_a_time(&access, move || {
+    one_at_a_time(&access.clone(), move || {
         let (text, _) = match candidate(&state, checked.source, checked.rule) {
             Ok(c) => c,
             Err(refusal) => return refusal,
         };
-        let loaded = match parse(&state.node_id, &text) {
+        let loaded = match parse(&state.node_id, &text, access.rules.functions()) {
             Ok(l) => l,
             Err(refusal) => return refusal,
         };
@@ -683,6 +685,7 @@ pub async fn test(state: &AdminState, req: &Request) -> Answer {
     };
     let state = state.clone();
     let running = access.rules.current();
+    let functions = access.rules.functions().clone();
     one_at_a_time(&access, move || {
         let (set, alone) = if t.source.is_none() && t.rule.is_none() {
             (running, t.only)
@@ -691,7 +694,7 @@ pub async fn test(state: &AdminState, req: &Request) -> Answer {
                 Ok(c) => c,
                 Err(refusal) => return refusal,
             };
-            match parse(&node, &text) {
+            match parse(&node, &text, &functions) {
                 Ok(loaded) => (Arc::new(loaded.rules), spliced.or(t.only)),
                 Err(refusal) => return refusal,
             }
@@ -832,8 +835,9 @@ fn evaluate(set: &RuleSet, rule: &Rule, input: &dyn Input) -> Tested {
             // A dry run's input is never a republished message, so no republish is
             // skipped as a loop; were one, it would show nothing.
             Outcome::Recursive(_) => actions += 1,
-            // A dry run is not timed (`evaluate_one` never reports it).
-            Outcome::Elapsed(_) => {}
+            // A dry run is not timed (`evaluate_one` never reports it), and its calls
+            // of `jq` are not counted as traffic.
+            Outcome::Elapsed(_) | Outcome::Function(_) => {}
         },
         &mut effects,
     );
@@ -1067,7 +1071,7 @@ impl RulesWrite<'_> {
             Ok(text) => text,
             Err(e) => return edit_refused(node, &e),
         };
-        let loaded = match parse(node, &text) {
+        let loaded = match parse(node, &text, self.rules.functions()) {
             Ok(l) => l,
             Err(refusal) => return refusal,
         };

@@ -747,3 +747,26 @@ to end, against EMQX 6.3.1's outputs, by `tests/rules_message_events.rs`
 `a_queued_message_that_expired_is_a_dropped_delivery_at_the_resume`,
 `a_delivery_on_another_node_names_its_publisher`,
 `an_unrouted_publish_is_dropped_on_the_node_it_arrived_at`, …).
+
+## Amendment (2026-10-11): `jq` is provided, and a Will's rules leave the hub while rules call it
+
+Two sentences of this record are changed by [ADR 0086](0086-wasm-rule-functions.md), which
+provides EMQX's `jq` function (the real jq, in a WebAssembly sandbox, off unless the
+operator sets `rules.jq = true`):
+
+- **Functions.** `jq` is no longer refused as a function mqttd lacks. A rules file that
+  calls it loads where it is switched on and the host can run it, and is refused, with the
+  reason, everywhere else.
+- **Decision 2, "the one hub-side evaluation is the Will".** That stood on a rule costing
+  microseconds. A rule that calls `jq` may run for as long as its timeout allows (EMQX's
+  default is ten seconds), and everything waits for the hub. So **while the loaded rules
+  call `jq`, the hub hands a Will's rules to a task of their own** instead of evaluating
+  them itself; what they derive is posted back to the hub as before
+  (`HubCommand::RuleDerived`). With no such rule loaded a Will is evaluated where it
+  always was. A client's publish was never evaluated on the hub and still is not: its
+  long `jq` call holds its own connection, and the worker thread under it hands its other
+  connections on (ADR 0086 D6 and its amendment).
+
+Pinned by `a_will_whose_rules_call_jq_does_not_hold_the_hub` and
+`a_ten_second_jq_on_one_connection_does_not_delay_another_connections_publish`
+(`tests/rules_binary.rs`).

@@ -17,16 +17,21 @@
 //!   gets the fuzzer past the section framing and into code that runs; the second
 //!   reaches everything the first cannot say;
 //! * bit 2: calls are bounded by their deadline alone; without it also by fuel;
-//! * bit 3: the module is granted the wall clock.
+//! * bit 3: the module is granted the wall clock;
+//! * bit 4: the module has a hand-off (ADR 0086 D6): a call still running after its
+//!   first slice, 200 µs here, is suspended once and finished inside it.
 //!
 //! Every bound is small, so that no input can make a run slow or large: 8 KiB of
 //! input, 1 MiB of linear memory, 256 KiB of stack, 4 KiB of output, 2 ms a call (and
 //! 20,000 units of fuel), 20 ms to start.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use libfuzzer_sys::fuzz_target;
-use mqtt_wasm_sandbox::{Arg, CallError, Execution, Grants, Limits, LoadError, Reply, Sandbox};
+use mqtt_wasm_sandbox::{
+    Arg, CallError, Execution, Grants, HandOff, Limits, LoadError, Reply, Sandbox,
+};
 
 const MAX_INPUT: usize = 8 * 1024;
 const MEMORY: usize = 1 << 20;
@@ -182,6 +187,7 @@ fuzz_target!(|data: &[u8]| {
         cancel_grace: Duration::from_millis(1),
         init_timeout: Duration::from_millis(20),
         max_fuel: (how & 4 == 0).then_some(20_000),
+        first_slice: Duration::from_micros(200),
     };
     let grants = Grants {
         clock: how & 8 != 0,
@@ -202,6 +208,12 @@ fuzz_target!(|data: &[u8]| {
         }
     };
     assert!(sandbox.description().len() <= MAX_OUTPUT as usize + 1);
+    let sandbox = if how & 16 == 0 {
+        sandbox
+    } else {
+        let hand_off: HandOff = Arc::new(|rest: &mut dyn FnMut()| rest());
+        sandbox.with_hand_off(hand_off)
+    };
     let Ok(mut instance) = sandbox.instantiate() else {
         return;
     };

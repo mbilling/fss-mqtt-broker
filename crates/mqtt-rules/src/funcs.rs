@@ -7,10 +7,14 @@
 //! A call with an argument of the wrong type fails the rule's SQL (counted as a
 //! failure), as EMQX's does.
 //!
-//! Deliberately absent (docs/RULES.md lists them): `jq`, schema registry and Sparkplug
+//! Deliberately absent (docs/RULES.md lists them): schema registry and Sparkplug
 //! functions, `maptab_lookup`, the `MongoDB` date helpers, the process-dictionary and
 //! `kv_store_*` state functions (ADR 0085 designs rule state), and `term_encode` /
 //! `term_decode`.
+//!
+//! `jq` is here and is not like the others: it runs in a WebAssembly sandbox
+//! (ADR 0086, [`crate::jq`]), and a rules file may call it only where the broker's
+//! operator has switched it on.
 
 mod compress;
 mod erl_string;
@@ -34,6 +38,8 @@ pub(crate) struct FnCtx<'a> {
     /// The load-time-compiled pattern (or why it does not compile) when the function's
     /// regex argument is a literal.
     pub regex: Option<&'a Compiled>,
+    /// What runs `jq`, for a call of it.
+    pub jq: Option<&'a crate::jq::Jq>,
 }
 
 /// A built-in function.
@@ -486,6 +492,8 @@ funcs! {
     };
     "json_decode" 1..=1 => |a, _| json_decode(bin(&a[0])?);
     "json_encode" 1..=1 => |a, _| Ok(Value::from(a[0].to_json()?));
+    // `emqx_rule_funcs:jq/2,3`, in the sandbox (ADR 0086).
+    "jq" 2..=3 => jq;
     "bin2hexstr" 1..=2 => |a, _| {
         let hex = mqtt_core::hex_lower(bin(&a[0])?).to_uppercase();
         Ok(Value::from(match hex_prefix(a.get(1))? {
@@ -621,6 +629,79 @@ funcs! {
             Some(path) => Ok(get_path(&decode_if_text(&p), &dotted(text(path)?)).unwrap_or_default()),
         }
     };
+}
+
+/// `jq(Program, Input)` and `jq(Program, Input, TimeoutMs)`: every output of the jq
+/// program, as an array. See [`crate::jq`] for what is EMQX's and what is not.
+///
+/// The call is reported ([`FunctionCall`](crate::jq::FunctionCall)) whatever its end.
+fn jq(a: &[Value], cx: &FnCtx) -> Result<Value, EvalError> {
+    let Some(jq) = cx.jq else {
+        // A rules file that calls `jq` loads only with one.
+        return Err(EvalError::new(crate::jq::SWITCHED_OFF));
+    };
+    let started = std::time::Instant::now();
+    let result = jq_call(jq, a, cx);
+    cx.ctx.calls.borrow_mut().push(crate::jq::FunctionCall {
+        function: "jq",
+        elapsed: started.elapsed(),
+        error: result.as_ref().err().map(|e| e.kind),
+        module: jq.stats(),
+    });
+    result.map_err(|e| EvalError::new(e.text))
+}
+
+fn jq_call(jq: &crate::jq::Jq, a: &[Value], cx: &FnCtx) -> Result<Value, crate::jq::Failure> {
+    use crate::jq::Failure;
+    let argument = |text: String| Failure {
+        text,
+        kind: "argument",
+    };
+    // EMQX looks at the timeout first (`jq:process_json/3`), then at the program.
+    let timeout = match a.get(2) {
+        None => Some(jq.default_timeout()),
+        Some(Value::Int(ms)) if *ms >= 0 => Some(std::time::Duration::from_millis(
+            u64::try_from(*ms).unwrap_or(u64::MAX),
+        )),
+        // An integer of 64 bits or fewer is a timeout Erlang's timer takes, and one
+        // that never comes.
+        Some(Value::Big(ms)) if ms.sign() == num_bigint::Sign::Plus && ms.bits() <= 64 => None,
+        // Past that `timer:apply_after/4` refuses it and the NIF's match on its
+        // answer fails.
+        Some(Value::Big(ms)) if ms.sign() == num_bigint::Sign::Plus => {
+            return Err(argument("{badmatch,{error,badarg}}".to_string()));
+        }
+        Some(other) => {
+            let got = io_format::format(b"~p", std::slice::from_ref(other), MAX_BUILT_BYTES)
+                .map_or_else(
+                    |_| other.type_name().to_string(),
+                    |text| String::from_utf8_lossy(&text).into_owned(),
+                );
+            return Err(argument(format!(
+                "bad_timeout_val: Needs positive integer or infinity but got {got}"
+            )));
+        }
+    };
+    // `jq/3`'s clauses take a binary program; anything else is no clause at all.
+    let Some(program) = a[0].as_bytes().filter(|_| a[0].is_binary()) else {
+        return Err(argument(format!(
+            "the program must be a string, got a {}",
+            a[0].type_name()
+        )));
+    };
+    // What is left of the message's build budget is the most this call may return,
+    // and what it returns is charged to it (ADR 0086 D7).
+    let left = MAX_BUILT_BYTES.saturating_sub(cx.ctx.built.get());
+    let outputs = jq.call(program, &a[1], timeout, left)?;
+    cx.ctx
+        .built
+        .set(cx.ctx.built.get().saturating_add(outputs.len()));
+    // Each output through the rule engine's reader, as `emqx_utils_json:decode/1`
+    // reads each: one it refuses (`1E+1000`) fails the rule.
+    json_decode(&outputs).map_err(|e| Failure {
+        text: format!("an output of the program is not JSON the rule engine reads: {e}"),
+        kind: "decode",
+    })
 }
 
 /// Look up a function by name.

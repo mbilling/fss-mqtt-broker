@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::funcs::{self, Compiled, Func};
+use crate::jq::{Functions, Jq, JqSwitch};
 use crate::lexer::{lex, Kw, Spanned, Tok};
 use crate::value::Value;
 use crate::{ParseError, MAX_REGEX_LITERALS_PER_FILE, MAX_REGEX_LITERAL_BYTES_PER_FILE};
@@ -111,6 +112,8 @@ pub(crate) enum Expr {
         /// The pattern of a regex function, compiled at load time when it is a literal
         /// (or why it does not compile: the call fails, as in EMQX).
         regex: Option<Compiled>,
+        /// For `jq`: what runs it (ADR 0086), which the rules were loaded with.
+        jq: Option<Arc<Jq>>,
     },
 }
 
@@ -142,10 +145,11 @@ pub(crate) struct Statement {
 }
 
 /// Parse one statement. Returns it with any warnings worth showing the author. Its
-/// literal regex patterns are compiled through `regexes`, which a whole rules file shares.
+/// literal regex patterns are compiled through `loading`, which a whole rules file
+/// shares, and its calls of `jq` are resolved against what the file is loaded with.
 pub(crate) fn parse(
     sql: &str,
-    regexes: &mut RegexPool,
+    loading: &mut Loading<'_>,
 ) -> Result<(Statement, Vec<String>), ParseError> {
     let toks = lex(sql)?;
     let mut p = Parser {
@@ -154,10 +158,51 @@ pub(crate) fn parse(
         pos: 0,
         warnings: Vec::new(),
         nest: 0,
-        regexes,
+        loading,
     };
     let stmt = p.statement()?;
     Ok((stmt, p.warnings))
+}
+
+/// What one rules file is loaded with and what its statements have used so far.
+#[derive(Debug)]
+pub(crate) struct Loading<'f> {
+    /// The literal regex patterns compiled so far.
+    pub regexes: RegexPool,
+    /// What the file may call beyond the built-in functions.
+    pub functions: &'f Functions,
+    /// The `jq` the file's statements call, once one does.
+    pub jq: Option<Arc<Jq>>,
+    /// The jq programs the statements spell out, each once.
+    pub jq_programs: Vec<Arc<str>>,
+}
+
+impl<'f> Loading<'f> {
+    pub(crate) fn new(functions: &'f Functions) -> Self {
+        Self {
+            regexes: RegexPool::default(),
+            functions,
+            jq: None,
+            jq_programs: Vec::new(),
+        }
+    }
+
+    /// What runs a call of `jq` in the file being loaded, or why the file cannot be
+    /// loaded (ADR 0086 D13). The first call compiles the module, when no earlier
+    /// load of this process has.
+    fn jq(&mut self) -> Result<Arc<Jq>, String> {
+        if let Some(jq) = &self.jq {
+            return Ok(jq.clone());
+        }
+        let jq = match &self.functions.jq {
+            JqSwitch::Off => return Err(crate::jq::SWITCHED_OFF.to_string()),
+            JqSwitch::Unavailable(why) => return Err(format!("jq is not available: {why}")),
+            JqSwitch::On(jq) => jq,
+        };
+        jq.load()?;
+        self.jq = Some(jq.clone());
+        Ok(jq.clone())
+    }
 }
 
 /// The literal regex patterns one rules file has compiled (ADR 0084 D3), each once.
@@ -214,18 +259,18 @@ const MAX_NESTING: usize = 64;
 /// A parsed expression and its height.
 type Parsed = Result<(Expr, usize), ParseError>;
 
-struct Parser<'a> {
+struct Parser<'a, 'f> {
     sql: &'a str,
     toks: Vec<Spanned>,
     pos: usize,
     warnings: Vec<String>,
     /// Current recursion depth (see [`MAX_NESTING`]).
     nest: usize,
-    /// Where literal regex patterns are compiled (see [`RegexPool`]).
-    regexes: &'a mut RegexPool,
+    /// Where literal regex patterns are compiled (see [`RegexPool`]), and what `jq` is.
+    loading: &'a mut Loading<'f>,
 }
 
-impl Parser<'_> {
+impl Parser<'_, '_> {
     fn peek(&self) -> &Tok {
         &self.toks[self.pos].tok
     }
@@ -836,6 +881,7 @@ impl Parser<'_> {
         let regex = match func.regex_arg.and_then(|i| args.get(i)) {
             Some(Expr::Const(Value::Str(pattern))) => {
                 let re = self
+                    .loading
                     .regexes
                     .get(pattern)
                     .map_err(|e| ParseError::at(self.sql, start, e))?;
@@ -850,8 +896,36 @@ impl Parser<'_> {
             }
             _ => None,
         };
+        let jq = if func.name == "jq" {
+            let jq = self
+                .loading
+                .jq()
+                .map_err(|e| ParseError::at(self.sql, start, e))?;
+            if let Some(Expr::Const(Value::Str(program))) = args.first() {
+                if !self.loading.jq_programs.contains(program) {
+                    // EMQX accepts a rule whose program does not compile and fails it on
+                    // every message; so does this engine, and says so at load.
+                    if let Err(e) = jq.check_program(program.as_bytes()) {
+                        self.warnings
+                            .push(format!("jq(): {e}; every call fails the rule, as in EMQX"));
+                    }
+                    self.loading.jq_programs.push(program.clone());
+                }
+            }
+            Some(jq)
+        } else {
+            None
+        };
         let h = self.node(h)?;
-        Ok((Expr::Call { func, args, regex }, h))
+        Ok((
+            Expr::Call {
+                func,
+                args,
+                regex,
+                jq,
+            },
+            h,
+        ))
     }
 }
 

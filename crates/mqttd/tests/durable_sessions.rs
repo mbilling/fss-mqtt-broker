@@ -933,7 +933,7 @@ async fn a_replica_serves_the_session_after_the_owner_dies() {
     // Generous: post-death takeover means a Raft reconfiguration (drop the dead voter)
     // plus a first-touch quorum log rebuild, which can run long on a contended CI runner.
     // A deterministic simulation harness (ADR 0024-T7) would remove the wall-clock margin.
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + Duration::from_mins(2);
     let pending = loop {
         if let Ok(p) = new_owner_node.store.pending(&client, 0, 100).await {
             if !p.is_empty() {
@@ -1118,7 +1118,7 @@ async fn a_bounded_voter_cluster_owns_every_session_on_a_voter_and_survives_fail
     })
     .await;
     // The session replays intact, still served from the surviving voter owner.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     let pending = loop {
         if let Ok(p) = owner_node.store.pending(&client, 0, 100).await {
             if !p.is_empty() {
@@ -1227,7 +1227,7 @@ async fn the_scale_out_domain_owns_sessions_on_learners_that_serve() {
         QoS::AtLeastOnce,
         false,
     );
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     loop {
         if learner.store.enqueue(&client, &msg).await.is_ok() {
             break;
@@ -1292,7 +1292,7 @@ async fn growing_the_scaled_out_cluster_migrates_ownership_with_zero_acked_loss(
             QoS::AtLeastOnce,
             false,
         );
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_mins(1);
         loop {
             let owner = n1.placement.read().unwrap().owner(&client.0);
             let node = seed_nodes.iter().find(|n| n.node_id == owner);
@@ -1335,7 +1335,7 @@ async fn growing_the_scaled_out_cluster_migrates_ownership_with_zero_acked_loss(
         .collect();
     let newcomer_ids: BTreeSet<NodeId> =
         [&n4, &n5, &n6].iter().map(|n| n.node_id.clone()).collect();
-    wait_until(Duration::from_secs(60), || {
+    wait_until(Duration::from_mins(1), || {
         let p = n1.placement.read().unwrap();
         sessions
             .iter()
@@ -1374,7 +1374,7 @@ async fn growing_the_scaled_out_cluster_migrates_ownership_with_zero_acked_loss(
         QoS::AtLeastOnce,
         false,
     );
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     loop {
         if node.store.enqueue(&fresh, &msg).await.is_ok() {
             break;
@@ -1427,7 +1427,7 @@ async fn pre_grow_history_survives_migration_onto_data_less_newcomers() {
             QoS::AtLeastOnce,
             false,
         );
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_mins(1);
         loop {
             let owner = n1.placement.read().unwrap().owner(&client.0);
             let node = seed_nodes.iter().find(|n| n.node_id == owner);
@@ -1456,7 +1456,7 @@ async fn pre_grow_history_survives_migration_onto_data_less_newcomers() {
     .await;
     let newcomer_ids: std::collections::BTreeSet<NodeId> =
         [&n4, &n5, &n6].iter().map(|n| n.node_id.clone()).collect();
-    wait_until(Duration::from_secs(60), || {
+    wait_until(Duration::from_mins(1), || {
         let p = n1.placement.read().unwrap();
         sessions
             .iter()
@@ -1468,7 +1468,7 @@ async fn pre_grow_history_survives_migration_onto_data_less_newcomers() {
     // CURRENT owner — the stranded-NoQuorum livelock is gone.
     for client in &sessions {
         let expect = format!("acked-{}", client.0).into_bytes();
-        let deadline = Instant::now() + Duration::from_secs(120);
+        let deadline = Instant::now() + Duration::from_mins(2);
         let mut last: String = "never polled".into();
         loop {
             let owner = n1.placement.read().unwrap().owner(&client.0);

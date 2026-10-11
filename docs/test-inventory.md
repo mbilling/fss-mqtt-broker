@@ -739,7 +739,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `publish_codec_round_trip_clears_the_floor`
 
-## `crates/mqtt-config/src/lib.rs` — 45 test(s)
+## `crates/mqtt-config/src/lib.rs` — 46 test(s)
 
 - `tests::a_backup_dir_inside_the_data_dir_is_a_config_error`
 - `tests::a_bad_enum_value_is_rejected`
@@ -775,6 +775,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_admin_listener_needs_tls_a_role_and_its_own_bind`
 - `tests::the_env_surface_is_a_deduplicated_curated_list`
 - `tests::the_gossip_key_is_inline_xor_by_reference`
+- `tests::the_jq_keys_load_from_file_and_environment`
 - `tests::the_new_per_subscriber_bounds_are_refused_out_of_range`
 - `tests::the_refound_guard_defaults_on_and_env_can_disable_it`
 - `tests::the_refusal_lists_all_unknown_keys`
@@ -874,7 +875,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tls::tls12_hardening_tests::the_tls12_suites_are_exactly_the_allowlist`
 - `tls::tls12_hardening_tests::tls12_session_tickets_are_off`
 
-## `crates/mqtt-observability/src/lib.rs` — 18 test(s)
+## `crates/mqtt-observability/src/lib.rs` — 19 test(s)
 
 - `audit_export::tests::a_full_queue_sheds_and_counts_instead_of_blocking`
 - `audit_export::tests::frames_reach_a_tcp_listener_and_flush_waits`
@@ -886,6 +887,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `metrics::tests::otlp_export_posts_to_the_endpoint`
 - `metrics::tests::render_produces_valid_openmetrics_exposition`
 - `metrics::tests::rule_counts_read_back_without_creating_a_series`
+- `metrics::tests::sandboxed_function_calls_are_counted_by_function_and_kind`
 - `metrics::tests::scaling_metrics_render_with_their_documented_names`
 - `tests::a_restart_is_a_new_chain_not_a_truncation`
 - `tests::audit_log_hash_chains_recorded_events`
@@ -895,7 +897,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-rules/src/lib.rs` — 169 test(s)
+## `crates/mqtt-rules/src/lib.rs` — 171 test(s)
 
 - `edit::tests::a_json_rule_body_is_a_rule_edit`
 - `edit::tests::an_insert_appends_the_rule_at_the_end`
@@ -921,6 +923,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `template::tests::the_literal_prefix_is_the_text_before_the_first_placeholder`
 - `template::tests::this_is_the_whole_output`
 - `tests::a_bad_rendered_topic_fails_the_action_not_the_rule`
+- `tests::a_build_without_jq_says_why_the_switch_has_nothing_to_turn_on`
 - `tests::a_failing_select_field_fails_the_rule_even_when_the_where_is_false`
 - `tests::a_file_may_compile_only_so_many_distinct_regular_expressions`
 - `tests::a_literal_qos_or_retain_that_can_never_be_valid_fails_the_load`
@@ -932,6 +935,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::a_pattern_that_is_not_utf8_means_its_own_bytes`
 - `tests::a_republish_into_sys_fails_its_action`
 - `tests::a_rule_never_sees_the_dup_flag`
+- `tests::a_rules_file_that_calls_jq_does_not_load_while_jq_is_switched_off`
 - `tests::addresses_print_as_emqx_prints_them`
 - `tests::an_invalid_pattern_loads_with_a_warning_and_fails_each_call`
 - `tests::arithmetic_follows_erlang`
@@ -1161,14 +1165,18 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_no_wildcard_fast_path_returns_exactly_the_named_topic`
 - `tests::unacked_messages_survive_for_replay`
 
-## `crates/mqtt-wasm-sandbox/src/lib.rs` — 25 test(s)
+## `crates/mqtt-wasm-sandbox/src/lib.rs` — 31 test(s)
 
+- `tests::a_call_is_held_to_its_own_bound_on_the_result`
 - `tests::a_call_returns_the_modules_value`
 - `tests::a_call_runs_the_same_interpreted`
+- `tests::a_call_that_outlasts_its_first_slice_goes_on_inside_the_hand_off`
 - `tests::a_fuel_bound_stops_the_same_work_at_the_same_point_every_time`
+- `tests::a_hand_off_that_misbehaves_does_not_lose_or_repeat_the_call`
 - `tests::a_module_without_the_abi_is_refused_at_load`
 - `tests::a_modules_own_error_is_its_status_and_message_and_the_instance_lives_on`
 - `tests::a_pool_compiles_on_first_use_and_shares_warm_instances`
+- `tests::a_pool_replaces_an_instance_a_call_stopped_and_counts_it`
 - `tests::a_pool_whose_module_cannot_load_says_why_on_every_call`
 - `tests::a_result_larger_than_the_limit_is_refused_unread`
 - `tests::a_small_fuel_bound_still_loads_and_runs_a_module`
@@ -1176,10 +1184,12 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::an_endless_loop_stops_at_the_deadline_and_poisons_only_its_instance`
 - `tests::an_import_on_the_list_is_provided`
 - `tests::an_import_outside_the_list_is_refused_at_load`
+- `tests::an_interpreted_call_is_handed_off_too`
 - `tests::another_abi_version_is_refused_at_load`
 - `tests::bytes_that_are_not_a_module_are_refused_at_load`
 - `tests::damaged_modules_are_refused_or_run_under_the_limits`
 - `tests::endless_recursion_overflows_the_modules_stack_and_not_the_hosts`
+- `tests::every_call_is_handed_off_at_the_end_of_its_own_first_slice`
 - `tests::every_call_stops_at_its_own_deadline_and_a_call_without_one_is_left_alone`
 - `tests::instances_share_no_state`
 - `tests::memory_growth_stops_at_the_cap`
@@ -1237,7 +1247,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 605 test(s)
+## `crates/mqttd/src/lib.rs` — 608 test(s)
 
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
@@ -1824,6 +1834,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `rules::tests::a_publish_carries_an_origin_only_while_a_message_event_is_wanted`
 - `rules::tests::a_rule_definition_hash_is_keyed_per_process`
 - `rules::tests::gated_derived_actions_are_counted_by_their_fate`
+- `rules::tests::jq_is_not_asked_for_unless_the_config_switches_it_on`
+- `rules::tests::the_hand_off_just_goes_on_where_there_is_no_worker_to_free`
+- `rules::tests::the_hand_off_lets_the_workers_other_tasks_run`
 - `rules::tests::the_insecure_trace_line_is_logged_once_per_change`
 - `rules::tests::the_publisher_hears_exactly_the_originals_answer`
 - `rules_sys::tests::a_payload_is_text_when_it_is_and_base64_when_not`
@@ -2322,7 +2335,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `rules_republishing_into_each_other_stop_at_the_depth_cap`
 - `the_original_s_limits_cover_the_whole_chain`
 
-## `crates/mqttd/tests/rules_binary.rs` — 47 test(s)
+## `crates/mqttd/tests/rules_binary.rs` — 55 test(s)
 
 - `a_closed_stdout_leaves_probe_and_backup_their_exit_status`
 - `a_closed_stdout_neither_panics_a_command_nor_changes_its_exit_status`
@@ -2338,9 +2351,12 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_rule_written_into_the_main_config_is_refused_with_where_rules_go`
 - `a_rules_file_that_does_not_load_on_sighup_is_rejected_and_the_old_rules_keep_working`
 - `a_shared_group_receives_derived_messages_balanced_across_members`
+- `a_ten_second_jq_on_one_connection_does_not_delay_another_connections_publish`
 - `a_will_runs_the_rules_in_force_when_the_broker_publishes_it`
+- `a_will_whose_rules_call_jq_does_not_hold_the_hub`
 - `an_acl_denied_publish_runs_no_rules`
 - `an_admin_rules_edit_applies_to_the_next_message`
+- `check_config_reports_whether_this_host_can_run_jq_while_it_is_switched_on`
 - `check_rules_accepts_a_valid_file_and_lists_every_rule`
 - `check_rules_exits_2_on_a_usage_error`
 - `check_rules_loads_1024_rules_and_refuses_1025`
@@ -2357,6 +2373,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `client_disconnected_reports_normal_tcp_closed_and_a_v5_reason_by_its_emqx_name`
 - `env_configured_rule_statistics_and_trace_reach_a_subscriber`
 - `in_a_two_process_cluster_a_publish_is_evaluated_once_on_its_landing_node`
+- `jq_is_off_by_default_and_a_rules_file_that_calls_it_does_not_load`
+- `jq_rules_are_applied_live_through_the_admin_api_and_refused_where_jq_is_off`
+- `jq_runs_in_the_broker_with_emqx_results_limits_and_metrics`
+- `jq_sees_only_the_environment_variables_the_operator_listed`
 - `no_local_does_not_suppress_a_derived_message_for_its_publisher`
 - `rule_test_event_picks_among_several_events`
 - `rule_test_prints_an_output_exactly_as_the_rule_renders_it`
@@ -2364,6 +2384,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `rule_test_refuses_an_input_the_rule_would_never_see`
 - `rule_test_runs_a_topics_and_events_statement_against_a_publish_unless_event_is_given`
 - `rule_test_runs_an_events_statement_against_a_sample_event`
+- `rule_test_runs_jq_with_the_results_emqx_gives`
 - `session_subscribed_fires_once_per_granted_filter`
 - `session_unsubscribed_fires_once_per_filter_actually_removed`
 - `sighup_swaps_the_rules_for_a_client_that_stays_connected`
