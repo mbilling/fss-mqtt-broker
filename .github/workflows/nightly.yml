@@ -151,6 +151,8 @@ jobs:
             target: rules_parse # rules TOML + SQL (operator file, hot-reloaded; ADR 0083)
           - crate: crates/mqtt-rules
             target: rules_eval # rule evaluation over publisher-controlled payloads
+          - crate: crates/mqtt-wasm-sandbox
+            target: module_load # WebAssembly module files and what they run (operator file; ADR 0086)
     # libFuzzer needs nightly rustc. PINNED (not floating @nightly): the 2026-07-24+
     # nightlies ICE in codegen ("not immediate: OperandRef(Uninit ...)", a
     # rustc_codegen_ssa bug) while compiling the tokio-runtime types the mqtt-cluster

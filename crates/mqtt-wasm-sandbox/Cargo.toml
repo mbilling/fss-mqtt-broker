@@ -1,0 +1,42 @@
+[package]
+name = "mqtt-wasm-sandbox"
+description = "ADR 0086: rule functions run as WebAssembly modules in a sandbox — the real jq first"
+version.workspace = true
+edition.workspace = true
+# wasmtime 49 needs 1.96; the workspace as a whole still declares 1.88 (ADR 0086).
+rust-version = "1.96"
+license.workspace = true
+publish = false
+
+[dependencies]
+# The runtime (Apache-2.0 WITH LLVM-exception, MSRV 1.96): Cranelift compiles a module
+# to machine code when it is loaded. Not the defaults, only:
+#   runtime, cranelift, std  the runtime and its compiler;
+#   async                    a call runs on a stack of its own (a fiber), so a module's
+#                            recursion can never reach the end of the caller's stack;
+#   pulley                   the runtime's interpreter, for hosts that forbid
+#                            executable memory (`Execution::Interpreted`).
+# No component model, no WASI, no garbage collector, no threads, no on-disk code cache,
+# no profiling or debugger hooks, no text format, no parallel compilation (rayon), no
+# backtraces.
+wasmtime = { version = "49.0.2", default-features = false, features = ["runtime", "cranelift", "async", "pulley", "std"] }
+
+[dev-dependencies]
+# The rule engine's exact JSON writer and reader: the jq tests marshal as a rule would.
+mqtt-rules = { path = "../mqtt-rules" }
+# Reads the EMQX oracle file (programs and outputs are base64 there).
+base64 = "0.23"
+# The module file's hash against the recorded one.
+sha2 = "0.11"
+
+[features]
+# The tests and examples that need jq.wasm (`jq-module/build.sh`, not checked in).
+# Off by default, so a build without the Wasm toolchain stays whole.
+jq-module = []
+
+[[test]]
+name = "jq_module"
+required-features = ["jq-module"]
+
+[lints]
+workspace = true

@@ -72,6 +72,7 @@ updates:
       - /crates/mqtt-auth/fuzz
       - /crates/mqtt-cluster/fuzz
       - /crates/mqtt-codec/fuzz
+      - /crates/mqtt-wasm-sandbox/fuzz
     schedule:
       interval: weekly
       day: monday

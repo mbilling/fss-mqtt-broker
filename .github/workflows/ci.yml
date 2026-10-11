@@ -28,6 +28,9 @@ jobs:
     timeout-minutes: 5
     outputs:
       code: ${{ steps.diff.outputs.code }}
+      # The WebAssembly sandbox lane (ADR 0086) builds a compiler's worth of crates in
+      # release mode, so it runs only when something it is built from changed.
+      sandbox: ${{ steps.diff.outputs.sandbox }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -41,11 +44,13 @@ jobs:
             BASE="${{ github.event.before }}"
           fi
           if [ -z "$BASE" ] || ! git cat-file -e "$BASE" 2>/dev/null; then
-            echo "code=true" >> "$GITHUB_OUTPUT"; echo "no usable base — fail open"; exit 0
+            echo "code=true" >> "$GITHUB_OUTPUT"; echo "sandbox=true" >> "$GITHUB_OUTPUT"
+            echo "no usable base — fail open"; exit 0
           fi
           FILES=$(git diff --name-only "$BASE"...HEAD || true)
           if [ -z "$FILES" ]; then
-            echo "code=true" >> "$GITHUB_OUTPUT"; echo "empty diff — fail open"; exit 0
+            echo "code=true" >> "$GITHUB_OUTPUT"; echo "sandbox=true" >> "$GITHUB_OUTPUT"
+            echo "empty diff — fail open"; exit 0
           fi
           echo "$FILES"
           CODE=false
@@ -59,8 +64,20 @@ jobs:
               *) CODE=true; break ;;
             esac
           done <<< "$FILES"
+          # The sandbox lane's inputs: the crate, the rule engine whose JSON reader and
+          # writer its tests marshal with, the dependency graph, the toolchain, and
+          # this file.
+          SANDBOX=false
+          while IFS= read -r f; do
+            case "$f" in
+              crates/mqtt-wasm-sandbox/*|crates/mqtt-rules/*) SANDBOX=true; break ;;
+              Cargo.lock|Cargo.toml|rust-toolchain.toml|deny.toml) SANDBOX=true; break ;;
+              .github/workflows/ci.yml|deploy/systemd/mqttd.service) SANDBOX=true; break ;;
+            esac
+          done <<< "$FILES"
           echo "code=$CODE" >> "$GITHUB_OUTPUT"
-          echo "verdict: code=$CODE"
+          echo "sandbox=$SANDBOX" >> "$GITHUB_OUTPUT"
+          echo "verdict: code=$CODE sandbox=$SANDBOX"
 
   test:
     name: build, test, lint
@@ -144,6 +161,78 @@ jobs:
         run: cargo check -p mqttd --features fips --all-targets
       - name: fips posture tests
         run: cargo test -p mqtt-net --lib --features fips
+
+  wasm-sandbox:
+    name: wasm sandbox (jq module from pinned sources, EMQX oracle, limits)
+    needs: changes
+    if: needs.changes.outputs.sandbox == 'true'
+    runs-on: ubuntu-latest
+    # ADR 0086 T1. Two things no other lane does: it BUILDS the jq module — EMQX's
+    # jq, C, compiled to WebAssembly — from sources and a compiler pinned by hash,
+    # and fails unless the result is byte for byte the file whose sha256 the tree
+    # records; and it runs that module through the sandbox against 285 answers
+    # recorded from EMQX itself, with the time, memory, stack and output limits.
+    # A cold run is the compiler download, ~100 C files and a release build of the
+    # runtime; both are cached.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master; `with:` selects the toolchain
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: wasm-sandbox
+      # The module is a pure function of these files (the script names the source
+      # commits and their tarball hashes; fetch-zig.sh the compiler's), so the cache
+      # key is their content. A hit skips the build, never the comparison below.
+      - name: Cache the built module
+        id: module
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: crates/mqtt-wasm-sandbox/jq-module/jq.wasm
+          key: jq-wasm-${{ hashFiles('crates/mqtt-wasm-sandbox/jq-module/build.sh', 'crates/mqtt-wasm-sandbox/jq-module/fetch-zig.sh', 'crates/mqtt-wasm-sandbox/jq-module/shim.c', 'crates/mqtt-wasm-sandbox/jq-module/compat.c', 'crates/mqtt-wasm-sandbox/jq-module/compat.h', 'crates/mqtt-wasm-sandbox/jq-module/jq.wasm.sha256') }}
+      - name: Build jq.wasm from pinned sources with the pinned compiler
+        if: steps.module.outputs.cache-hit != 'true'
+        run: |
+          ZIG="$(crates/mqtt-wasm-sandbox/jq-module/fetch-zig.sh "$RUNNER_TEMP/zig" | tail -n 1)"
+          ZIG="$ZIG" JQ_WASM_WORK="$RUNNER_TEMP/jq-wasm" crates/mqtt-wasm-sandbox/jq-module/build.sh
+      - name: The module is byte for byte the recorded build
+        working-directory: crates/mqtt-wasm-sandbox/jq-module
+        run: sha256sum --check --strict jq.wasm.sha256
+      # Release mode: the tests include two programs that run into EMQX's own
+      # ten-second timeout, and the whole oracle a second time in the interpreter.
+      - name: Sandbox tests, the EMQX oracle and the limits (release)
+        run: cargo test --release --locked -p mqtt-wasm-sandbox --features jq-module
+      # The compiled mode needs memory the process may map executable. The shipped
+      # systemd unit forbids exactly that (MemoryDenyWriteExecute), so the failure
+      # mode is checked under the real thing rather than described: compiled code is
+      # REFUSED with an error (not a crash), and the interpreter runs. The hardening
+      # properties are read out of the unit so this cannot drift from what ships.
+      - name: Under the shipped unit's hardening the compiler is refused and the interpreter runs
+        run: |
+          cargo build --release --locked -p mqtt-wasm-sandbox --example probe
+          target/release/examples/probe compiled=runs interpreted=runs
+          PROPS=()
+          for key in MemoryDenyWriteExecute SystemCallFilter SystemCallArchitectures \
+                     SystemCallErrorNumber LockPersonality NoNewPrivileges RestrictRealtime \
+                     RestrictNamespaces; do
+            value="$(sed -n "s/^${key}=//p" deploy/systemd/mqttd.service | head -n 1)"
+            if [ -n "$value" ]; then PROPS+=(-p "${key}=${value}"); fi
+          done
+          echo "systemd-run ${PROPS[*]}"
+          case " ${PROPS[*]} " in
+            *" MemoryDenyWriteExecute=true "*) ;;
+            *) echo "the unit no longer sets MemoryDenyWriteExecute=true"; exit 1 ;;
+          esac
+          sudo systemd-run --wait --pipe --collect --quiet "${PROPS[@]}" \
+            "$PWD/target/release/examples/probe" compiled=refused interpreted=runs
+      # What loading costs on this runner (the compile a broker pays once, when rules
+      # that call jq are loaded), for the record in the log.
+      - name: Measurements (module load, instantiate, timeouts, limits)
+        run: |
+          cargo build --release --locked -p mqtt-wasm-sandbox --features jq-module --example measure
+          MEASURE_LOADS=3 target/release/examples/measure crates/mqtt-wasm-sandbox/jq-module/jq.wasm
 
   docs:
     name: delivery dashboard
