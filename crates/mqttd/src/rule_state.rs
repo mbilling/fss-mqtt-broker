@@ -49,6 +49,18 @@
 //! While a loaded rule selects `$events/state/expired` no call removes one: an expired
 //! key is **held** until the sweep has handed its event over (see [`expiry`]).
 //!
+//! # Counting a message once
+//!
+//! `kv_incr` with an idempotency key (D8) is the one call that works on two keys: the
+//! entry that remembers the idempotency key ([`Remembered`]), and the counter. They
+//! are in different shards more often than not, and no call holds two shard locks, so
+//! it is two operations, each under its own lock ([`Handle::incr_once`]): the entry
+//! is inserted if it is not there, which decides under that one lock which of any
+//! number of calls with the same idempotency key is the first, and only that call
+//! then increments. A first call whose increment is refused takes its entry out
+//! again, so the refusal is the rule's error and the message is counted when it comes
+//! again. `kv_incr` without an idempotency key does none of this.
+//!
 //! # A namespace's life
 //!
 //! The store holds its namespaces weakly; a loaded rule set holds them. A namespace a
@@ -67,8 +79,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 use mqtt_rules::crdt::{Counts, CountsError, Data, Elements, Hlc, Hll, SetFull, Stamp};
 use mqtt_rules::state::{
-    Consistency, Eviction, NamespaceSettings, StateError, StateNamespace, StateOp, StateReply,
-    StateStore, Stored, BROWNOUT, MAX_SET_ELEMENTS, NAMESPACE_FULL, STORE_FULL, WRONG_TYPE,
+    Consistency, Eviction, NamespaceSettings, Remembered, StateError, StateNamespace, StateOp,
+    StateReply, StateStore, Stored, BROWNOUT, MAX_SET_ELEMENTS, NAMESPACE_FULL, STORE_FULL,
+    WRONG_TYPE,
 };
 use mqtt_rules::Value;
 
@@ -1089,6 +1102,7 @@ fn op_key<'a>(op: &StateOp<'a>) -> &'a [u8] {
         | StateOp::Set { key, .. }
         | StateOp::SetOnce { key, .. }
         | StateOp::Incr { key, .. }
+        | StateOp::IncrOnce { key, .. }
         | StateOp::Extreme { key, .. }
         | StateOp::Add { key, .. }
         | StateOp::Del { key }
@@ -1230,6 +1244,8 @@ impl Handle {
                 }
                 None => insert!(counter(by), NUMBER_BYTES, ttl, Some(Value::Int(by))),
             },
+            // Two keys, so never one map operation: `incr_once` takes it apart.
+            StateOp::IncrOnce { .. } => Step::NeedRoom(Refusal::Other),
             StateOp::Extreme {
                 value,
                 largest,
@@ -1437,13 +1453,25 @@ impl StateNamespace for Handle {
 impl Handle {
     /// [`call`](StateNamespace::call), before a refusal is counted by operation.
     fn answer(&self, op: &StateOp<'_>) -> Result<StateReply, StateError> {
+        if let StateOp::IncrOnce { key, by, ttl, once } = *op {
+            return self.incr_once(op, &StateOp::Incr { key, by, ttl }, once);
+        }
         if let Some(replica) = &self.namespace.replica {
             return replica.call(self, op);
         }
+        self.with_room(|| self.attempt(op))
+    }
+
+    /// Try `attempt` until it is done, making room between two tries where a new key
+    /// found none.
+    fn with_room<T>(
+        &self,
+        mut attempt: impl FnMut() -> Result<Step<T>, StateError>,
+    ) -> Result<T, StateError> {
         let mut evictions = 0;
         loop {
             // The shard's lock is released before anything else is done about room.
-            let refusal = match self.attempt(op)? {
+            let refusal = match attempt()? {
                 Step::Done(reply) => return Ok(reply),
                 Step::NeedRoom(refusal) => refusal,
             };
@@ -1464,6 +1492,121 @@ impl Handle {
             }
             return Err(self.full(refusal));
         }
+    }
+
+    /// `kv_incr` with the idempotency key `once` (D8): `incr`, unless the namespace
+    /// remembers `once`. Two operations, each under one shard's lock. The first
+    /// inserts the entry that remembers `once` if it is not there: of any number of
+    /// calls with one idempotency key, on any threads, exactly one finds it missing.
+    /// That one increments; the others read the count as it is at that moment, which
+    /// may be before the first has added to it.
+    ///
+    /// Nothing is counted twice and nothing is dropped without a word: a first call
+    /// whose increment is refused (no room for a new counter, a key of another type)
+    /// takes its entry out again and fails its rule, so the message is counted when it
+    /// is sent again.
+    fn incr_once(
+        &self,
+        op: &StateOp<'_>,
+        incr: &StateOp<'_>,
+        once: &[u8],
+    ) -> Result<StateReply, StateError> {
+        let seen = Remembered::of(once);
+        let seen = seen.key();
+        let Some(replica) = &self.namespace.replica else {
+            if !self.with_room(|| Ok(self.remember(seen)))? {
+                return self.count(op);
+            }
+            return self.with_room(|| self.attempt(incr)).inspect_err(|_| {
+                let ns = &*self.namespace;
+                let at = ns.shard_of(seen);
+                let mut shard = lock_shard(&ns.shards[at]);
+                ns.remove(&mut shard, seen);
+                if !shard.used.is_empty() || ns.oldest[at].load(Relaxed) != NOT_IN_ORDER {
+                    ns.note_oldest(at, &shard);
+                }
+            });
+        };
+        if !replica.remember(self, seen)? {
+            return replica.count(self, op);
+        }
+        replica.call(self, incr).inspect_err(|_| {
+            // A delete like any other: it reaches every node that heard of the entry.
+            let _ = replica.apply(self, &StateOp::Del { key: seen });
+        })
+    }
+
+    /// Remember the idempotency key whose entry is `seen` for the namespace's dedupe
+    /// window, from now: whether it was not remembered already. The entry holds when
+    /// it was first seen, and seeing it again changes nothing, its expiry included.
+    fn remember(&self, seen: &[u8]) -> Step<bool> {
+        let ns = &*self.namespace;
+        let now_ms = ns.shared.clock.now_ms();
+        let at = ns.shard_of(seen);
+        let mut guard = lock_shard(&ns.shards[at]);
+        let shard = &mut *guard;
+        if shard.map.get(seen).is_some_and(|e| e.expired(now_ms)) {
+            ns.expire(shard, seen);
+        }
+        let step = if let Some(entry) = shard.map.get_mut(seen) {
+            // Seen again is used again: an `lru` namespace keeps it that much longer.
+            let (used, expiry) = (&mut shard.used, &mut shard.expiry);
+            ns.after(&self.settings, entry, used, expiry, None, now_ms);
+            Step::Done(false)
+        } else {
+            let since = first(Value::Int(i64::try_from(now_ms).unwrap_or(i64::MAX)));
+            let window = Some(self.settings.dedupe_window_secs);
+            match ns.insert(
+                &self.settings,
+                shard,
+                seen,
+                since,
+                NUMBER_BYTES,
+                window,
+                now_ms,
+            ) {
+                Ok(()) => Step::Done(true),
+                Err(refusal) => Step::NeedRoom(refusal),
+            }
+        };
+        if !shard.used.is_empty() || ns.oldest[at].load(Relaxed) != NOT_IN_ORDER {
+            ns.note_oldest(at, shard);
+        }
+        step
+    }
+
+    /// What the counter `op` is about holds now, for a call that adds nothing to it:
+    /// `0` when there is none. Counted as the `kv_incr` it is.
+    fn count(&self, op: &StateOp<'_>) -> Result<StateReply, StateError> {
+        let ns = &*self.namespace;
+        let now_ms = ns.shared.clock.now_ms();
+        let key = op_key(op);
+        let at = ns.shard_of(key);
+        let mut guard = lock_shard(&ns.shards[at]);
+        let shard = &mut *guard;
+        if shard.map.get(key).is_some_and(|e| e.expired(now_ms)) {
+            ns.expire(shard, key);
+        }
+        let count = match shard.map.get_mut(key) {
+            None => Value::Int(0),
+            Some(entry) => {
+                if !matches!(entry.data, Data::Sum(_)) {
+                    return Err(ns.wrong_type(&entry.data, "sum"));
+                }
+                let count = entry.data.read();
+                let (used, expiry) = (&mut shard.used, &mut shard.expiry);
+                ns.after(&self.settings, entry, used, expiry, None, now_ms);
+                count
+            }
+        };
+        shard.ops[admin::op_index(op)] += 1;
+        if !shard.used.is_empty() || ns.oldest[at].load(Relaxed) != NOT_IN_ORDER {
+            ns.note_oldest(at, shard);
+        }
+        Ok(StateReply {
+            value: Some(count),
+            read_bytes: 0,
+        })
     }
 }
 

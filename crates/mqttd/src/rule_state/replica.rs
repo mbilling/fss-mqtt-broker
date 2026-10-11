@@ -444,9 +444,18 @@ impl Replica {
         handle: &Handle,
         op: &StateOp<'_>,
     ) -> Result<StateReply, StateError> {
+        self.with_room(handle, || self.attempt(handle, op))
+    }
+
+    /// Try `attempt` until it is done, making room once where a new key found none.
+    fn with_room<T>(
+        &self,
+        handle: &Handle,
+        mut attempt: impl FnMut() -> Result<Step<T>, StateError>,
+    ) -> Result<T, StateError> {
         let mut made_room = false;
         loop {
-            let refusal = match self.attempt(handle, op)? {
+            let refusal = match attempt()? {
                 Step::Done(reply) => return Ok(reply),
                 Step::NeedRoom(refusal) => refusal,
             };
@@ -457,6 +466,74 @@ impl Replica {
             }
             return Err(handle.full(refusal));
         }
+    }
+
+    /// Remember the idempotency key whose entry is `seen` (D8), for the namespace's
+    /// dedupe window from now: whether this copy did not remember it already. The
+    /// entry is a key like any other, written first (`first`), so it is sent to every
+    /// member, and two members' entries merge to the earlier. One this copy holds is
+    /// left as it is, its expiry included, and nothing is sent.
+    pub(super) fn remember(&self, handle: &Handle, seen: &[u8]) -> Result<bool, StateError> {
+        let ns = &*handle.namespace;
+        let node = ns.shared.node();
+        let at = ns.shard_of(seen);
+        let new = self.with_room(handle, || {
+            let wall_ms = ns.shared.clock.now_ms();
+            let now = Now {
+                by: Writer {
+                    node: &node.counts_as,
+                    clock: &node.clock,
+                    wall_ms,
+                },
+                ms: node.clock.physical_ms(wall_ms),
+            };
+            let mut guard = lock_shard(&self.shards[at]);
+            let held = guard.map.get(seen);
+            if held.is_some_and(|entry| entry.state.live(now.ms).is_some()) {
+                return Ok(Step::Done(false));
+            }
+            let since = Value::Int(i64::try_from(now.ms).unwrap_or(i64::MAX));
+            let window = Some(handle.settings.dedupe_window_secs);
+            let write = Write::SetOnce(&since);
+            self.write(
+                handle,
+                &mut guard,
+                at,
+                seen,
+                &write,
+                window,
+                NUMBER_BYTES,
+                &now,
+                |_| true,
+            )
+        })?;
+        if new {
+            ns.shared.wake.ping();
+        }
+        Ok(new)
+    }
+
+    /// What the counter `op` is about holds now, for a `kv_incr` that adds nothing to
+    /// it (its idempotency key is remembered): `0` when there is none. Not a write.
+    pub(super) fn count(
+        &self,
+        handle: &Handle,
+        op: &StateOp<'_>,
+    ) -> Result<StateReply, StateError> {
+        let ns = &*handle.namespace;
+        let now_ms = Self::now_ms(ns);
+        let key = op_key(op);
+        let at = ns.shard_of(key);
+        let count = {
+            let shard = lock_shard(&self.shards[at]);
+            match shard.map.get(key).and_then(|e| e.state.live(now_ms)) {
+                None => Value::Int(0),
+                Some(data @ Data::Sum(_)) => data.read(),
+                Some(held) => return Err(ns.wrong_type(held, "sum")),
+            }
+        };
+        self.marks[at].ops[super::admin::op_index(op)].fetch_add(1, Relaxed);
+        Ok(reply(Some(count)))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -540,6 +617,8 @@ impl Replica {
                     }
                 }
                 StateOp::Incr { by, ttl, .. } => write!(Write::Incr(by), ttl, 0, now_held),
+                // Two keys, so never one write: `Handle::incr_once` takes it apart.
+                StateOp::IncrOnce { .. } => Step::NeedRoom(Refusal::Other),
                 StateOp::Extreme {
                     value,
                     largest,

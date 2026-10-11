@@ -371,8 +371,13 @@ fn printable(bytes: &[u8]) -> String {
 }
 
 /// A key of the store as the report prints it: as JSON. A `kv_*` key is a string;
-/// one of EMQX's table is any value.
+/// one of EMQX's table is any value. The entry that remembers an idempotency key
+/// (D8) is printed as that key, and called what it is.
 fn key_text(namespace: &str, key: &[u8]) -> String {
+    let once = mqtt_rules::state::remembered(key).filter(|_| namespace != KV_STORE_NAMESPACE);
+    if let Some(once) = once {
+        return format!("idempotency key {}", key_text(namespace, once));
+    }
     let term = (namespace == KV_STORE_NAMESPACE)
         .then(|| mqtt_rules::state::key_term(key))
         .flatten()

@@ -91,6 +91,65 @@ pub const MAX_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 /// copy from before the delete cannot bring it back.
 pub const DEFAULT_TOMBSTONE_WINDOW_SECS: u64 = 60 * 60;
 
+/// A namespace's `dedupe_window` when its table does not say: five minutes. For that
+/// long a namespace remembers an idempotency key `kv_incr` was given (D8).
+pub const DEFAULT_DEDUPE_WINDOW_SECS: u64 = 5 * 60;
+
+/// The most `dedupe_window` may be: one hour.
+pub const MAX_DEDUPE_WINDOW_SECS: u64 = 60 * 60;
+
+/// The longest idempotency key (`kv_incr`'s fourth argument), in bytes: one less than
+/// a key's bound, so that the entry that remembers it ([`Remembered`]) is a key of the
+/// namespace like any other, to the peers and to an operator.
+pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = MAX_KEY_BYTES - 1;
+
+/// The byte the entry that remembers an idempotency key starts with, before the
+/// idempotency key itself. No `kv_*` key may start with it ([`remembered`]), so a
+/// value a publisher chooses as an idempotency key can never name, read or create a
+/// key of the rule's, and a rule's key can never pass for a remembered one.
+pub const REMEMBERED_PREFIX: u8 = 0;
+
+/// The key of the entry that remembers one idempotency key, built without an
+/// allocation: [`REMEMBERED_PREFIX`], then the idempotency key.
+#[derive(Debug, Clone, Copy)]
+pub struct Remembered {
+    bytes: [u8; MAX_KEY_BYTES],
+    len: usize,
+}
+
+impl Remembered {
+    /// The entry's key for the idempotency key `once`, which is 1 to
+    /// [`MAX_IDEMPOTENCY_KEY_BYTES`] bytes (anything past that is cut off: the rule
+    /// engine never hands over more).
+    #[must_use]
+    pub fn of(once: &[u8]) -> Self {
+        let once = &once[..once.len().min(MAX_IDEMPOTENCY_KEY_BYTES)];
+        let mut bytes = [REMEMBERED_PREFIX; MAX_KEY_BYTES];
+        bytes[1..=once.len()].copy_from_slice(once);
+        Self {
+            bytes,
+            len: once.len() + 1,
+        }
+    }
+
+    /// The entry's key.
+    #[must_use]
+    pub fn key(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+/// The idempotency key the entry `key` remembers; `None` for any other key. (A
+/// `kv_store_*` key that starts with the same byte is that byte alone, the key
+/// `undefined`, and remembers nothing.)
+#[must_use]
+pub fn remembered(key: &[u8]) -> Option<&[u8]> {
+    match key {
+        [REMEMBERED_PREFIX, once @ ..] if !once.is_empty() => Some(once),
+        _ => None,
+    }
+}
+
 /// Where a namespace's keys live and how they agree across nodes (D5). `strong` is
 /// phase 2, and a file that names it does not load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +190,9 @@ pub struct NamespaceSettings {
     /// How long an `eventual` namespace remembers a deleted key as deleted, in
     /// seconds. Nothing in a `local` one.
     pub tombstone_window_secs: u64,
+    /// How long the namespace remembers an idempotency key `kv_incr` was given, in
+    /// seconds (D8): at most `max_ttl_secs`.
+    pub dedupe_window_secs: u64,
 }
 
 impl NamespaceSettings {
@@ -146,6 +208,7 @@ impl NamespaceSettings {
             max_ttl_secs: MAX_TTL_SECS,
             eviction: Eviction::Fail,
             tombstone_window_secs: DEFAULT_TOMBSTONE_WINDOW_SECS,
+            dedupe_window_secs: DEFAULT_DEDUPE_WINDOW_SECS,
         }
     }
 
@@ -210,6 +273,22 @@ pub enum StateOp<'a> {
         by: i64,
         /// The expiry to set, in seconds.
         ttl: Option<u64>,
+    },
+    /// `kv_incr` with an idempotency key (D8): add `by` to the count unless the
+    /// namespace remembers `once`, and remember it for the namespace's dedupe window.
+    /// Replies with the count as it is afterwards, whether or not this call added to
+    /// it. Whichever of several calls with one `once` comes first is the only one that
+    /// adds; one whose increment is refused leaves `once` not remembered.
+    IncrOnce {
+        /// The key.
+        key: &'a [u8],
+        /// What to add; may be negative.
+        by: i64,
+        /// The expiry to set when the call adds, in seconds.
+        ttl: Option<u64>,
+        /// The idempotency key: 1 to [`MAX_IDEMPOTENCY_KEY_BYTES`] bytes. It is
+        /// remembered under [`Remembered::of`] it, as an entry of the namespace.
+        once: &'a [u8],
     },
     /// `kv_max` (`largest`) and `kv_min`: keep the larger or smaller of the number
     /// held and `value` (types `max`, `min`). Replies with the number now held.
@@ -405,6 +484,7 @@ pub(crate) struct StateSchema {
     max_ttl: Option<toml::Value>,
     eviction: Option<String>,
     tombstone_window: Option<toml::Value>,
+    dedupe_window: Option<toml::Value>,
 }
 
 /// Whether `name` can be a namespace's: a lower-case letter, then up to 63 lower-case
@@ -569,6 +649,29 @@ impl StateSchema {
                 ));
             }
             s.tombstone_window_secs = n;
+        }
+        match &self.dedupe_window {
+            Some(_) if name == KV_STORE_NAMESPACE => {
+                return Err(
+                    "dedupe_window is for the namespaces kv_incr counts in: EMQX's kv_store \
+                     table has no counters and no expiry"
+                        .to_string(),
+                );
+            }
+            Some(v) => {
+                let n = duration(v).map_err(|e| format!("dedupe_window: {e}"))?;
+                let most = MAX_DEDUPE_WINDOW_SECS.min(s.max_ttl_secs);
+                if !(1..=most).contains(&n) {
+                    return Err(format!(
+                        "dedupe_window = {v}: expected 1 second to 1 hour \
+                         ({MAX_DEDUPE_WINDOW_SECS} seconds), and at most max_ttl ({} seconds)",
+                        s.max_ttl_secs
+                    ));
+                }
+                s.dedupe_window_secs = n;
+            }
+            // Whatever it was left at, an entry never outlives the namespace's `max_ttl`.
+            None => s.dedupe_window_secs = s.dedupe_window_secs.min(s.max_ttl_secs),
         }
         if s.consistency == Consistency::Eventual && s.eviction == Eviction::Lru {
             return Err(
@@ -918,9 +1021,15 @@ fn fail(reason: &str, message: impl std::fmt::Display) -> EvalError {
     EvalError::new(format!("{reason}: {message}"))
 }
 
-/// A `kv_*` key: a string of 1 to [`MAX_KEY_BYTES`] bytes.
+/// A `kv_*` key: a string of 1 to [`MAX_KEY_BYTES`] bytes that does not start with a
+/// NUL byte ([`REMEMBERED_PREFIX`]: the namespace's remembered idempotency keys).
 fn key(v: &Value) -> Result<&[u8], EvalError> {
     match v.as_bytes() {
+        Some([REMEMBERED_PREFIX, ..]) => Err(fail(
+            "bad_key",
+            "a key cannot start with a NUL byte (the namespace keeps the idempotency keys \
+             kv_incr was given under such keys)",
+        )),
         Some(bytes) if (1..=MAX_KEY_BYTES).contains(&bytes.len()) => Ok(bytes),
         Some(bytes) => Err(fail(
             "bad_key",
@@ -929,6 +1038,26 @@ fn key(v: &Value) -> Result<&[u8], EvalError> {
         None => Err(fail(
             "bad_key",
             format!("a key is a string, got a {}", v.type_name()),
+        )),
+    }
+}
+
+/// `kv_incr`'s idempotency key: a string of 1 to [`MAX_IDEMPOTENCY_KEY_BYTES`] bytes.
+/// Anything else fails the rule: a message whose key is missing is neither counted
+/// twice without a word nor left out without one.
+fn idempotency_key(v: &Value) -> Result<&[u8], EvalError> {
+    match v.as_bytes() {
+        Some(bytes) if (1..=MAX_IDEMPOTENCY_KEY_BYTES).contains(&bytes.len()) => Ok(bytes),
+        Some(bytes) => Err(fail(
+            "bad_idempotency_key",
+            format!(
+                "an idempotency key is 1 to {MAX_IDEMPOTENCY_KEY_BYTES} bytes, got {}",
+                bytes.len()
+            ),
+        )),
+        None => Err(fail(
+            "bad_idempotency_key",
+            format!("an idempotency key is a string, got a {}", v.type_name()),
         )),
     }
 }
@@ -1070,10 +1199,21 @@ fn kv_incr(a: &[Value], cx: &FnCtx) -> Result<Value, EvalError> {
             ))
         }
     };
-    let op = StateOp::Incr {
-        key: key(&a[0])?,
-        by,
-        ttl: ttl(a.get(2), binding)?,
+    let (key, ttl) = (key(&a[0])?, ttl(a.get(2), binding)?);
+    let op = match a.get(3) {
+        None => StateOp::Incr { key, by, ttl },
+        Some(once) => {
+            // It writes two entries, the count and the remembered key, and is two of
+            // the message's calls: what a message can make the store hold stays
+            // bounded by the calls it may make.
+            cx.ctx.charge_state_call()?;
+            StateOp::IncrOnce {
+                key,
+                by,
+                ttl,
+                once: idempotency_key(once)?,
+            }
+        }
     };
     call(cx, &op).map(answer)
 }
@@ -1246,8 +1386,8 @@ pub(crate) static FUNCS: &[Func] = &[
     func("kv_get", 1, 1, kv_get),
     func("kv_set", 2, 3, kv_set),
     func("kv_set_once", 2, 3, kv_set_once),
-    // A fourth argument, the idempotency key, is ADR 0085 D8.
-    func("kv_incr", 1, 3, kv_incr),
+    // The fourth argument is the idempotency key (ADR 0085 D8).
+    func("kv_incr", 1, 4, kv_incr),
     func("kv_max", 2, 3, |a, cx| extreme(a, cx, true)),
     func("kv_min", 2, 3, |a, cx| extreme(a, cx, false)),
     func("kv_add", 2, 3, kv_add),

@@ -903,7 +903,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-rules/src/lib.rs` — 281 test(s)
+## `crates/mqtt-rules/src/lib.rs` — 285 test(s)
 
 - `crdt::tests::a_causally_later_lww_write_is_never_lost_whatever_the_wall_clocks_say`
 - `crdt::tests::a_counter_is_the_sum_of_every_nodes_increments_and_decrements`
@@ -1156,9 +1156,12 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests_state::a_dry_run_never_touches_the_store_the_rules_were_loaded_with`
 - `tests_state::a_file_declares_at_most_64_namespaces`
 - `tests_state::a_file_that_uses_state_is_refused_where_there_is_no_store`
+- `tests_state::a_key_cannot_start_with_a_nul_byte`
+- `tests_state::a_kv_incr_with_an_idempotency_key_is_two_of_a_messages_calls`
 - `tests_state::a_kv_store_key_is_the_exact_term`
 - `tests_state::a_kv_store_key_reads_back_as_its_term`
 - `tests_state::a_namespace_declaration_is_checked_when_the_file_loads`
+- `tests_state::a_namespace_declares_how_long_it_remembers_an_idempotency_key`
 - `tests_state::a_per_rule_edit_keeps_the_rules_state_key`
 - `tests_state::a_read_is_charged_to_the_build_budget`
 - `tests_state::a_republished_message_counts_its_state_calls_in_the_originals_budget`
@@ -1174,6 +1177,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests_state::an_in_list_is_evaluated_whole`
 - `tests_state::an_input_replayed_at_a_time_is_evaluated_at_that_time`
 - `tests_state::foreach_calls_run_per_element`
+- `tests_state::kv_incr_hands_the_store_its_idempotency_key`
 - `tests_state::the_1025th_state_call_of_a_message_fails_its_rule`
 - `tests_state::the_emqx_functions_answer_as_emqx_does`
 - `tests_state::the_expiry_event_carries_the_key_its_value_and_when_it_expired`
@@ -1369,7 +1373,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 703 test(s)
+## `crates/mqttd/src/lib.rs` — 716 test(s)
 
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
@@ -2022,6 +2026,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `rule_state::tests::kv_store_answers_what_emqx_answers`
 - `rule_state::tests::kv_store_is_one_table_for_every_rule_and_apart_from_kv`
 - `rule_state::tests::kv_store_keeps_its_values_from_one_message_to_the_next`
+- `rule_state::tests::once::a_full_namespace_refuses_the_increment_and_counts_the_message_when_there_is_room`
+- `rule_state::tests::once::a_message_seen_again_within_the_window_is_counted_once`
+- `rule_state::tests::once::a_refused_increment_is_not_remembered_and_a_duplicate_reads_the_count_there_is`
+- `rule_state::tests::once::a_remembered_key_expires_without_an_event`
+- `rule_state::tests::once::an_idempotency_key_is_the_namespaces_and_lasts_its_dedupe_window`
+- `rule_state::tests::once::an_lru_namespace_evicts_remembered_keys_like_any_other`
+- `rule_state::tests::once::an_operator_sees_remembered_keys_as_keys_of_the_namespace`
+- `rule_state::tests::once::concurrent_callers_with_one_idempotency_key_count_once`
 - `rule_state::tests::the_stores_ceiling_refuses_across_namespaces`
 - `rule_state::tests_replica::a_delete_reaches_every_node_and_an_old_copy_cannot_undo_it`
 - `rule_state::tests_replica::a_frame_for_a_namespace_declared_otherwise_is_refused_and_counted`
@@ -2045,6 +2057,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `rule_state::tests_replica::copies_that_differ_in_a_few_keys_exchange_a_few_parts`
 - `rule_state::tests_replica::deleting_a_key_this_node_has_never_seen_leaves_no_tombstone`
 - `rule_state::tests_replica::malformed_frames_are_refused_and_never_pass_a_bound`
+- `rule_state::tests_replica::once::a_message_counted_on_one_node_is_not_counted_again_where_the_entry_has_arrived`
+- `rule_state::tests_replica::once::a_refused_increment_is_not_remembered_in_an_eventual_namespace`
+- `rule_state::tests_replica::once::a_remembered_key_is_forgotten_on_every_node_when_its_window_is_over`
+- `rule_state::tests_replica::once::concurrent_callers_of_an_eventual_namespace_with_one_idempotency_key_count_once`
+- `rule_state::tests_replica::once::two_nodes_that_see_a_message_before_hearing_of_each_other_both_count_it`
 - `rule_state::tests_replica::two_nodes_updating_the_same_keys_across_a_partition_converge_when_it_heals`
 - `rules::tests::a_declared_module_needs_no_switch_and_is_read_beside_the_rules_file`
 - `rules::tests::a_publish_carries_an_origin_only_while_a_message_event_is_wanted`
@@ -2712,15 +2729,17 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_wills_rules_get_an_empty_dictionary`
 - `the_dictionaries_count_against_the_stores_ceiling`
 
-## `crates/mqttd/tests/rules_sequence.rs` — 25 test(s)
+## `crates/mqttd/tests/rules_sequence.rs` — 27 test(s)
 
 - `a_dictionary_is_one_client_ids_for_the_whole_sequence`
 - `a_failing_rule_or_action_of_a_rules_file_is_reported_with_its_reason`
 - `a_key_expires_when_the_sequences_clock_passes_its_ttl`
 - `a_kv_store_key_of_any_type_is_shown_as_the_value_it_is`
+- `a_message_sent_again_with_the_id_it_had_is_counted_once`
 - `a_quota_counts_in_a_window_and_starts_again_when_the_window_expires`
 - `a_replay_never_touches_the_store_its_functions_carried`
 - `a_rule_on_the_expiry_event_may_write_the_key_again_and_a_step_bounds_the_events`
+- `a_rule_that_re_enters_itself_counts_once_with_an_idempotency_key`
 - `a_rule_that_republishes_into_its_own_from_counts_twice_and_is_stopped_there`
 - `a_rules_file_runs_every_matching_rule_its_actions_and_what_they_republish`
 - `a_sequence_is_bounded_in_steps_and_in_the_length_of_a_line`
@@ -2740,19 +2759,21 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `what_a_payload_or_a_key_prints_cannot_break_the_reports_lines`
 - `where_rule_state_is_switched_off_a_replay_of_a_stateful_rule_does_not_load`
 
-## `crates/mqttd/tests/rules_state.rs` — 8 test(s)
+## `crates/mqttd/tests/rules_state.rs` — 9 test(s)
 
 - `a_key_that_expires_raises_the_expiry_event_for_the_rule_that_names_it`
 - `a_later_rule_and_a_re_entered_rule_see_a_write`
 - `a_memory_brownout_refuses_new_keys_and_existing_ones_still_update`
+- `a_qos1_publish_sent_again_is_counted_once_by_its_idempotency_key`
 - `a_reload_keeps_a_declared_namespace_and_drops_one_that_is_gone`
 - `a_reload_that_adds_a_rule_on_the_expiry_event_starts_raising_it`
 - `a_rule_keeps_state_between_publishes_and_counts_what_its_where_rejects`
 - `a_wills_rules_call_the_same_store`
 - `kv_store_counts_across_messages_and_is_shared_by_every_rule`
 
-## `crates/mqttd/tests/rules_state_cluster.rs` — 3 test(s)
+## `crates/mqttd/tests/rules_state_cluster.rs` — 4 test(s)
 
+- `a_message_resent_to_another_node_is_counted_once_when_the_entry_has_arrived`
 - `a_partition_heals`
 - `a_restarted_node_is_refilled_from_the_others`
 - `rules_on_every_node_count_one_counter_and_every_node_reads_the_same`

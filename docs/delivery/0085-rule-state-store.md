@@ -27,7 +27,7 @@ tasks:
     issue: 920
   - id: 0085-T5
     title: "kv_incr idempotency keys, remembered as entries of the namespace for its dedupe window"
-    status: planned
+    status: in-progress
     issue: 921
   - id: 0085-T6
     title: "Observability and admin: state metrics, per-namespace $SYS statistics, the admin state endpoints and the mqttd --admin state verbs"
@@ -134,7 +134,7 @@ and T15 carries the documentation of these three.
 | 0085-T2 | ✅ done | [#918](https://github.com/mbilling/fss-mqtt-broker/issues/918) | 2026-10-11 | "PR 935: crates/mqtt-rules/src/crdt.rs (the types, a merge that is commutative, associative and idempotent over every state the decoder accepts, the hybrid logical clock with a 60 s skew bound, the canonical bounded encoded form, kv_hll_add and kv_hll_count on a 2^14-register sketch hashed with SipHash-2-4 under a fixed key) and the store keeping its keys in crdt::Data; mqtt-rules tests_crdt (40); the state_merge fuzz target in the nightly tier (about 1.2 million inputs locally, no finding); T1 store tests and the 141 EMQX probes pass unmodified; the ADR amended for the delete rule of non-lww types, first-write expiry, the skew bound and the counter bound." |
 | 0085-T3 | ✅ done | [#919](https://github.com/mbilling/fss-mqtt-broker/issues/919) | 2026-10-11 | "PR 950: crates/mqttd/src/rule_state/replica.rs and link.rs (changed keys read per link with no per-link queue, repair by a 1,024-part digest, refusals counted by reason), peer protocol 14 with StateKeys, StateDigest and StateWant pinned in crates/mqtt-cluster/src/peer.rs; tests_replica and crates/mqttd/tests/rules_state_cluster.rs (convergence, restart refill, declaration mismatch, bounds, a v13 peer sent nothing); the rule_state benchmark (publish with one kv_incr 1.80 us local, 1.84 us eventual; 100k keys caught up in 0.14 s on loopback, Apple M1 Pro); the ADR amended for what T3 decided." |
 | 0085-T4 | 🚧 in-progress | [#920](https://github.com/mbilling/fss-mqtt-broker/issues/920) | — |  |
-| 0085-T5 | ⬜ planned | [#921](https://github.com/mbilling/fss-mqtt-broker/issues/921) | — |  |
+| 0085-T5 | 🚧 in-progress | [#921](https://github.com/mbilling/fss-mqtt-broker/issues/921) | — |  |
 | 0085-T6 | ✅ done | [#922](https://github.com/mbilling/fss-mqtt-broker/issues/922) | 2026-10-11 | "PR 948: crates/mqttd/src/rule_state/admin.rs and crates/mqttd/src/admin/state.rs (the overview for a viewer, the paged key listing and single-key read for an operator, the audited delete for an operator who is a listed rules writer, replicated in an eventual namespace), the CLI verbs state, state-keys, state-get and state-del with control characters escaped, the mqttd_rule_state_* series and $SYS/brokers/<node>/rule_state/<namespace> with no key and no value; tests for roles, paging under concurrent writes and merges, the key and value representation round trip, the audit record (key_sha256 and key_bytes) and a three-node delete that converges; the rule_state inspect benchmark." |
 | 0085-T7 | ✅ done | [#923](https://github.com/mbilling/fss-mqtt-broker/issues/923) | 2026-10-11 | "PR 947 and PR 952: mqttd --rule-test --sequence (crates/mqttd/src/rule_replay.rs) replays a file of JSON lines on a driven clock against a scratch store, for one statement or the configured rules file with its actions, re-entry and [state.*] tables; crates/mqttd/tests/rules_sequence.rs (the kv_held, quota, kv_changed and kv_store_* transcripts, the file format and its errors, the running store untouched) and the RULES.md transcripts run by rules_docs.rs; since PR 952 the replay raises $events/state/expired per key at its expiry time before the step's own message." |
 | 0085-T8 | ⬜ planned | [#924](https://github.com/mbilling/fss-mqtt-broker/issues/924) | — |  |
@@ -549,3 +549,54 @@ and T15 carries the documentation of these three.
     operator's delete of an expired key holds it for its event.
   - **Left, as planned:** full documentation (T8: the threat model's row for a namespace
     held full by owed events, the cookbook recipe).
+- 2026-10-11 — **T5 built** (#921, in review): `kv_incr` with an idempotency key counts a
+  message once. The ADR's amendment of this date ("T5: counting a message once, as
+  built") has every decision; the guarantee is D8's, unchanged.
+  - **The call:** `kv_incr(key, by, ttl, idempotency_key)`
+    (`crates/mqtt-rules/src/state.rs`: `StateOp::IncrOnce`). The key is a string of 1 to
+    255 bytes (D8 said 256), and anything else fails the rule. It is two of a message's
+    1,024 calls.
+  - **The store** (`crates/mqttd/src/rule_state.rs`: `Handle::incr_once`): the entry that
+    remembers the key is inserted if it is not there, under its shard's lock, and only
+    the call that inserted it increments; a refused increment takes the entry out again.
+    Two map operations, never two locks at once. On one node the check is exact.
+  - **The entry** is a key of the namespace under a NUL byte and the idempotency key,
+    type `first`, holding when it was first seen, expiring after the namespace's
+    `dedupe_window` (new in `[state.<name>]`: five minutes by default, at most an hour
+    and at most `max_ttl`), counted toward every bound, evicted by `lru`, replicated and
+    merged in an `eventual` namespace. **A `kv_*` key may no longer start with a NUL
+    byte** (`bad_key`), so no payload value can read, write or pass for one. It raises
+    no `$events/state/expired` and takes none of the events' pace.
+  - **Across nodes** (`rule_state/replica.rs`: `Replica::remember`): not counted again on
+    a node the entry has reached; counted once more by each node that sees the message
+    before it has heard, as D8 said. The merge does not take that count back, and the
+    amendment says why it cannot be made exact that way.
+  - **What makes a key:** a value the publisher gave the message. Not `id`, which is new
+    for every PUBLISH the broker receives, a resend included (pinned by a test on a
+    broker). RULES.md has the table.
+  - **An operator** sees remembered keys in counts and listings, as `first` keys that
+    start with a NUL byte; the prefix of that byte lists exactly them, and deleting one
+    lets its message count again. T6's tests are unchanged.
+  - **The replay** prints an entry as `idempotency key "<key>"`.
+  - **Tests:** mqtt-rules `tests_state` (4 new: the key handed to the store and what is
+    refused, no `kv_*` key under a NUL byte, two calls of the budget, `dedupe_window`), mqttd `rule_state::tests::once` (8: once within the
+    window, the namespace's scope and window, eight threads with one key, a full
+    namespace, a refused increment, the operator's view, expiry without an event,
+    `lru`), `rule_state::tests_replica::once` (5: a node that has heard, two nodes that
+    have not, the window on every node, a refused increment, threads beside a link),
+    `tests/rules_state.rs` (1: a real QoS 1 DUP resend on the same connection and after
+    a reconnect, counted once by the publisher's id and each time by `id`),
+    `tests/rules_state_cluster.rs` (1: two real nodes), `tests/rules_sequence.rs` (2: a
+    message sent again, a rule that re-enters itself); RULES.md's new transcript runs in
+    `rules_docs.rs`.
+  - **Measured** (`cargo bench -p mqttd --bench rule_state`, Apple M1 Pro, `main`'s
+    binary and this change's in turn, eight rounds, the fastest median of each case; the
+    machine was heavily loaded, and rounds of one binary differed by up to a factor of
+    five): without an idempotency key nothing moved (a publish with `kv_incr` 1.888 to
+    1.807 µs, `kv_incr` in the store 127.8 to 126.9 ns; −5.5% to +5.4% over nine cases,
+    inside the spread). With one: 224 ns in the store for a remembered key, 449 ns for a
+    new one; a publish evaluated with one 2.38 µs.
+  - **Left:** a type or filter of their own for remembered keys in an operator's listing
+    (T12) and `dedupe_window` in the overview; the cluster half of T4 must leave
+    remembered keys out of the expiry event; the threat model's row and the cookbook's
+    recipe (T8).

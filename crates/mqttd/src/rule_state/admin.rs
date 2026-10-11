@@ -116,7 +116,7 @@ pub(super) fn op_index(op: &StateOp<'_>) -> usize {
         StateOp::Get { .. } => 0,
         StateOp::Set { .. } => 1,
         StateOp::SetOnce { .. } => 2,
-        StateOp::Incr { .. } => 3,
+        StateOp::Incr { .. } | StateOp::IncrOnce { .. } => 3,
         StateOp::Extreme { largest: true, .. } => 4,
         StateOp::Extreme { largest: false, .. } => 5,
         StateOp::Add { .. } => 6,

@@ -18,6 +18,8 @@ use mqtt_rules::{Effect, Functions, Outcome, PublishInput, RuleSet};
 
 use super::{stored, NamespaceStats, Store, ENTRY_OVERHEAD};
 
+mod once;
+
 /// A store on a clock the test drives, and rules loaded with it.
 struct Rig {
     store: Arc<Store>,

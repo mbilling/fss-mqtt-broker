@@ -65,7 +65,7 @@ use std::collections::BinaryHeap;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Weak};
 
-use mqtt_rules::state::KV_STORE_NAMESPACE;
+use mqtt_rules::state::{remembered, KV_STORE_NAMESPACE};
 use mqtt_rules::Value;
 
 use super::{
@@ -223,7 +223,8 @@ impl Namespace {
         let Some(entry) = shard.take(key) else {
             return;
         };
-        if self.shared.expiry_events.load(Relaxed) {
+        // A remembered idempotency key (D8) raises no event, so nothing is owed for it.
+        if self.shared.expiry_events.load(Relaxed) && remembered(&entry.key).is_none() {
             shard.hold(entry);
         } else {
             self.release(&entry);
@@ -350,13 +351,18 @@ impl Store {
             let namespace = &namespaces[n];
             let mut shard = lock_shard(&namespace.shards[at]);
             let before = taken.len();
-            while taken.len() - before < PURGE_BATCH.min(left) {
+            // What counts toward `max`: every key, or, where events are raised, the
+            // keys that raise one. A remembered idempotency key (D8) raises none, and
+            // the events' pace must not hold up its removal.
+            let mut counted = 0;
+            while taken.len() - before < PURGE_BATCH && counted < left {
                 let Some(entry) = shard.pop_expired(slot) else {
                     break;
                 };
+                counted += usize::from(!events || remembered(&entry.key).is_none());
                 taken.push((n, entry));
             }
-            left -= taken.len() - before;
+            left -= counted;
             shard.expired += wide(taken.len() - before);
             let first = shard.first_expiry();
             if !shard.used.is_empty() || namespace.oldest[at].load(Relaxed) != NOT_IN_ORDER {
@@ -368,7 +374,7 @@ impl Store {
         for (n, entry) in &taken {
             let namespace = &namespaces[*n];
             namespace.release(entry);
-            if events {
+            if events && remembered(&entry.key).is_none() {
                 swept.expired.push(Expired::of(namespace, entry));
             } else {
                 swept.removed += 1;
@@ -381,7 +387,8 @@ impl Store {
     /// in the map, or held for its event), and return what its event reports. For a
     /// replayed sequence (`mqttd --rule-test --sequence`), which raises each key's
     /// event at the key's own expiry time and so asks for them one by one; the
-    /// broker's sweep is [`sweep`](Self::sweep).
+    /// broker's sweep is [`sweep`](Self::sweep). A remembered idempotency key (D8) is
+    /// taken out like any key and reports nothing: it raises no event.
     #[must_use]
     pub fn take_expired(&self, namespace: &str, key: &[u8]) -> Option<Expired> {
         let namespace = lock(&self.namespaces).get(namespace)?.upgrade()?;
@@ -400,7 +407,9 @@ impl Store {
         shard.expired += 1;
         drop(shard);
         namespace.release(&entry);
-        Some(Expired::of(&namespace, &entry))
+        remembered(&entry.key)
+            .is_none()
+            .then(|| Expired::of(&namespace, &entry))
     }
 
     /// Make `key` of `namespace` expire now, whatever expiry it had: it reads as

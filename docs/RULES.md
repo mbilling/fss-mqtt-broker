@@ -2342,7 +2342,7 @@ is discarded afterwards**; in EMQX each still sees the client's:
 | `kv_get(key)` | the value, or `undefined`. A counter reads as its count, a set as an array of its elements, a sketch as its estimate |
 | `kv_set(key, value[, ttl])` | the value written |
 | `kv_set_once(key, value[, ttl])` | the value now held: the new one, or the one already there |
-| `kv_incr(key[, by[, ttl]])` | the count after. `by` is an integer, 1 unless given, and may be negative |
+| `kv_incr(key[, by[, ttl[, idempotency_key]]])` | the count after. `by` is an integer, 1 unless given, and may be negative. With an [idempotency key](#counting-a-message-once), a message the namespace has already seen adds nothing |
 | `kv_max(key, value[, ttl])`, `kv_min(key, value[, ttl])` | the larger (smaller) of `value` and the number held, which is stored |
 | `kv_add(key, element[, ttl])` | the number of elements in the set after (at most 1,024, each at most 256 bytes) |
 | `kv_del(key)` | whether a value was there |
@@ -2352,8 +2352,8 @@ is discarded afterwards**; in EMQX each still sees the client's:
 | `kv_hll_add(key, value[, ttl])` | the estimate of how many distinct values the key has been given, this one included |
 | `kv_hll_count(key)` | that estimate, or `0` for no key |
 
-A key is a string of 1 to 256 bytes. A value is anything but `undefined`, at most 4 KiB as
-JSON (a string as its bytes). A TTL is a whole number of seconds or a duration such as
+A key is a string of 1 to 256 bytes that does not start with a NUL byte. A value is
+anything but `undefined`, at most 4 KiB as JSON (a string as its bytes). A TTL is a whole number of seconds or a duration such as
 `'10m'` (`s`, `m`, `h`, `d`), at least one second; a write without one gives a new key the
 namespace's `default_ttl` and leaves an existing key's expiry alone. A key has the type of
 the function that created it until it is deleted or expires: `kv_incr` on a key `kv_set`
@@ -2386,10 +2386,13 @@ left to right, then the `WHERE`.
 - In a `FOREACH`, a call in the `INCASE` runs once per element, one in the `DO` once per
   element that passed.
 - A write stays when a later field fails the rule, when the `WHERE` is false, and when an
-  action fails. A QoS 1 publish that is sent again is evaluated again and writes again.
+  action fails. A QoS 1 publish that is sent again is evaluated again and writes again:
+  to count such a message once, give `kv_incr` an
+  [idempotency key](#counting-a-message-once).
 - A later rule the message matches, and the rules a republished message re-enters, see the
   write. A rule also runs on its own republished output, so one that counts and republishes
-  into its own `FROM` counts twice.
+  into its own `FROM` counts twice (once, with an idempotency key that the republished
+  message still carries).
 
 `kv_held` and `kv_changed` are made for this order: they run on every message and carry
 their own reset. "Above 30 for five minutes", and "only when the state flips":
@@ -2426,6 +2429,7 @@ max_bytes = "32MiB"        # default 64 MiB; at most the broker's rules.state_ma
 default_ttl = "1h"         # default 24 hours
 max_ttl = "7d"             # default and at most 30 days
 eviction = "fail"          # or "lru": the least recently used key makes room
+dedupe_window = "5m"       # how long kv_incr remembers an idempotency key; default 5 minutes, at most 1 hour
 
 [rules.count_reports]
 state = "fleet"
@@ -2474,7 +2478,9 @@ a partition go on working. Copies that meet again merge, each key by its type:
 - **It is in memory.** A node that restarts comes back empty and is filled by the others
   when its links come up (100,000 small keys: 0.14 s on one machine); if
   every node stops at once the state is gone. Counts are at least once, as on one node,
-  and are not a ledger. A counter keeps one count for each run of each node that counted
+  and are not a ledger. With an [idempotency key](#counting-a-message-once) a message is
+  counted once on each node that sees it before it has heard of another node's count:
+  once, when the nodes are in touch. A counter keeps one count for each run of each node that counted
   on it, at most 256: one that outlives that many node restarts refuses the next node's
   increment until it is deleted.
 - **Rules files are per node.** Two nodes share a namespace when both declare it
@@ -2516,6 +2522,112 @@ bounds of its own; here a `kv_store_put` key is at most 256 bytes as JSON and a 
 broker is over its memory watermark (`brownout`), and every `proc_dict_*` call is one of
 the message's 1,024.
 
+#### Counting a message once
+
+A counter cannot tell a message that is sent again from a new one, and messages are sent
+again. A QoS 1 publisher that did not see its PUBACK repeats the PUBLISH, on the same
+connection or after a reconnect, and the broker routes and evaluates it again (only QoS 2
+has a window that stops a resend before the rules). A rule that republishes into its own
+`FROM` evaluates its own output. For this `kv_incr` takes a fourth argument, an
+**idempotency key**: the count goes up only if the rule's namespace has not seen that key.
+
+```sh
+cat > orders.jsonl <<'EOF'
+{"at": 0,    "topic": "orders/new", "clientid": "c1", "qos": 1, "payload": {"msg": "a1"}}
+# the PUBACK was lost: the client sends it again
+{"at": 2,    "topic": "orders/new", "clientid": "c1", "qos": 1, "payload": {"msg": "a1"}}
+{"at": 10,   "topic": "orders/new", "clientid": "c1", "qos": 1, "payload": {"msg": "a2"}}
+{"at": "5m", "topic": "orders/new", "clientid": "c1", "qos": 1, "payload": {"msg": "a1"}}
+EOF
+```
+
+```console
+$ mqttd --rule-test --sql 'SELECT kv_incr(clientid, 1, 3600, payload.msg) AS orders FROM "orders/#"' --sequence orders.jsonl
+#1 +0s orders/new {"msg": "a1"}
+  {"orders":1}
+  state rule:test: + idempotency key "a1" = 1735689600000 (first, expires +300s)
+  state rule:test: + "c1" = 1 (sum, expires +3600s)
+#2 +2s orders/new {"msg": "a1"}
+  {"orders":1}
+#3 +10s orders/new {"msg": "a2"}
+  {"orders":2}
+  state rule:test: + idempotency key "a2" = 1735689610000 (first, expires +310s)
+  state rule:test: ~ "c1" = 2 (sum, expires +3610s)
+#4 +300s orders/new {"msg": "a1"}
+  {"orders":3}
+  state rule:test: - idempotency key "a1" (expired +300s)
+  state rule:test: + idempotency key "a1" = 1735689900000 (first, expires +600s)
+  state rule:test: ~ "c1" = 3 (sum, expires +3900s)
+```
+
+- **What a call does.** The first call with a key adds to the counter, and the namespace
+  remembers the key for its `dedupe_window`: five minutes unless `[state.<name>]` says
+  otherwise, at most one hour and never longer than `max_ttl`, counted from that first
+  sight (a resend does not extend it). A later call with a remembered key adds nothing,
+  leaves the counter's expiry as it is and returns the count as it is at that moment (`0`
+  where the counter has expired meanwhile). After the window the same key is a new
+  message, as in step 4. `by` and the TTL have to be written out to reach the fourth
+  argument.
+- **A key is a string of 1 to 255 bytes.** Anything else fails the rule
+  (`bad_idempotency_key`): a message whose id is missing is neither counted twice nor
+  left out without a word. A number needs `str(payload.seq)`.
+- **The key is new, or not, to the namespace**, whichever counter the call names. One
+  message that feeds two counters needs two keys:
+  `kv_incr('all', 1, '1h', payload.msg)` followed by
+  `kv_incr('mine', 1, '1h', payload.msg)` counts in `all` only. Write
+  `'all:' + payload.msg` and `'mine:' + payload.msg`. Rules that name the same declared
+  namespace share what it remembers in the same way.
+
+**Which values make a good key.** One that the *publisher* gave the message, so that it
+is the same when the message is sent again:
+
+| Value | As an idempotency key |
+|---|---|
+| A payload field the publisher sets for each message (`payload.msg_id`, `str(payload.seq)`) | Good. Put `clientid` in front (`clientid + ':' + payload.msg_id`) unless the ids are unique across publishers, so that one publisher cannot use up another's ids |
+| An MQTT 5 user property or the correlation data (`pub_props.'User-Property'.msg_id`) | Good, in the same way |
+| `id` | **No.** mqttd makes it for each PUBLISH it receives, as EMQX does: a resent PUBLISH has a new `id`, and so has a message a rule republished. It is the same only for the rules one received publish matches, so all it stops is two rules of one namespace counting the same publish |
+| The MQTT packet identifier | Not readable from a rule, and a client uses it again as soon as it has been acknowledged |
+| `timestamp`, `publish_received_at`, `now_timestamp()` | No: the broker's time, new for each PUBLISH received |
+| `flags.dup` | No: always `false`, as in EMQX |
+| `sha256(payload)` | Only where two different messages never have the same payload |
+
+**What is promised.**
+
+- **On one node, exactly once.** Any number of connections that present one key at the
+  same moment make one increment between them. An increment that is refused (no room for
+  a new counter, a key of another type) is not remembered: the rule fails, and the
+  message counts when it is sent again.
+- **Across a cluster, once the remembered key has arrived.** In an `eventual` namespace a
+  remembered key is sent to the other nodes like any key, a few milliseconds after it
+  was written. A resend that reaches another node after that is not counted. One that
+  reaches another node *before* it (a device that reconnects elsewhere and resends at
+  once, or the two sides of a partition) is counted there as well: a message is counted
+  at most once by each node that sees it, and the nodes' counts add up. Their remembered
+  keys then merge into one, and no later sight counts anywhere. A count that is exact
+  across nodes needs `consistency = "strong"`, which is a later phase. In a `local`
+  namespace every node remembers for itself.
+- **Not across a restart**, like all rule state: a node that comes back has forgotten
+  what it had seen, until the other nodes of an `eventual` namespace have filled it.
+
+**What it costs in room.** A remembered key is an entry of the namespace like any other:
+it counts toward `max_keys` and `max_bytes` (137 bytes and the key's length; 96 more in an
+`eventual` namespace) and toward `rules.state_max_bytes` until its window is over. A
+namespace that counts 100 messages a second with the default window holds 30,000 of
+them: size `max_keys` for the messages of one window, or shorten `dedupe_window`. In a
+full namespace the increment is refused (`namespace_full`), never applied without being
+remembered. In an `lru` namespace a remembered key is evicted like any key, the least
+recently used first, so a full one remembers for less than its window. The call is two
+of a message's 1,024 state calls.
+
+**What an operator sees.** [Listings](#watching-and-managing-state) show a remembered
+key as a key that starts with a NUL byte (`\u0000`, then the idempotency key), of type
+`first`, holding the time it was first seen in milliseconds.
+`mqttd --admin state-keys <ns> --prefix AA== --prefix_encoding base64` lists exactly the
+remembered keys, and deleting one (`state-del`, with the key in base64) lets its message
+count again. No `kv_*` key may start with a NUL byte (`bad_key`), so nothing a publisher
+puts in a payload can read, write or pass for one. A remembered key raises no
+[`$events/state/expired`](#when-a-key-expires-eventsstateexpired).
+
 #### When a key expires: `$events/state/expired`
 
 A key past its expiry reads as absent from that moment. The broker removes it within
@@ -2556,6 +2668,9 @@ It is about no client: `clientid` and `username` read `undefined`.
   `consistency = "eventual"` expires on every member at the same moment, and none of
   them raises the event yet: choosing the one member that does is not built. A replay
   says so in a `note:` line.
+- **Not for a remembered idempotency key.** The keys `kv_incr` remembers
+  ([Counting a message once](#counting-a-message-once)) expire without an event; behind
+  a backlog of events they are removed in their turn, and count as keys until then.
 - **Without a rule on it, it costs nothing.** No rule's call does anything for it, and
   the broker's one sweeping task only removes what has expired.
 - **Late rather than lost.** At most `rules.state_expiry_per_sec` events are raised a
@@ -2622,6 +2737,10 @@ links read; with eight threads writing keys of their own, 0.9 µs a call, and 1.
 every write is a `kv_set` (each takes a stamp of the node's one clock). On the wire a
 counter is about 65 bytes and a 44-byte value about 105, once per peer for whatever was
 written in the 5 ms before.
+A `kv_incr` with an [idempotency key](#counting-a-message-once) is two such operations:
+0.22 µs in the store for a message the namespace has seen (0.13 µs without a key) and
+0.45 µs for a new one, which makes a key; a publish evaluated with one, 2.4 µs beside
+1.8 µs. A `kv_incr` without a key costs what it did.
 
 ### Watching and managing state
 

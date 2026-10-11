@@ -24,6 +24,8 @@ use mqtt_rules::{Functions, RuleSet, Value};
 use super::replica::{Refused, Replication};
 use super::{stored, StateLink, Store};
 
+mod once;
+
 const NS: &str = "shared";
 
 /// The moment every node's clock starts at.
