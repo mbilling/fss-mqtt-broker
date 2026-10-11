@@ -199,7 +199,10 @@ and payload fields, and the audit log is read by more people than may read paylo
 So the record of a request to `rules/state/keys` or `rules/state/key` carries
 `key_sha256` and `key_bytes` (and `prefix_sha256`, `prefix_bytes`) in place of `key` and
 `prefix`: the SHA-256 and the length of the bytes the parameter named, whatever its
-encoding. A delete of a key is also a `state.delete` record with the same hash, so whoever
+encoding. A listing's `cursor` holds the last key the page before it listed, so it is
+recorded the same way (`cursor_sha256`, `cursor_bytes`, of the cursor's text). Which
+filters a listing used and whether it asked for values (`expires_within`, `no_expiry`,
+`values`) are recorded as they came: none of them is of a key. A delete of a key is also a `state.delete` record with the same hash, so whoever
 knows a key can find what was done to it (`printf %s 'hot:dev-1' | sha256sum`):
 
 ```text
@@ -425,12 +428,61 @@ deleted key an `eventual` namespace still remembers. An `eventual` namespace is 
 the same order with the same promise, whether what changes meanwhile is a rule's write on
 this node or a state merged in from another.
 
+**Which keys: the filters.** A listing takes three, and a key is listed when **every one
+given** selects it:
+
+| Parameter | Selects |
+|---|---|
+| `prefix` (with `prefix_encoding`) | the keys that start with it; in `kv_store`, the string keys whose text does |
+| `expires_within=<duration>` | the keys that expire within that long of the moment the page is asked for. A key with no expiry is not one, and a key that has expired already is not listed at all |
+| `no_expiry=true` | the keys that never expire |
+
+- A **duration** is written as the rules file writes one: a whole number with a unit,
+  `s`, `m`, `h` or `d` (`90s`, `10m`, `1h`, `7d`), or a whole number of seconds (`600`).
+  Anything else (`1.5h`, `250ms`, `soon`) is `400 bad-request`.
+- **`expires_within` with `no_expiry=true` is `400 bad-request`**: together they select
+  nothing, and that is said rather than answered with an empty listing.
+- **In `kv_store` no key expires** (EMQX's table has no expiry), so `no_expiry` selects
+  every key there and `expires_within` none. In a declared namespace and in a rule's own,
+  a key written without a TTL takes the namespace's `default_ttl`, so `no_expiry` selects
+  nothing there until a key's expiry has been cleared.
+- **A remembered idempotency key** (`kv_incr`'s fourth argument) is a key of its
+  namespace like any other: the one that starts with a NUL byte, of type `first`, expiring
+  at the end of the dedupe window. It is listed with its size and expiry, `prefix=%00`
+  selects exactly those keys, and `expires_within` selects them by that expiry.
+- **A filter is judged page by page**, against the time each page is asked for and the
+  key as it then is. The promise above holds for a key that is there **and selected**
+  from the first page to the last. A key whose expiry changes while a listing runs, so
+  that it starts or stops being selected, is listed if it is selected when the listing
+  reaches its place, and never twice; under `expires_within` in a `local` namespace
+  that goes for any key whose expiry changes meanwhile, even one selected before and
+  after (it can be passed over: list again to be sure of such a key).
+
+**What a page is bounded by.** At most 1,000 keys (`limit`, 100 unless given), 256 KiB of
+key bytes and 50 ms of looking; with `values=true` also **1 MiB of values**, counted as
+each `value` stands in the answer (its JSON string, quotes and escapes included). A page
+that reaches a bound is short, and has a `next_cursor`. A page always holds one key, so a
+single value larger than the bound (only a `union` of many long elements can be) is a
+page of its own. An answer without values is therefore a few hundred KiB at the most,
+and one with values that plus 1 MiB.
+
 **It does not hold up the publish path.** A listing takes one shard's lock at a time, for
 64 keys at a time; reading a key or the counts is not a use (an `lru` namespace's order
-is as it was) and removes nothing. Measured beside publishes:
-[RULES.md](RULES.md#watching-and-managing-state). A listing of a namespace near its
-largest (1,000,000 keys) is slow, in pages that stop looking after 50 ms: narrow it with
-`prefix` only to read less, not to look less.
+is as it was) and removes nothing. With `values=true` each listed key is then read under
+one hold of its own. Measured beside publishes:
+[RULES.md](RULES.md#watching-and-managing-state).
+
+**What a filter costs.** A shard's keys are in a hash map, which has no order to come
+back to: a page looks at every key of each shard it takes keys from, however few it
+lists, so a `prefix` or `no_expiry` that selects little makes pages that are short or
+empty, not a listing that looks at less. A whole listing that selects one key in a
+hundred took about 0.2 s of looking for 1,000,000 keys and 2 to 3 ms for 100,000
+(Apple M1 Pro, [ADR 0085](adr/0085-rule-state-store.md), "T12: looking into the store").
+`expires_within` in a `local` namespace is the exception: keys that expire are already
+kept in order of expiry (for the sweep that removes them), and the listing walks only
+the part of that order up to its time, so it costs what it selects and not what the
+namespace holds: under 1 ms and 0.06 ms for the same two listings. An `eventual`
+namespace keeps another order, and is walked by its map for every filter.
 
 ## Endpoint reference
 
@@ -947,14 +999,35 @@ With rule state switched off (`rules.state_max_bytes = 0`) the answer is
 
 Operator. Parameters: `ns` (required: the namespace), `prefix` and `prefix_encoding`
 (`utf8`, the default, or `base64`; in `kv_store` a prefix is of a string key's text),
-`limit`, `cursor`. One page of the namespace's keys; each is an object with its `type`,
-the type of the function that created it (`lww`, `first`, `max`, `min`, `sum`, `union`,
-`hll`). See [Rule state](#rule-state) for how a key is written and what a page is.
+`expires_within` (a duration), `no_expiry` (`true`), `values` (`true`), `limit`, `cursor`.
+One page of the keys of the namespace that the filters select. See
+[Rule state](#rule-state) for how a key and a value are written, what the filters select
+and what a page is bounded by.
+
+| Field of a key | |
+|---|---|
+| `key`, `key_encoding`, `term` | the key ([how a key is written](#rule-state)) |
+| `type` | the type of the function that created it: `lww`, `first`, `max`, `min`, `sum`, `union`, `hll` |
+| `bytes` | what the namespace accounts the key as, toward its `max_bytes` and the store's ceiling: its key, what it holds, and the store's own 128 bytes a key. The `bytes` of a `local` namespace's keys add up to the namespace's `bytes` in [the overview](#get-adminv1rulesstate), which also counts keys past their expiry that are still held; an `eventual` namespace's also counts the deleted keys it remembers |
+| `expires_at` | when it expires; `null`: never |
+| `value`, `value_encoding`, `value_type` | with `values=true` only: what the key holds, exactly as [the read of one key](#get-adminv1rulesstatekey-delete-adminv1rulesstatekey) shows it. The rest of the object is then of that same reading |
 
 ```json
 {"node": "mqttd-1", "namespace": "alerts", "count": 2,
- "keys": [{"key": "hot:dev-1", "key_encoding": "utf8", "type": "first"},
-          {"key": "/wD+", "key_encoding": "base64", "type": "sum"}],
+ "keys": [{"key": "hot:dev-1", "key_encoding": "utf8", "type": "first", "bytes": 150,
+           "expires_at": "2026-10-11T13:00:00.000Z"},
+          {"key": "/wD+", "key_encoding": "base64", "type": "sum", "bytes": 147,
+           "expires_at": "2026-10-12T12:00:00.000Z"}],
+ "next_cursor": null}
+```
+
+`GET /admin/v1/rules/state/keys?ns=alerts&prefix=hot:&expires_within=1h&values=true`:
+
+```json
+{"node": "mqttd-1", "namespace": "alerts", "count": 1,
+ "keys": [{"key": "hot:dev-1", "key_encoding": "utf8", "type": "first", "bytes": 150,
+           "expires_at": "2026-10-11T13:00:00.000Z",
+           "value": "1791720000000", "value_encoding": "utf8", "value_type": "integer"}],
  "next_cursor": null}
 ```
 
@@ -962,13 +1035,15 @@ the type of the function that created it (`lww`, `first`, `max`, `min`, `sum`, `
 
 Parameters: `ns` and `key` (required), `key_encoding` (`utf8` unless given).
 
-`GET` (operator): what the key holds, as a rule would read it, its type and when it
-expires (`null`: never). `404 not-found` when there is no such key, or its expiry has
+`GET` (operator): what the key holds, as a rule would read it, its type, its `bytes`
+(what the namespace accounts it as, as [the listing](#get-adminv1rulesstatekeys) says it)
+and when it expires (`null`: never). `404 not-found` when there is no such key, or its expiry has
 passed.
 
 ```json
 {"node": "mqttd-1", "namespace": "alerts", "key": "hot:dev-1", "key_encoding": "utf8",
- "type": "lww", "value": "{\"temp\":31.5,\"serial\":123456789012345678901234567890}",
+ "type": "lww", "bytes": 190,
+ "value": "{\"temp\":31.5,\"serial\":123456789012345678901234567890}",
  "value_encoding": "utf8", "value_type": "map", "expires_at": "2026-10-11T13:00:00.000Z"}
 ```
 

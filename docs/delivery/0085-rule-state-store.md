@@ -63,7 +63,7 @@ tasks:
     evidence: "PR 933: crates/mqtt-rules/src/state/dict.rs (a Dictionary per evaluating task, the three names in state::FUNCS) and one dictionary per connection in crates/mqttd/src/rules.rs; 99 probes of EMQX 6.3.1 (direct calls, emqx_rule_sqltester, the REST SQL test, and clients on a running node for whose process holds the dictionary per trigger) pinned in mqtt-rules tests_proc_dict (14) and crates/mqttd/tests/rules_proc_dict.rs (10), plus one test each in admin_rules.rs and rules_binary.rs; bounds of 64 keys and 64 KiB with dictionary_full; the ADR amended where the probes contradicted it; the converter carries proc_dict_* rules live."
   - id: 0085-T12
     title: "View the contents of the store: each key's type, size and expiry in the listing, optionally values, filters by expiry (expires within, no expiry), kv_store included"
-    status: planned
+    status: in-progress
     issue: 940
   - id: 0085-T13
     title: "Expire entries manually: a bulk purge of one namespace by prefix, by expiry (expires within, no expiry), or already expired; dry run, batches off the publish path, 100,000 keys a call with a cursor, audited; no expiry event unless asked"
@@ -143,7 +143,7 @@ and T15 carries the documentation of these three.
 | 0085-T9 | ⬜ planned | [#925](https://github.com/mbilling/fss-mqtt-broker/issues/925) | — |  |
 | 0085-T10 | ⬜ planned | [#926](https://github.com/mbilling/fss-mqtt-broker/issues/926) | — |  |
 | 0085-T11 | ✅ done | [#927](https://github.com/mbilling/fss-mqtt-broker/issues/927) | 2026-10-11 | "PR 933: crates/mqtt-rules/src/state/dict.rs (a Dictionary per evaluating task, the three names in state::FUNCS) and one dictionary per connection in crates/mqttd/src/rules.rs; 99 probes of EMQX 6.3.1 (direct calls, emqx_rule_sqltester, the REST SQL test, and clients on a running node for whose process holds the dictionary per trigger) pinned in mqtt-rules tests_proc_dict (14) and crates/mqttd/tests/rules_proc_dict.rs (10), plus one test each in admin_rules.rs and rules_binary.rs; bounds of 64 keys and 64 KiB with dictionary_full; the ADR amended where the probes contradicted it; the converter carries proc_dict_* rules live." |
-| 0085-T12 | ⬜ planned | [#940](https://github.com/mbilling/fss-mqtt-broker/issues/940) | — |  |
+| 0085-T12 | 🚧 in-progress | [#940](https://github.com/mbilling/fss-mqtt-broker/issues/940) | — |  |
 | 0085-T13 | ⬜ planned | [#941](https://github.com/mbilling/fss-mqtt-broker/issues/941) | — |  |
 | 0085-T14 | ⬜ planned | [#942](https://github.com/mbilling/fss-mqtt-broker/issues/942) | — |  |
 | 0085-T15 | ⬜ planned | [#943](https://github.com/mbilling/fss-mqtt-broker/issues/943) | — |  |
@@ -602,3 +602,65 @@ and T15 carries the documentation of these three.
     (T12) and `dedupe_window` in the overview; the cluster half of T4 must leave
     remembered keys out of the expiry event; the threat model's row and the cookbook's
     recipe (T8).
+- 2026-10-11 — **T12 built** (#940, in review): looking into the store. The ADR's
+  amendment of this date ("T12: looking into the store, as built") has every decision.
+  - **The listing** (`GET /admin/v1/rules/state/keys`) says of each key its `type`, its
+    `bytes` (what the namespace accounts it as) and `expires_at` (`null`: never), all
+    read from the entry: no field was added to an entry, no write call was changed,
+    `ENTRY_OVERHEAD` is 128 bytes and nothing new is on the wire. `values=true` adds
+    `value`, `value_encoding` and `value_type` as the read of one key shows them;
+    operators only, as before.
+  - **The read of one key** (`GET /admin/v1/rules/state/key`) says `bytes` too.
+  - **Remembered idempotency keys** (T5, which merged while this was in review) are
+    listed as the entries they are: type `first`, their size, and an expiry at the end
+    of the dedupe window, by which `expires_within` selects them; `prefix` with their
+    NUL byte selects exactly them. No type or filter of their own was added.
+  - **Filters:** `expires_within=<duration>` and `no_expiry=true`, each alone or with
+    `prefix`; a key is listed when every one given selects it, and the two expiry
+    filters together are `400`. A duration is the rules file's (`10m`, `1h`) or whole
+    seconds. `kv_store` is listed like any namespace: no key of it expires, so
+    `no_expiry` selects every key there. Elsewhere a key without a TTL takes its
+    namespace's default, so `no_expiry` finds nothing until T14 clears an expiry.
+  - **Bounds:** T6's (1,000 keys, 256 KiB of keys, 50 ms of looking), and with values
+    1 MiB of them as they stand in the answer; a page always holds one key.
+  - **Under concurrent change:** a key that is there and selected from the first page to
+    the last is listed exactly once, none twice, in `local` and `eventual` namespaces,
+    whether a rule writes or a state is merged in. A key whose expiry changes meanwhile
+    may or may not be listed.
+  - **One selection for T13 and T14:** `Selector` with `ByExpiry` in the store
+    (`rule_state/admin.rs`) and `Selection`, read from a request once, in the admin API
+    (`admin/state.rs`). T13 adds `expired=true` as one more `ByExpiry`.
+  - **The walk's cost, decided:** no index and nothing per key. `expires_within` in a
+    `local` namespace walks the order of expiry the shard keeps for the sweep, 64
+    entries a hold, entered where the hold before ended: nothing is passed over and
+    nothing starts again. `prefix`, `no_expiry`, and every filter in an `eventual`
+    namespace, walk the map as T6 does. Measured (Apple M1 Pro, heavily loaded, the
+    faster of two rounds), one whole listing that selects one key in a hundred: by the
+    map 1.7 to 2.7 ms at 100,000 keys and 193 to 216 ms at 1,000,000 (2.8 to 4.6 ms and
+    238 to 254 ms beside writers); by the order of expiry 0.06 ms and 0.67 ms (0.08 and
+    2.0 ms beside writers). A call on the publish path beside a `no_expiry` listing that
+    does nothing but walk: 0.61 µs at 100,000 keys and 3.4 µs at 1,000,000, against 0.29
+    and 0.74 µs alone; beside an `expires_within` listing 0.32 and 0.90 µs. One page of
+    an unfiltered listing went from 0.106 to 0.142 ms at 100,000 keys (each key carries
+    more) and is unchanged at 1,000,000.
+  - **The audit log:** the request's record says which filters were used and names no
+    key. A listing's `cursor` holds the last key listed and was recorded whole by T6;
+    it is now recorded by hash and length, as `key` and `prefix` are.
+  - **The CLI, ahead of T15:** `mqttd --admin state-keys <ns>` takes `--values`,
+    `--expires-within <duration>` and `--no-expiry`, and prints `BYTES` and
+    `EXPIRES_AT`, with `VALUE` (cut to 60 characters; whole in `--json`) and
+    `VALUE_TYPE` under `--values`. They are T15's by the plan and are built here because
+    the listing cannot be tried from a terminal without them. **T15's remaining scope is
+    `state-purge`, `state-expire` and the prose** (RULES.md's section on operating the
+    store, the threat model's row). ADMIN-API.md and ADMIN-CLI.md describe what is
+    built.
+  - **Tests:** mqttd `rule_state::admin::tests` (7: the fields, each filter and
+    combination on a driven clock, EMQX's table, the values bound, a change of expiry
+    between pages, filtered listings beside writers, the order's walk),
+    `rule_state::tests_replica` (1: three nodes, merges between pages), `admin::state`
+    (3) and `admin::cli` (1, and the verbs' test extended), `tests/admin_rules.rs` (4:
+    roles and the kinds of namespace, the filters over the wire, a mebibyte of values,
+    the audit record), `tests/rules_binary.rs` (the CLI against a running broker).
+  - **Left open:** a map that can be entered by position would make every walk cost
+    what it looks at once, with nothing per key and nothing added to a write; it would
+    replace the map every state call goes through, so it is its own change.

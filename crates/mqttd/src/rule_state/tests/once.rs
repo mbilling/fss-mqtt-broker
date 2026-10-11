@@ -3,11 +3,12 @@
 //! and an increment whose key it remembers adds nothing.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use mqtt_rules::state::{NamespaceSettings, Remembered, StateNamespace, StateOp, StateStore};
 
 use super::{publish, rig, rules, Did, Rig, Store, ENTRY_OVERHEAD};
-use crate::rule_state::{Limits, Selector};
+use crate::rule_state::{ByExpiry, Limits, Selector};
 
 /// What a remembered idempotency key of `len` bytes is accounted as: an entry, its
 /// key (the marker byte and the idempotency key) and the time it was first seen.
@@ -319,6 +320,36 @@ fn an_operator_sees_remembered_keys_as_keys_of_the_namespace() {
         ("first", "1800000000000".to_string(), 1_800_000_300_000)
     );
     assert_eq!(r.store.counts("rule:test").unwrap().keys, 3);
+    // T12: listed with its size and its expiry (the end of the dedupe window), and
+    // selected by that expiry like any key; the counter expires in an hour and is not.
+    let soon = Selector::prefix(b"").expiring(ByExpiry::Within(Duration::from_mins(10)));
+    let page = r
+        .store
+        .keys("rule:test", &soon, None, &Limits::default())
+        .unwrap();
+    let mut within: Vec<(Vec<u8>, &str, u64, u64)> = page
+        .keys
+        .iter()
+        .map(|k| (k.key.to_vec(), k.type_name, k.bytes as u64, k.expires_ms))
+        .collect();
+    within.sort();
+    assert_eq!(
+        within,
+        [
+            (
+                b"\0m-1".to_vec(),
+                "first",
+                remembered_bytes(3),
+                1_800_000_300_000
+            ),
+            (
+                b"\0m-2".to_vec(),
+                "first",
+                remembered_bytes(3),
+                1_800_000_300_000
+            ),
+        ]
+    );
     assert!(r.store.delete_key("rule:test", b"\0m-1").unwrap());
     assert_eq!(r.count_once("n", "m-1"), r#"{"n":3}"#);
     assert_eq!(r.count_once("n", "m-2"), r#"{"n":3}"#);

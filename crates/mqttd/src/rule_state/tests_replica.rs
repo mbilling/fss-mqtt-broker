@@ -1493,6 +1493,168 @@ fn an_operator_lists_reads_and_counts_an_eventual_namespace() {
     assert_eq!(counts.ok[op("incr")], 1);
 }
 
+/// T12 for an `eventual` namespace: a replicated key is listed with its type, its
+/// size and its expiry on every node, with its value when asked, and selected by its
+/// expiry as a `local` key is; a deleted key that is still remembered is selected by
+/// nothing. A state merged in while a filtered listing is under way neither repeats
+/// nor hides a key that stays selected.
+#[test]
+#[allow(clippy::too_many_lines)] // three nodes, every filter, and a listing with merges in it
+fn a_replicated_key_is_listed_with_its_type_size_and_expiry_on_every_node() {
+    use super::{ByExpiry, KeyInfo, Limits, Selector, Values};
+    let settings = NamespaceSettings {
+        default_ttl_secs: None,
+        ..eventual()
+    };
+    let mut net = Net::new(vec![
+        node_with("a", &settings, 64 << 20),
+        node_with("b", &settings, 64 << 20),
+        node_with("c", &settings, 64 << 20),
+    ]);
+    net.connect_all();
+    for i in 0..300 {
+        net.nodes[0].set_for(&format!("soon:{i:03}"), "v", 60);
+        net.nodes[0].set_for(&format!("late:{i:03}"), "v", 7_200);
+        net.nodes[0].set(&format!("kept:{i:03}"), "v");
+    }
+    net.nodes[0].incr("count", 5);
+    net.nodes[0].add("members", "dev-1").unwrap();
+    net.nodes[0].set_for("gone", "v", 60);
+    net.nodes[0].set("gone-kept", "v");
+    net.settle();
+    assert_eq!(net.nodes[1].del("gone"), "true");
+    assert_eq!(net.nodes[1].del("gone-kept"), "true");
+    net.settle();
+    net.assert_converged();
+
+    let list = |node: &Node, selector: &Selector<'_>, limits: &Limits| -> Vec<KeyInfo> {
+        let (mut keys, mut from) = (Vec::new(), None);
+        loop {
+            let page = node
+                .store
+                .keys(NS, selector, from.as_ref(), limits)
+                .unwrap();
+            keys.extend(page.keys);
+            match page.next {
+                Some(cursor) => from = Some(cursor),
+                None => return keys,
+            }
+        }
+    };
+    let names = |keys: &[KeyInfo]| -> Vec<String> {
+        let names: Vec<String> = keys
+            .iter()
+            .map(|k| String::from_utf8(k.key.to_vec()).unwrap())
+            .collect();
+        let distinct: std::collections::BTreeSet<&String> = names.iter().collect();
+        assert_eq!(distinct.len(), names.len(), "no key is listed twice");
+        distinct.into_iter().cloned().collect()
+    };
+    let page = |keys: usize| Limits {
+        keys,
+        ..Limits::default()
+    };
+    let all = Selector::prefix(b"");
+    let soon = all.expiring(ByExpiry::Within(Duration::from_mins(10)));
+    let never = all.expiring(ByExpiry::Never);
+    let with_values = Limits {
+        values: Some(Values {
+            room: 1 << 20,
+            size: |value| value.to_json().map_or(0, |text| text.len()),
+        }),
+        ..page(100)
+    };
+    // The same on every node: the node that wrote, and the two that merged.
+    for node in &net.nodes {
+        let listed = list(node, &all, &with_values);
+        assert_eq!(listed.len(), 902, "node {}: no tombstone", node.id);
+        let of = |key: &str| listed.iter().find(|k| &*k.key == key.as_bytes()).unwrap();
+        let shown = |key: &str| {
+            let k = of(key);
+            let value = k.value.as_ref().unwrap().to_json().unwrap();
+            (k.type_name, k.expires_ms, value)
+        };
+        assert_eq!(
+            shown("soon:007"),
+            ("lww", START_MS + 60_000, "\"v\"".to_string())
+        );
+        assert_eq!(
+            shown("late:007"),
+            ("lww", START_MS + 7_200_000, "\"v\"".to_string())
+        );
+        assert_eq!(shown("kept:007"), ("lww", 0, "\"v\"".to_string()));
+        assert_eq!(shown("count"), ("sum", 0, "5".to_string()));
+        assert_eq!(shown("members"), ("union", 0, "[\"dev-1\"]".to_string()));
+        assert!(of("members").bytes > of("kept:007").bytes);
+        // The filters, alone and with a prefix, in pages of any size.
+        for limits in [page(1000), page(7)] {
+            let within = names(&list(node, &soon, &limits));
+            assert_eq!(within.len(), 300);
+            assert!(within.iter().all(|k| k.starts_with("soon:")));
+            let kept = names(&list(node, &never, &limits));
+            assert_eq!(kept.len(), 302);
+            assert!(kept.iter().all(|k| !k.contains("gone")));
+            let some = Selector::prefix(b"kept:00").expiring(ByExpiry::Never);
+            assert_eq!(names(&list(node, &some, &limits)).len(), 10);
+            let none = Selector::prefix(b"kept:").expiring(ByExpiry::Within(Duration::MAX));
+            assert_eq!(names(&list(node, &none, &limits)).len(), 0);
+        }
+        // What the namespace counts includes the deleted keys it remembers; what is
+        // listed is at most that.
+        let counted = node.store.counts(NS).unwrap();
+        assert_eq!(counted.keys, 904);
+        assert!(listed.iter().map(|k| k.bytes as u64).sum::<u64>() < counted.bytes);
+    }
+
+    // States merged in between two pages of a filtered listing on C: new keys the
+    // filter selects, a selected key deleted, and one whose expiry moves out of it.
+    let first = net.nodes[2]
+        .store
+        .keys(NS, &soon, None, &page(100))
+        .unwrap();
+    let cursor = first.next.clone().expect("more than one page");
+    let mut seen = names(&first.keys);
+    for i in 0..200 {
+        net.nodes[0].set_for(&format!("new:{i:03}"), "v", 30);
+    }
+    for i in (0..300).step_by(10) {
+        net.nodes[1].del(&format!("soon:{i:03}"));
+    }
+    for i in (5..300).step_by(10) {
+        net.nodes[0].set_for(&format!("soon:{i:03}"), "v", 7_200);
+    }
+    net.settle();
+    net.assert_converged();
+    let mut from = Some(cursor);
+    while let Some(cursor) = from {
+        let page = net.nodes[2]
+            .store
+            .keys(NS, &soon, Some(&cursor), &page(100))
+            .unwrap();
+        seen.extend(names(&page.keys));
+        from = page.next;
+    }
+    let distinct: std::collections::BTreeSet<&String> = seen.iter().collect();
+    assert_eq!(distinct.len(), seen.len(), "no key is listed twice");
+    for i in 0..300 {
+        let key = format!("soon:{i:03}");
+        if i % 5 != 0 {
+            assert!(distinct.contains(&key), "{key} stayed selected");
+        }
+    }
+    assert!(seen.iter().any(|k| k.starts_with("new:")));
+    // The time moves on for every node alike: the keys of a minute have expired
+    // everywhere, and are within nothing.
+    net.advance_ms(60_000);
+    for node in &net.nodes {
+        let within = names(&list(node, &soon, &page(1000)));
+        assert!(within.iter().all(|k| !k.starts_with("soon:") || {
+            let i: usize = k[5..].parse().unwrap();
+            i % 10 == 5
+        }));
+    }
+}
+
 /// D10: an operator's delete in an `eventual` namespace is a replicated delete, as a
 /// rule's `kv_del` there: it reaches every node, a copy from before it cannot bring
 /// the key back, and a write made after it stands. A key this node does not hold is

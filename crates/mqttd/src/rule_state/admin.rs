@@ -20,8 +20,9 @@
 //!   `lru` namespace's order of use, removes no expired key (the sweep that raises the
 //!   expiry event does that, D7) and counts as no call of a rule.
 //! * **A request is bounded**: a page of at most [`MAX_PAGE_KEYS`] keys and
-//!   [`MAX_PAGE_BYTES`] of them, within [`Limits::time`]. A page that reaches a bound
-//!   early is short, and says where the next one starts.
+//!   [`MAX_PAGE_BYTES`] of them, within [`Limits::time`], and, when it carries values,
+//!   [`Values::room`] of those. A page that reaches a bound early is short, and says
+//!   where the next one starts.
 //!
 //! # The order of a listing, and its cursor
 //!
@@ -42,9 +43,33 @@
 //! # One selection
 //!
 //! Which keys a listing shows is decided by one function, [`Selector::matches`], over
-//! one walk, [`Namespace::select`]. Whatever later selects keys by more than a prefix
-//! (an expiry before a time, no expiry), or does something to the
-//! keys selected, adds a predicate there and walks the same way.
+//! one walk, [`Namespace::select`]: by a prefix, and by expiry ([`ByExpiry`]: any, none,
+//! or one within a time from now), all of which must hold. What a key is selected by is
+//! in its entry already; nothing is kept per key for it. Whatever later does something
+//! to the keys selected (a purge, a change of expiry) takes the same [`Selector`] and
+//! walks the same way; a selection of keys that *have* expired is one more [`ByExpiry`]
+//! and the same order ([`Namespace::gather_due`]) from its start.
+//!
+//! # A key whose expiry changes while it is listed
+//!
+//! A key is judged when the walk looks at it, against the time its page was asked for.
+//! So the promise above is for a key that is there, **and selected**, from the first
+//! page to the last: one whose expiry is changed meanwhile so that it starts or stops
+//! being selected may or may not be listed, and is never listed twice. Under
+//! [`ByExpiry::Within`] in a `local` namespace the same goes for any key whose expiry
+//! is changed meanwhile, selected before and after or not: such a listing walks the
+//! shard's order of expiry, and a key that moves in that order while its shard is being
+//! looked at can be passed over.
+//!
+//! # What a walk costs
+//!
+//! A shard's map is walked whole for every page that takes keys from it, however few
+//! it selects, and each hold passes over the keys the holds before it looked at
+//! ([`Namespace::look`]). Keys that expire are also in an order the shard keeps anyway
+//! (by the second they expire, for the sweep), and that order can be entered anywhere:
+//! a [`ByExpiry::Within`] listing of a `local` namespace walks only the part of it up
+//! to its time, [`WALK_BATCH`] entries per hold, without passing over anything and
+//! without starting again when the map changes. No order is kept for a listing's sake.
 
 use std::ops::Bound;
 use std::sync::atomic::Ordering::Relaxed;
@@ -95,6 +120,10 @@ pub const MAX_PAGE_KEYS: usize = 1000;
 
 /// The most bytes of keys one page holds (it always holds one key).
 pub const MAX_PAGE_BYTES: usize = 256 * 1024;
+
+/// The most a page's values take together, as whoever asked measures them (a page
+/// that carries values always holds one key).
+pub const MAX_PAGE_VALUE_BYTES: usize = 1024 * 1024;
 
 /// How long a listing looks for a page's keys before it answers with what it has: a
 /// prefix few keys match can take a walk of every shard.
@@ -190,13 +219,27 @@ pub struct StoreTotals {
     pub dictionary_refused: u64,
 }
 
-/// Which keys of a namespace a walk selects.
+/// Which keys a walk selects by their expiry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ByExpiry {
+    /// Whatever their expiry.
+    #[default]
+    Any,
+    /// The keys that never expire. Every key of `kv_store` is one.
+    Never,
+    /// The keys that expire within this long of the moment the page is asked for (a
+    /// key that has expired already is not a key to list).
+    Within(Duration),
+}
+
+/// Which keys of a namespace a walk selects: those every part of it selects.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Selector<'a> {
     prefix: &'a [u8],
     /// The keys are `kv_store_*` keys ([`mqtt_rules::state::term_key`]): the prefix is
     /// of a string key's bytes, and a key that is not a string has none.
     terms: bool,
+    expiry: ByExpiry,
 }
 
 /// What comes before a string's bytes in its [`mqtt_rules::state::term_key`]: the tag
@@ -213,6 +256,7 @@ impl<'a> Selector<'a> {
         Self {
             prefix,
             terms: false,
+            expiry: ByExpiry::Any,
         }
     }
 
@@ -223,12 +267,30 @@ impl<'a> Selector<'a> {
         Self {
             prefix,
             terms: true,
+            expiry: ByExpiry::Any,
         }
     }
 
-    /// Whether the walk selects `key`, which holds a value now. The one place a key
-    /// is selected.
-    fn matches(&self, key: &[u8]) -> bool {
+    /// Of those keys, the ones `expiry` selects as well.
+    #[must_use]
+    pub fn expiring(mut self, expiry: ByExpiry) -> Self {
+        self.expiry = expiry;
+        self
+    }
+
+    /// Whether the walk selects `key`, which holds a value at `now_ms` and expires at
+    /// `expires_ms` (`0`: never). The one place a key is selected.
+    fn matches(&self, key: &[u8], expires_ms: u64, now_ms: u64) -> bool {
+        let by_expiry = match self.expiry {
+            ByExpiry::Any => true,
+            ByExpiry::Never => expires_ms == 0,
+            ByExpiry::Within(within) => {
+                expires_ms != 0 && expires_ms <= now_ms.saturating_add(millis(within))
+            }
+        };
+        if !by_expiry {
+            return false;
+        }
         if self.prefix.is_empty() {
             return true;
         }
@@ -243,6 +305,21 @@ impl<'a> Selector<'a> {
     }
 }
 
+/// A time in the store's milliseconds.
+fn millis(time: Duration) -> u64 {
+    u64::try_from(time.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// That a page carries each key's value, and how much of them.
+#[derive(Debug, Clone, Copy)]
+pub struct Values {
+    /// The most the page's values may take together, as `size` measures one. A page
+    /// always holds one key, whatever its value takes.
+    pub room: usize,
+    /// What one value takes, as whoever asked will show it.
+    pub size: fn(&Value) -> usize,
+}
+
 /// The bounds of one page.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
@@ -252,6 +329,8 @@ pub struct Limits {
     pub bytes: usize,
     /// How long to look. A page looks through at least one shard however short this is.
     pub time: Duration,
+    /// Whether the page carries values, and how much of them. `None`: none.
+    pub values: Option<Values>,
 }
 
 impl Default for Limits {
@@ -260,6 +339,7 @@ impl Default for Limits {
             keys: MAX_PAGE_KEYS,
             bytes: MAX_PAGE_BYTES,
             time: PAGE_TIME,
+            values: None,
         }
     }
 }
@@ -308,17 +388,45 @@ impl Cursor {
     }
 }
 
-/// One listed key. A struct, so that what a listing says of a key can grow.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One listed key, as the walk found it.
+#[derive(Debug, Clone)]
 pub struct KeyInfo {
     /// The key's bytes, as the store holds them.
     pub key: Arc<[u8]>,
     /// The type of the operation that created it (D4).
     pub type_name: &'static str,
+    /// What the namespace accounts the key as (D9): its key, what it holds and the
+    /// store's own overhead per key.
+    pub bytes: usize,
+    /// When it expires, in milliseconds since the Unix epoch; `0`: never.
+    pub expires_ms: u64,
+    /// What `kv_get` would read, in a page that carries values ([`Limits::values`]).
+    /// Boxed: a walk gathers many keys to list a few, and none of them has one yet.
+    pub value: Option<Box<Value>>,
+}
+
+/// A key of a shard, as one hold of its lock shows it to a walk.
+pub(super) struct Seen<'a> {
+    pub(super) key: &'a Arc<[u8]>,
+    pub(super) type_name: &'static str,
+    pub(super) bytes: usize,
+    pub(super) expires_ms: u64,
+}
+
+impl Seen<'_> {
+    fn listed(&self) -> KeyInfo {
+        KeyInfo {
+            key: self.key.clone(),
+            type_name: self.type_name,
+            bytes: self.bytes,
+            expires_ms: self.expires_ms,
+            value: None,
+        }
+    }
 }
 
 /// One page of a listing.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct Page {
     /// The keys, in the listing's order.
     pub keys: Vec<KeyInfo>,
@@ -337,6 +445,8 @@ pub struct KeyView {
     pub value: Value,
     /// When it expires, in milliseconds since the Unix epoch; `0`: never.
     pub expires_ms: u64,
+    /// What the namespace accounts the key as (D9).
+    pub bytes: usize,
 }
 
 /// Why a listing was not made.
@@ -415,7 +525,7 @@ impl Namespace {
         batch: usize,
         changes: &mut Option<u64>,
         now_ms: u64,
-        each: &mut dyn FnMut(&Arc<[u8]>, &'static str),
+        each: &mut dyn FnMut(Seen<'_>),
     ) -> Option<usize> {
         if let Some(replica) = &self.replica {
             return replica.look(at, seen, batch, changes, now_ms, each);
@@ -428,10 +538,41 @@ impl Namespace {
         for entry in shard.map.values().skip(seen).take(batch) {
             looked += 1;
             if !entry.expired(now_ms) {
-                each(&entry.key, entry.data.type_name());
+                each(Seen {
+                    key: &entry.key,
+                    type_name: entry.data.type_name(),
+                    bytes: entry.bytes,
+                    expires_ms: entry.expires_ms,
+                });
             }
         }
         Some(looked)
+    }
+
+    /// What `key` holds at `now_ms`, under one hold of its shard's lock; `None` when
+    /// there is no such key, or its expiry has passed.
+    fn peek(&self, key: &[u8], now_ms: u64) -> Option<KeyView> {
+        if let Some(replica) = &self.replica {
+            return replica
+                .peek(self, key)
+                .map(|(type_name, value, expires_ms, bytes)| KeyView {
+                    type_name,
+                    value,
+                    expires_ms,
+                    bytes,
+                });
+        }
+        let shard = lock_shard(&self.shards[self.shard_of(key)]);
+        shard
+            .map
+            .get(key)
+            .filter(|entry| !entry.expired(now_ms))
+            .map(|entry| KeyView {
+                type_name: entry.data.type_name(),
+                value: entry.data.read(),
+                expires_ms: entry.expires_ms,
+                bytes: entry.bytes,
+            })
     }
 
     /// The time the namespace judges expiries by.
@@ -463,12 +604,11 @@ impl Namespace {
         loop {
             // Room for a whole batch, made with no lock held.
             found.reserve(batch.min(1024));
-            let mut each = |key: &Arc<[u8]>, type_name: &'static str| {
-                if after.is_none_or(|after| &**key > after) && selector.matches(key) {
-                    found.push(KeyInfo {
-                        key: key.clone(),
-                        type_name,
-                    });
+            let mut each = |seen: Seen<'_>| {
+                if after.is_none_or(|after| &**seen.key > after)
+                    && selector.matches(seen.key, seen.expires_ms, now_ms)
+                {
+                    found.push(seen.listed());
                 }
             };
             let looked = self.look(at, seen, batch, &mut changes, now_ms, &mut each)?;
@@ -486,6 +626,78 @@ impl Namespace {
         }
     }
 
+    /// [`gather`](Self::gather) for a `local` namespace's keys that expire within
+    /// `within` of `now_ms`, by the shard's order of expiry: only the entries of that
+    /// order up to that time are looked at, [`WALK_BATCH`] per hold, each hold going on
+    /// from the entry the one before it ended at. An order can be entered anywhere, so
+    /// no hold passes over what was looked at, and a key put in or taken out meanwhile
+    /// moves no other: there is nothing to start again.
+    ///
+    /// A key whose expiry is changed between two holds moves in the order. Moved
+    /// ahead of the walk it is found a second time, which is why what is gathered is
+    /// made distinct here; moved behind it, it is not found.
+    fn gather_due(
+        &self,
+        at: usize,
+        selector: &Selector<'_>,
+        within: Duration,
+        after: Option<&[u8]>,
+        keep: usize,
+        now_ms: u64,
+    ) -> Vec<KeyInfo> {
+        let distinct = |found: &mut Vec<KeyInfo>| {
+            found.sort_unstable_by(|a, b| a.key.cmp(&b.key));
+            found.dedup_by(|a, b| a.key == b.key);
+        };
+        // A key that holds a value now expires after this second began, and one that
+        // is selected expires by `last`. No key is empty, so the order is entered
+        // before every key of the first second.
+        let last = super::expiry_slot(now_ms.saturating_add(millis(within)));
+        let mut from: Due = (now_ms / 1000, Arc::from(&[][..]));
+        let mut found: Vec<KeyInfo> = Vec::new();
+        loop {
+            found.reserve(WALK_BATCH);
+            let shard = lock_shard(&self.shards[at]);
+            let mut looked = 0;
+            let mut ended = None;
+            let ahead = (Bound::Excluded(&from), Bound::Unbounded);
+            for due in shard.expiry.range::<Due, _>(ahead).take(WALK_BATCH) {
+                if due.0 > last {
+                    break;
+                }
+                looked += 1;
+                ended = Some(due);
+                let Some(entry) = shard.map.get(&due.1) else {
+                    continue;
+                };
+                if !entry.expired(now_ms)
+                    && after.is_none_or(|after| &*entry.key > after)
+                    && selector.matches(&entry.key, entry.expires_ms, now_ms)
+                {
+                    found.push(KeyInfo {
+                        key: entry.key.clone(),
+                        type_name: entry.data.type_name(),
+                        bytes: entry.bytes,
+                        expires_ms: entry.expires_ms,
+                        value: None,
+                    });
+                }
+            }
+            let next = ended.filter(|_| looked == WALK_BATCH).cloned();
+            drop(shard);
+            if found.len() >= keep.saturating_mul(2).max(1024) {
+                // Distinct first: a key found twice must not stand for two.
+                distinct(&mut found);
+                found.truncate(keep);
+            }
+            let Some(next) = next else {
+                distinct(&mut found);
+                return found;
+            };
+            from = next;
+        }
+    }
+
     /// The first `want` keys of shard `at` after `after` that `selector` selects, in
     /// order of their bytes, cut where they pass `room` bytes (one key always fits);
     /// and whether that was every such key the shard has.
@@ -500,10 +712,15 @@ impl Namespace {
     ) -> (Vec<KeyInfo>, bool) {
         // One more than wanted, to know whether there are more.
         let keep = want.saturating_add(1);
-        let mut found = (0..WALK_RETRIES)
-            .find_map(|_| self.gather(at, selector, after, keep, WALK_BATCH, now_ms))
-            .or_else(|| self.gather(at, selector, after, keep, usize::MAX, now_ms))
-            .unwrap_or_default();
+        let mut found = match selector.expiry {
+            ByExpiry::Within(within) if self.replica.is_none() => {
+                self.gather_due(at, selector, within, after, keep, now_ms)
+            }
+            _ => (0..WALK_RETRIES)
+                .find_map(|_| self.gather(at, selector, after, keep, WALK_BATCH, now_ms))
+                .or_else(|| self.gather(at, selector, after, keep, usize::MAX, now_ms))
+                .unwrap_or_default(),
+        };
         found.sort_unstable_by(|a, b| a.key.cmp(&b.key));
         let mut more = found.len() > want;
         found.truncate(want);
@@ -559,6 +776,52 @@ impl Namespace {
                 break;
             }
         }
+        match limits.values {
+            Some(values) => self.with_values(page, selector, &values, now_ms),
+            None => page,
+        }
+    }
+
+    /// `page` with each key's value, and each key as it is now: every key is read
+    /// again, under one hold of its shard's lock each, so what the page says of a key
+    /// (its type, its size, its expiry) is of the value beside it. A key that is gone
+    /// since the walk found it, or that `selector` no longer selects, is left out. The
+    /// page is cut where its values pass `values.room` (one key always fits), and then
+    /// says where to go on.
+    fn with_values(
+        &self,
+        mut page: Page,
+        selector: &Selector<'_>,
+        values: &Values,
+        now_ms: u64,
+    ) -> Page {
+        let mut kept: Vec<KeyInfo> = Vec::with_capacity(page.keys.len());
+        let mut used = 0usize;
+        for mut listed in std::mem::take(&mut page.keys) {
+            let Some(view) = self.peek(&listed.key, now_ms) else {
+                continue;
+            };
+            if !selector.matches(&listed.key, view.expires_ms, now_ms) {
+                continue;
+            }
+            used = used.saturating_add((values.size)(&view.value));
+            if used > values.room {
+                if let Some(last) = kept.last() {
+                    page.next = Some(Cursor {
+                        instance: self.instance,
+                        shard: self.shard_of(&last.key),
+                        after: last.key.to_vec(),
+                    });
+                    break;
+                }
+            }
+            listed.type_name = view.type_name;
+            listed.bytes = view.bytes;
+            listed.expires_ms = view.expires_ms;
+            listed.value = Some(Box::new(view.value));
+            kept.push(listed);
+        }
+        page.keys = kept;
         page
     }
 }
@@ -638,26 +901,7 @@ impl Store {
     /// No such namespace.
     pub fn key(&self, namespace: &str, key: &[u8]) -> Result<Option<KeyView>, KeysError> {
         let ns = self.namespace(namespace).ok_or(KeysError::NoNamespace)?;
-        if let Some(replica) = &ns.replica {
-            return Ok(replica
-                .peek(&ns, key)
-                .map(|(type_name, value, expires_ms)| KeyView {
-                    type_name,
-                    value,
-                    expires_ms,
-                }));
-        }
-        let now_ms = ns.shared.clock.now_ms();
-        let shard = lock_shard(&ns.shards[ns.shard_of(key)]);
-        Ok(shard
-            .map
-            .get(key)
-            .filter(|entry| !entry.expired(now_ms))
-            .map(|entry| KeyView {
-                type_name: entry.data.type_name(),
-                value: entry.data.read(),
-                expires_ms: entry.expires_ms,
-            }))
+        Ok(ns.peek(key, ns.shared.clock.now_ms()))
     }
 
     /// Delete `key` of `namespace`, whatever its type: an operator's delete (D10).

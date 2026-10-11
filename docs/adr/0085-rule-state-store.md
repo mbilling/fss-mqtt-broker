@@ -2116,3 +2116,183 @@ factor of five, so only the fastest rounds say anything.)
   namespace hold one entry a message for the window, which is what `max_keys` is for;
   one who can guess another publisher's ids can use them up, which is what `clientid`
   in the key is for), and the cookbook's recipe.
+
+### 2026-10-11 — T12: looking into the store, as built
+
+T12 built the amendment "admin features" as edited by "no last-write time": the listing
+says each key's type, size and expiry, carries values on request, and selects by expiry.
+Nothing was added to an entry, no write call was changed, `ENTRY_OVERHEAD` is 128 bytes
+and the peer protocol is as it was. This lists what the amendment left open and T12
+settled.
+
+**What the listing says of a key**
+
+- **`type`, `bytes`, `expires_at`,** all read from the entry. `bytes` is what the
+  namespace accounts the key as (D9): its key, what it holds, and the store's overhead a
+  key. In a `local` namespace the listed sizes add up to the namespace's `bytes`, less
+  the keys past their expiry that are still held; in an `eventual` one that total also
+  counts the deleted keys it remembers. Neither kind is listed.
+- **`expires_at` is `null` for a key that never expires,** not absent as the amendment
+  had it: the read of one key (T6) already says `null`, and one shape is easier to read
+  than two.
+- **`values=true`** adds `value`, `value_encoding` and `value_type`, exactly as the read
+  of one key shows them. The walk gathers keys without values (it looks at many keys to
+  list a few); each key of the page is then read again under one hold of its shard's
+  lock, and what the page says of it (type, size, expiry) is of that reading. A key that
+  is gone by then, or that the filters no longer select, is left out.
+
+**What a page is bounded by**
+
+- T6's three bounds stand: 1,000 keys (`limit`), 256 KiB of key bytes, 50 ms of looking.
+- **With values, 1 MiB of them** (the amendment's figure), counted as each `value`
+  stands in the answer: its JSON string, quotes and escapes included. That is the one
+  measure that bounds the answer whatever a value holds (a control character is six
+  bytes there, a byte that is not UTF-8 four thirds). A page that reaches it is short and
+  has a `next_cursor`.
+- **A page always holds one key.** A single value past the bound is therefore a page of
+  its own; only a `union` of many long elements can be one (1,024 elements of 256 bytes).
+- So an answer without values is a few hundred KiB at the most, and one with values
+  that plus 1 MiB, but for that one case.
+
+**The filters, precisely**
+
+- **`prefix`**, as T6 built it. **`expires_within=<duration>`**: the keys whose expiry is
+  at or before the moment the page is asked for plus the duration. A key with no expiry
+  is not one; a key that has expired already is not listed by any listing (T6), and one
+  that is held for its event (T4) is in no listing either. **`no_expiry=true`**: the
+  keys that never expire.
+- **Combined, every one given must select a key** (AND). `expires_within` with
+  `no_expiry=true` selects nothing by definition and is refused (`400 bad-request`,
+  naming both) rather than answered with an empty listing.
+- **A duration is written as the rules file writes one**
+  (`mqtt_rules::state::duration_text`, the parser of `default_ttl` and of a rule's TTL
+  argument): a whole number with `s`, `m`, `h` or `d`; or a whole number of seconds, as
+  the file's integer form. `expires_within=0s` is taken and selects nothing.
+- **`kv_store`** is listed like any namespace. No key of it expires, so `no_expiry`
+  selects every key and `expires_within` none. Elsewhere it is the other way round
+  today: a key written without a TTL takes its namespace's `default_ttl`, so
+  `no_expiry` selects nothing in a declared namespace or a rule's own until T14's
+  `clear` has made such a key.
+- **Judged page by page.** "Now" is the moment each page is asked for, and a key is
+  judged as it is when the walk looks at it.
+
+**What a concurrent change does to a filtered listing.** T6's promise is kept for a key
+that is there **and selected** from the first page to the last: listed exactly once,
+whatever is written or merged in meanwhile, and no key is ever listed twice. A key whose
+expiry is changed while the listing runs, so that it starts or stops being selected, is
+listed if it is selected when the listing reaches its place and not otherwise: it may or
+may not be listed. Under `expires_within` in a `local` namespace that also goes for a
+key whose expiry is changed while its shard is being looked at and that is selected
+before and after (below: the order it is walked in is the order the change moves it
+in). Tests pin each case, for a `local` namespace and for an `eventual` one with states
+merged in between two pages.
+
+**One selection, for T13 and T14 too.** In the store, `Selector` is the prefix and a
+`ByExpiry` (any, never, within a time), judged by the one function `Selector::matches`
+over the one walk `Namespace::select`. In the admin API, `Selection` reads `prefix`,
+`prefix_encoding`, `expires_within` and `no_expiry` from a request once, refuses what
+contradicts, and gives the store its `Selector`. The listing takes it; a purge and a
+change of expiry take the same two types, so what a dry run or a listing shows is what
+the action reaches. T13's `expired=true` is one more `ByExpiry`, walked in the order of
+expiry from its start.
+
+**The walk, and what was decided about its cost**
+
+T6 left this to T12: a listing looks at every key of each shard it takes keys from, 64
+keys per hold, each hold passing over the keys the holds before it looked at, and starts
+a shard again when its map changed between two holds. With a filter that selects little,
+all of that is spent to list a few keys.
+
+- **Measured** (`cargo bench -p mqttd --bench rule_state -- filtered`; Apple M1 Pro; the
+  machine was shared and heavily loaded throughout, a load average of 13 to 65, so these
+  are upper figures and two rounds differed by up to a factor of two; the faster of two is given). One whole listing,
+  every page of it, of a namespace where the filter selects one key in a hundred, with
+  nothing else running and beside two writers (one writing existing keys anew, one
+  putting keys in and taking them out):
+
+  | Keys | Filter | Walks | Alone | Beside writers | Pages |
+  |---|---|---|---|---|---|
+  | 100,000 | `prefix` | the map | 2.7 ms | 4.6 ms | 1 |
+  | 100,000 | `no_expiry` | the map | 1.7 ms | 2.8 ms | 1 |
+  | 100,000 | `expires_within` | the order of expiry | 0.06 ms | 0.08 ms | 1 |
+  | 100,000 | `expires_within`, selecting 99 keys in 100 | the order of expiry | 12 ms | 17 ms | 99 |
+  | 100,000 | none (every key) | the map | 26 ms | 26 ms | 100 |
+  | 1,000,000 | `prefix` | the map | 216 ms | 254 ms | 10 |
+  | 1,000,000 | `no_expiry` | the map | 193 ms | 238 ms | 10 |
+  | 1,000,000 | `expires_within` | the order of expiry | 0.67 ms | 2.0 ms | 10 |
+  | 1,000,000 | `expires_within`, selecting 99 keys in 100 | the order of expiry | 0.99 s | 1.6 s | 990 |
+  | 1,000,000 | none (every key) | the map | 3.3 s | 3.7 s | 1,000 |
+
+  Where a filter selects one key in a hundred, the map's walk costs what the whole
+  namespace costs to look at once (64 shards, each walked whole: 2 to 3 ms at 100,000
+  keys, a fifth of a second at 1,000,000), and the writers add a fifth to two thirds by
+  making it start shards again. The order's walk costs what it lists: 30 to 300 times
+  less here, and it is the cheaper of the two even where nearly every key is selected.
+
+- **Decided: no index, and the order the store already keeps is used where it answers
+  the question.** A shard keeps its expiring keys in order of expiry, to the second, for
+  the sweep (T1, T4). `expires_within` in a `local` namespace walks that order instead of
+  the map: only the entries up to its time, 64 per hold, each hold going on from the
+  entry the one before ended at. An order can be entered anywhere, so nothing is passed
+  over, a hold is 64 entries and no more, and a key put in or taken out moves no other,
+  so there is nothing to start again. It costs what it selects, not what the namespace
+  holds. The price is the sentence above about a key whose expiry is changed during the
+  walk: it moves in that order, and moved behind the walk it is passed over (moved ahead
+  it is found twice and listed once).
+- **Kept as it was: the map's walk, for `prefix`, `no_expiry` and no filter,** and for
+  every filter in an `eventual` namespace, whose one order (of forgetting) is by the
+  later of a key's expiry and its last delete's window and so does not say when a value
+  expires. The cost is stated in ADMIN-API.md: a filter there makes pages that are short
+  or empty, not a listing that looks at less.
+- **Not done, and why.** An order of keys per shard would make every listing resumable
+  and cost every insert and delete on the publish path, and memory per key: the user
+  ruled out more bytes per key. Entering the map itself by position would need neither,
+  but the standard library's map cannot be entered at a position; a table that can
+  would replace the map every state call goes through, which is a change to the publish
+  path to be measured for itself and not a part of listing keys. It is the open point
+  below.
+- **What a listing costs the publish path** is unchanged for the map's walk (T6's
+  table). Measured the same way (`-- inspected`, four threads calling, the
+  faster of two rounds): beside a `no_expiry` listing that selects nothing and so does
+  nothing but walk, a call takes 0.61 µs at 100,000 keys and 3.4 µs at 1,000,000, against
+  0.29 and 0.74 µs alone and 0.58 and 1.8 µs beside a listing of every key; beside an
+  `expires_within` listing 0.32 and 0.90 µs, which is the spread of "alone". The
+  unfiltered listing itself, in turn with `main`'s binary over three rounds, the fastest
+  of each: one page of 1,000 keys 0.106 to 0.142 ms at 100,000 keys (each listed key now
+  carries its size and expiry, and is 56 bytes to sort where it was 32) and 2.97 to
+  3.11 ms at 1,000,000, where passing over keys is most of it; a call beside a listing of
+  every key 0.50 to 0.58 µs and 2.1 to 1.8 µs, inside the spread.
+
+**The read of one key says `bytes` too** (`GET /admin/v1/rules/state/key`), as the
+listing does and from the same reading of the entry.
+
+**The audit log.** The record of a listing keeps T6's rule and says more: `prefix` by
+hash and length, `expires_within`, `no_expiry` and `values` as they came (none is of a
+key). **`cursor` is now recorded by hash and length too:** a cursor holds the last key
+the page before it listed, in hex, and T6 recorded it whole, which put that key in the
+audit log. Reading keys and values is not audited beyond the request's own record.
+
+**The CLI.** `state-keys <ns>` gains `--values`, `--expires-within <duration>` and
+`--no-expiry` (named as a command line names things; they send `values=true`,
+`expires_within` and `no_expiry=true`), and prints `BYTES` and `EXPIRES_AT` for every
+key, `VALUE` and `VALUE_TYPE` with `--values`. A value is cut to 60 characters in the
+table and whole in `--json`; control characters are escaped in both, as everywhere.
+These flags are T15's by the plan and were built here, since the listing cannot be
+tried from a terminal without them. T15 keeps `state-purge`, `state-expire` and the
+prose (RULES.md's section on operating the store, the threat model's row).
+
+**Left open**
+
+- **A map that can be entered by position** (above): it would make every listing, and
+  T13's and T14's walks, cost what they look at once, with no memory per key and
+  nothing added to a write. Not decided.
+- **`expires_within` in an `eventual` namespace** walks the map. T4's cluster half adds
+  a sweep over that namespace's order; if it comes to keep values' expiries in an order
+  of their own, the listing can use it as the `local` one does.
+- **A type or a filter of their own for remembered idempotency keys,** which T5 left
+  to T12. Not added: such a key is an entry like any other (T5), so the listing shows it
+  with its type (`first`), its size and its expiry, `prefix` with the NUL byte it starts
+  with selects exactly those keys, and `expires_within` selects them by the end of their
+  dedupe window; a test pins that. A parameter that hides them, or lists only them,
+  is a small addition to `Selector` if an operator's listing turns out to be crowded
+  by them.

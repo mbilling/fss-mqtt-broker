@@ -1903,6 +1903,22 @@ async fn list_keys(n: &Node, who: &Who, params: &[(&str, &str)]) -> (Vec<Value>,
     }
 }
 
+/// Take `bytes` and `expires_at` out of listed keys, after checking that each has
+/// them: a size that covers the store's 128 bytes a key, and an expiry that is a time
+/// or `null`.
+fn without_size_and_expiry(keys: &mut [Value]) {
+    for key in keys {
+        let fields = key.as_object_mut().unwrap();
+        let bytes = fields.remove("bytes").and_then(|b| b.as_u64());
+        assert!(bytes.is_some_and(|b| b > 128), "{fields:?}");
+        let expires = fields.remove("expires_at").expect("expires_at");
+        assert!(
+            expires.is_null() || expires.as_str().is_some_and(|t| t.len() == 24),
+            "{expires}"
+        );
+    }
+}
+
 /// D10's roles. A viewer reads each namespace's mode, bounds and counts, and no key or
 /// value: the overview holds none, and listing or reading keys is refused. An operator
 /// lists keys and reads a value. A delete needs the operator role and a listed rules
@@ -2026,6 +2042,7 @@ async fn a_viewer_reads_counts_an_operator_keys_and_values_and_a_writer_deletes(
     assert_eq!(status, 200, "{body}");
     let mut listed = body["keys"].as_array().unwrap().clone();
     listed.sort_by_key(|k| k["key"].as_str().unwrap().to_string());
+    without_size_and_expiry(&mut listed);
     assert_eq!(
         listed,
         [
@@ -2048,6 +2065,9 @@ async fn a_viewer_reads_counts_an_operator_keys_and_values_and_a_writer_deletes(
         json!({
             "node": "rules-node", "namespace": "alerts",
             "key": "hot:dev-1", "key_encoding": "utf8", "type": "lww",
+            // What the namespace accounts it as: the store's 128 bytes, the key and
+            // the value.
+            "bytes": 128 + 9 + 53,
             // As the rule engine writes it: the integer keeps every digit.
             "value": "{\"temp\":31.5,\"serial\":123456789012345678901234567890}",
             "value_encoding": "utf8", "value_type": "map",
@@ -2405,7 +2425,8 @@ async fn every_key_a_listing_shows_can_be_read_and_deleted_as_shown() {
     assert_eq!(values, expected);
 
     // -- a rule's own namespace: a set reads as its elements
-    let (keys, _) = list_keys(&n, &n.operator, &[("ns", "rule:own")]).await;
+    let (mut keys, _) = list_keys(&n, &n.operator, &[("ns", "rule:own")]).await;
+    without_size_and_expiry(&mut keys);
     assert_eq!(
         keys,
         [json!({"key": "members", "key_encoding": "utf8", "type": "union"})]
@@ -2451,7 +2472,8 @@ async fn every_key_a_listing_shows_can_be_read_and_deleted_as_shown() {
     .collect();
     assert_eq!(shown, expected);
     // A prefix there is of a string key's text.
-    let (dev, _) = list_keys(&n, &n.operator, &[("ns", "kv_store"), ("prefix", "dev")]).await;
+    let (mut dev, _) = list_keys(&n, &n.operator, &[("ns", "kv_store"), ("prefix", "dev")]).await;
+    without_size_and_expiry(&mut dev);
     assert_eq!(
         dev,
         [json!({"key": "dev-1", "key_encoding": "utf8", "type": "lww"})]
@@ -2692,6 +2714,7 @@ async fn an_eventual_namespace_is_seen_and_managed_like_a_local_one() {
 
     let (mut keys, _) = list_keys(&n, &n.operator, &[("ns", "alerts")]).await;
     keys.sort_by_key(|k| k["key"].as_str().unwrap().to_string());
+    without_size_and_expiry(&mut keys);
     assert_eq!(
         keys,
         [
@@ -2748,4 +2771,567 @@ async fn an_eventual_namespace_is_seen_and_managed_like_a_local_one() {
     n.publish("set/1", br#"{"k":"hot:dev-1","v":"again"}"#);
     let (status, body) = n.call(&n.operator, "GET", &path, None).await;
     assert_eq!((status, &body["value"]), (200, &json!("again")), "{body}");
+}
+
+// ---------------------------------------------------------------------------------------
+// Looking into the store: sizes, expiries, values and filters (ADR 0085 T12)
+// ---------------------------------------------------------------------------------------
+
+/// Rules that write keys with an expiry the publisher chooses and with the
+/// namespace's default, into a `local` namespace, an `eventual` one, a rule's own and
+/// EMQX's table.
+const EXPIRING: &str = r#"[state.fleet]
+max_keys = 4000
+
+[state.shared]
+consistency = "eventual"
+
+[rules.soon]
+state = "fleet"
+sql = '''SELECT kv_set(payload.k, payload.v, payload.ttl) AS v FROM "soon/#"'''
+actions = [{ function = "console" }]
+
+[rules.later]
+state = "fleet"
+sql = '''SELECT kv_set(payload.k, payload.v) AS v FROM "later/#"'''
+actions = [{ function = "console" }]
+
+[rules.shared_soon]
+state = "shared"
+sql = '''SELECT kv_incr(payload.k, 1, payload.ttl) AS n FROM "shared/soon/#"'''
+actions = [{ function = "console" }]
+
+[rules.shared_later]
+state = "shared"
+sql = '''SELECT kv_set(payload.k, payload.v) AS v FROM "shared/later/#"'''
+actions = [{ function = "console" }]
+
+[rules.emqx]
+sql = '''SELECT kv_store_put(payload.k, payload.v) AS ok FROM "emqx/#"'''
+actions = [{ function = "console" }]
+
+[rules.own]
+sql = '''SELECT kv_add(payload.k, clientid, '5m') AS n FROM "own/#"'''
+actions = [{ function = "console" }]
+"#;
+
+/// The `key` of every listed key, sorted, after checking that none came twice.
+fn names(keys: &[Value]) -> Vec<String> {
+    let names: Vec<String> = keys
+        .iter()
+        .map(|k| k["key"].as_str().unwrap().to_string())
+        .collect();
+    let distinct: std::collections::BTreeSet<&String> = names.iter().collect();
+    assert_eq!(distinct.len(), names.len(), "no key is listed twice");
+    distinct.into_iter().cloned().collect()
+}
+
+/// A time `secs` from now, as the API writes one.
+fn in_secs(secs: u64) -> String {
+    mqttd::rules_sys::rfc3339_millis(
+        std::time::SystemTime::now() + std::time::Duration::from_secs(secs),
+    )
+}
+
+/// T12: the listing says of every key its type, what the namespace accounts it as and
+/// when it expires, in a declared namespace (`local` and `eventual`), a rule's own and
+/// EMQX's table; the sizes listed add up to what the overview counts. Values come only
+/// with `values=true`, as the read of one key shows them, and only to an operator.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // every kind of namespace, once
+async fn a_listing_shows_each_keys_type_size_and_expiry_and_values_when_asked() {
+    let n = Node::start(EXPIRING).await;
+    let (before_soon, before_day) = (in_secs(60), in_secs(86_400));
+    n.publish("soon/1", br#"{"k":"hot:dev-1","v":{"temp":31.5},"ttl":60}"#);
+    n.publish("later/1", br#"{"k":"hot:dev-2","v":"a secret reading"}"#);
+    n.publish("shared/soon/1", br#"{"k":"seen:dev-1","ttl":"1m"}"#);
+    n.publish("shared/later/1", br#"{"k":"last:dev-1","v":7}"#);
+    n.publish("emqx/1", br#"{"k":"dev-9","v":[1,"x"]}"#);
+    n.publish("emqx/1", br#"{"k":1.0,"v":"a float key"}"#);
+    n.publish("own/1", br#"{"k":"members"}"#);
+    let (after_soon, after_day) = (in_secs(60), in_secs(86_400));
+
+    let listed = |ns: &'static str, values: bool| {
+        let n = &n;
+        async move {
+            let mut params = vec![("ns", ns)];
+            if values {
+                params.push(("values", "true"));
+            }
+            let (mut keys, _) = list_keys(n, &n.operator, &params).await;
+            keys.sort_by_key(|k| k["key"].as_str().unwrap().to_string());
+            keys
+        }
+    };
+    let between = |key: &Value, from: &str, to: &str| {
+        let at = key["expires_at"].as_str().unwrap();
+        assert!(from <= at && at <= to, "{from} <= {at} <= {to}");
+    };
+
+    // A declared namespace: an expiry a rule chose, and the namespace's default.
+    let fleet = listed("fleet", false).await;
+    assert_eq!(names(&fleet), ["hot:dev-1", "hot:dev-2"]);
+    between(&fleet[0], &before_soon, &after_soon);
+    between(&fleet[1], &before_day, &after_day);
+    for key in &fleet {
+        assert_eq!(key["type"], "lww");
+        // No value, and nothing of one, unless it is asked for.
+        let fields: Vec<&String> = key.as_object().unwrap().keys().collect();
+        assert_eq!(
+            fields,
+            ["bytes", "expires_at", "key", "key_encoding", "type"]
+        );
+    }
+    let size = |key: &Value| key["bytes"].as_u64().unwrap();
+    assert_eq!(size(&fleet[0]), 128 + 9 + r#"{"temp":31.5}"#.len() as u64);
+    // The sizes are the namespace's own account, in every kind of namespace.
+    let (_, overview) = n
+        .call(&n.viewer, "GET", "/admin/v1/rules/state", None)
+        .await;
+    for ns in ["fleet", "kv_store", "rule:own"] {
+        let keys = listed(ns, false).await;
+        assert_eq!(
+            keys.iter().map(size).sum::<u64>(),
+            namespace(&overview, ns)["bytes"].as_u64().unwrap(),
+            "{ns}"
+        );
+    }
+
+    // With values: what the read of one key shows, beside the same facts.
+    let valued = listed("fleet", true).await;
+    for (plain, with) in fleet.iter().zip(&valued) {
+        let path = with_query(
+            "/admin/v1/rules/state/key",
+            &[("ns", "fleet"), ("key", plain["key"].as_str().unwrap())],
+        );
+        let (status, one) = n.call(&n.operator, "GET", &path, None).await;
+        assert_eq!(status, 200, "{one}");
+        for field in [
+            "value",
+            "value_encoding",
+            "value_type",
+            "type",
+            // The read of one key says its size too, and it is the listing's.
+            "bytes",
+            "expires_at",
+        ] {
+            assert_eq!(with[field], one[field], "{field}: {with}");
+        }
+        assert_eq!(with["bytes"], plain["bytes"]);
+    }
+    assert_eq!(
+        (&valued[0]["value"], &valued[0]["value_type"]),
+        (&json!("{\"temp\":31.5}"), &json!("map"))
+    );
+    assert_eq!(valued[1]["value"], "a secret reading");
+
+    // An `eventual` namespace: the same, for a counter and a value.
+    let shared = listed("shared", true).await;
+    assert_eq!(names(&shared), ["last:dev-1", "seen:dev-1"]);
+    assert_eq!(
+        (
+            &shared[0]["type"],
+            &shared[0]["value"],
+            &shared[0]["value_type"]
+        ),
+        (&json!("lww"), &json!("7"), &json!("integer"))
+    );
+    assert_eq!(
+        (&shared[1]["type"], &shared[1]["value"]),
+        (&json!("sum"), &json!("1"))
+    );
+    between(&shared[0], &before_day, &after_day);
+    between(&shared[1], &before_soon, &after_soon);
+    assert!(shared.iter().all(|key| size(key) > 128), "{shared:?}");
+
+    // A rule's own namespace.
+    let own = listed("rule:own", true).await;
+    assert_eq!(
+        (
+            &own[0]["key"],
+            &own[0]["type"],
+            &own[0]["value"],
+            &own[0]["value_type"]
+        ),
+        (
+            &json!("members"),
+            &json!("union"),
+            &json!("[\"c1\"]"),
+            &json!("array")
+        )
+    );
+    between(&own[0], &in_secs(290), &in_secs(300));
+
+    // EMQX's table: any key, any value, no expiry.
+    let emqx = listed("kv_store", true).await;
+    assert_eq!(emqx.len(), 2);
+    let float = emqx.iter().find(|k| k["key_encoding"] == "term").unwrap();
+    assert_eq!(
+        (&float["term"], &float["value"], &float["expires_at"]),
+        (&json!("1.0"), &json!("a float key"), &Value::Null)
+    );
+    let text = emqx.iter().find(|k| k["key"] == "dev-9").unwrap();
+    assert_eq!(
+        (
+            &text["value"],
+            &text["value_type"],
+            &text["expires_at"],
+            &text["type"]
+        ),
+        (
+            &json!("[1,\"x\"]"),
+            &json!("array"),
+            &Value::Null,
+            &json!("lww")
+        )
+    );
+
+    // Not a viewer's, with values or without: refused, with nothing of a key in it.
+    for params in [
+        &[("ns", "fleet")][..],
+        &[("ns", "fleet"), ("values", "true")],
+        &[
+            ("ns", "kv_store"),
+            ("no_expiry", "true"),
+            ("values", "true"),
+        ],
+    ] {
+        let path = with_query("/admin/v1/rules/state/keys", params);
+        let (status, body) = n.call(&n.viewer, "GET", &path, None).await;
+        assert_eq!((status, code(&body)), (403, "forbidden"), "{path}");
+        let text = body.to_string();
+        assert!(!text.contains("secret") && !text.contains("dev-"), "{text}");
+    }
+}
+
+/// T12: `expires_within` and `no_expiry`, alone and combined with `prefix`, select
+/// exactly the keys written that way, in a `local` namespace, an `eventual` one and
+/// EMQX's table, where no key expires, so `no_expiry` selects every key and
+/// `expires_within` none. The two together are refused, as is a duration that is not
+/// one. A key written between two pages of a filtered listing is listed when the
+/// listing has yet to reach its place, and no key is listed twice.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // each filter and each combination, once
+async fn the_filters_select_keys_by_expiry_alone_and_with_a_prefix() {
+    let n = Node::start(EXPIRING).await;
+    for i in 0..300 {
+        let soon = format!(r#"{{"k":"dev:{i:03}:soon","v":{i},"ttl":"5m"}}"#);
+        n.publish("soon/1", soon.as_bytes());
+        let hour = format!(r#"{{"k":"dev:{i:03}:hour","v":{i},"ttl":3600}}"#);
+        n.publish("soon/1", hour.as_bytes());
+        let later = format!(r#"{{"k":"dev:{i:03}:day","v":{i}}}"#);
+        n.publish("later/1", later.as_bytes());
+    }
+    for i in 0..50 {
+        let soon = format!(r#"{{"k":"seen:{i:02}","ttl":120}}"#);
+        n.publish("shared/soon/1", soon.as_bytes());
+        let later = format!(r#"{{"k":"last:{i:02}","v":{i}}}"#);
+        n.publish("shared/later/1", later.as_bytes());
+        let emqx = format!(r#"{{"k":"dev-{i:02}","v":{i}}}"#);
+        n.publish("emqx/1", emqx.as_bytes());
+    }
+    n.publish("emqx/1", br#"{"k":[1,"x"],"v":"an array key"}"#);
+    let select = |params: &'static [(&'static str, &'static str)]| {
+        let n = &n;
+        async move { names(&list_keys(n, &n.operator, params).await.0) }
+    };
+    let ends = |keys: &[String], kind: &str, count: usize| {
+        assert_eq!(keys.len(), count, "{kind}");
+        assert!(keys.iter().all(|k| k.ends_with(kind)), "{kind}: {keys:?}");
+    };
+
+    // A `local` namespace. Every key there has an expiry: a rule's, or the default.
+    assert_eq!(
+        select(&[("ns", "fleet"), ("limit", "1000")]).await.len(),
+        900
+    );
+    ends(
+        &select(&[("ns", "fleet"), ("expires_within", "10m")]).await,
+        ":soon",
+        300,
+    );
+    ends(
+        &select(&[("ns", "fleet"), ("expires_within", "600")]).await,
+        ":soon",
+        300,
+    );
+    assert_eq!(
+        select(&[("ns", "fleet"), ("expires_within", "4m")])
+            .await
+            .len(),
+        0
+    );
+    let two = select(&[("ns", "fleet"), ("expires_within", "2h"), ("limit", "70")]).await;
+    assert_eq!(two.len(), 600);
+    assert!(two.iter().all(|k| !k.ends_with(":day")));
+    assert_eq!(
+        select(&[("ns", "fleet"), ("expires_within", "2d")])
+            .await
+            .len(),
+        900
+    );
+    assert_eq!(
+        select(&[("ns", "fleet"), ("no_expiry", "true")])
+            .await
+            .len(),
+        0
+    );
+    // With a prefix: both must hold.
+    let some = select(&[
+        ("ns", "fleet"),
+        ("expires_within", "10m"),
+        ("prefix", "dev:00"),
+    ])
+    .await;
+    ends(&some, ":soon", 10);
+    assert!(some.iter().all(|k| k.starts_with("dev:00")));
+    let encoded = select(&[
+        ("ns", "fleet"),
+        ("expires_within", "2h"),
+        ("prefix", "ZGV2OjAx"),
+        ("prefix_encoding", "base64"),
+        ("limit", "7"),
+    ])
+    .await;
+    assert_eq!(encoded.len(), 20);
+    assert!(encoded.iter().all(|k| k.starts_with("dev:01")));
+    assert_eq!(
+        select(&[
+            ("ns", "fleet"),
+            ("expires_within", "10m"),
+            ("prefix", "nope")
+        ])
+        .await
+        .len(),
+        0
+    );
+
+    // An `eventual` namespace.
+    let seen = select(&[("ns", "shared"), ("expires_within", "10m"), ("limit", "20")]).await;
+    assert_eq!(seen.len(), 50);
+    assert!(seen.iter().all(|k| k.starts_with("seen:")));
+    assert_eq!(
+        select(&[
+            ("ns", "shared"),
+            ("expires_within", "10m"),
+            ("prefix", "seen:0")
+        ])
+        .await
+        .len(),
+        10
+    );
+    assert_eq!(
+        select(&[("ns", "shared"), ("expires_within", "2d")])
+            .await
+            .len(),
+        100
+    );
+    assert_eq!(
+        select(&[("ns", "shared"), ("no_expiry", "true")])
+            .await
+            .len(),
+        0
+    );
+
+    // EMQX's table: no key expires.
+    assert_eq!(
+        select(&[("ns", "kv_store"), ("no_expiry", "true")])
+            .await
+            .len(),
+        51
+    );
+    assert_eq!(select(&[("ns", "kv_store")]).await.len(), 51);
+    assert_eq!(
+        select(&[("ns", "kv_store"), ("expires_within", "30d")])
+            .await
+            .len(),
+        0
+    );
+    let some = select(&[
+        ("ns", "kv_store"),
+        ("no_expiry", "true"),
+        ("prefix", "dev-1"),
+    ])
+    .await;
+    assert_eq!(some.len(), 10);
+
+    // What contradicts, and what is not what its parameter takes: refused, saying why.
+    for (params, why) in [
+        (
+            &[
+                ("ns", "fleet"),
+                ("no_expiry", "true"),
+                ("expires_within", "1h"),
+            ][..],
+            "expires_within and no_expiry select nothing together",
+        ),
+        (
+            &[("ns", "fleet"), ("expires_within", "soon")],
+            "is not a duration",
+        ),
+        (
+            &[("ns", "fleet"), ("expires_within", "1.5h")],
+            "is not a duration",
+        ),
+        (
+            &[("ns", "fleet"), ("no_expiry", "1")],
+            "no_expiry is true or false",
+        ),
+        (
+            &[("ns", "fleet"), ("values", "all")],
+            "values is true or false",
+        ),
+    ] {
+        let path = with_query("/admin/v1/rules/state/keys", params);
+        let (status, body) = n.call(&n.operator, "GET", &path, None).await;
+        assert_eq!(
+            (status, code(&body)),
+            (400, "bad-request"),
+            "{path}: {body}"
+        );
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains(why), "{path}: {message}");
+    }
+
+    // Between two pages of a filtered listing: keys the filter selects are written,
+    // and one that was selected is given a later expiry.
+    let first = with_query(
+        "/admin/v1/rules/state/keys",
+        &[("ns", "fleet"), ("expires_within", "10m"), ("limit", "100")],
+    );
+    let (_, page) = n.call(&n.operator, "GET", &first, None).await;
+    assert_eq!(page["count"], 100, "{page}");
+    let cursor = page["next_cursor"].as_str().unwrap().to_string();
+    let mut seen = names(page["keys"].as_array().unwrap());
+    for i in 0..200 {
+        let soon = format!(r#"{{"k":"new:{i:03}:soon","v":{i},"ttl":30}}"#);
+        n.publish("soon/1", soon.as_bytes());
+    }
+    let (rest, _) = list_keys(
+        &n,
+        &n.operator,
+        &[
+            ("ns", "fleet"),
+            ("expires_within", "10m"),
+            ("limit", "100"),
+            ("cursor", &cursor),
+        ],
+    )
+    .await;
+    seen.extend(names(&rest));
+    let distinct: std::collections::BTreeSet<&String> = seen.iter().collect();
+    assert_eq!(distinct.len(), seen.len(), "no key is listed twice");
+    assert!((0..300).all(|i| distinct.contains(&format!("dev:{i:03}:soon"))));
+    assert!(seen.iter().all(|k| k.ends_with(":soon")));
+    assert!(seen.iter().any(|k| k.starts_with("new:")));
+}
+
+/// T12: a page with values ends at 1,000 keys or where its values pass 1 MiB of the
+/// answer, whichever comes first. Such a page is short and has a cursor, and the
+/// listing is whole all the same; without values the same keys fit one page.
+#[tokio::test]
+async fn a_page_with_values_ends_at_a_mebibyte_of_them() {
+    const BOUND: usize = 1024 * 1024;
+    let n = Node::start(EXPIRING).await;
+    let value = "v".repeat(4_000);
+    for i in 0..400 {
+        let payload = format!(r#"{{"k":"big:{i:03}","v":"{value}"}}"#);
+        n.publish("later/1", payload.as_bytes());
+    }
+    let (plain, pages) = list_keys(&n, &n.operator, &[("ns", "fleet"), ("limit", "1000")]).await;
+    assert_eq!((plain.len(), pages), (400, 1));
+    let mut cursor = None::<String>;
+    let (mut keys, mut sizes) = (Vec::new(), Vec::new());
+    loop {
+        let mut params = vec![("ns", "fleet"), ("limit", "1000"), ("values", "true")];
+        if let Some(cursor) = &cursor {
+            params.push(("cursor", cursor));
+        }
+        let path = with_query("/admin/v1/rules/state/keys", &params);
+        let (status, body) = n.call(&n.operator, "GET", &path, None).await;
+        assert_eq!(status, 200, "{body}");
+        let page = body["keys"].as_array().unwrap();
+        // What the values take of the answer: each as the JSON string it is there.
+        let taken: usize = page.iter().map(|k| k["value"].to_string().len()).sum();
+        assert!(taken <= BOUND, "{taken} bytes of values in one page");
+        assert!(page.iter().all(|k| k["value"] == value.as_str()));
+        sizes.push(taken);
+        keys.extend(page.iter().cloned());
+        match body["next_cursor"].as_str() {
+            Some(next) => cursor = Some(next.to_string()),
+            None => break,
+        }
+        assert!(sizes.len() < 50, "the listing does not end");
+    }
+    assert_eq!(names(&keys), names(&plain), "every key once");
+    // 400 values of 4,002 bytes are 1.6 MiB: two pages, the first as full as it gets.
+    assert_eq!(sizes.len(), 2, "{sizes:?}");
+    assert!(sizes[0] > BOUND - 4_002, "{sizes:?}");
+}
+
+/// T12: the audit log's record of a listing keeps D10's rule. It says which filters
+/// were used and whether values were asked for, and names no key: the prefix and the
+/// cursor, which holds the last key listed, are recorded by hash and length.
+#[tokio::test]
+async fn the_record_of_a_filtered_listing_names_its_filters_and_no_key() {
+    let n = Node::start(EXPIRING).await;
+    for i in 0..30 {
+        let soon = format!(r#"{{"k":"secret-device-{i:02}","v":"a secret reading","ttl":60}}"#);
+        n.publish("soon/1", soon.as_bytes());
+    }
+    let (keys, pages) = list_keys(
+        &n,
+        &n.operator,
+        &[
+            ("ns", "fleet"),
+            ("prefix", "secret-"),
+            ("expires_within", "10m"),
+            ("values", "true"),
+            ("limit", "20"),
+        ],
+    )
+    .await;
+    assert_eq!((keys.len(), pages), (30, 2));
+    let (keys, _) = list_keys(
+        &n,
+        &n.operator,
+        &[("ns", "kv_store"), ("no_expiry", "true")],
+    )
+    .await;
+    assert!(keys.is_empty());
+    let requests: Vec<String> = n
+        .audit
+        .of_kind("admin.request")
+        .into_iter()
+        .filter(|(who, _)| who.as_deref() == Some("CN=operator"))
+        .map(|(_, detail)| detail)
+        .collect();
+    let prefix = sha256_hex("secret-");
+    assert_eq!(
+        requests[0],
+        format!(
+            "role=operator GET /admin/v1/rules/state/keys?ns=fleet&prefix_sha256={prefix}&\
+             prefix_bytes=7&expires_within=10m&values=true&limit=20 -> 200"
+        )
+    );
+    assert!(
+        requests[1].starts_with(&format!(
+            "role=operator GET /admin/v1/rules/state/keys?ns=fleet&prefix_sha256={prefix}&\
+             prefix_bytes=7&expires_within=10m&values=true&limit=20&cursor_sha256="
+        )) && requests[1].contains("&cursor_bytes="),
+        "{requests:?}"
+    );
+    assert_eq!(
+        requests[2],
+        "role=operator GET /admin/v1/rules/state/keys?ns=kv_store&no_expiry=true -> 200"
+    );
+    // Nothing of a key or a value, as text or as the cursor's hex of it.
+    // `secret-device`, as a cursor would carry it.
+    let hex = "7365637265742d646576696365";
+    for record in &requests {
+        assert!(
+            !record.contains("secret-") && !record.contains("reading") && !record.contains(hex),
+            "{record}"
+        );
+    }
 }

@@ -292,8 +292,9 @@ const VERBS: &[Verb] = &[
         required: &["ns"],
         optional: &["prefix", "prefix_encoding", "limit", "cursor"],
         source_file: None,
-        help: "operator: the keys of namespace <ns> with their types (paged: --cursor takes \
-               next_cursor)",
+        help: "operator: the keys of namespace <ns>, each with its type, size and expiry \
+               (paged: --cursor takes next_cursor); --values: with their values; \
+               --expires-within <duration>, --no-expiry: only those keys",
     },
     Verb {
         name: "state-get",
@@ -318,6 +319,40 @@ const VERBS: &[Verb] = &[
 
 /// The verbs that take `--all-nodes` (`scope=cluster`): ask every node and merge.
 const ALL_NODES_VERBS: &[&str] = &["clients", "session", "subscribers"];
+
+/// A verb's options that are not `--<parameter> <value>`: named as a command line names
+/// things (`--no-expiry` for the parameter `no_expiry`), and, for a flag, taking no
+/// value and sending `true`.
+struct Named {
+    verb: &'static str,
+    /// The option, without its dashes.
+    option: &'static str,
+    /// The query parameter it sets.
+    param: &'static str,
+    /// It takes no value: giving it sends `<param>=true`.
+    flag: bool,
+}
+
+const NAMED_OPTIONS: &[Named] = &[
+    Named {
+        verb: "state-keys",
+        option: "values",
+        param: "values",
+        flag: true,
+    },
+    Named {
+        verb: "state-keys",
+        option: "no-expiry",
+        param: "no_expiry",
+        flag: true,
+    },
+    Named {
+        verb: "state-keys",
+        option: "expires-within",
+        param: "expires_within",
+        flag: false,
+    },
+];
 
 /// Options that take a value and apply to every verb.
 const GLOBAL_OPTIONS: &[&str] = &[
@@ -401,8 +436,19 @@ fn parse(args: &[String]) -> Result<Invocation, String> {
         }
         if let Some(name) = arg.strip_prefix("--") {
             let is_global = GLOBAL_OPTIONS.contains(&arg.as_str());
-            if !is_global && !verb.optional.contains(&name) {
+            let named = NAMED_OPTIONS
+                .iter()
+                .find(|n| n.verb == verb.name && n.option == name);
+            if !is_global && named.is_none() && !verb.optional.contains(&name) {
                 return Err(format!("{arg} is not an option of --admin {}", verb.name));
+            }
+            let name = named.map_or(name, |n| n.param);
+            if named.is_some_and(|n| n.flag) {
+                if inv.params.iter().any(|(k, _)| k == name) {
+                    return Err(format!("repeated option: {arg}"));
+                }
+                inv.params.push((name.to_string(), "true".to_string()));
+                continue;
             }
             let value = tokens
                 .next()
@@ -523,6 +569,10 @@ fn usage() -> String {
         }
         for o in v.optional {
             let _ = write!(shape, " [--{o} <v>]");
+        }
+        for named in NAMED_OPTIONS.iter().filter(|n| n.verb == v.name) {
+            let value = if named.flag { "" } else { " <v>" };
+            let _ = write!(shape, " [--{}{value}]", named.option);
         }
         if ALL_NODES_VERBS.contains(&v.name) {
             shape.push_str(" [--all-nodes]");
@@ -731,6 +781,7 @@ pub fn render_for(verb: &str, value: &Value) -> String {
         "cluster" => render_cluster(value),
         "rules" => render_rules(value),
         "state" => render_state(value),
+        "state-keys" => render_state_keys(value),
         // Verbatim, so `mqttd --admin rules-source > rules.toml` writes the file as it is.
         "rules-source" => value
             .get("source")
@@ -808,6 +859,58 @@ fn render_state(value: &Value) -> Option<String> {
             .iter()
             .map(|(c, _)| (*c).to_string())
             .collect::<Vec<_>>(),
+        &cells,
+    ));
+    Some(out)
+}
+
+/// The widest `VALUE` cell of a key listing; the whole value is in `--json`.
+const VALUE_WIDTH: usize = 60;
+
+/// One page of a namespace's keys (ADR 0085 D10, T12): what the answer says of the
+/// page, then one row per key with its type, size and expiry, `TERM` where a key of
+/// EMQX's table is not a string, and `VALUE` and `VALUE_TYPE` where values were asked
+/// for. A value is cut to [`VALUE_WIDTH`]; `--json` has it whole, with how it is carried.
+fn render_state_keys(value: &Value) -> Option<String> {
+    let keys = value.get("keys")?.as_array()?;
+    if keys.is_empty() || !keys.iter().all(Value::is_object) {
+        return None;
+    }
+    let Value::Object(answer) = value else {
+        return None;
+    };
+    let page: serde_json::Map<String, Value> = answer
+        .iter()
+        .filter(|(name, _)| name.as_str() != "keys")
+        .map(|(name, v)| (name.clone(), v.clone()))
+        .collect();
+    let mut out = render(&Value::Object(page));
+    let has = |field: &str| keys.iter().any(|key| key.get(field).is_some());
+    let mut columns = vec!["key", "key_encoding", "type", "bytes", "expires_at"];
+    if has("term") {
+        columns.push("term");
+    }
+    if has("value") {
+        columns.extend(["value", "value_type"]);
+    }
+    let cells: Vec<Vec<String>> = keys
+        .iter()
+        .map(|key| {
+            columns
+                .iter()
+                .map(|column| match key.get(*column) {
+                    None => "-".to_string(),
+                    Some(Value::String(text)) if *column == "value" => {
+                        printable_cut(text, VALUE_WIDTH)
+                    }
+                    Some(cell) => scalar(cell),
+                })
+                .collect()
+        })
+        .collect();
+    out.push_str("\nkeys:\n");
+    out.push_str(&grid(
+        &columns.iter().map(|c| c.to_uppercase()).collect::<Vec<_>>(),
         &cells,
     ));
     Some(out)
@@ -1610,6 +1713,41 @@ mod tests {
         assert!(validate(&args("state-keys alerts --prefix hot: --limit 10")).is_ok());
         assert!(validate(&args("state-keys alerts --cursor 1-00-0-")).is_ok());
         assert!(validate(&args("state-keys alerts --key_encoding base64")).is_err());
+        // T12: values and the filters, named as a command line names them.
+        let inv = parse(&args(
+            "state-keys alerts --values --expires-within 10m --prefix hot:",
+        ))
+        .unwrap();
+        assert_eq!(
+            inv.params,
+            [
+                ("ns".to_string(), "alerts".to_string()),
+                ("values".to_string(), "true".to_string()),
+                ("expires_within".to_string(), "10m".to_string()),
+                ("prefix".to_string(), "hot:".to_string()),
+            ]
+        );
+        let inv = parse(&args("state-keys alerts --no-expiry --json")).unwrap();
+        assert_eq!(inv.params[1], ("no_expiry".to_string(), "true".to_string()));
+        assert!(inv.json);
+        for refused in [
+            "state-keys alerts --values --values",
+            "state-keys alerts --no-expiry --no-expiry",
+            "state-keys alerts --expires-within",
+            "state-keys alerts --expires-within 1h --expires-within 2h",
+            "state-keys alerts --no_expiry",
+            "state-keys alerts --expires_within 1h",
+            "state-get alerts k --values",
+            "state --no-expiry",
+        ] {
+            assert!(validate(&args(refused)).is_err(), "{refused}");
+        }
+        let help = usage();
+        let flowing = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flowing.contains("[--values] [--no-expiry] [--expires-within <v>]"),
+            "{help}"
+        );
         assert!(validate(&args("state-get alerts")).is_err());
         assert!(validate(&args("state-del alerts")).is_err());
         assert!(validate(&args("state-del alerts k --if_match x")).is_err());
@@ -1691,18 +1829,34 @@ mod tests {
         let keys = json!({
             "node": "n1", "namespace": "alerts", "count": 2, "next_cursor": null,
             "keys": [
-                {"key": format!("hot:{hostile}"), "key_encoding": "utf8", "type": "first"},
-                {"key": "AQ==", "key_encoding": "term", "type": "lww",
-                 "term": format!("[\"{hostile}\"]")},
+                {"key": format!("hot:{hostile}"), "key_encoding": "utf8", "type": "first",
+                 "bytes": 180, "expires_at": "2026-10-11T13:00:00.000Z",
+                 "value": format!("{{\"v\":\"{hostile}\"}}"), "value_encoding": "utf8",
+                 "value_type": "map"},
+                {"key": "AQ==", "key_encoding": "term", "type": "lww", "bytes": 140,
+                 "expires_at": null, "term": format!("[\"{hostile}\"]"),
+                 "value": "x".repeat(200), "value_encoding": "utf8", "value_type": "string"},
             ],
         });
         let out = render_for("state-keys", &keys);
         clean(&out);
         assert!(
-            out.contains(&format!("\nhot:{escaped}  utf8          first  -\n")),
+            out.contains(&format!(
+                "\nhot:{escaped}  utf8          first  180    2026-10-11T13:00:00.000Z  -"
+            )),
             "{out}"
         );
         assert!(out.contains(&format!("[\"{escaped}\"]")), "{out}");
+        // A value is cut to its column in the table, between two escapes and never
+        // inside one, and is whole in `--json`.
+        assert!(
+            out.contains(
+                "  {\"v\":\"\\u{1b}]0;PWNED\\u{7}\\u{1b}[2J\\rX\\u{7f}\\u{9b}\\u{2028}\\n…"
+            ),
+            "{out}"
+        );
+        assert!(out.contains(&format!("  {}…", "x".repeat(59))), "{out}");
+        assert!(!out.contains(&"x".repeat(60)), "{out}");
         let one = json!({
             "node": "n1", "namespace": "alerts", "key": format!("hot:{hostile}"),
             "key_encoding": "utf8", "type": "lww", "value": format!("{{\"v\":\"{hostile}\"}}"),
@@ -1735,6 +1889,53 @@ mod tests {
             assert!(out.contains("\\u001b") && out.contains("\\u009b"), "{out}");
             assert_eq!(&serde_json::from_str::<Value>(&out).unwrap(), answer);
         }
+    }
+
+    /// T12: a page of keys is the answer's own facts, then a row per key with its
+    /// type, size and expiry (`-` for none); `TERM`, `VALUE` and `VALUE_TYPE` are
+    /// columns only when a key has them.
+    #[test]
+    fn a_page_of_keys_is_a_table_of_type_size_and_expiry() {
+        let page = json!({
+            "node": "mqttd-1", "namespace": "alerts", "count": 2, "next_cursor": "1-00-3-6b",
+            "keys": [
+                {"key": "hot:dev-1", "key_encoding": "utf8", "type": "first", "bytes": 153,
+                 "expires_at": "2026-10-11T13:00:00.000Z"},
+                {"key": "seen", "key_encoding": "utf8", "type": "union", "bytes": 2210,
+                 "expires_at": null},
+            ],
+        });
+        assert_eq!(
+            render_for("state-keys", &page),
+            "count        2\n\
+             namespace    alerts\n\
+             next_cursor  1-00-3-6b\n\
+             node         mqttd-1\n\
+             \n\
+             keys:\n\
+             KEY        KEY_ENCODING  TYPE   BYTES  EXPIRES_AT\n\
+             hot:dev-1  utf8          first  153    2026-10-11T13:00:00.000Z\n\
+             seen       utf8          union  2210   -\n"
+        );
+        let mut valued = page.clone();
+        valued["keys"][0]["value"] = json!("1791720000000");
+        valued["keys"][0]["value_encoding"] = json!("utf8");
+        valued["keys"][0]["value_type"] = json!("integer");
+        valued["keys"][1]["value"] = json!("[\"dev-1\",\"dev-2\"]");
+        valued["keys"][1]["value_encoding"] = json!("utf8");
+        valued["keys"][1]["value_type"] = json!("array");
+        let out = render_for("state-keys", &valued);
+        let rows = [
+            "KEY        KEY_ENCODING  TYPE   BYTES  EXPIRES_AT                VALUE              VALUE_TYPE",
+            "hot:dev-1  utf8          first  153    2026-10-11T13:00:00.000Z  1791720000000      integer",
+            "seen       utf8          union  2210   -                         [\"dev-1\",\"dev-2\"]  array",
+        ];
+        assert!(out.ends_with(&format!("{}\n", rows.join("\n"))), "{out}");
+        // A page with no key is the answer's facts alone.
+        let empty = json!({"node": "mqttd-1", "namespace": "alerts", "count": 0,
+                           "keys": [], "next_cursor": "1-00-3-"});
+        let out = render_for("state-keys", &empty);
+        assert!(out.contains("next_cursor  1-00-3-\n"), "{out}");
     }
 
     /// `rules-source` prints the file and nothing else, so redirecting it keeps the file.

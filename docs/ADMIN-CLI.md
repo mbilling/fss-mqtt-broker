@@ -464,8 +464,8 @@ what one key holds, and a delete.
 | Verb | Role | Does |
 |---|---|---|
 | `state` | viewer | a row per state namespace: its mode, bounds, keys, bytes and counts. No key and no value |
-| `state-keys <ns> [--prefix <text>] [--prefix_encoding utf8\|base64] [--limit <n>] [--cursor <next_cursor>]` | operator | the keys of namespace `<ns>`, each with its type; 100 a page unless `--limit` says otherwise, at most 1,000 |
-| `state-get <ns> <key> [--key_encoding utf8\|base64\|term]` | operator | one key's value, type and expiry |
+| `state-keys <ns> [--prefix <text>] [--prefix_encoding utf8\|base64] [--expires-within <duration>] [--no-expiry] [--values] [--limit <n>] [--cursor <next_cursor>]` | operator | the keys of namespace `<ns>`, each with its type, its size and its expiry, and with `--values` its value; 100 a page unless `--limit` says otherwise, at most 1,000 |
+| `state-get <ns> <key> [--key_encoding utf8\|base64\|term]` | operator | one key's value, type, size and expiry |
 | `state-del <ns> <key> [--key_encoding utf8\|base64\|term]` | operator, listed in `[rules] admin_writers` | delete one key; the next message's rule finds none |
 
 ```text
@@ -495,11 +495,22 @@ next_cursor  -
 node         mqttd-1
 
 keys:
-KEY        KEY_ENCODING  TYPE
-hot:dev-1  utf8          first
-hot:dev-2  utf8          first
+KEY        KEY_ENCODING  TYPE   BYTES  EXPIRES_AT
+hot:dev-1  utf8          first  150    2026-10-11T13:00:00.000Z
+hot:dev-2  utf8          first  150    2026-10-11T13:20:00.000Z
+
+$ mqttd --admin state-keys alerts --expires-within 30m --values
+count        1
+namespace    alerts
+next_cursor  -
+node         mqttd-1
+
+keys:
+KEY        KEY_ENCODING  TYPE   BYTES  EXPIRES_AT                VALUE          VALUE_TYPE
+hot:dev-1  utf8          first  150    2026-10-11T13:00:00.000Z  1791720000000  integer
 
 $ mqttd --admin state-get alerts hot:dev-1
+bytes           150
 expires_at      2026-10-11T13:00:00.000Z
 key             hot:dev-1
 key_encoding    utf8
@@ -535,12 +546,34 @@ printed: quote it for your shell, or take `key` and `key_encoding` from
   (`--key_encoding base64`).
 
 `state-keys` pages: while `next_cursor` is not `-`, pass it as `--cursor` for the next
-page. A page can be short, or empty, and still have one. Keys written while you page are
-neither repeated nor allowed to hide a key that stays
+page, with the same filters. A page can be short, or empty, and still have one. Keys
+written while you page are neither repeated nor allowed to hide a key that stays
 ([ADMIN-API.md § Rule state](ADMIN-API.md#rule-state)).
 
+**What `state-keys` says of a key.** `BYTES` is what the namespace accounts the key as
+(its key, what it holds, and the store's 128 bytes a key): the column that says which
+keys fill a namespace. `EXPIRES_AT` is when the key expires, `-` for never.
+
+**Which keys.** The filters combine: a key is listed when every one given selects it.
+
+- `--prefix <text>`: the keys that start with it.
+- `--expires-within <duration>`: the keys that expire within that long from now. A
+  duration is a whole number with a unit, `s`, `m`, `h` or `d` (`90s`, `10m`, `1h`, `7d`),
+  or a whole number of seconds.
+- `--no-expiry`: the keys that never expire. In `kv_store` that is every key (EMQX's
+  table has no expiry); elsewhere a key written without a TTL takes its namespace's
+  `default_ttl`, so there are none until a key's expiry has been cleared.
+- `--expires-within` with `--no-expiry` is refused (`400 bad-request`): no key is both.
+
+**`--values`** adds each key's value, as `state-get` shows it, and what it is
+(`VALUE_TYPE`; `binary` is bytes that are not UTF-8, shown as base64). A value longer
+than 60 characters is cut in the table and ends in `…`; `--json` has every value whole,
+with `value_encoding`. A page with values ends at 1 MiB of them, so it can hold fewer
+keys than `--limit`: go on from `next_cursor`.
+
 A `state-del` is audited (`state.delete`). The audit log names the key by its SHA-256 and
-length, never by itself, and so does the record of every `state-get` and `state-keys`.
+length, never by itself, and so does the record of every `state-get` and `state-keys`
+(its prefix and its cursor; the filters and `--values` are recorded as given).
 
 ## Recipes
 

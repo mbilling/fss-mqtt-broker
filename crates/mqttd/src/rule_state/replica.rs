@@ -1311,7 +1311,7 @@ impl Replica {
         batch: usize,
         changes: &mut Option<u64>,
         now_ms: u64,
-        each: &mut dyn FnMut(&Arc<[u8]>, &'static str),
+        each: &mut dyn FnMut(super::admin::Seen<'_>),
     ) -> Option<usize> {
         let shard = lock_shard(&self.shards[at]);
         if *changes.get_or_insert(shard.changes) != shard.changes {
@@ -1321,20 +1321,35 @@ impl Replica {
         for entry in shard.map.values().skip(seen).take(batch) {
             looked += 1;
             if let Some(data) = entry.state.live(now_ms) {
-                each(&entry.key, data.type_name());
+                each(super::admin::Seen {
+                    key: &entry.key,
+                    type_name: data.type_name(),
+                    bytes: entry.bytes,
+                    expires_ms: entry.state.expires_ms(),
+                });
             }
         }
         Some(looked)
     }
 
     /// What `key` holds now, for an operator's read: its type, what `kv_get` would
-    /// read, and its expiry. Not a write, so nothing is stamped or sent.
-    pub(super) fn peek(&self, ns: &Namespace, key: &[u8]) -> Option<(&'static str, Value, u64)> {
+    /// read, its expiry, and what it is accounted as. Not a write, so nothing is
+    /// stamped or sent.
+    pub(super) fn peek(
+        &self,
+        ns: &Namespace,
+        key: &[u8],
+    ) -> Option<(&'static str, Value, u64, usize)> {
         let now_ms = Self::now_ms(ns);
         let shard = lock_shard(&self.shards[ns.shard_of(key)]);
         let entry = shard.map.get(key)?;
         let data = entry.state.live(now_ms)?;
-        Some((data.type_name(), data.read(), entry.state.expires_ms()))
+        Some((
+            data.type_name(),
+            data.read(),
+            entry.state.expires_ms(),
+            entry.bytes,
+        ))
     }
 
     /// The rules' calls answered, by operation; keys forgotten whose value had
