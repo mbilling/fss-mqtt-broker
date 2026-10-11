@@ -11,8 +11,10 @@ tasks:
     evidence: "PR 929: crates/mqtt-rules/src/state.rs (StateStore and StateNamespace handed over in Functions, [state.<name>] and the rule key state, one table of function names) and crates/mqttd/src/rule_state.rs (local namespaces, typed keys, TTLs, bounds, LRU, the rules.state_max_bytes ceiling, brownout); 141 probes of EMQX 6.3.1 (emqx_rule_funcs and emqx_rule_sqltester) pinned in rule_state::tests, none contradicting the ADR; mqtt-rules tests_state (21), mqttd rule_state::tests (33), tests/rules_state.rs (6), additions to rules_binary.rs, admin_rules.rs and the converter test; dry runs on a scratch store; the rule_state benchmark (0.11-0.14 us per call on one thread, Apple M1 Pro)."
   - id: 0085-T2
     title: "Typed merges as CRDTs (lww, first, max, min, sum, union, hll, deletes) on a per-node hybrid logical clock, and the replicated form of a key"
-    status: in-progress
+    status: done
     issue: 918
+    date: 2026-10-11
+    evidence: "PR 935: crates/mqtt-rules/src/crdt.rs (the types, a merge that is commutative, associative and idempotent over every state the decoder accepts, the hybrid logical clock with a 60 s skew bound, the canonical bounded encoded form, kv_hll_add and kv_hll_count on a 2^14-register sketch hashed with SipHash-2-4 under a fixed key) and the store keeping its keys in crdt::Data; mqtt-rules tests_crdt (40); the state_merge fuzz target in the nightly tier (about 1.2 million inputs locally, no finding); T1 store tests and the 141 EMQX probes pass unmodified; the ADR amended for the delete rule of non-lww types, first-write expiry, the skew bound and the counter bound."
   - id: 0085-T3
     title: "eventual mode: every member holds the namespace; changed keys sent per peer link at peer protocol 14, applied off the hub, repaired by anti-entropy after partitions and restarts"
     status: planned
@@ -95,7 +97,7 @@ phases.
 | Task | Status | Issue | When | Evidence / notes |
 |------|--------|-------|------|------------------|
 | 0085-T1 | ✅ done | [#917](https://github.com/mbilling/fss-mqtt-broker/issues/917) | 2026-10-11 | "PR 929: crates/mqtt-rules/src/state.rs (StateStore and StateNamespace handed over in Functions, [state.<name>] and the rule key state, one table of function names) and crates/mqttd/src/rule_state.rs (local namespaces, typed keys, TTLs, bounds, LRU, the rules.state_max_bytes ceiling, brownout); 141 probes of EMQX 6.3.1 (emqx_rule_funcs and emqx_rule_sqltester) pinned in rule_state::tests, none contradicting the ADR; mqtt-rules tests_state (21), mqttd rule_state::tests (33), tests/rules_state.rs (6), additions to rules_binary.rs, admin_rules.rs and the converter test; dry runs on a scratch store; the rule_state benchmark (0.11-0.14 us per call on one thread, Apple M1 Pro)." |
-| 0085-T2 | 🚧 in-progress | [#918](https://github.com/mbilling/fss-mqtt-broker/issues/918) | — |  |
+| 0085-T2 | ✅ done | [#918](https://github.com/mbilling/fss-mqtt-broker/issues/918) | 2026-10-11 | "PR 935: crates/mqtt-rules/src/crdt.rs (the types, a merge that is commutative, associative and idempotent over every state the decoder accepts, the hybrid logical clock with a 60 s skew bound, the canonical bounded encoded form, kv_hll_add and kv_hll_count on a 2^14-register sketch hashed with SipHash-2-4 under a fixed key) and the store keeping its keys in crdt::Data; mqtt-rules tests_crdt (40); the state_merge fuzz target in the nightly tier (about 1.2 million inputs locally, no finding); T1 store tests and the 141 EMQX probes pass unmodified; the ADR amended for the delete rule of non-lww types, first-write expiry, the skew bound and the counter bound." |
 | 0085-T3 | ⬜ planned | [#919](https://github.com/mbilling/fss-mqtt-broker/issues/919) | — |  |
 | 0085-T4 | ⬜ planned | [#920](https://github.com/mbilling/fss-mqtt-broker/issues/920) | — |  |
 | 0085-T5 | ⬜ planned | [#921](https://github.com/mbilling/fss-mqtt-broker/issues/921) | — |  |
