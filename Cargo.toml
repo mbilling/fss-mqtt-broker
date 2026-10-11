@@ -21,7 +21,12 @@ members = [
 # cargo-deny and cargo-audit on every push and its lockfile is what the SBOM is cut from.
 # A feature flag would not achieve this — it removes a crate from the artifact, not from
 # Cargo.lock. The boundary has to be the lockfile.
-exclude = ["tools/mqttui"]
+#
+# `examples/rule-plugins/rust` is a workspace of its own too: a worked example of a
+# rule-function module (ADR 0086 D9), which is guest code built for WebAssembly and run
+# inside the broker's sandbox. It needs `unsafe` to implement the function ABI, and this
+# workspace forbids `unsafe`; it has no dependencies.
+exclude = ["tools/mqttui", "examples/rule-plugins/rust"]
 
 [workspace.package]
 version = "1.1.0"

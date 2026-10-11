@@ -97,6 +97,9 @@ rustls-pki-types.workspace = true
 # `test-util` enables tokio's paused-clock test helpers (start_paused) for the
 # time-based session-expiry tests (ADR 0009).
 tokio = { workspace = true, features = ["test-util"] }
+# A module written out by hand, for the tests of `[functions.<name>]` through the binary
+# (ADR 0086 D9): they need no Wasm toolchain.
+mqtt-wasm-sandbox = { path = "../mqtt-wasm-sandbox", features = ["test-module"] }
 # Per-node surviving data dirs for the crash/restart stress vocabulary (ADR 0042 T4).
 # Already in the tree via mqtt-cluster's dev-dependencies.
 tempfile = "3"

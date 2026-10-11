@@ -1,0 +1,25 @@
+# A worked example of a rule-function module for mqttd (ADR 0086 D9), in Rust.
+#
+# This crate is NOT a member of the broker's workspace, on purpose: it is guest code,
+# compiled to WebAssembly and run inside the broker's sandbox, and it cannot implement
+# the function ABI without `unsafe` (see src/lib.rs), which the workspace forbids for
+# the broker's own code. It has no dependencies. Build it with ../build.sh.
+[package]
+name = "mqttd-rule-plugin-geo"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Its own workspace root: the directory above is the broker's repository.
+[workspace]

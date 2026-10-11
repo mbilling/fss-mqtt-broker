@@ -1,212 +1,20 @@
-//! The sandbox against a module written out by hand here, byte by byte: these tests
-//! need no Wasm toolchain and no jq. What the module's one function does is chosen by
-//! the first letter of the name it is called by (see [`call_body`]).
+//! The sandbox against a module written out by hand, byte by byte
+//! ([`crate::test_module`]): these tests need no Wasm toolchain and no jq. What the
+//! module's one function does is chosen by the first letter of the name it is called by.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::jq::{Pool, PoolStats, Tag};
+use crate::test_module::{module, Shape};
 use crate::{
     Arg, CallError, Execution, Grants, HandOff, Limits, LoadError, Reply, Sandbox, ABI_VERSION,
 };
 
-fn uleb(mut n: u32, out: &mut Vec<u8>) {
-    loop {
-        let byte = u8::try_from(n & 0x7f).unwrap();
-        n >>= 7;
-        if n == 0 {
-            out.push(byte);
-            return;
-        }
-        out.push(byte | 0x80);
-    }
-}
-
-fn sleb(mut n: i32, out: &mut Vec<u8>) {
-    loop {
-        let byte = u8::try_from(n & 0x7f).unwrap();
-        n >>= 7;
-        let done = (n == 0 && byte & 0x40 == 0) || (n == -1 && byte & 0x40 != 0);
-        if done {
-            out.push(byte);
-            return;
-        }
-        out.push(byte | 0x80);
-    }
-}
-
-fn section(id: u8, body: &[u8], out: &mut Vec<u8>) {
-    out.push(id);
-    uleb(u32::try_from(body.len()).unwrap(), out);
-    out.extend_from_slice(body);
-}
-
-fn name(text: &str, out: &mut Vec<u8>) {
-    uleb(u32::try_from(text.len()).unwrap(), out);
-    out.extend_from_slice(text.as_bytes());
-}
-
-fn konst(n: i32, out: &mut Vec<u8>) {
-    out.push(0x41);
-    sleb(n, out);
-}
-
-/// `ret[0] = at; ret[1] = len` for the result pair `ret` (local 5).
-fn set_result(at: i32, len: i32, out: &mut Vec<u8>) {
-    for (offset, value) in [(0u8, at), (4, len)] {
-        out.extend_from_slice(&[0x20, 5]);
-        konst(value, out);
-        out.extend_from_slice(&[0x36, 2, offset]);
-    }
-}
-
-const DESCRIPTION: (i32, &[u8]) = (16, b"{}");
-const TRUE: (i32, &[u8]) = (32, b"jtrue");
-const NOPE: (i32, &[u8]) = (48, b"nope");
-
-/// The body of `mqttd_call(name, name_len, args, args_len, max_out, ret)`, with one
-/// extra local (6) holding the first byte of the name:
-///
-/// * `l` loops for ever; `g` grows its memory for ever; `r` recurses for ever;
-///   `x` runs `unreachable`;
-/// * `e` fails with status 7 and the message `nope`;
-/// * `n` fails with the number of arguments as its status, `p` with its allocator's
-///   next address;
-/// * `b` claims a result of two gigabytes;
-/// * anything else returns the JSON value `true`.
-fn call_body() -> Vec<u8> {
-    let mut b = vec![1, 1, 0x7f]; // one extra local, an i32
-    b.extend_from_slice(&[0x20, 0, 0x2d, 0, 0, 0x21, 6]); // local 6 = name[0]
-    let mut when = |letter: u8, then: &[u8]| {
-        b.extend_from_slice(&[0x20, 6]);
-        konst(i32::from(letter), &mut b);
-        b.extend_from_slice(&[0x46, 0x04, 0x40]); // i32.eq; if
-        b.extend_from_slice(then);
-        b.push(0x0b);
-    };
-    when(b'l', &[0x03, 0x40, 0x0c, 0, 0x0b]); // loop br 0 end
-    when(b'g', &[0x03, 0x40, 0x41, 16, 0x40, 0, 0x1a, 0x0c, 0, 0x0b]); // loop grow 16 pages
-    when(b'r', &[0x10, 5, 0x1a]); // call the recursing function
-    when(b'x', &[0x00]);
-    let failing = |status: &[u8]| {
-        let mut code = Vec::new();
-        set_result(NOPE.0, 4, &mut code);
-        code.extend_from_slice(status);
-        code.push(0x0f); // return
-        code
-    };
-    when(b'e', &failing(&[0x41, 7]));
-    when(b'n', &failing(&[0x20, 2, 0x28, 2, 0])); // i32.load(args): the count
-    when(b'p', &failing(&[0x23, 0])); // global.get 0
-    let mut huge = Vec::new();
-    set_result(64, i32::MAX, &mut huge);
-    huge.extend_from_slice(&[0x41, 0, 0x0f]);
-    when(b'b', &huge);
-    set_result(TRUE.0, 5, &mut b);
-    b.extend_from_slice(&[0x41, 0, 0x0b]);
-    b
-}
-
-/// What [`module`] varies.
-#[derive(Clone, Copy)]
-struct Shape {
-    version: u32,
-    /// An import to declare, as (module, name).
-    import: Option<(&'static str, &'static str)>,
-    /// Leave `mqttd_call` out of the exports.
-    without_call: bool,
-}
-
-const PLAIN: Shape = Shape {
-    version: ABI_VERSION,
-    import: None,
-    without_call: false,
-};
-
-/// A module speaking the ABI: a bump allocator, a description, one function.
-fn module(shape: Shape) -> Vec<u8> {
-    let mut out = b"\0asm\x01\0\0\0".to_vec();
-    // Types: 0 () -> i32, 1 (i32) -> i32, 2 (i32) -> (), 3 (i32 x 6) -> i32.
-    section(
-        1,
-        &[
-            4, 0x60, 0, 1, 0x7f, 0x60, 1, 0x7f, 1, 0x7f, 0x60, 1, 0x7f, 0, 0x60, 6, 0x7f, 0x7f,
-            0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7f,
-        ],
-        &mut out,
-    );
-    let imported = u8::from(shape.import.is_some());
-    if let Some((from, what)) = shape.import {
-        let mut body = vec![1];
-        name(from, &mut body);
-        name(what, &mut body);
-        body.extend_from_slice(&[0, 1]); // a function of type 1
-        section(2, &body, &mut out);
-    }
-    // Functions: version, alloc, free, describe, call, recurse.
-    section(3, &[6, 0, 1, 2, 2, 3, 0], &mut out);
-    section(5, &[1, 0, 1], &mut out); // one memory, one page, no maximum
-    section(6, &[1, 0x7f, 1, 0x41, 0x80, 0x08, 0x0b], &mut out); // global 0: mut i32 = 1024
-    let mut exports = Vec::new();
-    let mut count = 0u8;
-    let mut export = |text: &str, kind: u8, index: u8| {
-        name(text, &mut exports);
-        exports.extend_from_slice(&[kind, index]);
-        count += 1;
-    };
-    export("memory", 2, 0);
-    export("mqttd_abi_version", 0, imported);
-    export("mqttd_alloc", 0, imported + 1);
-    export("mqttd_free", 0, imported + 2);
-    export("mqttd_describe", 0, imported + 3);
-    if !shape.without_call {
-        export("mqttd_call", 0, imported + 4);
-    }
-    let mut body = vec![count];
-    body.extend_from_slice(&exports);
-    section(7, &body, &mut out);
-
-    let mut version = vec![0];
-    konst(i32::try_from(shape.version).unwrap(), &mut version);
-    version.push(0x0b);
-    // The old top of the heap is the answer; the top moves up by the length.
-    let alloc = vec![0, 0x23, 0, 0x23, 0, 0x20, 0, 0x6a, 0x24, 0, 0x0b];
-    let free = vec![0, 0x0b];
-    let mut describe = vec![0];
-    for (offset, value) in [(0u8, DESCRIPTION.0), (4, 2)] {
-        describe.extend_from_slice(&[0x20, 0]);
-        konst(value, &mut describe);
-        describe.extend_from_slice(&[0x36, 2, offset]);
-    }
-    describe.push(0x0b);
-    let mut call = call_body();
-    // Inside `call`, function 5 is the recursing one; an import shifts every index.
-    if imported == 1 {
-        let at = call.windows(3).position(|w| w == [0x10, 5, 0x1a]).unwrap();
-        call[at + 1] = 6;
-    }
-    let recurse = vec![0, 0x10, imported + 5, 0x0b];
-    let mut code = vec![6];
-    for function in [version, alloc, free, describe, call, recurse] {
-        uleb(u32::try_from(function.len()).unwrap(), &mut code);
-        code.extend_from_slice(&function);
-    }
-    section(10, &code, &mut out);
-
-    let mut data = vec![3];
-    for (at, bytes) in [DESCRIPTION, TRUE, NOPE] {
-        data.push(0);
-        konst(at, &mut data);
-        data.push(0x0b);
-        name(std::str::from_utf8(bytes).unwrap(), &mut data);
-    }
-    section(11, &data, &mut out);
-    out
-}
-
 fn sandbox(limits: Limits) -> Sandbox {
-    Sandbox::load(&module(PLAIN), limits, Grants::default()).expect("the test module loads")
+    Sandbox::load(&module(&Shape::default()), limits, Grants::default())
+        .expect("the test module loads")
 }
 
 #[allow(clippy::unnecessary_wraps)] // a deadline, as `call` takes one
@@ -295,9 +103,13 @@ fn a_fuel_bound_stops_the_same_work_at_the_same_point_every_time() {
     let burnt: Vec<u64> = [Execution::Compiled, Execution::Interpreted]
         .into_iter()
         .flat_map(|execution| {
-            let sandbox =
-                Sandbox::load_as(&module(PLAIN), execution, limits.clone(), Grants::default())
-                    .expect("the test module loads with a fuel bound");
+            let sandbox = Sandbox::load_as(
+                &module(&Shape::default()),
+                execution,
+                limits.clone(),
+                Grants::default(),
+            )
+            .expect("the test module loads with a fuel bound");
             (0..2).map(move |_| {
                 let mut instance = sandbox.instantiate().unwrap();
                 assert_eq!(
@@ -323,9 +135,13 @@ fn a_small_fuel_bound_still_loads_and_runs_a_module() {
         ..Limits::default()
     };
     for execution in [Execution::Compiled, Execution::Interpreted] {
-        let sandbox =
-            Sandbox::load_as(&module(PLAIN), execution, limits.clone(), Grants::default())
-                .unwrap_or_else(|e| panic!("{execution:?}: {e}"));
+        let sandbox = Sandbox::load_as(
+            &module(&Shape::default()),
+            execution,
+            limits.clone(),
+            Grants::default(),
+        )
+        .unwrap_or_else(|e| panic!("{execution:?}: {e}"));
         let mut instance = sandbox.instantiate().unwrap();
         assert_eq!(
             instance.call("t", &[], None),
@@ -356,8 +172,13 @@ fn endless_recursion_overflows_the_modules_stack_and_not_the_hosts() {
     for execution in [Execution::Compiled, Execution::Interpreted] {
         let limits = Limits::default();
         assert_eq!(limits.max_stack_bytes, 4 << 20);
-        let sandbox =
-            Sandbox::load_as(&module(PLAIN), execution, limits, Grants::default()).unwrap();
+        let sandbox = Sandbox::load_as(
+            &module(&Shape::default()),
+            execution,
+            limits,
+            Grants::default(),
+        )
+        .unwrap();
         let outcome = std::thread::Builder::new()
             .stack_size(256 * 1024)
             .spawn(move || {
@@ -414,7 +235,7 @@ fn a_call_is_held_to_its_own_bound_on_the_result() {
     );
     // The call's bound never raises the module's.
     let small = Sandbox::load(
-        &module(PLAIN),
+        &module(&Shape::default()),
         Limits {
             max_output_bytes: 3,
             ..Limits::default()
@@ -495,7 +316,11 @@ fn a_call_that_outlasts_its_first_slice_goes_on_inside_the_hand_off() {
         .instantiate()
         .unwrap();
     assert_eq!(instance.call("grow", &[], None), Err(CallError::Memory));
-    assert!(handed.load(Ordering::SeqCst) <= 1);
+    // The host enters the module twice before `grow` fails: once to allocate the
+    // argument frame, once for the function. Each entry is suspended at most once, and
+    // with a slice of zero the timer's tick may already be there when the allocation
+    // starts (seen on CI's runners, never on a laptop): at most two, never more.
+    assert!(handed.load(Ordering::SeqCst) <= 2);
 }
 
 /// A hand-off that does not run what it is given, or runs it twice, changes nothing:
@@ -532,7 +357,7 @@ fn an_interpreted_call_is_handed_off_too() {
         ..Limits::default()
     };
     let sandbox = Sandbox::load_as(
-        &module(PLAIN),
+        &module(&Shape::default()),
         Execution::Interpreted,
         limits,
         Grants::default(),
@@ -602,9 +427,9 @@ fn an_import_outside_the_list_is_refused_at_load() {
     for (from, what) in [("env", "system"), ("wasi_snapshot_preview1", "sock_send")] {
         let shape = Shape {
             import: Some((from, what)),
-            ..PLAIN
+            ..Shape::default()
         };
-        let error = Sandbox::load(&module(shape), Limits::default(), Grants::default());
+        let error = Sandbox::load(&module(&shape), Limits::default(), Grants::default());
         match error {
             Err(LoadError::Import { module, name }) => {
                 assert_eq!((module.as_str(), name.as_str()), (from, what));
@@ -618,9 +443,9 @@ fn an_import_outside_the_list_is_refused_at_load() {
 fn an_import_on_the_list_is_provided() {
     let shape = Shape {
         import: Some(("wasi_snapshot_preview1", "fd_close")),
-        ..PLAIN
+        ..Shape::default()
     };
-    let sandbox = Sandbox::load(&module(shape), Limits::default(), Grants::default()).unwrap();
+    let sandbox = Sandbox::load(&module(&shape), Limits::default(), Grants::default()).unwrap();
     let mut instance = sandbox.instantiate().unwrap();
     assert_eq!(
         instance.call("t", &[], soon()),
@@ -633,9 +458,9 @@ fn an_import_on_the_list_is_provided() {
 fn another_abi_version_is_refused_at_load() {
     let shape = Shape {
         version: ABI_VERSION + 1,
-        ..PLAIN
+        ..Shape::default()
     };
-    let error = Sandbox::load(&module(shape), Limits::default(), Grants::default());
+    let error = Sandbox::load(&module(&shape), Limits::default(), Grants::default());
     assert!(
         matches!(error, Err(LoadError::AbiVersion(v)) if v == ABI_VERSION + 1),
         "{error:?}"
@@ -646,15 +471,15 @@ fn another_abi_version_is_refused_at_load() {
 fn a_module_without_the_abi_is_refused_at_load() {
     let shape = Shape {
         without_call: true,
-        ..PLAIN
+        ..Shape::default()
     };
-    let error = Sandbox::load(&module(shape), Limits::default(), Grants::default());
+    let error = Sandbox::load(&module(&shape), Limits::default(), Grants::default());
     assert!(matches!(error, Err(LoadError::Export(_))), "{error:?}");
 }
 
 #[test]
 fn bytes_that_are_not_a_module_are_refused_at_load() {
-    let mut cut = module(PLAIN);
+    let mut cut = module(&Shape::default());
     cut.truncate(cut.len() - 7);
     for bytes in [b"not wasm at all".as_slice(), &cut] {
         let error = Sandbox::load(bytes, Limits::default(), Grants::default());
@@ -665,7 +490,7 @@ fn bytes_that_are_not_a_module_are_refused_at_load() {
 #[test]
 fn a_call_runs_the_same_interpreted() {
     let sandbox = Sandbox::load_as(
-        &module(PLAIN),
+        &module(&Shape::default()),
         Execution::Interpreted,
         Limits::default(),
         Grants::default(),
@@ -770,7 +595,7 @@ impl Numbers {
 /// code now does, without the host panicking or hanging.
 #[test]
 fn damaged_modules_are_refused_or_run_under_the_limits() {
-    let whole = module(PLAIN);
+    let whole = module(&Shape::default());
     let limits = Limits {
         memory_bytes: 1 << 20,
         max_stack_bytes: 256 * 1024,
@@ -833,7 +658,7 @@ fn damaged_modules_are_refused_or_run_under_the_limits() {
 #[test]
 fn a_pool_compiles_on_first_use_and_shares_warm_instances() {
     let pool = Pool::new(
-        module(PLAIN),
+        module(&Shape::default()),
         Execution::Compiled,
         Limits::default(),
         Grants::default(),
@@ -879,7 +704,7 @@ fn a_pool_replaces_an_instance_a_call_stopped_and_counts_it() {
         ..Limits::default()
     };
     let pool = Pool::new(
-        module(PLAIN),
+        module(&Shape::default()),
         Execution::Compiled,
         limits,
         Grants::default(),
@@ -949,4 +774,101 @@ fn a_pool_whose_module_cannot_load_says_why_on_every_call() {
     assert!(!pool.refused_by_host());
     assert!(pool.warm(&[b"."]).is_err());
     assert_eq!(pool.stats(), PoolStats::default());
+}
+
+fn plugin_pool(max_idle: usize, fresh_instance: bool) -> crate::ModulePool {
+    let wasm = crate::test_module::plugin("1", b"j41");
+    let sandbox = Sandbox::load(&wasm, Limits::default(), Grants::default()).unwrap();
+    crate::ModulePool::new(sandbox, max_idle, fresh_instance)
+}
+
+const A_SECOND: Duration = Duration::from_secs(1);
+
+#[test]
+fn the_test_plugin_describes_its_functions_and_returns_an_argument_as_it_came() {
+    let pool = plugin_pool(2, false);
+    let description = String::from_utf8(pool.sandbox().description().to_vec()).unwrap();
+    assert!(
+        description.starts_with("{\"module\":\"test\",\"version\":\"1\",\"functions\":["),
+        "{description}"
+    );
+    for function in crate::test_module::FUNCTIONS {
+        assert!(description.contains(&format!("\"name\":\"{function}\"")));
+    }
+    assert_eq!(
+        pool.call("which", &[], A_SECOND, 64),
+        Ok(Reply::Json(b"41".to_vec()))
+    );
+    assert_eq!(
+        pool.call("spin", &[], A_SECOND, 64),
+        Ok(Reply::Json(b"41".to_vec()))
+    );
+    let bytes = [0u8, 0xff, b'x'];
+    assert_eq!(
+        pool.call("ident", &[Arg::Binary(&bytes)], A_SECOND, 64),
+        Ok(Reply::Binary(bytes.to_vec()))
+    );
+    assert_eq!(
+        pool.call("ident", &[Arg::Json("{\"a\":[1,2.50]}")], A_SECOND, 64),
+        Ok(Reply::Json(b"{\"a\":[1,2.50]}".to_vec()))
+    );
+    // The bound on the result is this call's own.
+    assert_eq!(
+        pool.call("ident", &[Arg::Binary(&[b'x'; 100])], A_SECOND, 64),
+        Err(CallError::OutputTooLarge)
+    );
+}
+
+#[test]
+fn a_module_pool_keeps_warm_instances_and_replaces_one_a_call_stopped() {
+    let pool = plugin_pool(2, false);
+    assert_eq!(pool.stats(), crate::ModuleStats::default());
+    for _ in 0..3 {
+        pool.call("which", &[], A_SECOND, 64).unwrap();
+    }
+    let warm = pool.stats();
+    assert_eq!((warm.instances, warm.in_call, warm.made), (1, 0, 1));
+    assert_eq!(
+        warm.memory_bytes, 65_536,
+        "one page, as the module declares"
+    );
+    // The module's own refusal leaves the instance usable.
+    assert!(matches!(
+        pool.call("err", &[], A_SECOND, 64),
+        Err(CallError::Module { status: 7, .. })
+    ));
+    assert_eq!(pool.stats().replaced, 0);
+    // A call stopped at its deadline costs the pool that instance, and nothing else.
+    assert_eq!(
+        pool.call("loop_forever", &[], Duration::from_millis(5), 64),
+        Err(CallError::Timeout)
+    );
+    let after = pool.stats();
+    assert_eq!(
+        (after.instances, after.replaced, after.memory_bytes),
+        (0, 1, 0)
+    );
+    assert_eq!(
+        pool.call("which", &[], A_SECOND, 64),
+        Ok(Reply::Json(b"41".to_vec()))
+    );
+    assert_eq!(pool.stats().made, 2);
+}
+
+#[test]
+fn a_module_pool_told_to_keeps_no_instance_between_calls() {
+    let pool = plugin_pool(4, true);
+    // `p` answers with the allocator's next address, which only moves up: on a kept
+    // instance the second call would see a higher one.
+    let address = |pool: &crate::ModulePool| match pool.call("p", &[], A_SECOND, 64) {
+        Err(CallError::Module { status, .. }) => status,
+        other => panic!("{other:?}"),
+    };
+    let first = address(&pool);
+    assert_eq!(address(&pool), first);
+    let stats = pool.stats();
+    assert_eq!((stats.instances, stats.made, stats.replaced), (0, 2, 0));
+    let kept = plugin_pool(4, false);
+    let first = address(&kept);
+    assert!(address(&kept) > first);
 }

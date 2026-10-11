@@ -494,6 +494,7 @@ pub(crate) fn eval(e: &Expr, ctx: &EvalCtx, frames: Frames) -> Result<Value, Eva
             args,
             regex,
             jq,
+            module,
         } => {
             let args = args
                 .iter()
@@ -503,8 +504,10 @@ pub(crate) fn eval(e: &Expr, ctx: &EvalCtx, frames: Frames) -> Result<Value, Eva
                 ctx,
                 regex: regex.as_ref(),
                 jq: jq.as_deref(),
+                module: module.as_ref(),
             };
-            (func.f)(&args, &fcx).map_err(|err| err.in_fn(func.name))?
+            let name = module.as_ref().map_or(func.name, |m| &m.function.name);
+            (func.f)(&args, &fcx).map_err(|err| err.in_fn(name))?
         }
     })
 }

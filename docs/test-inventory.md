@@ -739,7 +739,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `publish_codec_round_trip_clears_the_floor`
 
-## `crates/mqtt-config/src/lib.rs` — 46 test(s)
+## `crates/mqtt-config/src/lib.rs` — 47 test(s)
 
 - `tests::a_backup_dir_inside_the_data_dir_is_a_config_error`
 - `tests::a_bad_enum_value_is_rejected`
@@ -774,6 +774,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::rules_writers_need_the_admin_listener`
 - `tests::the_admin_listener_needs_tls_a_role_and_its_own_bind`
 - `tests::the_env_surface_is_a_deduplicated_curated_list`
+- `tests::the_functions_env_key_loads_from_file_and_environment`
 - `tests::the_gossip_key_is_inline_xor_by_reference`
 - `tests::the_jq_keys_load_from_file_and_environment`
 - `tests::the_new_per_subscriber_bounds_are_refused_out_of_range`
@@ -897,7 +898,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
 
-## `crates/mqtt-rules/src/lib.rs` — 171 test(s)
+## `crates/mqtt-rules/src/lib.rs` — 181 test(s)
 
 - `edit::tests::a_json_rule_body_is_a_rule_edit`
 - `edit::tests::an_insert_appends_the_rule_at_the_end`
@@ -1057,6 +1058,16 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests_message_events::every_event_about_a_message_reports_the_same_id`
 - `tests_message_events::the_flags_are_the_delivery_s`
 - `tests_message_events::the_sql_test_has_a_sample_of_each_message_event`
+- `tests_modules::a_fresh_instance_per_call_keeps_no_state_between_messages`
+- `tests_modules::a_module_is_granted_only_environment_the_broker_lists`
+- `tests_modules::a_module_is_only_read_from_under_the_rules_files_directory`
+- `tests_modules::a_module_that_fails_a_check_fails_the_load_with_the_reason`
+- `tests_modules::a_modules_limits_fail_the_rule_and_are_counted_by_kind`
+- `tests_modules::a_names_count_of_replaced_instances_goes_on_when_its_module_changes`
+- `tests_modules::a_reload_swaps_a_module_and_a_call_in_flight_finishes_on_the_old_one`
+- `tests_modules::a_rules_file_declares_a_module_by_path_and_sha256_and_its_rules_call_it`
+- `tests_modules::a_statement_on_its_own_calls_the_modules_a_rules_file_declares`
+- `tests_modules::every_built_in_and_every_emqx_function_name_is_reserved`
 - `tests_republish::a_message_republished_from_an_event_has_no_dup_flag`
 - `tests_republish::a_republished_message_is_seen_as_emqx_shows_it`
 - `tests_republish::a_rule_does_not_republish_its_own_republished_message`
@@ -1165,7 +1176,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_no_wildcard_fast_path_returns_exactly_the_named_topic`
 - `tests::unacked_messages_survive_for_replay`
 
-## `crates/mqtt-wasm-sandbox/src/lib.rs` — 31 test(s)
+## `crates/mqtt-wasm-sandbox/src/lib.rs` — 34 test(s)
 
 - `tests::a_call_is_held_to_its_own_bound_on_the_result`
 - `tests::a_call_returns_the_modules_value`
@@ -1173,6 +1184,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::a_call_that_outlasts_its_first_slice_goes_on_inside_the_hand_off`
 - `tests::a_fuel_bound_stops_the_same_work_at_the_same_point_every_time`
 - `tests::a_hand_off_that_misbehaves_does_not_lose_or_repeat_the_call`
+- `tests::a_module_pool_keeps_warm_instances_and_replaces_one_a_call_stopped`
+- `tests::a_module_pool_told_to_keeps_no_instance_between_calls`
 - `tests::a_module_without_the_abi_is_refused_at_load`
 - `tests::a_modules_own_error_is_its_status_and_message_and_the_instance_lives_on`
 - `tests::a_pool_compiles_on_first_use_and_shares_warm_instances`
@@ -1194,6 +1207,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::instances_share_no_state`
 - `tests::memory_growth_stops_at_the_cap`
 - `tests::the_arguments_arrive_as_one_counted_frame`
+- `tests::the_test_plugin_describes_its_functions_and_returns_an_argument_as_it_came`
 - `tests::this_host_runs_both_kinds_of_code`
 - `timer::tests::a_deadline_ticks_when_it_passes_and_not_before`
 - `timer::tests::an_overdue_call_is_ticked_until_it_is_gone_and_then_nothing_ticks`
@@ -1247,7 +1261,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 608 test(s)
+## `crates/mqttd/src/lib.rs` — 611 test(s)
 
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
@@ -1261,6 +1275,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `admin::cli::tests::the_rules_source_prints_the_file_verbatim`
 - `admin::cli::tests::the_rules_verbs_are_validated_without_reading_the_file`
 - `admin::cli::tests::the_rules_view_is_a_table_of_counts_and_last_errors`
+- `admin::cli::tests::the_rules_view_lists_the_declared_modules_under_the_rules`
 - `admin::client::tests::responses_split_into_status_and_body`
 - `admin::client::tests::urls_need_https_and_a_port`
 - `admin::cluster::tests::a_silent_node_is_a_row_with_its_reason_not_a_healthy_one`
@@ -1273,6 +1288,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `admin::http::tests::the_body_cap_is_chosen_per_method_and_path`
 - `admin::roles::tests::operator_wins_and_cluster_certificates_are_peers`
 - `admin::roles::tests::subjects_map_to_roles`
+- `admin::rules::tests::a_declared_module_is_listed_whole_for_an_operator_and_redacted_for_a_viewer`
 - `admin::rules::tests::a_rule_body_leaves_out_what_the_file_already_says`
 - `admin::rules::tests::a_write_the_filesystem_refuses_is_a_conflict_and_any_other_failure_the_servers`
 - `admin::rules::tests::writers_with_an_unwritable_directory_are_warned_about`
@@ -1831,6 +1847,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `reload::tests::committed_config_never_returns_a_rejected_candidate`
 - `reload::tests::every_reload_attempt_is_recorded_with_its_repeats`
 - `reload::tests::reload_increments_the_metric_by_outcome`
+- `rules::tests::a_declared_module_needs_no_switch_and_is_read_beside_the_rules_file`
 - `rules::tests::a_publish_carries_an_origin_only_while_a_message_event_is_wanted`
 - `rules::tests::a_rule_definition_hash_is_keyed_per_process`
 - `rules::tests::gated_derived_actions_are_counted_by_their_fate`
@@ -2335,14 +2352,16 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `rules_republishing_into_each_other_stop_at_the_depth_cap`
 - `the_original_s_limits_cover_the_whole_chain`
 
-## `crates/mqttd/tests/rules_binary.rs` — 55 test(s)
+## `crates/mqttd/tests/rules_binary.rs` — 59 test(s)
 
 - `a_closed_stdout_leaves_probe_and_backup_their_exit_status`
 - `a_closed_stdout_neither_panics_a_command_nor_changes_its_exit_status`
+- `a_declared_module_runs_in_the_broker_under_its_limits_and_stays_pinned`
 - `a_failing_action_is_counted_failed_and_warned`
 - `a_failing_rule_never_affects_the_original_and_is_counted_failed`
 - `a_graceful_shutdown_forwards_every_shutdown_event_to_a_watcher_on_another_node`
 - `a_graceful_shutdown_keeps_every_shutdown_event_for_an_offline_watcher`
+- `a_live_edit_swaps_a_module_while_a_publish_in_flight_finishes_on_the_old_one`
 - `a_qos1_derived_message_is_queued_for_an_offline_persistent_session`
 - `a_qos1_puback_is_released_only_once_each_derived_message_is_stored`
 - `a_reload_turns_rule_watching_on_and_off_and_a_rejected_one_changes_nothing`
@@ -2363,6 +2382,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `check_rules_loads_16_actions_and_refuses_17`
 - `check_rules_loads_64_kib_of_sql_and_refuses_more`
 - `check_rules_refuses_a_literal_qos_of_3`
+- `check_rules_refuses_a_module_that_fails_a_check_and_says_why`
 - `check_rules_refuses_a_sink_action`
 - `check_rules_refuses_a_sql_syntax_error_with_its_position`
 - `check_rules_refuses_an_event_mqttd_does_not_raise`
@@ -2389,6 +2409,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `session_unsubscribed_fires_once_per_filter_actually_removed`
 - `sighup_swaps_the_rules_for_a_client_that_stays_connected`
 - `the_broker_refuses_to_boot_on_a_rules_file_that_does_not_load`
+- `the_worked_example_modules_run_in_the_broker_with_their_grants`
 - `two_rules_failing_on_every_message_each_log_one_warn_per_ten_seconds`
 - `with_config_watch_an_edited_rules_file_is_picked_up_without_a_signal`
 - `writers_for_a_rules_directory_the_broker_cannot_write_in_are_warned_about` — only when `cfg(unix)`

@@ -393,6 +393,8 @@ fn error(e: CallError, timeout: Option<Duration>) -> JqError {
 pub struct PoolStats {
     /// Instances the pool holds now: those waiting and those in a call.
     pub instances: u64,
+    /// Of those, the ones in a call.
+    pub in_call: u64,
     /// Linear memory of those instances, in bytes, as of the end of each one's last
     /// call.
     pub memory_bytes: u64,
@@ -534,8 +536,10 @@ impl Pool {
             .iter()
             .filter(|jq| jq.instance.is_some())
             .count();
+        let in_call = self.busy.load(Relaxed);
         PoolStats {
-            instances: bytes(waiting) + self.busy.load(Relaxed),
+            instances: bytes(waiting) + in_call,
+            in_call,
             memory_bytes: self.memory.load(Relaxed),
             made: self.made.load(Relaxed),
             replaced: self.replaced.load(Relaxed),

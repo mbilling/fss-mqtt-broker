@@ -43,6 +43,7 @@ mod json;
 mod lexer;
 mod num;
 mod parser;
+mod plugin;
 mod template;
 mod value;
 
@@ -55,6 +56,11 @@ pub use input::{
     PublishInput, EMQX_EVENT_TOPICS,
 };
 pub use jq::{FunctionCall, Functions, HandOff, Jq, JqSettings, JqSwitch, ModuleStats};
+pub use plugin::{
+    emqx_only_function_names, reserved as reserved_function_name, Module, ModuleFunction,
+    ModuleHost, ModuleSettings, DEFAULT_MEMORY_MIB, DEFAULT_TIMEOUT_MS, MAX_FUNCTIONS_PER_MODULE,
+    MAX_MEMORY_MIB, MAX_MODULES, MAX_MODULE_BYTES, MAX_TIMEOUT_MS,
+};
 pub use value::{json_decode, Map, Value};
 
 /// The most rules one file may define.
@@ -202,6 +208,14 @@ pub enum LoadError {
         /// The 1-based column (in characters) of a SQL error.
         sql_column: Option<usize>,
     },
+    /// One `[functions.<name>]` table: a module that cannot be loaded (ADR 0086 D9).
+    #[error("functions `{name}`: {message}")]
+    Function {
+        /// The table's name.
+        name: String,
+        /// Why its module is not loaded.
+        message: String,
+    },
 }
 
 impl LoadError {
@@ -283,7 +297,8 @@ pub enum Outcome<'a> {
     /// [`RuleSet::on_publish`] and [`RuleSet::on_event`], never by a dry run
     /// ([`RuleSet::evaluate_one`]), so it describes live traffic only.
     Elapsed(std::time::Duration),
-    /// The rule's SQL called a sandboxed function (`jq`, ADR 0086): how long the call
+    /// The rule's SQL called a sandboxed function (`jq` or an operator's module, ADR
+    /// 0086): how long the call
     /// took and how it ended. Reported after the SQL has run and before its
     /// `Passed`, `NoResult` or `Failed`, once per call, in call order.
     Function(&'a FunctionCall),
@@ -504,6 +519,10 @@ pub struct RuleSet {
     warnings: Vec<String>,
     /// Whether any rule, enabled or not, calls a sandboxed function.
     sandboxed: bool,
+    /// The modules the file declares (`[functions.<name>]`), in name order. Held for
+    /// as long as the set is: an evaluation on this set runs on these modules, whatever
+    /// a later load has put in their place.
+    modules: Vec<Arc<Module>>,
 }
 
 /// A successfully loaded rules file and what the author should be told about it.
@@ -520,6 +539,31 @@ pub struct Loaded {
 struct FileSchema {
     #[serde(default)]
     rules: BTreeMap<String, RuleSchema>,
+    /// Operator modules (ADR 0086 D9); an mqttd extension.
+    #[serde(default)]
+    functions: BTreeMap<String, plugin::ModuleSchema>,
+}
+
+/// The modules the rules file `text` declares, loaded as
+/// [`RuleSet::parse_with`] loads them.
+pub(crate) fn declared_modules(
+    text: &str,
+    functions: &Functions,
+) -> Result<Vec<Arc<Module>>, LoadError> {
+    let file: FileSchema = toml::from_str(text).map_err(|e| LoadError::File {
+        message: e.to_string(),
+        span: e.span(),
+    })?;
+    load_modules(&file, functions)
+}
+
+fn load_modules(file: &FileSchema, functions: &Functions) -> Result<Vec<Arc<Module>>, LoadError> {
+    plugin::load_all(
+        &file.functions,
+        functions.module_host().map(|host| &**host),
+        functions.dir(),
+    )
+    .map_err(|(name, message)| LoadError::Function { name, message })
 }
 
 fn yes() -> bool {
@@ -695,6 +739,10 @@ impl RuleSet {
     /// call beyond the built-in functions: a file that calls `jq` loads only where
     /// that is switched on and this host can run it (ADR 0086). The first such load of
     /// a process compiles the jq module, which takes about half a second.
+    ///
+    /// A file that declares modules (`[functions.<name>]`) loads only with `functions`
+    /// that can load them and know the rules file's directory
+    /// ([`Functions::with_modules`], [`Functions::beside`]).
     pub fn parse_with(text: &str, functions: &Functions) -> Result<Loaded, LoadError> {
         let file: FileSchema = toml::from_str(text).map_err(|e| LoadError::File {
             message: e.to_string(),
@@ -713,8 +761,13 @@ impl RuleSet {
             ..RuleSet::default()
         };
         let mut warnings = Vec::new();
+        // The modules first: a rule's call of a module's function is resolved against
+        // them, and a module that cannot be loaded fails the file whether or not a
+        // rule calls it.
+        set.modules = load_modules(&file, functions)?;
         // One for the whole file: the regex budget is file-wide (ADR 0084 D3).
         let mut loading = parser::Loading::new(functions);
+        loading.modules.clone_from(&set.modules);
         for (id, r) in file.rules {
             let fail = |e: CompileError| LoadError::Rule {
                 id: id.clone(),
@@ -785,6 +838,7 @@ impl RuleSet {
             let programs: Vec<&[u8]> = loading.jq_programs.iter().map(|p| p.as_bytes()).collect();
             jq.warm(&programs);
         }
+        set.sandboxed |= loading.calls_module;
         set.warnings.clone_from(&warnings);
         Ok(Loaded {
             rules: set,
@@ -801,15 +855,23 @@ impl RuleSet {
     pub fn load_with(path: &std::path::Path, functions: &Functions) -> Result<Loaded, LoadError> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| LoadError::file(format!("{}: {e}", path.display())))?;
-        Self::parse_with(&text, functions)
+        Self::parse_with(&text, &functions.beside(path))
     }
 
     /// Whether any rule of the file, enabled or not, calls a function that runs in the
-    /// sandbox (`jq`): such a rule may take as long as its timeout allows, so whoever
-    /// evaluates it must not be something everything else waits for.
+    /// sandbox (`jq`, or an operator's module): such a rule may take as long as its
+    /// timeout allows, so whoever evaluates it must not be something everything else
+    /// waits for.
     #[must_use]
     pub fn calls_sandbox(&self) -> bool {
         self.sandboxed
+    }
+
+    /// The modules the file declares (`[functions.<name>]`, ADR 0086 D9), in name
+    /// order.
+    #[must_use]
+    pub fn modules(&self) -> &[Arc<Module>] {
+        &self.modules
     }
 
     /// Every loaded rule (enabled or not), in id order.
@@ -1170,5 +1232,7 @@ mod tests;
 mod tests_emqx_examples;
 #[cfg(test)]
 mod tests_message_events;
+#[cfg(all(test, feature = "jq"))]
+mod tests_modules;
 #[cfg(test)]
 mod tests_republish;
