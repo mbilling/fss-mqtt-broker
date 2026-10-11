@@ -1199,3 +1199,209 @@ fn a_per_rule_edit_keeps_the_rules_state_key() {
         "{edited}"
     );
 }
+
+/// What shows a store's keys reads a `kv_store_*` key back as the value it was made
+/// from (`key_term`), and refuses bytes `term_key` never wrote.
+#[test]
+fn a_term_key_reads_back_as_the_value_it_was_made_from() {
+    use crate::state::key_term;
+    for text in [
+        "null",
+        "true",
+        "false",
+        "0",
+        "-7",
+        "1.0",
+        "-0.0",
+        "123456789012345678901234567890",
+        "-123456789012345678901234567890",
+        "\"\"",
+        "\"text\"",
+        "[]",
+        "[1,[2.5,\"x\"],{\"a\":null}]",
+        "{}",
+        "{\"a\":1,\"b\":{\"c\":[true]}}",
+    ] {
+        let value = json_decode(text.as_bytes()).unwrap();
+        let key = term_key(&value);
+        let back = key_term(&key).unwrap_or_else(|| panic!("{text} reads back"));
+        assert!(back.exact_eq(&value), "{text} came back as {back:?}");
+        assert_eq!(term_key(&back), key, "{text}");
+    }
+    assert!(matches!(
+        key_term(&term_key(&Value::Undefined)),
+        Some(Value::Undefined)
+    ));
+    // A binary that is not text stays a binary.
+    let binary = Value::Bin(Bytes::from_static(b"\xff\x00"));
+    assert!(key_term(&term_key(&binary)).unwrap().exact_eq(&binary));
+    // A map reads back in the order of its keys, whatever order it was written in.
+    let map = json_decode(br#"{"b":1,"a":2}"#).unwrap();
+    assert_eq!(
+        key_term(&term_key(&map)).unwrap().to_json().unwrap(),
+        r#"{"a":2,"b":1}"#
+    );
+    // Not a key: nothing, a tag no value has, a value cut short, bytes left over, a
+    // length past what is there.
+    let text = term_key(&Value::from("text"));
+    for bad in [
+        &[][..],
+        &[42],
+        &text[..text.len() - 1],
+        &[&text[..], &[0]].concat(),
+        &[7, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+        &[8, 0, 0, 0, 0, 0, 0, 0, 2, 1],
+    ] {
+        assert!(key_term(bad).is_none(), "{bad:?}");
+    }
+}
+
+/// A replayed sequence's clock (D11): an input that carries a time is evaluated at
+/// that time, by every function that reads the clock and in `timestamp`; one that
+/// carries none reads the wall clock, as every trigger of a running broker does.
+#[test]
+fn an_input_replayed_at_a_time_is_evaluated_at_that_time() {
+    let sql = "SELECT now_timestamp() AS s, now_timestamp('millisecond') AS ms, \
+               now_timestamp('microsecond') AS us, now_timestamp('nanosecond') AS ns, \
+               rfc3339_to_unix_ts(now_rfc3339('millisecond'), 'millisecond') AS text, \
+               format_date('second', '+00:00', '%Y-%m-%d %H:%M:%S') AS date, \
+               timestamp, publish_received_at FROM \"t/#\"";
+    let payload = Bytes::from_static(b"{}");
+    let props = mqtt_core::AppProperties::default();
+    let mut input = PublishInput::new("c", "t/1", &payload, 0, &props);
+    input.clock_ms = Some(1_735_689_601_250);
+    input.received_at_ms = Some(1_735_689_601_250);
+    assert_eq!(Input::clock_ms(&input), Some(1_735_689_601_250));
+    assert_eq!(
+        test_sql(sql, &input).unwrap(),
+        [
+            "{\"s\":1735689601,\"ms\":1735689601250,\"us\":1735689601250000,\
+             \"ns\":1735689601250000000,\"text\":1735689601250,\
+             \"date\":\"2025-01-01 00:00:01\",\"timestamp\":1735689601250,\
+             \"publish_received_at\":1735689601250}"
+        ]
+    );
+    // Without one: the wall clock.
+    let live = PublishInput::new("c", "t/1", &payload, 0, &props);
+    assert_eq!(Input::clock_ms(&live), None);
+    let before = now_ms();
+    let out = test_sql(
+        "SELECT now_timestamp('millisecond') AS ms, timestamp FROM \"t/#\"",
+        &live,
+    )
+    .unwrap();
+    let Value::Map(out) = json_decode(out[0].as_bytes()).unwrap() else {
+        panic!("an object: {out:?}")
+    };
+    for field in ["ms", "timestamp"] {
+        let Some(Value::Int(at)) = out.get(field) else {
+            panic!("{field} is a time: {out:?}")
+        };
+        assert!((before..=now_ms()).contains(at), "{field} = {at}");
+    }
+}
+
+/// A sample event raised at a time of a sequence's carries that time in every field
+/// that is one, and is the same event however often it is built.
+#[test]
+fn a_sample_event_replayed_at_a_time_carries_that_time() {
+    let client = ClientInfo {
+        clientid: "c",
+        username: None,
+        peer: None,
+        sockname: None,
+        node: "n",
+    };
+    let payload = Bytes::from_static(b"{}");
+    let at = 1_735_689_600_000;
+    let fields = |kind| {
+        let event = EventInput::sample_message_at(kind, &client, "t/1", 1, &payload, at, 7);
+        assert_eq!(event.clock_ms(), Some(at));
+        Value::from(event.all_fields()).to_json().unwrap()
+    };
+    for kind in EventKind::ALL {
+        let text = fields(kind);
+        assert_eq!(text, fields(kind), "{kind:?} is the same twice");
+        let Value::Map(map) = json_decode(text.as_bytes()).unwrap() else {
+            panic!("an object: {text}")
+        };
+        assert!(
+            matches!(map.get("timestamp"), Some(Value::Int(t)) if *t == at),
+            "{text}"
+        );
+        for (field, value) in map.iter() {
+            let is_time = field.ends_with("_at") || &**field == "timestamp";
+            if let (true, Value::Int(t)) = (is_time, value) {
+                // A sample disconnect is of a connection made a second before.
+                assert!(*t == at || *t == at - 1000, "{kind:?} {field} = {t}");
+            }
+        }
+        if EventKind::MESSAGE.contains(&kind) {
+            assert!(
+                text.contains("\"id\":\"00000000000000000000000000000007\""),
+                "{text}"
+            );
+        }
+    }
+    // The wall clock's sample reads no sequence's time.
+    assert_eq!(
+        EventInput::sample(EventKind::ClientConnected, &client, "t/1", 0).clock_ms(),
+        None
+    );
+}
+
+/// One statement compiled once runs against many inputs on the store it was compiled
+/// with, so what one input wrote the next reads (`SqlTest`); an input its `FROM` does
+/// not select is told apart from a failure.
+#[test]
+fn a_statement_compiled_once_keeps_its_state_from_one_input_to_the_next() {
+    let store = Arc::new(Recorder::default());
+    let test = SqlTest::compile(
+        "SELECT kv_incr(clientid) AS n, proc_dict_put('seen', topic) AS before FROM \"t/#\"",
+        &with_store(&store),
+    )
+    .unwrap();
+    assert!(test.selects_topics() && test.events().is_empty());
+    let payload = Bytes::from_static(b"{}");
+    let props = mqtt_core::AppProperties::default();
+    let dictionary = crate::state::Dictionary::new();
+    let run = |topic: &str, dictionary: &crate::state::Dictionary| {
+        test.run(
+            &PublishInput::new("c", topic, &payload, 0, &props),
+            dictionary,
+        )
+    };
+    assert_eq!(
+        run("t/1", &dictionary).unwrap(),
+        [r#"{"n":1,"before":"undefined"}"#]
+    );
+    assert_eq!(
+        run("t/2", &dictionary).unwrap(),
+        [r#"{"n":2,"before":"t/1"}"#]
+    );
+    // Another dictionary, the same store.
+    assert_eq!(
+        run("t/3", &crate::state::Dictionary::new()).unwrap(),
+        [r#"{"n":3,"before":"undefined"}"#]
+    );
+    let other = PublishInput::new("c", "other", &payload, 0, &props);
+    let why = test.from_mismatch(&other).expect("not selected");
+    assert_eq!(run("other", &dictionary).unwrap_err(), why);
+    assert_eq!(
+        log_of(&store).len(),
+        3,
+        "an input not selected calls nothing"
+    );
+
+    let events = SqlTest::compile(
+        "SELECT clientid FROM \"$events/client/connected\", \"$events/client/disconnected\"",
+        &Functions::default(),
+    )
+    .unwrap();
+    assert!(!events.selects_topics());
+    assert_eq!(
+        events.events(),
+        [EventKind::ClientConnected, EventKind::ClientDisconnected]
+    );
+    assert!(SqlTest::compile("SELECT", &Functions::default()).is_err());
+}

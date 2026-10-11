@@ -4517,6 +4517,8 @@ const KNOWN_FLAGS: &[&str] = &[
     "--username",
     "--qos",
     "--event",
+    "--sequence",
+    "--show-state",
     "--preflight",
     "--print-config",
     "--check-tls",
@@ -4537,8 +4539,9 @@ const KNOWN_FLAGS: &[&str] = &[
 /// The dash-prefixed arguments `mqttd` does not recognise. Pure over the argument list so
 /// it is unit-testable without spawning the binary (#169).
 fn unknown_flags<I: IntoIterator<Item = String>>(args: I) -> Vec<String> {
+    // A lone `-` is a value (`--sequence -`: standard input), never a flag.
     args.into_iter()
-        .filter(|a| a.starts_with('-') && !KNOWN_FLAGS.contains(&a.as_str()))
+        .filter(|a| a.starts_with('-') && a != "-" && !KNOWN_FLAGS.contains(&a.as_str()))
         .collect()
 }
 
@@ -4557,17 +4560,20 @@ fn validate_cli(args: &[String]) -> Result<(), String> {
     let mut mode = None;
     let mut options = std::collections::BTreeSet::new();
     let mut preflight = false;
+    let mut show_state = false;
     let mut tokens = args.iter().map(String::as_str).peekable();
     while let Some(arg) = tokens.next() {
         match arg {
             "--config" | "--url" | "--pid" | "--timeout" | "--sql" | "--topic" | "--payload"
-            | "--clientid" | "--username" | "--qos" | "--event" => {
+            | "--clientid" | "--username" | "--qos" | "--event" | "--sequence" => {
                 if !options.insert(arg) {
                     return Err(format!("repeated option: {arg}"));
                 }
-                let value = tokens
-                    .next()
-                    .filter(|value| !value.is_empty() && !value.starts_with('-'));
+                // `--sequence -` reads the sequence from standard input.
+                let value = tokens.next().filter(|value| {
+                    !value.is_empty()
+                        && (!value.starts_with('-') || (arg == "--sequence" && *value == "-"))
+                });
                 if value.is_none() {
                     return Err(format!("{arg} requires a value"));
                 }
@@ -4576,6 +4582,12 @@ fn validate_cli(args: &[String]) -> Result<(), String> {
             "--preflight" => {
                 if std::mem::replace(&mut preflight, true) {
                     return Err("repeated option: --preflight".to_string());
+                }
+            }
+            // A modifier of `--rule-test --sequence`: print the store at the end.
+            "--show-state" => {
+                if std::mem::replace(&mut show_state, true) {
+                    return Err("repeated option: --show-state".to_string());
                 }
             }
             "--check-config" | "--print-config" | "--check-tls" | "--hash-password" | "--probe"
@@ -4601,8 +4613,15 @@ fn validate_cli(args: &[String]) -> Result<(), String> {
     if preflight && mode != "--check-config" {
         return Err(format!("--preflight is not valid with {mode}"));
     }
-    if mode == "--rule-test" && !options.contains("--sql") {
-        return Err("--rule-test requires --sql <statement>".to_string());
+    if mode == "--rule-test" && !options.contains("--sql") && !options.contains("--sequence") {
+        return Err(
+            "--rule-test requires --sql <statement> (or --sequence <file>, to replay a \
+             sequence through the configured rules file)"
+                .to_string(),
+        );
+    }
+    if show_state && !(mode == "--rule-test" && options.contains("--sequence")) {
+        return Err("--show-state is valid only with --rule-test --sequence".to_string());
     }
     for option in options {
         let allowed = match option {
@@ -4615,9 +4634,10 @@ fn validate_cli(args: &[String]) -> Result<(), String> {
                     | "--probe"
                     | "--backup"
                     | "--check-rules"
+                    | "--rule-test"
             ),
             "--sql" | "--topic" | "--payload" | "--clientid" | "--username" | "--qos"
-            | "--event" => mode == "--rule-test",
+            | "--event" | "--sequence" => mode == "--rule-test",
             "--url" => mode == "--probe",
             "--pid" | "--timeout" => matches!(mode, "--decommission" | "--backup"),
             _ => unreachable!("only value options enter this set"),
@@ -4669,6 +4689,14 @@ USAGE:
                             (--topic t --payload p --clientid c --username u --qos n)
                             or, for a $events statement, a sample event (--event e);
                             jq() runs where the effective config sets rules.jq
+  mqttd --rule-test [--sql <statement>] --sequence <file> [--show-state]
+                            replay a sequence of messages (one JSON object per line:
+                            at or after, topic, payload, qos, retain, clientid,
+                            username, event; - reads standard input) on a store of its
+                            own and a clock the sequence drives; prints each step's
+                            outputs and what it changed in the store, and with
+                            --show-state the store at the end. Without --sql: through
+                            every rule of the configured rules file, actions included
   mqttd --hash-password [u] print an Argon2id password-file line and exit
   mqttd --probe [/readyz]   query the running broker's health endpoint and exit
   mqttd --decommission      drain and gracefully stop the running broker
@@ -4813,6 +4841,9 @@ fn check_rules_cli() -> ! {
 fn rule_test_cli() -> ! {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let opt = |name: &str| args.iter().skip_while(|a| *a != name).nth(1).cloned();
+    if let Some(sequence) = opt("--sequence") {
+        rule_test_sequence(&sequence, &opt, args.iter().any(|a| a == "--show-state"));
+    }
     let sql = opt("--sql").unwrap_or_default();
     let topic = opt("--topic").unwrap_or_else(|| "t/1".to_string());
     let payload = bytes::Bytes::from(opt("--payload").unwrap_or_else(|| "{}".to_string()));
@@ -4909,6 +4940,118 @@ fn rule_test_cli() -> ! {
             std::process::exit(1);
         }
     }
+}
+
+/// `mqttd --rule-test [--sql <statement>] --sequence <file> [--show-state]` (ADR 0085
+/// D11): replay a sequence of messages through one statement, or through every rule of
+/// the configured rules file, on a store of its own and a clock the sequence drives
+/// ([`mqttd::rule_replay`]). Prints each step's outputs and what it changed in the
+/// store. Exit `0`; `1` when a rule failed in a step, when nothing in the sequence was
+/// selected, or when the statement or the rules file does not load; `2` for a usage
+/// error, a sequence that cannot be read included.
+fn rule_test_sequence(sequence: &str, opt: &dyn Fn(&str) -> Option<String>, show_state: bool) -> ! {
+    use mqttd::rule_replay::{parse_sequence, Defaults, Replay};
+    let usage = |e: String| -> ! {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    };
+    let mut defaults = Defaults::default();
+    if let Some(topic) = opt("--topic") {
+        defaults.topic = topic;
+    }
+    if let Some(payload) = opt("--payload") {
+        defaults.payload = bytes::Bytes::from(payload);
+    }
+    if let Some(clientid) = opt("--clientid") {
+        defaults.clientid = clientid;
+    }
+    defaults.username = opt("--username");
+    defaults.qos = match opt("--qos").as_deref() {
+        None | Some("0") => 0,
+        Some("1") => 1,
+        Some("2") => 2,
+        Some(other) => usage(format!("--qos takes 0, 1 or 2, not {other:?}")),
+    };
+    if let Some(name) = opt("--event") {
+        let Some(kind) = mqtt_rules::EventKind::parse(&name) else {
+            let names: Vec<&str> = mqtt_rules::EventKind::ALL
+                .iter()
+                .map(|k| k.event_name())
+                .collect();
+            usage(format!(
+                "--event takes one of {}, not {name:?}",
+                names.join(", ")
+            ));
+        };
+        defaults.event = Some(kind);
+    }
+    let steps = if sequence == "-" {
+        parse_sequence(std::io::stdin().lock(), &defaults)
+    } else {
+        std::fs::File::open(sequence)
+            .map_err(|e| e.to_string())
+            .and_then(|file| parse_sequence(std::io::BufReader::new(file), &defaults))
+    };
+    let steps = match steps {
+        Ok(steps) => steps,
+        Err(e) if sequence == "-" => usage(format!("the sequence on standard input: {e}")),
+        Err(e) => usage(format!("{sequence}: {e}")),
+    };
+    // What the rules may call is what the effective config makes it, as for one
+    // message. Their state is in the replay's own store whatever the config says; the
+    // config gives only its ceiling (`rules.state_max_bytes`).
+    let rules = rules_config_or_default();
+    let functions = mqttd::rules::functions_from_config(&rules);
+    let (replay, what) = match (opt("--sql"), rules.file.as_deref()) {
+        (Some(sql), file) => {
+            let functions = match file.map(|file| (file, std::fs::read_to_string(file))) {
+                Some((file, Ok(text))) => functions.declaring(&text).unwrap_or_else(|e| {
+                    eprintln!(
+                        "warning: {file}: {e}; its [functions] are not available to the statement"
+                    );
+                    functions
+                }),
+                _ => functions,
+            };
+            match Replay::statement(&sql, &functions) {
+                Ok(replay) => (replay, "the statement's FROM"),
+                Err(e) => {
+                    eprintln!("rule test FAILED: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        (None, Some(file)) => match Replay::rules_file(Path::new(file), &functions) {
+            Ok(replay) => (replay, "an enabled rule of the rules file"),
+            Err(e) => {
+                eprintln!("rules INVALID ({file}): {e}");
+                std::process::exit(1);
+            }
+        },
+        (None, None) => usage(
+            "--rule-test --sequence without --sql replays the sequence through the configured \
+             rules file, and none is set (rules.file / MQTTD_RULES_FILE)"
+                .to_string(),
+        ),
+    };
+    for w in replay.warnings() {
+        eprintln!("warning: {w}");
+    }
+    let report = replay.run(&steps);
+    out!("{}", report.text(show_state));
+    let failed = report.failed();
+    if failed > 0 {
+        eprintln!(
+            "rule test FAILED: {failed} of {} steps had a rule or an action fail",
+            report.steps.len()
+        );
+        std::process::exit(1);
+    }
+    if !report.selected() {
+        eprintln!("rule test FAILED: nothing in the sequence is selected by {what}");
+        std::process::exit(1);
+    }
+    std::process::exit(0);
 }
 
 /// The effective config's `[rules]`, for the commands that are about a rules file or a
@@ -6132,6 +6275,23 @@ mod tests {
                 "https://127.0.0.1:9443",
             ],
             vec!["--admin", "help"],
+            vec!["--rule-test", "--sql", "SELECT 1 FROM \"t\""],
+            vec![
+                "--rule-test",
+                "--sql",
+                "SELECT 1 FROM \"t\"",
+                "--config",
+                "broker.toml",
+            ],
+            vec![
+                "--rule-test",
+                "--sql",
+                "SELECT 1 FROM \"t\"",
+                "--sequence",
+                "steps.jsonl",
+            ],
+            // Without --sql: the configured rules file; `-` is standard input.
+            vec!["--rule-test", "--sequence", "-", "--show-state"],
         ] {
             let values: Vec<_> = args.iter().map(ToString::to_string).collect();
             assert!(
@@ -6185,6 +6345,26 @@ mod tests {
             // `--admin` is the command word: it must come first.
             vec!["node", "--admin"],
             vec!["--probe", "--admin", "node"],
+            vec!["--rule-test"],
+            vec!["--rule-test", "--sequence"],
+            vec!["--rule-test", "--sequence", "--show-state"],
+            vec![
+                "--rule-test",
+                "--sql",
+                "SELECT 1 FROM \"t\"",
+                "--show-state",
+            ],
+            vec!["--rule-test", "--sql", "SELECT 1 FROM \"t\"", "-"],
+            vec!["--rule-test", "--topic", "-"],
+            vec!["--check-rules", "--sequence", "steps.jsonl"],
+            vec!["--check-rules", "--show-state"],
+            vec![
+                "--rule-test",
+                "--sequence",
+                "steps.jsonl",
+                "--show-state",
+                "--show-state",
+            ],
         ] {
             let values: Vec<_> = args.iter().map(ToString::to_string).collect();
             assert!(

@@ -502,6 +502,10 @@ pub struct PublishInput<'a> {
     /// message events report the `id` this publish's rules saw; `None` draws one when
     /// a rule first reads `id`.
     pub message_id: Option<u128>,
+    /// For a message replayed in a sequence: the sequence's time, which `timestamp`
+    /// and the functions that read the clock use instead of the wall clock
+    /// ([`Input::clock_ms`]). `None` for every message of a running broker.
+    pub clock_ms: Option<i64>,
     id: OnceCell<Arc<str>>,
     received: OnceCell<i64>,
     /// `timestamp`, read once per message so every reference agrees.
@@ -537,6 +541,7 @@ impl<'a> PublishInput<'a> {
             republish_depth: 0,
             dup_flag: true,
             message_id: None,
+            clock_ms: None,
             id: OnceCell::new(),
             received: OnceCell::new(),
             stamped: OnceCell::new(),
@@ -627,7 +632,7 @@ impl Input for PublishInput<'_> {
             "timestamp" => Value::Int(
                 *self
                     .stamped
-                    .get_or_init(|| now_ms().max(self.received_at())),
+                    .get_or_init(|| self.clock_ms.unwrap_or_else(now_ms).max(self.received_at())),
             ),
             "node" => Value::from(self.node),
             _ => Value::Undefined,
@@ -664,6 +669,10 @@ impl Input for PublishInput<'_> {
 
     fn has_dup_flag(&self) -> bool {
         self.dup_flag
+    }
+
+    fn clock_ms(&self) -> Option<i64> {
+        self.clock_ms
     }
 }
 
@@ -724,6 +733,8 @@ pub struct EventInput {
     fields: Map,
     /// For a message event, what of its message is not a field.
     message: Option<MessagePart>,
+    /// For an event replayed in a sequence: the sequence's time ([`Input::clock_ms`]).
+    clock_ms: Option<i64>,
 }
 
 /// What a message event keeps of its message beside its fields: the raw payload
@@ -809,6 +820,7 @@ impl EventInput {
             kind,
             fields,
             message: None,
+            clock_ms: None,
         }
     }
 
@@ -851,6 +863,7 @@ impl EventInput {
                     .map(|o| o.clientid.clone()),
                 republish_depth: msg.origin.map_or(0, |o| o.republish_depth),
             }),
+            clock_ms: None,
         }
     }
 
@@ -1162,9 +1175,46 @@ impl EventInput {
         qos: u8,
         payload: &Bytes,
     ) -> Self {
-        let now = now_ms();
+        Self::sample_from(kind, c, topic, qos, payload, now_ms(), new_message_id())
+    }
+
+    /// [`sample_message`](Self::sample_message) as a replayed sequence raises it
+    /// (`mqttd --rule-test --sequence`): at `now_ms` on the sequence's clock, which
+    /// every time in it is taken from and which the functions that read the clock
+    /// then read ([`Input::clock_ms`]); a message event's message has the id
+    /// `message_id`. The same arguments give the same event.
+    #[must_use]
+    pub fn sample_message_at(
+        kind: EventKind,
+        c: &ClientInfo,
+        topic: &str,
+        qos: u8,
+        payload: &Bytes,
+        now_ms: i64,
+        message_id: u128,
+    ) -> Self {
+        let mut sample = Self::sample_from(kind, c, topic, qos, payload, now_ms, message_id);
+        // The builders stamp an event with the wall clock, as the broker raises it.
+        for field in ["timestamp", "disconnected_at"] {
+            if let Some(at) = sample.fields.get_mut(field) {
+                *at = Value::Int(now_ms);
+            }
+        }
+        sample.clock_ms = Some(now_ms);
+        sample
+    }
+
+    fn sample_from(
+        kind: EventKind,
+        c: &ClientInfo,
+        topic: &str,
+        qos: u8,
+        payload: &Bytes,
+        now: i64,
+        message_id: u128,
+    ) -> Self {
         let origin = mqtt_core::Origin {
-            id: new_message_id(),
+            id: message_id,
             clientid: c.clientid.to_string(),
             username: c.username.map(str::to_string),
             peer: c.peer,
@@ -1240,5 +1290,9 @@ impl Input for EventInput {
     /// A message event has `flags`, `dup` included.
     fn has_dup_flag(&self) -> bool {
         self.message.is_some()
+    }
+
+    fn clock_ms(&self) -> Option<i64> {
+        self.clock_ms
     }
 }

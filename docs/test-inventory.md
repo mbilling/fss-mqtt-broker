@@ -1157,11 +1157,15 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests_state::a_read_is_charged_to_the_build_budget`
 - `tests_state::a_republished_message_counts_its_state_calls_in_the_originals_budget`
 - `tests_state::a_rule_names_its_namespace_and_a_key_never_selects_one`
+- `tests_state::a_sample_event_replayed_at_a_time_carries_that_time`
 - `tests_state::a_state_key_must_name_a_declared_namespace`
 - `tests_state::a_statement_alone_takes_the_files_default_settings`
+- `tests_state::a_statement_compiled_once_keeps_its_state_from_one_input_to_the_next`
+- `tests_state::a_term_key_reads_back_as_the_value_it_was_made_from`
 - `tests_state::a_value_is_measured_as_the_rule_engine_writes_it`
 - `tests_state::a_write_stays_when_a_later_field_fails_the_rule`
 - `tests_state::an_in_list_is_evaluated_whole`
+- `tests_state::an_input_replayed_at_a_time_is_evaluated_at_that_time`
 - `tests_state::foreach_calls_run_per_element`
 - `tests_state::the_1025th_state_call_of_a_message_fails_its_rule`
 - `tests_state::the_emqx_functions_answer_as_emqx_does`
@@ -2484,7 +2488,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `rules_republishing_into_each_other_stop_at_the_depth_cap`
 - `the_original_s_limits_cover_the_whole_chain`
 
-## `crates/mqttd/tests/rules_binary.rs` — 63 test(s)
+## `crates/mqttd/tests/rules_binary.rs` — 67 test(s)
 
 - `a_broker_keeps_rule_state_between_publishes`
 - `a_closed_stdout_leaves_probe_and_backup_their_exit_status`
@@ -2536,11 +2540,15 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `rule_test_prints_an_output_exactly_as_the_rule_renders_it`
 - `rule_test_prints_each_output_of_a_publish_statement_as_json`
 - `rule_test_refuses_an_input_the_rule_would_never_see`
+- `rule_test_replays_a_sequence_through_a_statement`
+- `rule_test_replays_a_sequence_through_the_configured_rules_file`
 - `rule_test_runs_a_topics_and_events_statement_against_a_publish_unless_event_is_given`
 - `rule_test_runs_an_events_statement_against_a_sample_event`
 - `rule_test_runs_jq_with_the_results_emqx_gives`
 - `rule_test_runs_proc_dict_on_a_dictionary_of_its_own`
 - `rule_test_runs_the_state_functions_on_a_store_of_its_own`
+- `rule_test_sequence_exits_by_what_the_replay_found`
+- `rule_test_sequence_refuses_a_misuse_of_its_options`
 - `session_subscribed_fires_once_per_granted_filter`
 - `session_unsubscribed_fires_once_per_filter_actually_removed`
 - `sighup_swaps_the_rules_for_a_client_that_stays_connected`
@@ -2626,6 +2634,29 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_takeover_does_not_carry_the_dictionary`
 - `a_wills_rules_get_an_empty_dictionary`
 - `the_dictionaries_count_against_the_stores_ceiling`
+
+## `crates/mqttd/tests/rules_sequence.rs` — 20 test(s)
+
+- `a_dictionary_is_one_client_ids_for_the_whole_sequence`
+- `a_failing_rule_or_action_of_a_rules_file_is_reported_with_its_reason`
+- `a_key_expires_when_the_sequences_clock_passes_its_ttl`
+- `a_kv_store_key_of_any_type_is_shown_as_the_value_it_is`
+- `a_quota_counts_in_a_window_and_starts_again_when_the_window_expires`
+- `a_replay_never_touches_the_store_its_functions_carried`
+- `a_rule_that_republishes_into_its_own_from_counts_twice_and_is_stopped_there`
+- `a_rules_file_runs_every_matching_rule_its_actions_and_what_they_republish`
+- `a_sequence_is_bounded_in_steps_and_in_the_length_of_a_line`
+- `a_sequence_line_gives_the_message_and_what_it_leaves_out_is_the_defaults`
+- `a_sequence_that_cannot_be_read_names_the_line_and_the_reason`
+- `a_statement_on_events_runs_against_samples_at_the_sequences_time`
+- `a_step_that_fails_is_reported_and_the_replay_goes_on_with_what_it_wrote`
+- `an_emqx_kv_store_rule_counts_across_the_messages_of_a_sequence`
+- `change_detection_passes_only_the_messages_whose_value_differs_from_the_last`
+- `hot_for_five_minutes_fires_once_the_condition_has_held_that_long`
+- `nothing_selected_is_told_apart_from_no_output`
+- `the_clock_is_the_sequences_and_a_replay_prints_the_same_every_time`
+- `what_a_payload_or_a_key_prints_cannot_break_the_reports_lines`
+- `where_rule_state_is_switched_off_a_replay_of_a_stateful_rule_does_not_load`
 
 ## `crates/mqttd/tests/rules_state.rs` — 6 test(s)
 
