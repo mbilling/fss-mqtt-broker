@@ -8,9 +8,11 @@
 //! failure), as EMQX's does.
 //!
 //! Deliberately absent (docs/RULES.md lists them): schema registry and Sparkplug
-//! functions, `maptab_lookup`, the `MongoDB` date helpers, the process-dictionary and
-//! `kv_store_*` state functions (ADR 0085 designs rule state), and `term_encode` /
-//! `term_decode`.
+//! functions, `maptab_lookup`, the `MongoDB` date helpers, the process-dictionary
+//! functions (`proc_dict_*`, ADR 0085 D13), and `term_encode` / `term_decode`.
+//!
+//! The state functions (EMQX's `kv_store_*` and mqttd's `kv_*`) are in
+//! [`crate::state`]: they work on a store whoever loads the rules supplies (ADR 0085).
 //!
 //! `jq` is here and is not like the others: it runs in a WebAssembly sandbox
 //! (ADR 0086, [`crate::jq`]), and a rules file may call it only where the broker's
@@ -42,6 +44,8 @@ pub(crate) struct FnCtx<'a> {
     pub jq: Option<&'a crate::jq::Jq>,
     /// The module and function, for a call of an operator's function.
     pub module: Option<&'a crate::plugin::ModuleCall>,
+    /// The namespace, for a call of a state function (ADR 0085).
+    pub state: Option<&'a crate::state::StateBinding>,
 }
 
 /// A built-in function.
@@ -758,13 +762,20 @@ fn jq_call(jq: &crate::jq::Jq, a: &[Value], cx: &FnCtx) -> Result<Value, crate::
 
 /// Look up a function by name.
 pub(crate) fn lookup(name: &str) -> Option<&'static Func> {
-    FUNCS.iter().find(|f| f.name == name)
+    FUNCS
+        .iter()
+        .chain(crate::state::FUNCS)
+        .find(|f| f.name == name)
 }
 
 /// Every built-in function name, for documentation and its drift test.
 #[must_use]
 pub fn names() -> Vec<&'static str> {
-    FUNCS.iter().map(|f| f.name).collect()
+    FUNCS
+        .iter()
+        .chain(crate::state::FUNCS)
+        .map(|f| f.name)
+        .collect()
 }
 
 /// A pattern compiled, or why it does not compile.

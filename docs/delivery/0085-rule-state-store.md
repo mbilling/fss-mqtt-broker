@@ -5,7 +5,7 @@ adr_status: Accepted
 tasks:
   - id: 0085-T1
     title: "The store and its SQL functions on local namespaces: the StateStore trait handed over in Functions, [state.*] and the rule key state, EMQX's kv_store_* with EMQX's behaviour, the kv_* functions incl. kv_held and kv_changed, state calls in EMQX's evaluation order, bounds, the store's ceiling and memory accounting, dry runs on a scratch store"
-    status: planned
+    status: in-progress
     issue: 917
   - id: 0085-T2
     title: "Typed merges as CRDTs (lww, first, max, min, sum, union, hll, deletes) on a per-node hybrid logical clock, and the replicated form of a key"
@@ -61,7 +61,8 @@ The ADR was accepted on 2026-10-11, after a review against the EMQX evaluation o
 Five choices were decided by default and are listed in the ADR with what the other answer
 costs: `eventual` replicates to every member; `strong` is phase 2 behind a design
 amendment; EMQX's `proc_dict_*` are provided; state needs no switch beyond its ceiling
-(`rules.state_max_bytes`); the names stay `kv_*`. Nothing is built yet.
+(`rules.state_max_bytes`); the names stay `kv_*`. T1, the store and its functions on
+one node, is built and in review; nothing after it is started.
 
 ## Plan
 
@@ -89,7 +90,7 @@ phases.
 <!-- status-table:0085 -->
 | Task | Status | Issue | When | Evidence / notes |
 |------|--------|-------|------|------------------|
-| 0085-T1 | ⬜ planned | [#917](https://github.com/mbilling/fss-mqtt-broker/issues/917) | — |  |
+| 0085-T1 | 🚧 in-progress | [#917](https://github.com/mbilling/fss-mqtt-broker/issues/917) | — |  |
 | 0085-T2 | ⬜ planned | [#918](https://github.com/mbilling/fss-mqtt-broker/issues/918) | — |  |
 | 0085-T3 | ⬜ planned | [#919](https://github.com/mbilling/fss-mqtt-broker/issues/919) | — |  |
 | 0085-T4 | ⬜ planned | [#920](https://github.com/mbilling/fss-mqtt-broker/issues/920) | — |  |
@@ -133,3 +134,39 @@ phases.
     amendment. The Will special case ("submitted without waiting") is gone.
   - **T11** is new: EMQX's `proc_dict_*`.
   - One issue per task (#880 stays open as the feature's tracker until T8 is done).
+- 2026-10-11 — **T1 built** (#917, in review). What it is:
+  - **The engine's half** (`crates/mqtt-rules/src/state.rs`): the `StateStore` and
+    `StateNamespace` traits, handed over in `Functions` (`with_state`, `without_state`);
+    `[state.<name>]` and the rule key `state`; a state call resolved to its namespace at
+    load and refused where there is no store (naming `rules.state_max_bytes` when that is
+    `0`); EMQX's `kv_store_put/get/del` and mqttd's eleven `kv_*` functions, their names in
+    one table; argument checks (key, value, TTL), the 1,024-call budget in the message's
+    `Budget`, reads charged to the build budget; `RuleSet::evaluate_one` given the scratch
+    store a dry run evaluates on. `mqtt-rules` holds no state: its tests use a store that
+    only records calls.
+  - **The broker's store** (`crates/mqttd/src/rule_state.rs`): `local` namespaces of 64
+    shards, each a map behind its own mutex; typed keys (`lww`, `first`, `max`, `min`,
+    `sum`, `union`); `max_keys`, `max_bytes`, the store's ceiling and the brownout, each a
+    refusal counted by reason; `eviction = "lru"`; TTLs, with a key past its expiry
+    absent at once; namespaces held by the rule sets that use them, which is what keeps,
+    changes or drops keys across a reload. `rules.state_max_bytes`
+    (`MQTTD_RULES_STATE_MAX_BYTES`, 256 MiB; `0` = off; read at startup).
+  - **EMQX 6.3.1 probed:** 141 probes of `kv_store_*` and of when a call runs, pinned as
+    tests. Nothing in the ADR was contradicted; the ADR's amendment of this date lists
+    what they added. One of them changed the engine: an `IN` list is evaluated whole, as
+    EMQX evaluates it (ADR 0083, amended).
+  - **Dry runs:** `--rule-test`, `--check-rules`, `--check-config` and
+    `POST /admin/v1/rules/test` work on a store of their own.
+  - **The converter** carries a rule that calls `kv_store_*` live, with a note on the
+    bounds; `proc_dict_*` rules stay commented out until T11.
+  - **Measured** (`cargo bench -p mqttd --bench rule_state`, Apple M1 Pro): a publish's
+    evaluation goes from 1.38 µs to 1.74 µs with one `kv_incr`; a call on the store is
+    0.11 to 0.14 µs alone, 0.20 µs with four threads on keys of their own and 0.33 µs with
+    eight, 0.63 µs and 1.9 µs when they all increment one key. The per-publish benchmark
+    without a state rule (`cargo bench -p mqtt-rules`) moved between −1.4% and +1.8%
+    against `main` over two runs, which is its spread from one run to the next.
+  - **Left for later tasks, as planned:** documentation beyond what keeps RULES.md true
+    (T8: the threat model and hardening rows, the worked sequences); metrics, `$SYS` and
+    the admin verbs (T6; the refusal counts exist in the store and are not exported yet);
+    the expiry sweep and its event (T4: until then an expired key is removed by the call
+    that finds it, or when its namespace needs room).

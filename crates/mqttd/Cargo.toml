@@ -115,6 +115,11 @@ workspace = true
 name = "shared_plan"
 harness = false
 
+# What a rule's state call costs, alone and under contention (ADR 0085 D14).
+[[bench]]
+name = "rule_state"
+harness = false
+
 [[bench]]
 name = "shared_capacity"
 harness = false

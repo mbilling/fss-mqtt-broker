@@ -120,6 +120,13 @@ impl Hub {
         self.events.wants = watch.wants();
         self.events.watch = Some(watch);
         self.events.notes = Some(rules.spawn_notes(self.self_tx.clone()));
+        // The memory watermark may have been passed before the rules were attached.
+        if let Some(state) = rules.state() {
+            state.set_brownout(
+                self.brownout_axes
+                    .contains(&crate::hub::BrownoutAxis::Memory),
+            );
+        }
         self.rules = Some(rules);
         self.recompute_peers_want_origin();
         self.tell_message_events(None);

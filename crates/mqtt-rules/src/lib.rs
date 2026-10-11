@@ -19,6 +19,8 @@
 //! the broker decides where evaluation runs (on the connection task that read the
 //! publish, so it scales with connections and nodes) and how a republished message is
 //! delivered (through the same acknowledgement gate as the message that caused it).
+//! What a rule remembers between messages ([`state`], ADR 0085) lives in a store the
+//! broker supplies, behind a trait.
 //!
 //! The SQL dialect, the function set and every known difference from EMQX are
 //! documented in `docs/RULES.md`.
@@ -44,6 +46,7 @@ mod lexer;
 mod num;
 mod parser;
 mod plugin;
+pub mod state;
 mod template;
 mod value;
 
@@ -61,6 +64,7 @@ pub use plugin::{
     ModuleHost, ModuleSettings, DEFAULT_MEMORY_MIB, DEFAULT_TIMEOUT_MS, MAX_FUNCTIONS_PER_MODULE,
     MAX_MEMORY_MIB, MAX_MODULES, MAX_MODULE_BYTES, MAX_TIMEOUT_MS,
 };
+pub use state::{StateStore, StateSwitch, MAX_STATE_CALLS_PER_TRIGGER};
 pub use value::{json_decode, Map, Value};
 
 /// The most rules one file may define.
@@ -328,8 +332,9 @@ impl Recursion {
 }
 
 /// What every effect of one original message — a client's publish, a Will, an event —
-/// may use together: [`MAX_EFFECTS_PER_TRIGGER`] effects and [`MAX_DERIVED_BYTES`] plus
-/// four times the original's payload. Shared by the evaluation of the original and of
+/// may use together: [`MAX_EFFECTS_PER_TRIGGER`] effects, [`MAX_DERIVED_BYTES`] plus
+/// four times the original's payload, and [`MAX_STATE_CALLS_PER_TRIGGER`] state calls
+/// (ADR 0085 D9). Shared by the evaluation of the original and of
 /// every message its rules republish that re-enters the rule engine, so a chain or a
 /// loop of rules multiplies a publish no more than one rule can.
 #[derive(Debug)]
@@ -337,6 +342,7 @@ pub struct Budget {
     effects: std::cell::Cell<usize>,
     bytes: std::cell::Cell<usize>,
     limit: usize,
+    pub(crate) state_calls: std::cell::Cell<usize>,
 }
 
 impl Budget {
@@ -347,7 +353,14 @@ impl Budget {
             effects: std::cell::Cell::new(0),
             bytes: std::cell::Cell::new(0),
             limit: MAX_DERIVED_BYTES.saturating_add(payload_len.saturating_mul(4)),
+            state_calls: std::cell::Cell::new(0),
         }
+    }
+
+    /// State calls counted so far.
+    #[must_use]
+    pub fn state_calls(&self) -> usize {
+        self.state_calls.get()
     }
 
     /// Effects charged so far.
@@ -371,6 +384,8 @@ pub struct Rule {
     enabled: bool,
     sql: String,
     stmt: parser::Statement,
+    /// The namespace its `state` key names (ADR 0085 D1).
+    state: Option<String>,
     actions: Vec<action::Action>,
     /// The `actions` entries as the file wrote them.
     action_specs: Vec<toml::Value>,
@@ -442,6 +457,13 @@ impl Rule {
     #[must_use]
     pub fn sql(&self) -> &str {
         &self.sql
+    }
+
+    /// The declared namespace its `state` key names (ADR 0085 D1); `None` for a rule
+    /// that keeps its state, if any, in a namespace of its own.
+    #[must_use]
+    pub fn state(&self) -> Option<&str> {
+        self.state.as_deref()
     }
 
     /// The topic filters in its `FROM`.
@@ -523,6 +545,10 @@ pub struct RuleSet {
     /// as long as the set is: an evaluation on this set runs on these modules, whatever
     /// a later load has put in their place.
     modules: Vec<Arc<Module>>,
+    /// The state namespaces the file holds: the ones it declares and the ones its
+    /// rules call (ADR 0085). Held for as long as the set is, and a namespace lives
+    /// while a set that holds it does.
+    state: Vec<Arc<state::StateBinding>>,
 }
 
 /// A successfully loaded rules file and what the author should be told about it.
@@ -542,19 +568,22 @@ struct FileSchema {
     /// Operator modules (ADR 0086 D9); an mqttd extension.
     #[serde(default)]
     functions: BTreeMap<String, plugin::ModuleSchema>,
+    /// State namespaces (ADR 0085 D1); an mqttd extension.
+    #[serde(default)]
+    state: BTreeMap<String, state::StateSchema>,
 }
 
-/// The modules the rules file `text` declares, loaded as
-/// [`RuleSet::parse_with`] loads them.
-pub(crate) fn declared_modules(
-    text: &str,
-    functions: &Functions,
-) -> Result<Vec<Arc<Module>>, LoadError> {
+/// A rules file's modules and its `[state.<name>]` tables.
+pub(crate) type Declared = (Vec<Arc<Module>>, BTreeMap<String, state::StateSchema>);
+
+/// What the rules file `text` declares for a statement on its own: its modules, loaded
+/// as [`RuleSet::parse_with`] loads them, and its `[state.<name>]` tables.
+pub(crate) fn declared(text: &str, functions: &Functions) -> Result<Declared, LoadError> {
     let file: FileSchema = toml::from_str(text).map_err(|e| LoadError::File {
         message: e.to_string(),
         span: e.span(),
     })?;
-    load_modules(&file, functions)
+    Ok((load_modules(&file, functions)?, file.state))
 }
 
 fn load_modules(file: &FileSchema, functions: &Functions) -> Result<Vec<Arc<Module>>, LoadError> {
@@ -580,6 +609,10 @@ struct RuleSchema {
     enable: bool,
     #[serde(default)]
     description: String,
+    /// The declared namespace the rule's `kv_*` calls work on (ADR 0085 D1); without
+    /// it they work on a namespace of the rule's own.
+    #[serde(default)]
+    state: Option<String>,
 }
 
 /// Whether `id` is a valid rule id: a letter or `_` followed by up to 63 letters, digits,
@@ -768,6 +801,10 @@ impl RuleSet {
         // One for the whole file: the regex budget is file-wide (ADR 0084 D3).
         let mut loading = parser::Loading::new(functions);
         loading.modules.clone_from(&set.modules);
+        // The namespaces the file declares, before any rule names one: a file that
+        // declares state where there is no store does not load (ADR 0085 D2).
+        loading.state = state::StateLoading::new(&functions.state, file.state);
+        loading.state.declare().map_err(LoadError::file)?;
         for (id, r) in file.rules {
             let fail = |e: CompileError| LoadError::Rule {
                 id: id.clone(),
@@ -790,6 +827,10 @@ impl RuleSet {
                     .into(),
                 ));
             }
+            loading
+                .state
+                .rule(&id, r.state.as_deref())
+                .map_err(|e| fail(e.into()))?;
             let Compiled {
                 stmt,
                 topics,
@@ -809,6 +850,7 @@ impl RuleSet {
                 enabled: r.enable,
                 sql: r.sql,
                 stmt,
+                state: r.state,
                 actions,
                 action_specs: r.actions,
                 topics,
@@ -818,19 +860,7 @@ impl RuleSet {
                 no_result_window: AtomicU64::new(0),
             });
         }
-        for (i, rule) in set.rules.iter().enumerate() {
-            if !rule.enabled {
-                continue;
-            }
-            for t in &rule.topics {
-                let key: FilterKey = Arc::from(t.as_str());
-                set.topic_index.insert(&key);
-                set.by_filter.entry(key).or_default().push(i);
-            }
-            for e in &rule.events {
-                set.by_event[e.index()].push(i);
-            }
-        }
+        set.index();
         if let Some(jq) = &loading.jq {
             set.sandboxed = true;
             // The programs the file spells out, compiled into every warm instance now:
@@ -839,11 +869,36 @@ impl RuleSet {
             jq.warm(&programs);
         }
         set.sandboxed |= loading.calls_module;
+        if loading.state.called_emqx && loading.state.called_own {
+            warnings.push(
+                "the file calls both EMQX's kv_store_* functions and mqttd's kv_* functions: \
+                 they do not share keys (kv_get does not read what kv_store_put wrote)"
+                    .to_string(),
+            );
+        }
+        set.state = loading.state.into_bindings();
         set.warnings.clone_from(&warnings);
         Ok(Loaded {
             rules: set,
             warnings,
         })
+    }
+
+    /// Index the enabled rules by what their `FROM` selects.
+    fn index(&mut self) {
+        for (i, rule) in self.rules.iter().enumerate() {
+            if !rule.enabled {
+                continue;
+            }
+            for t in &rule.topics {
+                let key: FilterKey = Arc::from(t.as_str());
+                self.topic_index.insert(&key);
+                self.by_filter.entry(key).or_default().push(i);
+            }
+            for e in &rule.events {
+                self.by_event[e.index()].push(i);
+            }
+        }
     }
 
     /// Load a rules file from disk, with `jq` switched off.
@@ -872,6 +927,14 @@ impl RuleSet {
     #[must_use]
     pub fn modules(&self) -> &[Arc<Module>] {
         &self.modules
+    }
+
+    /// The state namespaces the file holds, in name order (ADR 0085): the ones it
+    /// declares, EMQX's `kv_store` when a rule calls `kv_store_*`, and `rule:<id>` for
+    /// each rule that keeps state without naming a namespace. Empty for a file that
+    /// uses no state.
+    pub fn state_namespaces(&self) -> impl Iterator<Item = (&str, &state::NamespaceSettings)> + '_ {
+        self.state.iter().map(|b| (&*b.name, &b.settings))
     }
 
     /// Every loaded rule (enabled or not), in id order.
@@ -974,7 +1037,7 @@ impl RuleSet {
         // A rule whose FROM lists several matching filters fires once.
         hits.sort_unstable();
         hits.dedup();
-        let ctx = EvalCtx::new(input);
+        let ctx = EvalCtx::new(input).within(budget);
         for i in hits {
             apply_timed(&self.rules[i], &ctx, budget, report, out);
         }
@@ -1003,7 +1066,7 @@ impl RuleSet {
         if hits.is_empty() {
             return;
         }
-        let ctx = EvalCtx::new(input);
+        let ctx = EvalCtx::new(input).within(budget);
         for &i in hits {
             apply_timed(&self.rules[i], &ctx, budget, report, out);
         }
@@ -1015,11 +1078,17 @@ impl RuleSet {
     /// asks [`Rule::from_mismatch`] first. Returns `false` when there is no such rule.
     ///
     /// Nothing about the rule changes: `report` is the caller's, and neither the failure
-    /// report gate nor the trace windows are touched.
+    /// report gate nor the trace windows are touched. **Nor is the store the rules were
+    /// loaded with** (ADR 0085 D11): the rule's state calls go to `scratch`, a store
+    /// the caller made for the dry run and drops after it, where each namespace has the
+    /// name and settings it has here. Rules evaluated on one scratch store see each
+    /// other's writes, as rules on one message do. With `None`, a state call fails the
+    /// rule.
     pub fn evaluate_one(
         &self,
         id: &str,
         input: &dyn Input,
+        scratch: Option<&dyn StateStore>,
         report: &mut dyn FnMut(&Rule, Outcome<'_>),
         out: &mut Vec<(Arc<str>, Effect)>,
     ) -> bool {
@@ -1027,7 +1096,8 @@ impl RuleSet {
             return false;
         };
         let budget = Budget::new(input.payload().map_or(0, Bytes::len));
-        apply(rule, &EvalCtx::new(input), &budget, report, out);
+        let ctx = EvalCtx::new(input).within(&budget).dry_run(scratch);
+        apply(rule, &ctx, &budget, report, out);
         true
     }
 }
@@ -1236,3 +1306,5 @@ mod tests_message_events;
 mod tests_modules;
 #[cfg(test)]
 mod tests_republish;
+#[cfg(test)]
+mod tests_state;

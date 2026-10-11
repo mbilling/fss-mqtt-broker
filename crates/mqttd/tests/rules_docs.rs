@@ -7,8 +7,9 @@
 //! line, on a snippet or command it recognises but cannot run, and on output it cannot
 //! tell apart from the blocks around it.
 //!
-//! **Rules snippets** must load with `RuleSet::parse`, the loader `--check-rules`, startup
-//! and a reload all use:
+//! **Rules snippets** must load with the loader `--check-rules`, startup and a reload all
+//! use (`RuleSet::parse_with`, given a store of its own for the snippets that keep state,
+//! ADR 0085, as `--check-rules` gives it one):
 //!
 //! - a ```` ```toml ```` block (the info string in any case) with a `[rules.<id>]` table,
 //!   or a shell heredoc that writes one (`cat > rules.toml <<'EOF'`,
@@ -736,15 +737,18 @@ impl Snippet {
         self.toml.contains("jq(")
     }
 
-    /// Load it as the broker would: with `jq` switched on when it calls `jq`.
+    /// Load it as the broker would: with `jq` switched on when it calls `jq`, and with
+    /// a store for the state it keeps (ADR 0085), which needs no switch.
     fn load(&self) -> Result<(), String> {
-        let loaded = if self.calls_jq() {
-            let jq = mqtt_rules::Functions::with_jq(mqtt_rules::JqSettings::default());
-            mqtt_rules::RuleSet::parse_with(&self.toml, &jq)
+        let functions = if self.calls_jq() {
+            mqtt_rules::Functions::with_jq(mqtt_rules::JqSettings::default())
         } else {
-            mqtt_rules::RuleSet::parse(&self.toml)
+            mqtt_rules::Functions::default()
         };
-        loaded.map(|_| ()).map_err(|e| e.to_string())
+        let functions = functions.with_state(mqttd::rule_state::Store::scratch(None));
+        mqtt_rules::RuleSet::parse_with(&self.toml, &functions)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 }
 

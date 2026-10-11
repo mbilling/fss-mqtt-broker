@@ -1852,6 +1852,11 @@ fn undocumented_emqx_functions_match_emqx_source() {
 /// tests". Every function
 /// the engine implements is called in some row above, so a function added without an
 /// example from EMQX's reference (or its source) fails here, naming it.
+///
+/// The state functions are the exception: they need a store, which this crate does not
+/// have. EMQX's `kv_store_*` are pinned to what EMQX 6.3.1 answered in the broker's
+/// tests of its store (`mqttd`, `rule_state`), and what the engine does with every one
+/// of them is in `tests_state`.
 #[test]
 fn every_implemented_function_has_an_example() {
     let mut called = std::collections::BTreeSet::new();
@@ -1875,6 +1880,7 @@ fn every_implemented_function_has_an_example() {
     let missing: Vec<&str> = function_names()
         .into_iter()
         .filter(|f| !called.contains(*f))
+        .filter(|f| !crate::state::FUNCS.iter().any(|s| s.name == *f))
         .collect();
     assert!(
         missing.is_empty(),

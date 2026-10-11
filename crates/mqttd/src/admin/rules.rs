@@ -737,6 +737,13 @@ pub async fn test(state: &AdminState, req: &Request) -> Answer {
     let state = state.clone();
     let running = access.rules.current();
     let functions = access.rules.functions().clone();
+    // A scratch store, dropped with this request: a dry run never reads or writes the
+    // state the running rules keep (ADR 0085 D11). `None` where rule state is off, and
+    // no rule that calls it loads.
+    let scratch = access
+        .rules
+        .state()
+        .map(|running| crate::rule_state::Store::scratch(Some(running)));
     one_at_a_time(&access, move || {
         let (set, alone) = if t.source.is_none() && t.rule.is_none() {
             (running, t.only)
@@ -759,7 +766,13 @@ pub async fn test(state: &AdminState, req: &Request) -> Answer {
                 json!({}),
             );
         }
-        let results = dry_run(&set, alone.as_deref(), &trigger, &node);
+        let results = dry_run(
+            &set,
+            alone.as_deref(),
+            &trigger,
+            &node,
+            scratch.as_deref().map(|s| s as &dyn mqtt_rules::StateStore),
+        );
         let answer = TestAnswer {
             node: &node,
             results,
@@ -771,7 +784,13 @@ pub async fn test(state: &AdminState, req: &Request) -> Answer {
 
 /// Evaluate `trigger` against `alone`, or every enabled rule of `set` whose `FROM`
 /// selects it, with a report of its own: nothing outside this function sees it.
-fn dry_run(set: &RuleSet, alone: Option<&str>, trigger: &Trigger, node: &str) -> Vec<Tested> {
+fn dry_run(
+    set: &RuleSet,
+    alone: Option<&str>,
+    trigger: &Trigger,
+    node: &str,
+    scratch: Option<&dyn mqtt_rules::StateStore>,
+) -> Vec<Tested> {
     let props = mqtt_core::AppProperties::default();
     let mut message = mqtt_rules::PublishInput::new(
         &trigger.clientid,
@@ -815,7 +834,7 @@ fn dry_run(set: &RuleSet, alone: Option<&str>, trigger: &Trigger, node: &str) ->
     };
     ids.into_iter()
         .filter_map(|id| set.get(id))
-        .map(|rule| evaluate(set, rule, input))
+        .map(|rule| evaluate(set, rule, input, scratch))
         .collect()
 }
 
@@ -848,7 +867,12 @@ struct Tested {
     rule: String,
 }
 
-fn evaluate(set: &RuleSet, rule: &Rule, input: &dyn Input) -> Tested {
+fn evaluate(
+    set: &RuleSet,
+    rule: &Rule,
+    input: &dyn Input,
+    scratch: Option<&dyn mqtt_rules::StateStore>,
+) -> Tested {
     let id = &**rule.id();
     if let Some(reason) = rule.from_mismatch(input) {
         return Tested {
@@ -867,6 +891,7 @@ fn evaluate(set: &RuleSet, rule: &Rule, input: &dyn Input) -> Tested {
     set.evaluate_one(
         id,
         input,
+        scratch,
         &mut |_, outcome| match outcome {
             Outcome::Passed => result = "passed",
             Outcome::NoResult => result = "no_result",

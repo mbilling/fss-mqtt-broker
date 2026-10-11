@@ -425,9 +425,6 @@ const EMQX_ONLY: &[&str] = &[
     // Exported by earlier releases, and still in rules written for them.
     "byteszie",
     "str_utf16_le_decode",
-    "kv_store_del",
-    "kv_store_get",
-    "kv_store_put",
     "maptab_lookup",
     "mongo_date",
     "proc_dict_del",

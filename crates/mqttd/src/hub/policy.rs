@@ -63,6 +63,13 @@ impl Hub {
         if let Some(m) = &self.metrics {
             m.set_brownout(axis.as_str(), on);
         }
+        // Rule state is process memory (ADR 0085 D9): over the memory watermark it
+        // takes no new key. A flag the store reads; nothing here waits for it.
+        if axis == BrownoutAxis::Memory {
+            if let Some(state) = self.rules.as_ref().and_then(|rules| rules.state()) {
+                state.set_brownout(on);
+            }
+        }
 
         let effective = !self.brownout_axes.is_empty();
         if effective != self.brownout {

@@ -64,6 +64,13 @@ pub struct EvalCtx<'a> {
     /// with the input after them, are one merged map. `usize::MAX` (a `SELECT`): every
     /// frame and the input fall through in turn. Set per clause by [`merged_from`].
     merged_from: std::cell::Cell<usize>,
+    /// The original message's budget, which its state calls are counted in
+    /// ([`within`](Self::within)); without one, this context counts its own.
+    budget: Option<&'a crate::Budget>,
+    own_state_calls: std::cell::Cell<usize>,
+    /// For a dry run: the scratch store its state calls go to instead of the one the
+    /// rules were loaded with ([`dry_run`](Self::dry_run)).
+    scratch: Option<crate::state::Scratch<'a>>,
 }
 
 /// Patterns and the result of compiling each, most recent first.
@@ -88,7 +95,58 @@ impl<'a> EvalCtx<'a> {
             built: std::cell::Cell::new(0),
             calls: std::cell::RefCell::new(Vec::new()),
             merged_from: std::cell::Cell::new(usize::MAX),
+            budget: None,
+            own_state_calls: std::cell::Cell::new(0),
+            scratch: None,
         }
+    }
+
+    /// The same context, counting its state calls in `budget`: the original message's,
+    /// shared by every rule it matches and every message its rules republish.
+    #[must_use]
+    pub fn within(mut self, budget: &'a crate::Budget) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
+    /// The same context for a dry run: its state calls go to `scratch`, never to the
+    /// store the rules were loaded with (ADR 0085 D11). Without a scratch store a
+    /// state call fails its rule.
+    #[must_use]
+    pub fn dry_run(mut self, scratch: Option<&'a dyn crate::state::StateStore>) -> Self {
+        self.scratch = Some(crate::state::Scratch::new(scratch));
+        self
+    }
+
+    /// Count one state call against the original message's
+    /// [`MAX_STATE_CALLS_PER_TRIGGER`](crate::state::MAX_STATE_CALLS_PER_TRIGGER),
+    /// refusing the one past it.
+    pub(crate) fn charge_state_call(&self) -> Result<(), EvalError> {
+        let calls = self
+            .budget
+            .map_or(&self.own_state_calls, |budget| &budget.state_calls);
+        if calls.get() >= crate::state::MAX_STATE_CALLS_PER_TRIGGER {
+            return Err(EvalError::new(format!(
+                "this message already made {} state calls (across every rule it matched and \
+                 every message they republished); the rest fail",
+                crate::state::MAX_STATE_CALLS_PER_TRIGGER
+            )));
+        }
+        calls.set(calls.get() + 1);
+        Ok(())
+    }
+
+    /// One call on `binding`'s namespace: the store's the rules were loaded with, or
+    /// a dry run's scratch store's.
+    pub(crate) fn state_call(
+        &self,
+        binding: &crate::state::StateBinding,
+        op: &crate::state::StateOp<'_>,
+    ) -> Result<Result<crate::state::StateReply, crate::state::StateError>, EvalError> {
+        Ok(match &self.scratch {
+            None => binding.namespace().call(op),
+            Some(scratch) => scratch.namespace(binding)?.call(op),
+        })
     }
 
     /// The decoded payload (cached). An undecodable payload is an error for whichever
@@ -458,13 +516,14 @@ pub(crate) fn eval(e: &Expr, ctx: &EvalCtx, frames: Frames) -> Result<Value, Eva
             list,
             negated,
         } => {
+            // EMQX evaluates the whole list before it looks for the value
+            // (`lists:member(eval(Var), [eval(V) || V <- Vals])`, probed on 6.3.1): an
+            // element after the match still fails the rule, and a state call in one
+            // still runs.
             let v = eval(expr, ctx, frames)?;
             let mut found = false;
             for x in list {
-                if strict_eq(&v, &eval(x, ctx, frames)?) {
-                    found = true;
-                    break;
-                }
+                found |= strict_eq(&v, &eval(x, ctx, frames)?);
             }
             Value::Bool(found != *negated)
         }
@@ -495,6 +554,7 @@ pub(crate) fn eval(e: &Expr, ctx: &EvalCtx, frames: Frames) -> Result<Value, Eva
             regex,
             jq,
             module,
+            state,
         } => {
             let args = args
                 .iter()
@@ -505,6 +565,7 @@ pub(crate) fn eval(e: &Expr, ctx: &EvalCtx, frames: Frames) -> Result<Value, Eva
                 regex: regex.as_ref(),
                 jq: jq.as_deref(),
                 module: module.as_ref(),
+                state: state.as_deref(),
             };
             let name = module.as_ref().map_or(func.name, |m| &m.function.name);
             (func.f)(&args, &fcx).map_err(|err| err.in_fn(name))?

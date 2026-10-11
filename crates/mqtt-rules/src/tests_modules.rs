@@ -287,7 +287,9 @@ fn a_module_that_fails_a_check_fails_the_load_with_the_reason() {
     for (name, why) in [
         ("upper", "a built-in function has that name"),
         ("jq", "a built-in function has that name"),
-        ("kv_store_get", "EMQX has a function of that name"),
+        ("kv_store_get", "a built-in function has that name"),
+        ("kv_get", "a built-in function has that name"),
+        ("proc_dict_get", "EMQX has a function of that name"),
         ("schema_decode", "EMQX has a function of that name"),
         ("select", "it is a word of rule SQL"),
     ] {

@@ -2634,11 +2634,27 @@ def collect_bridge_tls(up: BridgeUpstream, body: dict, where: str) -> None:
 # jq() is not in this list: mqttd has it (ADR 0086), but OFF unless the operator sets
 # `[rules] jq = true`, and a rules file that calls it does not load while it is off. A
 # rule calling it is commented out for the same all-or-nothing reason, with what to do.
+#
+# kv_store_put/get/del are not in it either: mqttd has them, with EMQX's results
+# (ADR 0085), and a rule calling them is carried live, with a note on what differs.
 RULE_FUNCS_UNSUPPORTED = (
     "byteszie", "schema_encode", "schema_decode", "schema_check",
     "sparkplug_encode", "sparkplug_decode", "maptab_lookup", "mongo_date",
-    "str_utf16_le_decode", "term_encode", "term_decode", "kv_store_get",
-    "kv_store_put", "kv_store_del", "proc_dict_get", "proc_dict_put", "proc_dict_del",
+    "str_utf16_le_decode", "term_encode", "term_decode",
+    "proc_dict_get", "proc_dict_put", "proc_dict_del",
+)
+
+# EMQX's own state functions, which mqttd provides (ADR 0085 D13).
+RULE_FUNCS_KV_STORE = ("kv_store_put", "kv_store_get", "kv_store_del")
+
+# What a carried rule that calls one of them is told.
+RULE_KV_STORE_NOTE = (
+    "calls kv_store_*, which mqttd provides with EMQX's results, in one table per node, "
+    "in memory (it starts empty at every restart, as EMQX's does). Unlike EMQX's, the "
+    "table is BOUNDED: a key of at most 256 bytes, a value of at most 4 KiB, 100,000 keys "
+    "and 64 MiB unless a [state.kv_store] table in the rules file says otherwise, under "
+    "[rules] state_max_bytes; past a bound the call fails the rule, where EMQX would have "
+    "stored the value (docs/RULES.md)"
 )
 
 # Every `$events/...` topic EMQX accepts in a FROM (emqx_rule_events:event_topics_enum/0,
@@ -2817,6 +2833,10 @@ def convert_rules(tree: dict, conv: Conversion) -> None:
             )
         else:
             blocked = _rule_sql_blockers(sql)
+            if blocked is None and any(
+                re.search(rf"\b{fn}\s*\(", sql) for fn in RULE_FUNCS_KV_STORE
+            ):
+                todos.append(f"rule {rid}: {RULE_KV_STORE_NOTE}")
         for k, v in body.items():
             if k not in ("sql", "actions", "enable", "description", "metadata", "name"):
                 todos.append(f"rule {rid}: {k} = {v!r} has no mqttd equivalent and was not carried")
