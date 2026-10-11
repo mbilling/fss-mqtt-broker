@@ -39,6 +39,17 @@
 //!   namespace of `<keys>` keys, with nothing else running (`idle`), with another thread
 //!   listing every key over and over (`listing`), and with one reading the counts over
 //!   and over (`counting`). The difference from `idle` is what the look costs a publish.
+//!   `listing_no_expiry` and `listing_expires_within` (four threads) are a listing with
+//!   a filter that selects nothing there, over and over: the first walks every shard's
+//!   map to find that out, the second each shard's order of expiry.
+//! - `filtered/<keys>/<filter>/<beside>` — one whole listing with a filter (T12), every
+//!   page of it, in a namespace of `<keys>` keys that expire in an hour plus one key in
+//!   a hundred that expires in five minutes and one in a hundred that never does.
+//!   `prefix`, `no_expiry` and `expires_within` each select one key in a hundred;
+//!   `expires_within_all` selects every key that expires and `all` every key. `idle` is
+//!   with nothing else running; `writers` with one thread writing existing keys anew
+//!   (which moves them in the order of expiry) and one putting keys in and taking them
+//!   out (which changes the shards' maps under the walk).
 //! - `sweep/*` — the expiry sweep (D7), which runs on a task of its own about once a
 //!   second: `idle` is one pass over a namespace of 100,000 keys none of which is due
 //!   (64 shard locks, each for one read), `expired` and `expired_event` the time per
@@ -60,7 +71,7 @@ use mqtt_rules::state::{
     term_key, Consistency, Eviction, NamespaceSettings, StateNamespace, StateOp, StateStore,
 };
 use mqtt_rules::{Functions, PublishInput, RuleSet, Value};
-use mqttd::rule_state::{stored, Limits, Selector, StateLink, Store};
+use mqttd::rule_state::{stored, ByExpiry, Limits, Selector, StateLink, Store};
 
 const CEILING: u64 = 1 << 30;
 
@@ -422,6 +433,121 @@ fn inspect(c: &mut Criterion, keys: usize) {
     });
 }
 
+/// The keys of the namespace that `selector` selects, page by page: how many there
+/// were, and how many pages.
+fn list_selected(store: &Store, selector: &Selector<'_>) -> (usize, usize) {
+    let limits = Limits::default();
+    let (mut listed, mut pages, mut from) = (0, 0, None);
+    loop {
+        let page = store
+            .keys("bench", selector, from.as_ref(), &limits)
+            .expect("the namespace is there");
+        listed += page.keys.len();
+        pages += 1;
+        match page.next {
+            Some(next) => from = Some(next),
+            None => return (listed, pages),
+        }
+    }
+}
+
+/// One whole listing with a filter, in a namespace of `keys` keys where the filter
+/// selects one key in a hundred (or, to compare, most keys), alone and beside writers.
+fn filtered(c: &mut Criterion, keys: usize) {
+    let store = Store::new(CEILING);
+    let settings = NamespaceSettings {
+        max_keys: mqtt_rules::state::MAX_MAX_KEYS,
+        max_bytes: CEILING,
+        default_ttl_secs: None,
+        ..NamespaceSettings::defaults(CEILING)
+    };
+    let ns = namespace(&store, &settings);
+    let one = Value::Int(1);
+    let set = |key: &str, ttl: Option<u64>| {
+        ns.call(&StateOp::Set {
+            key: key.as_bytes(),
+            value: stored(&one),
+            ttl,
+        })
+        .expect("room to fill");
+    };
+    let part = keys / 100;
+    for i in 0..keys - 2 * part {
+        set(&format!("state:device-{i:07}"), Some(3600));
+    }
+    for i in 0..part {
+        set(&format!("soon:device-{i:07}"), Some(300));
+        set(&format!("kept:device-{i:07}"), None);
+    }
+    let all = Selector::prefix(b"");
+    let selectors = [
+        ("prefix", Selector::prefix(b"soon:")),
+        ("no_expiry", all.expiring(ByExpiry::Never)),
+        (
+            "expires_within",
+            all.expiring(ByExpiry::Within(Duration::from_mins(10))),
+        ),
+        (
+            "expires_within_all",
+            all.expiring(ByExpiry::Within(Duration::from_hours(2))),
+        ),
+        ("all", all),
+    ];
+    let mut group = c.benchmark_group(format!("filtered/{keys}"));
+    group.sample_size(10);
+    for writers in [false, true] {
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            if writers {
+                let (rewriting, stop_it) = (ns.clone(), &stop);
+                scope.spawn(move || {
+                    let one = Value::Int(1);
+                    let mut i = 0usize;
+                    while !stop_it.load(std::sync::atomic::Ordering::Relaxed) {
+                        let key = format!("state:device-{:07}", i % (keys - 2 * part));
+                        black_box(rewriting.call(&StateOp::Set {
+                            key: key.as_bytes(),
+                            value: stored(&one),
+                            ttl: Some(3600),
+                        }))
+                        .ok();
+                        i += 1;
+                    }
+                });
+                let (churning, stop_it) = (ns.clone(), &stop);
+                scope.spawn(move || {
+                    let one = Value::Int(1);
+                    let mut i = 0usize;
+                    while !stop_it.load(std::sync::atomic::Ordering::Relaxed) {
+                        let key = format!("churn:{}", i % 10_000);
+                        black_box(churning.call(&StateOp::Set {
+                            key: key.as_bytes(),
+                            value: stored(&one),
+                            ttl: Some(3600),
+                        }))
+                        .ok();
+                        black_box(churning.call(&StateOp::Del {
+                            key: key.as_bytes(),
+                        }))
+                        .ok();
+                        i += 1;
+                    }
+                });
+            }
+            let beside = if writers { "writers" } else { "idle" };
+            for (name, selector) in &selectors {
+                let (listed, pages) = list_selected(&store, selector);
+                eprintln!("filtered/{keys}/{name}/{beside}: {listed} keys in {pages} pages");
+                group.bench_function(format!("{name}/{beside}"), |b| {
+                    b.iter(|| black_box(list_selected(&store, selector)));
+                });
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+    group.finish();
+}
+
 /// What runs beside the publish path.
 #[derive(Clone, Copy, PartialEq)]
 enum Looking {
@@ -431,6 +557,12 @@ enum Looking {
     Listing,
     /// A thread reading the namespace's counts, over and over.
     Counting,
+    /// A thread listing the keys that never expire, of which there are none, over and
+    /// over: a walk of every shard's map.
+    ListingNoExpiry,
+    /// A thread listing the keys that expire within ten minutes, of which there are
+    /// none, over and over: a walk of each shard's order of expiry.
+    ListingExpiresWithin,
 }
 
 /// A call on the publish path, as each of `threads` threads sees it, in a namespace of
@@ -441,6 +573,8 @@ fn inspected(c: &mut Criterion, keys: usize, looking: Looking, threads: usize) {
         Looking::Idle => "idle",
         Looking::Listing => "listing",
         Looking::Counting => "counting",
+        Looking::ListingNoExpiry => "listing_no_expiry",
+        Looking::ListingExpiresWithin => "listing_expires_within",
     };
     let stop = std::sync::atomic::AtomicBool::new(false);
     let looks = std::sync::atomic::AtomicU64::new(0);
@@ -452,6 +586,15 @@ fn inspected(c: &mut Criterion, keys: usize, looking: Looking, threads: usize) {
                     match looking {
                         Looking::Listing => {
                             black_box(list_all(store, &Limits::default()));
+                        }
+                        Looking::ListingNoExpiry => {
+                            let never = Selector::prefix(b"").expiring(ByExpiry::Never);
+                            black_box(list_selected(store, &never));
+                        }
+                        Looking::ListingExpiresWithin => {
+                            let soon = Selector::prefix(b"")
+                                .expiring(ByExpiry::Within(Duration::from_mins(10)));
+                            black_box(list_selected(store, &soon));
                         }
                         _ => {
                             black_box(store.counts("bench"));
@@ -1095,6 +1238,10 @@ fn bench(c: &mut Criterion) {
                 inspected(c, keys, looking, threads);
             }
         }
+        for looking in [Looking::ListingNoExpiry, Looking::ListingExpiresWithin] {
+            inspected(c, keys, looking, 4);
+        }
+        filtered(c, keys);
     }
     sweep(c);
     let cores = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);

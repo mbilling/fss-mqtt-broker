@@ -5,8 +5,8 @@
 //! | Endpoint | Role | Does |
 //! |---|---|---|
 //! | `GET /admin/v1/rules/state` | viewer | Each namespace's mode, bounds, counts and bytes; the store's total and the connections' dictionaries'. No key, no value. |
-//! | `GET /admin/v1/rules/state/keys?ns=&prefix=&cursor=` | operator | One page of a namespace's keys, each with its type. |
-//! | `GET /admin/v1/rules/state/key?ns=&key=` | operator | One key's value, type and expiry. |
+//! | `GET /admin/v1/rules/state/keys?ns=&prefix=&expires_within=&no_expiry=&values=&cursor=` | operator | One page of a namespace's keys, each with its type, size and expiry, and its value when asked. |
+//! | `GET /admin/v1/rules/state/key?ns=&key=` | operator | One key's value, type, size and expiry. |
 //! | `DELETE /admin/v1/rules/state/key?ns=&key=` | operator and rules writer | Deletes one key; audited as `state.delete`. |
 //!
 //! # Who
@@ -35,21 +35,36 @@
 //! (`utf8`, or `base64` for bytes that are not), and `value_type` what the value is
 //! (`string`, `integer`, `map`, …; `undefined` in `kv_store`, where it can be stored).
 //!
+//! # Which keys: one selection
+//!
+//! [`Selection`] is the keys of one namespace a request names, read from its query
+//! once: `prefix` (with `prefix_encoding`), `expires_within=<duration>` and
+//! `no_expiry=true`. A key is selected when **every** parameter given selects it.
+//! `expires_within` and `no_expiry` together select nothing by definition and are
+//! refused. The listing takes it now; whatever acts on a selection of keys (a purge, a
+//! change of expiry) takes the same one, so that what a listing shows is what the
+//! action reaches.
+//!
 //! # The audit log names no key
 //!
 //! `state.delete` records the namespace and the key's SHA-256 and length, and the
-//! `admin.request` record of these endpoints carries `key` and `prefix` the same way
-//! ([`audit_query`]): the audit log is read by more people than may read payload data,
-//! and whoever knows a key can still find what was done to it.
+//! `admin.request` record of these endpoints carries `key`, `prefix` and `cursor` the
+//! same way ([`audit_query`]; a cursor holds the last key listed): the audit log is
+//! read by more people than may read payload data, and whoever knows a key can still
+//! find what was done to it. Which filters a listing used (`expires_within`,
+//! `no_expiry`, `values`) is recorded as it came: none of them is of a key.
 
 use super::http::Request;
 use super::routes::{error, Answer};
 use super::{AdminState, Caller};
 use crate::reload::sha256_hex;
 use crate::rule_state::report;
-use crate::rule_state::{Cursor, KeysError, Limits, Selector, Store, MAX_PAGE_KEYS};
+use crate::rule_state::{
+    ByExpiry, Cursor, KeysError, Limits, Selector, Store, Values, MAX_PAGE_KEYS,
+    MAX_PAGE_VALUE_BYTES,
+};
 use crate::rules_sys::rfc3339_millis;
-use mqtt_rules::state::{key_term, term_key, KV_STORE_NAMESPACE, MAX_KEY_BYTES};
+use mqtt_rules::state::{duration_text, key_term, term_key, KV_STORE_NAMESPACE, MAX_KEY_BYTES};
 use mqtt_rules::Value as Term;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -157,8 +172,107 @@ fn shown_value(value: &Term) -> (String, &'static str, &'static str) {
     }
 }
 
-/// The query of a state request as the audit log records it: `key` and `prefix` by
-/// SHA-256 and length, everything else as it came. `None` for any other path.
+/// What a value takes in an answer: its text as JSON carries it, quotes and escapes
+/// included. What [`MAX_PAGE_VALUE_BYTES`] bounds.
+fn value_size(value: &Term) -> usize {
+    serde_json::to_string(&shown_value(value).0).map_or(0, |text| text.len())
+}
+
+/// When a key expires as an answer says it: the time, or `null` for never.
+fn expires_at(expires_ms: u64) -> Value {
+    json!((expires_ms != 0).then(|| rfc3339_millis(UNIX_EPOCH + Duration::from_millis(expires_ms))))
+}
+
+/// A parameter that is `true` or `false` (`false` when it is left out).
+fn flag(req: &Request, name: &str) -> Result<bool, String> {
+    match req.param(name) {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(other) => Err(format!("{name} is true or false, not {other:?}")),
+    }
+}
+
+/// A duration as a parameter carries it: as the rules file writes one, a whole number
+/// with a unit (`90s`, `10m`, `1h`, `7d`), or a whole number of seconds.
+fn duration(text: &str) -> Result<Duration, String> {
+    let seconds = || {
+        text.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| text.parse::<u64>().ok())?
+    };
+    seconds()
+        .or_else(|| duration_text(text))
+        .map(Duration::from_secs)
+        .ok_or_else(|| {
+            format!(
+                "{text:?} is not a duration: a whole number of seconds, or one with a unit \
+                 (s, m, h, d) such as 90s, 10m, 1h or 7d"
+            )
+        })
+}
+
+/// The keys of one namespace that a request names (see the module's documentation).
+/// Read from the query once; [`selector`](Self::selector) is what the store walks by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Selection {
+    /// The bytes `prefix` names; empty for none.
+    prefix: Vec<u8>,
+    /// Which keys by their expiry: `expires_within`, `no_expiry`, or neither.
+    expiry: ByExpiry,
+    /// The namespace is EMQX's table, where a prefix is of a string key's text.
+    kv_store: bool,
+}
+
+impl Selection {
+    /// The selection `req` names in a namespace that is EMQX's table (`kv_store`) or
+    /// not.
+    ///
+    /// # Errors
+    /// What is wrong with a parameter, or with two of them together.
+    pub(super) fn of(req: &Request, kv_store: bool) -> Result<Self, String> {
+        let prefix = match req.param("prefix_encoding") {
+            Some("term") => Err("prefix_encoding is utf8 or base64".to_string()),
+            encoding => named(req.param("prefix").unwrap_or_default(), encoding),
+        }
+        .map_err(|e| format!("prefix: {e}"))?;
+        let never = flag(req, "no_expiry")?;
+        let within = req
+            .param("expires_within")
+            .map(|text| duration(text).map_err(|e| format!("expires_within: {e}")))
+            .transpose()?;
+        let expiry = match (within, never) {
+            (Some(_), true) => {
+                return Err(
+                    "expires_within and no_expiry select nothing together: a key that \
+                     expires within a time has an expiry. Give one of them"
+                        .to_string(),
+                )
+            }
+            (Some(within), false) => ByExpiry::Within(within),
+            (None, true) => ByExpiry::Never,
+            (None, false) => ByExpiry::Any,
+        };
+        Ok(Self {
+            prefix,
+            expiry,
+            kv_store,
+        })
+    }
+
+    /// What the store selects keys by.
+    pub(super) fn selector(&self) -> Selector<'_> {
+        let by_prefix = if self.kv_store {
+            Selector::string_prefix(&self.prefix)
+        } else {
+            Selector::prefix(&self.prefix)
+        };
+        by_prefix.expiring(self.expiry)
+    }
+}
+
+/// The query of a state request as the audit log records it: `key`, `prefix` and
+/// `cursor` (which holds the last key listed) by SHA-256 and length, everything else
+/// as it came. `None` for any other path.
 #[must_use]
 pub fn audit_query(request: &Request) -> Option<Vec<(String, String)>> {
     if !request.path.starts_with(STATE_PATHS) {
@@ -167,7 +281,7 @@ pub fn audit_query(request: &Request) -> Option<Vec<(String, String)>> {
     let encoding = |name: &str| request.param(&format!("{name}_encoding"));
     let mut query = Vec::with_capacity(request.query.len() + 2);
     for (name, value) in &request.query {
-        if name == "key" || name == "prefix" {
+        if name == "key" || name == "prefix" || name == "cursor" {
             // Bytes that do not decode are hashed as they were sent.
             let bytes = named(value, encoding(name)).unwrap_or_else(|_| value.clone().into_bytes());
             query.push((format!("{name}_sha256"), sha256_hex(&bytes)));
@@ -292,9 +406,14 @@ pub async fn overview(state: &AdminState) -> Answer {
 }
 
 /// `GET /admin/v1/rules/state/keys?ns=<namespace>[&prefix=<text>[&prefix_encoding=…]]
-/// [&limit=<n>][&cursor=<next_cursor>]`: one page of the namespace's keys, 100 by
-/// default and at most 1,000. Each key is an object, with its type. `next_cursor` is
-/// `null` on the last page; a page can be short, or empty, and still have one.
+/// [&expires_within=<duration>|&no_expiry=true][&values=true][&limit=<n>]
+/// [&cursor=<next_cursor>]`: one page of the namespace's keys that the [`Selection`]
+/// names, 100 by default and at most 1,000. Each key is an object with its `type`,
+/// its `bytes` (what the namespace accounts it as) and `expires_at` (`null`: never);
+/// with `values=true` also `value`, `value_encoding` and `value_type`, as the read of
+/// one key shows them, and the page then ends where its values pass
+/// [`MAX_PAGE_VALUE_BYTES`] of the answer. `next_cursor` is `null` on the last page; a
+/// page can be short, or empty, and still have one.
 pub async fn keys(state: &AdminState, req: &Request) -> Answer {
     let node = state.node_id.clone();
     let (_, store) = match store_of(state) {
@@ -305,13 +424,11 @@ pub async fn keys(state: &AdminState, req: &Request) -> Answer {
         Ok(ns) => ns.to_string(),
         Err(refusal) => return refusal,
     };
-    let prefix = match req.param("prefix_encoding") {
-        Some("term") => Err("prefix_encoding is utf8 or base64".to_string()),
-        encoding => named(req.param("prefix").unwrap_or_default(), encoding),
-    };
-    let prefix = match prefix {
-        Ok(prefix) => prefix,
-        Err(e) => return bad_request(&node, &format!("prefix: {e}")),
+    let kv_store = ns == KV_STORE_NAMESPACE;
+    let asked = Selection::of(req, kv_store).and_then(|keys| Ok((keys, flag(req, "values")?)));
+    let (selection, values) = match asked {
+        Ok(asked) => asked,
+        Err(e) => return bad_request(&node, &e),
     };
     // As every list of the API: 100 by default, at most 1,000.
     let limit = match super::sessions::count_param(req, "limit", super::sessions::DEFAULT_LIMIT) {
@@ -326,14 +443,13 @@ pub async fn keys(state: &AdminState, req: &Request) -> Answer {
         },
     };
     blocking(move || {
-        let kv_store = ns == KV_STORE_NAMESPACE;
-        let selector = if kv_store {
-            Selector::string_prefix(&prefix)
-        } else {
-            Selector::prefix(&prefix)
-        };
+        let selector = selection.selector();
         let limits = Limits {
             keys: limit,
+            values: values.then_some(Values {
+                room: MAX_PAGE_VALUE_BYTES,
+                size: value_size,
+            }),
             ..Limits::default()
         };
         let page = match store.keys(&ns, &selector, cursor.as_ref(), &limits) {
@@ -355,6 +471,14 @@ pub async fn keys(state: &AdminState, req: &Request) -> Answer {
             .map(|listed| {
                 let mut key = shown_key(kv_store, &listed.key);
                 key["type"] = json!(listed.type_name);
+                key["bytes"] = json!(listed.bytes);
+                key["expires_at"] = expires_at(listed.expires_ms);
+                if let Some(value) = &listed.value {
+                    let (value, value_encoding, value_type) = shown_value(value);
+                    key["value"] = json!(value);
+                    key["value_encoding"] = json!(value_encoding);
+                    key["value_type"] = json!(value_type);
+                }
                 key
             })
             .collect();
@@ -374,7 +498,8 @@ pub async fn keys(state: &AdminState, req: &Request) -> Answer {
 }
 
 /// `GET /admin/v1/rules/state/key?ns=<namespace>&key=<key>[&key_encoding=…]`: what the
-/// key holds, as a rule would read it; its type; when it expires.
+/// key holds, as a rule would read it; its type; what the namespace accounts it as;
+/// when it expires.
 pub async fn key(state: &AdminState, req: &Request) -> Answer {
     let node = state.node_id.clone();
     let (_, store) = match store_of(state) {
@@ -405,11 +530,11 @@ pub async fn key(state: &AdminState, req: &Request) -> Answer {
         body["node"] = json!(node);
         body["namespace"] = json!(ns);
         body["type"] = json!(view.type_name);
+        body["bytes"] = json!(view.bytes);
         body["value"] = json!(value);
         body["value_encoding"] = json!(value_encoding);
         body["value_type"] = json!(value_type);
-        body["expires_at"] = json!((view.expires_ms != 0)
-            .then(|| rfc3339_millis(UNIX_EPOCH + Duration::from_millis(view.expires_ms))));
+        body["expires_at"] = expires_at(view.expires_ms);
         (200, body.to_string())
     })
     .await
@@ -650,5 +775,144 @@ mod tests {
             None
         );
         assert_eq!(audit_query(&request("/admin/v1/rules/state", &[])), None);
+    }
+
+    /// The record of a listing says which filters it used and whether it asked for
+    /// values, as they came, and names no key: not the prefix, and not the cursor,
+    /// which holds the last key the page before listed.
+    #[test]
+    fn the_audit_log_records_a_listings_filters_and_no_key() {
+        // A cursor is the last key listed, in hex: here `hot:dev-1`.
+        let cursor = Cursor::decode("1-00000000000000aa-3-686f743a6465762d31").unwrap();
+        assert!(cursor.encode().ends_with("-686f743a6465762d31"));
+        let listing = request(
+            "/admin/v1/rules/state/keys",
+            &[
+                ("ns", "alerts"),
+                ("prefix", "hot:"),
+                ("expires_within", "10m"),
+                ("values", "true"),
+                ("limit", "50"),
+                ("cursor", &cursor.encode()),
+            ],
+        );
+        let pair = |name: &str, value: &str| (name.to_string(), value.to_string());
+        assert_eq!(
+            audit_query(&listing).unwrap(),
+            [
+                pair("ns", "alerts"),
+                pair("prefix_sha256", &sha256_hex(b"hot:")),
+                pair("prefix_bytes", "4"),
+                pair("expires_within", "10m"),
+                pair("values", "true"),
+                pair("limit", "50"),
+                pair("cursor_sha256", &sha256_hex(cursor.encode().as_bytes())),
+                pair("cursor_bytes", &cursor.encode().len().to_string()),
+            ]
+        );
+        let never = request(
+            "/admin/v1/rules/state/keys",
+            &[("ns", "kv_store"), ("no_expiry", "true")],
+        );
+        assert_eq!(
+            audit_query(&never).unwrap(),
+            [pair("ns", "kv_store"), pair("no_expiry", "true")]
+        );
+    }
+
+    /// One selection, read from the query once: a prefix, `expires_within` and
+    /// `no_expiry`, each alone or with the prefix. A duration is written as the rules
+    /// file writes one, or as a whole number of seconds. The two expiry filters
+    /// together are refused, as is anything that is not what its parameter takes.
+    #[test]
+    fn a_selection_is_read_from_the_query_and_refuses_what_contradicts() {
+        let of = |query: &[(&str, &str)], kv_store: bool| {
+            Selection::of(&request("/admin/v1/rules/state/keys", query), kv_store)
+        };
+        let all = of(&[("ns", "alerts")], false).unwrap();
+        assert_eq!(
+            (all.prefix.as_slice(), all.expiry),
+            (&b""[..], ByExpiry::Any)
+        );
+        for (text, secs) in [
+            ("90", 90),
+            ("90s", 90),
+            ("10m", 600),
+            ("1h", 3600),
+            ("7d", 7 * 86_400),
+            ("0s", 0),
+        ] {
+            let keys = of(&[("prefix", "hot:"), ("expires_within", text)], false).unwrap();
+            assert_eq!(
+                (keys.prefix.as_slice(), keys.expiry),
+                (&b"hot:"[..], ByExpiry::Within(Duration::from_secs(secs))),
+                "{text}"
+            );
+        }
+        let never = of(
+            &[
+                ("no_expiry", "true"),
+                ("prefix", "/wD+"),
+                ("prefix_encoding", "base64"),
+            ],
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            (never.prefix.as_slice(), never.expiry, never.kv_store),
+            (&b"\xff\x00\xfe"[..], ByExpiry::Never, true)
+        );
+        // `false` is the parameter left out.
+        let plain = of(&[("no_expiry", "false"), ("expires_within", "1h")], false).unwrap();
+        assert_eq!(plain.expiry, ByExpiry::Within(Duration::from_hours(1)));
+        for (query, why) in [
+            (
+                &[("no_expiry", "true"), ("expires_within", "1h")][..],
+                "expires_within and no_expiry select nothing together",
+            ),
+            (
+                &[("expires_within", "soon")],
+                "expires_within: \"soon\" is not a duration",
+            ),
+            (&[("expires_within", "")], "is not a duration"),
+            (&[("expires_within", "1.5h")], "is not a duration"),
+            (&[("expires_within", "-5m")], "is not a duration"),
+            (&[("expires_within", "+5")], "is not a duration"),
+            (&[("expires_within", "10 m")], "is not a duration"),
+            (&[("expires_within", "250ms")], "is not a duration"),
+            (
+                &[("expires_within", "99999999999999999999d")],
+                "is not a duration",
+            ),
+            (&[("no_expiry", "yes")], "no_expiry is true or false"),
+            (&[("no_expiry", "")], "no_expiry is true or false"),
+            (
+                &[("prefix", "!"), ("prefix_encoding", "base64")],
+                "prefix: not base64",
+            ),
+            (
+                &[("prefix", "x"), ("prefix_encoding", "term")],
+                "prefix: prefix_encoding is utf8 or base64",
+            ),
+        ] {
+            let e = of(query, false).unwrap_err();
+            assert!(e.contains(why), "{query:?}: {e}");
+        }
+    }
+
+    /// What a value takes of a page is its text as the answer's JSON carries it: the
+    /// quotes, and an escape for every character JSON escapes.
+    #[test]
+    fn a_value_is_measured_as_the_answer_carries_it() {
+        assert_eq!(value_size(&Term::from("abc")), 5);
+        assert_eq!(value_size(&Term::Int(1234)), 6);
+        assert_eq!(value_size(&Term::from("a\"b")), 6);
+        assert_eq!(value_size(&Term::from("\u{1b}")), 8);
+        // A map is JSON text inside a JSON string: its quotes are escaped.
+        let mut map = Map::new();
+        map.insert("a", Term::Int(1));
+        assert_eq!(value_size(&Term::from(map)), "\"{\\\"a\\\":1}\"".len());
+        // Bytes that are not text are carried as base64.
+        assert_eq!(value_size(&Term::Bin(vec![0xff, 0x00, 0xfe].into())), 6);
     }
 }

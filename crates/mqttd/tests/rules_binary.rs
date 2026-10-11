@@ -3214,10 +3214,25 @@ async fn an_operator_sees_and_deletes_rule_state_from_the_command_line() {
     let keys = admin_cli(&pki, admin, &["state-keys", "alerts"]);
     assert_eq!(keys.code, Some(0), "{keys:?}");
     clean(&keys);
+    // Each key's type, its size and its expiry (the namespace's default TTL gave one).
+    let row: Vec<&str> = keys
+        .stdout
+        .lines()
+        .find(|l| l.starts_with(escaped))
+        .unwrap_or_else(|| panic!("no row for the key: {keys:?}"))
+        .split_whitespace()
+        .collect();
+    assert_eq!(row[..3], [escaped, "utf8", "lww"], "{keys:?}");
     assert!(
-        keys.stdout
-            .lines()
-            .any(|l| l == format!("{escaped}  utf8          lww")),
+        row[3].parse::<u64>().is_ok_and(|bytes| bytes > 128),
+        "{keys:?}"
+    );
+    assert!(row[4].ends_with('Z') && row[4].len() == 24, "{keys:?}");
+    assert!(
+        keys.stdout.contains(
+            "KEY_ENCODING  TYPE  BYTES  EXPIRES_AT
+"
+        ),
         "{keys:?}"
     );
     assert!(
@@ -3232,9 +3247,99 @@ async fn an_operator_sees_and_deletes_rule_state_from_the_command_line() {
     assert_eq!(keys.code, Some(0), "{keys:?}");
     clean(&keys);
     let listed: serde_json::Value = serde_json::from_str(&keys.stdout).unwrap();
+    assert_eq!(listed["count"], 1, "{keys:?}");
     assert_eq!(
-        listed["keys"],
-        serde_json::json!([{"key": hostile, "key_encoding": "utf8", "type": "lww"}])
+        (
+            &listed["keys"][0]["key"],
+            &listed["keys"][0]["key_encoding"],
+            &listed["keys"][0]["type"]
+        ),
+        (
+            &serde_json::json!(hostile),
+            &serde_json::json!("utf8"),
+            &serde_json::json!("lww")
+        )
+    );
+    assert!(listed["keys"][0].get("value").is_none(), "{keys:?}");
+    // `--values`: the value beside its key, escaped in the table and whole in `--json`;
+    // `--expires-within` and `--no-expiry` select by expiry, and not both at once.
+    let valued = admin_cli(
+        &pki,
+        admin,
+        &["state-keys", "alerts", "--values", "--expires-within", "2d"],
+    );
+    assert_eq!(valued.code, Some(0), "{valued:?}");
+    clean(&valued);
+    assert!(
+        valued
+            .stdout
+            .lines()
+            .any(|l| l.starts_with(escaped) && l.ends_with(&format!("reading {escaped}  string"))),
+        "{valued:?}"
+    );
+    assert!(
+        valued.stdout.lines().any(|l| l.starts_with("plain ")
+            && l.split_whitespace().skip(5).collect::<Vec<_>>() == ["7", "integer"]),
+        "{valued:?}"
+    );
+    let valued = admin_cli(
+        &pki,
+        admin,
+        &[
+            "state-keys",
+            "alerts",
+            "--values",
+            "--prefix",
+            "hot:",
+            "--json",
+        ],
+    );
+    clean(&valued);
+    let listed: serde_json::Value = serde_json::from_str(&valued.stdout).unwrap();
+    assert_eq!(
+        (
+            &listed["keys"][0]["value"],
+            &listed["keys"][0]["value_encoding"],
+            &listed["keys"][0]["value_type"]
+        ),
+        (
+            &serde_json::json!(format!("reading {hostile}")),
+            &serde_json::json!("utf8"),
+            &serde_json::json!("string")
+        )
+    );
+    for (filter, count) in [
+        (&["--expires-within", "1m"][..], "0"),
+        (&["--no-expiry"], "0"),
+        (&["--expires-within", "2d", "--prefix", "pla"], "1"),
+    ] {
+        let mut args = vec!["state-keys", "alerts"];
+        args.extend(filter);
+        let some = admin_cli(&pki, admin, &args);
+        assert_eq!(some.code, Some(0), "{some:?}");
+        assert!(
+            some.stdout
+                .lines()
+                .any(|l| l == format!("count        {count}")),
+            "{filter:?}: {some:?}"
+        );
+    }
+    let both = admin_cli(
+        &pki,
+        admin,
+        &[
+            "state-keys",
+            "alerts",
+            "--no-expiry",
+            "--expires-within",
+            "1h",
+        ],
+    );
+    assert_eq!(both.code, Some(1), "{both:?}");
+    assert!(
+        both.stderr
+            .contains("400 bad-request: expires_within and no_expiry select nothing together"),
+        "{both:?}"
     );
 
     // The key as it is, control characters and all, is what names it.

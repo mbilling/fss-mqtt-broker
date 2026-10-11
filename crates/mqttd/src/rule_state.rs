@@ -1627,8 +1627,9 @@ mod admin;
 pub mod report;
 
 pub use admin::{
-    Cursor, KeyInfo, KeyView, KeysError, Limits, NamespaceCounts, Page, Selector, StoreTotals,
-    MAX_PAGE_BYTES, MAX_PAGE_KEYS, OPS, PAGE_TIME, RESULTS,
+    ByExpiry, Cursor, KeyInfo, KeyView, KeysError, Limits, NamespaceCounts, Page, Selector,
+    StoreTotals, Values, MAX_PAGE_BYTES, MAX_PAGE_KEYS, MAX_PAGE_VALUE_BYTES, OPS, PAGE_TIME,
+    RESULTS,
 };
 
 #[cfg(test)]

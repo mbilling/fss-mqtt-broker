@@ -13,7 +13,10 @@ use mqtt_rules::state::{
 use mqtt_rules::Value;
 
 use super::super::{stored, Store, ENTRY_OVERHEAD, REFUSALS, SHARDS};
-use super::{Cursor, KeysError, Limits, Page, Selector, OPS, RESULTS, SCAN_BATCH};
+use super::{
+    ByExpiry, Cursor, KeyInfo, KeysError, Limits, Page, Selector, Values, OPS, RESULTS, SCAN_BATCH,
+    WALK_BATCH,
+};
 
 const CEILING: u64 = 256 << 20;
 
@@ -344,18 +347,16 @@ fn a_cursor_reads_back_and_a_stale_or_broken_one_is_refused() {
     let Rig { store, ns, .. } = r;
     drop(ns);
     assert_eq!(
-        store.keys("n", &all(), None, &limit(10)),
-        Err(KeysError::NoNamespace)
+        store.keys("n", &all(), None, &limit(10)).err(),
+        Some(KeysError::NoNamespace)
     );
     let _again = store.open("n", &settings).unwrap();
     assert_eq!(
-        store.keys("n", &all(), Some(&cursor), &limit(10)),
-        Err(KeysError::StaleCursor)
+        store.keys("n", &all(), Some(&cursor), &limit(10)).err(),
+        Some(KeysError::StaleCursor)
     );
-    assert_eq!(
-        store.keys("n", &all(), None, &limit(10)),
-        Ok(Page::default())
-    );
+    let again = store.keys("n", &all(), None, &limit(10)).unwrap();
+    assert!(again.keys.is_empty() && again.next.is_none());
     assert_eq!(store.key("gone", b"k").err(), Some(KeysError::NoNamespace));
     assert_eq!(store.delete_key("gone", b"k"), Err(KeysError::NoNamespace));
     assert_eq!(store.counts("gone"), None);
@@ -660,4 +661,571 @@ fn the_totals_tell_namespaces_from_dictionaries() {
         (held + 400, 1_000, true, 400, 2)
     );
     assert_eq!(store.counts("n").unwrap().bytes, held);
+}
+
+// -- what a listing says of a key, and what it selects by (T12) -------------------------
+
+/// The start of the rig's clock.
+const START_MS: u64 = 1_800_000_000_000;
+
+fn within(secs: u64) -> Selector<'static> {
+    all().expiring(ByExpiry::Within(Duration::from_secs(secs)))
+}
+
+fn never() -> Selector<'static> {
+    all().expiring(ByExpiry::Never)
+}
+
+impl Rig {
+    /// Every page of a listing: each key as it was listed.
+    fn infos(&self, selector: &Selector<'_>, limits: &Limits) -> Vec<KeyInfo> {
+        let (mut keys, mut from) = (Vec::new(), None);
+        for _ in 0..100_000 {
+            let page = self.page(selector, from.as_ref(), limits);
+            assert!(page.keys.len() <= limits.keys);
+            keys.extend(page.keys);
+            match page.next {
+                Some(next) => from = Some(next),
+                None => return keys,
+            }
+        }
+        panic!("the listing does not end");
+    }
+
+    /// The keys a listing selects, sorted, after checking that none came twice.
+    fn selected(&self, selector: &Selector<'_>, limits: &Limits) -> Vec<String> {
+        let (keys, _) = self.listing(selector, limits);
+        let distinct: BTreeSet<String> = keys
+            .iter()
+            .map(|k| String::from_utf8_lossy(k).into_owned())
+            .collect();
+        assert_eq!(distinct.len(), keys.len(), "no key is listed twice");
+        distinct.into_iter().collect()
+    }
+
+    fn advance(&self, secs: u64) {
+        self.clock.fetch_add(secs * 1000, Relaxed);
+    }
+}
+
+/// What a value takes, for a test: the length of its JSON.
+fn json_len(value: &Value) -> usize {
+    value.to_json().map_or(0, |text| text.len())
+}
+
+fn with_values(room: usize, keys: usize) -> Limits {
+    Limits {
+        keys,
+        values: Some(Values {
+            room,
+            size: json_len,
+        }),
+        ..Limits::default()
+    }
+}
+
+/// A listing says of each key its type, what the namespace accounts it as, and when
+/// it expires: all of it in the entry already. Nothing was added to an entry for it:
+/// a key still costs its key, its value and 128 bytes, and the sizes listed add up to
+/// what the namespace counts.
+#[test]
+fn a_listing_says_each_keys_type_size_and_expiry() {
+    let r = rig();
+    r.set(b"plain", None);
+    r.set(b"short", Some(90));
+    r.ns.call(&StateOp::Incr {
+        key: b"counter",
+        by: 5,
+        ttl: Some(3600),
+    })
+    .unwrap();
+    r.ns.call(&StateOp::Add {
+        key: b"members",
+        identity: b"dev-1",
+        element: stored(&Value::from("dev-1")),
+        ttl: None,
+    })
+    .unwrap();
+    let listed = r.infos(&all(), &limit(10));
+    let by_key: BTreeMap<&[u8], &KeyInfo> = listed.iter().map(|k| (&*k.key, k)).collect();
+    let shown = |key: &[u8]| {
+        let k = by_key[key];
+        assert!(k.value.is_none(), "no value unless values are asked for");
+        (k.type_name, k.expires_ms)
+    };
+    assert_eq!(shown(b"plain"), ("lww", 0));
+    assert_eq!(shown(b"short"), ("lww", START_MS + 90_000));
+    assert_eq!(shown(b"counter"), ("sum", START_MS + 3_600_000));
+    assert_eq!(shown(b"members"), ("union", 0));
+    assert_eq!(ENTRY_OVERHEAD, 128);
+    assert!(by_key[&b"plain"[..]].bytes > ENTRY_OVERHEAD + b"plain".len());
+    assert!(by_key[&b"members"[..]].bytes > by_key[&b"plain"[..]].bytes);
+    let counts = r.store.counts("n").unwrap();
+    assert_eq!(
+        listed.iter().map(|k| k.bytes as u64).sum::<u64>(),
+        counts.bytes,
+        "the sizes listed are what the namespace accounts"
+    );
+    // What a listing says is what a read of the key says.
+    for k in &listed {
+        let view = r.store.key("n", &k.key).unwrap().unwrap();
+        assert_eq!(
+            (view.type_name, view.expires_ms, view.bytes),
+            (k.type_name, k.expires_ms, k.bytes)
+        );
+    }
+}
+
+/// Each filter alone, and combined with the others and a prefix, selects exactly the
+/// keys written that way, on a clock the test drives: `Within` the keys that expire
+/// within that long of now (the last millisecond included, and not one that has
+/// expired), `Never` the keys with no expiry, both only among the prefix's keys. However
+/// the listing is paged.
+#[test]
+fn the_filters_select_exactly_the_keys_written_that_way() {
+    let r = rig();
+    // Per prefix: 40 keys that never expire, 40 that expire in a minute, 40 in an
+    // hour, 40 in a day.
+    let ttls = [(None, "never"), (Some(60), "min"), (Some(3600), "hour")];
+    let ttls = ttls.iter().chain(&[(Some(86_400), "day")]);
+    let mut model: BTreeMap<String, u64> = BTreeMap::new();
+    for (ttl, kind) in ttls {
+        for prefix in ["a", "b"] {
+            for i in 0..40 {
+                let key = format!("{prefix}:{kind}:{i:02}");
+                r.set(key.as_bytes(), *ttl);
+                model.insert(key, ttl.map_or(0, |secs| START_MS + secs * 1000));
+            }
+        }
+    }
+    let expected = |prefix: &str, by: ByExpiry, now_ms: u64| -> Vec<String> {
+        model
+            .iter()
+            .filter(|(key, expires_ms)| {
+                let live = **expires_ms == 0 || **expires_ms > now_ms;
+                let selected = match by {
+                    ByExpiry::Any => true,
+                    ByExpiry::Never => **expires_ms == 0,
+                    ByExpiry::Within(d) => {
+                        let within = u64::try_from(d.as_millis()).unwrap();
+                        **expires_ms != 0 && **expires_ms <= now_ms + within
+                    }
+                };
+                live && selected && key.starts_with(prefix)
+            })
+            .map(|(key, _)| key.clone())
+            .collect()
+    };
+    let hurried = Limits {
+        time: Duration::ZERO,
+        ..limit(7)
+    };
+    let check = |now_ms: u64| {
+        for by in [
+            ByExpiry::Any,
+            ByExpiry::Never,
+            ByExpiry::Within(Duration::ZERO),
+            ByExpiry::Within(Duration::from_secs(59)),
+            ByExpiry::Within(Duration::from_mins(1)),
+            ByExpiry::Within(Duration::from_mins(10)),
+            ByExpiry::Within(Duration::from_hours(1)),
+            ByExpiry::Within(Duration::from_hours(30 * 24)),
+        ] {
+            for prefix in ["", "a:", "b:hour", "nope"] {
+                let selector = Selector::prefix(prefix.as_bytes()).expiring(by);
+                let want = expected(prefix, by, now_ms);
+                for limits in [limit(1000), limit(7), hurried] {
+                    assert_eq!(
+                        r.selected(&selector, &limits),
+                        want,
+                        "{by:?} {prefix:?} {limits:?}"
+                    );
+                }
+            }
+        }
+    };
+    check(START_MS);
+    // Exactly the keys of a minute within a minute, of an hour within an hour.
+    assert_eq!(r.selected(&within(59), &limit(100)).len(), 0);
+    assert_eq!(r.selected(&within(60), &limit(100)).len(), 80);
+    assert_eq!(r.selected(&within(3600), &limit(100)).len(), 160);
+    assert_eq!(r.selected(&never(), &limit(100)).len(), 80);
+    // A millisecond before the minute is up they are within anything; then they have
+    // expired, and are within nothing.
+    r.clock.fetch_add(59_999, Relaxed);
+    check(START_MS + 59_999);
+    assert_eq!(
+        r.selected(&within(0), &limit(100)).len(),
+        0,
+        "within no time"
+    );
+    assert_eq!(r.selected(&within(1), &limit(100)).len(), 80);
+    r.clock.fetch_add(1, Relaxed);
+    check(START_MS + 60_000);
+    assert_eq!(r.selected(&within(1), &limit(100)).len(), 0);
+    // Later the hour's keys come within ten minutes.
+    r.advance(3_000);
+    check(START_MS + 3_060_000);
+    assert_eq!(r.selected(&within(600), &limit(100)).len(), 80);
+    // A listing removes nothing: the expired keys are still held.
+    assert_eq!(r.store.counts("n").unwrap().keys, 320);
+    // With a rule on the expiry event, a call that finds its key expired holds it for
+    // the event: out of the map, still counted, and listed by no filter.
+    r.store.set_expiry_events(true);
+    for i in 0..40 {
+        let key = format!("a:min:{i:02}");
+        assert!(r
+            .ns
+            .call(&StateOp::Get {
+                key: key.as_bytes()
+            })
+            .unwrap()
+            .value
+            .is_none());
+    }
+    assert_eq!(r.store.counts("n").unwrap().keys, 320);
+    check(START_MS + 3_060_000);
+}
+
+/// EMQX's table is listed like any namespace. Its keys never expire, so `Never`
+/// selects every one of them and `Within` none; a prefix there is of a string key's
+/// text, and combines.
+#[test]
+fn emqxs_table_is_listed_with_sizes_and_every_key_has_no_expiry() {
+    let clock = Arc::new(AtomicU64::new(START_MS));
+    let store = Store::with_manual_clock(CEILING, clock);
+    let ns = store
+        .open(
+            mqtt_rules::state::KV_STORE_NAMESPACE,
+            &NamespaceSettings {
+                default_ttl_secs: None,
+                ..NamespaceSettings::defaults(CEILING)
+            },
+        )
+        .unwrap();
+    let terms = [
+        Value::from("dev-1"),
+        Value::from("dev-2"),
+        Value::Int(1),
+        Value::from(vec![Value::from("dev-3")]),
+    ];
+    for term in &terms {
+        ns.call(&StateOp::Set {
+            key: &term_key(term),
+            value: stored(&Value::from("held")),
+            ttl: None,
+        })
+        .unwrap();
+    }
+    let list = |selector: Selector<'_>| {
+        store
+            .keys(
+                mqtt_rules::state::KV_STORE_NAMESPACE,
+                &selector,
+                None,
+                &with_values(1 << 20, 10),
+            )
+            .unwrap()
+            .keys
+    };
+    let all = list(Selector::string_prefix(b""));
+    assert_eq!(all.len(), 4);
+    for k in &all {
+        assert_eq!((k.type_name, k.expires_ms), ("lww", 0));
+        assert!(k.bytes > ENTRY_OVERHEAD);
+        assert_eq!(k.value.as_ref().unwrap().to_json().unwrap(), "\"held\"");
+    }
+    assert_eq!(
+        list(Selector::string_prefix(b"").expiring(ByExpiry::Never)).len(),
+        4
+    );
+    let day = ByExpiry::Within(Duration::from_hours(24));
+    assert_eq!(list(Selector::string_prefix(b"").expiring(day)).len(), 0);
+    assert_eq!(
+        list(Selector::string_prefix(b"dev-").expiring(ByExpiry::Never)).len(),
+        2
+    );
+}
+
+/// A page with values carries each key's value as a read of it does, and ends where
+/// its values pass their room: such a page is short and says where the next starts,
+/// one value larger than the room is a page of its own, and the listing is whole all
+/// the same. Without `values` a page carries none.
+#[test]
+fn a_page_with_values_ends_where_its_values_pass_their_room() {
+    let r = rig();
+    let text = "x".repeat(98);
+    for i in 0..300 {
+        r.ns.call(&StateOp::Set {
+            key: &name(i),
+            value: stored(&Value::from(text.as_str())),
+            ttl: Some(60),
+        })
+        .unwrap();
+    }
+    let large = "y".repeat(3_000);
+    r.ns.call(&StateOp::Set {
+        key: b"large",
+        value: stored(&Value::from(large.as_str())),
+        ttl: None,
+    })
+    .unwrap();
+    let whole = r.listing(&all(), &limit(1000)).0;
+    assert_eq!(whole.len(), 301);
+    assert!(r
+        .infos(&all(), &limit(1000))
+        .iter()
+        .all(|k| k.value.is_none()));
+    // Each value is 100 bytes as JSON: 1,000 bytes of room is ten keys a page, until
+    // the large one, which has a page to itself.
+    let limits = with_values(1_000, 1000);
+    let (mut pages, mut from, mut keys) = (Vec::new(), None, Vec::new());
+    loop {
+        let page = r.page(&all(), from.as_ref(), &limits);
+        let sizes: Vec<usize> = page
+            .keys
+            .iter()
+            .map(|k| json_len(k.value.as_ref().expect("a value for every key")))
+            .collect();
+        assert!(
+            sizes.iter().sum::<usize>() <= 1_000 || sizes.len() == 1,
+            "{sizes:?}"
+        );
+        for k in &page.keys {
+            let view = r.store.key("n", &k.key).unwrap().unwrap();
+            assert_eq!(
+                k.value.as_ref().unwrap().to_json().unwrap(),
+                view.value.to_json().unwrap()
+            );
+            assert_eq!(
+                (k.type_name, k.bytes, k.expires_ms),
+                (view.type_name, view.bytes, view.expires_ms)
+            );
+        }
+        keys.extend(page.keys.iter().map(|k| k.key.to_vec()));
+        pages.push(sizes);
+        match page.next {
+            Some(next) => from = Some(next),
+            None => break,
+        }
+        assert!(pages.len() < 1_000, "the listing does not end");
+    }
+    assert_eq!(keys, whole, "every key once, in the listing's order");
+    assert!(pages.contains(&vec![3_002]), "the large value, alone");
+    assert!(pages.iter().filter(|sizes| sizes.len() == 10).count() >= 20);
+    assert!(pages.iter().all(|sizes| sizes.len() <= 10));
+    // Room for everything: the bound on keys is what ends a page.
+    let roomy = with_values(1 << 20, 50);
+    assert_eq!(r.page(&all(), None, &roomy).keys.len(), 50);
+    assert_eq!(r.listing(&all(), &roomy).0, whole);
+    // With a filter: the values of the keys selected, and of no other.
+    let selected = r.infos(&never(), &with_values(1 << 20, 50));
+    assert_eq!(selected.len(), 1);
+    assert_eq!(json_len(selected[0].value.as_ref().unwrap()), 3_002);
+}
+
+/// What a change of expiry does to a filtered listing that is under way, page by
+/// page. A key that is selected from the first page to the last is listed exactly
+/// once. One whose expiry changes meanwhile is judged when the listing reaches it:
+/// after the cursor it is listed if it is selected then, before the cursor it stays
+/// as it was listed or not listed. No key is listed twice.
+#[test]
+fn a_key_whose_expiry_changes_during_a_listing_is_judged_where_the_listing_reaches_it() {
+    for by in [ByExpiry::Within(Duration::from_mins(10)), ByExpiry::Never] {
+        let r = rig();
+        // What `by` selects, and what it does not.
+        let (inside, outside) = match by {
+            ByExpiry::Never => (None, Some(60)),
+            _ => (Some(60), None),
+        };
+        for i in 0..1_000 {
+            r.set(&name(i), inside);
+            r.set(format!("out:{i:04}").as_bytes(), outside);
+        }
+        let selector = all().expiring(by);
+        let first = r.page(&selector, None, &limit(300));
+        assert_eq!(first.keys.len(), 300);
+        let cursor = first.next.clone().unwrap();
+        let at = (cursor.shard, cursor.after.clone());
+        let mut listed: Vec<Vec<u8>> = first.keys.iter().map(|k| k.key.to_vec()).collect();
+        // Meanwhile every fourth selected key stops being selected, and every fourth
+        // of the others starts. (A key is given another expiry by deleting it and
+        // writing it again where the new one is none: a write without a TTL keeps
+        // the expiry a key has.)
+        let change = |key: &[u8], ttl: Option<u64>| {
+            r.del(key);
+            r.set(key, ttl);
+        };
+        for i in (0..1_000).step_by(4) {
+            change(&name(i), outside);
+            change(format!("out:{i:04}").as_bytes(), inside);
+        }
+        // And some stay selected with another expiry: still listed exactly once.
+        if inside.is_some() {
+            for i in (1..1_000).step_by(4) {
+                r.set(&name(i), Some(120));
+            }
+        }
+        let mut from = Some(cursor);
+        while let Some(cursor) = from {
+            let page = r.page(&selector, Some(&cursor), &limit(300));
+            listed.extend(page.keys.iter().map(|k| k.key.to_vec()));
+            from = page.next;
+        }
+        let seen: BTreeSet<&Vec<u8>> = listed.iter().collect();
+        assert_eq!(seen.len(), listed.len(), "{by:?}: no key is listed twice");
+        let (mut started_after, mut stopped_before) = (0, 0);
+        for i in 0..1_000 {
+            let (key, other) = (name(i), format!("out:{i:04}").into_bytes());
+            if i % 4 != 0 {
+                assert!(seen.contains(&key), "{by:?}: {i} stayed selected");
+                assert!(!seen.contains(&other), "{by:?}: {i} was never selected");
+                continue;
+            }
+            // Stopped being selected: listed only if the first page had it.
+            let before = r.place(&key) <= at;
+            assert_eq!(seen.contains(&key), before, "{by:?}: {i} stopped");
+            stopped_before += usize::from(before);
+            // Started being selected: listed only where the listing had yet to come.
+            let before = r.place(&other) <= at;
+            assert_eq!(seen.contains(&other), !before, "{by:?}: {i} started");
+            started_after += usize::from(!before);
+        }
+        assert!(
+            started_after > 0 && stopped_before > 0,
+            "both cases were tried"
+        );
+    }
+}
+
+/// The same with the changes on other threads while filtered listings run: keys that
+/// stay selected are each listed exactly once in every listing, keys that are never
+/// selected never, and a key whose expiry is changing may or may not be listed, and
+/// never twice. `Within` walks the order of expiry and `Never` the map; both keep
+/// the promise while keys come and go around them.
+#[test]
+fn filtered_listings_stay_exact_for_keys_that_stay_selected_while_others_change() {
+    const WRITERS: usize = 4;
+    const LISTINGS: usize = 12;
+    let r = rig();
+    let soon: BTreeSet<Vec<u8>> = (0..1_500).map(name).collect();
+    let fixed: BTreeSet<Vec<u8>> = (0..1_500)
+        .map(|i| format!("fixed:{i:04}").into_bytes())
+        .collect();
+    for key in &soon {
+        r.set(key, Some(60));
+    }
+    for key in &fixed {
+        r.set(key, None);
+    }
+    for i in 0..500 {
+        r.set(format!("late:{i}").as_bytes(), Some(86_400));
+    }
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        for t in 0..WRITERS {
+            let (ns, stop) = (r.ns.clone(), &stop);
+            scope.spawn(move || {
+                let mut i = 0usize;
+                while !stop.load(Relaxed) {
+                    // Keys that come and go, with and without an expiry, and keys
+                    // whose expiry moves in and out of what a listing selects.
+                    let churn = format!("churn:{t}:{}", i % 300).into_bytes();
+                    let ttl = [None, Some(30), Some(7_200)][i % 3];
+                    let _ = ns.call(&StateOp::Set {
+                        key: &churn,
+                        value: stored(&Value::Int(1)),
+                        ttl,
+                    });
+                    if i.is_multiple_of(2) {
+                        let _ = ns.call(&StateOp::Del { key: &churn });
+                    }
+                    let moving = format!("moving:{t}:{}", i % 100).into_bytes();
+                    let _ = ns.call(&StateOp::Set {
+                        key: &moving,
+                        value: stored(&Value::Int(1)),
+                        ttl: Some([20, 40, 7_200][i % 3]),
+                    });
+                    i += 1;
+                }
+            });
+        }
+        let other = |k: &Vec<u8>| k.starts_with(b"churn:") || k.starts_with(b"moving:");
+        for round in 0..LISTINGS {
+            let limits = limit([250, 1000, 33][round % 3]);
+            let (keys, _) = r.listing(&within(600), &limits);
+            let seen: BTreeSet<&Vec<u8>> = keys.iter().collect();
+            assert_eq!(seen.len(), keys.len(), "no key is listed twice");
+            assert!(soon.iter().all(|k| seen.contains(k)));
+            assert!(keys.iter().all(|k| soon.contains(k) || other(k)));
+            let (keys, _) = r.listing(&never(), &limits);
+            let seen: BTreeSet<&Vec<u8>> = keys.iter().collect();
+            assert_eq!(seen.len(), keys.len(), "no key is listed twice");
+            assert!(fixed.iter().all(|k| seen.contains(k)));
+            assert!(keys
+                .iter()
+                .all(|k| fixed.contains(k) || k.starts_with(b"churn:")));
+        }
+        stop.store(true, Relaxed);
+    });
+}
+
+/// A `Within` listing of a `local` namespace walks the shard's order of expiry, not
+/// its map, and selects what a walk of the map would: among many keys that expire
+/// later, across more keys of one second than one hold looks at, in pages of any
+/// size, and while the map of every shard changes all the time.
+#[test]
+fn a_listing_by_expiry_walks_the_order_of_expiry() {
+    let r = rig();
+    for i in 0..20_000 {
+        r.set(&name(i), Some(86_400));
+    }
+    for i in 0..50 {
+        r.set(format!("due:{i:02}").as_bytes(), Some(30));
+    }
+    // More keys of one second than one hold looks at: the walk goes on from where a
+    // hold ended, within the second.
+    for i in 0..(3 * WALK_BATCH + 5) {
+        r.set(format!("burst:{i:03}").as_bytes(), Some(45));
+    }
+    let by_order = r.selected(&within(60), &limit(1000));
+    assert_eq!(by_order.len(), 50 + 3 * WALK_BATCH + 5);
+    // What the map's walk selects, judged the same way.
+    let by_map: Vec<String> = r
+        .infos(&all(), &limit(1000))
+        .iter()
+        .filter(|k| k.expires_ms != 0 && k.expires_ms <= START_MS + 60_000)
+        .map(|k| String::from_utf8(k.key.to_vec()).unwrap())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    assert_eq!(by_order, by_map);
+    // Small pages go through the same keys, in the listing's order.
+    let (paged, _) = r.listing(&within(60), &limit(3));
+    let places: Vec<(usize, Vec<u8>)> = paged.iter().map(|k| r.place(k)).collect();
+    assert!(places.windows(2).all(|w| w[0] < w[1]));
+    assert_eq!(paged.len(), by_order.len());
+    // The map of every shard changes between any two holds: a walk of the map would
+    // start over, the order's walk has nothing to start over.
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let (ns, stop) = (r.ns.clone(), &stop);
+        scope.spawn(move || {
+            let mut i = 0usize;
+            while !stop.load(Relaxed) {
+                let key = format!("churn:{}", i % 5_000).into_bytes();
+                let _ = ns.call(&StateOp::Set {
+                    key: &key,
+                    value: stored(&Value::Int(1)),
+                    ttl: None,
+                });
+                let _ = ns.call(&StateOp::Del { key: &key });
+                i += 1;
+            }
+        });
+        for _ in 0..20 {
+            assert_eq!(r.selected(&within(60), &limit(1000)), by_order);
+        }
+        stop.store(true, Relaxed);
+    });
 }

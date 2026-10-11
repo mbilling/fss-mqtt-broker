@@ -1373,8 +1373,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 716 test(s)
+## `crates/mqttd/src/lib.rs` — 728 test(s)
 
+- `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
 - `admin::cli::tests::all_nodes_asks_for_the_cluster_scope_on_the_verbs_that_have_one`
 - `admin::cli::tests::answers_render_as_tables_and_lines`
@@ -1412,9 +1413,12 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `admin::scope::tests::only_node_and_cluster_are_scopes_and_a_forward_is_always_node_scope`
 - `admin::scope::tests::subscribers_merge_with_their_node_and_honour_the_limit`
 - `admin::state::tests::a_key_that_names_none_is_refused`
+- `admin::state::tests::a_selection_is_read_from_the_query_and_refuses_what_contradicts`
 - `admin::state::tests::a_shown_key_addresses_the_key_it_was_shown_for`
+- `admin::state::tests::a_value_is_measured_as_the_answer_carries_it`
 - `admin::state::tests::a_value_is_shown_as_the_rule_engine_writes_it`
 - `admin::state::tests::the_audit_log_names_a_state_key_by_its_hash`
+- `admin::state::tests::the_audit_log_records_a_listings_filters_and_no_key`
 - `admission::tests::a_cordon_refuses_new_connections_until_lifted`
 - `admission::tests::the_global_cap_refuses_at_the_bound_and_recovers`
 - `admission::tests::the_penalty_box_refuses_after_the_threshold`
@@ -1969,16 +1973,23 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `reload::tests::every_reload_attempt_is_recorded_with_its_repeats`
 - `reload::tests::reload_increments_the_metric_by_outcome`
 - `rule_state::admin::tests::a_cursor_reads_back_and_a_stale_or_broken_one_is_refused`
+- `rule_state::admin::tests::a_key_whose_expiry_changes_during_a_listing_is_judged_where_the_listing_reaches_it`
 - `rule_state::admin::tests::a_large_backlog_is_counted_whole`
+- `rule_state::admin::tests::a_listing_by_expiry_walks_the_order_of_expiry`
 - `rule_state::admin::tests::a_listing_pages_through_every_key_exactly_once`
+- `rule_state::admin::tests::a_listing_says_each_keys_type_size_and_expiry`
 - `rule_state::admin::tests::a_page_is_bounded_in_bytes_and_in_time`
+- `rule_state::admin::tests::a_page_with_values_ends_where_its_values_pass_their_room`
 - `rule_state::admin::tests::a_prefix_in_emqxs_table_is_of_a_string_keys_text`
 - `rule_state::admin::tests::a_write_during_a_listing_neither_repeats_nor_hides_a_key_that_stays`
 - `rule_state::admin::tests::an_expired_key_is_absent_to_an_operator_and_counted_as_backlog`
 - `rule_state::admin::tests::an_operators_delete_removes_a_key_of_any_type`
 - `rule_state::admin::tests::calls_are_counted_by_operation_and_result`
+- `rule_state::admin::tests::emqxs_table_is_listed_with_sizes_and_every_key_has_no_expiry`
+- `rule_state::admin::tests::filtered_listings_stay_exact_for_keys_that_stay_selected_while_others_change`
 - `rule_state::admin::tests::listings_stay_exact_for_stable_keys_while_other_threads_write`
 - `rule_state::admin::tests::reading_a_key_is_not_a_use_and_counts_as_no_call`
+- `rule_state::admin::tests::the_filters_select_exactly_the_keys_written_that_way`
 - `rule_state::admin::tests::the_totals_tell_namespaces_from_dictionaries`
 - `rule_state::expiry::tests::a_key_written_again_after_it_expired_still_raises_the_event_it_owed`
 - `rule_state::expiry::tests::a_mass_expiry_is_handed_over_at_the_rate_in_order_and_none_is_shed`
@@ -2045,6 +2056,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `rule_state::tests_replica::a_merge_keeps_to_the_namespaces_bounds_and_the_stores_ceiling`
 - `rule_state::tests_replica::a_namespace_cannot_change_its_mode_under_the_rules_that_hold_it`
 - `rule_state::tests_replica::a_node_joins_and_a_node_leaves`
+- `rule_state::tests_replica::a_replicated_key_is_listed_with_its_type_size_and_expiry_on_every_node`
 - `rule_state::tests_replica::a_restarted_node_is_refilled_from_the_others_each_key_once`
 - `rule_state::tests_replica::a_state_from_a_clock_too_far_ahead_is_refused_until_the_clock_catches_up`
 - `rule_state::tests_replica::a_store_without_an_eventual_namespace_sends_nothing`
@@ -2153,11 +2165,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `the_authorization_dry_run_never_allows_a_publish_into_sys`
 - `the_cluster_view_compares_every_nodes_rules_digest`
 
-## `crates/mqttd/tests/admin_rules.rs` — 25 test(s)
+## `crates/mqttd/tests/admin_rules.rs` — 29 test(s)
 
 - `a_dry_run_and_a_check_leave_the_running_rule_state_untouched`
 - `a_dry_run_works_on_a_scratch_dictionary_of_its_own`
 - `a_last_error_is_shown_only_for_the_definition_it_was_about`
+- `a_listing_shows_each_keys_type_size_and_expiry_and_values_when_asked`
+- `a_page_with_values_ends_at_a_mebibyte_of_them`
 - `a_rejected_reload_says_the_file_was_written_and_what_still_runs`
 - `a_rules_body_is_read_only_from_a_role_that_may_send_one`
 - `a_rules_file_written_where_there_was_none_is_private` — only when `cfg(unix)`
@@ -2173,7 +2187,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `one_rule_is_edited_in_place_and_the_rest_of_the_file_kept_byte_for_byte`
 - `the_dry_run_answers_a_console_output_as_the_rule_rendered_it`
 - `the_dry_run_shows_what_the_rules_would_do_and_changes_nothing`
+- `the_filters_select_keys_by_expiry_alone_and_with_a_prefix`
 - `the_keys_of_a_namespace_are_listed_in_pages_of_at_most_a_thousand`
+- `the_record_of_a_filtered_listing_names_its_filters_and_no_key`
 - `the_rules_file_is_read_verbatim_by_an_operator_only`
 - `the_running_rules_are_read_whole_by_an_operator_and_redacted_for_a_viewer`
 - `the_state_endpoints_refuse_what_names_nothing`

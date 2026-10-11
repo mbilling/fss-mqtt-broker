@@ -519,8 +519,10 @@ fn size(v: &toml::Value) -> Result<u64, String> {
     }
 }
 
-/// Text such as `10m` as whole seconds (`s`, `m`, `h`, `d`).
-fn duration_text(s: &str) -> Option<u64> {
+/// Text such as `10m` as whole seconds: a whole number and a unit (`s`, `m`, `h`,
+/// `d`), as a `[state.<name>]` table writes a duration. `None` for any other text.
+#[must_use]
+pub fn duration_text(s: &str) -> Option<u64> {
     let digits = s.len() - s.trim_start_matches(|c: char| c.is_ascii_digit()).len();
     let n: u64 = s[..digits].parse().ok()?;
     let unit = match &s[digits..] {
