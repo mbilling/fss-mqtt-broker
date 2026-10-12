@@ -1,6 +1,6 @@
 # Rule engine
 
-**Dated 2026-10-12.** Unreleased: no release has the rule engine yet
+**Dated 2026-10-12.** In releases from `v1.2.0`, the first with the rule engine
 ([ADR 0083](adr/0083-rule-engine.md)). Rules filter, transform and re-route messages as
 they pass through the broker. They are written in **EMQX's rule SQL**, with EMQX's
 `republish` and `console` actions. A rule written for EMQX's rule engine runs here
@@ -27,10 +27,13 @@ the admin API. The rest of this page is the reference.
 
 ### 1. Get a build that has the rule engine
 
-No release has the rule engine yet. `v1.1.0` and every earlier release do not: the
-binaries, the `ghcr.io/mbilling/fss-mqtt-broker` images and the Helm chart's default
-image. Until the next release, build from source (Rust ≥ 1.96; the first build takes a few
-minutes):
+`v1.2.0` is the first release with the rule engine: its binaries and the
+`ghcr.io/mbilling/fss-mqtt-broker:1.2.0` image have it. `v1.1.0` and every earlier
+release do not, and neither does a compose file or a Helm release that still pins an
+older image tag. Take the binary for your platform from the
+[release page](https://github.com/mbilling/fss-mqtt-broker/releases)
+([RELEASING.md](../RELEASING.md#verifying-a-release) verifies it) and put it on your
+`PATH`, or build from source (Rust ≥ 1.96; the first build takes a few minutes):
 
 ```sh
 git clone https://github.com/mbilling/fss-mqtt-broker && cd fss-mqtt-broker
@@ -40,16 +43,17 @@ mqttd --help | grep -e --rule-test
 ```
 
 The last command prints a `mqttd --rule-test --sql <statement>` line only in a build
-that has the rule engine. Do not go by `mqttd --version`: a build of `main` reports the
-last release's version (`mqttd 1.1.0` today), exactly as that release's binary does,
-until the next release bumps it.
+that has the rule engine. A release says `mqttd 1.2.0` or later to `mqttd --version`;
+for a build of `main` go by the help line, since such a build reports the version of
+the release it was last bumped for.
 
-A release binary or image does not know rules, and does not always say so:
+A release before `v1.2.0` does not know rules, and does not always say so:
 `mqttd --check-rules` is an `unrecognised argument`, a `[rules]` table in `mqttd.toml` is
 an `unknown config key`, but `MQTTD_RULES_FILE` is ignored without a word. A broker that
 runs your rules logs a `rule engine:` line at startup (step 3); no line, no rules.
 
-**For Docker**, build an image from the same checkout. This needs Linux and the musl C
+**For Docker**, use `ghcr.io/mbilling/fss-mqtt-broker:1.2.0` or later wherever this page
+says `mqttd:rules`, or build an image from the same checkout. That needs Linux and the musl C
 toolchain (`apt install musl-tools` on Debian/Ubuntu); it is what
 `scripts/image-smoke.sh` does:
 
@@ -980,7 +984,8 @@ mosquitto_sub -h 127.0.0.1 -t '$SYS/brokers/+/rules' -v
   {"ok":"undefined"}
   ```
 
-  **Upgrading from an earlier build.** Until 2026-10-11 a build of `main` read these
+  **Upgrading from a build of `main` older than `v1.2.0`.** No release did this: until
+  2026-10-11 a build of `main` read these
   words as the booleans in any case, which EMQX never did. A rules file written for such
   a build that holds one changes its result without failing: run `mqttd --check-rules`
   on it, and put each word it names in lower case. A rule moved from EMQX means here what
@@ -2601,7 +2606,7 @@ the consequence above for a node with smaller bounds. Ship the same rules file t
 node and compare `summary.same_rules` of `mqttd --admin cluster --json`.
 
 **Upgrading.** `eventual` state travels on the peer links at **peer protocol 14**, which
-the first release with the rule engine introduces. A node on `v1.1.0` or earlier has no rule engine and
+`v1.2.0` introduces. A node on `v1.1.0` or earlier has no rule engine and
 speaks 12 or below: it runs no rules, holds no state and is sent none. The members that speak 14 replicate among
 themselves. **Upgrade every node first, then deploy the rules that use state.** A
 cluster without an `eventual` namespace puts nothing new on the wire.
@@ -3162,13 +3167,17 @@ magnitude and the ratios, not as a guarantee. They are microbenchmarks of the st
 of one rule's evaluation, not a cluster benchmark, and nothing here was measured across
 machines.
 
+The first, second and fifth rows, and the `eventual` figure under the table, were
+measured again for `v1.2.0` on 2026-10-12: the same machine, still not idle (load
+average 9 to 21), the fastest of three rounds.
+
 | | Time |
 |---|---|
-| A publish evaluated against one rule, no state call | 1.4 µs |
-| The same with one `kv_incr` | 1.8 µs |
+| A publish evaluated against one rule, no state call | 1.40 µs |
+| The same with one `kv_incr` | 1.76 µs |
 | with one `kv_held` | 1.9 µs |
 | with one `kv_hll_add` | 2.1 µs |
-| with one `kv_incr` and an idempotency key (a message already seen) | 2.4 µs |
+| with one `kv_incr` and an idempotency key (a message already seen) | 2.23 µs |
 | The store's part of a call, one thread | 0.11 to 0.15 µs |
 | Every worker calling at once, each on keys of its own: 2, 4, 8 threads | 0.14, 0.20, 0.33 µs a call |
 | Every worker incrementing **one** key: 2, 4, 8 threads | 0.19, 0.63, 1.9 µs a call |
@@ -3182,7 +3191,9 @@ machines.
   0.19 µs alone; on keys of their own 0.23, 0.32 and 0.49 µs with two, four and eight
   threads; all on one key 0.3 to 0.4, 0.95 and 3.0 µs.
 - **An `eventual` namespace costs the same on the publish path**: a publish with a
-  `kv_incr` 1.84 µs beside 1.80 µs `local`. In the store a write is 0.16 µs, and 0.27 to
+  `kv_incr` 1.84 µs beside 1.76 µs `local`. Between two nodes on one machine's loopback
+  (the same day and conditions), a write on one was readable on the other 1.3 ms later,
+  and a peer caught up on 100,000 keys in 89 ms. In the store a write is 0.16 µs, and 0.27 to
   0.30 µs while a peer link keeps up (the key is put back in the order the links read).
   With eight threads writing keys of their own, 0.9 µs a call beside 0.34 µs `local`,
   and 1.65 µs when every write is a `kv_set`, each of which takes a stamp of the node's
@@ -3342,9 +3353,8 @@ publish, gated, so the PUBACK or PUBREC waits for all of it
 
 `direct_dispatch = true` opts a message out: no rule runs on it and it is not retained.
 
-**Upgrading from an earlier build.** No release has the rule engine yet, so this is
-about builds of `main`: until 2026-10-10 a republished message never re-entered the
-rules. A rules file written for such a build starts chaining on a later one: a rule
+**Upgrading from a build of `main` older than `v1.2.0`.** No release did this: until
+2026-10-10 a republished message never re-entered the rules in a build of `main`. A rules file written for such a build starts chaining on a later one: a rule
 whose output topic another rule's `FROM` matches now triggers that rule too. Check
 each `republish` topic against every `FROM` (`mqttd --check-rules` lists them), and set
 `direct_dispatch = true` on the actions that must not trigger anything.
@@ -3454,6 +3464,13 @@ publish, rule work on every one of those messages would take about 0.14 core, sp
 across the connection tasks. These are microbenchmarks of the engine, not a cluster
 benchmark. A derived message costs what any publish costs to route, so a rule that
 doubles your message count doubles the routing load.
+
+`jq`, modules and state did not move these figures for rules that use none of them. The
+same five cases on an Apple M1 Pro (2026-10-12, not idle: load average 9 to 21; the
+fastest of three alternating rounds), the commit before `jq` and state against the
+`v1.2.0` tree: 86.4 and 85.9 ns, 751 and 756 ns, 1,399 and 1,401 ns, 3,749 and 3,715 ns,
+6,342 and 6,435 ns, between 0.9% faster and 1.5% slower. That machine is faster per core
+than the VM of the table, so compare the pairs, not the columns.
 
 A [state](#state-what-a-rule-remembers) call adds about 0.4 to 0.5 µs to the evaluation
 of a publish, and more when every worker thread calls the store at once, on one key

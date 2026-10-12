@@ -395,10 +395,10 @@ source path, the instant, the file names, the set digest, and — if the restore
 
 ## A rule does not fire, or publishes `undefined`
 
-The rule engine is unreleased (no release has it yet), so first check that the binary
+The rule engine is in releases from `v1.2.0`, so first check that the binary
 has it: `mqttd --help` lists `--check-rules` only in a build that does
-([RULES.md § Try it in two minutes](RULES.md#try-it-in-two-minutes)). A release binary or
-image ignores `MQTTD_RULES_FILE` without a word, so its startup log has no `rule engine:`
+([RULES.md § Try it in two minutes](RULES.md#try-it-in-two-minutes)). An older release's
+binary or image ignores `MQTTD_RULES_FILE` without a word, so its startup log has no `rule engine:`
 line. The full checklist,
 with the commands, is [RULES.md § My rule does not fire](RULES.md#my-rule-does-not-fire);
 in short:

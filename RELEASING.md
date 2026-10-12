@@ -106,6 +106,13 @@ must already be in the registry (the coverage tests refuse the bump without it).
    `X.Y.Z`, commit, and merge to `main`. `mqttui` versions **independently** — it is a
    separate workspace and a separate published crate (ADR 0056 §1), so bump
    `tools/mqttui/Cargo.toml` only when `mqttui` itself changed.
+
+   When the release changes what an operator has to know (a MINOR that raises
+   `proto_max`, new configuration, a client-visible behaviour), write
+   `docs/release-notes/X.Y.Z.md` in the same commit: what is new and what an upgrade
+   needs. The pipeline appends that file to the text of the GitHub Release it creates
+   (step 6), so the notes are reviewed with the release commit and published from the
+   tag. A release without the file gets the generated text alone.
 3. **Confirm the readiness checklist** in
    [ADR 0044](docs/adr/0044-release-readiness-assurance.md) is satisfied — the
    release is gated on it.

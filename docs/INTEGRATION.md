@@ -1,12 +1,12 @@
 # External consumers: the integration blueprint
 
-**Verified against `v1.0.16` (2026-09-11); the rule-engine paragraphs against `main` after `v1.1.0` (2026-10-07).** How to get messages out of mqttd and into the rest of your stack — Kafka, a
+**Verified against `v1.0.16` (2026-09-11); the rule-engine paragraphs against `v1.2.0` (2026-10-12).** How to get messages out of mqttd and into the rest of your stack — Kafka, a
 webhook, a database, anything — and what the broker
 does and does not promise while you do it ([ADR 0063](adr/0063-external-consumer-integration.md)).
 
 mqttd has no built-in Kafka/HTTP sinks, **by design**: it is a broker, not an
 integration platform, and everything it ships is held to the same durability and
-refusal contracts. Inside the broker it does run EMQX's rule SQL (unreleased;
+refusal contracts. Inside the broker it does run EMQX's rule SQL (since `v1.2.0`;
 [RULES.md](RULES.md), [ADR 0083](adr/0083-rule-engine.md)): filter,
 reshape and re-route between topics with `republish`. A rule's actions never leave
 the broker, so a rule can prepare a stream (`SELECT … FROM "raw/#" WHERE …` republished

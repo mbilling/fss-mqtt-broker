@@ -1,6 +1,6 @@
 # OpenSSF Best Practices badge — the self-certification answer sheet
 
-**Verified against `v1.1.0` (2026-10-07).** ADR 0069 T7. The registration at
+**Verified against `v1.2.0` (2026-10-12).** ADR 0069 T7. The registration at
 <https://www.bestpractices.dev> is a maintainer act (browser login, ~15 min);
 this sheet makes it paste-through: every **passing-level** criterion, the
 answer, and the evidence URL. It stays in-tree afterwards as the public record
@@ -42,7 +42,7 @@ the repo; the justification strings below fill the rest.
 | Criterion | Answer | Evidence |
 |---|---|---|
 | Working build system | Met | cargo; reproducible release builds (RELEASING.md) |
-| Automated test suite; invoked by CI | Met | ci.yml (`cargo test --all`, 6 gated jobs); nightly tiers |
+| Automated test suite; invoked by CI | Met | ci.yml (`cargo test --all`, 8 jobs); nightly tiers |
 | New functionality adds tests (policy) | Met | CONTRIBUTING.md; the red-first/mutation discipline; check-test-hygiene gates it structurally |
 | Warning flags / linters enabled | Met | clippy (all targets) gated per PR |
 
@@ -50,8 +50,8 @@ the repo; the justification strings below fill the rest.
 
 | Criterion | Answer | Evidence |
 |---|---|---|
-| Secure development knowledge | Met | docs/THREAT-MODEL.md; 70 ADRs; docs/HARDENING.md |
-| Use basic good crypto practices | Met | one provider (aws-lc-rs, ADR 0053); TLS 1.3 default; Argon2id; docs/compliance/crypto-policy.md |
+| Secure development knowledge | Met | docs/THREAT-MODEL.md; 86 ADRs; docs/HARDENING.md |
+| Use basic good crypto practices | Met | one provider for every security function (aws-lc-rs, ADR 0053); TLS 1.3 default; Argon2id; docs/compliance/crypto-policy.md |
 | Secured delivery mechanism | Met | signed releases (cosign keyless), SLSA provenance, SBOM — RELEASING.md verify one-liners |
 | Known vulnerabilities fixed | Met | cargo-audit gated; Dependabot; per-release VEX |
 | No leaked credentials | Met | secrets by path only (config schema enforces); gitignored key material |
@@ -61,8 +61,8 @@ the repo; the justification strings below fill the rest.
 | Criterion | Answer | Evidence |
 |---|---|---|
 | Static analysis; before release | Met | clippy + CodeQL (codeql.yml) per PR |
-| Dynamic analysis | Met | continuous fuzzing (6 cargo-fuzz targets, nightly); chaos/soak/upgrade harnesses |
-| Memory-safety tools where applicable | Met | memory-safe Rust across the workspace; `unsafe` absent from product code |
+| Dynamic analysis | Met | continuous fuzzing (10 cargo-fuzz targets, nightly); chaos/soak/upgrade harnesses |
+| Memory-safety tools where applicable | Met | memory-safe Rust across the workspace; `unsafe_code = "forbid"` as a workspace lint; linked C libraries are named in docs/THREAT-MODEL.md (accepted risks) |
 
 ## Honest gaps at silver/gold (not required for passing)
 

@@ -13,6 +13,7 @@ one hand-maintained catalogue for exactly that reason (see
 | You want | Look at |
 |---|---|
 | What changed in a release, and the signed artifacts | [GitHub Releases](https://github.com/mbilling/fss-mqtt-broker/releases) |
+| What an upgrade to a release needs | The same release page. Its text is generated at the tag, and includes [`docs/release-notes/<version>.md`](docs/release-notes/) from the tagged tree when the release has one (from 1.2.0) |
 | Whether a capability is built, and the evidence for it | [delivery dashboard](docs/delivery/STATUS.md) — per-task status, generated and CI-checked |
 | Why something was designed the way it is | [`docs/adr/`](docs/adr/) |
 | What is *not* built yet | [Limitations](GUIDE.md#limitations) |

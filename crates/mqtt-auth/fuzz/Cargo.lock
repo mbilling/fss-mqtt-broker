@@ -426,7 +426,7 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
 name = "mqtt-auth"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "argon2",
  "async-trait",
@@ -450,7 +450,7 @@ dependencies = [
 
 [[package]]
 name = "mqtt-codec"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "bytes",
  "thiserror",
@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "mqtt-core"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "bytes",
  "mqtt-codec",

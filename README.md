@@ -440,7 +440,7 @@ Other published measurements (dev-grade, single host, never capacity): [DURABLE-
 
 ## Feature Comparison Matrix
 
-✅ open build · 💰 **paid edition only** · ⚠️ partial · ✖ absent · n/v not verified. Sources and notes: [COMPARISON.md](docs/COMPARISON.md) (dated 2026-10-08).
+✅ open build · 💰 **paid edition only** · ⚠️ partial · ✖ absent · n/v not verified. Sources and notes: [COMPARISON.md](docs/COMPARISON.md) (dated 2026-10-12).
 
 | Feature | mqttd | Mosquitto 2.x | EMQX 6.x | HiveMQ CE | VerneMQ 2.1 | NanoMQ 0.25 |
 |---|---|---|---|---|---|---|
