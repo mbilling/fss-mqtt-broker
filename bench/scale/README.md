@@ -19,9 +19,11 @@ The prerequisites and pricing below describe the default Hetzner platform.
    that is not this rig's. A new project's default limits (10 servers) are too
    small for the scale-out sizes; this rig's project runs at **30 servers / 200
    vCPUs** (raised 2026-09-15), which `terraform/quota.tf` enforces at plan time
-   (`server_quota`, `vcpu_quota`). The largest shape the rig can express, 10
-   brokers + 20 drivers, is 30 servers / 200 vCPUs on CCX23 + CCX33 — exactly the
-   quota, which `quota.tf` rejects anything beyond.
+   (`server_quota`, `vcpu_quota`). Two shapes fill it on CCX23 + CCX33: 10
+   brokers + 20 drivers is 30 servers / 200 vCPUs, and 14 brokers + 16 drivers is
+   30 servers / 184 vCPUs. `quota.tf` rejects anything beyond, and `run.sh`'s
+   shape preflight says the same offline (14 brokers + 20 drivers is 34 servers
+   and is refused before any cloud call).
 2. **A Read & Write API token** for that project → `export HCLOUD_TOKEN=...` in
    the shell that runs the rig. Never committed, never a CI secret.
 3. **An SSH keypair.** The default is `~/.ssh/id_ed25519`; for any other key
@@ -192,7 +194,7 @@ checked *per rung* rather than once, because a shape can be valid at 1 site and
 impossible at 8 — and the binding constraint is usually the harness: sites are
 dealt round-robin to drivers at three one-vCPU containers each, so 16 sites
 needs 12 containers on the busiest of 5 drivers and is **refused**. Reaching 16
-needs `DRIVER_COUNT=8`, which `driver_count` permits (it caps at 12, and
+needs `DRIVER_COUNT=8`, which `driver_count` permits (it caps at 20, and
 `quota.tf` refuses any broker/driver combination that would exceed the project's
 server or vCPU quota part way through an apply). That bound belongs to the load
 generators, not the broker, and the shape check prints it rather than letting a
@@ -331,6 +333,33 @@ trapped teardown; `482-knee-smoke.sh` proves it at 3 → 1 → 3 on small hosts;
 `test-resize.py` covers both offline. [`knee-3-5-7-10.md`](knee-3-5-7-10.md) runs the same
 machinery across four sizes (10 → 7 → 5 → 3 → 10), drivers scaled 2N per arm,
 each ladder stopped at its knee.
+
+### Cluster sizes, and what 12 and 14 mean
+
+`run.sh` and the Hetzner module accept exactly 1, 3, 5, 7, 10, 12 and 14 brokers. 1, 3
+and 5 are ADR 0048's curve points; 7 and 10 are the scale-out extensions, and 10 fills
+one spread placement group, which Hetzner limits to 10 servers.
+
+**12 and 14 are throughput extensions, not failure-independence claims.** Brokers 1–10
+stay in the original placement group; brokers 11–14 go into a second one, created only
+for those sizes (`terraform/layout.tf`, `terraform/brokers.tf`). Each group keeps its own
+members on distinct physical hosts, but a broker of one group may share a host with a
+broker of the other. A result at 12 or 14 says how much traffic the cluster carried. It
+does not say what the cluster survives, and "one broker per physical machine" is proven
+only up to 10.
+
+Brokers 11–14 take private addresses 10.99.1.41–44: the first ten keep 10.99.1.11–20 and
+the drivers 10.99.1.21–40, so no shape of ten or fewer changes. `teardown.sh` finds the
+second group as it finds the first, by the `purpose=mqttd-bench-scale` label.
+
+`CLOUD=upcloud` stays at 10 and refuses 12 and 14 by name. Its module keeps every broker
+in one strict anti-affinity server group, and nothing in this repository establishes how
+many servers such a group admits.
+
+[`durable-scaleout-10-12-14.md`](durable-scaleout-10-12-14.md) is the campaign these
+sizes were added for: durable QoS 1 at 14 → 12 → 10 → 14 on one provisioning of 14
+brokers and 16 drivers, read by a deliberately simple rule (no message lost, p99 below
+1 s) — a diagnostic scale-out, not a certified curve.
 
 Two campaigns on the 1.2.0 release commit (2026-10-12, an unreleased candidate build, 10 →
 3 → 10) have their own cards: [`qos1-knees-2026-10-12.md`](qos1-knees-2026-10-12.md)

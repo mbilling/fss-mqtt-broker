@@ -197,7 +197,7 @@ if [ "$CLOUD" = hcloud ]; then
 else
 	export DRIVER_TYPE="${DRIVER_TYPE:-${TF_VAR_driver_server_type:-4xCPU-8GB}}"
 fi
-python3 - "$RUN" "$TFDIR" "$CLOUD" "${SIZES[@]}" <<'PY'
+BROKER_TYPE="${BROKER_TYPE:-}" python3 - "$RUN" "$TFDIR" "$CLOUD" "${SIZES[@]}" <<'PY'
 import glob, json, os, pathlib, re, sys
 run, module, cloud, *sizes = sys.argv[1:]
 def refuse(message):
@@ -213,8 +213,19 @@ for pattern in ('terraform.tfvars', '*.auto.tfvars', 'terraform.tfvars.json', '*
                      else any(re.search(r'(?m)^\s*' + field + r'\s*=', text) for field in fields))
         if overrides:
             refuse(f'{name} overrides workload shape; use run.sh sizes, DRIVER_COUNT and DRIVER_TYPE')
-if not sizes or any(s not in ('1','3','5','7','10') for s in sizes):
-    refuse('sizes must be 1, 3, 5, 7 or 10')
+# The same explicit lists as each module's `node_count` validation. 12 and 14
+# exist on Hetzner only: a spread placement group admits 10 servers, so brokers
+# 11+ sit in a second group (terraform/layout.tf) — a throughput extension, not
+# a failure-independence claim. The UpCloud module keeps every broker in one
+# strict anti-affinity server group whose member limit this repository does not
+# establish, so it stays at 10 and says so rather than guessing.
+allowed = {'hcloud': ('1', '3', '5', '7', '10', '12', '14'), 'upcloud': ('1', '3', '5', '7', '10')}[cloud]
+if cloud == 'upcloud' and any(s in ('12', '14') for s in sizes):
+    refuse('sizes 12 and 14 are Hetzner-only (CLOUD=hcloud): they need a second placement group, and the '
+           'member limit of an UpCloud strict anti-affinity server group is not established for this rig; '
+           'CLOUD=upcloud sizes must be 1, 3, 5, 7 or 10')
+if not sizes or any(s not in allowed for s in sizes):
+    refuse('sizes must be ' + ', '.join(allowed[:-1]) + ' or ' + allowed[-1])
 count = os.environ['DRIVER_COUNT']
 # 20, not 12: the project's quota was raised to 30 servers / 200 vCPUs on
 # 2026-09-15, and 10 CCX23 brokers + 20 CCX33 drivers is exactly that — 30
@@ -236,6 +247,33 @@ if cores is None:
         cores = match[1] if match else None
 if cores is None or not re.fullmatch(r'[1-9][0-9]*', str(cores)):
     refuse(f'unknown CPU count for {plan}; supply DRIVER_VCPUS explicitly')
+# The Hetzner project's quotas, per requested size: brokers and drivers were
+# bounded separately (10 and 20), which was the whole quota only while 10 was the
+# largest size. 14 brokers + 20 drivers is 34 servers, and an apply that crosses
+# the limit part way leaves the servers it already made billing. terraform/
+# quota.tf refuses the same shapes at plan time and stays the authority; this
+# says so offline, where PREFLIGHT_ONLY can see it. The quotas and the broker
+# type default exactly as the module's variables do.
+if cloud == 'hcloud':
+    hcloud_vcpus = dict(ccx13=2, ccx23=4, ccx33=8, ccx43=16, ccx53=32, cpx32=4, cpx42=8, cpx41=8, cpx51=16)
+    def quota(name, default):
+        value = os.getenv('TF_VAR_' + name, str(default))
+        if not re.fullmatch(r'[1-9][0-9]*', value):
+            refuse(f'TF_VAR_{name} must be a positive integer, got {value!r}')
+        return int(value)
+    server_quota, vcpu_quota = quota('server_quota', 30), quota('vcpu_quota', 200)
+    broker_plan = os.getenv('BROKER_TYPE') or os.getenv('TF_VAR_broker_server_type') or 'ccx23'
+    # An unlisted type counts as the largest known, as in quota.tf.
+    broker_cores, driver_cores = hcloud_vcpus.get(broker_plan, 32), hcloud_vcpus.get(plan, 32)
+    for size in sizes:
+        servers = int(size) + int(count)
+        if servers > server_quota:
+            refuse(f'size {size} needs {servers} servers ({size} brokers + {count} drivers) but the project '
+                   f'server quota is {server_quota}; lower DRIVER_COUNT to {server_quota - int(size)} or fewer')
+        vcpus = int(size) * broker_cores + int(count) * driver_cores
+        if vcpus > vcpu_quota:
+            refuse(f'size {size} needs {vcpus} vCPUs ({size} x {broker_plan} = {int(size) * broker_cores}, plus '
+                   f'{count} x {plan} = {int(count) * driver_cores}) but the project vCPU quota is {vcpu_quota}')
 # The synthetic inventory must describe drivers the way the LIVE inventory will,
 # or the shape check proves a different budget than the paid run enforces. The
 # Hetzner module's inventory carries server_type and no vcpus (run-curve.sh looks

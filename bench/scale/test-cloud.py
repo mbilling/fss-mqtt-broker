@@ -46,6 +46,11 @@ if "destroy" in sys.argv and os.getenv("FAIL_DESTROY") == "1": sys.exit(77)
 if os.path.basename(sys.argv[0]) == "hcloud" and os.getenv("LEAK_SERVER") == "1":
     if sys.argv[1:3] == ["server", "list"]: print("123 leaked-server")
     sys.exit(0)
+# Both spread placement groups of a 12- or 14-broker shape, left behind.
+if os.path.basename(sys.argv[0]) == "hcloud" and os.getenv("LEAK_GROUPS") == "1":
+    if sys.argv[1:3] == ["placement-group", "list"]:
+        print("501 mqttd-bench-brokers 10 spread\\n502 mqttd-bench-brokers-b 4 spread")
+    sys.exit(0)
 # Stop before output/bootstrap, but let the EXIT trap exercise destroy.
 sys.exit(77 if "apply" in sys.argv or os.path.basename(sys.argv[0]) in ("hcloud", "ssh") else 0)
 '''
@@ -251,6 +256,19 @@ with_cpu_sampling "$3" work
             (("10",), {"DRIVER_COUNT": "4"}, "spreads unevenly"),
             (("1", "10"), {"DRIVER_COUNT": "4"}, "spreads unevenly"),
             (("1", "2"), {}, "sizes must be"),
+            (("11",), {}, "sizes must be 1, 3, 5, 7, 10, 12 or 14"),
+            (("16",), {}, "sizes must be 1, 3, 5, 7, 10, 12 or 14"),
+            # 14 brokers + 20 drivers: each was inside its own bound, the pair is
+            # 34 servers in a 30-server project.
+            (("14",), {"DRIVER_COUNT": "20"}, "size 14 needs 34 servers (14 brokers + 20 drivers) but the project server quota is 30"),
+            (("12",), {"DRIVER_COUNT": "19"}, "size 12 needs 31 servers"),
+            (("14",), {"DRIVER_COUNT": "16", "DRIVER_TYPE": "ccx43"}, "size 14 needs 312 vCPUs"),
+            (("14",), {"DRIVER_COUNT": "16", "TF_VAR_vcpu_quota": "183"}, "size 14 needs 184 vCPUs"),
+            (("10", "14"), {"DRIVER_COUNT": "17"}, "size 14 needs 31 servers"),
+            # UpCloud keeps every broker in one server group of unestablished limit.
+            (("12",), {"CLOUD": "upcloud", "UPCLOUD_TOKEN": "dummy"}, "sizes 12 and 14 are Hetzner-only"),
+            (("14",), {"CLOUD": "upcloud", "UPCLOUD_TOKEN": "dummy"}, "sizes 12 and 14 are Hetzner-only"),
+            (("11",), {"CLOUD": "upcloud", "UPCLOUD_TOKEN": "dummy"}, "sizes must be 1, 3, 5, 7 or 10"),
             (("1",), {"DRIVER_COUNT": "2.5"}, "DRIVER_COUNT"),
             (("1",), {"DRIVER_COUNT": "0"}, "DRIVER_COUNT"),
             (("1",), {"DRIVER_TYPE": "unknown"}, "unknown CPU count"),
@@ -277,6 +295,116 @@ with_cpu_sampling "$3" work
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("no cloud calls made", result.stderr)
                 self.assertEqual(self.calls(), [])
+
+    def campaign_env(self, name="qos1-campaign/durable-scaleout-10-12-14.env"):
+        """The knobs a committed campaign env exports, as the campaign driver sees them."""
+        out = subprocess.run(["bash", "-c", f"set -a; . {SCALE / name}; env -0"], capture_output=True,
+                             text=True, check=True, env={"PATH": os.environ["PATH"]})
+        knobs = dict(kv.split("=", 1) for kv in out.stdout.split("\0") if "=" in kv)
+        return {k: v for k, v in knobs.items()
+                if k.startswith(("KNEE_", "LANE", "DRIVER", "BROKER", "CLOUD", "TF_VAR_"))}
+
+    def test_the_10_12_14_campaign_fits_the_quota_and_every_arm_has_a_valid_shape(self):
+        """14 x ccx23 + 16 x ccx33 is 184 vCPU on 30 servers: inside 200 / 30, with
+        the server count exactly at its limit. Each arm is checked as the campaign
+        driver checks it — its size, its drivers, its ladder — on the real shape
+        code, and 42 sites must fit: 126 one-vCPU containers on 128."""
+        env = self.campaign_env()
+        arms = [a.strip().split(":", 2) for a in env.pop("KNEE_ARMS").split(";") if a.strip()]
+        self.assertEqual([(a[0], a[1]) for a in arms], [("14", "16"), ("12", "16"), ("10", "16"), ("14", "16")])
+        self.assertEqual((env["BROKER_TYPE"], env["DRIVER_TYPE"], env["DRIVER_COUNT"]), ("ccx23", "ccx33", "16"))
+        self.assertEqual(14 * 4 + 16 * 8, 184)
+        for size, drivers, ladder in arms[:3]:
+            with self.subTest(size=size):
+                run = self.root / f"run-{size}"
+                result = subprocess.run(
+                    ["bash", str(self.rig / "run.sh"), "full", size], capture_output=True, text=True, timeout=120,
+                    env=self.env | env | {"PREFLIGHT_ONLY": "1", "DRIVER_COUNT": drivers,
+                                          "LANE_E_SITES_OVERRIDE": ladder, "RUN_DIR": str(run)})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("no cloud calls made", result.stderr)
+                shape = (run / f"preflight-{size}/results/nodes={size}/laneE/shape.txt").read_text()
+                self.assertIn(f"brokers={size} drivers=16", shape)
+                self.assertIn(f"cover all {size} brokers", shape)
+                pairs = int(size) * (int(size) - 1)
+                self.assertIn(f"over each of {pairs} directed broker pairs", shape)
+                rows = [line.split("|") for line in shape.splitlines() if line.strip().endswith("| ok")]
+                self.assertEqual([r[0].strip() for r in rows], ladder.split())
+                if size == "14":
+                    top = [c.strip() for c in rows[-1]]
+                    # sites, containers, busiest driver: every one-vCPU slot but two is used.
+                    self.assertEqual((top[0], top[4], top[5]), ("42", "126", "8"))
+        self.assertEqual(self.calls(), [])
+
+    def test_the_campaign_shape_is_refused_where_consumers_cannot_cover_14_brokers(self):
+        """Two containers of 10 consumers reach 11 brokers. That was every broker
+        at 10 nodes; at 14 it leaves three without a local member, and the shape
+        check must say so before anything is paid for."""
+        env = self.campaign_env() | {"LANE_E_SUBS_PER_SITE": "20"}
+        env.pop("KNEE_ARMS")
+        result = self.run_script("run.sh", "full", "14", PREFLIGHT_ONLY="1",
+                                 LANE_E_SITES_OVERRIDE="1 35 42", **env)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("cover only 11 of 14 brokers", result.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_sizes_are_one_explicit_list_in_the_preflight_and_both_modules(self):
+        def tf_sizes(module):
+            text = (SCALE / module / "variables.tf").read_text()
+            block = text[text.index('variable "node_count"'):text.index('variable "driver_count"')]
+            return re.search(r"contains\(\[([0-9, ]+)\], var\.node_count\)", block)[1].replace(" ", "").split(",")
+
+        run = (SCALE / "run.sh").read_text()
+        allowed = re.search(r"allowed = \{'hcloud': \(([^)]*)\), 'upcloud': \(([^)]*)\)\}", run)
+        listed = [re.findall(r"\d+", group) for group in allowed.groups()]
+        self.assertEqual(listed[0], ["1", "3", "5", "7", "10", "12", "14"])
+        self.assertEqual(listed[0], tf_sizes("terraform"))
+        self.assertEqual(listed[1], ["1", "3", "5", "7", "10"])
+        self.assertEqual(listed[1], tf_sizes("terraform-upcloud"))
+
+    def test_brokers_past_the_tenth_get_a_second_placement_group_and_free_addresses(self):
+        """The module itself is evaluated by test-upcloud-quota.py, which needs
+        OpenTofu. This is the part CI can hold without it: the second group exists
+        only above ten brokers, carries the label teardown sweeps by, and no
+        broker address can land in the drivers' range."""
+        layout = (SCALE / "terraform/layout.tf").read_text()
+        brokers = (SCALE / "terraform/brokers.tf").read_text()
+        self.assertIn("placement_group_capacity = 10", layout)
+        self.assertIn("second_placement_group = var.node_count > local.placement_group_capacity", layout)
+        expr = re.search(r'"10\.99\.1\.\$\{i < local\.placement_group_capacity \? (\d+) \+ i : (\d+) \+ i\}"', layout)
+        self.assertIsNotNone(expr, "the broker address expression changed; re-derive this check")
+        low, high = int(expr[1]), int(expr[2])
+        driver = int(re.search(r'driver_ips = \[for i in range\(var\.driver_count\) : "10\.99\.1\.\$\{(\d+) \+ i\}"\]', layout)[1])
+        broker_ips = [low + i if i < 10 else high + i for i in range(14)]
+        driver_ips = [driver + i for i in range(20)]
+        self.assertEqual(broker_ips[:10], list(range(11, 21)), "the first ten brokers must not move")
+        self.assertEqual(broker_ips[10:], [41, 42, 43, 44])
+        self.assertEqual(len(set(broker_ips + driver_ips)), 34, "a broker and a driver share an address")
+        self.assertLess(max(broker_ips + driver_ips), 255)
+        second = brokers[brokers.index('resource "hcloud_placement_group" "brokers_b"'):brokers.index('resource "hcloud_server" "broker"')]
+        self.assertIn("count = local.second_placement_group ? 1 : 0", second)
+        self.assertIn('type   = "spread"', second)
+        self.assertIn("labels = local.common_labels", second)
+        # Group 0 is the original, group 1 the second; a broker selects one of them.
+        ids = re.search(r"placement_group_ids = \[\s*(\S+),\s*(\S+),\s*\]", brokers)
+        self.assertEqual(ids.groups(), ("hcloud_placement_group.brokers.id", "one(hcloud_placement_group.brokers_b[*].id)"))
+        self.assertIn("placement_group_id = local.placement_group_ids[local.broker_placement_group[count.index]]", brokers)
+        self.assertIn("for i in range(var.node_count) : i < local.placement_group_capacity ? 0 : 1", layout)
+        self.assertIn('purpose = "mqttd-bench-scale"', (SCALE / "terraform/network.tf").read_text())
+
+    def test_forced_teardown_deletes_both_placement_groups(self):
+        result = self.run_script("teardown.sh", "--force", HCLOUD_TOKEN="dummy", LEAK_GROUPS="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [c[2] for c in self.calls() if c[0] == "hcloud"]
+        self.assertIn(["placement-group", "list", "-l", "purpose=mqttd-bench-scale", "-o", "noheader"], calls)
+        self.assertEqual([c for c in calls if c[1] == "delete"],
+                         [["placement-group", "delete", "501"], ["placement-group", "delete", "502"]])
+        # Without --force the same leak is reported and nothing is deleted.
+        self.log.write_text("")
+        result = self.run_script("teardown.sh", HCLOUD_TOKEN="dummy", LEAK_GROUPS="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mqttd-bench-brokers-b", result.stderr)
+        self.assertFalse([c for c in self.calls() if "delete" in c[2]])
 
     def test_variable_file_shape_overrides_fail_closed(self):
         path = self.rig / "terraform/terraform.tfvars.json"

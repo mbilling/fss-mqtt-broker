@@ -1,10 +1,28 @@
 variable "node_count" {
-  description = "Broker nodes in this cluster. ADR 0048 §2 fixes the curve's canonical points at 1, 3 and 5; 7 is the past-the-voter-cap extension (durable capacity is architecturally flat there per ADR 0049 unless the MQTTD_LEASE_VOTERS variant is run beside it — run-curve.sh does both and the doc publishes both)."
+  description = <<-EOT
+    Broker nodes in this cluster. ADR 0048 §2 fixes the curve's canonical points
+    at 1, 3 and 5; 7 is the past-the-voter-cap extension (durable capacity is
+    architecturally flat there per ADR 0049 unless the MQTTD_LEASE_VOTERS variant
+    is run beside it — run-curve.sh does both and the doc publishes both); 10 is
+    the ADR 0073 scale-out extension and exactly fills one spread placement group.
+
+    12 and 14 are THROUGHPUT extensions, not failure-independence claims. Hetzner
+    admits at most 10 servers to a spread placement group, so brokers 11+ live in
+    a second group (layout.tf, brokers.tf). Each group keeps its own members on
+    distinct physical hosts, but a broker of one group may share a physical host
+    with a broker of the other. Above 10 the rig therefore no longer proves "one
+    broker per physical machine": a result at 12 or 14 says how much traffic the
+    cluster carried, never what it survives.
+
+    The list is explicit on purpose. The private address plan and the two
+    placement groups are sized for 14, and run.sh's shape preflight carries the
+    same list.
+  EOT
   type        = number
 
   validation {
-    condition     = contains([1, 3, 5, 7, 10], var.node_count)
-    error_message = "node_count must be 1, 3, 5, 7 or 10 (the curve points plus the ADR 0073 scale-out extensions; 10 exactly fills the spread placement group's limit)."
+    condition     = contains([1, 3, 5, 7, 10, 12, 14], var.node_count)
+    error_message = "node_count must be 1, 3, 5, 7, 10, 12 or 14 (the curve points; the ADR 0073 scale-out extension at 10, which fills one spread placement group; and the 12/14 throughput extensions, whose brokers 11+ sit in a second group)."
   }
 }
 

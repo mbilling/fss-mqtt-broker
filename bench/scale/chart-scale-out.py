@@ -131,15 +131,22 @@ OFFER_TICK_BELOW = 0.99
 W, H = 960, 572
 L, R, T, B = 96, 48, 140, 110
 PW, PH = W - L - R, H - T - B
+# The x-axis reaches 11.2 nodes, or 1.2 past the largest size drawn: a curve that
+# gains a 12- or 14-node point must not put it off the plot.
 X_MAX = 11.2
 COL_W = 24
 
 
+def x_max_for(points) -> float:
+    return max(X_MAX, max(n for n, *_ in points) + 1.2)
+
+
 def draw(c: dict) -> str:
     y_max = c["y_max"]
+    x_max = x_max_for(c["points"])
 
     def x(n: float) -> float:
-        return L + n / X_MAX * PW
+        return L + n / x_max * PW
 
     def y(v: float) -> float:
         return T + PH - v / y_max * PH
@@ -173,7 +180,7 @@ def draw(c: dict) -> str:
 
     # Linear scaling reference: a projection, so it is the one dashed line.
     pn = c["per_node"]
-    xe = min(X_MAX, y_max / pn)
+    xe = min(x_max, y_max / pn)
     o.append(f'<line x1="{x(0):.1f}" y1="{y(0):.1f}" x2="{x(xe):.1f}" y2="{y(pn * xe):.1f}" '
              'class="k-muted" stroke-width="1.25" stroke-dasharray="5 5"/>')
 
@@ -349,6 +356,12 @@ def self_test() -> None:
         checks.append((f"{chart['file']}: {want} certified, {total - want} hollow",
                        out.count('class="f-good"') == want + 1
                        and out.count('data-rung="uncertified"') == total - want))
+    # A 14-node point stays inside the plot, and the published curves keep their axis.
+    wide = {**CURVES["qos1"], "points": CURVES["qos1"]["points"] + [(14, 400_000, "certified", "", None)]}
+    checks.append(("a 14-node column is drawn inside the plot",
+                   14 / x_max_for(wide["points"]) * PW + COL_W / 2 <= PW and "<svg" in draw(wide)))
+    checks.append(("curves up to 10 nodes keep the 11.2-node axis",
+                   all(x_max_for(c["points"]) == X_MAX for c in CURVES.values())))
     bad = [name for name, ok in checks if not ok]
     if bad:
         raise SystemExit("chart-scale-out self-test FAILED: " + "; ".join(bad))

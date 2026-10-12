@@ -1944,6 +1944,36 @@ class RunTests(unittest.TestCase):
         # every delivery the fake made was acknowledged by a member
         self.assertGreater(fake.member_acks, 0, "members never acknowledged a QoS 1 delivery")
 
+    def test_fourteen_brokers_are_182_pairs_inside_one_deadline(self) -> None:
+        # The largest cluster the rig forms. The deadline bounds the WHOLE control,
+        # not a pair, and the pairs grow as N*(N-1): 90 at ten brokers, 182 at
+        # fourteen. Two-digit broker indices appear here for the first time too
+        # (broker10..13), in file names, pair rows and the ledger. The client must
+        # finish all of it well inside the default 90 s with nothing but its own
+        # work to wait for.
+        nodes, count = 14, 20
+        fake = FakeCluster(nodes)
+        started = time.monotonic()
+        try:
+            rc, chunks, stderr = _run_via_stdin(fake.specs(), count, 90, qos=1)
+            fake.settle(2 * nodes)
+        finally:
+            fake.close()
+        self.assertEqual((rc, stderr), (0, ""))
+        self.assertLess(time.monotonic() - started, 45, "the control's own work must leave the brokers most of the deadline")
+        names = [n for n, _ in chunks]
+        self.assertEqual(names, ["metrics-pre-broker%d.prom" % i for i in range(nodes)]
+                         + ["metrics-post-broker%d.prom" % i for i in range(nodes)] + ["clients.tsv", "timeline.tsv"])
+        d = self.capture(chunks)
+        self.assertEqual(ledger(d, nodes, count)["status"], "pass")
+        rows = [line.split("\t")[:2] for line in (d / "clients.tsv").read_text().splitlines() if line.startswith("broker")]
+        self.assertEqual(len(rows), 182)
+        self.assertIn(["broker13", "broker10"], rows)
+        self.assertEqual((fake.connections, fake.disconnects), (2 * nodes, 2 * nodes))
+        # One broker short is a different cluster: the ledger must not pass it as 13.
+        with self.assertRaises(ValueError):
+            ledger(d, nodes - 1, count)
+
     def test_a_truncated_scrape_is_retried_and_never_kept(self) -> None:
         fake = FakeCluster(2, propagation=0.1, truncate={1: 1})
         try:

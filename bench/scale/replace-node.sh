@@ -10,7 +10,8 @@
 # and the only remedy the rig had was to destroy all 25 servers and hope.
 #
 # Hetzner servers are cattle and this rig's addressing is by index: a server's
-# PRIVATE IP is fixed by terraform (brokers 10.99.1.11+i, drivers 10.99.1.21+i),
+# PRIVATE IP is fixed by terraform (layout.tf: brokers 10.99.1.11+i, drivers
+# 10.99.1.21+i, brokers past the tenth 10.99.1.41..),
 # so `tofu apply -replace` swaps the machine and keeps its address. Only the
 # public IP and the host key change, and both are refreshed here.
 #
