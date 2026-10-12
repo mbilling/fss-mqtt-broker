@@ -371,6 +371,7 @@ expiry. "Tests" names the test that fails if the mitigation is removed:
 | Node-level impersonation | V2/V3 postures add per-node signatures chained to the cluster CA; authenticated cert CN must equal the claimed `from`; strict postures — no cross-posture acceptance | ADR 0022/0023; `swim_auth.rs`, `swim_driver.rs` |
 | Replay | V3 posture: per-node monotonic sequence persisted by clock-free block reservation + RFC 6479 sliding window keyed on the **authenticated** sender | ADR 0023 |
 | Revoked node keeps gossiping | Cluster-CA-signed CRL checked on every inbound signed datagram; an unsigned CRL is refused (an unauthenticated revocation list is a DoS lever) | ADR 0022 T7; `mqtt-auth/src/signed_gossip.rs` |
+| Reflection through certificate requests | A node answers a datagram it cannot attribute — valid cluster-key MAC, certificate fingerprint not cached — with one `Join` (< 800 B) to its UDP source: at most one per source per second and 16 per second in all, from a 256-entry table. The datagram is dropped **undecoded**; nothing in it reaches membership. Without the gossip key a datagram draws nothing | ADR 0022 (2026-10-12 amendment); `swim_driver.rs` (`CertRequests`) |
 | Foreign-cluster confusion / split-brain | Cluster identity: founder mints, joiners adopt on first authenticated contact; foreign gossip dropped and counted (`cluster-mismatch`); the refound guard latches NotReady when surviving peers contradict a re-bootstrap | ADR 0054; `mqtt-cluster/src/cluster_identity.rs` |
 
 ### Accepted risks (gossip)
@@ -378,6 +379,13 @@ expiry. "Tests" names the test that fails if the mitigation is removed:
 - **ADR 0003 accepts replay in the V1/V2 postures** — bounded and self-healing via
   incarnation supersession; a replayed `Dead` costs one refutation. The V3 posture
   closes it; V3 is opt-in hardening.
+- **A holder of the gossip key can aim a node's certificate requests.** The source
+  of a `cert-miss` datagram is whatever its sender wrote, and replaying a captured
+  fingerprint datagram at a node that lacks its sender's certificate needs no key at
+  all. The reflection is capped at 16 datagrams of under 800 bytes a second per node,
+  about five times the bytes that drew them; the V3 replay window does not apply (it is
+  keyed on an authenticated sender). Spending a node's requests on forged sources only
+  returns it to 1.1.0's slower certificate learning. (ADR 0022, 2026-10-12.)
 - **A claim at a higher generation is deliberately not fought** — it means another
   process runs with the same id; refutation yielding is the correct behaviour.
 - **Unkeyed SWIM remains possible**, loudly logged INSECURE; weak keys are startup

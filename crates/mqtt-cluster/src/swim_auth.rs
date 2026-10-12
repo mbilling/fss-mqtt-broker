@@ -10,7 +10,7 @@
 //! I/O boundary only ([`crate::swim_driver`]).
 
 use aws_lc_rs::{digest, hmac};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
@@ -39,6 +39,10 @@ const FP_LEN: usize = 32;
 /// restarted its cache. Every other datagram carries only the 32-byte fingerprint,
 /// keeping signed gossip under a typical 1500-byte MTU.
 const FULL_CERT_EVERY: u64 = 16;
+/// Bound on the set of destinations a node remembers having sent its full certificate
+/// to (issue #971): far above any real cluster. On overflow the set is cleared, which
+/// only means every destination is primed once more.
+const PRIMED_DEST_CAP: usize = 1024;
 /// Bound on cached peer certificates: comfortably above any real cluster size, small
 /// enough that a key-holding flooder cannot balloon memory. On overflow the cache is
 /// cleared and re-primes from the periodic full-cert datagrams.
@@ -86,6 +90,10 @@ pub struct SignerSlot {
     cell: RwLock<(Arc<dyn GossipSign>, [u8; FP_LEN])>,
     /// Outgoing-datagram counter driving the periodic full-cert refresh (0022-T6).
     sends: AtomicU64,
+    /// Destinations that have already been sent the CURRENT certificate in full
+    /// (issue #971): the first datagram to each destination carries it, whatever
+    /// its kind. Cleared on [`swap`](Self::swap) — a rotated leaf is new to everyone.
+    primed: Mutex<HashSet<String>>,
 }
 
 impl SignerSlot {
@@ -94,7 +102,31 @@ impl SignerSlot {
         Self {
             cell: RwLock::new((signer, fp)),
             sends: AtomicU64::new(0),
+            primed: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// True the first time `dest` is asked about since start or the last
+    /// [`swap`](Self::swap) — i.e. when the datagram being sealed is this
+    /// identity's first to that destination and must carry the full certificate.
+    fn first_contact(&self, dest: &str) -> bool {
+        let mut primed = self.primed.lock().unwrap_or_else(PoisonError::into_inner);
+        if primed.contains(dest) {
+            return false;
+        }
+        if primed.len() >= PRIMED_DEST_CAP {
+            primed.clear();
+        }
+        primed.insert(dest.to_string());
+        true
+    }
+
+    /// Forget that `dest` was sent the certificate: its next datagram carries it again.
+    fn unprime(&self, dest: &str) {
+        self.primed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(dest);
     }
 
     /// Swap in a freshly-built signer (a rotated leaf + key). The send counter is reset so
@@ -105,6 +137,11 @@ impl SignerSlot {
         let fp = fingerprint(signer.cert_der());
         *self.cell.write().unwrap_or_else(PoisonError::into_inner) = (signer, fp);
         self.sends.store(0, Ordering::Relaxed);
+        // Every destination's first datagram after the rotation carries the new leaf.
+        self.primed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
     }
 
     /// The current signer + fingerprint, cloned out so sealing never holds the lock.
@@ -133,8 +170,9 @@ pub enum OpenReject {
     /// The sender's certificate is revoked by the cluster CRL.
     Revoked,
     /// A fingerprint-only datagram referenced a certificate this node has not cached yet
-    /// (0022-T6). Recoverable, not adversarial: the sender's next priming (Join/Sync) or
-    /// periodic full-cert datagram re-primes the cache and gossip converges.
+    /// (0022-T6). Recoverable, not adversarial: the driver asks the sender for it
+    /// (issue #971), and the sender's next priming (Join/Sync) or periodic full-cert
+    /// datagram re-primes the cache regardless.
     UnknownCert,
 }
 
@@ -403,6 +441,50 @@ impl SwimAuth {
         body.extend_from_slice(&sig);
         body.extend_from_slice(payload);
         self.frame(VERSION_V3, &body)
+    }
+
+    /// [`seal`](Self::seal) (or, with `seq`, [`seal_sequenced`](Self::seal_sequenced))
+    /// for a datagram addressed to `dest` — what the driver uses. On top of `prime`,
+    /// the **first** datagram this identity sends to each destination carries the
+    /// full certificate (issue #971).
+    ///
+    /// Priming by message kind alone reaches only the nodes a `Join`/`Sync` is
+    /// exchanged with — the seeds. Every other pair first meets through gossip and
+    /// then speaks in pings and acks, which carried the fingerprint: each side
+    /// dropped the other's datagrams as `cert-miss` until one of them happened to be
+    /// the sender's every-16th overall, and with N−1 destinations sharing that one
+    /// counter the wait grew with the cluster. That was the false-suspicion storm at
+    /// formation above about ten nodes. The cost is one certificate per (sender,
+    /// destination) pair, in a datagram no larger than a `Sync`; the every-16th
+    /// refresh is unchanged. [`unprime`](Self::unprime) makes a destination "first"
+    /// again, for a member that restarted.
+    ///
+    /// # Panics
+    /// As [`seal`](Self::seal).
+    #[must_use]
+    pub fn seal_to(&self, dest: &str, payload: &[u8], seq: Option<u64>, prime: bool) -> Vec<u8> {
+        // Asked unconditionally, so a `Join`/`Sync` — full by its kind — counts as the
+        // destination's first datagram too.
+        let first = self
+            .signer
+            .as_ref()
+            .is_some_and(|slot| slot.first_contact(dest));
+        let prime = prime || first;
+        match seq {
+            Some(seq) => self.seal_sequenced(payload, seq, prime),
+            None => self.seal(payload, prime),
+        }
+    }
+
+    /// Forget that `dest` has been sent this node's certificate, so the next datagram
+    /// [`seal_to`](Self::seal_to) addresses to it carries the full certificate again.
+    /// The driver calls it for a member that has restarted (issue #971): the new
+    /// process has an empty cache. A no-op in the shared-key posture and for a
+    /// destination never sealed to.
+    pub fn unprime(&self, dest: &str) {
+        if let Some(slot) = &self.signer {
+            slot.unprime(dest);
+        }
     }
 
     /// The cert-ref field for an outgoing signed datagram (0022-T6): the full leaf
@@ -1190,6 +1272,204 @@ mod tests {
             t[i] ^= 0x01;
             assert!(receiver.open(&t).is_err(), "fp bit flip at {i} accepted");
         }
+    }
+}
+
+/// Issue #971: the first datagram to each destination carries the full certificate.
+#[cfg(test)]
+mod first_contact_tests {
+    use super::{
+        GossipSign, GossipVerify, OpenReject, SwimAuth, VerifiedIdentity, CERT_REF_FP,
+        CERT_REF_FULL, FULL_CERT_EVERY, KEY_LEN, PRIMED_DEST_CAP, TAG_LEN, VERSION_V1, VERSION_V2,
+        VERSION_V3,
+    };
+    use std::sync::Arc;
+
+    struct Signer(Vec<u8>);
+    impl GossipSign for Signer {
+        fn cert_der(&self) -> &[u8] {
+            &self.0
+        }
+        fn sign(&self, payload: &[u8]) -> Vec<u8> {
+            payload.iter().rev().copied().collect()
+        }
+    }
+    struct Verifier;
+    impl GossipVerify for Verifier {
+        fn verify(
+            &self,
+            cert_der: &[u8],
+            payload: &[u8],
+            sig: &[u8],
+        ) -> Result<VerifiedIdentity, OpenReject> {
+            let expected: Vec<u8> = payload.iter().rev().copied().collect();
+            if sig == expected {
+                Ok(VerifiedIdentity {
+                    cn: String::from_utf8_lossy(cert_der).into_owned(),
+                    failure_domain: None,
+                })
+            } else {
+                Err(OpenReject::Auth)
+            }
+        }
+    }
+
+    fn signed(cn: &str) -> SwimAuth {
+        SwimAuth::new(&[9; KEY_LEN])
+            .with_signing(Arc::new(Signer(cn.as_bytes().to_vec())), Arc::new(Verifier))
+    }
+
+    /// The cert-ref marker of a sealed signed datagram (v2, or v3 after its sequence).
+    fn cert_ref(datagram: &[u8]) -> u8 {
+        match datagram[0] {
+            VERSION_V2 => datagram[1 + TAG_LEN],
+            VERSION_V3 => datagram[1 + TAG_LEN + 8],
+            v => panic!("not a signed datagram: version {v}"),
+        }
+    }
+
+    #[test]
+    fn the_first_datagram_to_each_destination_carries_the_full_certificate() {
+        let a = signed("a");
+        // Spend the every-16th slot (the very first seal) so it cannot explain a
+        // full certificate below.
+        assert_eq!(cert_ref(&a.seal(b"x", false)), CERT_REF_FULL);
+
+        assert_eq!(
+            cert_ref(&a.seal_to("b:1", b"ping", None, false)),
+            CERT_REF_FULL
+        );
+        assert_eq!(
+            cert_ref(&a.seal_to("b:1", b"ping", None, false)),
+            CERT_REF_FP
+        );
+        // Another destination is primed on ITS first datagram, not b's.
+        assert_eq!(
+            cert_ref(&a.seal_to("c:1", b"ack", None, false)),
+            CERT_REF_FULL
+        );
+        assert_eq!(
+            cert_ref(&a.seal_to("c:1", b"ack", None, false)),
+            CERT_REF_FP
+        );
+        assert_eq!(
+            cert_ref(&a.seal_to("b:1", b"ping", None, false)),
+            CERT_REF_FP
+        );
+
+        // A receiver that has never heard of `a` opens that first datagram, and
+        // from then on the fingerprint form too.
+        let fresh = signed("z");
+        let first = a.seal_to("d:1", b"hello", None, false);
+        assert_eq!(fresh.open(&first).unwrap().identity.as_deref(), Some("a"));
+        let second = a.seal_to("d:1", b"again", None, false);
+        assert_eq!(cert_ref(&second), CERT_REF_FP);
+        assert_eq!(fresh.open(&second).unwrap().payload, b"again");
+    }
+
+    /// The every-16th refresh of 0022-T6 is unchanged: it still counts every sealed
+    /// datagram, whatever its destination.
+    #[test]
+    fn the_periodic_full_certificate_still_rides_every_sixteenth_datagram() {
+        let a = signed("a");
+        let _ = a.seal_to("b:1", b"x", None, false); // send 0: full on both counts
+        let mut full = Vec::new();
+        for n in 1..=(2 * FULL_CERT_EVERY) {
+            if cert_ref(&a.seal_to("b:1", b"x", None, false)) == CERT_REF_FULL {
+                full.push(n);
+            }
+        }
+        assert_eq!(full, vec![FULL_CERT_EVERY, 2 * FULL_CERT_EVERY]);
+    }
+
+    /// `unprime` is for a destination whose process restarted: its next datagram, and
+    /// only that one, carries the full certificate again. Other destinations, and a
+    /// destination never sealed to, are untouched.
+    #[test]
+    fn an_unprimed_destination_is_shown_the_certificate_once_more() {
+        let a = signed("a");
+        for dest in ["b:1", "c:1"] {
+            let _ = a.seal_to(dest, b"x", None, false);
+        }
+        a.unprime("b:1");
+        a.unprime("never-seen:1");
+        assert_eq!(cert_ref(&a.seal_to("c:1", b"x", None, false)), CERT_REF_FP);
+        assert_eq!(
+            cert_ref(&a.seal_to("b:1", b"x", None, false)),
+            CERT_REF_FULL
+        );
+        assert_eq!(cert_ref(&a.seal_to("b:1", b"x", None, false)), CERT_REF_FP);
+        // Without a signer there is nothing to forget.
+        SwimAuth::new(&[9; KEY_LEN]).unprime("b:1");
+    }
+
+    /// A rotated leaf is new to every destination: each one's next datagram carries it.
+    #[test]
+    fn a_rotated_signer_primes_every_destination_again() {
+        let a = signed("a");
+        for dest in ["b:1", "c:1"] {
+            let _ = a.seal_to(dest, b"x", None, false);
+            assert_eq!(cert_ref(&a.seal_to(dest, b"x", None, false)), CERT_REF_FP);
+        }
+        a.signer_slot()
+            .unwrap()
+            .swap(Arc::new(Signer(b"a-rotated".to_vec())));
+        // (The first seal after a swap is full by the reset counter; the second
+        // destination's is full only because it is that destination's first.)
+        assert_eq!(
+            cert_ref(&a.seal_to("b:1", b"x", None, false)),
+            CERT_REF_FULL
+        );
+        assert_eq!(
+            cert_ref(&a.seal_to("c:1", b"x", None, false)),
+            CERT_REF_FULL
+        );
+        assert_eq!(cert_ref(&a.seal_to("b:1", b"x", None, false)), CERT_REF_FP);
+        assert_eq!(cert_ref(&a.seal_to("c:1", b"x", None, false)), CERT_REF_FP);
+    }
+
+    #[test]
+    fn a_sequence_selects_the_sequenced_form_and_priming_applies_to_it_too() {
+        let a = signed("a").with_sequencing();
+        let _ = a.seal(b"x", false);
+        let first = a.seal_to("b:1", b"x", Some(7), false);
+        assert_eq!(first[0], VERSION_V3);
+        assert_eq!(cert_ref(&first), CERT_REF_FULL);
+        let second = a.seal_to("b:1", b"x", Some(8), false);
+        assert_eq!(cert_ref(&second), CERT_REF_FP);
+        let opened_by = signed("z").with_sequencing();
+        assert_eq!(opened_by.open(&first).unwrap().seq, Some(7));
+    }
+
+    /// Without a signer there is no certificate: `seal_to` is `seal`.
+    #[test]
+    fn the_shared_key_posture_is_unaffected() {
+        let a = SwimAuth::new(&[9; KEY_LEN]);
+        let sealed = a.seal_to("b:1", b"payload", None, false);
+        assert_eq!(sealed[0], VERSION_V1);
+        assert_eq!(sealed, a.seal(b"payload", false));
+    }
+
+    /// The remembered-destination set cannot grow without bound: past the cap it is
+    /// cleared, which costs one more priming datagram per destination and nothing else.
+    #[test]
+    fn the_set_of_primed_destinations_is_bounded() {
+        let a = signed("a");
+        for i in 0..(PRIMED_DEST_CAP + 10) {
+            let _ = a.seal_to(
+                &format!("10.0.{}.{}:7946", i / 250, i % 250),
+                b"x",
+                None,
+                false,
+            );
+        }
+        let slot = a.signer_slot().unwrap();
+        let primed = slot.primed.lock().unwrap().len();
+        assert!(
+            primed <= PRIMED_DEST_CAP,
+            "{primed} destinations remembered"
+        );
+        assert_eq!(primed, 10, "cleared at the cap, then refilled");
     }
 }
 

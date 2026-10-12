@@ -318,6 +318,7 @@ struct OtelInstruments {
     durable_recovery_failures: OtelCounter<u64>,
     lease_quorum_ack_ms: OtelGauge<i64>,
     gossip_rejected: OtelCounter<u64>,
+    gossip_cert_requests: OtelCounter<u64>,
     security_reloads: OtelCounter<u64>,
     revocation_evictions: OtelCounter<u64>,
     session_rehomes: OtelCounter<u64>,
@@ -431,6 +432,7 @@ impl OtelInstruments {
             durable_recovery_failures: meter.u64_counter("durable_recovery_failures").build(),
             lease_quorum_ack_ms: meter.i64_gauge("lease_quorum_ack_ms").build(),
             gossip_rejected: meter.u64_counter("gossip_rejected").build(),
+            gossip_cert_requests: meter.u64_counter("gossip_cert_requests").build(),
             security_reloads: meter.u64_counter("security_reloads").build(),
             revocation_evictions: meter.u64_counter("revocation_evictions").build(),
             session_rehomes: meter.u64_counter("session_rehomes").build(),
@@ -597,6 +599,11 @@ pub struct Metrics {
     /// preceded the incident — alertable before any session is refused.
     lease_quorum_ack_ms: Gauge,
     gossip_rejected_total: Family<ReasonLabel, Counter>,
+    /// Certificate requests sent: a `Join` to the source of a datagram dropped as
+    /// `cert-miss` (issue #971). It follows `gossip_rejected_total{reason="cert-miss"}`
+    /// one for one while a peer's certificate is being learned and stops when it is;
+    /// `cert-miss` climbing while this stands still is the rate limit holding.
+    gossip_cert_requests_total: Counter,
     security_reloads_total: Family<OutcomeLabel, Counter>,
     revocation_evictions_total: Family<ReasonLabel, Counter>,
     session_rehomes_total: Family<ReasonLabel, Counter>,
@@ -1162,7 +1169,13 @@ impl Metrics {
             &mut registry,
             "gossip_rejected",
             "SWIM gossip datagrams dropped, by reason (auth, decode, identity, replay, \
-             expired, revoked, domain, cert-miss)",
+             expired, revoked, domain, cert-miss, cluster-mismatch)",
+        );
+        let gossip_cert_requests_total = register_counter(
+            &mut registry,
+            "gossip_cert_requests",
+            "Certificate requests sent: a Join greeting to the source of a SWIM datagram \
+             dropped as cert-miss, so both sides learn the other's certificate",
         );
         let security_reloads_total = register_family(
             &mut registry,
@@ -1671,6 +1684,7 @@ impl Metrics {
             durable_recovery_failures_total,
             lease_quorum_ack_ms,
             gossip_rejected_total,
+            gossip_cert_requests_total,
             security_reloads_total,
             revocation_evictions_total,
             session_rehomes_total,
@@ -2362,6 +2376,12 @@ impl Metrics {
         self.otel
             .gossip_rejected
             .add(1, &[KeyValue::new("reason", reason.to_string())]);
+    }
+
+    /// This node asked a `cert-miss` sender for its certificate (issue #971).
+    pub fn gossip_cert_requested(&self) {
+        self.gossip_cert_requests_total.inc();
+        self.otel.gossip_cert_requests.add(1, &[]);
     }
 
     /// A hot reload of the security policy completed with `outcome` (`"ok"` for an applied

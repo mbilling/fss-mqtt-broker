@@ -206,3 +206,187 @@ fingerprint, so old-leaf and new-leaf nodes accept each other while a fleet roll
 at a time. Rotating the **CA itself** remains restart-bound (the verifier and the CRL
 check pin the startup CA). Delivered as 0022-T8; the deployment-facing account is in
 ADR 0047's 2026-08-14 amendment.
+
+## Amendment (2026-10-12): who is shown the certificate, and when (issue #971)
+
+T6 decided *that* most datagrams carry a fingerprint. It left *who has seen the
+certificate* to two rules: `Join`/`Sync` carry it, and so does every 16th datagram a node
+seals — one counter per node, whoever the datagram is for. Only seeds are sent a `Join`.
+So two nodes that are not each other's seed met through gossip and then spoke in pings
+and acks, each dropping everything the other sent as `cert-miss` until one of its
+datagrams to that peer happened to be its 16th overall; with N−1 destinations sharing
+the counter, the wait grew with the cluster. A node probed during the wait did not
+answer, was suspected, and after 4 s was declared dead.
+
+That was the storm of false `SUSPECT`/`DEAD` the 12- and 14-node formations of the
+durable scale-out campaign logged, and the pair of brokers one of which held the other
+out for more than four and a half minutes. It reproduces without a cloud: fourteen
+brokers on loopback, started the way the rig starts them, did not settle in 169 s, with
+37 to 69 suspicions and 4 to 12 false deaths per broker, 115 to 193 `cert-miss` drops on
+every broker that is not a seed — and one broker still dropping, at the end, the
+datagrams of the peer it had buried 113 s earlier.
+
+### What the simulation measured
+
+`crates/mqtt-cluster/tests/swim_formation_sim.rs` forms N signed nodes over a virtual
+clock and a lossless network, through the driver's real endpoint, with the rig's seeding
+and start order (a founder, followers a few seconds apart, the founder restarted with
+seeds). Sixteen seeds per size, each watched for 300 s after the last start; per-node
+figures are the median seed's. "Settled" is the moment after which every node held every
+other alive for good.
+
+| N | | settled, median (worst) | not settled in 300 s | `SUSPECT` / node | `DEAD` / node | `cert-miss` / node | longest eviction |
+|---|---|---|---|---|---|---|---|
+| 10 | 1.1.0 | 80 s (263 s) | 1 of 16 | 22.6 | 2.0 | 86 | 293 s |
+| | now | 4.5 s (8.0 s) | 0 | 0 | 0 | 0.1 | none |
+| 12 | 1.1.0 | 194 s (252 s) | 6 of 16 | 34.4 | 4.3 | 114 | ≥ 300 s |
+| | now | 6.6 s (9.3 s) | 0 | 0 | 0 | 0.1 | none |
+| 14 | 1.1.0 | 215 s (294 s) | 4 of 16 | 50.6 | 8.1 | 143 | ≥ 300 s |
+| | now | 7.5 s (11.9 s) | 0 | 0 | 0 | 0.1 | none |
+| 20 | 1.1.0 | 252 s (286 s) | 9 of 16 | 94.0 | 32.6 | 222 | 264 s |
+| | now | 15.9 s (19.1 s) | 0 | 0 | 0 | 0.1 | none |
+| 30 | 1.1.0 | never | 16 of 16 | 153 | 126 | 330 | 277 s |
+| | now | 26.3 s (32.1 s) | 0 | 0 | 0 | 0.1 | none |
+
+At 3 and 5 nodes neither build raises a suspicion: most pairs include a seed. The 1.1.0
+rows agree with what the rig's brokers logged (14 nodes: 19–73 `SUSPECT`, 3–12 `DEAD`,
+100–260 `cert-miss` each).
+
+Each cause was then removed on its own (14 nodes, same seeds):
+
+| 1.1.0, with only… | settled, median (worst) | `SUSPECT` / node | `DEAD` / node | `cert-miss` / node | longest eviction |
+|---|---|---|---|---|---|
+| nothing changed | 215 s (294 s; 4 of 16 never) | 50.6 | 8.1 | 143 | ≥ 300 s |
+| every certificate handed out in advance | 7.1 s (11.9 s) | 0 | 0 | 0 | none |
+| the certificate on the first datagram to each destination | 16.5 s (119 s) | 1.1 | 0 (worst 0.6) | 6.8 | 110 s |
+| a request to the sender of a `cert-miss` | 35 s (49 s) | 0.1 | 0.7 | 5.4 | 42 s |
+| the re-greet counting probes that only helpers rescued (ADR 0016) | 113 s (161 s) | 25.4 | 9.5 | 77 | 131 s |
+| a parting greeting when a tombstone is pruned (ADR 0016) | 60 s (74 s) | 37.7 | 6.2 | 99 | 35 s |
+
+So the storm is entirely the certificate's distribution: with certificates known in
+advance, 1.1.0's state machine forms a cluster of 30 without one suspicion, and in the
+time the fixed build takes. The 4 s suspicion window is not what failed. (It does not
+scale with the cluster, though, and that has a cost of its own: see ADR 0016's amendment
+of the same date.)
+
+### Decision
+
+Three rules, all in the driver, none on the wire.
+
+1. **The first datagram to each destination carries the full certificate**, whatever its
+   kind (`SwimAuth::seal_to`): the node remembers which addresses it has sealed to since
+   it started or last rotated its leaf. The every-16th refresh stays as it was.
+2. **A member's new life un-primes it.** A restarted process has an empty cache, while
+   every peer remembers having shown the old one its certificate. When the state machine
+   sees a member at a higher generation — in the member's own datagram or in gossip —
+   the driver forgets that it primed that address before it seals anything else, so the
+   reply to the datagram that revealed the restart already carries the certificate.
+   Without this rule the restarted founder of the table above was still suspected and,
+   in a few seeds, declared dead for up to 16 s (30 nodes).
+3. **A `cert-miss` is answered with a request.** The receiver sends the datagram's UDP
+   source one `Join` — the frame that carries the sender's certificate and that every
+   release answers with a `Sync` carrying its own — holding only the node's own claim.
+   At most one per source address per second, sixteen per second in all, the sources
+   remembered in a table of 256 entries (`swim_driver::CertRequests`). This is what
+   heals the state rules 1 and 2 cannot see coming: a cache lost without a restart, a
+   peer still on 1.1.0, a priming datagram lost on the network.
+
+Rule 3 is the request the issue's reading called for; rules 1 and 2 are why it is
+almost never needed: a formation of 14 now counts one or two `cert-miss` drops in all,
+around the founder's restart.
+
+**The wire is unchanged.** The request is an ordinary `Join`; a full certificate in a
+ping or an ack is the cert-ref form T6 already defined and 1.1.0 already accepts on
+every 16th datagram. There is no new message kind, field or version, so no protocol
+number moves and no pinned bytes change. (A new kind was the other candidate; a 1.1.0
+node cannot decode an enum variant it does not know and would count the datagram as
+`decode`. It bought nothing the `Join` does not.)
+
+**Size.** No run on either build sealed a datagram larger than 1,067 bytes (a 560-byte
+leaf and six piggybacked updates), against a budget of 1,452 (a 1500-byte MTU less IPv6
+and UDP headers): a ping with the certificate is no larger than the `Sync` that always
+carried it. A request is under 800 bytes.
+
+### What a datagram can trigger that has not been authenticated to a node
+
+A `cert-miss` is decided after the cluster-key HMAC verifies and before any signature
+can be checked — the certificate is what is missing. So:
+
+- **Without the gossip key: nothing.** The datagram fails the HMAC and is dropped as
+  `auth`, as before. No reply, no state.
+- **With a valid HMAC and an unknown fingerprint** (a holder of the gossip key, or
+  anyone replaying a captured fingerprint datagram at a node that does not hold its
+  sender's certificate): the datagram is dropped **undecoded** — no membership statement
+  in it is read, no member is added, nothing is acknowledged — and its UDP source,
+  which nothing vouches for, is sent one `Join` within the limits above. That is the
+  whole of it: per reflecting node at most sixteen datagrams of under 800 bytes a second,
+  about five times the bytes of the datagram that drew each, to addresses the sender
+  chose. The `Join` discloses the node's certificate, id and addresses, which every
+  datagram it sends discloses anyway.
+- **Every membership statement a node accepts is still verified** exactly as before:
+  HMAC, certificate chain, validity, revocation, signature, and the certificate's CN
+  against the claimed sender. Nothing in this amendment accepts anything.
+- A key-holder who spends a node's sixteen requests a second on forged sources delays
+  that node's learning of genuine certificates; rules 1 and 2, the every-16th refresh
+  and ADR 0016's re-greet do not depend on the request and still apply — the node is
+  then no worse off than on 1.1.0.
+- The anti-replay window (ADR 0023) does not cover the request: it is keyed on the
+  authenticated sender, which a `cert-miss` datagram does not have. The rate limit is
+  the bound.
+
+Memory per unauthenticated datagram: none unless a request is granted, then one address
+string and a timestamp in a table that cannot exceed 256 entries. CPU: the HMAC, one
+table lookup, and for a granted request one signature. Tested in
+`swim_driver::cert_request_tests`.
+
+### Mixed versions
+
+A 1.1.0 node needs nothing new: it answers the `Join`, and it accepts a full certificate
+on any datagram. What it lacks is its own half — it neither primes on first contact nor
+asks — so:
+
+- a cluster with **one node left on 1.1.0** forms like an upgraded one up to 14 nodes
+  (no suspicion; settled within 12.1 s); at 30 nodes the old node was declared dead
+  once in more than half the seeds, and was back within 31 s;
+- **half way through**, the 1.1.0 nodes still storm among themselves as before, and a
+  pair of them can still hold each other out; no pair with an upgraded node in it stays
+  broken;
+- **one upgraded node** among 1.1.0 nodes changes little — the storm is between the
+  others.
+
+A rolling upgrade does not re-form the cluster: nodes restart one at a time into a mesh
+whose certificates are cached, and the restarting node is the upgraded one. The numbers
+above are formations, the worst case.
+
+### On real processes
+
+The same formation with fourteen brokers on loopback (release binaries, signed gossip,
+peer mTLS, the rig's seeding, the founder restarted with seeds), one run each:
+
+| brokers | mesh whole on every broker | `SUSPECT` / broker | `cert-miss` / broker |
+|---|---|---|---|
+| 14 built without this change | not within 169 s | 37–69 | 115–193 (seeds: 0 and 60) |
+| 14 with it | 8 s after the founder's restart, and for the 102 s watched | 0 | 0 (the restarted founder: 2, both answered with a request) |
+| 7 with it, 7 on the released 1.1.0 binary | after 75 s, and for the 95 s more watched | 1–4 | upgraded: 1–7, and 37 of the 38 answered with a request; 1.1.0: 28–86 (the seed: 0) |
+
+In the mixed run no broker rejected a datagram for any reason but `cert-miss`: the two
+versions decode each other's gossip. `crates/mqttd/tests/swim_formation_proc.rs` keeps
+the second row as a test, with twelve brokers.
+
+### Observability
+
+`mqttd_gossip_cert_requests_total` counts the requests a node sends. It follows
+`mqttd_gossip_rejected_total{reason="cert-miss"}` while a certificate is being learned
+and stops when it is. `cert-miss` climbing while requests stand still is the rate limit
+holding; `cert-miss` climbing on one node with its member count one short was the
+signature of the stuck pair.
+
+### Not decided here
+
+- Formation time is now what it is with certificates known in advance, and grows with
+  the cluster (26 s at 30 nodes) because a `Sync` carries six updates, not the whole
+  view: a node that restarts re-learns the others about one a second. Sending the view
+  in several datagrams would shorten it and is a wire and amplification question of its
+  own.
+- What a publish does while one node holds a live peer dead is the hub's question, not
+  gossip's; it loses acknowledged QoS 1 messages, and is issue #973.

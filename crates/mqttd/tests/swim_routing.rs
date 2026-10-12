@@ -41,6 +41,8 @@ fn swim_cfg() -> SwimConfig {
         awareness_max: 8,
         isolation_rounds: 5,
         reprime_after: 3,
+        reprime_on_rescued_probe: true,
+        greet_pruned: true,
     }
 }
 

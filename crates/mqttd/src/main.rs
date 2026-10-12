@@ -3718,15 +3718,21 @@ async fn start_swim(
     let _ = swim_key_fps.set(fps);
     // On graceful shutdown (ADR 0019) the driver announces a SWIM leave so peers drop
     // this node from the ring immediately, instead of waiting out failure detection.
-    tokio::spawn(swim_driver::run(
+    // Count the certificate requests the driver sends when it drops a datagram as
+    // cert-miss (issue #971): the healing half of that counter.
+    let cert_requested: swim_driver::CertRequestCounter = {
+        let m = metrics.clone();
+        Arc::new(move || m.gossip_cert_requested())
+    };
+    let gossip = swim_driver::Gossip::new(swim, auth, seq_alloc)
+        .with_reject_counter(Some(reject))
+        .with_cert_request_counter(Some(cert_requested))
+        .with_identity(Some(cluster_identity));
+    tokio::spawn(swim_driver::run_gossip(
         socket,
-        swim,
+        gossip,
         SWIM_TICK,
         event_tx,
-        auth,
-        seq_alloc,
-        Some(reject),
-        Some(cluster_identity),
         Some(swim_isolated.clone()),
         shutdown.clone().cancelled_owned(),
     ));
