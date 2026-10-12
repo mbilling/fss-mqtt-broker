@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use mqtt_rules::{json_decode, Value};
-use mqtt_wasm_sandbox::jq::{Jq, JqError, Pool, Tag, DEFAULT_TIMEOUT};
+use mqtt_wasm_sandbox::jq::{Jq, JqError, Pool, Tag, COMPILE_TIMEOUT, DEFAULT_TIMEOUT};
 use mqtt_wasm_sandbox::{Arg, CallError, Execution, Grants, Limits, Sandbox};
 
 mod oracle;
@@ -889,10 +889,14 @@ fn a_ceiling_holds_a_call_whatever_timeout_it_names() {
 
 /// The ceiling covers the whole call, and so the compiling of a program the instance
 /// has not seen, which a timeout does not cover in EMQX or here (compiling has the
-/// five seconds of `COMPILE_TIMEOUT` instead). A program that takes tens of
+/// thirty seconds of `COMPILE_TIMEOUT` instead). A program that takes tens of
 /// milliseconds to compile is stopped in the compiler under a ceiling of one
 /// millisecond, and the error says which bound it met; without a ceiling it compiles
 /// and runs.
+///
+/// One millisecond is there to stop the long compilation, not to time anything: no
+/// assertion below depends on how fast this machine is. The call after it runs under
+/// a ceiling it can meet.
 #[test]
 fn a_ceiling_covers_compiling_the_program() {
     // An array of six thousand additions: near the largest function jq compiles.
@@ -924,11 +928,26 @@ fn a_ceiling_covers_compiling_the_program() {
         String::from_utf8_lossy(&error.message),
         "jq stopped: compiling the program ran into the 1 ms one call may take"
     );
+    // Stopped by the ceiling and not by the compiler's own thirty seconds: a bound
+    // generous enough that a stalled runner cannot miss it.
     assert!(
-        took < compiling,
-        "compiling takes {compiling:?}, and under a ceiling of 1 ms the call took {took:?}"
+        took < COMPILE_TIMEOUT / 2,
+        "compiling alone takes {compiling:?}; under a ceiling of 1 ms the call took {took:?}"
     );
+    assert_eq!((jq.instances, jq.replaced), (1, 1));
     // The instance the compiler was stopped in is gone; the next call has a new one.
+    // It is made under a ceiling a call can meet: even a one-character program takes
+    // about a millisecond to compile, so one millisecond would stop this call too.
+    let mut jq = jq_under(Some(Duration::from_secs(20)));
+    let error = jq
+        .eval(
+            program.as_bytes(),
+            Arg::Binary(b"1"),
+            Some(Duration::from_hours(1)),
+        )
+        .map(|_| ())
+        .err();
+    assert_eq!(error.map(|e| e.kind), None, "twenty seconds are enough");
     assert_eq!(text(jq.eval(b".", Arg::Binary(b"1"), None)), "[1]");
-    assert_eq!((jq.instances, jq.replaced), (2, 1));
+    assert_eq!((jq.instances, jq.replaced), (1, 0));
 }
