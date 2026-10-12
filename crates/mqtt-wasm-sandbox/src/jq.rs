@@ -64,8 +64,11 @@ pub fn recorded_sha256() -> &'static str {
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The longest compiling one program may take. The longest rule SQL (64 KiB of
-/// program text) compiles in a small fraction of it.
-pub const COMPILE_TIMEOUT: Duration = Duration::from_secs(5);
+/// program text) compiles in a small fraction of it on an idle machine; a loaded or
+/// emulated host can take many times longer, and a bound a healthy host can run into
+/// fails rules for no fault of theirs. Inside a call the ceiling
+/// (`rules.function_max_ms`) ends compiling first.
+pub const COMPILE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// An instance holding more memory than this after a call is replaced: an
 /// instance's memory never shrinks, and one large payload should not pin it.

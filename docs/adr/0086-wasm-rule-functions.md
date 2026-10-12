@@ -1219,3 +1219,18 @@ purpose: the number of concurrent long calls, still bounded only by the blocking
 limit and the number of publishing connections. It stays an accepted risk, now bounded
 in time per call. A limit on the count remains possible later and would sit beside the
 ceiling, not replace it.
+
+### 2026-10-12 — Compiling a jq program may take thirty seconds, not five
+
+`COMPILE_TIMEOUT`, the bound on compiling one jq program outside a call (the literal
+programs of a rules file, at load), goes from 5 s to 30 s. Five seconds is thousands of
+times what a program needs on an idle host, and still a bound a loaded or emulated host
+can run into; a load-time bound that a healthy host can miss fails rules for no fault of
+theirs. Inside a call nothing changes: compiling ends at the call's ceiling
+(`rules.function_max_ms`, 10 s unless set) first, as the amendment above has it. Rows that
+say "5 s" in §4 and D7 above are of their date.
+
+The test that showed the ceiling stopping the compiler asserted its timing against a
+ceiling of one millisecond, and made its next call under the same millisecond, which a
+one-character program does not always compile in. It failed on a busy CI runner. No
+assertion in it depends on the machine's speed now.
