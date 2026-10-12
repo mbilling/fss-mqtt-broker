@@ -334,6 +334,9 @@ struct Variant {
     /// After formation has had `at_ms`, cut node `node` off (nothing in, nothing out)
     /// for `for_ms`. Times in the outcome are then measured from the end of the cut.
     isolate: Option<Isolate>,
+    /// Applied to the configuration of every node on this tree ([`Flavor::Current`]):
+    /// how a failure-detection variant is measured against the default (issue #973).
+    tune: fn(Config) -> Config,
 }
 
 #[derive(Clone, Copy)]
@@ -351,6 +354,7 @@ impl Variant {
             arm_founder: true,
             stagger_ms: (2500, 4500),
             isolate: None,
+            tune: |cfg| cfg,
         }
     }
 }
@@ -418,6 +422,12 @@ struct Outcome {
     /// `measured_from` — or over the whole run when nothing is isolated.
     suspects: Vec<u32>,
     deads: Vec<u32>,
+    /// `Dead` transitions raised while a member was cut off (by it, or about it):
+    /// the member really was unreachable when each of these was declared.
+    deads_during_cut: u32,
+    /// How long after the cut began every OTHER node held the cut-off member `Dead`,
+    /// ms — the detection time of a real death, when the cut never ends.
+    buried_after: Option<u64>,
     /// `cert-miss` drops, `[source][destination]`.
     cert_miss: Vec<Vec<u32>>,
     /// Longest stretch one node held a healthy peer `Dead` or pruned, ms (open ones run
@@ -457,6 +467,8 @@ struct Sim {
     last_not_full: u64,
     /// `(node, from, until)` in global ms while a node is cut off.
     cut: Option<(usize, u64, u64)>,
+    /// The nodes that have declared the cut-off member `Dead` since the cut began.
+    buriers: std::collections::BTreeSet<usize>,
 }
 
 fn addr_of(i: usize) -> String {
@@ -486,6 +498,7 @@ impl Sim {
             evicted_since: BTreeMap::new(),
             last_not_full: 0,
             cut: None,
+            buriers: std::collections::BTreeSet::new(),
         };
         // Founder first; the rig waits for it to be ready before starting anyone else.
         sim.push(0, Ev::Start(0));
@@ -545,7 +558,11 @@ impl Sim {
             None,
             // Wall-clock ms at start in the broker: strictly greater on a restart.
             1_000_000 + self.now,
-            Endpoint::cfg(flavor),
+            if flavor == Flavor::Current {
+                (self.variant.tune)(Endpoint::cfg(flavor))
+            } else {
+                Endpoint::cfg(flavor)
+            },
             self.seeds_for(i, armed),
         );
         let auth = signed_auth(&id_of(i));
@@ -606,6 +623,21 @@ impl Sim {
                         MemberState::Dead => {
                             if self.counting() {
                                 self.out.deads[from] += 1;
+                            }
+                            if self.cut.is_some_and(|(_, from, until)| {
+                                self.now >= from && self.now < until
+                            }) {
+                                self.out.deads_during_cut += 1;
+                            }
+                            if let Some((node, cut_from, _)) = self.cut {
+                                if subject == node && self.now >= cut_from {
+                                    self.buriers.insert(from);
+                                    if self.buriers.len() == self.n - 1
+                                        && self.out.buried_after.is_none()
+                                    {
+                                        self.out.buried_after = Some(self.now - cut_from);
+                                    }
+                                }
                             }
                             self.evicted_since
                                 .entry((from, subject))
@@ -1058,4 +1090,255 @@ fn a_formation_run_is_reproducible_from_its_seed() {
         )
     };
     assert_eq!(run(), run());
+}
+
+// ---------------------------------------------------------------------------------
+// The false `Dead` a short outage still ends in (issue #973, ADR 0087): how often, and
+// what each candidate change to failure detection does about it.
+// ---------------------------------------------------------------------------------
+
+/// One way of deciding that a suspect is dead: the default, or a candidate measured
+/// against it. Each is a function of the default configuration, so a candidate is
+/// exactly the default plus what its name says.
+type Detector = (&'static str, fn(Config) -> Config);
+
+/// Today's rule: 4 s for one suspecter, 1.5 s for three, whatever the cluster's size.
+const TODAY: Detector = ("default: 4 s / 1.5 s", |cfg| cfg);
+/// The SWIM paper's rule applied to today's window: both ends × `max(1, log10 N)`.
+const LOG_N: Detector = ("x log10(N)", |cfg| Config {
+    suspicion_scales_with_log_n: true,
+    ..cfg
+});
+/// memberlist's LAN defaults (Lifeguard's dynamic suspicion): the floor is
+/// `4 × max(1, log10 N)` protocol periods, the ceiling six times the floor.
+const MEMBERLIST: Detector = ("memberlist: 4 log10(N) s, x6", |cfg| Config {
+    suspicion_min_timeout_ms: 4000,
+    suspicion_timeout_ms: 24_000,
+    suspicion_scales_with_log_n: true,
+    ..cfg
+});
+/// The window simply doubled, as a control for "is it only about length".
+const DOUBLED: Detector = ("doubled: 8 s / 3 s", |cfg| Config {
+    suspicion_timeout_ms: 8000,
+    suspicion_min_timeout_ms: 3000,
+    ..cfg
+});
+/// A direct refutation path: one last probe of the suspect, carrying the suspicion,
+/// before it is declared dead.
+const LAST_PROBE: Detector = ("last direct probe", |cfg| Config {
+    confirm_before_dead: true,
+    ..cfg
+});
+/// Both: the scaled window and the last probe.
+const LAST_PROBE_LOG_N: Detector = ("last direct probe, x log10(N)", |cfg| Config {
+    confirm_before_dead: true,
+    suspicion_scales_with_log_n: true,
+    ..cfg
+});
+
+/// A formed cluster on this tree (certificates known all round) running `detector`, in
+/// which one member is cut off for `for_ms` a minute after formation.
+fn cut_under(detector: Detector, for_ms: u64) -> Variant {
+    cut_under_mixed(detector, all_current, for_ms)
+}
+
+/// [`cut_under`] with only the nodes `flavor` puts on this tree running `detector`;
+/// the rest run v1.1.0, which knows none of the candidates.
+fn cut_under_mixed(detector: Detector, flavor: fn(usize, usize) -> Flavor, for_ms: u64) -> Variant {
+    Variant {
+        tune: detector.1,
+        ..cut_off(flavor, for_ms)
+    }
+}
+
+/// What a sweep of one `(detector, size, cut)` cell saw.
+struct CutCell {
+    runs: usize,
+    /// Runs in which some node declared a healthy member `Dead` at any time.
+    any_dead: usize,
+    /// Runs in which some node turned a member `Dead` AFTER the cut ended — declared
+    /// it then, or adopted then a `Dead` another node had declared during the cut —
+    /// about a member that was reachable again at that moment.
+    dead_after_cut: usize,
+    /// `Dead` transitions per run (during and after the cut), median and worst.
+    transitions: (u32, u32),
+    /// The longest any node held a healthy member out after the cut ended, ms.
+    longest_eviction: u64,
+    /// Runs whose views were not whole again at the deadline.
+    unsettled: usize,
+}
+
+fn cut_cell(detector: Detector, n: usize, for_ms: u64, seeds: u64) -> CutCell {
+    cut_cell_of(&cut_under(detector, for_ms), n, seeds)
+}
+
+fn cut_cell_of(variant: &Variant, n: usize, seeds: u64) -> CutCell {
+    // Long enough for a tombstone (30 s) to be pruned and the member greeted back.
+    let runs = sweep(n, seeds, variant, 75_000);
+    let mut transitions: Vec<u32> = runs
+        .iter()
+        .map(|o| o.deads_during_cut + o.total_deads())
+        .collect();
+    transitions.sort_unstable();
+    CutCell {
+        runs: runs.len(),
+        any_dead: transitions.iter().filter(|t| **t > 0).count(),
+        dead_after_cut: runs.iter().filter(|o| o.total_deads() > 0).count(),
+        transitions: (
+            transitions[transitions.len() / 2],
+            transitions[transitions.len() - 1],
+        ),
+        longest_eviction: runs.iter().map(|o| o.longest_eviction).max().unwrap_or(0),
+        unsettled: runs.iter().filter(|o| o.settled.is_none()).count(),
+    }
+}
+
+/// How long `detector` takes to bury a member that really died: the cut never ends.
+/// Median and worst over the seeds, ms from the death to the last survivor's `Dead`;
+/// `None` if some run never got there.
+fn burial_ms(detector: Detector, n: usize, seeds: u64) -> Option<(u64, u64)> {
+    let forever = 10_000_000;
+    let variant = Variant {
+        isolate: Some(Isolate {
+            at_ms: 60_000,
+            for_ms: forever,
+        }),
+        ..cut_under(detector, forever)
+    };
+    // `measured_from` is the end of the cut, which never comes: run to a deadline
+    // before it that leaves two minutes after the death.
+    let mut times: Vec<u64> = Vec::new();
+    for seed in 0..seeds {
+        let mut sim = Sim::new(n, seed, variant.clone());
+        sim.out.measured_from = sim.cut.expect("isolating variant").1;
+        times.push(sim.run(120_000).buried_after?);
+    }
+    times.sort_unstable();
+    Some((times[times.len() / 2], times[times.len() - 1]))
+}
+
+const CUT_SIZES: [usize; 5] = [3, 5, 10, 14, 30];
+const CUTS_MS: [u64; 6] = [500, 1000, 1500, 2000, 3000, 5000];
+
+/// The measurement behind ADR 0087 §5 and its issue: for each detector, cluster size
+/// and cut length, how many of 32 seeds end with a healthy member declared `Dead`; and
+/// what each detector costs when the member really is dead. Not an assertion —
+/// `cargo test -p mqtt-cluster --release --test swim_formation_sim false_dead_report -- --ignored --nocapture`.
+#[test]
+#[ignore = "measurement report for issue #973; run with --ignored --nocapture"]
+fn false_dead_report() {
+    let seeds = 32;
+    let detectors = [
+        TODAY,
+        LOG_N,
+        DOUBLED,
+        MEMBERLIST,
+        LAST_PROBE,
+        LAST_PROBE_LOG_N,
+    ];
+    println!(
+        "false DEAD after one member is cut off, {seeds} seeds per cell: \
+         runs with any DEAD / runs in which a node turned a member DEAD after the cut ended \
+         [DEAD transitions median..worst; longest eviction after the cut, s; unsettled runs]"
+    );
+    let cell = |c: &CutCell, for_ms: u64| {
+        #[allow(clippy::cast_precision_loss)] // report formatting of small numbers
+        let (cut_s, evicted_s) = (for_ms as f64 / 1000.0, c.longest_eviction as f64 / 1000.0);
+        format!(
+            " | {cut_s:.1}s {:>2}/{:>2} [{}..{}; {evicted_s:.0}s; {}]",
+            c.any_dead, c.dead_after_cut, c.transitions.0, c.transitions.1, c.unsettled,
+        )
+    };
+    for detector in detectors {
+        println!("\n{}", detector.0);
+        for n in CUT_SIZES {
+            let mut line = format!("  N={n:<3}");
+            for for_ms in CUTS_MS {
+                let c = cut_cell(detector, n, for_ms, seeds);
+                assert_eq!(c.runs, usize::try_from(seeds).expect("small"));
+                line.push_str(&cell(&c, for_ms));
+            }
+            println!("{line}");
+        }
+    }
+    // A rolling upgrade: only the upgraded nodes run the candidate; a v1.1.0 node is
+    // probed and answers as it always has.
+    println!("\nlast direct probe in a mixed cluster, N=14");
+    for (label, flavor) in [
+        (
+            "one node left on v1.1.0",
+            one_left_on_v1_1 as fn(usize, usize) -> Flavor,
+        ),
+        ("half the nodes on v1.1.0", half_upgraded),
+        ("every node on v1.1.0", all_v1_1),
+    ] {
+        let mut line = format!("  {label:<25}");
+        for for_ms in CUTS_MS {
+            let c = cut_cell_of(&cut_under_mixed(LAST_PROBE, flavor, for_ms), 14, seeds);
+            line.push_str(&cell(&c, for_ms));
+        }
+        println!("{line}");
+    }
+    println!(
+        "\na member that really died: ms until the last survivor holds it DEAD, median / worst"
+    );
+    for detector in detectors {
+        let cells: Vec<String> = CUT_SIZES
+            .into_iter()
+            .map(|n| match burial_ms(detector, n, 16) {
+                Some((med, max)) => format!("N={n} {med} / {max}"),
+                None => format!("N={n} not buried"),
+            })
+            .collect();
+        println!("  {:<30} | {}", detector.0, cells.join(" | "));
+    }
+}
+
+/// CHARACTERISATION of the open failure-detection issue (ADR 0087 §5): on today's
+/// fixed window, a member of a formed 14-node cluster that is cut off for 1.5 s — less
+/// than half the window — is declared `Dead` by some node in a good share of the
+/// schedules (16 of 32 seeds in the report), and each such verdict then stands for the
+/// tombstone's 30 s. This pins that it still happens; when the default detector
+/// changes so that it does not, this test fails and is replaced by the bound the new
+/// detector keeps.
+#[test]
+fn a_short_cut_still_ends_in_a_false_dead_on_the_default_window() {
+    let c = cut_cell(TODAY, 14, 1500, 8);
+    assert!(
+        c.dead_after_cut >= 2,
+        "{} of {} runs turned a reachable member DEAD",
+        c.dead_after_cut,
+        c.runs
+    );
+    assert!(
+        c.longest_eviction >= Config::default().dead_ttl_ms - 1000,
+        "a false verdict stands until its tombstone is pruned: {} ms",
+        c.longest_eviction
+    );
+    assert_eq!(c.unsettled, 0, "and is then healed (issue #971)");
+}
+
+/// The candidate ADR 0087 recommends, measured not adopted: with one last direct probe
+/// before `Dead` (`Config::confirm_before_dead`, off by default), the same cut — and
+/// any cut shorter than the window's floor — ends with no node turning the member
+/// `Dead`, at every size, while a member that really died is still buried by every
+/// survivor in about the time the default takes.
+#[test]
+fn a_last_direct_probe_spares_a_member_cut_off_for_less_than_the_window() {
+    for n in [5, 14, 30] {
+        for for_ms in [500, 1500] {
+            let c = cut_cell(LAST_PROBE, n, for_ms, seeds(n));
+            assert_eq!(
+                c.any_dead, 0,
+                "N={n}, cut {for_ms} ms: {} of {} runs turned a member DEAD",
+                c.any_dead, c.runs
+            );
+        }
+    }
+    let (_, default_worst) = burial_ms(TODAY, 14, 3).expect("the default buries a dead member");
+    let (_, worst) = burial_ms(LAST_PROBE, 14, 3).expect("a dead member is still buried");
+    assert!(
+        worst <= default_worst + 3000,
+        "burying a dead member took {worst} ms; the default takes {default_worst} ms"
+    );
 }

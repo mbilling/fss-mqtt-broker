@@ -262,7 +262,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 390 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 394 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -563,6 +563,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `swim::tests::a_leaving_node_does_not_refute_its_own_dead`
 - `swim::tests::a_members_new_life_is_reported_to_the_driver_exactly_once`
 - `swim::tests::a_node_advertises_its_own_domain_on_outgoing_gossip`
+- `swim::tests::a_node_told_it_is_suspected_answers_with_its_refutation_first`
 - `swim::tests::a_peer_marks_a_leaving_node_dead_immediately`
 - `swim::tests::a_ping_req_naming_an_unroutable_target_is_relayed_to_our_learned_address`
 - `swim::tests::a_probe_rescued_only_by_helpers_still_counts_toward_the_regreet`
@@ -574,6 +575,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `swim::tests::a_run_of_unanswered_probe_rounds_marks_the_node_isolated_while_gossip_keeps_the_view_fresh`
 - `swim::tests::a_single_ack_of_our_probe_clears_isolation`
 - `swim::tests::a_stale_circulating_dead_claim_cannot_rekill_the_refuted_member`
+- `swim::tests::a_suspect_is_probed_once_more_before_it_is_declared_dead`
+- `swim::tests::a_suspect_that_refutes_in_its_ack_is_not_declared_dead`
 - `swim::tests::a_tombstone_fences_the_dead_life_but_not_a_new_one`
 - `swim::tests::a_tombstone_is_pruned_after_its_ttl_and_the_id_can_rejoin`
 - `swim::tests::address_change_at_higher_incarnation_is_adopted`
@@ -605,6 +608,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `swim::tests::probe_failure_leads_to_suspect_then_dead`
 - `swim::tests::refutation_resets_accumulated_suspicions`
 - `swim::tests::refutes_suspicion_about_self`
+- `swim::tests::the_suspicion_window_grows_with_log_n_only_when_asked`
 - `swim::tests::with_the_v1_1_rule_a_rescued_probe_resets_the_regreet_count`
 - `swim_auth::first_contact_tests::a_rotated_signer_primes_every_destination_again`
 - `swim_auth::first_contact_tests::a_sequence_selects_the_sequenced_form_and_priming_applies_to_it_too`
@@ -680,12 +684,15 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `three_nodes_converge_then_detect_failure`
 - `two_nodes_discover_each_other`
 
-## `crates/mqtt-cluster/tests/swim_formation_sim.rs` — 6 test(s)
+## `crates/mqtt-cluster/tests/swim_formation_sim.rs` — 9 test(s)
 
 - `a_cluster_part_way_through_the_upgrade_from_v1_1_forms`
 - `a_formation_run_is_reproducible_from_its_seed`
+- `a_last_direct_probe_spares_a_member_cut_off_for_less_than_the_window`
 - `a_member_falsely_declared_dead_is_readmitted_within_the_tombstone_ttl`
+- `a_short_cut_still_ends_in_a_false_dead_on_the_default_window`
 - `a_signed_cluster_forms_with_no_false_suspicion_at_any_size`
+- `false_dead_report` — `#[ignore]`d
 - `formation_report` — `#[ignore]`d
 - `the_v1_1_rules_reproduce_the_formation_storm_and_preshared_certificates_remove_it`
 
@@ -1400,7 +1407,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 745 test(s)
+## `crates/mqttd/src/lib.rs` — 747 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1629,6 +1636,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::pending_bounds::the_entry_cap_evicts_only_the_oldest`
 - `hub::forwarding::pending_bounds::the_reached_record_is_charged_and_released_with_its_entry`
 - `hub::forwarding::pending_bounds::the_sweep_retransmits_only_overdue_forwards`
+- `hub::forwarding::zone_fwd_proofs::a_forward_unanswered_when_its_target_is_declared_dead_is_acked_when_the_grace_runs_out`
+- `hub::forwarding::zone_fwd_proofs::a_publish_for_a_peer_declared_dead_owes_it_nothing_where_a_link_down_peer_is_owed`
 - `hub::forwarding::zone_fwd_proofs::a_qos0_publish_nobody_wants_does_not_walk_the_peer_map`
 - `hub::forwarding::zone_fwd_proofs::a_reached_answer_is_downgraded_for_an_older_peer`
 - `hub::forwarding::zone_fwd_proofs::a_reached_forward_releases_a_held_ack_and_a_stored_one_does_not`
@@ -2431,6 +2440,15 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `persistent_session_queues_offline_and_replays_on_reconnect`
 - `publish_reaches_matching_subscriber`
 - `qos1_publish_is_acked_and_downgraded`
+
+## `crates/mqttd/tests/false_dead_delivery.rs` — 6 test(s)
+
+- `durable_a_follower_evictor_loses_acked_publishes_for_a_durable_session`
+- `durable_a_leader_evictor_moves_the_lease_and_still_loses_acked_publishes`
+- `durable_the_evicted_peer_dials_the_link_returns_and_sessions_follow_the_lease`
+- `plain_a_verdict_withdrawn_inside_the_settle_window_loses_only_the_memberless_share_group`
+- `plain_the_evicted_peer_dials_the_link_returns_and_only_a_memberless_share_group_loses`
+- `plain_the_evictor_dials_acked_publishes_for_the_evicted_peers_subscribers_are_lost`
 
 ## `crates/mqttd/tests/http_auth.rs` — 7 test(s)
 

@@ -54,6 +54,9 @@ impl MemberState {
 }
 
 /// Timing and fan-out parameters for the protocol.
+// The bools are four independent rules, each on or off: two that a v1.1.0 node lacks
+// (issue #971) and two measured candidates (issue #973). Not an encodable state.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Time between probe rounds (the SWIM protocol period `T`), in ms.
@@ -118,6 +121,26 @@ pub struct Config {
     /// live member answers with a `Sync` and is re-admitted first-hand; a dead one
     /// costs a single datagram per prune. `false` is v1.1.0's behaviour.
     pub greet_pruned: bool,
+    /// Scale the suspicion window with the size of the cluster: both ends of it are
+    /// multiplied by `max(1, log10(n))`, `n` counting this node and every member it
+    /// holds — the SWIM paper's rule (and memberlist's), because a refutation needs
+    /// a number of gossip rounds that grows with `log n` to get back. `false` (the
+    /// default) is the fixed window every release so far has run. **A measurement
+    /// knob (issue #973 / ADR 0087), not operator configuration**: nothing sets it
+    /// outside the formation simulation.
+    pub suspicion_scales_with_log_n: bool,
+    /// Probe a suspect once more, directly, before declaring it `Dead`. When its
+    /// suspicion window lapses the member is sent one `Ping` carrying the suspicion
+    /// itself and is given one ack timeout: a live member that hears it refutes in
+    /// the `Ack` — first-hand, so the suspicion is cleared here without waiting for
+    /// gossip to carry the refutation back. Only a member that stays silent is
+    /// declared `Dead`, one ack timeout later than it would have been. With this on,
+    /// a node also puts its own refutation at the head of its gossip queue, so that
+    /// `Ack` is certain to carry it. No new wire element: an older member answers
+    /// the same `Ping` with the same `Ack`. `false` (the default) is the behaviour
+    /// of every release so far. **A measurement knob (issue #973 / ADR 0087), not
+    /// operator configuration.**
+    pub confirm_before_dead: bool,
 }
 
 impl Default for Config {
@@ -137,6 +160,8 @@ impl Default for Config {
             reprime_after: 3,
             reprime_on_rescued_probe: true,
             greet_pruned: true,
+            suspicion_scales_with_log_n: false,
+            confirm_before_dead: false,
         }
     }
 }
@@ -179,6 +204,10 @@ pub struct Member {
     /// (With `Config::reprime_on_rescued_probe` off, v1.1.0's rule: only probes
     /// that helpers could not rescue either, reset by any ack.)
     unanswered_probes: u32,
+    /// `Config::confirm_before_dead`: when the last direct probe sent at the end of
+    /// this member's suspicion window gives up. `Some` only while that probe is
+    /// outstanding; cleared whenever the member's `(incarnation, state)` changes.
+    confirm_deadline: Option<u64>,
 }
 
 /// True when `addr` names the unspecified host (`0.0.0.0` / `[::]`) or is empty —
@@ -542,7 +571,24 @@ impl Swim {
             // Linear from max (1 suspecter) to min (k suspecters).
             max - (max - min) * (confirmations - 1) / (k - 1)
         };
-        base * self.health_multiplier()
+        base * self.size_multiplier_permille() / 1000 * self.health_multiplier()
+    }
+
+    /// `max(1, log10(n))` in thousandths, `n` being this node plus every member it
+    /// holds — the factor `Config::suspicion_scales_with_log_n` applies to the
+    /// suspicion window. `1000` when the knob is off, and up to ten nodes either way.
+    fn size_multiplier_permille(&self) -> u64 {
+        if !self.cfg.suspicion_scales_with_log_n {
+            return 1000;
+        }
+        // A cluster size: exact in an `f64`, and its log10 is a small positive number.
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let permille = ((self.members.len() as f64 + 1.0).log10() * 1000.0) as u64;
+        permille.max(1000)
     }
 
     /// Raise awareness (capped at `awareness_max`): a signal that *we* are the slow one
@@ -682,6 +728,11 @@ impl Swim {
                     failure_domain: self.local_domain.clone(),
                 };
                 self.enqueue_gossip(refute);
+                if self.cfg.confirm_before_dead {
+                    // The reply to the datagram that carried the claim must carry
+                    // the refutation, whatever else is waiting to be gossiped.
+                    self.gossip.rotate_right(1);
+                }
                 // Having to refute ourselves signals we are the slow one (ADR 0016 §2).
                 self.raise_awareness();
             }
@@ -796,6 +847,7 @@ impl Swim {
             // The `(incarnation, state)` identity changed: reset the suspecter set,
             // seeding it from this update if it is a fresh `Suspect` (ADR 0016 §3).
             if changed || inc_advanced {
+                m.confirm_deadline = None;
                 m.suspecters.clear();
                 if u.state == MemberState::Suspect {
                     if let Some(sus) = &u.suspecter {
@@ -850,6 +902,7 @@ impl Swim {
                         _ => BTreeSet::new(),
                     },
                     unanswered_probes: 0,
+                    confirm_deadline: None,
                 },
             );
             out.push(Action::StateChange {
@@ -1127,8 +1180,54 @@ impl Swim {
             .map(|m| m.id.clone())
             .collect();
         for id in timed_out {
+            if self.cfg.confirm_before_dead {
+                match self.members.get(&id).and_then(|m| m.confirm_deadline) {
+                    // The window has lapsed: ask the suspect itself, once.
+                    None => {
+                        self.confirm_suspect(&id, now, out);
+                        continue;
+                    }
+                    // Asked, and still inside its ack timeout.
+                    Some(deadline) if now < deadline => continue,
+                    // Asked, and silent: dead.
+                    Some(_) => {}
+                }
+            }
             self.declare(&id, MemberState::Dead, now, out);
         }
+    }
+
+    /// `Config::confirm_before_dead`: send `id` one `Ping` that carries our suspicion
+    /// of it, and give it one ack timeout. If it is alive and hears us, applying that
+    /// claim makes it bump its incarnation and its `Ack` carries the refutation
+    /// first-hand, which clears the suspicion (and this deadline) in `apply_update`.
+    fn confirm_suspect(&mut self, id: &NodeId, now: u64, out: &mut Vec<Action>) {
+        let deadline = now + self.scaled_ack_timeout();
+        let Some(m) = self.members.get_mut(id) else {
+            return;
+        };
+        m.confirm_deadline = Some(deadline);
+        let claim = Update {
+            id: id.0.clone(),
+            addr: m.addr.clone(),
+            peer_addr: m.peer_addr.clone(),
+            incarnation: m.incarnation,
+            generation: m.generation,
+            state: MemberState::Suspect,
+            suspecter: Some(self.local.0.clone()),
+            failure_domain: m.failure_domain.clone(),
+        };
+        let to = m.addr.clone();
+        self.seq += 1;
+        let mut msg = self.message(Kind::Ping { seq: self.seq });
+        // The claim rides this datagram whether or not it is still in the gossip
+        // queue's retransmit budget, within the usual per-datagram bound.
+        if !msg.gossip.iter().any(|u| u.id == claim.id) {
+            msg.gossip
+                .truncate(self.cfg.gossip_fanout.saturating_sub(1));
+            msg.gossip.insert(0, claim);
+        }
+        out.push(Action::Send { to, msg });
     }
 
     fn start_probe(&mut self, now: u64, out: &mut Vec<Action>) {
@@ -1430,6 +1529,8 @@ mod tests {
             reprime_after: 3,
             reprime_on_rescued_probe: true,
             greet_pruned: true,
+            suspicion_scales_with_log_n: false,
+            confirm_before_dead: false,
         }
     }
 
@@ -2639,6 +2740,205 @@ mod tests {
             Some(MemberState::Suspect),
             "after a refutation the window resets to full, not the prior floor"
         );
+    }
+
+    // --- issue #973 / ADR 0087: failure-detection knobs, off by default ---------
+
+    fn node_with(id: &str, addr: &str, cfg: Config) -> Swim {
+        Swim::new(
+            NodeId(id.to_string()),
+            addr.to_string(),
+            peer_addr_of(addr),
+            None,
+            1,
+            cfg,
+            Vec::new(),
+        )
+    }
+
+    /// Every datagram in `actions`, as `(destination, message)`.
+    fn sends(actions: &[Action]) -> Vec<(&str, &Message)> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Send { to, msg } => Some((to.as_str(), msg)),
+                Action::StateChange { .. } => None,
+            })
+            .collect()
+    }
+
+    /// `confirm_before_dead`: when the window lapses the suspect is not declared dead
+    /// but sent one `Ping` carrying the suspicion; it is declared dead one ack timeout
+    /// later if it stays silent, and it is asked only once.
+    #[test]
+    fn a_suspect_is_probed_once_more_before_it_is_declared_dead() {
+        let cfg = Config {
+            confirm_before_dead: true,
+            ..fast_cfg()
+        };
+        let mut s = node_with("a", "a:1", cfg.clone());
+        let mut out = Vec::new();
+        s.apply_update(&suspect_from("b", "b:1", 0, "x"), 0, &mut out);
+        // Spend the claim's place in the gossip queue, so the probe below is shown to
+        // carry it on its own account.
+        while !s.take_gossip().is_empty() {}
+
+        let lapsed = cfg.suspicion_timeout_ms + 1;
+        out.clear();
+        s.expire_suspects(lapsed, &mut out);
+        assert_eq!(member_state(&s, "b"), Some(MemberState::Suspect));
+        let sent = sends(&out);
+        assert_eq!(sent.len(), 1, "exactly one last probe: {out:?}");
+        let (to, msg) = sent[0];
+        assert_eq!(to, "b:1");
+        assert!(matches!(msg.kind, Kind::Ping { .. }));
+        assert!(
+            msg.gossip.iter().any(|u| u.id == "b"
+                && u.state == MemberState::Suspect
+                && u.incarnation == 0
+                && u.suspecter.as_deref() == Some("a")),
+            "the probe tells the suspect what it is suspected of: {:?}",
+            msg.gossip
+        );
+
+        // Inside its ack timeout: still suspect, and not asked again.
+        out.clear();
+        s.expire_suspects(lapsed + cfg.ack_timeout_ms - 1, &mut out);
+        assert_eq!(member_state(&s, "b"), Some(MemberState::Suspect));
+        assert!(out.is_empty(), "asked once: {out:?}");
+
+        // Silent: dead, one ack timeout after the window.
+        s.expire_suspects(lapsed + cfg.ack_timeout_ms, &mut out);
+        assert_eq!(member_state(&s, "b"), Some(MemberState::Dead));
+    }
+
+    /// `confirm_before_dead`: a suspect that answers the last probe with its refutation
+    /// stays a member, and a later suspicion of it gets a last probe of its own.
+    #[test]
+    fn a_suspect_that_refutes_in_its_ack_is_not_declared_dead() {
+        let cfg = Config {
+            confirm_before_dead: true,
+            ..fast_cfg()
+        };
+        let mut s = node_with("a", "a:1", cfg.clone());
+        let mut out = Vec::new();
+        s.apply_update(&suspect_from("b", "b:1", 0, "x"), 0, &mut out);
+        let lapsed = cfg.suspicion_timeout_ms + 1;
+        out.clear();
+        s.expire_suspects(lapsed, &mut out);
+        let seq = ping_seq(&out).expect("the last probe");
+
+        // b heard the suspicion, bumped its incarnation and says so in its ack.
+        s.handle(
+            m(
+                "b",
+                "b:1",
+                Kind::Ack { seq },
+                vec![alive_update("b", "b:1", 1)],
+            ),
+            lapsed + 5,
+        );
+        assert_eq!(member_state(&s, "b"), Some(MemberState::Alive));
+        s.expire_suspects(lapsed + 10 * cfg.ack_timeout_ms, &mut out);
+        assert_eq!(member_state(&s, "b"), Some(MemberState::Alive));
+
+        // Suspected again at the new incarnation: the window, then a fresh last probe.
+        let again = lapsed + 100;
+        s.apply_update(&suspect_from("b", "b:1", 1, "x"), again, &mut out);
+        out.clear();
+        s.expire_suspects(again + cfg.suspicion_timeout_ms + 1, &mut out);
+        assert_eq!(member_state(&s, "b"), Some(MemberState::Suspect));
+        assert!(
+            ping_seq(&out).is_some(),
+            "a new suspicion is confirmed anew"
+        );
+    }
+
+    /// `confirm_before_dead`: a node told it is suspected puts its refutation at the
+    /// head of its gossip, so the reply to that very datagram carries it however much
+    /// else is queued. (Off, the refutation queues behind everything else, as before.)
+    #[test]
+    fn a_node_told_it_is_suspected_answers_with_its_refutation_first() {
+        for (on, refutation_leads) in [(true, true), (false, false)] {
+            let cfg = Config {
+                confirm_before_dead: on,
+                ..fast_cfg()
+            };
+            let fanout = cfg.gossip_fanout;
+            let mut s = node_with("a", "a:1", cfg);
+            let mut out = Vec::new();
+            // More pending updates than one datagram carries.
+            for i in 0..(fanout + 4) {
+                s.apply_update(
+                    &alive_update(&format!("n{i}"), &format!("n{i}:1"), 0),
+                    0,
+                    &mut out,
+                );
+            }
+            let inc = current_incarnation(&s);
+            let out = s.handle(
+                m(
+                    "x",
+                    "x:1",
+                    Kind::Ping { seq: 7 },
+                    vec![suspect_from("a", "a:1", inc, "x")],
+                ),
+                1,
+            );
+            let sent = sends(&out);
+            let (_, ack) = sent
+                .iter()
+                .find(|(to, msg)| *to == "x:1" && matches!(msg.kind, Kind::Ack { seq: 7 }))
+                .expect("the ping is acked");
+            let carries_refutation = ack
+                .gossip
+                .iter()
+                .any(|u| u.id == "a" && u.state == MemberState::Alive && u.incarnation == inc + 1);
+            assert_eq!(
+                carries_refutation, refutation_leads,
+                "confirm_before_dead={on}: {:?}",
+                ack.gossip
+            );
+            if on {
+                assert_eq!(ack.gossip[0].id, "a", "the refutation is first");
+            }
+        }
+    }
+
+    /// `suspicion_scales_with_log_n`: the window is multiplied by `max(1, log10 n)` —
+    /// unchanged up to ten nodes, about 1.48 times as long at thirty — and only when
+    /// the knob is on.
+    #[test]
+    fn the_suspicion_window_grows_with_log_n_only_when_asked() {
+        let window = fast_cfg().suspicion_timeout_ms;
+        // (scaled, nodes in the cluster, still suspect at, dead by)
+        for (scaled, nodes, alive_at, dead_at) in [
+            (false, 30, window - 1, window + 1),
+            (true, 10, window - 1, window + 1),
+            (true, 30, window * 147 / 100, window * 148 / 100 + 1),
+            (true, 100, window * 2 - 1, window * 2 + 1),
+        ] {
+            let cfg = Config {
+                suspicion_scales_with_log_n: scaled,
+                ..fast_cfg()
+            };
+            let mut s = node_with("a", "a:1", cfg);
+            let mut out = Vec::new();
+            // `nodes` counts this node; `b` is one of the others.
+            for i in 0..(nodes - 2) {
+                s.apply_update(
+                    &alive_update(&format!("n{i}"), &format!("n{i}:1"), 0),
+                    0,
+                    &mut out,
+                );
+            }
+            s.apply_update(&suspect_from("b", "b:1", 0, "x"), 0, &mut out);
+            let ctx = format!("scaled={scaled} nodes={nodes}");
+            s.expire_suspects(alive_at, &mut out);
+            assert_eq!(member_state(&s, "b"), Some(MemberState::Suspect), "{ctx}");
+            s.expire_suspects(dead_at, &mut out);
+            assert_eq!(member_state(&s, "b"), Some(MemberState::Dead), "{ctx}");
+        }
     }
 
     // --- helpers ---------------------------------------------------------------

@@ -2456,6 +2456,75 @@ mod zone_fwd_proofs {
         }
     }
 
+    // ---- issue #973 / ADR 0087: what `PeerDead` does to a gated publish ------
+    //
+    // CHARACTERISATION of today's behaviour, at the hub. ADR 0087 decides that a
+    // peer under a `Dead` verdict keeps its interest (as unreachable) until it is
+    // confirmed gone; when that lands, the `dead` arms below must behave as the
+    // `link down` arms do, and these tests are flipped with it.
+
+    /// The gap of issue #973 in one hub: the SAME publish toward the SAME peer is an
+    /// obligation that holds the publisher's acknowledgement while the peer's link is
+    /// merely down, and nothing at all once the peer has been declared dead — the
+    /// forward is derived from the interest table, and `peer_dead` empties it. The
+    /// acknowledged-forward path itself is never reached.
+    #[test]
+    fn a_publish_for_a_peer_declared_dead_owes_it_nothing_where_a_link_down_peer_is_owed() {
+        for (dead, owed) in [(false, true), (true, false)] {
+            let mut h = hub();
+            let peer = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
+            if dead {
+                h.peer_dead(&peer.node);
+            } else {
+                h.peer_disconnected(&peer.node, 0);
+            }
+            assert_eq!(h.interest.has_node(&peer.node), owed, "dead={dead}");
+
+            let (id, mut rx) = register(&mut h, "t/x");
+            fan_out(&mut h, "t/x", QoS::AtLeastOnce, false, Some(id));
+            h.pending_local_done(id);
+            assert_eq!(
+                h.pending_publishes
+                    .get(id)
+                    .is_some_and(|p| p.awaiting.values().any(|o| o.node == peer.node)),
+                owed,
+                "dead={dead}: a forward obligation toward the peer"
+            );
+            assert_eq!(
+                matches!(rx.try_recv(), Ok(PublishOutcome::Accepted)),
+                !owed,
+                "dead={dead}: the publisher is acknowledged at once exactly when nothing is owed"
+            );
+        }
+    }
+
+    /// The in-flight face of the same gap: a forward that was SENT and is still
+    /// unanswered when its target is declared dead. `peer_dead` discards the
+    /// obligation and arms the re-route grace; with no successor announcing the
+    /// interest, the grace runs out after `REROUTE_GRACE_TICKS` sweeps and the
+    /// publisher is told `Accepted` — whether or not the target ever stored it.
+    #[test]
+    fn a_forward_unanswered_when_its_target_is_declared_dead_is_acked_when_the_grace_runs_out() {
+        let mut h = hub();
+        let peer = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
+        let (id, _seq, mut rx) = held_forward(&mut h, &peer.node);
+        assert!(rx.try_recv().is_err(), "held for the peer's answer");
+
+        h.peer_dead(&peer.node);
+        let p = &h.pending_publishes[&id];
+        assert!(p.awaiting.is_empty(), "the obligation is discarded");
+        assert_eq!(p.reroute_grace, Some(REROUTE_GRACE_TICKS));
+
+        for tick in 1..=REROUTE_GRACE_TICKS {
+            assert!(rx.try_recv().is_err(), "still held before sweep {tick}");
+            h.sweep_pending_forwards();
+        }
+        assert!(
+            matches!(rx.try_recv(), Ok(PublishOutcome::Accepted)),
+            "acknowledged when the grace runs out, with no answer from anyone"
+        );
+    }
+
     /// An entry that has already been answered and survives only for the
     /// replay: `refuse_pending` must not claim `Refused` to a publisher that has
     /// been told `Accepted`, and `drop_pending` must not be read as a withhold —

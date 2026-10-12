@@ -2394,6 +2394,17 @@ IGNORE_ALLOWLIST: dict[str, tuple[str, str | None]] = {
         "file, which every tier runs with bounds",
         None,
     ),
+    "crates/mqtt-cluster/tests/swim_formation_sim.rs::false_dead_report": (
+        "measurement, not a pass/fail: for six ways of deciding a suspect is dead, five "
+        "cluster sizes and six outage lengths it prints how many of 32 seeded runs end with "
+        "a healthy member declared DEAD, and what each costs when the member really died "
+        "(issue #973 / #975; eleven minutes, --release). Its figures are recorded in ADR "
+        "0087 and issue #975; today's default and the recommended candidate are asserted by "
+        "`a_short_cut_still_ends_in_a_false_dead_on_the_default_window` and "
+        "`a_last_direct_probe_spares_a_member_cut_off_for_less_than_the_window`, which every "
+        "tier runs",
+        None,
+    ),
     "crates/mqttd/tests/durable_bench.rs::durable_path_floor": (
         "macro-benchmark: minutes long, and only meaningful in --release",
         None,
