@@ -371,12 +371,60 @@ rig's quota, is in
 [the card](../../bench/scale/durable-knees-2026-10-12.md#estimate-brokers-needed-to-meet-the-offers-that-were-not-met):
 at 15,000 msg/s per node, 210,000 msg/s needs 14 nodes and 240,000 needs 16.
 
-<!-- SCALE-OUT-10-12-14: the results of bench/scale/durable-scaleout-10-12-14.md go here, in a follow-up. -->
-**Not in this document yet:** the durable scale-out at 14, 12 and 10 nodes
-([card](../../bench/scale/durable-scaleout-10-12-14.md)). No figure from it is published
-here.
-
 Run: `knee-20261012T122155Z` (untracked).
+
+### (e) Past 10 nodes: 10, 12 and 14 on one provisioning — not curve points
+
+A second durable campaign the same day asked whether the total keeps growing past 10
+nodes. Same binary, same store and same reading rule as above, with these differences:
+14 × CCX23 brokers + 16 × CCX33 drivers, formed as 14, then 12, then 10 nodes on the same
+hosts; **28** persistent consumers per site, not 20, so that two consumer containers
+reach every broker at 14 nodes; two rungs per size, at 15k and 18k msg/s per node
+offered. Brokers 11–14 are in a second placement group and may share a physical host with
+another broker. Card:
+[durable-scaleout-10-12-14.md](../../bench/scale/durable-scaleout-10-12-14.md).
+
+![Durable QoS 1 total msg/s at 10, 12 and 14 nodes on the 1.2.0 candidate](img/scale-out-durable-candidate.svg)
+
+| nodes | sites | offered msg/s | delivered/s (brokers) | of the offer | per node | delivered/s (drivers) | publishes late | p50 · p95 · p99 | forwarded, cluster · highest broker | reading | the rig's verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 10 | 25 | 150,000 | 150,419 | 100.3% | 15.0k | 150,401 | 8% | ≤25 · ≤100 · ≤500 ms | 4.78% · 11.99% | holds | NOT CARRIED |
+| 10 | 30 | 180,000 | 173,100 | 96.2% | 17.3k | 173,099 | 25% | ≤50 · ≤500 · ≤500 ms | 8.67% · 20.56% | holds | NOT CARRIED |
+| 12 | 30 | 180,000 | 179,039 | 99.5% | 14.9k | 179,033 | 7% | ≤50 · ≤100 · ≤500 ms | 13.41% · 33.33% | holds | NOT CARRIED |
+| 12 | 36 | 216,000 | 205,750 | 95.3% | 17.1k | 205,744 | 26% | ≤50 · ≤500 · ≤500 ms | 12.15% · 35.33% | holds | NOT CARRIED |
+| 14 | 35 | 210,000 | 208,739 | 99.4% | 14.9k | 208,745 | 14% | ≤50 · ≤500 · ≤500 ms | 15.79% · 49.27% | holds | NOT CARRIED |
+| 14 | 42 | 252,000 | 240,497 | 95.4% | 17.2k | 240,507 | 28% | ≤100 · ≤500 · ≤500 ms | 13.36% · 39.18% | holds | NOT CARRIED |
+
+Every 1-site rung (six) is GREEN at 6,000 msg/s and p99 ≤ 10 ms. The ledger closes on
+every rung: 306,233,432 identities, 0 missing, 0 unacknowledged, 0 duplicates, and every
+broker reports 0 drops. The chart draws all six loaded rungs as "holds, not certified".
+
+- **The total grew at each size, at about the same rate per node.** 150,419 → 179,039 →
+  208,739 msg/s at 15k per node offered; 173,100 → 205,750 → 240,497 at 18k.
+- **What the rig objects to.** At 15k per node, late publishes (7–14%; at 14 nodes the
+  rung was also not steady). At 18k, the offer was not met (95–96%), 25–28% of publishes
+  were late and no rung went steady. The verdicts are in the card, verbatim.
+- **The brokers were the limit at 18k per node, not the load generators.** No rung flags
+  a saturated driver core, and the least-idle driver host averaged 59–67% idle on the 18k
+  rungs. The least-idle broker host averaged 14–19% idle, and the summarizer's verdict is
+  WRITER-BOUND at all three sizes. One rung above 15k per size does not locate a ceiling.
+- **Forwarding grew with the cluster and the per-node rate did not fall.** The card of
+  section (c) predicted (1 − 1/N)^28 = 5.2%, 8.7% and 12.6% at 10, 12 and 14 nodes.
+  Measured at 15k per node: 4.78%, 13.41% and 15.79%. The prediction is about right at
+  10 and 14 and low at 12; consumers are not spread evenly across brokers.
+
+What cannot be concluded:
+
+- **That the hosts did not drift.** The closing 14-node arm, the drift control, did not
+  run: the re-formed cluster did not reach a full mesh within the rig's 180 s, because one
+  broker kept another marked dead
+  ([#971](https://github.com/mbilling/fss-mqtt-broker/issues/971)). The comparison across
+  sizes rests on one pass per size, with a GREEN 1-site control before and after each.
+- **Anything certified, or anything about failure independence at 12 and 14 nodes.**
+- **That this is the morning's 10-node arm.** 28 consumers per site and 16 drivers here,
+  20 and 20 there.
+
+Run: `knee-20261012T170816Z` (untracked).
 
 ## Related
 
