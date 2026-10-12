@@ -217,6 +217,7 @@ Consequences for the rig:
 - **A prediction, not a result:** the 14 · 12 · 10 campaign
   ([`durable-scaleout-10-12-14.md`](durable-scaleout-10-12-14.md)) uses 28 persistent
   consumers per site. (1 − 1/N)^28 is 12.6% at 14 nodes, 8.7% at 12 and 5.2% at 10.
+  That campaign has since run, and its card compares these with what it measured.
 
 ### Where the time goes
 

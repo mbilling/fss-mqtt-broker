@@ -20,7 +20,7 @@
 >
 > All three use shared subscriptions. [Scale-out ↓](#cluster-scale-out-qos-0-shared-subscriptions)
 >
-> **Newest, on the unreleased 1.2.0 candidate** (read from the brokers' counters; at 10 nodes mostly not certified by the rig): QoS 1 held 39–42k msg/s per node on 10 nodes. Durable QoS 1 took 15k per node in full and stopped taking more near 21k, with publishers slowed and nothing dropped. 427 million messages ledgered, none lost. [What we measured ↓](#scale-what-we-measured-on-the-120-candidate)
+> **Newest, on the unreleased 1.2.0 candidate** (read from the brokers' counters; above 3 nodes mostly not certified by the rig, and not at all past 10): **durable QoS 1 delivered 173,000 → 206,000 → 240,000 msg/s on 10 → 12 → 14 nodes**, about 17k per node at each size, p99 ≤ 500 ms, with publishers slowed and nothing dropped. QoS 1 with clean sessions held 39–42k msg/s per node on 10 nodes. 733 million messages ledgered, none lost. [What we measured ↓](#scale-what-we-measured-on-the-120-candidate)
 
 ---
 
@@ -120,9 +120,36 @@ store, not the log store of the 3-node figure below. These are not points on the
 commands: [qos1-knees-2026-10-12.md](bench/scale/qos1-knees-2026-10-12.md) ·
 [durable-knees-2026-10-12.md](bench/scale/durable-knees-2026-10-12.md).
 
-<!-- SCALE-OUT-10-12-14: the results of bench/scale/durable-scaleout-10-12-14.md go here, in a follow-up. -->
-**Not here yet:** durable QoS 1 at 14, 12 and 10 nodes
-([card](bench/scale/durable-scaleout-10-12-14.md)). No figure from it is published.
+**Durable QoS 1 past 10 nodes: the total grew at each size.** A third campaign the same
+day: one provisioning formed as 14, then 12, then 10 nodes, the same durable workload
+with 28 persistent consumers per site.
+
+| nodes | offered 15k msg/s per node: delivered | offered 18k msg/s per node: delivered | p99 | messages ledgered · lost |
+|---|---|---|---|---|
+| 10 | 150,419 msg/s (15.0k per node) | 173,100 of 180,000 (17.3k per node) | ≤ 500 ms | 91,243,694 · 0 |
+| 12 | 179,039 msg/s (14.9k per node) | 205,750 of 216,000 (17.1k per node) | ≤ 500 ms | 83,430,832 · 0 |
+| 14 | 208,739 msg/s (14.9k per node) | 240,497 of 252,000 (17.2k per node) | ≤ 500 ms | 131,558,906 · 0 |
+
+![Durable QoS 1 total msg/s at 10, 12 and 14 nodes on the 1.2.0 candidate: every rung holds, none certified](docs/benchmarks/img/scale-out-durable-candidate.svg)
+
+- **Adding nodes added throughput.** 10 → 12 → 14 nodes delivered 150,419 → 179,039 →
+  208,739 msg/s offered 15k per node, and 173,100 → 205,750 → 240,497 offered 18k, at the
+  same rate per node, with nothing lost.
+- **At 18k per node the brokers took 95–96% of the offer** and slowed the publishers.
+  The brokers were the limit, not the load generators, which had CPU to spare.
+- **The larger clusters forwarded more between brokers and kept the rate**: 4.78% of
+  publishes at 10 nodes, 13.41% at 12, 15.79% at 14.
+
+**Limits.** Same reading rule and same unreleased candidate as above, default store. The
+rig certified none of these six rungs: on each, publishers ran behind schedule. Each is
+one 60 s window. The closing arm, a repeat of the 14-node cluster as a drift control, did
+not run: the re-formed cluster did not reach a full mesh
+([#971](https://github.com/mbilling/fss-mqtt-broker/issues/971)). So drift over the two
+hours is not bounded by a repeat, only by the 1-site controls around each ladder. Brokers
+11–14 sit in a second placement group and may share a physical host with another broker.
+With the two campaigns above, 733,316,488 messages ledgered, none lost. Every rung, the
+rig's verdicts, the cross-node counters and the commands:
+[durable-scaleout-10-12-14.md](bench/scale/durable-scaleout-10-12-14.md).
 
 ### Cluster scale-out, QoS 0 shared subscriptions
 
