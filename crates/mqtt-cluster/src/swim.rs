@@ -101,6 +101,23 @@ pub struct Config {
     /// never learn: to us the peer is merely deaf, and after this many silent
     /// probes we reintroduce ourselves with the full certificate.
     pub reprime_after: u32,
+    /// What counts as an unanswered probe for `reprime_after` (issue #971). `true`
+    /// (the default): a probe whose DIRECT ack never came, whether or not helpers
+    /// then reached the member — an `IndirectAck` proves the member is alive, not
+    /// that it can hear *us*, and a member that drops our datagrams as `cert-miss`
+    /// is rescued by helpers every round. `false` is v1.1.0's rule (only a probe
+    /// that helpers could not rescue either counts, and an indirect ack resets the
+    /// count), kept so the formation simulation can run a v1.1.0 node beside a
+    /// current one.
+    pub reprime_on_rescued_probe: bool,
+    /// Greet a member once, with a certificate-carrying `Join`, at the moment its
+    /// `Dead` tombstone is pruned (issue #971). After the prune this node holds
+    /// nothing about the member and would never address it again; if the `Dead`
+    /// was false — and above all if the two nodes evicted EACH OTHER, so neither
+    /// probes the other — nothing else re-introduces them in a quiet cluster. A
+    /// live member answers with a `Sync` and is re-admitted first-hand; a dead one
+    /// costs a single datagram per prune. `false` is v1.1.0's behaviour.
+    pub greet_pruned: bool,
 }
 
 impl Default for Config {
@@ -118,6 +135,8 @@ impl Default for Config {
             awareness_max: 8,
             isolation_rounds: 5,
             reprime_after: 3,
+            reprime_on_rescued_probe: true,
+            greet_pruned: true,
         }
     }
 }
@@ -152,11 +171,13 @@ pub struct Member {
     /// (ADR 0016 §3). Its size shrinks the effective suspicion window; reset whenever the
     /// member's `(incarnation, state)` identity changes.
     suspecters: BTreeSet<NodeId>,
-    /// Consecutive direct probes of OURS this member never answered (directly or via
-    /// helpers). Reset by any ack that clears a probe of it. At
-    /// `Config::reprime_after` the next probe is accompanied by a `Join` re-greet —
-    /// the certificate-carrying prime frame that heals a receiver-side cert-cache
-    /// loss (issue #383): its `Sync` reply re-primes both directions.
+    /// Consecutive probes of OURS this member did not answer DIRECTLY (issue #971:
+    /// helpers reaching it does not show that it hears us). Reset by its direct
+    /// ack. At `Config::reprime_after` the next probe is accompanied by a `Join`
+    /// re-greet — the certificate-carrying prime frame that heals a receiver-side
+    /// cert-cache loss (issue #383): its `Sync` reply re-primes both directions.
+    /// (With `Config::reprime_on_rescued_probe` off, v1.1.0's rule: only probes
+    /// that helpers could not rescue either, reset by any ack.)
     unanswered_probes: u32,
 }
 
@@ -375,6 +396,10 @@ pub struct Swim {
     /// keeps painting a fresh-looking `Alive` view. Reset by any ack of any
     /// probe of ours.
     failed_probe_rounds: u32,
+    /// SWIM addresses of members seen starting a NEW LIFE (a higher generation)
+    /// since the driver last asked ([`take_new_lives`](Self::take_new_lives)). A set
+    /// of member addresses, so bounded by the membership however rarely it is drained.
+    new_lives: BTreeSet<String>,
 }
 
 impl Swim {
@@ -419,7 +444,22 @@ impl Swim {
             awareness: 0,
             leaving: false,
             failed_probe_rounds: 0,
+            new_lives: BTreeSet::new(),
         }
+    }
+
+    /// The SWIM addresses of members that have started a new life (a restart: a
+    /// higher generation) since this was last called, and forget them.
+    ///
+    /// For the driver (issue #971): a restarted process starts with an empty
+    /// certificate cache, so whatever this node remembers about having shown it our
+    /// certificate is about a process that no longer exists. The driver un-primes
+    /// these addresses before it seals anything else, so the very next datagram to
+    /// each — typically the reply to the datagram that revealed the restart —
+    /// carries the full certificate, and the restarted member never has to drop one
+    /// of ours.
+    pub fn take_new_lives(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.new_lives).into_iter().collect()
     }
 
     /// This node's id.
@@ -557,6 +597,48 @@ impl Swim {
         }
     }
 
+    /// This node's claim about itself: `Alive`, this life, at its current incarnation.
+    fn self_update(&self) -> Update {
+        Update {
+            id: self.local.0.clone(),
+            addr: self.local_addr.clone(),
+            peer_addr: self.local_peer_addr.clone(),
+            incarnation: self.incarnation,
+            generation: self.generation,
+            state: MemberState::Alive,
+            suspecter: None,
+            failure_domain: self.local_domain.clone(),
+        }
+    }
+
+    /// A `Join` greeting to `addr` — the frame the driver seals with this node's FULL
+    /// certificate and the receiver answers with a `Sync` sealed with its own, so one
+    /// exchange teaches both sides the other's certificate (issue #971). It carries
+    /// only this node's claim about itself (so the receiver learns the incarnation we
+    /// run at, as in `tick`'s bootstrap greeting) and does NOT draw on the gossip
+    /// queue: the driver sends it to a datagram's source address before that source
+    /// is authenticated, and pending membership updates must not have their
+    /// retransmit budget spent on an address that may not be a member at all.
+    ///
+    /// Used by the driver when it drops a datagram for `cert-miss`, and by `tick`
+    /// when a tombstone is pruned.
+    #[must_use]
+    pub fn greet(&self, addr: &str) -> Action {
+        Action::Send {
+            to: addr.to_string(),
+            msg: Message {
+                from: self.local.0.clone(),
+                from_addr: self.local_addr.clone(),
+                from_peer_addr: self.local_peer_addr.clone(),
+                from_domain: self.local_domain.clone(),
+                from_generation: self.generation,
+                cluster_id: None, // stamped by the driver at send time (ADR 0054)
+                kind: Kind::Join,
+                gossip: vec![self.self_update()],
+            },
+        }
+    }
+
     /// Apply one membership update, returning any observable state change.
     ///
     /// Handles self-refutation: a `Suspect`/`Dead` claim about us at an incarnation
@@ -687,6 +769,12 @@ impl Swim {
             // our own loopback. Same shape as `peer_addr`'s empty-claim rule.
             if !unroutable(&u.addr) {
                 m.addr.clone_from(&u.addr);
+            }
+            if new_life {
+                // A new process holds none of the certificates the old one had
+                // cached — ours included (issue #971). Tell the driver, so the next
+                // datagram we send this member carries it again.
+                self.new_lives.insert(m.addr.clone());
             }
             // Never let a claimant that hasn't learned the routing address yet
             // erase one we already know.
@@ -873,7 +961,7 @@ impl Swim {
     /// membership changes observed.
     pub fn tick(&mut self, now: u64) -> Vec<Action> {
         let mut out = Vec::new();
-        self.prune_tombstones(now);
+        self.prune_tombstones(now, &mut out);
         if !self.bootstrapped {
             self.bootstrapped = true;
             self.next_probe_at = now + self.cfg.protocol_period_ms;
@@ -965,6 +1053,16 @@ impl Swim {
             if let Some(p) = &mut self.probe {
                 p.indirect_deadline = Some(indirect_deadline);
             }
+            // The member did not answer us DIRECTLY (issue #971). Counted here, not
+            // when the indirect round fails too: helpers reaching the member says it
+            // is alive, not that it hears us — and a member that drops our datagrams
+            // as `cert-miss` is rescued by its helpers every single round, so a count
+            // that an indirect ack resets never reaches the re-greet.
+            if self.cfg.reprime_on_rescued_probe {
+                if let Some(m) = self.members.get_mut(&target) {
+                    m.unanswered_probes = m.unanswered_probes.saturating_add(1);
+                }
+            }
         } else if let Some(idl) = p.indirect_deadline {
             if now >= idl {
                 // Indirect probing also failed: suspect the target. We do NOT raise our
@@ -977,9 +1075,12 @@ impl Swim {
                 // RUN of silent round-robin targets means the silence is ours.
                 self.failed_probe_rounds = self.failed_probe_rounds.saturating_add(1);
                 let target = p.target.clone();
-                if let Some(m) = self.members.get_mut(&target) {
-                    // Per-member deafness (issue #383): drives the Join re-greet.
-                    m.unanswered_probes = m.unanswered_probes.saturating_add(1);
+                if !self.cfg.reprime_on_rescued_probe {
+                    if let Some(m) = self.members.get_mut(&target) {
+                        // Per-member deafness (issue #383), v1.1.0's rule: counted
+                        // only when helpers could not reach the member either.
+                        m.unanswered_probes = m.unanswered_probes.saturating_add(1);
+                    }
                 }
                 self.probe = None;
                 self.declare(&target, MemberState::Suspect, now, out);
@@ -990,9 +1091,29 @@ impl Swim {
     /// Remove tombstoned `Dead` members whose `dead_ttl_ms` has elapsed (ADR 0016
     /// phase 1). By now stale gossip has drained, so the id may rejoin as a fresh
     /// member without having to out-race a lingering refutation.
-    fn prune_tombstones(&mut self, now: u64) {
-        self.members
-            .retain(|_, m| m.tombstone_deadline.is_none_or(|d| now < d));
+    ///
+    /// Each pruned member gets one parting `Join` (issue #971, `Config::greet_pruned`):
+    /// from here on this node holds nothing about it and would never address it
+    /// again, so a member that was declared `Dead` falsely — and that, having been
+    /// declared dead by us, may equally have declared US dead and stopped probing —
+    /// would stay out of this node's view until some third party happened to gossip
+    /// about it. If it is alive it answers with a `Sync` (first-hand, so it is
+    /// re-admitted at once); if it is not, this is one datagram to a closed port.
+    /// A node that is itself leaving greets nobody.
+    fn prune_tombstones(&mut self, now: u64, out: &mut Vec<Action>) {
+        let mut pruned = Vec::new();
+        self.members.retain(|_, m| {
+            let keep = m.tombstone_deadline.is_none_or(|d| now < d);
+            if !keep && !unroutable(&m.addr) {
+                pruned.push(m.addr.clone());
+            }
+            keep
+        });
+        if self.cfg.greet_pruned && !self.leaving {
+            for addr in pruned {
+                out.push(self.greet(&addr));
+            }
+        }
     }
 
     fn expire_suspects(&mut self, now: u64, out: &mut Vec<Action>) {
@@ -1205,8 +1326,13 @@ impl Swim {
                         self.probe = None;
                         self.lower_awareness(); // an indirect probe still succeeded
                         self.failed_probe_rounds = 0; // our PingReq reached a helper
-                        if let Some(m) = self.members.get_mut(&NodeId(target)) {
-                            m.unanswered_probes = 0;
+
+                        // The member is alive — but it still has not answered US,
+                        // so the deaf-peer count stands (issue #971).
+                        if !self.cfg.reprime_on_rescued_probe {
+                            if let Some(m) = self.members.get_mut(&NodeId(target)) {
+                                m.unanswered_probes = 0;
+                            }
                         }
                     }
                 }
@@ -1302,6 +1428,8 @@ mod tests {
             awareness_max: 8,
             isolation_rounds: 3,
             reprime_after: 3,
+            reprime_on_rescued_probe: true,
+            greet_pruned: true,
         }
     }
 
@@ -2825,5 +2953,310 @@ mod tests {
         let b = s.members().into_iter().find(|m| m.id.0 == "b").unwrap();
         assert_eq!(b.state, MemberState::Alive);
         assert_eq!(b.addr, "b:1");
+    }
+
+    /// The `Join` greetings in `actions`, as the addresses they go to.
+    fn joins_to(actions: &[Action]) -> Vec<String> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Send { to, msg } if matches!(msg.kind, Kind::Join) => Some(to.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Node `a`, bootstrapped, holding `b` alive, asking one helper per failed probe.
+    fn node_holding_b(cfg: &Config) -> Swim {
+        let mut s = Swim::new(
+            NodeId("a".to_string()),
+            "a:1".to_string(),
+            peer_addr_of("a:1"),
+            None,
+            1,
+            Config {
+                indirect_probes: 1,
+                ..cfg.clone()
+            },
+            Vec::new(),
+        );
+        let mut out = Vec::new();
+        s.apply_update(&alive_update("b", "b:1", 0), 0, &mut out);
+        s.tick(0); // bootstrap
+        s
+    }
+
+    /// Issue #971: a member that drops our datagrams as `cert-miss` never acks us
+    /// directly, but its helpers reach it every round. That rescue used to reset the
+    /// deaf-peer count, so the certificate-carrying re-greet of #383 never fired and
+    /// the pair stayed one-sided for minutes. A probe that only helpers rescued now
+    /// counts; only the member's own ack clears it.
+    #[test]
+    fn a_probe_rescued_only_by_helpers_still_counts_toward_the_regreet() {
+        let mut s = node_holding_b(&fast_cfg());
+        // c is the helper. It is probed too (and answers directly), in whatever order
+        // the shuffle draws, so the loop counts the probes of b.
+        let mut out = Vec::new();
+        s.apply_update(&alive_update("c", "c:1", 0), 0, &mut out);
+        let mut t = 100;
+        let mut probes_of_b = 0;
+        let mut regreeted_at = None;
+        // Bounded: b and c alternate at worst, so 3 unanswered probes of b plus the
+        // re-greeting one take at most 8 rounds.
+        for _ in 0..8 {
+            let started = s.tick(t);
+            let pinged_b = started.iter().any(|a| {
+                matches!(a, Action::Send { to, msg } if to == "b:1" && matches!(msg.kind, Kind::Ping { .. }))
+            });
+            if pinged_b {
+                if joins_to(&started) == vec!["b:1".to_string()] {
+                    regreeted_at = Some(probes_of_b);
+                    break;
+                }
+                probes_of_b += 1;
+                s.tick(t + 21); // no direct ack: the helper is asked
+                s.handle(
+                    m(
+                        "c",
+                        "c:1",
+                        Kind::IndirectAck {
+                            target: "b".to_string(),
+                        },
+                        vec![],
+                    ),
+                    t + 25,
+                );
+                assert_eq!(member_state(&s, "b"), Some(MemberState::Alive));
+            } else {
+                // c's turn: it answers directly.
+                let seq = ping_seq(&started).expect("a probe of c");
+                s.handle(m("c", "c:1", Kind::Ack { seq }, vec![]), t + 1);
+            }
+            t += 100;
+        }
+        assert_eq!(
+            regreeted_at,
+            Some(3),
+            "the fourth probe of a member whose last three were rescued only by helpers \
+             is accompanied by a Join"
+        );
+
+        // b answers that probe itself: it hears us again, and the re-greets stop.
+        let seq = s.seq;
+        s.handle(m("b", "b:1", Kind::Ack { seq }, vec![]), t + 1);
+        for _ in 0..4 {
+            t += 100;
+            let started = s.tick(t);
+            assert!(
+                joins_to(&started).is_empty(),
+                "an answered member is not re-greeted: {started:?}"
+            );
+            if let Some(seq) = ping_seq(&started) {
+                let from = if started
+                    .iter()
+                    .any(|a| matches!(a, Action::Send { to, .. } if to == "b:1"))
+                {
+                    "b"
+                } else {
+                    "c"
+                };
+                s.handle(
+                    m(from, &format!("{from}:1"), Kind::Ack { seq }, vec![]),
+                    t + 1,
+                );
+            }
+        }
+    }
+
+    /// v1.1.0's rule, kept behind `reprime_on_rescued_probe: false` for the
+    /// mixed-version simulation: an indirect ack resets the count, so a member
+    /// rescued by helpers every round is never re-greeted.
+    #[test]
+    fn with_the_v1_1_rule_a_rescued_probe_resets_the_regreet_count() {
+        let mut s = node_holding_b(&Config {
+            reprime_on_rescued_probe: false,
+            ..fast_cfg()
+        });
+        let mut out = Vec::new();
+        s.apply_update(&alive_update("c", "c:1", 0), 0, &mut out);
+        let mut t = 100;
+        for _ in 0..12 {
+            let started = s.tick(t);
+            assert!(
+                joins_to(&started).is_empty(),
+                "never re-greeted: {started:?}"
+            );
+            let pinged_b = started
+                .iter()
+                .any(|a| matches!(a, Action::Send { to, .. } if to == "b:1"));
+            if pinged_b {
+                s.tick(t + 21);
+                s.handle(
+                    m(
+                        "c",
+                        "c:1",
+                        Kind::IndirectAck {
+                            target: "b".to_string(),
+                        },
+                        vec![],
+                    ),
+                    t + 25,
+                );
+            } else if let Some(seq) = ping_seq(&started) {
+                s.handle(m("c", "c:1", Kind::Ack { seq }, vec![]), t + 1);
+            }
+            t += 100;
+        }
+    }
+
+    /// Issue #971: at the moment a tombstone is pruned this node forgets the member
+    /// and would never address it again. If the `Dead` was false and the member has
+    /// stopped probing us too (it declared US dead in the same episode), nothing
+    /// re-introduces the pair. So the prune sends the member one `Join` — once.
+    #[test]
+    fn a_pruned_member_is_greeted_once_as_its_tombstone_goes() {
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        s.apply_update(&alive_update("b", "b:1", 0), 0, &mut out);
+        s.tick(0); // bootstrap
+        s.apply_update(&dead_update("b", "b:1", 0), 10, &mut out);
+        let ttl = fast_cfg().dead_ttl_ms;
+
+        // While the tombstone stands: nothing is sent to a dead member.
+        let before = s.tick(10 + ttl - 1);
+        assert!(joins_to(&before).is_empty(), "{before:?}");
+
+        // The prune: one certificate-carrying greeting, carrying our own claim.
+        let pruned = s.tick(10 + ttl);
+        assert_eq!(member_state(&s, "b"), None);
+        assert_eq!(joins_to(&pruned), vec!["b:1".to_string()]);
+        let greeting = pruned
+            .iter()
+            .find_map(|a| match a {
+                Action::Send { msg, .. } if matches!(msg.kind, Kind::Join) => Some(msg),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(greeting.gossip, vec![alive_update("a", "a:1", 1)]);
+
+        // Once. The member is gone from the view; nothing addresses it again.
+        for i in 1..=30u64 {
+            let later = s.tick(10 + ttl + i * 100);
+            assert!(joins_to(&later).is_empty(), "{later:?}");
+        }
+
+        // If the member is alive it answers with a Sync, and is back first-hand.
+        s.handle(
+            m("b", "b:1", Kind::Sync, vec![alive_update("b", "b:1", 1)]),
+            10 + ttl + 5000,
+        );
+        assert_eq!(member_state(&s, "b"), Some(MemberState::Alive));
+    }
+
+    /// The parting greeting has two exceptions: v1.1.0's rule (off), and a node that
+    /// is itself leaving — it must not invite anyone back.
+    #[test]
+    fn no_parting_greeting_under_the_v1_1_rule_or_while_leaving() {
+        let ttl = fast_cfg().dead_ttl_ms;
+        let mut out = Vec::new();
+
+        let mut old = Swim::new(
+            NodeId("a".to_string()),
+            "a:1".to_string(),
+            peer_addr_of("a:1"),
+            None,
+            1,
+            Config {
+                greet_pruned: false,
+                ..fast_cfg()
+            },
+            Vec::new(),
+        );
+        old.apply_update(&alive_update("b", "b:1", 0), 0, &mut out);
+        old.tick(0);
+        old.apply_update(&dead_update("b", "b:1", 0), 10, &mut out);
+        let pruned = old.tick(10 + ttl);
+        assert_eq!(member_state(&old, "b"), None);
+        assert!(joins_to(&pruned).is_empty(), "{pruned:?}");
+
+        let mut leaving = node("a", "a:1", &[]);
+        leaving.apply_update(&alive_update("b", "b:1", 0), 0, &mut out);
+        leaving.tick(0);
+        leaving.apply_update(&dead_update("b", "b:1", 0), 10, &mut out);
+        let _ = leaving.leave();
+        let pruned = leaving.tick(10 + ttl);
+        assert_eq!(member_state(&leaving, "b"), None);
+        assert!(joins_to(&pruned).is_empty(), "{pruned:?}");
+    }
+
+    /// Issue #971: a member's restart (a higher generation) is reported to the
+    /// driver, once, by its SWIM address — whether we learn of it first-hand or from
+    /// a relay — so the driver can show the new process our certificate again. A
+    /// first sighting, a refutation and a stale claim are not restarts.
+    #[test]
+    fn a_members_new_life_is_reported_to_the_driver_exactly_once() {
+        let mut s = node("a", "a:1", &[]);
+        // First sighting of b and c (generation 1): nothing to re-prime.
+        s.handle(
+            m("b", "b:1", Kind::Join, vec![alive_update("c", "c:1", 0)]),
+            0,
+        );
+        assert!(s.take_new_lives().is_empty());
+        // A higher incarnation of the same life: not a restart.
+        s.handle(
+            m("b", "b:1", Kind::Sync, vec![alive_update("b", "b:1", 5)]),
+            1,
+        );
+        assert!(s.take_new_lives().is_empty());
+
+        // b's own datagram from a new process: first-hand.
+        let mut from_new_b = m("b", "b:1", Kind::Ping { seq: 1 }, vec![]);
+        from_new_b.from_generation = 2;
+        s.handle(from_new_b.clone(), 2);
+        assert_eq!(s.take_new_lives(), vec!["b:1".to_string()]);
+        assert!(s.take_new_lives().is_empty(), "reported once");
+        // More datagrams from the same life: nothing new.
+        s.handle(from_new_b, 3);
+        assert!(s.take_new_lives().is_empty());
+
+        // c's restart, learned from a relay.
+        let relayed = Update {
+            generation: 2,
+            ..alive_update("c", "c:1", 1)
+        };
+        s.handle(m("b", "b:1", Kind::Sync, vec![relayed.clone()]), 4);
+        assert_eq!(s.take_new_lives(), vec!["c:1".to_string()]);
+        // A claim about c's previous life changes nothing and reports nothing.
+        s.handle(
+            m("b", "b:1", Kind::Sync, vec![dead_update("c", "c:1", 9)]),
+            5,
+        );
+        assert!(s.take_new_lives().is_empty());
+        assert_eq!(member_state(&s, "c"), Some(MemberState::Alive));
+    }
+
+    /// `greet` is what the driver sends to the source of a datagram it could not
+    /// authenticate to a node (issue #971). It must say only who we are, and must
+    /// not spend pending updates' retransmit budget on that address.
+    #[test]
+    fn a_greeting_carries_only_our_own_claim_and_leaves_the_gossip_queue_alone() {
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        s.apply_update(&alive_update("b", "b:1", 0), 0, &mut out);
+        s.apply_update(&dead_update("c", "c:1", 4), 0, &mut out);
+        let queued = s.gossip.clone();
+        assert_eq!(queued.len(), 2);
+
+        let Action::Send { to, msg } = s.greet("203.0.113.9:7946") else {
+            panic!("a greeting is a datagram");
+        };
+        assert_eq!(to, "203.0.113.9:7946");
+        assert_eq!(msg.kind, Kind::Join);
+        assert_eq!(msg.gossip, vec![alive_update("a", "a:1", 1)]);
+        assert_eq!(s.gossip, queued, "the queue and its budgets are untouched");
+        assert!(
+            s.members().iter().all(|m| m.addr != "203.0.113.9:7946"),
+            "greeting an address does not make it a member"
+        );
     }
 }

@@ -2386,6 +2386,14 @@ IGNORE_ALLOWLIST: dict[str, tuple[str, str | None]] = {
         "asserted by `the_sweep_retransmits_only_overdue_forwards`, which every tier runs",
         None,
     ),
+    "crates/mqtt-cluster/tests/swim_formation_sim.rs::formation_report": (
+        "measurement, not a pass/fail: it prints what a signed-gossip formation does at seven "
+        "sizes on v1.1.0's rules, with each cause removed in turn, on this tree and in mixed "
+        "clusters (issue #971; minutes long, --release). Its figures are recorded in ADR "
+        "0022's 2026-10-12 amendment; the behaviour is asserted by the other tests of that "
+        "file, which every tier runs with bounds",
+        None,
+    ),
     "crates/mqttd/tests/durable_bench.rs::durable_path_floor": (
         "macro-benchmark: minutes long, and only meaningful in --release",
         None,

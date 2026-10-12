@@ -223,3 +223,73 @@ picked up when the address arrived.
 Wire: `Update.generation` and `Message.from_generation` are appended fields — a
 pre-1.0 reshape under ADR 0039, same clean-break rules as ADR 0052 and the
 `cluster_id` field before them, so `BASELINE_REF` moves with it.
+
+## Amendment (2026-10-12): a falsely evicted member is re-admitted in bounded time (issue #971)
+
+The formation storm of issue #971 was a certificate-distribution fault and is settled in
+[ADR 0022](0022-signed-gossip.md)'s amendment of the same date. What it exposed here is
+what happens *after* a false `Dead`, whatever caused it: on 1.1.0 nothing guaranteed the
+member ever came back.
+
+**Why it stayed out.** Membership is disseminated only on change — updates piggyback on
+probe traffic for a bounded number of retransmissions, and a `Sync` answers a `Join` and
+nothing else; there is no periodic exchange of views. A node that declares a peer `Dead`
+fences it for `DEAD_TTL` (§1) and then prunes it, after which it holds nothing about the
+peer and never addresses it again. Whether the peer returns then depends on the peer:
+
+- if it still holds the evictor alive it keeps probing it, and its datagram re-admits
+  it first-hand — unless the evictor cannot open that datagram (ADR 0022: a missing
+  certificate), in which case the probe fails, helpers rescue it, and the pair stays
+  one-sided. The issue-#383 re-greet was meant for exactly this and never fired: it
+  counted only probes that helpers could **not** rescue, and an indirect ack reset the
+  count;
+- if the two nodes declared **each other** dead — which a short outage of one of them
+  produces routinely, see below — neither probes the other. A third party's gossip is
+  the only way back, and in a quiet cluster there is none. The first-hand rule of #383
+  cannot help: no first-hand datagram is ever sent.
+
+In the simulation a member cut off for 8 s in a formed 5-node cluster was still evicted
+by some node five minutes later in 13 of 16 seeds on 1.1.0; at 14 and 30 nodes the views
+took up to 88 s and 116 s to become whole, healed only by gossip that happened to pass.
+
+### Decision
+
+1. **A probe that only helpers rescued counts toward the re-greet.** `unanswered_probes`
+   is now "probes this member did not answer *directly*": it rises when the direct ack
+   deadline lapses and is cleared by the member's own ack, not by an `IndirectAck`. An
+   indirect ack says the member is alive; it does not say the member hears *us*. After
+   `reprime_after` (3) such probes the next one is accompanied by the certificate-carrying
+   `Join`, as #383 intended. (Between two current nodes ADR 0022's request heals the pair
+   on the first probe; this rule is what heals it when the evictor still runs 1.1.0, or
+   the request was not sent.)
+2. **A pruned member gets one parting `Join`.** At the moment a tombstone is pruned the
+   node greets the member it is about to forget. A live member answers with a `Sync` and
+   is re-admitted first-hand, whichever of the two had stopped probing; a dead one costs
+   one datagram to a closed port per prune. A node that is itself leaving greets nobody.
+
+Neither weakens §1 or the generation rules. The fence still stands for its full
+`DEAD_TTL`; a crashed process answers no greeting; a restarted one was already admitted
+by its generation. Nothing is accepted that was not accepted before — the greeting only
+makes a live member speak.
+
+With both, the same 8 s cut heals in every seed: no node holds a healthy member out for
+longer than `DEAD_TTL` plus a round trip (30.1 s measured, at every size), and every view
+is whole within 59 s at worst (14 nodes; 41 s at 30).
+
+Both rules are `Config` switches (`reprime_on_rescued_probe`, `greet_pruned`), on by
+default; off, they are 1.1.0's behaviour, which is how the formation simulation runs a
+1.1.0 node beside a current one. They are not operator configuration.
+
+### What this does not fix: a short outage can still end in a false `Dead`
+
+The suspicion window is 4 s for one suspecter and shrinks to 1.5 s with three (§3). It
+does not grow with the cluster, and a refutation travels only as fast as piggybacked
+gossip: the suspicion has to reach the suspect and the refutation has to return, each a
+few probe periods' worth of hops. With every certificate known, cutting one member of a
+formed cluster off for **1.5 s** ends in some node declaring it dead in the median seed
+at 14 and at 30 nodes (none at 5), on 1.1.0 and now alike. What has changed is the cost:
+the eviction now ends at `DEAD_TTL` (30.1 s), where it ran to 46 s and 63 s at worst.
+
+SWIM's own answer is a window that scales with log N, and Lifeguard's is to tell the
+suspect directly; either is a change to failure-detection timing that this amendment
+does not make; it is left for a change of its own.

@@ -262,7 +262,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 372 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 390 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -559,10 +559,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `swim::tests::a_first_hand_refutation_pierces_the_tombstone_but_a_relay_does_not`
 - `swim::tests::a_fully_removed_member_is_readmitted_on_direct_contact_and_a_refutation_sticks`
 - `swim::tests::a_gracefully_left_node_is_readmitted_when_it_restarts`
+- `swim::tests::a_greeting_carries_only_our_own_claim_and_leaves_the_gossip_queue_alone`
 - `swim::tests::a_leaving_node_does_not_refute_its_own_dead`
+- `swim::tests::a_members_new_life_is_reported_to_the_driver_exactly_once`
 - `swim::tests::a_node_advertises_its_own_domain_on_outgoing_gossip`
 - `swim::tests::a_peer_marks_a_leaving_node_dead_immediately`
 - `swim::tests::a_ping_req_naming_an_unroutable_target_is_relayed_to_our_learned_address`
+- `swim::tests::a_probe_rescued_only_by_helpers_still_counts_toward_the_regreet`
+- `swim::tests::a_pruned_member_is_greeted_once_as_its_tombstone_goes`
 - `swim::tests::a_receiver_learns_a_peers_gossiped_failure_domain`
 - `swim::tests::a_reflected_datagram_from_ourselves_is_ignored`
 - `swim::tests::a_relay_poisoned_record_heals_on_first_direct_contact`
@@ -594,12 +598,21 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `swim::tests::join_triggers_full_state_sync`
 - `swim::tests::learns_a_new_member_from_gossip`
 - `swim::tests::leave_announces_self_as_dead_to_every_known_peer`
+- `swim::tests::no_parting_greeting_under_the_v1_1_rule_or_while_leaving`
 - `swim::tests::one_probers_suspicion_alone_holds_the_full_window`
 - `swim::tests::peer_addr_is_learned_from_first_contact_and_kept_on_empty_claims`
 - `swim::tests::ping_is_acked`
 - `swim::tests::probe_failure_leads_to_suspect_then_dead`
 - `swim::tests::refutation_resets_accumulated_suspicions`
 - `swim::tests::refutes_suspicion_about_self`
+- `swim::tests::with_the_v1_1_rule_a_rescued_probe_resets_the_regreet_count`
+- `swim_auth::first_contact_tests::a_rotated_signer_primes_every_destination_again`
+- `swim_auth::first_contact_tests::a_sequence_selects_the_sequenced_form_and_priming_applies_to_it_too`
+- `swim_auth::first_contact_tests::an_unprimed_destination_is_shown_the_certificate_once_more`
+- `swim_auth::first_contact_tests::the_first_datagram_to_each_destination_carries_the_full_certificate`
+- `swim_auth::first_contact_tests::the_periodic_full_certificate_still_rides_every_sixteenth_datagram`
+- `swim_auth::first_contact_tests::the_set_of_primed_destinations_is_bounded`
+- `swim_auth::first_contact_tests::the_shared_key_posture_is_unaffected`
 - `swim_auth::key_fingerprint_tests::key_fingerprints_track_the_accept_set_without_leaking_material`
 - `swim_auth::tests::a_datagram_sealed_with_an_accepted_secondary_key_opens`
 - `swim_auth::tests::a_key_outside_the_ring_is_rejected`
@@ -631,6 +644,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `swim_auth::tests::v2_body_framing_is_pinned`
 - `swim_auth::tests::v3_body_framing_is_pinned`
 - `swim_auth::tests::wrong_key_is_rejected`
+- `swim_driver::cert_request_tests::a_cert_miss_draws_one_bounded_join_and_nothing_in_the_datagram_is_believed`
+- `swim_driver::cert_request_tests::a_peer_pruned_after_a_false_dead_is_readmitted_on_its_next_probe`
+- `swim_driver::cert_request_tests::a_restarted_member_is_shown_our_certificate_again_in_the_very_next_datagram`
+- `swim_driver::cert_request_tests::a_v1_1_evictor_is_reprimed_after_three_probes_rescued_only_by_a_helper`
+- `swim_driver::cert_request_tests::the_request_limiter_bounds_its_rate_and_its_table`
 - `swim_driver::tests::a_self_claim_contradicting_the_certificate_is_rejected`
 - `swim_driver::tests::a_signed_relay_cannot_assert_a_third_partys_domain`
 - `swim_driver::tests::an_agreeing_self_claim_passes_and_an_unattested_one_is_kept`
@@ -661,6 +679,15 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `signed_gossip_converges`
 - `three_nodes_converge_then_detect_failure`
 - `two_nodes_discover_each_other`
+
+## `crates/mqtt-cluster/tests/swim_formation_sim.rs` — 6 test(s)
+
+- `a_cluster_part_way_through_the_upgrade_from_v1_1_forms`
+- `a_formation_run_is_reproducible_from_its_seed`
+- `a_member_falsely_declared_dead_is_readmitted_within_the_tombstone_ttl`
+- `a_signed_cluster_forms_with_no_false_suspicion_at_any_size`
+- `formation_report` — `#[ignore]`d
+- `the_v1_1_rules_reproduce_the_formation_storm_and_preshared_certificates_remove_it`
 
 ## `crates/mqtt-cluster/tests/swim_sim.rs` — 6 test(s)
 
@@ -2844,6 +2871,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `membership_perf_ack_requires_complete_confirmation` — only when `cfg(target_os = "linux")`
 - `membership_receipt_oracle_rejects_loss_duplicates_and_stale_bursts`
 - `membership_tcp_fixture_receives_all_data_before_each_socket_fence`
+
+## `crates/mqttd/tests/swim_formation_proc.rs` — 1 test(s)
+
+- `twelve_signed_brokers_form_a_whole_mesh_without_a_certificate_storm`
 
 ## `crates/mqttd/tests/swim_routing.rs` — 3 test(s)
 
