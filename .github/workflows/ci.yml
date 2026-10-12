@@ -447,6 +447,11 @@ jobs:
         run: python3 bench/scale/test-resize.py
       - name: Lane E knee stop — consecutive-fail count under set -u (offline)
         run: python3 bench/scale/test-lane-e-ladder.py
+      # A published chart may carry rungs the rig did not certify. They are drawn hollow,
+      # never in the certified colour, and the offered rate appears only where delivery
+      # read below it.
+      - name: The scale-out chart never draws an uncertified rung as a certified one
+        run: python3 bench/scale/chart-scale-out.py --self-test
 
   interop:
     name: foreign-client interop (mosquitto + paho)

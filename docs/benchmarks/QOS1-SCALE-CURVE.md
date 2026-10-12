@@ -348,6 +348,76 @@ the full offer every time.
 
 Run: `knee-20260926T213327Z` (untracked).
 
+## The 1.2.0 candidate at 3 and 10 nodes (2026-10-12) — not curve points
+
+Two campaigns on one day, each on one provisioning (10 × CCX23 + 20 × CCX33, Hetzner
+`fsn1`, arms 10 → 3 → 10): QoS 1 with clean sessions, then **durable** QoS 1 with
+persistent consumers.
+
+**Read this before any number below:**
+- **Unreleased binary.** The `release: v1.2.0` commit `7d4eced8`, cross-built by hand
+  (zig cc, x86_64 musl, not stripped, without the jq module), sha256 `9111c1eb…c513`. It
+  is not the release pipeline's signed build, and v1.2.0 was not tagged. By this
+  repository's rule a number from an unreleased build is not a published-curve point; the
+  curve table at the top of this document is unchanged.
+- **Not a comparison.** No v1.1.0 arm ran on the same hosts, so these runs do not measure
+  a change since v1.1.0.
+- **Observed.** `OBSERVE=1`: live Grafana was attached throughout.
+- **Rebuilt driver.** The audit driver was rebuilt for the run (archive `2cded28d…`), not
+  the `67bb4194…` archive behind the curve above.
+- **Zero loss everywhere.** Every rung of both campaigns closes its ledger: 233,716,926
+  and 193,366,130 message identities, none missing, unacknowledged or duplicated.
+
+Cards, with every rung, the verbatim verdicts, the ledgers and the commands:
+[qos1-knees-2026-10-12.md](../../bench/scale/qos1-knees-2026-10-12.md) and
+[durable-knees-2026-10-12.md](../../bench/scale/durable-knees-2026-10-12.md).
+
+![QoS 1 per node on the 1.2.0 candidate, certified and uncertified rungs](img/scale-out-qos1-candidate.svg)
+
+A green column is a rung the rig graded GREEN. A hollow column was measured and **not
+certified**. `delivered/s` is the summarizer's driver-side rate; the brokers' own counters
+are beside it where the two differ.
+
+### QoS 1, clean sessions
+
+| nodes | sites | offered msg/s | delivered/s | brokers counted | per node | p50 · p95 · p99 | the rig's verdict |
+|---|---|---|---|---|---|---|---|
+| 3 | 4 | 120,000 | 120,001 | 120,004 | 40.0k | ≤1 · ≤5 · ≤10 ms | GREEN |
+| 3 | 4 (rep 2) | 120,000 | 120,000 | 120,001 | 40.0k | ≤1 · ≤5 · ≤10 ms | GREEN |
+| 3 | 5 | 150,000 | 149,988 | 149,982 | 50.0k | ≤5 · ≤25 · ≤25 ms | GREEN (the ladder's top: a floor) |
+| 10 | 13 | 390,000 | 374,784 | 389,816 | 37.5k · 39.0k | ≤1 · ≤5 · ≤50 ms | NOT CARRIED |
+| 10 | 14 | 420,000 | 407,008 | 420,004 | 40.7k · 42.0k | ≤1 · ≤10 · ≤50 ms | NOT CARRIED |
+| 10 | 13 (drift control) | 390,000 | 376,125 | 390,290 | 37.6k · 39.0k | ≤1 · ≤5 · ≤25 ms | NOT CARRIED |
+
+The three NOT CARRIED verdicts, verbatim, in table order:
+
+```text
+NOT CARRIED: INVALID EVIDENCE (endpoint scrape window uncertainty exceeds 2%); DRIVER CORE SATURATED (driver13 core 1 was >=95% busy in 84% of 61 in-window samples — the load generator had no headroom; this rung measures the driver, not the broker)
+NOT CARRIED: INVALID EVIDENCE (endpoint scrape window uncertainty exceeds 2%); DRIVER CORE SATURATED (driver13 core 1 was >=95% busy in 63% of 65 in-window samples — the load generator had no headroom; this rung measures the driver, not the broker)
+NOT CARRIED: INVALID EVIDENCE (endpoint scrape window uncertainty exceeds 2%); DRIVER CORE SATURATED (driver13 core 1 was >=95% busy in 74% of 66 in-window samples — the load generator had no headroom; this rung measures the driver, not the broker)
+```
+
+- **Certified by the rig:** 3 nodes at 40k msg/s per node, twice, and at 50k/node once.
+  Crossing 0.00%.
+- **Measured, not certified:** all three 10-node rungs. One load-generator host had a
+  saturated core in both 10-node arms, and the drivers' endpoint scrapes missed the 2%
+  bound, so the rig measured its generator rather than the broker.
+- **What the 10-node rungs still show:** nothing lost, p99 ≤ 50 ms against a 1 s line, the
+  publishers sent 99.9–100.0% of the offer, and the brokers counted the full offer
+  (39.0k and 42.0k per node). The drivers' logs read 3–4% lower. That gap is a
+  disagreement between two readings the rig had already rejected, not loss.
+- **What they do not show:** a re-certified 39k/node at 10 nodes, or a knee. The ladder
+  stopped after two NOT CARRIED rungs and never ran 45k/node.
+
+### Durable QoS 1, default store (redb)
+
+The durable campaign of the same day is in
+[SCALE-CURVE.md](SCALE-CURVE.md#durable-qos-1-by-site-on-the-120-candidate-2026-10-12--not-curve-points):
+15.0k msg/s per node GREEN at 10 nodes, a ceiling near 21k per node at both 3 and 10
+nodes, zero loss, and a failed crossing gate at 10 nodes.
+
+Runs: `knee-20261012T105735Z` and `knee-20261012T122155Z` (untracked).
+
 ## The workload
 
 Identical at both sizes, and unchanged across every rung:
