@@ -23,12 +23,16 @@ Under each size, what kind of number the green figure is:
   floor       — the highest rung measured; the knee lies above it
   uncertified — the arm's own gate failed
 
-The per-rung chart (RUNG_CHARTS) draws one column per rung, msg/s per node:
-  GREEN column    the rig graded the rung GREEN — p99 <= 1 s, zero loss
-  hollow column   measured, NOT certified: the rig's verdict was NOT CARRIED
+The per-rung chart (RUNG_CHARTS) draws one column per rung, msg/s per node, at the
+rate the BROKERS' own counters delivered over the window (summarize-curve.py's
+`delivered/s (brokers)`), in three states that are never drawn alike:
+  filled GREEN    certified: the rig graded the rung GREEN — p99 <= 1 s, zero loss
+  GREEN outline   holds by the reading rule (no message lost, p99 <= 1 s, broker
+                  counters) but NOT certified: the rig's verdict was NOT CARRIED
                   (the reasons are in the card named in `source`)
-  tick above      the offered rate, where delivery read more than 1% below it
-A rung the rig did not certify is never drawn in the certified colour.
+  dashed grey     does not hold: a message was lost or p99 is above 1 s
+  tick above      the offered rate, where the brokers delivered more than 1% less
+A rung the rig did not certify is never filled.
 """
 import sys
 from pathlib import Path
@@ -83,49 +87,54 @@ CURVES = {
 }
 
 # One column per rung, in msg/s PER NODE, for a campaign whose rungs are not all
-# certified. A rung is (sites, offered msg/s, delivered msg/s, verdict, control):
-# delivered is summarize-curve.py's `delivered/s`, verdict "green" only where the
-# summarizer printed GREEN, anything else is drawn hollow. 1-site rungs are left out.
+# certified. A rung is (sites, offered msg/s, delivered msg/s, state, control):
+# delivered is summarize-curve.py's `delivered/s (brokers)`, the brokers' own
+# counters over the window. state is
+#   "green"  the summarizer's verdict is GREEN (the rig certified the rung)
+#   "holds"  its broker-counter reading says HOLDS and its verdict is not GREEN
+#   "fails"  its reading says DOES NOT HOLD
+# 1-site rungs are left out.
+RUNG_STATES = ("green", "holds", "fails")
 RUNG_CHARTS = {
     "qos1-candidate": {
         "file": "scale-out-qos1-candidate.svg",
-        "title": "QoS 1 per node, 1.2.0 candidate: 40–50k GREEN clean, 15k GREEN durable",
-        "subtitle": "msg/s per node, one column per rung · UNRELEASED candidate 7d4eced, not the signed "
-                    "release · 4-vCPU nodes · zero loss",
+        "title": "QoS 1 per node on the 1.2.0 candidate: every rung held, nothing lost",
+        "subtitle": "msg/s per node from the brokers' own counters, one column per rung · UNRELEASED "
+                    "candidate 7d4eced · 4-vCPU nodes",
         "source": "bench/scale/qos1-knees-2026-10-12.md · bench/scale/durable-knees-2026-10-12.md · "
-                  "Hetzner fsn1, 2026-10-12 · delivered = driver-side rate",
+                  "Hetzner fsn1, 2026-10-12",
         "y_max": 60_000, "y_step": 10_000,
         "panels": [
             {"title": "QoS 1, clean sessions — the routing path",
              "groups": [
-                 (3, "crossing 0.00%", [
+                 (3, "0.00% forwarded", [
+                     (4, 120_000, 120_004, "green", False),
                      (4, 120_000, 120_001, "green", False),
-                     (4, 120_000, 120_000, "green", False),
-                     (5, 150_000, 149_988, "green", False),
+                     (5, 150_000, 149_982, "green", False),
                  ]),
-                 (10, "crossing 0.00%", [
-                     (13, 390_000, 374_784, "not carried", False),
-                     (14, 420_000, 407_008, "not carried", False),
-                     (13, 390_000, 376_125, "not carried", True),
+                 (10, "0.00% forwarded", [
+                     (13, 390_000, 389_816, "holds", False),
+                     (14, 420_000, 420_004, "holds", False),
+                     (13, 390_000, 390_290, "holds", True),
                  ]),
              ]},
-            {"title": "Durable QoS 1 — redb store, 2 copies, fsync + replication",
+            {"title": "Durable QoS 1 — default store, 2 copies, fsync + quorum ack",
              "groups": [
-                 (3, "crossing 0.00%", [
-                     (12, 72_000, 62_806, "not carried", False),
-                     (15, 90_000, 63_429, "not carried", False),
+                 (3, "0.00% forwarded", [
+                     (12, 72_000, 62_243, "holds", False),
+                     (15, 90_000, 62_611, "holds", False),
                  ]),
-                 (10, "crossing gate failed: 14–17%", [
-                     (25, 150_000, 149_071, "not carried", False),
-                     (35, 210_000, 199_072, "not carried", False),
-                     (40, 240_000, 219_004, "not carried", False),
-                     (25, 150_000, 149_976, "green", True),
+                 (10, "13–17% of publishes forwarded", [
+                     (25, 150_000, 150_023, "holds", False),
+                     (35, 210_000, 192_217, "holds", False),
+                     (40, 240_000, 210_547, "holds", False),
+                     (25, 150_000, 149_979, "green", True),
                  ]),
              ]},
         ],
     },
 }
-# The offered rate is drawn where delivery read more than this share below it.
+# The offered rate is drawn where the brokers delivered more than this share below it.
 OFFER_TICK_BELOW = 0.99
 
 W, H = 960, 572
@@ -237,6 +246,9 @@ def per_node(v: float, n: int) -> str:
     return f"{v / n / 1000:.1f}k"
 
 
+STATE_WORDS = {"green": "certified GREEN", "holds": "holds, not certified", "fails": "does not hold"}
+
+
 def offer_tick(offered: float, delivered: float) -> bool:
     return delivered < OFFER_TICK_BELOW * offered
 
@@ -250,21 +262,28 @@ def draw_rungs(c: dict) -> str:
         return RT + ph - v / y_max * ph
 
     rungs = [(n, r) for p in c["panels"] for n, _, rs in p["groups"] for r in rs]
+    for _, r in rungs:
+        if r[3] not in RUNG_STATES:
+            raise SystemExit(f"unknown rung state {r[3]!r}; one of {', '.join(RUNG_STATES)}")
     o = cs.open_svg(RW, RH, c["title"], c["subtitle"],
-                    "One column per rung, msg/s per node. A green column is a rung the rig graded GREEN "
-                    "(p99 ≤ 1 s, zero loss); a hollow dashed column was measured but NOT certified; a tick "
-                    "above a column is the offered rate where delivery read below it. " + "; ".join(
+                    "One column per rung, msg/s per node, as the brokers' own counters delivered it. A filled "
+                    "green column is a rung the rig certified GREEN (p99 ≤ 1 s, zero loss); a green outline "
+                    "holds by the reading rule (no message lost, p99 ≤ 1 s) and is NOT certified by the rig; "
+                    "a dashed grey column does not hold; a tick above a column is the offered rate where the "
+                    "brokers delivered less. " + "; ".join(
                         f"{p['title']}, {n} nodes ({note}): " + ", ".join(
                             f"{sites} sites{' control' if ctl else ''} {per_node(dlv, n)} of "
-                            f"{per_node(off, n)} offered, {'GREEN' if v == 'green' else 'not certified'}"
+                            f"{per_node(off, n)} offered, {STATE_WORDS[v]}"
                             for sites, off, dlv, v, ctl in rs)
                         for p in c["panels"] for n, note, rs in p["groups"]))
 
-    keys = [("good", "GREEN · certified, p99 ≤ 1 s, zero loss", "box")]
-    if any(r[3] != "green" for _, r in rungs):
-        keys.append(("ghost", "measured, NOT certified · zero loss", "ghost"))
+    keys = [("good", "certified GREEN by the rig", "box")]
+    if any(r[3] == "holds" for _, r in rungs):
+        keys.append(("good", "holds: no loss, p99 ≤ 1 s · NOT certified", "outline"))
+    if any(r[3] == "fails" for _, r in rungs):
+        keys.append(("ghost", "does not hold", "ghost"))
     if any(offer_tick(r[1], r[2]) for _, r in rungs):
-        keys.append(("ink2", "offered, where delivery read below it", "line"))
+        keys.append(("ink2", "offered, where the brokers delivered less", "line"))
     lx = 32
     for role, label, kind in keys:
         o += cs.swatch(lx, 100, role, label, kind=kind)
@@ -292,10 +311,17 @@ def draw_rungs(c: dict) -> str:
                 top = y(dlv / n)
                 if verdict == "green":
                     o.append(cs.column(cx, top, y0, RCOL_W, "good"))
+                elif verdict == "holds":
+                    # Open at the baseline, so the outline reads as a column and
+                    # not as a box floating on the axis.
+                    o.append(f'<path d="M{cx + 1:.1f},{y0:.1f} V{top + 5:.1f} Q{cx + 1:.1f},{top + 1:.1f} '
+                             f'{cx + 5:.1f},{top + 1:.1f} H{cx + RCOL_W - 5:.1f} Q{cx + RCOL_W - 1:.1f},{top + 1:.1f} '
+                             f'{cx + RCOL_W - 1:.1f},{top + 5:.1f} V{y0:.1f}" fill="none" class="k-good" '
+                             'stroke-width="2" data-rung="holds"/>')
                 else:
                     o.append(f'<rect x="{cx + 0.75:.1f}" y="{top + 0.75:.1f}" width="{RCOL_W - 1.5:.1f}" '
                              f'height="{max(y0 - top - 0.75, 1):.1f}" rx="4" fill="none" class="k-ghost" '
-                             'stroke-width="1.5" stroke-dasharray="3 2" data-rung="uncertified"/>')
+                             'stroke-width="1.5" stroke-dasharray="3 2" data-rung="fails"/>')
                 if offer_tick(off, dlv):
                     yo = y(off / n)
                     if top - yo > 6:
@@ -326,36 +352,54 @@ def draw_rungs(c: dict) -> str:
 
 
 def self_test() -> None:
-    """A rung the rig did not certify must never be drawn as a certified one."""
+    """Certified, holds-but-not-certified and does-not-hold are three different marks,
+    and only a rung the rig certified is ever filled."""
     c = {
         "title": "t", "subtitle": "s", "source": "x", "y_max": 60_000, "y_step": 10_000,
         "panels": [{"title": "p", "groups": [
-            (3, "note-3", [(4, 120_000, 120_000, "green", False), (5, 150_000, 120_000, "not carried", False)]),
-            (10, "note-10", [(13, 390_000, 389_000, "not carried", True)]),
+            (3, "note-3", [(4, 120_000, 120_000, "green", False), (5, 150_000, 120_000, "holds", False),
+                           (6, 180_000, 90_000, "fails", False)]),
+            (10, "note-10", [(13, 390_000, 389_000, "holds", True)]),
         ]}],
     }
     svg = draw_rungs(c)
+    body = svg.split("</desc>")[1]
+    marks = {state: [line for line in svg.splitlines() if f'data-rung="{state}"' in line] for state in ("holds", "fails")}
     checks = [
         ("one certified column plus its legend key", svg.count('class="f-good"') == 2),
-        ("two hollow columns", svg.count('data-rung="uncertified"') == 2),
-        ("a hollow column has no fill", all('fill="none"' in line for line in svg.splitlines()
-                                            if 'data-rung="uncertified"' in line)),
-        ("the offered rate is drawn only where delivery read below it", svg.count('data-rung="offered"') == 1),
-        ("the unmet offer is labelled", "of 50.0k" in svg and "of 39.0k" not in svg.split("</desc>")[1]),
-        ("the legend names the uncertified mark", "measured, NOT certified" in svg),
+        ("two holds-not-certified columns", len(marks["holds"]) == 2),
+        ("one does-not-hold column", len(marks["fails"]) == 1),
+        ("an uncertified column has no fill", all('fill="none"' in line for lines in marks.values() for line in lines)),
+        ("holds is a solid green outline", all('class="k-good"' in line and "dasharray" not in line for line in marks["holds"])),
+        ("does-not-hold is dashed grey, never green", all('class="k-ghost"' in line and "dasharray" in line
+                                                          for line in marks["fails"])),
+        ("the offered rate is drawn only where the brokers delivered less", svg.count('data-rung="offered"') == 2),
+        ("the unmet offer is labelled", "of 50.0k" in body and "of 39.0k" not in body),
+        ("the legend names all three states", "certified GREEN by the rig" in body and "NOT certified" in body
+         and "does not hold" in body),
+        ("the description says which rungs are not certified", "holds, not certified" in svg.split("</desc>")[0]),
         ("the control rung is labelled", ">control<" in svg),
         ("both group notes are printed", "note-3" in svg and "note-10" in svg),
     ]
     all_green = {**c, "panels": [{"title": "p", "groups": [(3, "n", [(4, 120_000, 120_000, "green", False)])]}]}
-    checks.append(("no uncertified legend key without an uncertified rung",
-                   "NOT certified" not in draw_rungs(all_green).split("</desc>")[1]))
+    only = draw_rungs(all_green).split("</desc>")[1]
+    checks.append(("no holds or does-not-hold legend key without such a rung",
+                   "NOT certified" not in only and "does not hold" not in only))
+    try:
+        draw_rungs({**c, "panels": [{"title": "p", "groups": [(3, "n", [(4, 1, 1, "not carried", False)])]}]})
+        checks.append(("an unknown rung state is refused", False))
+    except SystemExit:
+        checks.append(("an unknown rung state is refused", True))
     for chart in RUNG_CHARTS.values():
         out = draw_rungs(chart)
-        want = sum(r[3] == "green" for p in chart["panels"] for _, _, rs in p["groups"] for r in rs)
-        total = sum(len(rs) for p in chart["panels"] for _, _, rs in p["groups"])
-        checks.append((f"{chart['file']}: {want} certified, {total - want} hollow",
-                       out.count('class="f-good"') == want + 1
-                       and out.count('data-rung="uncertified"') == total - want))
+        states = [r[3] for p in chart["panels"] for _, _, rs in p["groups"] for r in rs]
+        checks.append((f"{chart['file']}: {states.count('green')} certified, {states.count('holds')} holds, "
+                       f"{states.count('fails')} does not hold",
+                       out.count('class="f-good"') == states.count("green") + 1
+                       and out.count('data-rung="holds"') == states.count("holds")
+                       and out.count('data-rung="fails"') == states.count("fails")))
+        ticks = sum(offer_tick(r[1], r[2]) for p in chart["panels"] for _, _, rs in p["groups"] for r in rs)
+        checks.append((f"{chart['file']}: {ticks} offered ticks", out.count('data-rung="offered"') == ticks))
     # A 14-node point stays inside the plot, and the published curves keep their axis.
     wide = {**CURVES["qos1"], "points": CURVES["qos1"]["points"] + [(14, 400_000, "certified", "", None)]}
     checks.append(("a 14-node column is drawn inside the plot",
@@ -365,8 +409,9 @@ def self_test() -> None:
     bad = [name for name, ok in checks if not ok]
     if bad:
         raise SystemExit("chart-scale-out self-test FAILED: " + "; ".join(bad))
-    print(f"chart-scale-out self-test: {len(checks)} checks OK (an uncertified rung is hollow, never green; "
-          "the offered rate appears only where delivery read below it)")
+    print(f"chart-scale-out self-test: {len(checks)} checks OK (only a rung the rig certified is filled; one that "
+          "holds by the reading rule is a green outline, one that does not is dashed grey; the offered rate "
+          "appears only where the brokers delivered less)")
 
 
 def main() -> None:

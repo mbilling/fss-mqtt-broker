@@ -24,6 +24,14 @@ Honesty mechanics, enforced here rather than remembered:
   - Broker-side counter deltas cross-check driver-reported totals; a mismatch
     beyond ±2% is flagged on the row.
   - durable_bench's own verdicts (violations/caveats) are carried verbatim.
+  - A lane E rung is read TWICE, and the two are never merged. The verdict column is
+    the rig's certification (GREEN / NOT CARRIED and its reasons), from the drivers'
+    audited evidence. Beside it, `broker_reading` asserts the rung from the BROKERS'
+    own counters over their own window: it HOLDS if no message was lost (the identity
+    ledger closes and no broker dropped anything) and p99 is within 1 s. The delivered
+    rate printed first is the brokers'; the drivers' is the labelled column beside it,
+    and a gap between them past 2% is printed as READINGS DISAGREE, never resolved by
+    quietly picking one.
 """
 
 from __future__ import annotations
@@ -40,6 +48,7 @@ from pathlib import Path
 TOLERANCE = 0.02  # counter cross-check band
 DRIVER_OK = 0.97  # a rung counts only if the offered rate was actually reached
 CORE_SAT_SHARE = 0.5  # share of in-window samples a driver core may spend >=95% busy
+DELIVERED_OFFER = 0.99  # brokers delivered at least this share of the offer: "the offer", not "N% of it"
 LATE_OK = 0.05  # share of publishes behind their own schedule before a rung is flagged
 # Zero loss: a rung that drained and still owes a single message FAILED. Loss is
 # the only thing a rung can fail on; latency is graded (GREEN_MS / YELLOW_MS).
@@ -58,6 +67,11 @@ YELLOW_MS = 5000.0
 # misses it is telling you the cluster changed under the ladder, not that the rig
 # is imprecise.
 CONTROL_OK = 0.05
+# The broker-counter reading (`broker_reading`): a rung HOLDS at p99 <= this, the same
+# line as GREEN, and the drivers' delivered rate may sit this far from the brokers'
+# before the two are reported as disagreeing.
+HOLDS_P99_MS = GREEN_MS
+READINGS_AGREE = TOLERANCE
 # Seconds at the END of a rung's driver series that count as the measurement.
 # The rung's opening seconds are ramp (subscribers first, then publishers), and
 # averaging them in is what turned a healthy ladder into a phantom knee.
@@ -1156,6 +1170,7 @@ def self_test() -> None:
         if not r.get("incomplete") or r["pass"]:
             failures.append(f"an in-flight rung was not reported as incomplete: {r}")
 
+    failures += reading_self_test()
     if failures:
         for f in failures:
             print(f"FAIL {f}", file=sys.stderr)
@@ -1185,8 +1200,228 @@ def self_test() -> None:
         "a QoS 1 rung whose completion IS measurable, a rung measured mid-ramp, a "
         "rung on an un-reset cluster, a clean control rung, an in-flight rung; and "
         "at ladder level a failed control, a drifted control, a missing control "
-        "and a healthy ladder that must still claim its site count)"
+        "and a healthy ladder that must still claim its site count); "
+        "broker-counter reading OK (13 rungs — it HOLDS at the brokers' rate where the drivers' "
+        "evidence was refused and their logs read 4% low, the gap reported as READINGS DISAGREE; "
+        "one missing identity, a broker drop or p99 above 1 s DOES NOT HOLD; no ledger, no "
+        "latency histogram or an unreadable broker scrape is NOT ASSERTED; a skipped forwarding "
+        "control leaves the reading and marks only the forwarded share uncertified; a soft broker "
+        "window prints its band; an unmet offer holds at the carried rate with its share of the "
+        "offer; and the rig's verdict is the same before and after the reading)"
     )
+
+
+def reading_self_test() -> list[str]:
+    """The broker-counter reading, on synthesized rungs (no cluster, no cost).
+
+    One audited QoS 1 rung on one broker — 6,000 identities in a 60 s window, 100
+    msg/s — and then the same rung with one thing wrong at a time. Each case pins
+    what the reading says AND that the rig's own verdict is whatever it was before
+    the reading was computed.
+    """
+    import base64
+    import json
+    import tempfile
+
+    failures: list[str] = []
+    N = 6_000
+
+    def rung(root: Path, name: str, *, offered: int = 100, nodes: int = 1) -> Path:
+        d = root / name / f"nodes={nodes}" / "laneE" / "sites-1"
+        d.mkdir(parents=True)
+        subs = ["sub-s0-0", "sub-s0-1"]
+        eps = [{"name": "pub-s0-0", "driver": 0, "site": "0", "role": "pub", "clients": 1}] + [
+            {"name": n, "driver": 0, "site": "0", "role": "sub", "clients": 1} for n in subs]
+        (d / "manifest.json").write_text(json.dumps({"nodes": nodes, "drivers": 1, "window_secs": 60, "endpoints": eps}))
+        (d / "rung.txt").write_text(
+            f"sites=1 offered={offered} publishers=1 consumers=2 per_consumer=50 qos=1 sub_qos=1 window_secs=60 "
+            "window=aligned cpu_window=missing settled=yes reset=yes steady=yes drained=yes p99_budget_ms=1000\n")
+        (d / "window.tsv").write_text(
+            "host\tphase\tstart_ms\tend_ms\tmain_pid\n"
+            + "".join(f"broker{i}\topen\t100000\t100010\t42\nbroker{i}\tclose\t160000\t160010\t42\n" for i in range(nodes))
+            + "driver0\topen\t100000\t100010\t\ndriver0\tclose\t160000\t160010\t\n")
+        for phase, n in (("before", 0), ("window-open", 0), ("window-close", N), ("drain", N), ("after", N)):
+            for i in range(nodes):
+                (d / f"metrics-{phase}-broker{i}.prom").write_text(
+                    f'mqttd_publish_received_total{{qos="1"}} {n // nodes}\n'
+                    f'mqttd_publish_delivered_total{{qos="1"}} {n // nodes}\n'
+                    f"mqttd_peer_links {nodes - 1}\n# EOF\n")
+        for name in ["pub-s0-0"] + subs:
+            pub = name.startswith("pub")
+            for suffix, final in (("-base", False), ("", True), ("-terminal", True)):
+                n = (N if pub else N // 2) if final else 0
+                family = "puback_latency" if pub else "e2e_latency"
+                text = (f"audit_sent {n}\naudit_acked {n}\naudit_paused_workers {1 if final else 0}\npub_overrun 0\n"
+                        if pub else f"recv {n}\n")
+                text += f'{family}_bucket{{le="1"}} {n}\n{family}_bucket{{le="+Inf"}} {n}\n{family}_count {n}\n'
+                (d / f"{name}{suffix}.prom").write_text(text + "# EOF\n")
+            bits = (1 << N) - 1 if pub else sum(1 << i for i in range(subs.index(name), N, 2))
+            topic = base64.b64encode(b"site/0/1").decode()
+            (d / f"{name}.ledger").write_text("".join(
+                f"{kind}\t{topic}\t<0.1.0>\t{bits.bit_count()}\t{bits:X}\n"
+                for kind in (["sent", "acked"] if pub else ["received"])) + "# EOF\n")
+        return d
+
+    def read(d: Path) -> tuple[dict, dict, str]:
+        r = lane_e_rung(d)
+        before = (rung_verdict(r), r["pass"], r["carried"], r["failed"], r["band"], list(r["flags"]))
+        b = broker_reading(d, r)
+        if before != (rung_verdict(r), r["pass"], r["carried"], r["failed"], r["band"], list(r["flags"])):
+            failures.append(f"{d.parts[-4]}: the broker reading changed the rig's verdict from {before[0]!r}")
+        r["reading"] = b
+        return r, b, reading_text(b)
+
+    def driver_logs(d: Path, recv_per_sub: int) -> None:
+        """What the summarizer falls back to once the audited evidence is refused."""
+        def log(path: Path, counters: dict[str, int], final: int | None = None) -> None:
+            lines = [f"{f'{t // 60}m{t % 60}s' if t >= 60 else f'{t}s'} {c} total={v * t} rate={v}/sec"
+                     for t in range(61) for c, v in counters.items()]
+            if final is not None:
+                lines += [f"1m1s {c} total={final} rate=0/sec" for c in counters]
+            path.write_text("\n".join(lines) + "\n")
+        log(d / "pub-s0-0.log", {"pub": 100, "pub_succ": 100, "pub_overrun": 0})
+        for name in ("sub-s0-0", "sub-s0-1"):
+            # The window read low; after the drain every consumer had all of it.
+            log(d / f"{name}.log", {"recv": recv_per_sub})
+            log(d / f"{name}.drain", {"recv": recv_per_sub}, final=N // 2)
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+
+        # 1. A clean audited rung: GREEN by the rig, HOLDS by the reading, one rate.
+        r, b, text = read(rung(root, "clean"))
+        if rung_verdict(r) != "GREEN" or b["holds"] is not True or text != "HOLDS at 100/s" or b["disagree"]:
+            failures.append(f"a clean audited rung did not read GREEN and HOLDS at 100/s: {rung_verdict(r)!r} {text!r} {b['disagree']!r}")
+        if b["ledger"]["sent"] != N or b["dropped"] != 0 or abs(b["band_share"] - 10 / 60_000) > 1e-9:
+            failures.append(f"the reading's inputs are wrong on a clean rung: {b}")
+
+        # 2. The 2026-10-12 case: the audited evidence is refused, the fallback read of
+        #    the drivers' logs is 4% low, and every broker counter shows the full offer.
+        #    The rig does NOT certify it. The reading holds at the BROKERS' rate, and
+        #    the gap is printed as a disagreement, not folded into either number.
+        d = rung(root, "disagree")
+        (d / "pub-s0-0-base.prom").unlink()
+        driver_logs(d, 48)
+        r, b, text = read(d)
+        if not rung_verdict(r).startswith("NOT CARRIED: INVALID EVIDENCE"):
+            failures.append(f"a rung with refused driver evidence was not NOT CARRIED: {rung_verdict(r)}")
+        if abs(r["recv_rate"] - 96) > 1e-9 or abs(b["deliv_rate"] - 100) > 1e-9 or text != "HOLDS at 100/s":
+            failures.append(f"the asserted rate is not the brokers': drivers {r['recv_rate']}, brokers {b['deliv_rate']}, {text!r}")
+        if "READINGS DISAGREE: drivers 96/s (subscriber logs" not in b["disagree"] or "brokers 100/s" not in b["disagree"]:
+            failures.append(f"a 4% gap between the drivers' and the brokers' rate was not reported: {b['disagree']!r}")
+        table = render_broker_reading([r])
+        if "READINGS DISAGREE" not in table or "| HOLDS at 100/s | NOT CARRIED |" not in table:
+            failures.append(f"the reading table does not show the holds reading beside the rig's verdict:\n{table}")
+        # Inside the tolerance the two readings are one reading: no note.
+        d = rung(root, "agree")
+        (d / "pub-s0-0-base.prom").unlink()
+        driver_logs(d, 49)
+        if read(d)[1]["disagree"]:
+            failures.append("a 2% gap between the readings was reported as a disagreement")
+
+        # 3. ONE identity never arrived: the rung does not hold, whatever its rate.
+        d = rung(root, "missing")
+        led = (d / "sub-s0-0.ledger").read_text().split("\t")
+        bits = int(led[4].split("\n")[0], 16) & ~1
+        (d / "sub-s0-0.ledger").write_text("\t".join(led[:3] + [str(bits.bit_count()), f"{bits:X}\n# EOF\n"]))
+        term = d / "sub-s0-0-terminal.prom"
+        term.write_text(term.read_text().replace(f"recv {N // 2}", f"recv {N // 2 - 1}"))
+        r, b, text = read(d)
+        if b["holds"] is not False or "missing 1" not in text or not text.startswith("DOES NOT HOLD"):
+            failures.append(f"one missing identity still held: {text!r}")
+
+        # 4. A broker drop is loss on the brokers' own word, even with a closed ledger.
+        d = rung(root, "drop")
+        for phase in ("drain", "after"):
+            p = d / f"metrics-{phase}-broker0.prom"
+            p.write_text(p.read_text().replace("# EOF", 'mqttd_publish_dropped_total{reason="queue-full"} 3\n# EOF'))
+        r, b, text = read(d)
+        if b["holds"] is not False or "brokers dropped queue-full 3" not in text:
+            failures.append(f"a broker drop still held: {text!r}")
+
+        # 5. p99 above 1 s: carried YELLOW by the rig's bands, and it does not hold.
+        d = rung(root, "slow")
+        for name in ("sub-s0-0", "sub-s0-1"):
+            for suffix, n in (("-base", 0), ("", N // 2), ("-terminal", N // 2)):
+                (d / f"{name}{suffix}.prom").write_text(
+                    f'recv {n}\ne2e_latency_bucket{{le="1"}} 0\ne2e_latency_bucket{{le="2500"}} {n}\n'
+                    f'e2e_latency_bucket{{le="+Inf"}} {n}\ne2e_latency_count {n}\n# EOF\n')
+        r, b, text = read(d)
+        if not rung_verdict(r).startswith("YELLOW") or b["holds"] is not False or "p99 <=2500ms is above 1000ms" not in text:
+            failures.append(f"a rung at p99 <=2500ms held, or was not YELLOW: {rung_verdict(r)!r} {text!r}")
+
+        # 6. No ledger, no assertion: "nothing lost" is never inferred from a rate.
+        d = rung(root, "no-ledger")
+        for p in d.glob("*.ledger"):
+            p.unlink()
+        r, b, text = read(d)
+        if b["holds"] is not None or not text.startswith("NOT ASSERTED: no identity ledger") or abs(b["deliv_rate"] - 100) > 1e-9:
+            failures.append(f"a rung without a ledger was asserted, or lost its broker rate: {text!r} {b['deliv_rate']}")
+
+        # 7. Broker counters that cannot be read assert nothing, and print no rate.
+        d = rung(root, "truncated")
+        p = d / "metrics-window-close-broker0.prom"
+        p.write_text(p.read_text().replace("# EOF\n", ""))
+        r, b, text = read(d)
+        if b["holds"] is not None or "broker counters unreadable" not in text or broker_rate_cell(b) != "—":
+            failures.append(f"a truncated broker scrape was asserted: {text!r}")
+
+        # 8. The brokers' own window is soft (a 3 s scrape on a 60 s window): the rate
+        #    is printed with its band, not dropped and not shown as a bare midpoint.
+        d = rung(root, "soft-window")
+        w = d / "window.tsv"
+        w.write_text(w.read_text().replace("broker0\tclose\t160000\t160010", "broker0\tclose\t160000\t163000"))
+        r, b, text = read(d)
+        lo, hi = N / 63.0, N / 59.99
+        if not b["window_wide"] or abs(b["deliv_band"][0] - lo) > 1e-6 or abs(b["deliv_band"][1] - hi) > 1e-6:
+            failures.append(f"a soft broker window did not widen the band to {lo:.2f}..{hi:.2f}: {b['deliv_band']}")
+        if broker_rate_cell(b) != f"{b['deliv_rate']:,.0f} ({lo:,.0f}–{hi:,.0f})" or b["holds"] is not True:
+            failures.append(f"a soft broker window dropped the rate or the reading: {broker_rate_cell(b)!r} {text!r}")
+        if not rung_verdict(r).startswith("NOT CARRIED"):
+            failures.append(f"the rig certified a rung whose window scrape was 5% of the window: {rung_verdict(r)}")
+
+        # 9. Offered more than was carried: it holds AT THE RATE THE BROKERS CARRIED,
+        #    and says what share of the offer that was. The rig does not carry it.
+        r, b, text = read(rung(root, "over-offer", offered=150))
+        if text != "HOLDS at 100/s (67% of the offer)" or not any("OFFER NOT MET" in f for f in r["flags"]):
+            failures.append(f"a rung offered 150/s that carried 100/s did not read as holding at 67%: {text!r} {r['flags']}")
+
+        # 10. The reading does not hang on the crossing certificate. Two brokers whose
+        #     forwarding control was skipped: the rig certifies nothing at that size,
+        #     and the brokers' counters, drops and ledger are all still there. The
+        #     rung is read, and only its forwarded share is marked uncertified.
+        d = rung(root, "no-canary", nodes=2)
+        (d.parent / "forward-canary.txt").write_text("status=skipped nodes=2\n")
+        driver_logs(d, 50)
+        r, b, text = read(d)
+        if text != "HOLDS at 100/s" or not b["cert_error"] or "skipped" not in b["cert_error"]:
+            failures.append(f"a skipped forwarding control cost the rung its reading: {text!r} {b['cert_error']!r}")
+        if rung_verdict(r) == "GREEN" or "NOT CERTIFIED" not in render_broker_reading([r]):
+            failures.append(f"an uncertified crossing was certified or printed as certified: {rung_verdict(r)!r}")
+
+        # 11. No latency histogram is a missing input, not a slow rung: NOT ASSERTED.
+        #     With a message missing as well, it is the loss that is reported.
+        d = rung(root, "no-histogram")
+        for name in ("sub-s0-0", "sub-s0-1"):
+            for suffix, n in (("-base", 0), ("", N // 2), ("-terminal", N // 2)):
+                (d / f"{name}{suffix}.prom").write_text(f"recv {n}\n# EOF\n")
+        r, b, text = read(d)
+        if b["holds"] is not None or text != "NOT ASSERTED: no latency histogram, so p99 is unknown":
+            failures.append(f"a rung with no latency histogram was not NOT ASSERTED: {text!r}")
+        for phase in ("drain", "after"):
+            p = d / f"metrics-{phase}-broker0.prom"
+            p.write_text(p.read_text().replace("# EOF", 'mqttd_publish_dropped_total{reason="queue-full"} 1\n# EOF'))
+        r, b, text = read(d)
+        if b["holds"] is not False or "brokers dropped" not in text or "p99" in text:
+            failures.append(f"a broker drop on a rung with no histogram was not DOES NOT HOLD on the drop: {text!r}")
+
+        # 12. A rung still running has no reading.
+        d = root / "live" / "nodes=1" / "laneE" / "sites-1"
+        d.mkdir(parents=True)
+        r, b, text = read(d)
+        if b["holds"] is not None or not text.startswith("NOT ASSERTED"):
+            failures.append(f"an in-flight rung was asserted: {text!r}")
+    return failures
 
 
 def p99_ms(label: str) -> float:
@@ -1768,6 +2003,209 @@ def lane_e_rung(rdir: Path) -> dict:
     }
 
 
+def load_lane_e_evidence():
+    spec = importlib.util.spec_from_file_location("lane_e_evidence", Path(__file__).with_name("lane-e-evidence.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def broker_reading(rdir: Path, r: dict) -> dict:
+    """A rung asserted from the BROKERS' counters. Separate from the rig's verdict.
+
+    `lane_e_rung` certifies: its verdict needs the offer met on schedule, a steady
+    window, a load generator with headroom and the drivers' audited evidence. This
+    asks a narrower question, by a rule that is easy to state:
+
+      HOLDS          no message was lost, and p99 <= HOLDS_P99_MS
+      DOES NOT HOLD  a message was lost, or p99 is above the line
+      NOT ASSERTED   an input is missing: the brokers' counters, the identity
+                     ledger or the latency histogram cannot be read
+
+    It does not depend on the crossing certificate. A size whose forwarding
+    control was skipped or failed still has broker counters, so the rung is still
+    read; its forwarded share is then printed as uncertified, because an absent
+    forwarded counter cannot be told from a zero.
+
+    Its inputs, each from the side that can see it:
+
+      rate       each broker's Δ mqttd_publish_received_total / _delivered_total over
+                 its own window (extract-lane-e.py), with the band its own scrape
+                 brackets leave. Not the drivers' rate: a driver whose scrape is
+                 slow, or whose audited evidence was refused, moves this by nothing.
+      drops      Δ mqttd_publish_dropped_total, every reason, before -> after.
+      no loss    the identity ledger (lane-e-evidence.py `identity_ledger`): every
+                 identity sent was acknowledged and received, none unexpected. It is
+                 read from terminal ledgers, not from the window.
+      p99        the consumers' end-to-end histogram over the window, plus the
+                 clock uncertainty when the evidence carries one. Brokers cannot
+                 measure end-to-end latency, so this one input is the drivers'.
+
+    HOLDS is a statement about the rate the brokers CARRIED, which is why it is
+    printed with that rate and its share of the offer: a rung offered more than the
+    cluster takes can hold at less than its offer (publishers are slowed, nothing is
+    lost). It never changes `pass`, `carried`, `band` or the verdict text.
+    """
+    out: dict = {
+        "holds": None, "why": [], "error": None, "ledger": None, "ledger_error": None,
+        "recv_rate": None, "deliv_rate": None, "recv_band": None, "deliv_band": None,
+        "band_share": None, "window_wide": False, "broker_bracket_ms": None,
+        "of_offer": None, "dropped": None, "dropped_by_reason": {},
+        "crossing": None, "max_crossing": None, "max_crossing_broker": None, "cert_error": None,
+        "lifetime_received": None, "driver_rate": r.get("recv_rate"),
+        "driver_source": ("audited endpoints" if r.get("evidence")
+                          else "subscriber logs; the audited evidence was refused" if r.get("qos") == "1"
+                          else "subscriber logs"),
+        "disagree": "", "p99": r.get("p99", "—"),
+    }
+    if r.get("incomplete"):
+        out["why"].append("no rung.txt: still running, or the rung died")
+        return out
+    extractor = load_lane_e_extractor()
+    try:
+        x = extractor.extract_rung(rdir, require_cert=False)
+    except (ValueError, OSError, KeyError, IndexError) as exc:
+        out["error"] = str(exc)
+        out["why"].append(f"broker counters unreadable ({exc})")
+        return out
+    if x["deliv_rate"] is None:
+        out["error"] = "no aligned window"
+        out["why"].append("no aligned broker window (before/after snapshots only, ramp and drain included)")
+        return out
+    offered = r.get("offered") or 0.0
+    drops = x["lifetime_drops"]
+    out.update(
+        recv_rate=x["recv_rate"], deliv_rate=x["deliv_rate"], recv_band=x["recv_band"], deliv_band=x["deliv_band"],
+        band_share=extractor.band_share(x["deliv_rate"], x["deliv_band"]),
+        broker_bracket_ms=x["broker_bracket_ms"],
+        # The brokers' own window has soft edges: print the band, not just the midpoint.
+        window_wide=x["broker_bracket_ms"] > extractor.BRACKET_SHARE * x["window_s"] * 1000,
+        of_offer=x["deliv_rate"] / offered if offered else None,
+        dropped=sum(drops.values()), dropped_by_reason=drops,
+        crossing=x["crossing"], max_crossing=x["max_crossing"], max_crossing_broker=x["max_crossing_broker"],
+        cert_error=x["cert_error"], lifetime_received=x["lifetime_received"],
+    )
+    driver = out["driver_rate"]
+    lo, hi = x["deliv_band"]
+    if driver is not None and x["deliv_rate"] > 0 and not lo <= driver <= hi:
+        gap = abs(driver - x["deliv_rate"]) / x["deliv_rate"]
+        if gap > READINGS_AGREE:
+            out["disagree"] = (
+                f"READINGS DISAGREE: drivers {driver:,.0f}/s ({out['driver_source']}), brokers "
+                f"{x['deliv_rate']:,.0f}/s — {gap * 100:.1f}% apart, past the {READINGS_AGREE:.0%} tolerance. "
+                "The brokers' rate is the one asserted; the drivers' is not corrected to match."
+            )
+    try:
+        ledger = load_lane_e_evidence().identity_ledger(rdir)
+    except (ValueError, OSError, KeyError, IndexError) as exc:
+        out["ledger_error"] = str(exc) or type(exc).__name__
+        out["why"].append(f"no identity ledger ({out['ledger_error']})")
+        return out
+    out["ledger"] = ledger
+    lost = []
+    if not ledger["identities_close"]:
+        lost.append(
+            "the ledger does not close ("
+            + ", ".join(f"{k.replace('_', ' ')} {ledger[k]:,}" for k in ("missing", "unacked", "unexpected", "unexpected_acks") if ledger[k])
+            + ")" if any(ledger[k] for k in ("missing", "unacked", "unexpected", "unexpected_acks"))
+            else "the ledger does not close (no distinct identities sent)"
+        )
+    if out["dropped"]:
+        lost.append("brokers dropped " + ", ".join(f"{k or 'unlabelled'} {v:,.0f}" for k, v in sorted(drops.items())))
+    clock_margin = ((r.get("evidence") or {}).get("clock") or {}).get("latency_uncertainty_ms", 0)
+    no_histogram = out["p99"] in ("", "—")
+    if not no_histogram and latency_band(out["p99"], clock_margin, HOLDS_P99_MS) != "green":
+        lost.append(f"p99 {out['p99']} is above {HOLDS_P99_MS:g}ms")
+    if lost:
+        out["holds"], out["why"] = False, lost
+    elif no_histogram:
+        # Nothing was lost, and nothing says how long a delivery took: an input is
+        # missing, which is not the same as p99 being over the line.
+        out["why"] = ["no latency histogram, so p99 is unknown"]
+    else:
+        out["holds"] = True
+    return out
+
+
+def reading_text(b: dict) -> str:
+    """The reading in the words the table uses."""
+    if b["holds"] is None:
+        return "NOT ASSERTED: " + "; ".join(b["why"])
+    if not b["holds"]:
+        return "DOES NOT HOLD: " + "; ".join(b["why"])
+    text = f"HOLDS at {b['deliv_rate']:,.0f}/s"
+    if b["of_offer"] is not None and b["of_offer"] < DELIVERED_OFFER:
+        text += f" ({b['of_offer'] * 100:.0f}% of the offer)"
+    return text
+
+
+def broker_rate_cell(b: dict | None) -> str:
+    """The brokers' delivered rate; with its band where their own window is soft."""
+    if not b or b["deliv_rate"] is None:
+        return "—"
+    if b["window_wide"]:
+        return f"{b['deliv_rate']:,.0f} ({b['deliv_band'][0]:,.0f}–{b['deliv_band'][1]:,.0f})"
+    return f"{b['deliv_rate']:,.0f}"
+
+
+def render_broker_reading(rungs: list[dict]) -> str:
+    """The second reading, as its own table. Nothing here is the rig's verdict."""
+    def run(r: dict) -> str:
+        return f"{r.get('rep', 1)}{' (control)' if r.get('control') else ''}"
+
+    out = [
+        f"\nReading from the brokers' counters — a rung HOLDS if no message was lost and p99 <= {HOLDS_P99_MS:g}ms:\n",
+        "| sites | run | offered msg/s | brokers received/s | brokers delivered/s | band | of offer | drivers delivered/s "
+        "| broker drops | ledger: sent · missing · unacked · duplicates | forwarded: cluster · highest broker | p99 | reading "
+        "| the rig's verdict |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for r in rungs:
+        b = r.get("reading")
+        if not b:
+            continue
+        num = lambda v, f=",.0f": "—" if v is None else format(v, f)  # noqa: E731
+        led = b["ledger"]
+        ledger = "—" if not led else f"{led['sent']:,} · {led['missing']:,} · {led['unacked']:,} · {led['duplicates']:,}"
+        band = "—" if b["band_share"] is None else f"±{b['band_share'] * 100:.2f}%"
+        cross = "—" if b["crossing"] is None else (
+            f"{b['crossing'] * 100:.2f}% · {b['max_crossing'] * 100:.2f}% (broker{b['max_crossing_broker']})"
+            + (" — NOT CERTIFIED" if b["cert_error"] else ""))
+        out.append(
+            f"| {r['sites']} | {run(r)} | {r['offered']:,.0f} | {num(b['recv_rate'])} | {broker_rate_cell(b)} | {band} | "
+            f"{num(b['of_offer'], '.1%')} | {num(b['driver_rate'])} | {num(b['dropped'])} | {ledger} | {cross} | {b['p99']} | "
+            f"{reading_text(b)} | {rung_verdict(r).split(':')[0].split(';')[0]} |")
+    notes = [(r, r["reading"]["disagree"]) for r in rungs if r.get("reading") and r["reading"]["disagree"]]
+    if notes:
+        out.append("")
+        out += [f"> {r['sites']} site(s), run {run(r)}: {text}" for r, text in notes]
+    uncertified = [r for r in rungs if r.get("reading") and r["reading"]["cert_error"]]
+    if uncertified:
+        out.append("")
+        which = ", ".join(f"{r['sites']} site(s) run {run(r)}" for r in uncertified)
+        out.append(
+            f"> Forwarded shares marked NOT CERTIFIED ({which}): "
+            f"{uncertified[0]['reading']['cert_error']}. The rates, drops and ledger do not depend on it; the forwarded "
+            "share does, because a forwarded counter that is absent reads the same as one that is zero.")
+    mismatch = [r for r in rungs if r.get("reading") and r["reading"]["ledger"]
+                and r["reading"]["lifetime_received"] != r["reading"]["ledger"]["sent"]]
+    if mismatch:
+        out.append("")
+        out += [f"> {r['sites']} site(s), run {run(r)}: the brokers received "
+                f"{r['reading']['lifetime_received']:,.0f} publishes over the rung and the ledger holds "
+                f"{r['reading']['ledger']['sent']:,} sent identities — the two counts are not the same traffic."
+                for r in mismatch]
+    out.append(
+        "\n> This is a READING, not a certification. The rate is each broker's own counters over its own window "
+        "(extract-lane-e.py), `band` is what the brokers' scrape brackets leave on it, and `of offer` is that rate "
+        "against the rung's offer. No loss is the identity ledger closing with zero broker drops; p99 is the "
+        "consumers' histogram (brokers cannot time a delivery end to end). A rung can HOLD here and be NOT CARRIED "
+        "above: the rig's verdict also needs the offer met on schedule, a steady window, a load generator with "
+        "headroom and valid driver evidence, and only that verdict certifies a rung."
+    )
+    return "\n".join(out)
+
+
 def _lane_e_carried(offer_met, delivered, late_share, settled_ok, reset_ok, core_ok, steady,
                     qos, sub_qos, completed, bounds, dropped, deliv_by_qos, evidence, drained,
                     recv_rate, offered, sites) -> bool:
@@ -1851,7 +2289,7 @@ def render_durable_writer(rungs: list[dict]) -> str:
         return format(lo, fmt) if format(lo, fmt) == format(hi, fmt) else f"{lo:{fmt}}–{hi:{fmt}}"
 
     out = ["\nDurable writer — does throughput follow the disk? (steady window, per broker):\n",
-           "| sites | run | verdict | delivered/s | durable appends/s | writer ops/s per node | ops/commit "
+           "| sites | run | verdict | delivered/s (brokers) | durable appends/s | writer ops/s per node | ops/commit "
            "| commit ms | ms/op | flush share | disk w/s | disk MB/s | barrier floor/s |",
            "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     durable = [r for r in rungs if r.get("durable")]
@@ -1860,7 +2298,8 @@ def render_durable_writer(rungs: list[dict]) -> str:
         d = [x["disk"] for x in w if x.get("disk")]
         out.append(
             f"| {r['sites']} | {r.get('rep', 1)}{' (control)' if r.get('control') else ''} | "
-            f"{rung_verdict(r).split(';')[0].split(' (')[0][:32]} | {r.get('recv_rate', 0):,.0f} | "
+            f"{rung_verdict(r).split(';')[0].split(' (')[0][:32]} | "
+            f"{broker_rate_cell(r.get('reading')) if (r.get('reading') or {}).get('deliv_rate') is not None else format(r.get('recv_rate', 0), ',.0f') + ' (drivers)'} | "
             f"{sum(x['appends_s'] for x in w):,.0f} | {rng([x['ops_s'] for x in w], ',.0f')} | "
             f"{rng([x['ops_commit'] for x in w], '.1f')} | {rng([x['commit_ms'] for x in w], '.2f')} | "
             f"{rng([x['ms_per_op'] for x in w], '.3f')} | {rng([x['flush_share'] for x in w], '.0%')} | "
@@ -2055,10 +2494,14 @@ def main() -> None:
         for n, d in e_sizes:
             # Sort by site count, then by repeat index, so a repeated rung sits
             # beside its twin rather than at the end of the table.
-            rungs = sorted(
-                (lane_e_rung(r) for r in (d / "laneE").glob("sites-*")),
-                key=lambda r: (r["sites"], r.get("rep", 1)),
-            )
+            rungs = []
+            for rdir in (d / "laneE").glob("sites-*"):
+                rung = lane_e_rung(rdir)
+                # Computed here and not in lane_e_rung: the harness calls lane_e_rung
+                # for its stop rule mid-run, and the verdict must not depend on it.
+                rung["reading"] = broker_reading(rdir, rung)
+                rungs.append(rung)
+            rungs.sort(key=lambda r: (r["sites"], r.get("rep", 1)))
             if not rungs:
                 continue
             print(f"### {n} node(s)\n")
@@ -2070,11 +2513,15 @@ def main() -> None:
             # p50 and p95 beside the p99 that grades the rung: a vendor comparison
             # quotes a median and a p95, and one percentile cannot be set against
             # another. All three are the driver histogram's bucket upper bounds.
-            head = "| sites | offered msg/s | delivered/s | per consumer | caught up in | p50 | p95 | p99 | verdict |"
+            # Two delivered columns: the brokers' own counters first, because that is
+            # the figure the reading below asserts; the drivers' beside it, labelled,
+            # because it is the one the verdict in the last column was graded on.
+            head = ("| sites | offered msg/s | delivered/s (brokers) | delivered/s (drivers) | per consumer "
+                    "| caught up in | p50 | p95 | p99 | verdict |")
             if repeated:
-                head = "| sites | run | offered msg/s | delivered/s | per consumer | caught up in | p50 | p95 | p99 | verdict |"
+                head = head.replace("| sites |", "| sites | run |", 1)
             print(head)
-            print("|---|---|---|---|---|---|---|---|---|" + ("---|" if repeated else ""))
+            print("|---|---|---|---|---|---|---|---|---|---|" + ("---|" if repeated else ""))
             for r in rungs:
                 verdict = rung_verdict(r)
                 run_col = f" {r.get('rep', 1)} |" if repeated else ""
@@ -2085,7 +2532,7 @@ def main() -> None:
                 else:
                     caught = "—"  # a run directory from before the gate existed
                 print(
-                    f"| {r['sites']} |{run_col} {r['offered']:,.0f} | {r['recv_rate']:,.0f} | "
+                    f"| {r['sites']} |{run_col} {r['offered']:,.0f} | {broker_rate_cell(r.get('reading'))} | {r['recv_rate']:,.0f} | "
                     f"{r['per_consumer']:,.0f} | {caught} | {r.get('p50', '—')} | {r.get('p95', '—')} | {r['p99']} | {verdict} |"
                 )
             # ── message accounting (#534, acceptance 3) ──────────────────
@@ -2139,6 +2586,9 @@ def main() -> None:
                     "Unique delivery and duplicates are n/a without an identity ledger. "
                     "Available backlog bytes and outbound inflight gauges are retained in final_state; oldest age is unavailable."
                 )
+
+            if any(r["reading"]["deliv_rate"] is not None for r in rungs):
+                print(render_broker_reading(rungs))
 
             if any(r.get("durable") for r in rungs):
                 print(render_durable_writer(rungs))

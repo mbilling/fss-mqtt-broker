@@ -374,20 +374,28 @@ Cards, with every rung, the verbatim verdicts, the ledgers and the commands:
 
 ![QoS 1 per node on the 1.2.0 candidate, certified and uncertified rungs](img/scale-out-qos1-candidate.svg)
 
-A green column is a rung the rig graded GREEN. A hollow column was measured and **not
-certified**. `delivered/s` is the summarizer's driver-side rate; the brokers' own counters
-are beside it where the two differ.
+Every rung is read twice. **The reading rule:** a rung holds if no message was lost (its
+identity ledger closes and no broker dropped anything) and p99 is at or below 1 s, at the
+rate the brokers' own counters show. **The rig's verdict** is the certification, and asks
+for more: the offer met on schedule, a steady window, a load generator with headroom and
+valid driver-side evidence. `summarize-curve.py` prints both. In the chart a filled column
+is a rung the rig certified GREEN, and a green outline is a rung that holds and is **not
+certified**.
 
 ### QoS 1, clean sessions
 
-| nodes | sites | offered msg/s | delivered/s | brokers counted | per node | p50 · p95 · p99 | the rig's verdict |
-|---|---|---|---|---|---|---|---|
-| 3 | 4 | 120,000 | 120,001 | 120,004 | 40.0k | ≤1 · ≤5 · ≤10 ms | GREEN |
-| 3 | 4 (rep 2) | 120,000 | 120,000 | 120,001 | 40.0k | ≤1 · ≤5 · ≤10 ms | GREEN |
-| 3 | 5 | 150,000 | 149,988 | 149,982 | 50.0k | ≤5 · ≤25 · ≤25 ms | GREEN (the ladder's top: a floor) |
-| 10 | 13 | 390,000 | 374,784 | 389,816 | 37.5k · 39.0k | ≤1 · ≤5 · ≤50 ms | NOT CARRIED |
-| 10 | 14 | 420,000 | 407,008 | 420,004 | 40.7k · 42.0k | ≤1 · ≤10 · ≤50 ms | NOT CARRIED |
-| 10 | 13 (drift control) | 390,000 | 376,125 | 390,290 | 37.6k · 39.0k | ≤1 · ≤5 · ≤25 ms | NOT CARRIED |
+`delivered/s (brokers)` is each broker's own counters over its window (±0.03%: every
+broker answered its scrapes within 26 ms). `delivered/s (drivers)` is the driver-side
+figure the rig graded.
+
+| nodes | sites | offered msg/s | delivered/s (brokers) | per node | delivered/s (drivers) | p50 · p95 · p99 | reading | the rig's verdict |
+|---|---|---|---|---|---|---|---|---|
+| 3 | 4 | 120,000 | 120,004 | 40.0k | 120,001 | ≤1 · ≤5 · ≤10 ms | holds | GREEN |
+| 3 | 4 (rep 2) | 120,000 | 120,001 | 40.0k | 120,000 | ≤1 · ≤5 · ≤10 ms | holds | GREEN |
+| 3 | 5 | 150,000 | 149,982 | 50.0k | 149,988 | ≤5 · ≤25 · ≤25 ms | holds | GREEN (the ladder's top: a floor) |
+| 10 | 13 | 390,000 | 389,816 | 39.0k | 374,784 | ≤1 · ≤5 · ≤50 ms | holds | NOT CARRIED |
+| 10 | 14 | 420,000 | 420,004 | 42.0k | 407,008 | ≤1 · ≤10 · ≤50 ms | holds | NOT CARRIED |
+| 10 | 13 (drift control) | 390,000 | 390,290 | 39.0k | 376,125 | ≤1 · ≤5 · ≤25 ms | holds | NOT CARRIED |
 
 The three NOT CARRIED verdicts, verbatim, in table order:
 
@@ -397,24 +405,25 @@ NOT CARRIED: INVALID EVIDENCE (endpoint scrape window uncertainty exceeds 2%); D
 NOT CARRIED: INVALID EVIDENCE (endpoint scrape window uncertainty exceeds 2%); DRIVER CORE SATURATED (driver13 core 1 was >=95% busy in 74% of 66 in-window samples — the load generator had no headroom; this rung measures the driver, not the broker)
 ```
 
+- **Holds:** every rung. 40.0–50.0k msg/s per node at 3 nodes, 39.0–42.0k at 10, nothing
+  lost, p99 ≤ 50 ms, 0.00% of publishes forwarded between brokers.
 - **Certified by the rig:** 3 nodes at 40k msg/s per node, twice, and at 50k/node once.
-  Crossing 0.00%.
-- **Measured, not certified:** all three 10-node rungs. One load-generator host had a
-  saturated core in both 10-node arms, and the drivers' endpoint scrapes missed the 2%
-  bound, so the rig measured its generator rather than the broker.
-- **What the 10-node rungs still show:** nothing lost, p99 ≤ 50 ms against a 1 s line, the
-  publishers sent 99.9–100.0% of the offer, and the brokers counted the full offer
-  (39.0k and 42.0k per node). The drivers' logs read 3–4% lower. That gap is a
-  disagreement between two readings the rig had already rejected, not loss.
-- **What they do not show:** a re-certified 39k/node at 10 nodes, or a knee. The ladder
-  stopped after two NOT CARRIED rungs and never ran 45k/node.
+- **Not certified:** all three 10-node rungs. One load-generator host had a saturated
+  core in both 10-node arms, and a driver host took 1.7–2.8 s to answer its window scrape,
+  so the rig refused the audited driver evidence and fell back to the subscribers' logs.
+- **The driver column's 3–4% shortfall is a disagreement between readings.** It is not
+  the publishers, which sent 99.9–100.0% of the offer, and it is not loss. The brokers
+  counted the full offer received and delivered, and the tool prints `READINGS DISAGREE`
+  on those three rungs.
+- **Not shown:** a re-certified 39k/node at 10 nodes, or a knee. The ladder stopped after
+  two NOT CARRIED rungs and never ran 45k/node.
 
 ### Durable QoS 1, default store (redb)
 
 The durable campaign of the same day is in
 [SCALE-CURVE.md](SCALE-CURVE.md#durable-qos-1-by-site-on-the-120-candidate-2026-10-12--not-curve-points):
-15.0k msg/s per node GREEN at 10 nodes, a ceiling near 21k per node at both 3 and 10
-nodes, zero loss, and a failed crossing gate at 10 nodes.
+15.0k msg/s per node taken in full at 10 nodes, a ceiling near 21k per node at both 3 and
+10 nodes, zero loss, and 13–17% of publishes forwarded between brokers at 10 nodes.
 
 Runs: `knee-20261012T105735Z` and `knee-20261012T122155Z` (untracked).
 

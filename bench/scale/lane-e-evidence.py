@@ -187,6 +187,39 @@ def reconcile(sent, acked, received):
     }
 
 
+def identity_ledger(rdir):
+    """Reconcile a rung's message identities, whatever its throughput window is worth.
+
+    Every identity a publisher sent, had acknowledged, and a subscriber received,
+    across the rung's whole `$share` group, from the terminal ledgers. It reads no
+    window stamp, so a rung whose rate evidence was refused still answers the one
+    question a ledger can: was anything lost. `identities_close` is that answer;
+    duplicates are counted beside it and do not open the ledger (QoS 1 may
+    redeliver). Raises ValueError when a ledger is missing, truncated or disagrees
+    with the endpoint's own terminal counters.
+    """
+    rdir = Path(rdir)
+    manifest = json.loads((rdir / "manifest.json").read_text())
+    pub = [rdir / (v["name"] + ".ledger") for v in manifest["endpoints"] if v["role"] == "pub"]
+    sub = [rdir / (v["name"] + ".ledger") for v in manifest["endpoints"] if v["role"] == "sub"]
+    s, st = ledger(pub, "sent")
+    a, at = ledger(pub, "acked")
+    r, rt = ledger(sub, "received")
+    v = reconcile(s, a, r)
+    v.update(sent=st, acked=at, received=rt, duplicates=rt - v["unique_delivered"])
+    for paths, name, total in [(pub, "audit_sent", st), (pub, "audit_acked", at), (sub, "recv", rt)]:
+        observed = sum(value(metric(rdir / (p.stem + "-terminal.prom")), name) for p in paths)
+        if observed != total:
+            raise ValueError(f"{name} terminal/ledger mismatch: {observed} != {total}")
+    v["terminal_counters_match"] = True
+    v["identities_close"] = (
+        bool(st)
+        and st == sum(bits.bit_count() for bits in s.values())
+        and not any(v[k] for k in ("missing", "unexpected", "unacked", "unexpected_acks"))
+    )
+    return v
+
+
 def load_extractor():
     spec = importlib.util.spec_from_file_location(
         "lane_e_extract", Path(__file__).with_name("extract-lane-e.py")

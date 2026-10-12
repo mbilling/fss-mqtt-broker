@@ -443,12 +443,28 @@ def load_window(rdir: Path, nodes: int) -> dict:
             main_pid[i] = int(p["open"])
     usable = {h: e for h, e in edges.items() if set(e) == {"open", "close"} and e["close"][0] > e["open"][1]}
     brackets = [end - start for e in usable.values() for start, end in e.values()]
-    return {"hosts": usable, "listed": listed, "main_pid": main_pid, "max_bracket_ms": max(brackets)}
+    # The brokers' own scrapes, apart from the drivers': a load generator that takes
+    # seconds to answer its scrape says nothing about when a broker's counters were read.
+    broker_brackets = [end - start for h, e in usable.items() if h.startswith("broker") for start, end in e.values()]
+    return {"hosts": usable, "listed": listed, "main_pid": main_pid, "max_bracket_ms": max(brackets),
+            "max_broker_bracket_ms": max(broker_brackets)}
 
 
 def window_seconds(edges: dict[str, tuple[int, int]]) -> float:
     mid = lambda e: (e[0] + e[1]) / 2  # noqa: E731
     return (mid(edges["close"]) - mid(edges["open"])) / 1000
+
+
+def window_bounds(edges: dict[str, tuple[int, int]]) -> tuple[float, float]:
+    """`(shortest, longest)` seconds a host's window can have been.
+
+    A scrape is stamped before and after, and the counters were read somewhere in
+    between. So the window is at least close-start minus open-end and at most
+    close-end minus open-start, and a counter delta over it is a rate between
+    delta / longest and delta / shortest. load_window has already refused a broker
+    whose window closes before it opens, so `shortest` is positive.
+    """
+    return (edges["close"][0] - edges["open"][1]) / 1000, (edges["close"][1] - edges["open"][0]) / 1000
 
 
 # ── crossing certificate ────────────────────────────────────────────────────
@@ -603,7 +619,13 @@ def certify(nodes: int, snaps: dict[str, dict[int, dict]], window: dict | None, 
 # ── one rung ────────────────────────────────────────────────────────────────
 
 
-def extract_rung(rdir: Path, canaries: dict | None = None) -> dict:
+def extract_rung(rdir: Path, canaries: dict | None = None, require_cert: bool = True) -> dict:
+    """One rung's broker counters. With `require_cert` (the default, and what the
+    report and the gate use) a rung whose crossing is not certified raises. Without
+    it the rung is still read and the refusal comes back as `cert_error`, `cert`
+    "uncertified": a reader that wants the brokers' rates and drops, and makes no
+    claim about crossing, must not lose them to a skipped forwarding control. An
+    unreadable, truncated or reset scrape raises either way."""
     rdir = Path(rdir)
     nodes = nodes_of(rdir)
     meta = read_meta(rdir)
@@ -639,9 +661,15 @@ def extract_rung(rdir: Path, canaries: dict | None = None) -> dict:
         except ValueError as exc:
             canaries[key] = (str(exc), None)
     canary_error, canary = canaries[key]
-    if canary_error:
-        raise ValueError(canary_error)
-    cert = certify(nodes, snaps, window, canary)
+    cert_error = None
+    try:
+        if canary_error:
+            raise ValueError(canary_error)
+        cert = certify(nodes, snaps, window, canary)
+    except ValueError as exc:
+        if require_cert:
+            raise
+        cert, cert_error = "uncertified", str(exc)
 
     lo_label, hi_label = ("window-open", "window-close") if aligned else ("before", "after")
     lo, hi = snaps[lo_label], snaps[hi_label]
@@ -657,12 +685,14 @@ def extract_rung(rdir: Path, canaries: dict | None = None) -> dict:
             "crossing": fwd / recv if recv > 0 else None,
             "peer_links": {lo_label: peer_links(lo[b]), hi_label: peer_links(hi[b])},
             "window_s": window_seconds(window["hosts"][f"broker{b}"]) if window else None,
+            "window_bounds_s": window_bounds(window["hosts"][f"broker{b}"]) if window else None,
         })
     received = sum(p["received"] for p in per_broker)
     forwarded = sum(p["forwarded"] for p in per_broker)
     if received <= 0:
         raise ValueError("no positive received delta; crossing is unknown")
-    window_s = recv_rate = deliv_rate = bracket_ms = None
+    window_s = recv_rate = deliv_rate = bracket_ms = broker_bracket_ms = None
+    recv_band = deliv_band = None
     bracket_wide = False
     if window is not None:
         # Each broker over its OWN window: the edges are stamped per host.
@@ -671,6 +701,13 @@ def extract_rung(rdir: Path, canaries: dict | None = None) -> dict:
         deliv_rate = sum(p["delivered"] / p["window_s"] for p in per_broker)
         bracket_ms = window["max_bracket_ms"]
         bracket_wide = bracket_ms > BRACKET_SHARE * window_s * 1000
+        # The band the brokers' OWN scrape brackets leave on their rates: each
+        # broker's delta over the longest and the shortest window its stamps allow.
+        # bracket_ms above is the widest scrape on ANY host, drivers included, so it
+        # can be seconds wide while every broker answered in milliseconds.
+        broker_bracket_ms = window["max_broker_bracket_ms"]
+        recv_band = tuple(sum(p["received"] / p["window_bounds_s"][i] for p in per_broker) for i in (1, 0))
+        deliv_band = tuple(sum(p["delivered"] / p["window_bounds_s"][i] for p in per_broker) for i in (1, 0))
     worst = max((p for p in per_broker if p["crossing"] is not None), key=lambda p: p["crossing"])
     rx_skew, eff_nodes = ingress_skew(per_broker)
 
@@ -700,8 +737,12 @@ def extract_rung(rdir: Path, canaries: dict | None = None) -> dict:
         "window_s": window_s,
         "bracket_ms": bracket_ms,
         "bracket_wide": bracket_wide,
+        "broker_bracket_ms": broker_bracket_ms,
         "recv_rate": recv_rate,
         "deliv_rate": deliv_rate,
+        # (low, high) msg/s: the rate's bounds from the brokers' scrape brackets.
+        "recv_band": recv_band,
+        "deliv_band": deliv_band,
         "per_node_deliv": deliv_rate / nodes if deliv_rate is not None else None,
         "offered": meta.get("offered", "—"),
         "received": received,
@@ -714,6 +755,7 @@ def extract_rung(rdir: Path, canaries: dict | None = None) -> dict:
         "idle_brokers": [p["broker"] for p in per_broker if p["crossing"] is None],
         "per_broker": per_broker,
         "cert": cert,
+        "cert_error": cert_error,
         "lifetime_end": end_label,
         "lifetime_received": delta(lifetime_start, end, RECEIVED),
         "lifetime_delivered": delta(lifetime_start, end, DELIVERED),
@@ -758,6 +800,18 @@ def format_hub(r: dict) -> str:
     return ",".join(f"{k}={v:.1f}µs" for k, v in sorted(r["hub_us"].items()))
 
 
+def band_share(rate: float | None, band: tuple[float, float] | None) -> float | None:
+    """Half the width of a rate's band as a share of the rate; None when unknown."""
+    if not rate or band is None:
+        return None
+    return (band[1] - band[0]) / 2 / rate
+
+
+def format_band(rate: float | None, band: tuple[float, float] | None) -> str:
+    share = band_share(rate, band)
+    return "—" if share is None else f"±{share * 100:.2f}%"
+
+
 def format_drops(drops: dict[str, float]) -> str:
     return ",".join(f"{k}:{v:.0f}" for k, v in sorted(drops.items())) or "0"
 
@@ -765,8 +819,8 @@ def format_drops(drops: dict[str, float]) -> str:
 def report_rows(rungs: list[dict]) -> list[list[str]]:
     num = lambda v: "—" if v is None else f"{v:.0f}"  # noqa: E731
     rows = [[
-        "nodes", "sites", "rep", "control", "offered", "window", "window_s", "bracket_ms", "recv/s", "deliv/s",
-        "deliv/s/node", "win_recv", "life_recv", "life_deliv", "fwd", "crossing", "max_broker", "rx_skew", "eff_nodes", "cert",
+        "nodes", "sites", "rep", "control", "offered", "window", "window_s", "bracket_ms", "broker_bracket_ms", "recv/s",
+        "deliv/s", "deliv_band", "deliv/s/node", "win_recv", "life_recv", "life_deliv", "fwd", "crossing", "max_broker", "rx_skew", "eff_nodes", "cert",
         "hub_dispatch_mean", "peer_inflight", "sessions", "broker_idle", "driver_idle", "cpu_window", "settled",
         "drained", "win_drops", "life_drops",
     ]]
@@ -779,7 +833,8 @@ def report_rows(rungs: list[dict]) -> list[list[str]]:
             "aligned" if r["aligned"] else "UNALIGNED",
             "—" if r["window_s"] is None else f"{r['window_s']:.1f}",
             "—" if r["bracket_ms"] is None else f"{r['bracket_ms']}" + ("!" if r["bracket_wide"] else ""),
-            num(r["recv_rate"]), num(r["deliv_rate"]), num(r["per_node_deliv"]),
+            "—" if r["broker_bracket_ms"] is None else f"{r['broker_bracket_ms']}",
+            num(r["recv_rate"]), num(r["deliv_rate"]), format_band(r["deliv_rate"], r["deliv_band"]), num(r["per_node_deliv"]),
             f"{r['received']:.0f}", f"{r['lifetime_received']:.0f}", f"{r['lifetime_delivered']:.0f}",
             f"{r['forwarded']:.0f}", f"{r['crossing'] * 100:.2f}%", worst,
             "—" if r["rx_skew"] is None else f"{r['rx_skew']:.2f}",
@@ -802,7 +857,9 @@ def print_report(rungs: list[dict]) -> None:
         "# cert: structural = nodes=1 with no peer links; canary = the size's forwarding positive control re-derived and still in force;\n"
         "#   canary-unbound = floors held but no window.tsv MainPID ties the rung to the process that passed (not certified)\n"
         "# win_* = steady window; life_* = before -> drain (or after), for the drain-vs-broker delivery check\n"
-        f"# bracket_ms = widest window scrape; ! = wider than {BRACKET_SHARE:.0%} of window_s\n"
+        f"# bracket_ms = widest window scrape on any host, drivers included; ! = wider than {BRACKET_SHARE:.0%} of window_s\n"
+        "# broker_bracket_ms = widest window scrape on a BROKER; deliv_band = what the brokers' own brackets leave\n"
+        "#   on deliv/s (each broker's delta over the longest and the shortest window its stamps allow)\n"
         "# idle = mean of per-host means / lowest host mean / lowest 1 s row; [n/m hosts] = hosts with a usable\n"
         "#   window row and CPU samples inside it; * = cpu_window not aligned, so the figure may not cover the window"
     )
@@ -1302,6 +1359,65 @@ class WindowTests(unittest.TestCase):
             self.assertEqual((r["bracket_ms"], r["bracket_wide"]), (2000, True))
             _, stdout, _ = run_main([str(Path(td))])
             self.assertIn("2000!", stdout)
+
+    def test_the_brokers_rate_band_comes_from_the_brokers_own_brackets(self):
+        """A slow DRIVER scrape widens bracket_ms and leaves the brokers' rate where
+        it was; a slow BROKER scrape widens the band on the rate itself."""
+        with tempfile.TemporaryDirectory() as td:
+            rdir = self.synthetic_rung(Path(td))
+            r = extract_rung(rdir)
+            # Every stamp is +-100 ms: 10k/s per broker over 60/40/30 s windows.
+            lo = sum(self.RECV[b] / (w + 0.2) for b, w in ((0, 60), (1, 40), (2, 30)))
+            hi = sum(self.RECV[b] / (w - 0.2) for b, w in ((0, 60), (1, 40), (2, 30)))
+            self.assertEqual(r["broker_bracket_ms"], 200)
+            self.assertAlmostEqual(r["recv_band"][0], lo)
+            self.assertAlmostEqual(r["recv_band"][1], hi)
+            self.assertLess(r["deliv_band"][0], r["deliv_rate"])
+            self.assertGreater(r["deliv_band"][1], r["deliv_rate"])
+            tight = band_share(r["deliv_rate"], r["deliv_band"])
+            self.assertLess(tight, 0.006)
+            header, row = report_rows([r])
+            self.assertEqual(row[header.index("deliv_band")], f"±{tight * 100:.2f}%")
+            self.assertEqual(row[header.index("broker_bracket_ms")], "200")
+            tsv = rdir / "window.tsv"
+            original = tsv.read_text()
+            # driver0 takes 2.6 s to answer its close scrape, as a saturated generator does.
+            tsv.write_text(re.sub(r"(?m)^(driver0\tclose\t\d+\t)(\d+)", lambda m: f"{m.group(1)}{int(m.group(2)) + 2400}", original))
+            slow_driver = extract_rung(rdir)
+            self.assertEqual((slow_driver["bracket_ms"], slow_driver["bracket_wide"]), (2600, True))
+            self.assertEqual(slow_driver["broker_bracket_ms"], 200)
+            self.assertEqual(slow_driver["deliv_band"], r["deliv_band"])
+            # The same 2.6 s on a broker is a band on the brokers' rate.
+            tsv.write_text(re.sub(r"(?m)^(broker0\tclose\t\d+\t)(\d+)", lambda m: f"{m.group(1)}{int(m.group(2)) + 2400}", original))
+            slow_broker = extract_rung(rdir)
+            self.assertEqual(slow_broker["broker_bracket_ms"], 2600)
+            self.assertGreater(band_share(slow_broker["deliv_rate"], slow_broker["deliv_band"]), 2 * tight)
+            self.assertLess(slow_broker["deliv_band"][0], r["deliv_band"][0])
+
+    def test_the_counters_are_readable_without_the_certificate_only_on_request(self):
+        """A skipped forwarding control makes the crossing INVALID for the report
+        and the gate. A caller that asks for the counters alone still gets the
+        rates, the band and the drops, with the refusal attached and the rung
+        marked uncertified; a broken scrape is refused whoever asks."""
+        with tempfile.TemporaryDirectory() as td:
+            rdir = self.synthetic_rung(Path(td))
+            certified = extract_rung(rdir)
+            (rdir.parent / "forward-canary.txt").write_text("status=skipped nodes=3\n")
+            with self.assertRaisesRegex(ValueError, "positive control was skipped"):
+                extract_rung(rdir)
+            r = extract_rung(rdir, require_cert=False)
+            self.assertEqual(r["cert"], "uncertified")
+            self.assertIn("positive control was skipped", r["cert_error"])
+            self.assertIsNone(certified["cert_error"])
+            for key in ("recv_rate", "deliv_rate", "deliv_band", "drops", "lifetime_drops", "lifetime_received"):
+                self.assertEqual(r[key], certified[key], key)
+            rc, stdout, _ = run_main(["--crossing-gate", "0.5", str(Path(td))])
+            self.assertEqual(rc, 1)
+            self.assertIn("GATE nodes=3 FAIL", stdout)
+            bad = rdir / "metrics-window-close-broker1.prom"
+            bad.write_text(bad.read_text().replace("# EOF\n", ""))
+            with self.assertRaisesRegex(ValueError, "truncated scrape"):
+                extract_rung(rdir, require_cert=False)
 
     def test_four_column_window_tsv_is_structural_only(self):
         # The pre-MainPID harness's window.tsv still reads (the real N=1 smoke rung is

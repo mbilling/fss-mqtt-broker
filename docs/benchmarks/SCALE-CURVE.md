@@ -275,22 +275,30 @@ clean-session campaign of the same day is in
 
 ![QoS 1 per node on the 1.2.0 candidate, certified and uncertified rungs](img/scale-out-qos1-candidate.svg)
 
-A green column is a rung the rig graded GREEN. A hollow column was measured and **not
-certified**. `delivered/s` is the summarizer's driver-side rate; `brokers counted` is each
-broker's own counters over the window. Latencies are histogram bucket upper bounds.
+Every rung is read twice. **The reading rule:** a rung holds if no message was lost (its
+identity ledger closes and no broker dropped anything) and p99 is at or below 1 s, at the
+rate the brokers' own counters show. **The rig's verdict** is the certification, and asks
+for more: the offer met on schedule, a steady window, a load generator with headroom and
+valid driver-side evidence. `summarize-curve.py` prints both. In the chart a filled column
+is a rung the rig certified GREEN, and a green outline is a rung that holds and is **not
+certified**.
 
-| nodes | sites | offered msg/s | delivered/s | brokers counted | per node | publishes late | p50 · p95 · p99 | the rig's verdict |
-|---|---|---|---|---|---|---|---|---|
-| 10 | 25 | 150,000 | 149,071 | 150,023 | 14.9k · 15.0k | 4% | ≤25 · ≤100 · ≤500 ms | NOT CARRIED (1) |
-| 10 | 35 | 210,000 | 199,072 | 192,217 | 19.9k · 19.2k | 41% | ≤50 · ≤500 · ≤500 ms | NOT CARRIED (2) |
-| 10 | 40 | 240,000 | 219,004 | 210,547 | 21.9k · 21.1k | 53% | ≤100 · ≤500 · ≤500 ms | NOT CARRIED (3) |
-| 10 | 25 (drift control) | 150,000 | 149,976 | 149,979 | 15.0k | 3% | ≤25 · ≤50 · ≤500 ms | GREEN |
-| 3 | 12 | 72,000 | 62,806 | 62,243 | 20.9k · 20.7k | 57% | ≤100 · ≤500 · ≤500 ms | NOT CARRIED (4) |
-| 3 | 15 | 90,000 | 63,429 | 62,611 | 21.1k · 20.9k | 88% | ≤100 · ≤500 · ≤1000 ms | NOT CARRIED (5) |
+`delivered/s (brokers)` is each broker's own counters over its window (±0.03%: every
+broker answered its scrapes within 29 ms). `delivered/s (drivers)` is the driver-side
+figure the rig graded. Latencies are histogram bucket upper bounds.
 
-Every 1-site rung (6,000 msg/s, six of them) is GREEN at p50 · p95 · p99 ≤ 5 ms. The
-ladders stopped after two consecutive NOT CARRIED rungs and skipped 50 sites (10 nodes) and
-18 sites (3 nodes). The five NOT CARRIED verdicts, verbatim:
+| nodes | sites | offered msg/s | delivered/s (brokers) | of the offer | per node | delivered/s (drivers) | publishes late | p50 · p95 · p99 | reading | the rig's verdict |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 10 | 25 | 150,000 | 150,023 | 100.0% | 15.0k | 149,071 | 4% | ≤25 · ≤100 · ≤500 ms | holds | NOT CARRIED (1) |
+| 10 | 35 | 210,000 | 192,217 | 91.5% | 19.2k | 199,072 | 41% | ≤50 · ≤500 · ≤500 ms | holds | NOT CARRIED (2) |
+| 10 | 40 | 240,000 | 210,547 | 87.7% | 21.1k | 219,004 | 53% | ≤100 · ≤500 · ≤500 ms | holds | NOT CARRIED (3) |
+| 10 | 25 (drift control) | 150,000 | 149,979 | 100.0% | 15.0k | 149,976 | 3% | ≤25 · ≤50 · ≤500 ms | holds | GREEN |
+| 3 | 12 | 72,000 | 62,243 | 86.4% | 20.7k | 62,806 | 57% | ≤100 · ≤500 · ≤500 ms | holds | NOT CARRIED (4) |
+| 3 | 15 | 90,000 | 62,611 | 69.6% | 20.9k | 63,429 | 88% | ≤100 · ≤500 · ≤1000 ms | holds | NOT CARRIED (5) |
+
+Every 1-site rung (6,000 msg/s, six of them) is GREEN and holds, at p50 · p95 · p99 ≤ 5 ms.
+The ladders stopped after two consecutive NOT CARRIED rungs and skipped 50 sites (10 nodes)
+and 18 sites (3 nodes). The five NOT CARRIED verdicts, verbatim:
 
 ```text
 (1) NOT CARRIED: INVALID EVIDENCE (endpoint scrape window uncertainty exceeds 2%)
@@ -300,62 +308,73 @@ ladders stopped after two consecutive NOT CARRIED rungs and skipped 50 sites (10
 (5) NOT CARRIED: INVALID EVIDENCE (endpoint scrape window uncertainty exceeds 2%); NOT STEADY (last aggregate sample below offer; per-site delivery did not remain within the offer band; publisher pacing, scrape timing and broker service are not isolated); OFFER NOT MET (70% of offer); PUBLISHERS LATE (88% of publishes behind schedule — end-to-end publisher timing; scheduling, network and broker service are not isolated)
 ```
 
-The crossing gate, the rig's check that an arm ran the intended local-delivery path,
-passes at 3 nodes:
-
-```text
-GATE nodes=3 PASS 4 rungs, cert=canary, max broker crossing 0.00% <= 0.5%, ladder stopped at its knee (1 skipped)
-```
-
-and **fails on both 10-node arms** (`GATE nodes=10 FAIL …`, naming every broker above
-0.5%): 13.60% of publishes were forwarded to another broker at 25 sites, 16.84% at 35 and
-15.48% at 40, up to 37.87% on one broker. The per-rung table is in the card.
-
 **Ledger.** `bench/scale/qos1-campaign/ledger-report.py` closes on every rung of all three arms:
 193,366,130 message identities sent, acknowledged and received, with 0 missing, 0
-unacknowledged, 0 duplicates and 0 unexpected. Every broker reports 0 drops in every
-window. The per-rung table is in the card.
+unacknowledged, 0 duplicates and 0 unexpected. Every broker reports 0 drops on every rung.
+The per-rung table is in the card.
 
-### (a) What the rig certifies
+### (a) What held
 
-- **One rung is graded GREEN: 150,000 msg/s at 10 nodes, 15.0k msg/s per node**, p99 ≤
-  500 ms, zero loss, once.
-- **Its arm fails the crossing gate**, so it is a graded rung of an ungated arm, not a
-  gated scale-curve point.
-
-### (b) Measured, not certified, and why
-
-- **10 nodes, 25 sites, first pass:** the full offer sent and delivered; rejected only
-  because the drivers' endpoint scrapes missed the 2% window bound. The same rung 57
-  minutes later is the GREEN one.
-- **10 nodes at 35 and 40 sites, 3 nodes at 12 and 15 sites:** the offer was not met.
-  The publishers ran late (41–88% of publishes behind schedule) and the rungs never went
-  steady. At QoS 1 a late publisher is one waiting for its acknowledgement. No rung
-  flags a saturated driver, and the least-idle driver host averaged 68–78% idle.
-- **3 nodes has no carried rung above 1 site.** Its ladder was set from the log-store
-  result and started above this store's ceiling. That is a mistake in the ladder, not a
-  finding about 3 nodes.
-
-### (c) What can and cannot be concluded
-
-- **Ceiling on the default store: about 21k msg/s per node.** 19.2–21.9k at 10 nodes and
-  20.7–21.1k at 3. It is a saturation plateau read from NOT CARRIED rungs, not a certified
-  knee.
-- **Clean rate: at least 15k msg/s per node at 10 nodes.** The knee lies between 15k and
-  about 20k per node and was not located.
-- **About the same ceiling per node at 3 and at 10 nodes.** No more than that. No 3-node
-  rung was carried, only two sizes ran, and the 10-node arms forwarded 14–17% of publishes
-  where the 3-node arm forwarded none, so the two sizes did not run the same path. The
-  crossing at 10 nodes is unexplained.
-- **Past the ceiling the cluster slows its publishers and loses nothing.**
+- **10 nodes takes 150,000 msg/s in full: 15.0k msg/s per node**, p99 ≤ 500 ms, twice.
+- **Past that the cluster stops taking more at about 21k msg/s per node, at both sizes**:
+  19.2–21.1k at 10 nodes, 20.7–20.9k at 3, by the brokers' counters.
+- **Nothing was lost and p99 stayed at or below 1 s on every rung.** Past the ceiling the
+  cluster slows its publishers; it does not lose what it accepted.
 - **The limit is not the disk.** The summarizer's verdict is WRITER-BOUND at both sizes:
   one flush explains at most 17% of a commit, on disks 3–4× apart in flush rate.
-- **Not a statement about the log store, and not a statement about v1.1.0.**
+
+### (b) What the rig certifies, and why not the rest
+
+- **One rung is graded GREEN: 150,000 msg/s at 10 nodes**, once, in an arm that fails the
+  crossing gate.
+- **10 nodes, 25 sites, first pass:** the full offer delivered; rejected only because the
+  drivers' endpoint scrapes missed the 2% window bound. The brokers' scrapes took at most
+  29 ms.
+- **10 nodes at 35 and 40 sites, 3 nodes at 12 and 15 sites:** past the ceiling. The
+  publishers ran late (41–88% of publishes behind schedule) and the rungs never went
+  steady. No rung flags a saturated driver, and the least-idle driver host averaged
+  68–78% idle.
+- **3 nodes has no rung above 1 site that took its whole offer.** Its ladder was set from
+  the log-store result and started above this store's ceiling. That is a mistake in the
+  ladder, not a finding about 3 nodes.
+
+### (c) Cross-node traffic
+
+| | publishes forwarded to another broker | highest single broker |
+|---|---|---|
+| 3 nodes, every rung | 0.00% | 0.00% |
+| 10 nodes, 25 · 35 · 40 sites | 13.60% · 16.84% · 15.48% | 32.00% · 37.87% · 31.40% |
+| 10 nodes, 25 sites (drift control) | 13.60% | 32.00% |
+| clean sessions, 3 and 10 nodes, every rung | 0.00% | 0.00% |
+
+- **Some cross-node traffic did not stop it scaling.** 10 nodes reached about the same
+  ceiling per node while forwarding 13–17% of publishes as 3 nodes did forwarding none.
+- **Why it forwards.** A persistent session lives on the broker that owns it, chosen from
+  its client id, not on the broker its client dialled
+  ([ADR 0005](../adr/0005-session-affinity.md)). With 20 consumers per site spread over 10
+  brokers that way, some brokers hold no member of a site's `$share` group and forward
+  that site's publishes. At 25 sites that is 34 of 250 site × broker pairs, 13.60%. At 3
+  nodes every broker holds members of every site. The counters behind this, and what was
+  not checked, are in
+  [the card](../../bench/scale/durable-knees-2026-10-12.md#cross-node-traffic).
+- The rig's crossing gate (every broker ≤ 0.5%) therefore fails on both 10-node arms. Its
+  shape check predicted about 0%, which holds for clean sessions only.
+
+### (d) What cannot be concluded
+
+- **A certified knee, or a certified flat curve.** The ceiling is read from rungs the rig
+  graded NOT CARRIED, only two sizes ran, and each rung is one 60 s window.
+- **Anything about the log store, or about v1.1.0.**
 
 A sizing estimate for the offers that were not met, with its arithmetic and what fits the
 rig's quota, is in
 [the card](../../bench/scale/durable-knees-2026-10-12.md#estimate-brokers-needed-to-meet-the-offers-that-were-not-met):
 at 15,000 msg/s per node, 210,000 msg/s needs 14 nodes and 240,000 needs 16.
+
+<!-- SCALE-OUT-10-12-14: the results of bench/scale/durable-scaleout-10-12-14.md go here, in a follow-up. -->
+**Not in this document yet:** the durable scale-out at 14, 12 and 10 nodes
+([card](../../bench/scale/durable-scaleout-10-12-14.md)). No figure from it is published
+here.
 
 Run: `knee-20261012T122155Z` (untracked).
 

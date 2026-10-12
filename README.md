@@ -19,6 +19,8 @@
 > - **Durable QoS 1** (ack after fsync + replication): **90,000 msg/s on 3 nodes, 12 vCPU** ([↓](#durable-and-qos-1-scale-out)).
 >
 > All three use shared subscriptions. [Scale-out ↓](#cluster-scale-out-qos-0-shared-subscriptions)
+>
+> **Newest, on the unreleased 1.2.0 candidate** (read from the brokers' counters; at 10 nodes mostly not certified by the rig): QoS 1 held 39–42k msg/s per node on 10 nodes. Durable QoS 1 took 15k per node in full and stopped taking more near 21k, with publishers slowed and nothing dropped. 427 million messages ledgered, none lost. [What we measured ↓](#scale-what-we-measured-on-the-120-candidate)
 
 ---
 
@@ -79,6 +81,48 @@ HiveMQ CE  2024.3   ████████████████████
 | memory returned | **95%** | **98%** | 24% | — |
 
 ![mqttd at 150,000 msg/s](docs/benchmarks/img/timeline-mqttd-150k.svg)
+
+### Scale: what we measured on the 1.2.0 candidate
+
+**The per-node rate held from 3 to 10 nodes, and no message was lost.** Two campaigns on
+2026-10-12, each on one provisioning of 4-vCPU brokers, 3 and 10 nodes on the same hosts:
+
+| | 3 nodes | 10 nodes | p99 | messages ledgered · lost |
+|---|---|---|---|---|
+| **QoS 1, clean sessions** | 40.0k msg/s per node (120,000 msg/s), and 50.0k (150,000) at the top of its ladder | 39.0k per node (390,000 msg/s) and 42.0k (420,000), the highest rung run | ≤ 50 ms | 233,716,926 · 0 |
+| **Durable QoS 1**: persistent sessions, every delivery fsynced and quorum-acked, default store | stops taking more at 20.7–20.9k per node (62,243 and 62,611 msg/s) | 15.0k per node taken in full (150,000 msg/s); stops taking more at 19.2–21.1k (192,217 and 210,547) | ≤ 500 ms; ≤ 1000 ms on the most overloaded rung | 193,366,130 · 0 |
+
+![QoS 1 per node on the 1.2.0 candidate: rungs the rig certified, and rungs that hold](docs/benchmarks/img/scale-out-qos1-candidate.svg)
+
+- **Clean sessions did not find a limit at either size.** Every rung delivered its whole
+  offer.
+- **Durable QoS 1 has the same ceiling per node at 3 and at 10 nodes, about 21k msg/s.**
+  Offered more than that, the brokers acknowledge more slowly, publishers fall behind
+  their schedule, and nothing is dropped.
+- **Some cross-node traffic did not stop it scaling.** At 3 nodes no publish was
+  forwarded between brokers (0.00%). On the loaded durable 10-node rungs 13–17% of
+  publishes were, 31–38% on the busiest broker, and the cluster reached the same ceiling
+  per node. Clean sessions at 10 nodes forwarded 0.00%. The durable case forwards by
+  design: a persistent session lives on the broker that owns it, not on the one its
+  client dialled, so at 10 nodes some brokers hold no local member of a site's `$share`
+  group ([the counters](bench/scale/durable-knees-2026-10-12.md#cross-node-traffic)).
+
+**How to read this.** Rates are the brokers' own counters over a 60 s window. A rung
+*holds* if no message was lost (every message identity sent was acknowledged and
+received, and no broker dropped one) and p99 is at or below 1 s. Every rung here holds.
+That rule is simpler than the rig's certification: the rig graded 4 of these 12 rungs
+GREEN and the rest NOT CARRIED, for a saturated load-generator host, driver-side evidence
+it refused, or an offer the cluster did not take in full. The binary is an unreleased
+candidate build of the 1.2.0 commit `7d4eced`, not the signed release. Brokers are Hetzner
+CCX23 (4 vCPU). Each rung is one 60 s window, and the durable figures are for the default
+store, not the log store of the 3-node figure below. These are not points on the
+[certified curve](docs/benchmarks/QOS1-SCALE-CURVE.md). Every rung, both readings and the
+commands: [qos1-knees-2026-10-12.md](bench/scale/qos1-knees-2026-10-12.md) ·
+[durable-knees-2026-10-12.md](bench/scale/durable-knees-2026-10-12.md).
+
+<!-- SCALE-OUT-10-12-14: the results of bench/scale/durable-scaleout-10-12-14.md go here, in a follow-up. -->
+**Not here yet:** durable QoS 1 at 14, 12 and 10 nodes
+([card](bench/scale/durable-scaleout-10-12-14.md)). No figure from it is published.
 
 ### Cluster scale-out, QoS 0 shared subscriptions
 
@@ -172,30 +216,8 @@ rung: [QOS1-SCALE-CURVE.md](docs/benchmarks/QOS1-SCALE-CURVE.md#7-and-10-nodes--
 reproduce: [QOS1-SCALE-CURVE.md § Reproduction](docs/benchmarks/QOS1-SCALE-CURVE.md#reproduction).
 
 
-**The 1.2.0 candidate, 2026-10-12: measured, mostly not certified.** Two campaigns at 3
-and 10 nodes on an **unreleased build of the `release: v1.2.0` commit** (not the signed
-release; no v1.1.0 arm, so not a before/after). Every rung of both closed its message
-ledger with nothing missing, unacknowledged or duplicated.
-
-![QoS 1 per node on the 1.2.0 candidate: certified and uncertified rungs](docs/benchmarks/img/scale-out-qos1-candidate.svg)
-
-- **QoS 1, clean sessions.** 3 nodes: GREEN at 120,000 msg/s twice and at 150,000 once
-  (50k/node, the top of its ladder). 10 nodes: 390,000 and 420,000 msg/s offered, nothing
-  lost, p99 ≤ 50 ms, but **not certified**: one load-generator host had a saturated core,
-  so those rungs measured the generator.
-- **Durable QoS 1, default store (redb, 2 copies).** 10 nodes: GREEN at 150,000 msg/s
-  (15k/node, p99 ≤ 500 ms). Offered 210,000 and 240,000, it delivered 199,072 and
-  219,004; 3 nodes offered 72,000 and 90,000 delivered 62,806 and 63,429. That is a
-  ceiling near 21k msg/s per node at both sizes. Past it publishers are slowed; nothing
-  is dropped. Not comparable with the log-store figure above. The 10-node arms also
-  failed the rig's crossing gate (14–17% of publishes forwarded), which is unexplained.
-
-Every rung, the rig's verdicts and what can be concluded:
-[QOS1-SCALE-CURVE.md](docs/benchmarks/QOS1-SCALE-CURVE.md#the-120-candidate-at-3-and-10-nodes-2026-10-12--not-curve-points)
-(clean sessions) and
-[SCALE-CURVE.md](docs/benchmarks/SCALE-CURVE.md#durable-qos-1-by-site-on-the-120-candidate-2026-10-12--not-curve-points)
-(durable). Cards: [qos1-knees-2026-10-12.md](bench/scale/qos1-knees-2026-10-12.md) ·
-[durable-knees-2026-10-12.md](bench/scale/durable-knees-2026-10-12.md).
+The newest runs, on the 1.2.0 candidate, are not points on this curve and have their own
+section: [Scale: what we measured on the 1.2.0 candidate](#scale-what-we-measured-on-the-120-candidate).
 
 MB/s is application payload (216 B/message). **The constraint is packets, not
 bytes** — measured: holding 60,000 msg/s and growing the payload to 8 KiB reached

@@ -139,6 +139,9 @@ def swatch(x: float, y: float, role: str, label: str, *, kind: str = "box") -> l
     elif kind == "dash":
         mark = (f'<line x1="{x:.1f}" y1="{y - 4:.1f}" x2="{x + 18:.1f}" y2="{y - 4:.1f}" class="k-{role}" '
                 'stroke-width="2" stroke-dasharray="4 3"/>')
+    elif kind == "outline":
+        mark = (f'<rect x="{x + 1:.1f}" y="{y - 11:.1f}" width="12" height="12" rx="3" fill="none" '
+                f'class="k-{role}" stroke-width="2"/>')
     elif kind == "ghost":
         mark = (f'<rect x="{x + 1:.1f}" y="{y - 11:.1f}" width="12" height="12" rx="3" fill="none" '
                 f'class="k-{role}" stroke-width="1.5" stroke-dasharray="3 2"/>')
