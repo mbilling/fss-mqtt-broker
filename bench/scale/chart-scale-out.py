@@ -33,6 +33,10 @@ rate the BROKERS' own counters delivered over the window (summarize-curve.py's
   dashed grey     does not hold: a message was lost or p99 is above 1 s
   tick above      the offered rate, where the brokers delivered more than 1% less
 A rung the rig did not certify is never filled.
+
+A rung chart with `"unit": "total"` draws the same marks at the CLUSTER's msg/s
+instead of the per-node rate, and prints the per-node rate under each column: the
+form for "does the total grow when nodes are added".
 """
 import sys
 from pathlib import Path
@@ -94,6 +98,8 @@ CURVES = {
 #   "holds"  its broker-counter reading says HOLDS and its verdict is not GREEN
 #   "fails"  its reading says DOES NOT HOLD
 # 1-site rungs are left out.
+# Optional per chart: "unit" ("per-node", the default, or "total": columns at the
+# cluster's msg/s) and "slot" / "col_w" / "group_gap" for a chart with few columns.
 RUNG_STATES = ("green", "holds", "fails")
 RUNG_CHARTS = {
     "qos1-candidate": {
@@ -130,6 +136,33 @@ RUNG_CHARTS = {
                      (40, 240_000, 210_547, "holds", False),
                      (25, 150_000, 149_979, "green", True),
                  ]),
+             ]},
+        ],
+    },
+    # bench/scale/durable-scaleout-10-12-14.md, "Result": one panel per per-node offer,
+    # one column per cluster size, at the cluster's total. No rung here is certified.
+    "durable-scaleout-candidate": {
+        "file": "scale-out-durable-candidate.svg",
+        "title": "Durable QoS 1 on the 1.2.0 candidate: 10 → 12 → 14 nodes, the total grows, nothing lost",
+        "subtitle": "total msg/s from the brokers' own counters · default store (redb), 2 copies, fsync + "
+                    "quorum ack · UNRELEASED candidate 7d4eced",
+        "source": "bench/scale/durable-scaleout-10-12-14.md · 4-vCPU nodes, one provisioning, Hetzner fsn1, "
+                  "2026-10-12 · one 60 s window per rung",
+        "unit": "total",
+        "y_max": 300_000, "y_step": 50_000,
+        "slot": 100, "col_w": 44, "group_gap": 18,
+        "panels": [
+            {"title": "Offered 15k msg/s per node",
+             "groups": [
+                 (10, "4.78% forwarded", [(25, 150_000, 150_419, "holds", False)]),
+                 (12, "13.41% forwarded", [(30, 180_000, 179_039, "holds", False)]),
+                 (14, "15.79% forwarded", [(35, 210_000, 208_739, "holds", False)]),
+             ]},
+            {"title": "Offered 18k msg/s per node",
+             "groups": [
+                 (10, "8.67% forwarded", [(30, 180_000, 173_100, "holds", False)]),
+                 (12, "12.15% forwarded", [(36, 216_000, 205_750, "holds", False)]),
+                 (14, "13.36% forwarded", [(42, 252_000, 240_497, "holds", False)]),
              ]},
         ],
     },
@@ -257,6 +290,14 @@ def draw_rungs(c: dict) -> str:
     y_max = c["y_max"]
     ph = RH - RT - RB
     y0 = RT + ph
+    total = c.get("unit", "per-node") == "total"
+    slot, col_w, group_gap = c.get("slot", SLOT), c.get("col_w", RCOL_W), c.get("group_gap", GROUP_GAP)
+
+    def height(v: float, n: int) -> float:
+        return v if total else v / n
+
+    def rate(v: float, n: int) -> str:
+        return cs.compact(v) if total else per_node(v, n)
 
     def y(v: float) -> float:
         return RT + ph - v / y_max * ph
@@ -266,18 +307,22 @@ def draw_rungs(c: dict) -> str:
         if r[3] not in RUNG_STATES:
             raise SystemExit(f"unknown rung state {r[3]!r}; one of {', '.join(RUNG_STATES)}")
     o = cs.open_svg(RW, RH, c["title"], c["subtitle"],
-                    "One column per rung, msg/s per node, as the brokers' own counters delivered it. A filled "
+                    f"One column per rung, {'total msg/s' if total else 'msg/s per node'}, as the brokers' own "
+                    "counters delivered it. A filled "
                     "green column is a rung the rig certified GREEN (p99 ≤ 1 s, zero loss); a green outline "
                     "holds by the reading rule (no message lost, p99 ≤ 1 s) and is NOT certified by the rig; "
                     "a dashed grey column does not hold; a tick above a column is the offered rate where the "
                     "brokers delivered less. " + "; ".join(
                         f"{p['title']}, {n} nodes ({note}): " + ", ".join(
-                            f"{sites} sites{' control' if ctl else ''} {per_node(dlv, n)} of "
-                            f"{per_node(off, n)} offered, {STATE_WORDS[v]}"
+                            f"{sites} sites{' control' if ctl else ''} {rate(dlv, n)} of "
+                            f"{rate(off, n)} offered, {STATE_WORDS[v]}"
                             for sites, off, dlv, v, ctl in rs)
                         for p in c["panels"] for n, note, rs in p["groups"]))
 
-    keys = [("good", "certified GREEN by the rig", "box")]
+    # Only the keys this chart uses: a chart with no certified rung shows no filled key.
+    keys = []
+    if any(r[3] == "green" for _, r in rungs):
+        keys.append(("good", "certified GREEN by the rig", "box"))
     if any(r[3] == "holds" for _, r in rungs):
         keys.append(("good", "holds: no loss, p99 ≤ 1 s · NOT certified", "outline"))
     if any(r[3] == "fails" for _, r in rungs):
@@ -293,7 +338,8 @@ def draw_rungs(c: dict) -> str:
         o.append(cs.hline(RL, RW - RR, y(v), "axis" if v == 0 else "grid"))
         o.append(cs.text(RL - 12, y(v) + 4, cs.compact(v) if v else "0", size=12, role="muted",
                          anchor="end", num=True))
-    o.append(cs.text(RL - 12, RT - 14, "msg/s per node", size=11, role="muted", anchor="end"))
+    o.append(cs.text(RL - 12, RT - 14, "msg/s" if total else "msg/s per node", size=11, role="muted",
+                     anchor="end"))
 
     x = RL + 16.0
     for pi, p in enumerate(c["panels"]):
@@ -303,43 +349,48 @@ def draw_rungs(c: dict) -> str:
         p_start = x
         for gi, (n, note, rs) in enumerate(p["groups"]):
             if gi:
-                x += GROUP_GAP
+                x += group_gap
             g_start = x
             for sites, off, dlv, verdict, ctl in rs:
-                mid = x + SLOT / 2
-                cx = mid - RCOL_W / 2
-                top = y(dlv / n)
+                mid = x + slot / 2
+                cx = mid - col_w / 2
+                top = y(height(dlv, n))
+                half = col_w / 2 - 2
                 if verdict == "green":
-                    o.append(cs.column(cx, top, y0, RCOL_W, "good"))
+                    o.append(cs.column(cx, top, y0, col_w, "good"))
                 elif verdict == "holds":
                     # Open at the baseline, so the outline reads as a column and
                     # not as a box floating on the axis.
                     o.append(f'<path d="M{cx + 1:.1f},{y0:.1f} V{top + 5:.1f} Q{cx + 1:.1f},{top + 1:.1f} '
-                             f'{cx + 5:.1f},{top + 1:.1f} H{cx + RCOL_W - 5:.1f} Q{cx + RCOL_W - 1:.1f},{top + 1:.1f} '
-                             f'{cx + RCOL_W - 1:.1f},{top + 5:.1f} V{y0:.1f}" fill="none" class="k-good" '
+                             f'{cx + 5:.1f},{top + 1:.1f} H{cx + col_w - 5:.1f} Q{cx + col_w - 1:.1f},{top + 1:.1f} '
+                             f'{cx + col_w - 1:.1f},{top + 5:.1f} V{y0:.1f}" fill="none" class="k-good" '
                              'stroke-width="2" data-rung="holds"/>')
                 else:
-                    o.append(f'<rect x="{cx + 0.75:.1f}" y="{top + 0.75:.1f}" width="{RCOL_W - 1.5:.1f}" '
+                    o.append(f'<rect x="{cx + 0.75:.1f}" y="{top + 0.75:.1f}" width="{col_w - 1.5:.1f}" '
                              f'height="{max(y0 - top - 0.75, 1):.1f}" rx="4" fill="none" class="k-ghost" '
                              'stroke-width="1.5" stroke-dasharray="3 2" data-rung="fails"/>')
                 if offer_tick(off, dlv):
-                    yo = y(off / n)
+                    yo = y(height(off, n))
                     if top - yo > 6:
                         o.append(cs.vline(mid, yo + 1, top - 2, "ghost", 1, "2 2"))
-                    o.append(f'<line x1="{mid - 11:.1f}" y1="{yo:.1f}" x2="{mid + 11:.1f}" y2="{yo:.1f}" '
+                    o.append(f'<line x1="{mid - half:.1f}" y1="{yo:.1f}" x2="{mid + half:.1f}" y2="{yo:.1f}" '
                              'class="k-ink2" stroke-width="2.5" stroke-linecap="round" data-rung="offered"/>')
-                    o.append(cs.text(mid, yo - 21, per_node(dlv, n), size=13, role="ink", anchor="middle",
+                    o.append(cs.text(mid, yo - 21, rate(dlv, n), size=13, role="ink", anchor="middle",
                                      weight=650, num=True))
-                    o.append(cs.text(mid, yo - 8, f"of {per_node(off, n)}", size=10, role="ink2",
+                    o.append(cs.text(mid, yo - 8, f"of {rate(off, n)}", size=10, role="ink2",
                                      anchor="middle", num=True))
                 else:
-                    o.append(cs.text(mid, top - 8, per_node(dlv, n), size=13, role="ink", anchor="middle",
+                    o.append(cs.text(mid, top - 8, rate(dlv, n), size=13, role="ink", anchor="middle",
                                      weight=650, num=True))
                 o.append(cs.text(mid, y0 + 18, f"{sites} sites", size=11, role="ink2", anchor="middle",
                                  num=True))
-                if ctl:
+                if total:
+                    # The per-node rate the total stands for, and the control mark beside it.
+                    o.append(cs.text(mid, y0 + 31, f"{per_node(dlv, n)} / node" + (" · control" if ctl else ""),
+                                     size=10, role="muted", anchor="middle", num=True))
+                elif ctl:
                     o.append(cs.text(mid, y0 + 31, "control", size=10, role="muted", anchor="middle"))
-                x += SLOT
+                x += slot
             gm = (g_start + x) / 2
             o.append(cs.text(gm, y0 + 54, f"{n} nodes", size=13, role="ink", anchor="middle", weight=600))
             o.append(cs.text(gm, y0 + 71, note, size=11, role="muted", anchor="middle"))
@@ -395,11 +446,41 @@ def self_test() -> None:
         states = [r[3] for p in chart["panels"] for _, _, rs in p["groups"] for r in rs]
         checks.append((f"{chart['file']}: {states.count('green')} certified, {states.count('holds')} holds, "
                        f"{states.count('fails')} does not hold",
-                       out.count('class="f-good"') == states.count("green") + 1
+                       out.count('class="f-good"') == states.count("green") + (1 if "green" in states else 0)
                        and out.count('data-rung="holds"') == states.count("holds")
                        and out.count('data-rung="fails"') == states.count("fails")))
         ticks = sum(offer_tick(r[1], r[2]) for p in chart["panels"] for _, _, rs in p["groups"] for r in rs)
         checks.append((f"{chart['file']}: {ticks} offered ticks", out.count('data-rung="offered"') == ticks))
+    # A total chart: the cluster's msg/s on the columns, the per-node rate beneath, and
+    # no filled mark anywhere when the rig certified none of its rungs.
+    t = {**c, "unit": "total", "y_max": 300_000, "y_step": 50_000, "slot": 100, "col_w": 44,
+         "panels": [{"title": "p", "groups": [
+             (10, "n10", [(30, 180_000, 173_100, "holds", False)]),
+             (14, "n14", [(35, 210_000, 208_739, "holds", False), (42, 252_000, 240_497, "holds", True)]),
+         ]}]}
+    tsvg = draw_rungs(t)
+    tbody = tsvg.split("</desc>")[1]
+    checks += [
+        ("a total chart labels the cluster's rate, not the per-node one",
+         ">173k<" in tbody and ">209k<" in tbody and ">240k<" in tbody and ">17.3k<" not in tbody),
+        ("a total chart prints the per-node rate under each column",
+         ">17.3k / node<" in tbody and ">14.9k / node<" in tbody and ">17.2k / node · control<" in tbody),
+        ("a total chart marks the unmet offers at the cluster's rate",
+         tsvg.count('data-rung="offered"') == 2 and ">of 180k<" in tbody and ">of 252k<" in tbody
+         and ">of 210k<" not in tbody),
+        ("a total chart's axis is msg/s, not msg/s per node",
+         ">msg/s<" in tbody and "msg/s per node" not in tbody and "total msg/s" in tsvg.split("</desc>")[0]),
+        ("a chart with no certified rung has no filled mark and no certified key",
+         'class="f-good"' not in tsvg and "certified GREEN by the rig" not in tbody
+         and tsvg.count('data-rung="holds"') == 3),
+        ("the per-node chart keeps its axis", "msg/s per node" in body),
+    ]
+    scale = RUNG_CHARTS["durable-scaleout-candidate"]
+    firsts = [[rs[0] for _, _, rs in p["groups"]] for p in scale["panels"]]
+    checks.append(("the scale-out chart is 10, 12 and 14 nodes at each offer, its totals rising, none certified",
+                   all([n for n, _, _ in p["groups"]] == [10, 12, 14] for p in scale["panels"])
+                   and all(a[2] < b[2] for rungs in firsts for a, b in zip(rungs, rungs[1:]))
+                   and all(r[3] == "holds" for rungs in firsts for r in rungs)))
     # A 14-node point stays inside the plot, and the published curves keep their axis.
     wide = {**CURVES["qos1"], "points": CURVES["qos1"]["points"] + [(14, 400_000, "certified", "", None)]}
     checks.append(("a 14-node column is drawn inside the plot",

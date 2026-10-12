@@ -301,7 +301,7 @@ def main() -> int:
 
     # --- the candidate scale section quotes its cards, figure for figure -------
     # "Scale: what we measured on the 1.2.0 candidate" publishes rates, ledger totals
-    # and forwarded shares from two run cards. The cards are the record (the raw runs
+    # and forwarded shares from three run cards. The cards are the record (the raw runs
     # are untracked), so every figure in the section must be one a card states: a
     # number edited in the README alone, or left behind when a card is corrected, is
     # a claim with no source. Three shapes are held to it — thousands-separated
@@ -319,7 +319,8 @@ def main() -> int:
         )
     else:
         cards = [ROOT / "bench" / "scale" / n
-                 for n in ("qos1-knees-2026-10-12.md", "durable-knees-2026-10-12.md")]
+                 for n in ("qos1-knees-2026-10-12.md", "durable-knees-2026-10-12.md",
+                           "durable-scaleout-10-12-14.md")]
         stated = set()
         for card in cards:
             stated |= scale_figures(card.read_text(encoding="utf-8"))
@@ -327,8 +328,8 @@ def main() -> int:
         figure_count = len(quoted)
         for figure in sorted(quoted - stated):
             problems.append(
-                f"the README's 1.2.0-candidate scale section says {figure}, which neither "
-                "bench/scale/qos1-knees-2026-10-12.md nor durable-knees-2026-10-12.md states"
+                f"the README's 1.2.0-candidate scale section says {figure}, which none of "
+                + ", ".join(f"bench/scale/{c.name}" for c in cards) + " states"
             )
         if not quoted:
             problems.append("the README's 1.2.0-candidate scale section quotes no figure at all")

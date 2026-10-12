@@ -359,7 +359,8 @@ many servers such a group admits.
 [`durable-scaleout-10-12-14.md`](durable-scaleout-10-12-14.md) is the campaign these
 sizes were added for: durable QoS 1 at 14 → 12 → 10 → 14 on one provisioning of 14
 brokers and 16 drivers, read by a deliberately simple rule (no message lost, p99 below
-1 s) — a diagnostic scale-out, not a certified curve.
+1 s) — a diagnostic scale-out, not a certified curve. It ran on 2026-10-12 and the card
+holds its results; the closing 14-node arm did not run (#971).
 
 Two campaigns on the 1.2.0 release commit (2026-10-12, an unreleased candidate build, 10 →
 3 → 10) have their own cards: [`qos1-knees-2026-10-12.md`](qos1-knees-2026-10-12.md)
