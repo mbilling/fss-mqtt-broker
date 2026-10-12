@@ -1,7 +1,8 @@
 # Rule cookbook
 
-**Dated 2026-10-12.** For the rule engine, which no release has yet: see
-[RULES.md](RULES.md) for how to get a build that has it.
+**Dated 2026-10-12.** For the rule engine, in releases from `v1.2.0`: see
+[RULES.md](RULES.md#1-get-a-build-that-has-the-rule-engine) for how to get a build that
+has it.
 
 Twenty-three working recipes for mqttd's [rule engine](RULES.md). Each one is a rules file
 in [`docs/examples/rules/`](examples/rules/) that you can copy as it is, with the messages
@@ -63,7 +64,7 @@ privacy-safe feeds they derive), see the [rule-engine demo](../demo/rules/README
 
 ## Run any recipe in under a minute
 
-You need a build of `mqttd` that has the rule engine (no release has it yet) and the
+You need a build of `mqttd` that has the rule engine (`v1.2.0` or later) and the
 Mosquitto command-line clients, `mosquitto_sub` and `mosquitto_pub`. Run the commands from
 the repository root, so the recipe paths resolve. From a source checkout, build the broker
 and put it on your `PATH`, in each terminal where you run `mqttd` ([RULES.md](RULES.md)

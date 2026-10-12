@@ -35,8 +35,8 @@ demo/rules/run.sh
 It starts mqttd on free localhost ports with `rules.toml` and plays this page's ten minutes
 at ten times real time (about a minute): the numbers and alerts below are what it prints. It prints each device message (`→`) and each message
 the rules derive (`⇒`), then the broker's own per-rule counters. It needs Python 3
-(standard library only) and a build of mqttd with the rule engine: no release has it yet,
-so `run.sh` uses this checkout's `target/` build, or runs `cargo build --release -p mqttd`
+(standard library only) and a build of mqttd with the rule engine (`v1.2.0` or later):
+`run.sh` uses this checkout's `target/` build, or runs `cargo build --release -p mqttd`
 the first time. With `mqttui`, run it as `mqttui --run demo-rules`.
 
 Every option goes to the simulator:

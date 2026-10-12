@@ -1,6 +1,6 @@
 # Audit export schema
 
-**Verified against `v1.1.0` + ADR 0066 T3 (2026-10-07), and ADR 0084's additions (2026-10-08).** The contract a SIEM
+**Verified against `v1.2.0` + ADR 0066 T3 (2026-10-12).** The contract a SIEM
 parser is written against: the record format, the complete kind vocabulary, the
 boundary invariants, the delivery semantics, and the verification procedure.
 Stability promise: **fields and semantics below are frozen; new `kind` values
@@ -72,7 +72,7 @@ the stream proves itself (the external-anchoring model; see the
   closing record reaches you; a crash may lose the unexported tail — which
   invariant 3 turns into a visible event rather than a silent one.
 
-## Kind vocabulary (complete at v1.0.0; additive-only from here)
+## Kind vocabulary (16 kinds at v1.0.0, additive-only since: `admin.request` in v1.1.0; `rules.write` and `state.delete` in v1.2.0)
 
 | Kind | Subject | Emitted when |
 |---|---|---|
@@ -93,7 +93,7 @@ the stream proves itself (the external-anchoring model; see the
 | `security.evict` | identity | A live session's grants tightened/evicted on reload |
 | `security.penalty` | source addr | Auth-failure penalty box engaged for a source (ADR 0041 T2) |
 | `admin.request` | certificate subject | An admin API request was answered (ADR 0081); `detail` is `role=<role> <METHOD> <target> -> <status>`, refusals included |
-| `state.delete` | certificate subject | The admin API deleted a key of the rule state store (ADR 0085 D10); `detail` is `ns=<namespace> key_sha256=<sha256 of the key's bytes> key_bytes=<their length> deleted=<true\|false>` (`false`: no value was there). The key is payload-derived data and is never recorded itself; the `admin.request` record of a `rules/state/keys` or `rules/state/key` request carries `key_sha256`, `key_bytes`, `prefix_sha256` and `prefix_bytes` in place of `key` and `prefix` for the same reason |
+| `state.delete` | certificate subject | The admin API deleted a key of the rule state store (ADR 0085 D10); `detail` is `ns=<namespace> key_sha256=<sha256 of the key's bytes> key_bytes=<their length> deleted=<true\|false>` (`false`: no value was there). The key is payload-derived data and is never recorded itself; the `admin.request` record of a `rules/state/keys` or `rules/state/key` request carries `key_sha256`, `key_bytes`, `prefix_sha256`, `prefix_bytes`, `cursor_sha256` and `cursor_bytes` in place of `key`, `prefix` and `cursor` for the same reason (a cursor holds the last key listed) |
 | `rules.write` | certificate subject | The admin API replaced the rules file (ADR 0084), recorded after the new file is in place and its reload has run; `detail` is `op=<put-file\|put-rule\|delete-rule> rule=<id, or - for put-file> old=<sha256, or - when there was no file> new=<sha256> applied=<true\|false>`. A write refused before the new file is in place leaves only its `admin.request`; one whose reload is refused (`409 reload-rejected`) is recorded with `applied=false`. A write that changes nothing on disk (`written: false`) records no `rules.write` |
 
 ## Verification

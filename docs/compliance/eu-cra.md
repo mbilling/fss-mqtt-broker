@@ -1,6 +1,6 @@
 # EU Cyber Resilience Act — readiness statement
 
-**Verified against `v1.1.0` (2026-10-07).** ADR 0067 T2: the CRA's essential
+**Verified against `v1.2.0` (2026-10-12).** ADR 0067 T2: the CRA's essential
 requirements as a checklist against shipped, checkable facts, plus the
 reporting-duty runbook. **This is not a conformity assessment and confers no CE
 marking**; it is the technical-documentation groundwork a manufacturer or
@@ -27,17 +27,17 @@ begin **September 2026** and its full obligations apply from **December 2027**.
 
 | # | Requirement (condensed) | Shipped fact | Check it |
 |---|---|---|---|
-| 1 | Designed/produced with appropriate level of cybersecurity | Security-first design record: 70 ADRs, [threat model](../THREAT-MODEL.md), [hardening baseline](../HARDENING.md) | the documents; CI gates |
+| 1 | Designed/produced with appropriate level of cybersecurity | Security-first design record: 86 ADRs, [threat model](../THREAT-MODEL.md), [hardening baseline](../HARDENING.md) | the documents; CI gates |
 | 2 | Delivered **without known exploitable vulnerabilities** | `cargo audit` gates every PR and release; findings fixed or dispositioned in the [VEX](../../security/vex/README.md) | release pipeline logs; `vex-<version>.openvex.json` per release |
 | 3 | **Secure by default** configuration | Deny-by-default authn/authz; TLS 1.3 only; every insecure posture opt-in and self-announced (`INSECURE:` lines — [HARDENING H-0](../HARDENING.md)) | boot log grep; hardening items H-1..H-4 |
 | 4 | Security updates, automatic where appropriate; **separable from functional updates** | Patch releases change no format of any kind (ADR 0039 §1), so a security fix is adoptable without functional risk; three supported minor lines ([SUPPORT.md](../../SUPPORT.md)) | release notes; the patch rule in ADR 0039 |
 | 5 | Protection from unauthorised access (authn, identity/access mgmt) | Argon2id passwords, mTLS with EKU + SAN discipline, OIDC (asymmetric-only), deny-by-default ACL, session-owner guard | THREAT-MODEL §1; HARDENING §2–3 |
 | 6 | Confidentiality of stored/transmitted data | TLS 1.3 (client and cluster planes), no plaintext by default; at-rest encryption is the platform's (stated, not implied — [THREAT-MODEL §4](../THREAT-MODEL.md)) | HARDENING H-1.x, H-4.1 |
 | 7 | Integrity of data, commands, configuration | Schema-gated stores, epoch fencing, hash-chained audit, backup sha-256 trailers, validate-before-swap config | THREAT-MODEL §2/§4/§5 |
-| 8 | Process only what is **necessary** (data minimisation) | The broker stores payloads it is asked to retain/queue and identity subjects — nothing else; audit records carry **no credentials** by contract | [AUDIT-SCHEMA](../AUDIT-SCHEMA.md); `AuditSink` doc |
-| 9 | Availability of essential functions; resilience to DoS | Admission caps before TLS work, auth penalty box, per-subscriber bounds, watermark **brownout** (refuse growth, keep serving), quorum write floor | THREAT-MODEL §1-DoS; ADR 0041 |
-| 10 | Minimise own attack surface | No dashboard (a recorded, deliberate absence); the admin API is off unless configured, mTLS-only from a dedicated admin CA, role-scoped (viewer/operator) and audited per request; read-only health and metrics endpoints; signals and files remain a complete control plane without it | ADR 0033/0051/0081; THREAT-MODEL §5 |
-| 11 | Reduce incident impact; exploitation mitigation | Fail-closed everywhere; effect-free refusals; distroless nonroot images; hardened systemd unit; memory-safe implementation language | HARDENING H-7.5/7.6 |
+| 8 | Process only what is **necessary** (data minimisation) | The broker stores payloads it is asked to retain/queue and identity subjects. Where the operator's rules keep state, it also holds the keys and values those rules build from messages: in memory only, every key with an expiry (30 days at most), under a configured ceiling, and absent when no rule uses it or `rules.state_max_bytes = 0`. The rule trace, off by default, copies selected messages to `$SYS` while it is on. Audit records carry **no credentials** by contract, and name a rule-state key by its SHA-256, never by itself | [AUDIT-SCHEMA](../AUDIT-SCHEMA.md); `AuditSink` doc; HARDENING H-7.9, H-7.16 |
+| 9 | Availability of essential functions; resilience to DoS | Admission caps before TLS work, auth penalty box, per-subscriber bounds, watermark **brownout** (refuse growth, keep serving), quorum write floor; per-message bounds on rule evaluation, on sandboxed rule functions and on rule state | THREAT-MODEL §1-DoS; ADR 0041, 0083, 0085, 0086 |
+| 10 | Minimise own attack surface | No dashboard (a recorded, deliberate absence); the admin API is off unless configured, mTLS-only from a dedicated admin CA, role-scoped (viewer/operator) and audited per request, and writes the rules file only for subjects listed in `rules.admin_writers` (none by default); the WebAssembly sandbox for rule functions (`jq`, operator modules) is off by default and creates no runtime until used, and a build without it is documented; read-only health and metrics endpoints; signals and files remain a complete control plane without it | ADR 0033/0051/0081/0084/0086; THREAT-MODEL §5; HARDENING H-7.10, H-7.12, H-7.13 |
+| 11 | Reduce incident impact; exploitation mitigation | Fail-closed everywhere; effect-free refusals; distroless nonroot images; hardened systemd unit (one restriction, `MemoryDenyWriteExecute`, is given up where the sandbox is switched on: H-7.15); memory-safe implementation language, with the linked C named in the threat model's accepted risks | HARDENING H-7.5/7.6/7.15 |
 | 12 | Security-relevant information recorded (logging/monitoring) | Hash-chained audit trail with SIEM export, boundary-alert invariants, independent verifier | [AUDIT-SCHEMA](../AUDIT-SCHEMA.md); `scripts/audit-verify.py` |
 | 13 | Users can securely remove data / transfer | Session takeover semantics, backup export/restore (documented window semantics), data-dir ownership | ADR 0062; OPERATIONS DR section |
 
@@ -47,7 +47,7 @@ begin **September 2026** and its full obligations apply from **December 2027**.
 |---|---|
 | Identify and document vulnerabilities; **SBOM** | CycloneDX per shipped binary, per release, signed |
 | Address without delay; provide security updates | SUPPORT.md lifecycle; patches on all supported lines |
-| Regular testing | CI battery per PR; nightly chaos/soak/upgrade; continuous fuzzing (6 targets) |
+| Regular testing | CI battery per PR; nightly chaos/soak/upgrade; continuous fuzzing (10 targets) |
 | Publish fixed-vulnerability information | GitHub Security Advisories + release notes; VEX per release |
 | Coordinated disclosure **policy** | [SECURITY.md](../../SECURITY.md): private reporting channel, expectations, timelines |
 | Share/receive vulnerability reports (contact point) | The repository's private advisory form (SECURITY.md names it) |

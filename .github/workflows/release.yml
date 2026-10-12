@@ -559,6 +559,16 @@ jobs:
             printf 'Every asset below is cosign-signed (keyless, transparency-logged)\n'
             printf 'and the binaries are byte-reproducible from this tag. See\n'
             printf 'RELEASING.md for the one-command verify path.\n'
+            # The hand-written notes for this version, when the tagged tree carries
+            # them: what is new and what an upgrade needs. Read from the tree at this
+            # tag, like everything above, so they are reviewed with the release commit
+            # and never edited into a published release by hand. A version without the
+            # file gets the text above alone.
+            NOTES="docs/release-notes/${VERSION}.md"
+            if [ -f "$NOTES" ]; then
+              printf '\n'
+              cat "$NOTES"
+            fi
           } > release-notes.md
           PRERELEASE_FLAG=""
           [[ "${{ steps.v.outputs.prerelease }}" == "true" ]] && PRERELEASE_FLAG="--prerelease"

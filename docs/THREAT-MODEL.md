@@ -1,6 +1,6 @@
 # Threat model
 
-**Verified against `v1.1.0` (2026-10-07); ADR 0084's surfaces added 2026-10-08, ADR 0086's (rule functions in a WebAssembly sandbox) 2026-10-11, ADR 0085's (state for rules) 2026-10-12.** This is the one-document answer to "what
+**Verified against `v1.2.0` (2026-10-12).** This is the one-document answer to "what
 is your threat model?" (ADR 0066 T1). It consolidates — it does not invent: every
 mitigation row names the ADR that decided it and the code that enforces it, and every
 accepted risk is quoted from the record that accepted it. The maintenance rule: a PR
@@ -36,7 +36,7 @@ the operator.
 | Credential guessing | Argon2id PHC hashes; identical error for unknown-user and wrong-password (no enumeration oracle) | ADR 0004; `mqtt-auth/src/password.rs` |
 | Client-cert forgery / CA misuse | mTLS with EKU-checked client certs; SAN-source selection never silently falls back to CN (a CA that can mint any CN must not impersonate a SAN-named workload); absent/ambiguous identity fails closed to anonymous policy = deny | ADR 0004 T11; `mqtt-auth/src/mtls.rs` |
 | Token forgery (OIDC/JWT) | Asymmetric-only allow-list (RS256/ES256), `HS*` refused outright (key-confusion class); `iss`+`aud` required; JWKS staleness fails closed past 24 h | ADR 0050; `mqtt-auth/src/oidc.rs` |
-| Identity as topic-injection vector | Identities containing `+`, `#`, `/` rejected at the door for every auth source | ADR 0004; `mqtt-auth/src/mtls.rs:151` |
+| Identity as topic-injection vector | Identities containing `+`, `#`, `/` rejected at the door for every auth source | ADR 0004; `mqtt-auth/src/mtls.rs:154` |
 | **Session theft by client-id collision** | Session-owner guard, on by default with no config: a persistent session records its owning principal; a different principal resuming it gets CONNACK `0x87` | ADR 0031; `mqtt-storage/src/lib.rs` (`SessionClaim`) |
 | Anonymous access | Default-off; enabling it logs `INSECURE` at startup | ADR 0046; `mqttd/src/main.rs` |
 | Forged broker messages on `$SYS` (fake rule statistics or trace) | `$SYS` and everything under `$SYS/` are reserved for the broker by one predicate, whatever the ACL says: a client publish is refused at the ACL step (v5 `0x87`, v3.1.1 dropped, after topic-alias resolution), a Will on it refuses the CONNECT, and a rule republish that renders it fails its action. The one exception is `$SYS/broker/connection/<id>/state`, where a Mosquitto bridge reports its connection state: it is outside the broker's own `$SYS/brokers/`, so nothing the broker publishes can be forged through it, and the ACL decides it like any topic. In the hub only the broker's own `SysPublish` may route a reserved topic; every other path (client and derived publishes, Wills, retained restores, a peer forward that would be retained, is QoS 1 or 2, or names this node) drops it. Retained `$SYS` values stored before the upgrade are cleared by the node that owns them during the first minute after boot (the count is logged at WARN), a restore skips them, and subscribe-time replay never delivers a retained `$SYS` value, so one not yet cleared, or replicated from an older peer, is never seen. The authorization dry run answers such a publish `allowed: false`. Rolling-upgrade window: see the accepted risks | ADR 0084 D1; `mqtt-core` `is_reserved_topic`, `mqttd/src/conn.rs`, `hub/`, `mqtt-rules/src/action.rs`, `admin/authz.rs` |
@@ -50,8 +50,8 @@ the operator.
 | Placeholder abuse (`%i`/`%c`) | A pattern whose placeholder is empty or contains topic metacharacters is unusable — allow grants nothing, deny refuses outright | ADR 0004 T12; `mqtt-auth/src/acl.rs:33` |
 | Revoked-but-connected clients | Policy reload sweeps **live** sessions: identity revocation terminates, permission tightening removes grants | ADR 0040; `mqttd/src/reload.rs` |
 | TLS downgrade / weak crypto | TLS 1.3 only by default (1.2 is per-listener opt-in); one audited build site, no skip-verification path, one crypto provider passed explicitly | ADR 0002, 0053; `mqtt-net/src/tls.rs` |
-| QUIC 0-RTT replay | `max_early_data_size = 0` — 0-RTT disabled | ADR 0036; `mqtt-net/src/quic.rs:52` |
-| A rule republishing where its publisher cannot | Not mitigated by the ACL, by design: the ACL decides whether the *original* is accepted, and what a rule derives from it is operator configuration with the ACL file's trust (see the control-plane accepted risks). A derived message carries no publisher identity and never re-enters the rule engine, so a client cannot steer one rule's output into another. A topic template filled from the payload, the client id or the username lets the publisher choose those topic levels (`x/../admin`, a `$`-prefixed level); a rendered topic with a wildcard, NUL, `$share/` or a reserved `$SYS` topic fails the action, and docs/RULES.md documents the `WHERE … regex_match(…)` guard that confines the rest — the rule author's to apply | ADR 0083 §3; `mqttd/src/rules.rs`, `mqtt-rules/src/action.rs`; [RULES.md](RULES.md#security-values-the-publisher-chooses) |
+| QUIC 0-RTT replay | `max_early_data_size = 0` — 0-RTT disabled | ADR 0036; `mqtt-net/src/quic.rs:53` |
+| A rule republishing where its publisher cannot | Not mitigated by the ACL, by design: the ACL decides whether the *original* is accepted, and what a rule derives from it is operator configuration with the ACL file's trust (see the control-plane accepted risks). A derived message carries no publisher identity. Unless its action sets `direct_dispatch = true` it re-enters the rule engine, as in EMQX, so a client whose publish a rule selects also reaches every rule whose `FROM` matches what that rule republishes: a chain stops 32 republishes deep, a rule does not republish again what it republished itself, and the whole chain shares the original's limits (Denial of service, below). A topic template filled from the payload, the client id or the username lets the publisher choose those topic levels (`x/../admin`, a `$`-prefixed level); a rendered topic with a wildcard, NUL, `$share/` or a reserved `$SYS` topic fails the action, and docs/RULES.md documents the `WHERE … regex_match(…)` guard that confines the rest — the rule author's to apply | ADR 0083 §3; `mqttd/src/rules.rs`, `mqtt-rules/src/action.rs`; [RULES.md](RULES.md#security-values-the-publisher-chooses) |
 
 ### Repudiation
 
@@ -166,6 +166,19 @@ expiry. "Tests" names the test that fails if the mitigation is removed:
   the operator writes, or one a rule takes from the payload, can do it; a rule that lets
   the payload choose its pattern hands this cost to the publisher. EMQX has the same
   exposure, softened by its scheduler. (ADR 0083 amendment 2026-10-10.)
+- **Three C libraries run in the broker's own address space on payload bytes, where a
+  rule calls them.** `regex_match`, `regex_replace` and `regex_extract` run PCRE2
+  (10.46, without its JIT), the compression functions (`gunzip`, `unzip`,
+  `zip_uncompress` and their counterparts) run zlib, and `lz4_compress` and
+  `lz4_uncompress` run liblz4 (1.10.0): chosen because EMQX's results are those
+  libraries' results, built from the sources their crates carry and linked statically.
+  Unlike jq they are not guests of a sandbox, so the rule engine's memory safety there
+  is theirs, not Rust's. What bounds a payload's reach: the match, depth and heap limits
+  on PCRE2 (Denial of service, above), decompressed output charged to the message's
+  1 MiB build budget and produced in chunks, `cargo audit` over their crates, and the
+  nightly fuzz target that evaluates rules over arbitrary payloads. A rules file that
+  calls none of these functions never enters them. (ADR 0083 §8 and its amendment of
+  2026-10-10; `crates/mqtt-rules/Cargo.toml`, `funcs/re.rs`, `funcs/compress.rs`.)
 - **A v3.1.1 denied publish is still plainly acknowledged** — the protocol has no
   negative PUBACK; the denial is visible only in the audit log (v5 clients are told
   `0x87`). QoS 0 denial is a silent drop in both versions. (ADR 0004, issue #246.)
@@ -323,7 +336,7 @@ expiry. "Tests" names the test that fails if the mitigation is removed:
 | Threat | Mitigation | Where |
 |---|---|---|
 | Rogue node joins the mesh | Mutual TLS against a **dedicated cluster CA** — possession of a cluster cert is admission; client cert required on accept, server cert verified on dial | ADR 0002; `mqttd/src/peer.rs` |
-| Admitted cert claims another node's id | `Hello.node_id` must equal the certificate Subject CN, checked on **both** link directions | ADR 0004 step 5; `mqttd/src/peer.rs:340` |
+| Admitted cert claims another node's id | `Hello.node_id` must equal the certificate Subject CN, checked on **both** link directions | ADR 0004 step 5; `mqttd/src/peer.rs` (`handle`, `expected_cn`) |
 | Revoked node keeps its links | Cluster CRL read per accept/per dial from a `watch` — a reload applies without restart; revoked fails closed | ADR 0040 T4; `mqttd/src/peer.rs` |
 
 ### Tampering / Elevation
@@ -333,6 +346,7 @@ expiry. "Tests" names the test that fails if the mitigation is removed:
 | Frame confusion across versions | Proto negotiation (`PROTO_MIN..PROTO_MAX`); no overlap → link dropped loudly; `Hello`/`ProxyHello` byte-frozen (readable before negotiation, forever); strict codec — unknown variant or trailing bytes tears the link down | ADR 0038, 0039; `mqtt-cluster/src/peer.rs` |
 | Stale owner writes after takeover | Epoch fencing per placement group: followers fence a superseded lease-holder on a newer epoch (deliberately not one global fence, which would let the highest epoch fence everyone) | ADR 0006, 0037, 0042; `mqtt-cluster/src/cluster_log.rs` |
 | Forward loops | A peer `Publish` reaches local subscribers only, never re-forwarded — a protocol invariant | ADR 0014; `mqtt-cluster/src/peer.rs` |
+| A publisher's identity leaving its node | Since peer protocol 13 a forwarded publish can carry who published it to another member: client id, username, source address, receive time, and how many republishes deep it is. It travels only on a link that negotiated 13, and only to a member that asked for it because its own rules select a message event (delivered, acked, dropped); a cluster without such rules puts neither frame on the wire, and a proto-12 link is sent neither. The frame is otherwise handled as the publish frame it stands for, and the receiver uses the origin only as input to its rules. A member is believed about it, as about the message itself (accepted risks, below) | ADR 0083; `mqtt-cluster/src/peer.rs` (`MessageEvents`, `OriginPublish`), `mqttd/src/hub/events.rs`. Tests: `a_frame_carrying_its_origin_unwraps_to_the_same_frame` (`mqtt-cluster/src/peer.rs`); `without_a_message_event_rule_nothing_is_carried_or_noted`, `only_a_proto_13_link_that_asked_is_sent_origins` (`mqttd/src/hub/tests/message_events.rs`) |
 
 ### Accepted risks (peer bus)
 
@@ -500,9 +514,12 @@ consolidated from the ADRs that accepted them:
    unless explicitly opted in). (ADR 0029.)
 3. **Durable capacity is pinned to the lease voter set** (default 5), not node
    count. (ADR 0021/0049.)
-4. **The SIEM export story is in flight** (ADR 0066 T3): the chain is now
-   cryptographic with anchored heads, but syslog/OTLP transport, the frozen kind
-   vocabulary, the drop policy, and the verify tool are scheduled, not shipped.
+4. **The SIEM export has three deliberate gaps** (ADR 0066 T3, delivered): the
+   chain is cryptographic with anchored heads and ships as RFC 5424 syslog over TCP
+   with a frozen kind vocabulary, a shed-and-count drop policy and an independent
+   verifier ([AUDIT-SCHEMA](AUDIT-SCHEMA.md)). Not built: OTLP logs, TLS on the
+   export transport itself (a local relay owns that hop), and a keyed-HMAC chain
+   for deployments that cannot anchor heads externally.
 5. **Mid-roll protocol skew windows** are documented per feature (e.g. a proto<7
    link answers brownout the v3.1.1 way). (ADR 0041 §5.)
 6. **Rule functions in the WebAssembly sandbox are opt-in, and opting in adds a
@@ -510,7 +527,14 @@ consolidated from the ADRs that accepted them:
    unless used; on, the sandbox is as sound as wasmtime and Cranelift, the process maps
    executable pages and carries process-wide fault handlers, and concurrent long calls
    are bounded only by the runtime's thread limit and each call's own time and memory
-   limits: a cap is not decided. (ADR 0086; Surface 1, accepted risks.)
+   limits: the time one call may take has a ceiling (`rules.function_max_ms`), and a
+   cap on how many run at once was decided against and is not built. (ADR 0086 and its
+   amendment of 2026-10-11; Surface 1, accepted risks.)
+7. **Rule state is memory holding what publishers sent.** Keys and values are built
+   from payloads, client ids and topic levels, held in memory for up to 30 days, lost
+   with the process, and in an `eventual` namespace copied to every member. Bounded in
+   size at four levels; not encrypted in memory, not on disk, and without a quota per
+   publisher inside a namespace. (ADR 0085; Surface 1, "State for rules".)
 
 Corrections to this document follow the same rule as COMPARISON.md: versioned,
 dated, and cited — a threat model that drifts from the code is worse than none.

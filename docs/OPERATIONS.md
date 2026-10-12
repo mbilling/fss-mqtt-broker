@@ -1114,7 +1114,7 @@ That is the design working. The alerts below say a node is **spending real time 
 
 The rule engine's reference is [RULES.md](RULES.md), which starts with a two-minute
 walkthrough; tested recipes are in [RULES-COOKBOOK.md](RULES-COOKBOOK.md). This is the
-operating summary. The engine is unreleased: no release has it yet.
+operating summary. The engine is in releases from `v1.2.0`.
 
 - **Configure** with `[rules] file` (`MQTTD_RULES_FILE`). The file is per-node operator
   configuration, like the ACL file: ship the same file to every node. Rules are written in
