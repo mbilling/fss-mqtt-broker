@@ -62,8 +62,9 @@ Every rung is read twice, and the two readings are kept apart.
 
 `summarize-curve.py` prints both: the verdict in its first table, the reading in
 "Reading from the brokers' counters". In the table below, `delivered/s (brokers)` is the
-figure the reading asserts. Every broker answered both window scrapes within 29 ms, so
-that rate is known to ±0.03% on every rung. `delivered/s (drivers)` is the driver-side
+figure the reading asserts. Every broker answered both window scrapes within 29 ms, and
+the band that leaves on the rate (`extract-lane-e.py`'s `deliv_band`) is at most ±0.03%
+on any rung. `delivered/s (drivers)` is the driver-side
 figure the rig graded. Latencies are histogram bucket upper bounds, from the consumers.
 
 | nodes | sites | offered msg/s | delivered/s (brokers) | of the offer | per node | delivered/s (drivers) | sent/s (publishers) | publishes late | p50 · p95 · p99 | reading | the rig's verdict |

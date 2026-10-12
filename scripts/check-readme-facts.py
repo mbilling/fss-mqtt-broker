@@ -306,8 +306,8 @@ def main() -> int:
     # number edited in the README alone, or left behind when a card is corrected, is
     # a claim with no source. Three shapes are held to it — thousands-separated
     # counts (`233,716,926`), per-node rates (`20.7–20.9k`) and percentages
-    # (`13–17%`) — with a range checked end by end. Prose numbers (node counts,
-    # dates, `p99 ≤ 500 ms`) are left to the reader.
+    # (`13–17%`) — with a range kept whole, so neither end can drift. Prose numbers
+    # (node counts, dates, `p99 ≤ 500 ms`) are left to the reader.
     section = re.search(
         r"^### Scale: what we measured on the 1\.2\.0 candidate\n(.*?)(?=^#{2,3} )",
         text, re.MULTILINE | re.DOTALL)

@@ -2053,7 +2053,9 @@ def broker_reading(rdir: Path, r: dict) -> dict:
         "of_offer": None, "dropped": None, "dropped_by_reason": {},
         "crossing": None, "max_crossing": None, "max_crossing_broker": None, "cert_error": None,
         "lifetime_received": None, "driver_rate": r.get("recv_rate"),
-        "driver_source": "audited endpoints" if r.get("evidence") else "subscriber logs; the audited evidence was refused",
+        "driver_source": ("audited endpoints" if r.get("evidence")
+                          else "subscriber logs; the audited evidence was refused" if r.get("qos") == "1"
+                          else "subscriber logs"),
         "disagree": "", "p99": r.get("p99", "—"),
     }
     if r.get("incomplete"):
