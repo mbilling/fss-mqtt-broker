@@ -1,16 +1,13 @@
 # One private network; every measured byte (MQTT, SWIM, peer bus, health scrapes)
-# stays on it. Addresses are FIXED — brokers 10.99.1.11.., drivers 10.99.1.21.. —
-# so certificate SANs, seed lists and lane configs are deterministic per size and
-# need no discovery step.
+# stays on it. Addresses are FIXED (layout.tf: brokers 10.99.1.11.., drivers
+# 10.99.1.21.., brokers past the tenth 10.99.1.41..) so certificate SANs, seed
+# lists and lane configs are deterministic per size and need no discovery step.
 
 locals {
   common_labels = {
     purpose = "mqttd-bench-scale"
     run     = var.run_label
   }
-
-  broker_ips = [for i in range(var.node_count) : "10.99.1.${11 + i}"]
-  driver_ips = [for i in range(var.driver_count) : "10.99.1.${21 + i}"]
 }
 
 resource "hcloud_network" "bench" {

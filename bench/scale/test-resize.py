@@ -152,6 +152,41 @@ class ResizeTests(Rig):
         self.assertEqual(got["brokers"], inventory()["brokers"])
         self.assertIn("left_out=\n", (self.root / "arm3/RESIZED.txt").read_text())
 
+    def test_fourteen_brokers_shrink_to_twelve_and_ten_and_grow_back(self):
+        """The 10-12-14 campaign's order on one provisioning: 14 -> 12 -> 10 -> 14.
+        Every size is a prefix of the same fourteen hosts, so the brokers left out
+        are always the highest-numbered — at 12 and 10 that is part or all of the
+        second placement group, never a broker of the first ten."""
+        full = inventory(brokers=14, drivers=16)
+        # The addresses terraform/layout.tf gives brokers 11-14: past the drivers.
+        for i in range(10, 14):
+            full["brokers"][i]["private_ip"] = f"10.99.1.{31 + i}"
+        path = self.provision / "inventory-14.json"
+        path.write_text(json.dumps(full))
+        names = [b["node_id"] for b in full["brokers"]]
+        for arm, size in enumerate((12, 10, 14), start=2):
+            with self.subTest(size=size):
+                self.log.unlink(missing_ok=True)
+                out = self.root / f"{arm}-n{size}"
+                r = self.resize(size, out, inv=path)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                got = json.loads((out / f"inventory-{size}.json").read_text())
+                self.assertEqual(got["brokers"], full["brokers"][:size])
+                self.assertEqual(got["drivers"], full["drivers"], "every arm keeps all 16 drivers")
+                self.assertEqual((got["node_count"], got["resized_from"]), (size, 14))
+                stamp = (out / "RESIZED.txt").read_text()
+                self.assertIn(f"size={size}\nprovisioned=14\n", stamp)
+                self.assertIn(f"kept={','.join(names[:size])}\n", stamp)
+                self.assertIn(f"left_out={','.join(names[size:])}\n", stamp)
+                self.assertIn("drivers=16 of 16", stamp)
+                # All fourteen are stopped and cleared each time, in index order:
+                # two-digit indices included, and a left-out broker never keeps running.
+                hosts = [c["argv"][-2] for c in self.calls()]
+                self.assertEqual(hosts, [f"root@198.51.100.{i + 1}" for i in range(14)])
+        self.assertIn("left_out=mqttd-13,mqttd-14\n", (self.root / "2-n12/RESIZED.txt").read_text())
+        self.assertIn("left_out=mqttd-11,mqttd-12,mqttd-13,mqttd-14\n", (self.root / "3-n10/RESIZED.txt").read_text())
+        self.assertIn("left_out=\n", (self.root / "4-n14/RESIZED.txt").read_text())
+
     def test_refuses_what_it_cannot_honour(self):
         cases = [
             ((8, self.root / "a"), "exceeds the 7 brokers"),
@@ -268,6 +303,33 @@ class CampaignTests(Rig):
                          ["1 7 14", "1 5 10", "1 3 6", "1 20"])
         for arm in ("1-n10", "2-n7", "3-n5", "4-n3", "5-n10"):
             self.assertIn(f"{arm}/results", r.stderr)
+
+    def test_the_10_12_14_campaign_resizes_down_and_back_on_one_provisioning(self):
+        """The committed campaign env, as written: 14 brokers and 16 drivers are
+        provisioned once, 12 and 10 re-form on prefixes of them with the whole
+        driver fleet, and the closing arm returns to 14."""
+        out = subprocess.run(["bash", "-c", f"set -a; . {SCALE}/qos1-campaign/durable-scaleout-10-12-14.env; env -0"],
+                             capture_output=True, text=True, check=True, env={"PATH": os.environ["PATH"]})
+        knobs = dict(kv.split("=", 1) for kv in out.stdout.split("\0") if "=" in kv)
+        self.assertEqual(knobs["KNEE_ARMS"], "14:16:1 35 42; 12:16:1 30 36; 10:16:1 25 30; 14:16:1 35")
+        full = self.provision / "inventory-14.json"
+        full.write_text(json.dumps(inventory(brokers=14, drivers=16)))
+        env = {k: v for k, v in knobs.items() if k.startswith(("KNEE_", "LANE", "DRIVER"))}
+        r = self.campaign(env=env | {"OBSERVE": "0", "FULL_INVENTORY": str(full)})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = self.calls()
+        self.assertEqual(calls[0]["argv"], ["run.sh", "full", "14"])
+        self.assertEqual((calls[0]["env"]["DRIVER_COUNT"], calls[0]["env"]["KEEP_INFRA"]), ("16", "1"))
+        self.assertEqual(calls[0]["env"]["LANE_E_SITES_OVERRIDE"], "1 35 42")
+        provisioned = str(Path(calls[0]["env"]["RUN_DIR"]) / "inventory-14.json")
+        resizes = [c["argv"] for c in calls if c["argv"][0] == "resize-cluster.sh"]
+        self.assertEqual([(a[1], a[2], a[4], Path(a[3]).name) for a in resizes],
+                         [(provisioned, "12", "16", "2-n12"), (provisioned, "10", "16", "3-n10"),
+                          (provisioned, "14", "16", "4-n14")])
+        self.assertEqual([c["env"]["LANE_E_SITES_OVERRIDE"] for c in calls if c["argv"][0] == "run-curve.sh"],
+                         ["1 30 36", "1 25 30", "1 35"])
+        self.assertEqual(self.steps()[-1], "teardown.sh")
+        self.assertEqual(self.steps().count("teardown.sh"), 1)
 
     def test_preflight_checks_each_arm_with_its_own_drivers(self):
         r = self.campaign(env={"PREFLIGHT_ONLY": "1", "KNEE_ARMS": "10:20:1 20; 3:6:1 6", "DRIVER_COUNT": "20"})

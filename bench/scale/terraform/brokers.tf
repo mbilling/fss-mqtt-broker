@@ -3,11 +3,37 @@
 # group makes Hetzner guarantee distinct physical machines, which is the strongest
 # "independent disks" statement a cloud VM can make; the per-host barrier probe
 # then MEASURES what the disk actually does, per run.
+#
+# That guarantee holds for up to ten brokers, the most one spread group admits.
+# Sizes 12 and 14 put brokers 11+ in a second group: distinct hosts within each
+# group, no guarantee between the two (layout.tf, variables.tf `node_count`).
 
 resource "hcloud_placement_group" "brokers" {
   name   = "mqttd-bench-brokers"
   type   = "spread"
   labels = local.common_labels
+}
+
+# The second group, for brokers 11+ (layout.tf). Created only when there are
+# more than ten brokers, so every shape of ten or fewer plans as it always has.
+# It carries the same labels as the first: teardown.sh's label audit lists and
+# deletes placement groups by `purpose`, so it finds this one with no change.
+resource "hcloud_placement_group" "brokers_b" {
+  count = local.second_placement_group ? 1 : 0
+
+  name   = "mqttd-bench-brokers-b"
+  type   = "spread"
+  labels = local.common_labels
+}
+
+# Indexed by layout.tf's broker_placement_group (0 or 1). The second entry is
+# null while the second group does not exist, and no broker of a shape of ten or
+# fewer ever selects it.
+locals {
+  placement_group_ids = [
+    hcloud_placement_group.brokers.id,
+    one(hcloud_placement_group.brokers_b[*].id),
+  ]
 }
 
 resource "hcloud_server" "broker" {
@@ -17,7 +43,7 @@ resource "hcloud_server" "broker" {
   server_type        = var.broker_server_type
   image              = var.image
   location           = var.location
-  placement_group_id = hcloud_placement_group.brokers.id
+  placement_group_id = local.placement_group_ids[local.broker_placement_group[count.index]]
   firewall_ids       = [hcloud_firewall.bench.id]
   labels             = merge(local.common_labels, { role = "broker" })
 

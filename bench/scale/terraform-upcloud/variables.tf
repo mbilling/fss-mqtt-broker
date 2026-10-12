@@ -1,10 +1,10 @@
 variable "node_count" {
-  description = "Broker nodes in this cluster. Same canonical points as the Hetzner rig (see ../terraform/variables.tf)."
+  description = "Broker nodes in this cluster: the Hetzner rig's points up to 10 (see ../terraform/variables.tf). Its 12 and 14 are NOT offered here. brokers.tf places every broker in ONE strict anti-affinity server group, this repository records no member limit for such a group, and the private address plan (network.tf) gives brokers ten addresses before the drivers' range begins. Nobody has formed more than 10 brokers on UpCloud with this rig, so the module refuses rather than guesses."
   type        = number
 
   validation {
     condition     = contains([1, 3, 5, 7, 10], var.node_count)
-    error_message = "node_count must be 1, 3, 5, 7 or 10."
+    error_message = "node_count must be 1, 3, 5, 7 or 10. Sizes 12 and 14 exist only on the Hetzner rig (CLOUD=hcloud): the member limit of an UpCloud strict anti-affinity server group is not established in this repository, and this module's address plan holds ten brokers."
   }
 }
 
