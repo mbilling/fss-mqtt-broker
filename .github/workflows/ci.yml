@@ -113,6 +113,18 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --all-targets --all-features
+      # The fuzz targets are workspaces of their own and only the nightly tier builds
+      # them, so a change to an API they call (a new field of `Limits`, say) reached
+      # main unnoticed and turned the nightly red. Type-checking them here costs no
+      # fuzzing toolchain: the targets are plain binaries to `cargo check`.
+      - name: The fuzz targets still compile
+        shell: bash
+        run: |
+          for manifest in crates/*/fuzz/Cargo.toml; do
+            echo "::group::$manifest"
+            cargo check --manifest-path "$manifest" --bins
+            echo "::endgroup::"
+          done
       - name: Test
         shell: bash
         run: |

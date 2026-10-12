@@ -188,6 +188,7 @@ fuzz_target!(|data: &[u8]| {
         init_timeout: Duration::from_millis(20),
         max_fuel: (how & 4 == 0).then_some(20_000),
         first_slice: Duration::from_micros(200),
+        max_call: None,
     };
     let grants = Grants {
         clock: how & 8 != 0,
