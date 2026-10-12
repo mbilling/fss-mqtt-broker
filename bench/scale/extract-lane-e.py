@@ -619,7 +619,13 @@ def certify(nodes: int, snaps: dict[str, dict[int, dict]], window: dict | None, 
 # ── one rung ────────────────────────────────────────────────────────────────
 
 
-def extract_rung(rdir: Path, canaries: dict | None = None) -> dict:
+def extract_rung(rdir: Path, canaries: dict | None = None, require_cert: bool = True) -> dict:
+    """One rung's broker counters. With `require_cert` (the default, and what the
+    report and the gate use) a rung whose crossing is not certified raises. Without
+    it the rung is still read and the refusal comes back as `cert_error`, `cert`
+    "uncertified": a reader that wants the brokers' rates and drops, and makes no
+    claim about crossing, must not lose them to a skipped forwarding control. An
+    unreadable, truncated or reset scrape raises either way."""
     rdir = Path(rdir)
     nodes = nodes_of(rdir)
     meta = read_meta(rdir)
@@ -655,9 +661,15 @@ def extract_rung(rdir: Path, canaries: dict | None = None) -> dict:
         except ValueError as exc:
             canaries[key] = (str(exc), None)
     canary_error, canary = canaries[key]
-    if canary_error:
-        raise ValueError(canary_error)
-    cert = certify(nodes, snaps, window, canary)
+    cert_error = None
+    try:
+        if canary_error:
+            raise ValueError(canary_error)
+        cert = certify(nodes, snaps, window, canary)
+    except ValueError as exc:
+        if require_cert:
+            raise
+        cert, cert_error = "uncertified", str(exc)
 
     lo_label, hi_label = ("window-open", "window-close") if aligned else ("before", "after")
     lo, hi = snaps[lo_label], snaps[hi_label]
@@ -743,6 +755,7 @@ def extract_rung(rdir: Path, canaries: dict | None = None) -> dict:
         "idle_brokers": [p["broker"] for p in per_broker if p["crossing"] is None],
         "per_broker": per_broker,
         "cert": cert,
+        "cert_error": cert_error,
         "lifetime_end": end_label,
         "lifetime_received": delta(lifetime_start, end, RECEIVED),
         "lifetime_delivered": delta(lifetime_start, end, DELIVERED),
@@ -1380,6 +1393,31 @@ class WindowTests(unittest.TestCase):
             self.assertEqual(slow_broker["broker_bracket_ms"], 2600)
             self.assertGreater(band_share(slow_broker["deliv_rate"], slow_broker["deliv_band"]), 2 * tight)
             self.assertLess(slow_broker["deliv_band"][0], r["deliv_band"][0])
+
+    def test_the_counters_are_readable_without_the_certificate_only_on_request(self):
+        """A skipped forwarding control makes the crossing INVALID for the report
+        and the gate. A caller that asks for the counters alone still gets the
+        rates, the band and the drops, with the refusal attached and the rung
+        marked uncertified; a broken scrape is refused whoever asks."""
+        with tempfile.TemporaryDirectory() as td:
+            rdir = self.synthetic_rung(Path(td))
+            certified = extract_rung(rdir)
+            (rdir.parent / "forward-canary.txt").write_text("status=skipped nodes=3\n")
+            with self.assertRaisesRegex(ValueError, "positive control was skipped"):
+                extract_rung(rdir)
+            r = extract_rung(rdir, require_cert=False)
+            self.assertEqual(r["cert"], "uncertified")
+            self.assertIn("positive control was skipped", r["cert_error"])
+            self.assertIsNone(certified["cert_error"])
+            for key in ("recv_rate", "deliv_rate", "deliv_band", "drops", "lifetime_drops", "lifetime_received"):
+                self.assertEqual(r[key], certified[key], key)
+            rc, stdout, _ = run_main(["--crossing-gate", "0.5", str(Path(td))])
+            self.assertEqual(rc, 1)
+            self.assertIn("GATE nodes=3 FAIL", stdout)
+            bad = rdir / "metrics-window-close-broker1.prom"
+            bad.write_text(bad.read_text().replace("# EOF\n", ""))
+            with self.assertRaisesRegex(ValueError, "truncated scrape"):
+                extract_rung(rdir, require_cert=False)
 
     def test_four_column_window_tsv_is_structural_only(self):
         # The pre-MainPID harness's window.tsv still reads (the real N=1 smoke rung is

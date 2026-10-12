@@ -20,7 +20,7 @@
 >
 > All three use shared subscriptions. [Scale-out ↓](#cluster-scale-out-qos-0-shared-subscriptions)
 >
-> **Newest, on the unreleased 1.2.0 candidate:** QoS 1 at 39–42k msg/s per node and durable QoS 1 at 15–21k per node on 10 nodes, 427 million messages ledgered, none lost. [What we measured ↓](#scale-what-we-measured-on-the-120-candidate)
+> **Newest, on the unreleased 1.2.0 candidate** (read from the brokers' counters; at 10 nodes mostly not certified by the rig): QoS 1 held 39–42k msg/s per node on 10 nodes. Durable QoS 1 took 15k per node in full and stopped taking more near 21k, with publishers slowed and nothing dropped. 427 million messages ledgered, none lost. [What we measured ↓](#scale-what-we-measured-on-the-120-candidate)
 
 ---
 

@@ -1201,12 +1201,13 @@ def self_test() -> None:
         "rung on an un-reset cluster, a clean control rung, an in-flight rung; and "
         "at ladder level a failed control, a drifted control, a missing control "
         "and a healthy ladder that must still claim its site count); "
-        "broker-counter reading OK (11 rungs — it HOLDS at the brokers' rate where the drivers' "
+        "broker-counter reading OK (13 rungs — it HOLDS at the brokers' rate where the drivers' "
         "evidence was refused and their logs read 4% low, the gap reported as READINGS DISAGREE; "
-        "one missing identity, a broker drop or p99 above 1 s DOES NOT HOLD; no ledger or an "
-        "unreadable broker scrape is NOT ASSERTED; a soft broker window prints its band; an "
-        "unmet offer holds at the carried rate with its share of the offer; and the rig's "
-        "verdict is the same before and after the reading)"
+        "one missing identity, a broker drop or p99 above 1 s DOES NOT HOLD; no ledger, no "
+        "latency histogram or an unreadable broker scrape is NOT ASSERTED; a skipped forwarding "
+        "control leaves the reading and marks only the forwarded share uncertified; a soft broker "
+        "window prints its band; an unmet offer holds at the carried rate with its share of the "
+        "offer; and the rig's verdict is the same before and after the reading)"
     )
 
 
@@ -1225,24 +1226,26 @@ def reading_self_test() -> list[str]:
     failures: list[str] = []
     N = 6_000
 
-    def rung(root: Path, name: str, *, offered: int = 100) -> Path:
-        d = root / name / "nodes=1" / "laneE" / "sites-1"
+    def rung(root: Path, name: str, *, offered: int = 100, nodes: int = 1) -> Path:
+        d = root / name / f"nodes={nodes}" / "laneE" / "sites-1"
         d.mkdir(parents=True)
         subs = ["sub-s0-0", "sub-s0-1"]
         eps = [{"name": "pub-s0-0", "driver": 0, "site": "0", "role": "pub", "clients": 1}] + [
             {"name": n, "driver": 0, "site": "0", "role": "sub", "clients": 1} for n in subs]
-        (d / "manifest.json").write_text(json.dumps({"nodes": 1, "drivers": 1, "window_secs": 60, "endpoints": eps}))
+        (d / "manifest.json").write_text(json.dumps({"nodes": nodes, "drivers": 1, "window_secs": 60, "endpoints": eps}))
         (d / "rung.txt").write_text(
             f"sites=1 offered={offered} publishers=1 consumers=2 per_consumer=50 qos=1 sub_qos=1 window_secs=60 "
             "window=aligned cpu_window=missing settled=yes reset=yes steady=yes drained=yes p99_budget_ms=1000\n")
         (d / "window.tsv").write_text(
             "host\tphase\tstart_ms\tend_ms\tmain_pid\n"
-            "broker0\topen\t100000\t100010\t42\nbroker0\tclose\t160000\t160010\t42\n"
-            "driver0\topen\t100000\t100010\t\ndriver0\tclose\t160000\t160010\t\n")
+            + "".join(f"broker{i}\topen\t100000\t100010\t42\nbroker{i}\tclose\t160000\t160010\t42\n" for i in range(nodes))
+            + "driver0\topen\t100000\t100010\t\ndriver0\tclose\t160000\t160010\t\n")
         for phase, n in (("before", 0), ("window-open", 0), ("window-close", N), ("drain", N), ("after", N)):
-            (d / f"metrics-{phase}-broker0.prom").write_text(
-                f'mqttd_publish_received_total{{qos="1"}} {n}\nmqttd_publish_delivered_total{{qos="1"}} {n}\n'
-                "mqttd_peer_links 0\n# EOF\n")
+            for i in range(nodes):
+                (d / f"metrics-{phase}-broker{i}.prom").write_text(
+                    f'mqttd_publish_received_total{{qos="1"}} {n // nodes}\n'
+                    f'mqttd_publish_delivered_total{{qos="1"}} {n // nodes}\n'
+                    f"mqttd_peer_links {nodes - 1}\n# EOF\n")
         for name in ["pub-s0-0"] + subs:
             pub = name.startswith("pub")
             for suffix, final in (("-base", False), ("", True), ("-terminal", True)):
@@ -1383,7 +1386,36 @@ def reading_self_test() -> list[str]:
         if text != "HOLDS at 100/s (67% of the offer)" or not any("OFFER NOT MET" in f for f in r["flags"]):
             failures.append(f"a rung offered 150/s that carried 100/s did not read as holding at 67%: {text!r} {r['flags']}")
 
-        # 10. A rung still running has no reading.
+        # 10. The reading does not hang on the crossing certificate. Two brokers whose
+        #     forwarding control was skipped: the rig certifies nothing at that size,
+        #     and the brokers' counters, drops and ledger are all still there. The
+        #     rung is read, and only its forwarded share is marked uncertified.
+        d = rung(root, "no-canary", nodes=2)
+        (d.parent / "forward-canary.txt").write_text("status=skipped nodes=2\n")
+        driver_logs(d, 50)
+        r, b, text = read(d)
+        if text != "HOLDS at 100/s" or not b["cert_error"] or "skipped" not in b["cert_error"]:
+            failures.append(f"a skipped forwarding control cost the rung its reading: {text!r} {b['cert_error']!r}")
+        if rung_verdict(r) == "GREEN" or "NOT CERTIFIED" not in render_broker_reading([r]):
+            failures.append(f"an uncertified crossing was certified or printed as certified: {rung_verdict(r)!r}")
+
+        # 11. No latency histogram is a missing input, not a slow rung: NOT ASSERTED.
+        #     With a message missing as well, it is the loss that is reported.
+        d = rung(root, "no-histogram")
+        for name in ("sub-s0-0", "sub-s0-1"):
+            for suffix, n in (("-base", 0), ("", N // 2), ("-terminal", N // 2)):
+                (d / f"{name}{suffix}.prom").write_text(f"recv {n}\n# EOF\n")
+        r, b, text = read(d)
+        if b["holds"] is not None or text != "NOT ASSERTED: no latency histogram, so p99 is unknown":
+            failures.append(f"a rung with no latency histogram was not NOT ASSERTED: {text!r}")
+        for phase in ("drain", "after"):
+            p = d / f"metrics-{phase}-broker0.prom"
+            p.write_text(p.read_text().replace("# EOF", 'mqttd_publish_dropped_total{reason="queue-full"} 1\n# EOF'))
+        r, b, text = read(d)
+        if b["holds"] is not False or "brokers dropped" not in text or "p99" in text:
+            failures.append(f"a broker drop on a rung with no histogram was not DOES NOT HOLD on the drop: {text!r}")
+
+        # 12. A rung still running has no reading.
         d = root / "live" / "nodes=1" / "laneE" / "sites-1"
         d.mkdir(parents=True)
         r, b, text = read(d)
@@ -1987,7 +2019,13 @@ def broker_reading(rdir: Path, r: dict) -> dict:
 
       HOLDS          no message was lost, and p99 <= HOLDS_P99_MS
       DOES NOT HOLD  a message was lost, or p99 is above the line
-      NOT ASSERTED   the brokers' counters or the identity ledger cannot be read
+      NOT ASSERTED   an input is missing: the brokers' counters, the identity
+                     ledger or the latency histogram cannot be read
+
+    It does not depend on the crossing certificate. A size whose forwarding
+    control was skipped or failed still has broker counters, so the rung is still
+    read; its forwarded share is then printed as uncertified, because an absent
+    forwarded counter cannot be told from a zero.
 
     Its inputs, each from the side that can see it:
 
@@ -2013,7 +2051,7 @@ def broker_reading(rdir: Path, r: dict) -> dict:
         "recv_rate": None, "deliv_rate": None, "recv_band": None, "deliv_band": None,
         "band_share": None, "window_wide": False, "broker_bracket_ms": None,
         "of_offer": None, "dropped": None, "dropped_by_reason": {},
-        "crossing": None, "max_crossing": None, "max_crossing_broker": None,
+        "crossing": None, "max_crossing": None, "max_crossing_broker": None, "cert_error": None,
         "lifetime_received": None, "driver_rate": r.get("recv_rate"),
         "driver_source": "audited endpoints" if r.get("evidence") else "subscriber logs; the audited evidence was refused",
         "disagree": "", "p99": r.get("p99", "—"),
@@ -2023,7 +2061,7 @@ def broker_reading(rdir: Path, r: dict) -> dict:
         return out
     extractor = load_lane_e_extractor()
     try:
-        x = extractor.extract_rung(rdir)
+        x = extractor.extract_rung(rdir, require_cert=False)
     except (ValueError, OSError, KeyError, IndexError) as exc:
         out["error"] = str(exc)
         out["why"].append(f"broker counters unreadable ({exc})")
@@ -2043,7 +2081,7 @@ def broker_reading(rdir: Path, r: dict) -> dict:
         of_offer=x["deliv_rate"] / offered if offered else None,
         dropped=sum(drops.values()), dropped_by_reason=drops,
         crossing=x["crossing"], max_crossing=x["max_crossing"], max_crossing_broker=x["max_crossing_broker"],
-        lifetime_received=x["lifetime_received"],
+        cert_error=x["cert_error"], lifetime_received=x["lifetime_received"],
     )
     driver = out["driver_rate"]
     lo, hi = x["deliv_band"]
@@ -2073,10 +2111,17 @@ def broker_reading(rdir: Path, r: dict) -> dict:
     if out["dropped"]:
         lost.append("brokers dropped " + ", ".join(f"{k or 'unlabelled'} {v:,.0f}" for k, v in sorted(drops.items())))
     clock_margin = ((r.get("evidence") or {}).get("clock") or {}).get("latency_uncertainty_ms", 0)
-    if latency_band(out["p99"], clock_margin, HOLDS_P99_MS) != "green":
+    no_histogram = out["p99"] in ("", "—")
+    if not no_histogram and latency_band(out["p99"], clock_margin, HOLDS_P99_MS) != "green":
         lost.append(f"p99 {out['p99']} is above {HOLDS_P99_MS:g}ms")
-    out["holds"] = not lost
-    out["why"] = lost
+    if lost:
+        out["holds"], out["why"] = False, lost
+    elif no_histogram:
+        # Nothing was lost, and nothing says how long a delivery took: an input is
+        # missing, which is not the same as p99 being over the line.
+        out["why"] = ["no latency histogram, so p99 is unknown"]
+    else:
+        out["holds"] = True
     return out
 
 
@@ -2122,7 +2167,8 @@ def render_broker_reading(rungs: list[dict]) -> str:
         ledger = "—" if not led else f"{led['sent']:,} · {led['missing']:,} · {led['unacked']:,} · {led['duplicates']:,}"
         band = "—" if b["band_share"] is None else f"±{b['band_share'] * 100:.2f}%"
         cross = "—" if b["crossing"] is None else (
-            f"{b['crossing'] * 100:.2f}% · {b['max_crossing'] * 100:.2f}% (broker{b['max_crossing_broker']})")
+            f"{b['crossing'] * 100:.2f}% · {b['max_crossing'] * 100:.2f}% (broker{b['max_crossing_broker']})"
+            + (" — NOT CERTIFIED" if b["cert_error"] else ""))
         out.append(
             f"| {r['sites']} | {run(r)} | {r['offered']:,.0f} | {num(b['recv_rate'])} | {broker_rate_cell(b)} | {band} | "
             f"{num(b['of_offer'], '.1%')} | {num(b['driver_rate'])} | {num(b['dropped'])} | {ledger} | {cross} | {b['p99']} | "
@@ -2131,6 +2177,14 @@ def render_broker_reading(rungs: list[dict]) -> str:
     if notes:
         out.append("")
         out += [f"> {r['sites']} site(s), run {run(r)}: {text}" for r, text in notes]
+    uncertified = [r for r in rungs if r.get("reading") and r["reading"]["cert_error"]]
+    if uncertified:
+        out.append("")
+        which = ", ".join(f"{r['sites']} site(s) run {run(r)}" for r in uncertified)
+        out.append(
+            f"> Forwarded shares marked NOT CERTIFIED ({which}): "
+            f"{uncertified[0]['reading']['cert_error']}. The rates, drops and ledger do not depend on it; the forwarded "
+            "share does, because a forwarded counter that is absent reads the same as one that is zero.")
     mismatch = [r for r in rungs if r.get("reading") and r["reading"]["ledger"]
                 and r["reading"]["lifetime_received"] != r["reading"]["ledger"]["sent"]]
     if mismatch:
