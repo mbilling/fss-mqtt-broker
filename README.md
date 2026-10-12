@@ -172,6 +172,31 @@ rung: [QOS1-SCALE-CURVE.md](docs/benchmarks/QOS1-SCALE-CURVE.md#7-and-10-nodes--
 reproduce: [QOS1-SCALE-CURVE.md § Reproduction](docs/benchmarks/QOS1-SCALE-CURVE.md#reproduction).
 
 
+**The 1.2.0 candidate, 2026-10-12: measured, mostly not certified.** Two campaigns at 3
+and 10 nodes on an **unreleased build of the `release: v1.2.0` commit** (not the signed
+release; no v1.1.0 arm, so not a before/after). Every rung of both closed its message
+ledger with nothing missing, unacknowledged or duplicated.
+
+![QoS 1 per node on the 1.2.0 candidate: certified and uncertified rungs](docs/benchmarks/img/scale-out-qos1-candidate.svg)
+
+- **QoS 1, clean sessions.** 3 nodes: GREEN at 120,000 msg/s twice and at 150,000 once
+  (50k/node, the top of its ladder). 10 nodes: 390,000 and 420,000 msg/s offered, nothing
+  lost, p99 ≤ 50 ms, but **not certified**: one load-generator host had a saturated core,
+  so those rungs measured the generator.
+- **Durable QoS 1, default store (redb, 2 copies).** 10 nodes: GREEN at 150,000 msg/s
+  (15k/node, p99 ≤ 500 ms). Offered 210,000 and 240,000, it delivered 199,072 and
+  219,004; 3 nodes offered 72,000 and 90,000 delivered 62,806 and 63,429. That is a
+  ceiling near 21k msg/s per node at both sizes. Past it publishers are slowed; nothing
+  is dropped. Not comparable with the log-store figure above. The 10-node arms also
+  failed the rig's crossing gate (14–17% of publishes forwarded), which is unexplained.
+
+Every rung, the rig's verdicts and what can be concluded:
+[QOS1-SCALE-CURVE.md](docs/benchmarks/QOS1-SCALE-CURVE.md#the-120-candidate-at-3-and-10-nodes-2026-10-12--not-curve-points)
+(clean sessions) and
+[SCALE-CURVE.md](docs/benchmarks/SCALE-CURVE.md#durable-qos-1-by-site-on-the-120-candidate-2026-10-12--not-curve-points)
+(durable). Cards: [qos1-knees-2026-10-12.md](bench/scale/qos1-knees-2026-10-12.md) ·
+[durable-knees-2026-10-12.md](bench/scale/durable-knees-2026-10-12.md).
+
 MB/s is application payload (216 B/message). **The constraint is packets, not
 bytes** — measured: holding 60,000 msg/s and growing the payload to 8 KiB reached
 **492 MB/s** (1,576 Mbit/s per node) while softirq stayed flat at 24–34% across

@@ -151,6 +151,14 @@ The first calibration (2026-09-28, 3 nodes, v1.0.18) was **not disk-bound**:
 A rung that asks for persistent consumers and shows no durable append in its
 window is flagged **NOT DURABLE** and is not carried.
 
+The 2026-10-12 campaigns on the 1.2.0 release commit (an unreleased candidate build) ran
+from two env files here, with one card each:
+- `confirm-knees-7d4eced.env`: QoS 1, clean sessions, 10 → 3 → 10
+  ([card](../qos1-knees-2026-10-12.md)).
+- `durable-knees-7d4eced.env`: durable QoS 1 on the default store (redb), 10 → 3 → 10
+  ([card](../durable-knees-2026-10-12.md)). On redb the ceiling was about 21k msg/s per
+  node, so a 3-node ladder set from the log-store result starts above it.
+
 ```sh
 cd bench/scale
 export MQTTD_VERSION=1.0.18 QOS1_DRIVER_ARCHIVE=<audited driver, sha256 67bb4194...>

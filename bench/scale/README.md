@@ -332,6 +332,12 @@ trapped teardown; `482-knee-smoke.sh` proves it at 3 → 1 → 3 on small hosts;
 machinery across four sizes (10 → 7 → 5 → 3 → 10), drivers scaled 2N per arm,
 each ladder stopped at its knee.
 
+Two campaigns on the 1.2.0 release commit (2026-10-12, an unreleased candidate build, 10 →
+3 → 10) have their own cards: [`qos1-knees-2026-10-12.md`](qos1-knees-2026-10-12.md)
+(QoS 1, clean sessions) and [`durable-knees-2026-10-12.md`](durable-knees-2026-10-12.md)
+(durable QoS 1 on the default store, with a sizing estimate). Both publish rungs the rig
+did not certify, labelled as such.
+
 ## Cross-broker comparison on cloud hardware (ADR 0048 T4)
 
 `./run.sh compare` provisions ONE broker host and a driver fleet, then runs every
