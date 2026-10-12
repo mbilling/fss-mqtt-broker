@@ -23,9 +23,14 @@ A rung **holds** if:
 
 1. **no message is lost**: the ledger shows `missing = 0` for the rung
    (`qos1-campaign/ledger-report.py`: every message identity sent, acknowledged and
-   received, reconciled across the whole `$share` group), and
+   received, reconciled across the whole `$share` group), and no broker dropped
+   anything, and
 2. **p99 stays below 1 s**: the rung's end-to-end p99 is in the ≤ 1000 ms bucket or
    lower (`summarize-curve.py`).
+
+The rate a rung holds at is the brokers' own: each broker's delivered counter over its
+window. `summarize-curve.py` computes the rule and prints it per rung, with its inputs,
+under "Reading from the brokers' counters", beside the rig's verdict and apart from it.
 
 That is the maintainer's rule for this campaign: not 100% scientifically correct, but
 easy to communicate. What it leaves out, on purpose:
@@ -45,10 +50,14 @@ easy to communicate. What it leaves out, on purpose:
 broker forwarded to another broker. The shape predicts about 0%: every broker holds a
 local member of every site's `$share` group.
 
-**Known observation, not explained:** in the 2026-10-12 durable campaign both 10-node
-arms failed this gate. 13–17% of publishes were forwarded between brokers at 25–40
-sites; the 3-node arm measured 0.00%
-([`durable-knees-2026-10-12.md`](durable-knees-2026-10-12.md)). Expect the same here.
+**That prediction does not hold for persistent consumers.** In the 2026-10-12 durable
+campaign both 10-node arms failed this gate: 13–17% of publishes were forwarded between
+brokers at 25–40 sites, and the 3-node arm measured 0.00%. A persistent session lives on
+the broker that owns it, not on the one its client dialled, so some brokers hold no
+member of a site's group
+([`durable-knees-2026-10-12.md`](durable-knees-2026-10-12.md#cross-node-traffic)). Expect
+forwarding here too: with 28 consumers per site, (1 − 1/N)^28 is 12.6% at 14 nodes, 8.7%
+at 12 and 5.2% at 10. That is a prediction, not a result.
 
 This campaign prints the crossing of every arm and, per the reading rule, does not gate
 on it. The consequence to keep in mind: an arm that forwards carries work an arm that

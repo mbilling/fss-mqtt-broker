@@ -59,6 +59,20 @@ def github_anchor(heading: str) -> str:
     return re.sub(r"\s", "-", text)
 
 
+def scale_figures(text: str) -> set[str]:
+    """The figures a scale section or card states, in a comparable form.
+
+    Thousands-separated counts (`233,716,926`), per-node rates (`20.7k`) and
+    percentages (`0.00%`). A range is one figure, kept whole (`19.2–21.1k`,
+    `13–17%`): a card full of percentages contains most single numbers somewhere,
+    so a range checked end by end would pass with either end changed.
+    """
+    out = set(re.findall(r"(?<![\d.,])\d{1,3}(?:,\d{3})+(?![\d,]*\.\d)", text))
+    out |= set(re.findall(r"(?<![\d.,–])(?:\d+\.\d+–)?\d+\.\d+k\b", text))
+    out |= set(re.findall(r"(?<![\d.,–])(?:\d+(?:\.\d+)?–)?\d+(?:\.\d+)?%", text))
+    return out
+
+
 def fail(problems: list[str]) -> None:
     print("README states facts the tree contradicts:\n", file=sys.stderr)
     for p in problems:
@@ -285,6 +299,40 @@ def main() -> int:
                     "or a GENERATED banner) — ADR 0070 T8"
                 )
 
+    # --- the candidate scale section quotes its cards, figure for figure -------
+    # "Scale: what we measured on the 1.2.0 candidate" publishes rates, ledger totals
+    # and forwarded shares from two run cards. The cards are the record (the raw runs
+    # are untracked), so every figure in the section must be one a card states: a
+    # number edited in the README alone, or left behind when a card is corrected, is
+    # a claim with no source. Three shapes are held to it — thousands-separated
+    # counts (`233,716,926`), per-node rates (`20.7–20.9k`) and percentages
+    # (`13–17%`) — with a range checked end by end. Prose numbers (node counts,
+    # dates, `p99 ≤ 500 ms`) are left to the reader.
+    section = re.search(
+        r"^### Scale: what we measured on the 1\.2\.0 candidate\n(.*?)(?=^#{2,3} )",
+        text, re.MULTILINE | re.DOTALL)
+    figure_count = 0
+    if not section:
+        problems.append(
+            "the '### Scale: what we measured on the 1.2.0 candidate' section is gone — "
+            "restore it or update this script"
+        )
+    else:
+        cards = [ROOT / "bench" / "scale" / n
+                 for n in ("qos1-knees-2026-10-12.md", "durable-knees-2026-10-12.md")]
+        stated = set()
+        for card in cards:
+            stated |= scale_figures(card.read_text(encoding="utf-8"))
+        quoted = scale_figures(section.group(1))
+        figure_count = len(quoted)
+        for figure in sorted(quoted - stated):
+            problems.append(
+                f"the README's 1.2.0-candidate scale section says {figure}, which neither "
+                "bench/scale/qos1-knees-2026-10-12.md nor durable-knees-2026-10-12.md states"
+            )
+        if not quoted:
+            problems.append("the README's 1.2.0-candidate scale section quotes no figure at all")
+
     if problems:
         fail(problems)
 
@@ -292,6 +340,7 @@ def main() -> int:
         f"README facts check: {len(adrs)} ADRs, {len(crates)} crates, "
         f"{task_count} scripts, {len(anchors)} anchors, "
         f"{citation_count} evidence citations across {len(cited_docs)} cited docs, "
+        f"{figure_count} candidate scale figures found in their cards, "
         f"dates in sync — all match."
     )
     return 0

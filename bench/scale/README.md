@@ -364,8 +364,17 @@ brokers and 16 drivers, read by a deliberately simple rule (no message lost, p99
 Two campaigns on the 1.2.0 release commit (2026-10-12, an unreleased candidate build, 10 →
 3 → 10) have their own cards: [`qos1-knees-2026-10-12.md`](qos1-knees-2026-10-12.md)
 (QoS 1, clean sessions) and [`durable-knees-2026-10-12.md`](durable-knees-2026-10-12.md)
-(durable QoS 1 on the default store, with a sizing estimate). Both publish rungs the rig
-did not certify, labelled as such.
+(durable QoS 1 on the default store, with a sizing estimate and the cross-node traffic
+of both). Both publish rungs the rig did not certify, labelled as such.
+
+`summarize-curve.py` reads a lane E rung twice and never merges the two. Its verdict
+column is the rig's certification. Under "Reading from the brokers' counters" it asserts
+the rung from the brokers' own counters: the rung **holds** if no message was lost (the
+identity ledger closes, no broker dropped anything) and p99 is at or below 1 s, at the
+rate each broker's delivered counter shows over its own window. The driver-side rate is
+printed beside it, and a gap past 2% is reported as `READINGS DISAGREE`.
+`extract-lane-e.py` prints that rate with the band the brokers' scrape brackets leave on
+it (`deliv_band`).
 
 ## Cross-broker comparison on cloud hardware (ADR 0048 T4)
 
