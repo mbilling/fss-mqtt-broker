@@ -307,10 +307,16 @@ neither is operator configuration**; with both off the state machine is what it 
 
 - `confirm_before_dead` — Lifeguard's direct refutation path in its smallest form: when a
   suspect's window lapses it is sent one `Ping` carrying the suspicion and given one ack
-  timeout; a live member refutes in its `Ack`, first-hand (its refutation is put at the
-  head of its gossip for that), and only a silent one is declared `Dead`. No new wire
-  element. In the simulation no member cut off for up to 1.5 s is declared dead at any
-  size, and a real death is detected 0.1–0.5 s later in the median.
+  timeout, and only a silent one is declared `Dead`. A member that answers is kept
+  whatever its `Ack` carries. Usually the `Ack` carries the refutation, first-hand (a
+  node told it is suspected puts its refutation at the head of its gossip). When it does
+  not — the member had already refuted an earlier claim and that refutation's retransmit
+  budget is spent, so our claim is stale to it; or it is an older build — the `Ack` to
+  that probe is itself proof of life: the window restarts and the member is sent one
+  `Join`, whose `Sync` states its incarnation. No new wire element, and nothing asked of
+  the suspect that a v1.1.0 node does not already do. In the simulation no member cut
+  off for up to 1.5 s is declared dead at any size, and a real death is detected
+  0.1–0.5 s later in the median.
 - `suspicion_scales_with_log_n` — the SWIM paper's rule: both ends of the window times
   `max(1, log10 n)`.
 

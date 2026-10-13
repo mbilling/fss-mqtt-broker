@@ -29,7 +29,8 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use common::{Client, Recv};
@@ -69,14 +70,22 @@ enum Link {
     EvictedDials,
 }
 
-/// SWIM timings as the other in-process cluster suites set them: quick to form, and
-/// never the source of a `Dead` in these tests — the false verdict is injected.
+/// SWIM timings: quick to form (a short protocol period carries the gossip), and
+/// **deaf to load**. Nothing in these tests needs real failure detection — the false
+/// verdict is injected — and real detection firing would undo the experiment: a
+/// `Suspect` A's own SWIM raised about B, refuted, comes back as an `Alive` event,
+/// the link manager's `Alive` arm redials B, and every lossy row would flip as if a
+/// fix had landed. So a probe waits ten seconds (direct, then indirect) before it
+/// suspects anyone, and a suspicion would take two minutes to become a `Dead`. On top
+/// of that every episode checks that A's SWIM raised nothing about B while the
+/// verdict stood ([`Cluster::membership_moved_only_as_injected`]), so a run in which
+/// it did fails saying so.
 fn swim_cfg() -> SwimConfig {
     SwimConfig {
         protocol_period_ms: 150,
-        ack_timeout_ms: 60,
-        suspicion_timeout_ms: 2000,
-        suspicion_min_timeout_ms: 1000,
+        ack_timeout_ms: 5000,
+        suspicion_timeout_ms: 120_000,
+        suspicion_min_timeout_ms: 120_000,
         dead_ttl_ms: 5000,
         indirect_probes: 2,
         gossip_fanout: 8,
@@ -104,8 +113,13 @@ struct Node {
     swim_addr: String,
     peer_addr: String,
     placement: Arc<RwLock<Placement>>,
-    /// The channel this node's SWIM driver reports membership changes on.
+    /// The channel this node's link manager reads membership changes from. The SWIM
+    /// driver's own events reach it through [`raised`](Self::raised)'s tap; the tests
+    /// inject theirs here directly.
     events: mpsc::UnboundedSender<MembershipEvent>,
+    /// Every membership change this node's own SWIM driver raised, in order — so a
+    /// test can tell the verdict it injected from one real detection produced.
+    raised: Arc<Mutex<Vec<(NodeId, MemberState)>>>,
     metrics: Arc<mqtt_observability::metrics::Metrics>,
     plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
 }
@@ -236,11 +250,24 @@ async fn start_node(id: &str, seeds: Vec<String>, mode: Mode) -> Node {
         seeds,
     );
     let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let (driver_tx, mut driver_rx) = mpsc::unbounded_channel::<MembershipEvent>();
+    let raised = Arc::new(Mutex::new(Vec::new()));
+    {
+        let (raised, to_link_manager) = (raised.clone(), event_tx.clone());
+        tokio::spawn(async move {
+            while let Some(event) = driver_rx.recv().await {
+                raised.lock().unwrap().push((event.id.clone(), event.state));
+                if to_link_manager.send(event).is_err() {
+                    break;
+                }
+            }
+        });
+    }
     tokio::spawn(swim_driver::run(
         socket,
         swim,
         Duration::from_millis(20),
-        event_tx.clone(),
+        driver_tx,
         // This test's own key (#754): a recycled port cannot merge two tests' clusters.
         Some(SwimAuth::new(&common::this_tests_cluster_key())),
         None,
@@ -266,6 +293,7 @@ async fn start_node(id: &str, seeds: Vec<String>, mode: Mode) -> Node {
         peer_addr,
         placement,
         events: event_tx,
+        raised,
         metrics,
         plane,
     }
@@ -277,6 +305,10 @@ struct Cluster {
     b: Node,
     c: Node,
     mode: Mode,
+    /// How many events A's own SWIM had raised when the verdict was injected, and
+    /// when it was withdrawn (`usize::MAX` until then).
+    raised_at_verdict: AtomicUsize,
+    raised_at_heal: AtomicUsize,
 }
 
 /// Which node founds the cluster — in durable mode, the lease group's first leader.
@@ -307,7 +339,14 @@ impl Cluster {
                 (a, b, c)
             }
         };
-        let cluster = Cluster { a, b, c, mode };
+        let cluster = Cluster {
+            a,
+            b,
+            c,
+            mode,
+            raised_at_verdict: AtomicUsize::new(0),
+            raised_at_heal: AtomicUsize::new(usize::MAX),
+        };
         let nodes = cluster.nodes();
         wait_until(
             "every node counts three members",
@@ -383,8 +422,16 @@ impl Cluster {
     }
 
     /// A — and only A — is told B is dead: the event A's SWIM driver emits for a `Dead`.
-    /// Returns once A's link manager has applied it (the members gauge shows it).
-    async fn falsely_declare_b_dead_on_a(&self) {
+    /// Returns once A's link manager has applied it (the members gauge shows it) — and,
+    /// where the link stays down (`link` is [`Link::EvictorDials`]), once BOTH hubs have
+    /// dropped it: A's by its `PeerDead`, B's by the disconnect it then sees. Each hub
+    /// publishes its link count on its sweep tick, so this costs up to a second of the
+    /// eight-second settle window; without it the first publishes race the hubs (a
+    /// publish B dispatches before it has seen the link go is still owed to A's
+    /// `$share` member, and is held rather than lost).
+    async fn falsely_declare_b_dead_on_a(&self, link: Link) {
+        self.raised_at_verdict
+            .store(self.a.raised.lock().unwrap().len(), Ordering::SeqCst);
         self.a.events.send(self.event(MemberState::Dead)).unwrap();
         let metrics = self.a.metrics.clone();
         wait_until(
@@ -393,11 +440,51 @@ impl Cluster {
             || metrics.render().contains("mqttd_members{state=\"dead\"} 1"),
         )
         .await;
+        if link == Link::EvictorDials {
+            for node in [&self.a, &self.b] {
+                wait_until(
+                    "the hub's link count drops to the one link that is left",
+                    Duration::from_secs(20),
+                    || series(node).get("mqttd_peer_links").copied() == Some(1.0),
+                )
+                .await;
+            }
+        }
     }
 
-    /// A's membership heals: the `Alive` event a first-hand refutation raises.
+    /// A's membership heals: the `Alive` event a first-hand refutation raises. Only
+    /// the first call marks the end of the verdict.
     fn heal(&self) {
+        let _ = self.raised_at_heal.compare_exchange(
+            usize::MAX,
+            self.a.raised.lock().unwrap().len(),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
         self.a.events.send(self.event(MemberState::Alive)).unwrap();
+    }
+
+    /// The precondition every row of an episode rests on: between the injected `Dead`
+    /// and the injected `Alive`, A's own SWIM raised nothing about B. If it did — a
+    /// starved runner made a probe of B time out, B refuted, and the resulting real
+    /// `Alive` redialed the link — the episode measured something else, and it fails
+    /// HERE, naming that, rather than further on looking like a change in the broker.
+    #[track_caller]
+    fn membership_moved_only_as_injected(&self) {
+        let raised = self.a.raised.lock().unwrap();
+        let from = self.raised_at_verdict.load(Ordering::SeqCst);
+        let to = self.raised_at_heal.load(Ordering::SeqCst).min(raised.len());
+        let about_b: Vec<_> = raised[from..to]
+            .iter()
+            .filter(|(id, _)| *id == self.b.id)
+            .collect();
+        assert!(
+            about_b.is_empty(),
+            "VOID EPISODE, not a behaviour change: while the injected verdict stood, A's \
+             own SWIM raised {about_b:?} about B (real failure detection fired, most \
+             likely on a starved runner), so the routing state did not stay as the test \
+             set it. Re-run; if this recurs, the SWIM timings in `swim_cfg` are too tight."
+        );
     }
 }
 
@@ -935,11 +1022,10 @@ async fn retained_on(node: &Node, id: &str, filter: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------------
 
 /// How long a publisher waits for an acknowledgement before it is called withheld.
-const ACK_BOUND: Duration = Duration::from_secs(15);
-/// The same for the second publish of an episode: the routing-settle window (about
-/// eight seconds, which the first publish may be held for) is over by then, so an
-/// acknowledgement that is coming at all comes at once.
-const SECOND_BOUND: Duration = Duration::from_secs(5);
+/// The longest one that does come is the first publish's, held for the routing-settle
+/// window: seven to ten seconds on an idle machine. The bound is three times that, so
+/// a loaded runner does not turn a slow acknowledgement into a withheld one.
+const ACK_BOUND: Duration = Duration::from_secs(30);
 /// How long after A's `Alive` event a path may take to work again.
 const HEAL_BOUND: Duration = Duration::from_mins(2);
 /// How long subscribers are read for deliveries that should not come.
@@ -1164,7 +1250,7 @@ async fn episode(
     let mut retained_pub = Publisher::connect(&cluster, On::A, "pub-retained").await;
 
     let before = series(&cluster.a);
-    cluster.falsely_declare_b_dead_on_a().await;
+    cluster.falsely_declare_b_dead_on_a(link).await;
     let verdict = Instant::now();
 
     // Every flow publishes at once, each on its own connection: an acknowledgement
@@ -1187,7 +1273,7 @@ async fn episode(
         flow.first = answer;
         flow.pkids[0] = flow.publisher.last_pkid;
     }
-    let seconds = join_all(flows.iter_mut().map(|f| f.publish("second", SECOND_BOUND))).await;
+    let seconds = join_all(flows.iter_mut().map(|f| f.publish("second", ACK_BOUND))).await;
     for (flow, answer) in flows.iter_mut().zip(seconds) {
         flow.second = answer;
         flow.pkids[1] = flow.publisher.last_pkid;
@@ -1234,6 +1320,7 @@ async fn episode(
         reached_b_healed,
         owner_during,
     };
+    cluster.membership_moved_only_as_injected();
     println!("--- {mode:?}, {link:?}, founder {founder:?}, heal after {heal_after:?}");
     for (name, seen) in &episode.flows {
         println!(
@@ -1334,15 +1421,22 @@ async fn plain_the_evictor_dials_acked_publishes_for_the_evicted_peers_subscribe
     // The offline session lost nothing it was owed BEFORE the verdict.
     assert!(e.flow("offline").ever["b"].contains(&"healthy"));
 
-    // The publisher's view: one long acknowledgement, then prompt ones — and a success
-    // code on every one of them.
+    // The publisher's view: the first acknowledgement is held for the routing-settle
+    // window (eight sweep ticks of a second; the lower bound is far below it and no
+    // load can shorten a hold), the second is not — and each carries a success code.
     let clean = e.flow("clean");
-    let held = clean.first.after().expect("acked");
+    let (held, prompt) = (
+        clean.first.after().expect("acked"),
+        clean.second.after().expect("acked"),
+    );
     assert!(
-        held > Duration::from_secs(4),
+        held > Duration::from_secs(3),
         "the first publish is held for the routing-settle window: {held:?}"
     );
-    assert!(clean.second.after().expect("acked") < Duration::from_secs(2));
+    assert!(
+        prompt < held,
+        "the second is acknowledged without that hold: {prompt:?} against {held:?}"
+    );
 
     // The operator's view.
     e.expect_no_drop_was_counted();
@@ -1368,10 +1462,11 @@ async fn plain_the_evictor_dials_acked_publishes_for_the_evicted_peers_subscribe
 /// path heals in about a second while A's membership still says `Dead`.
 ///
 /// The first publish waits out that second in A's settle window and is then routed;
-/// nothing is lost — with one exception, pinned here as CHARACTERISATION: the settle
-/// pass re-routes ordinary interest only, so a publish that found its `$share` group
-/// without a member is acknowledged at the end of the window and never placed
-/// (`share-b`, first publish), although the member was back seven seconds earlier.
+/// nothing is lost — with one exception: the settle pass re-routes ordinary interest
+/// only, so a publish that found its `$share` group without a member is acknowledged
+/// at the end of the window and never placed (`share-b`, first publish), although the
+/// member was back seven seconds earlier. That row races the redial, so it is allowed
+/// either way here; it is pinned exactly where there is no redial, in the test above.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn plain_the_evicted_peer_dials_the_link_returns_and_only_a_memberless_share_group_loses() {
     let e = episode(Mode::Plain, Link::EvictedDials, Founder::Evictor, None).await;
@@ -1389,14 +1484,23 @@ async fn plain_the_evicted_peer_dials_the_link_returns_and_only_a_memberless_sha
     }
     e.expect("offline", [DeliveredOnHeal, DeliveredOnHeal]);
     // Both directions of the same gap: neither node's settle pass places a publish
-    // whose `$share` group came back with the link.
-    e.expect("share-b", [AckedAndLost, Delivered]);
-    e.expect("reverse-share", [AckedAndLost, Delivered]);
+    // whose `$share` group came back with the link. The first publish races the
+    // redial (500 ms): sent the moment the verdict is applied it is lost, as every
+    // run on an idle machine shows; a runner slow enough to dispatch it only after
+    // the group is back delivers it. The second always finds the group.
+    let races_the_redial: &[Fate] = &[AckedAndLost, Delivered];
+    e.expect_one_of("share-b", [races_the_redial, &[Delivered]]);
+    e.expect_one_of("reverse-share", [races_the_redial, &[Delivered]]);
 
+    // Relative, so that load cannot decide it: in the same episode the `rule` flow's
+    // first publish (the original, which nobody subscribes to) IS held to the end of
+    // the window, and the clean session's is not.
     let waited = e.flow("clean").first.after().expect("acked");
+    let whole_window = e.flow("rule").first.after().expect("acked");
     assert!(
-        waited < Duration::from_secs(5),
-        "the first publish waits for the redial, not for the whole window: {waited:?}"
+        waited < whole_window,
+        "the first publish waits for the redial ({waited:?}), not for the whole \
+         window ({whole_window:?})"
     );
     e.expect_no_drop_was_counted();
     assert!(e.retained.acked_ok() && e.reached_b_standing && e.reached_b_healed);
@@ -1409,8 +1513,9 @@ async fn plain_the_evicted_peer_dials_the_link_returns_and_only_a_memberless_sha
 /// seconds or so of a false verdict and no longer: withdrawn just after the window
 /// has closed, the same first publish is lost (seen while this was written).
 ///
-/// The exception, CHARACTERISATION as in the test above: the settle pass does not
-/// re-select a `$share` group, so `share-b`'s first publish is lost even so.
+/// The exception: the settle pass does not re-select a `$share` group, so `share-b`'s
+/// first publish is lost even so (allowed either way here, since a runner slow enough
+/// to dispatch it after the withdrawal delivers it; pinned exactly in the first test).
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn plain_a_verdict_withdrawn_inside_the_settle_window_loses_only_the_memberless_share_group()
 {
@@ -1431,12 +1536,20 @@ async fn plain_a_verdict_withdrawn_inside_the_settle_window_loses_only_the_membe
     ] {
         e.expect(flow, [DeliveredOnHeal, DeliveredOnHeal]);
     }
-    e.expect("share-b", [AckedAndLost, DeliveredOnHeal]);
-    e.expect("reverse-share", [AckedAndLost, DeliveredOnHeal]);
-    let clean = e.flow("clean");
+    // Lost on every idle run; a runner that dispatches the first publish only after
+    // the verdict was withdrawn (two seconds late) would deliver it.
+    let lost_unless_late: &[Fate] = &[AckedAndLost, DeliveredOnHeal];
+    e.expect_one_of("share-b", [lost_unless_late, &[DeliveredOnHeal]]);
+    e.expect_one_of("reverse-share", [lost_unless_late, &[DeliveredOnHeal]]);
+    // Relative again: the `rule` flow's first publish (the original, which nobody
+    // subscribes to) is acknowledged at the end of the window, the clean session's
+    // when B's interest returned.
+    let at_return = e.flow("clean").first.after().expect("acked");
+    let at_window_end = e.flow("rule").first.after().expect("acked");
     assert!(
-        clean.first.after().expect("acked") < Duration::from_secs(6),
-        "acknowledged when the interest returned, not at the end of the window: {clean:#?}"
+        at_return < at_window_end,
+        "acknowledged when the interest returned ({at_return:?}), not at the end of \
+         the window ({at_window_end:?})"
     );
 }
 
@@ -1531,7 +1644,7 @@ async fn durable_a_leader_evictor_moves_the_lease_and_still_loses_acked_publishe
 /// its client to follow it, and the publishes reach that client as it resumes.
 ///
 /// The one loss is the one plain mode has in this orientation (`share-b`, first
-/// publish): CHARACTERISATION, as there.
+/// publish), racing the redial as there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn durable_the_evicted_peer_dials_the_link_returns_and_sessions_follow_the_lease() {
     let e = episode(Mode::Durable, Link::EvictedDials, Founder::Evictor, None).await;
@@ -1543,8 +1656,9 @@ async fn durable_the_evicted_peer_dials_the_link_returns_and_sessions_follow_the
     let reaches_the_session: &[Fate] = &[Delivered, DeliveredOnHeal];
     e.expect_one_of("persistent", [reaches_the_session, reaches_the_session]);
     e.expect("offline", [DeliveredOnHeal, DeliveredOnHeal]);
-    e.expect("share-b", [AckedAndLost, Delivered]);
-    e.expect("reverse-share", [AckedAndLost, Delivered]);
+    let races_the_redial: &[Fate] = &[AckedAndLost, Delivered];
+    e.expect_one_of("share-b", [races_the_redial, &[Delivered]]);
+    e.expect_one_of("reverse-share", [races_the_redial, &[Delivered]]);
     e.expect_no_drop_was_counted();
     assert!(e.retained.acked_ok() && e.reached_b_standing && e.reached_b_healed);
 }

@@ -434,8 +434,10 @@ clean-session QoS 1 rung at ten nodes, the durable rung, and the `$share` QoS 1 
 - **O7 — A v5 PUBACK `0x10` (no matching subscribers)** for a publish that matched
   nobody: a cheap signal to every v5 publisher; a separate decision, since it changes
   what an ordinary unmatched publish returns.
-- **O8 — The README's "none lost"** until this ships: it should carry the condition it
-  was measured under (no node held a live peer dead).
+- **O8 — The README's "none lost"** until this ships. Since this record's change the
+  sentence is followed by its condition (the runs inject no fault, and #973 is named),
+  and the 1.2.0 release notes list the limit. Whether the headline figure at the top of
+  the README should carry it too is open.
 
 ## 7. The false verdict itself
 
@@ -462,10 +464,12 @@ turned a healthy member `Dead`.
 | **one last direct probe before `Dead`** | 5 | 0 | 0 | 0 | 0 | 6 | 29 |
 | | 10 | 0 | 0 | 0 | 0 | 3 | 31 |
 | | 14 | 0 | 0 | 0 | 0 | 8 | 30 |
-| | 30 | 0 | 0 | 0 | 2 | 3 | 30 |
+| | 30 | 0 | 0 | 0 | 0 | 0 | 28 |
 
 Up to 3 s every one of today's verdicts was reached after the outage had ended; each stood
-for the tombstone's 30 s. What each costs when the member is really dead (ms until the
+for the tombstone's 30 s. What is left with the probe at 3 s is a `Dead` declared *during*
+the outage — three suspecters shorten the window to 1.5 s, and the member really was
+silent when it was asked — and adopted from gossip by the others afterwards. What each costs when the member is really dead (ms until the
 last survivor holds it `Dead`, median / worst): today 5313 / 8037 at 14 nodes and
 6500 / 8347 at 30; the last direct probe 5613 / 8337 and 7005 / 8347; memberlist's
 defaults 7775 / 20079 and 10869 / 23494. The full table and the mixed-version rows are in
@@ -473,7 +477,12 @@ defaults 7775 / 20079 and 10869 / 23494. The full table and the mixed-version ro
 
 The last direct probe is `Config::confirm_before_dead`, added with this record so that it
 could be measured, **off by default**; so is `Config::suspicion_scales_with_log_n`.
-Neither is operator configuration. The default is not changed here, although the probe is
+Neither is operator configuration. The probe's rule is that a suspect which answers it is
+never declared dead on that window, whatever its `Ack` carries: usually the `Ack` carries
+the refutation; when it cannot (the suspect is already an incarnation ahead of a stale
+claim and has nothing left to gossip about itself, or is an older build), the `Ack` alone
+keeps it and it is asked for its own claim with a `Join`. That second half was added on
+review; without it the 30-node row read 0, 0, 0, 2, 3, 30. The default is not changed here, although the probe is
 never worse in any cell and adds no wire element: ADR 0016 asks that a change to failure
 detection be a change of its own, a clean cut on a lossless network is one fault shape,
 and in a cluster part-way through an upgrade the nodes still on v1.1.0 keep declaring —

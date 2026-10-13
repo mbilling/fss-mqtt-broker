@@ -422,8 +422,10 @@ struct Outcome {
     /// `measured_from` — or over the whole run when nothing is isolated.
     suspects: Vec<u32>,
     deads: Vec<u32>,
-    /// `Dead` transitions raised while a member was cut off (by it, or about it):
-    /// the member really was unreachable when each of these was declared.
+    /// Every `Dead` transition any node raised while a member was cut off. Nearly all
+    /// are by that member or about it — it really was unreachable at that moment —
+    /// but the count does not check: a `Dead` between two other nodes in that
+    /// interval is counted too.
     deads_during_cut: u32,
     /// How long after the cut began every OTHER node held the cut-off member `Dead`,
     /// ms — the detection time of a real death, when the cut never ends.
@@ -1325,8 +1327,10 @@ fn a_short_cut_still_ends_in_a_false_dead_on_the_default_window() {
 /// survivor in about the time the default takes.
 #[test]
 fn a_last_direct_probe_spares_a_member_cut_off_for_less_than_the_window() {
-    for n in [5, 14, 30] {
-        for for_ms in [500, 1500] {
+    // A handful of runs per size: this is every tier's test, and the 32-seed table is
+    // the report's (ADR 0087 §7).
+    for (n, cuts) in [(5, &[1500][..]), (14, &[500, 1500]), (30, &[1500])] {
+        for &for_ms in cuts {
             let c = cut_cell(LAST_PROBE, n, for_ms, seeds(n));
             assert_eq!(
                 c.any_dead, 0,
