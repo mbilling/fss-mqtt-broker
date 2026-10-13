@@ -13,9 +13,10 @@
 //!    dropped without a count, and one behind a link-down member waited.
 //!
 //! Driven without the hub's actor (the `settle_gate` precedent): the handlers are
-//! called directly, the sweep is the plain function it is, and no assertion reads
-//! a clock. A peer is a pair of channels; what the hub put on its link is read
-//! back in order.
+//! called directly, the sweep is the plain function it is, and no assertion depends
+//! on how long the test took — the one test about what the sweep does as time
+//! passes runs on a paused clock and moves it itself. A peer is a pair of channels;
+//! what the hub put on its link is read back in order.
 
 use super::settle_gate::quiesce;
 use super::*;
@@ -49,10 +50,15 @@ struct Link {
 
 /// A link that has just formed: the peer has said nothing on it yet.
 fn link(hub: &mut Hub, name: &str, proto: u32) -> Link {
+    link_as(hub, name, proto, 0)
+}
+
+/// [`link`], as connection `conn_id`.
+fn link_as(hub: &mut Hub, name: &str, proto: u32, conn_id: u64) -> Link {
     let node = NodeId(name.into());
     let (tx, rx) = mpsc::unbounded_channel();
     let (ctl, ctl_rx) = mpsc::unbounded_channel();
-    hub.peer_connected(node.clone(), 0, tx, ctl, None, proto, Arc::default());
+    hub.peer_connected(node.clone(), conn_id, tx, ctl, None, proto, Arc::default());
     Link {
         node,
         rx,
@@ -189,13 +195,10 @@ fn tick(hub: &mut Hub) {
     hub.sweep_pending_forwards();
 }
 
-/// Make everything pending publish `id` is owed overdue at the next sweep.
-fn age(hub: &mut Hub, id: u64) {
+/// Restart the overdue clock of pending publish `id`, as a registration on it does.
+fn just_forwarded(hub: &mut Hub, id: u64) {
     let p = hub.pending_publishes.get_mut(id).expect("still pending");
-    p.created_at = tokio::time::Instant::now()
-        .checked_sub(crate::hub::SESSION_SWEEP_INTERVAL * 2)
-        .expect("the clock is past two sweep intervals");
-    p.forwarded_after_ms = 0;
+    p.forwarded_after_ms = u32::try_from(p.created_at.elapsed().as_millis()).unwrap();
 }
 
 fn accepted(rx: &mut oneshot::Receiver<PublishOutcome>) -> bool {
@@ -313,15 +316,23 @@ fn a_share_delivery_made_before_the_peers_membership_arrives_goes_out_behind_wha
 
 /// The sweep still sends an overdue forward to a linked peer that has not
 /// announced — a peer that restarted and cannot yet say what it routes answers it
-/// with a failure, and the publisher retries instead of waiting on it — but it
-/// sends EVERYTHING of that kind the peer is owed, oldest first, not the overdue
-/// one alone ahead of an older one beside it.
+/// with a failure, and the publisher retries instead of waiting on it — but:
 ///
-/// A `$share` delivery is the exception for a peer that cannot say "that member is
-/// not here" (v1.1.0, proto 12): sent before its membership snapshot, such a peer
-/// would answer `Stored` for a consumer that left during the outage. It waits.
-#[test]
-fn a_peer_that_has_not_announced_within_a_tick_is_sent_what_it_is_owed_oldest_first() {
+/// - only once the LINK has been there for a sweep interval. What was held across
+///   an outage is overdue the moment the link forms, and the first sweep after it
+///   came within a second: the backlog went out before the peer had said anything;
+/// - EVERYTHING the peer is owed, oldest first, not the overdue one alone ahead of
+///   an older one beside it — once: the link is then open;
+/// - never a `$share` delivery. Only the membership snapshot says whether the named
+///   member is still there, and a peer that has not sent it cannot yet say who is
+///   on it: it could only answer `Failed`, withholding an acknowledgement the
+///   snapshot would have let this node place again.
+///
+/// On a paused clock, moved by the test: nothing here depends on how long the test
+/// itself takes.
+#[tokio::test(start_paused = true)]
+async fn a_peer_silent_for_a_sweep_interval_is_sent_its_ordinary_forwards_oldest_first() {
+    let interval = crate::hub::SESSION_SWEEP_INTERVAL;
     for proto in [PROTO_MAX, PROTO_V1_1_0] {
         let mut h = hub();
         let first = peer(&mut h, "p", proto, &["c"]);
@@ -331,35 +342,32 @@ fn a_peer_that_has_not_announced_within_a_tick_is_sent_what_it_is_owed_oldest_fi
         let (older, _a) = publish_ordinary(&mut h, "t/a", QoS::AtLeastOnce);
         let (newer, _b) = publish_ordinary(&mut h, "t/a", QoS::AtLeastOnce);
         let (shared, _c) = publish_shared(&mut h);
+        // The outage lasts: everything held is long overdue when the link returns.
+        tokio::time::advance(interval * 5).await;
 
         let mut back = link(&mut h, "p", proto);
-        // Only the NEWER ordinary forward is overdue; the older one's clock was
-        // restarted (as a re-route on its publish does).
-        age(&mut h, newer);
-        age(&mut h, shared);
         tick(&mut h);
-        let frames = sent(&mut back);
-        let ordinary: Vec<u64> = frames
-            .iter()
-            .filter(|(_, member)| member.is_none())
-            .map(|(seq, _)| *seq)
-            .collect();
-        assert_eq!(
-            ordinary,
-            vec![owed(&h, older)[0].0, owed(&h, newer)[0].0],
-            "proto {proto}: both, the older first"
+        assert!(
+            sent(&mut back).is_empty(),
+            "proto {proto}: nothing at the first sweep after the link formed — the \
+             peer has had no time to say anything"
         );
-        let shared_sent = frames.iter().filter(|(_, member)| member.is_some()).count();
+
+        // A sweep interval of silence. Only the NEWER forward is overdue now: the
+        // older one's clock was restarted (as a re-route on its publish does).
+        tokio::time::advance(interval).await;
+        just_forwarded(&mut h, older);
+        tick(&mut h);
         assert_eq!(
-            shared_sent,
-            usize::from(proto == PROTO_MAX),
-            "proto {proto}: a `$share` delivery goes before the membership snapshot \
-             only to a peer that can refuse it for a member that is gone"
+            sent(&mut back),
+            vec![(owed(&h, older)[0].0, None), (owed(&h, newer)[0].0, None)],
+            "proto {proto}: both ordinary forwards, the older first, and no `$share` \
+             delivery"
         );
 
         // That was the one flush: the link is open for ordinary forwards now, so a
-        // new one is sent as it is registered, and the next tick sends nothing
-        // again that is not overdue.
+        // new one is sent as it is registered, and a sweep with nothing overdue
+        // sends nothing again.
         let (_, _d) = publish_ordinary(&mut h, "t/a", QoS::AtLeastOnce);
         assert_eq!(sent(&mut back).len(), 1, "proto {proto}: sent at once");
         tick(&mut h);
@@ -368,21 +376,142 @@ fn a_peer_that_has_not_announced_within_a_tick_is_sent_what_it_is_owed_oldest_fi
             "proto {proto}: the whole backlog is not sent again every tick"
         );
 
-        // The snapshot arrives, and the member is still there. The peer that was
-        // already sent the delivery is not sent it again (the sweep retransmits it
-        // if it stays unanswered); the one that was made to wait is sent it now.
+        // However long the peer stays silent, the `$share` delivery waits.
+        tokio::time::advance(interval * 3).await;
+        tick(&mut h);
+        assert!(
+            sent(&mut back).iter().all(|(_, member)| member.is_none()),
+            "proto {proto}: only ordinary retransmissions"
+        );
+
+        // The peer announces. Its interest: nothing is sent a second time. Its
+        // members: the member is still there, and the delivery goes out.
+        h.peer_announced_interest(&back.node, vec!["t/#".to_string()]);
+        assert!(sent(&mut back).is_empty(), "proto {proto}");
         h.peer_announced_shared(&back.node, members(&["c"]));
-        let at_the_snapshot = sent(&mut back);
-        if proto == PROTO_MAX {
-            assert!(at_the_snapshot.is_empty(), "proto {proto}: sent once");
-        } else {
-            assert_eq!(
-                at_the_snapshot,
-                vec![(owed(&h, shared)[0].0, Some("c".to_string()))],
-                "proto {proto}"
-            );
-        }
+        assert_eq!(
+            sent(&mut back),
+            vec![(owed(&h, shared)[0].0, Some("c".to_string()))],
+            "proto {proto}"
+        );
     }
+}
+
+/// The order holds for what this node learns it owes only AT the heal. A publish
+/// that matched nobody when it was made is kept for the settle pass while the view
+/// is unsettled, with no forward recorded; when the peer's snapshot on the new link
+/// announces a matching filter — its subscriber subscribed during the outage, or
+/// its interest had been erased with its hold — the publish is re-routed to it.
+/// That happened at the next settle pass, up to a tick after the snapshot, and
+/// everything published in between had already been sent: the subscriber saw up to
+/// a second of newer messages, then the older ones. The re-route now happens at
+/// the announcement, before the link opens, and goes out in its place.
+#[test]
+fn what_is_first_owed_at_the_heal_goes_out_in_publish_order_too() {
+    // (a) the subscriber subscribed on the peer while the link was down.
+    let mut h = hub();
+    h.set_cluster_configured();
+    assert!(
+        h.routing_unsettled(),
+        "fixture: an unmatched publish is kept"
+    );
+    let first = link(&mut h, "p", PROTO_MAX);
+    announce(&mut h, &first, &["other/#"], &[]);
+    h.peer_disconnected(&first.node, 0);
+    let (cut_1, mut ack_1) = publish_ordinary(&mut h, "t/a", QoS::AtLeastOnce);
+    let (cut_2, _b) = publish_ordinary(&mut h, "t/a", QoS::AtLeastOnce);
+    assert!(
+        owed(&h, cut_1).is_empty() && unanswered(&mut ack_1),
+        "nothing is owed to anybody yet, and the acknowledgement is held"
+    );
+    let mut back = link(&mut h, "p", PROTO_MAX);
+    let (linked, _c) = publish_ordinary(&mut h, "t/a", QoS::AtLeastOnce);
+    h.peer_announced_interest(&back.node, vec!["t/#".to_string()]);
+    let order: Vec<u64> = sent(&mut back).into_iter().map(|(seq, _)| seq).collect();
+    let expected: Vec<u64> = [cut_1, cut_2, linked]
+        .into_iter()
+        .map(|id| owed(&h, id)[0].0)
+        .collect();
+    assert_eq!(
+        order, expected,
+        "(a) re-routed at the announcement, oldest first"
+    );
+    let (_, _d) = publish_ordinary(&mut h, "t/a", QoS::AtLeastOnce);
+    assert_eq!(
+        sent(&mut back).len(),
+        1,
+        "(a) and what follows goes behind them"
+    );
+
+    // (b) the outage outlasts the hold: the peer is held dead, its hold runs out
+    // and its interest is erased; it returns and announces the same filter.
+    let mut h = hub();
+    h.set_cluster_configured();
+    let first = link(&mut h, "p", PROTO_MAX);
+    announce(&mut h, &first, &["t/#"], &[]);
+    h.peer_dead(&first.node);
+    let (during_the_hold, _a) = publish_ordinary(&mut h, "t/a", QoS::AtLeastOnce);
+    assert_eq!(
+        owed(&h, during_the_hold).len(),
+        1,
+        "owed to the peer held dead"
+    );
+    for _ in 0..REROUTE_GRACE_TICKS {
+        tick(&mut h);
+    }
+    assert!(!h.interest.has_node(&first.node), "the hold ran out");
+    assert!(
+        owed(&h, during_the_hold).is_empty(),
+        "and discharged what was owed"
+    );
+    let (after_1, _b) = publish_ordinary(&mut h, "t/a", QoS::AtLeastOnce);
+    let (after_2, _c) = publish_ordinary(&mut h, "t/a", QoS::AtLeastOnce);
+    let mut back = link(&mut h, "p", PROTO_MAX);
+    let (linked, _d) = publish_ordinary(&mut h, "t/a", QoS::AtLeastOnce);
+    h.peer_announced_interest(&back.node, vec!["t/#".to_string()]);
+    let order: Vec<u64> = sent(&mut back).into_iter().map(|(seq, _)| seq).collect();
+    let expected: Vec<u64> = [during_the_hold, after_1, after_2, linked]
+        .into_iter()
+        .map(|id| owed(&h, id)[0].0)
+        .collect();
+    assert_eq!(order, expected, "(b) everything still held, oldest first");
+}
+
+/// A snapshot left over from a link the peer has since REPLACED opens nothing. The
+/// snapshot commands carry the link they arrived on; one that names another link
+/// than the node's current one is dropped — it is not the first thing the peer
+/// said on THIS link, and a stale membership could name a consumer that has left.
+#[tokio::test]
+async fn a_snapshot_from_a_replaced_link_does_not_open_the_new_one() {
+    let mut h = hub();
+    let old = link_as(&mut h, "p", PROTO_MAX, 1);
+    announce(&mut h, &old, &["t/#"], &["c"]);
+    h.peer_disconnected(&old.node, 1);
+    let (_, _a) = publish_ordinary(&mut h, "t/a", QoS::AtLeastOnce);
+    let (_, _b) = publish_shared(&mut h);
+    let mut new = link_as(&mut h, "p", PROTO_MAX, 2);
+
+    let node = new.node.clone();
+    let interest = |conn_id| HubCommand::RemoteInterest {
+        node: node.clone(),
+        conn_id: Some(conn_id),
+        filters: vec!["t/#".to_string()],
+    };
+    let membership = |conn_id| HubCommand::RemoteSharedInterest {
+        node: node.clone(),
+        conn_id: Some(conn_id),
+        groups: members(&["c"]),
+    };
+    h.dispatch(interest(1)).await;
+    h.dispatch(membership(1)).await;
+    assert!(
+        sent(&mut new).is_empty(),
+        "left over from the replaced link"
+    );
+    h.dispatch(interest(2)).await;
+    assert_eq!(sent(&mut new).len(), 1, "the ordinary forward");
+    h.dispatch(membership(2)).await;
+    assert_eq!(sent(&mut new).len(), 1, "the `$share` delivery");
 }
 
 // ---- item 1: a `$share` delivery is acknowledged only when a member took it ----
@@ -498,6 +627,84 @@ async fn a_node_whose_view_is_unsettled_does_not_call_a_share_member_gone() {
             }
         )]
     );
+}
+
+/// The likelier way for a consumer to be gone when the hub is busy: its connection
+/// has ended, and its `Detach` is still queued behind the commands ahead of it — so
+/// the hub still lists it as online when the delivery arrives. The send finds the
+/// channel closed and reaps the session; with a clean session nobody took the
+/// message, and the answer is the refusal, not `Stored` (which this path gave: the
+/// first delivery after a consumer left was acknowledged to its publisher, and
+/// only the later ones were refused). At `QoS` 1 and `QoS` 2.
+///
+/// A PERSISTENT session in the same state did take it: the message is in its
+/// queue, and the answer is `Stored`.
+#[tokio::test]
+async fn a_shared_delivery_for_a_member_whose_connection_has_ended_is_refused() {
+    for (persistent, qos) in [
+        (false, QoS::AtLeastOnce),
+        (false, QoS::ExactlyOnce),
+        (true, QoS::AtLeastOnce),
+    ] {
+        let case = format!("persistent={persistent} qos={qos:?}");
+        let store = Arc::new(MemorySessionStore::new());
+        let (mut h, _) = Hub::with_config(NodeId("so-receiver".into()), store.clone());
+        let mut origin = link(&mut h, "so-origin", PROTO_MAX);
+        let member = ClientId("left".into());
+        let (otx, orx) = mpsc::unbounded_channel::<Box<crate::hub::Outgoing>>();
+        let (outbound, _meter) = Outbound::new(otx);
+        let (reply, wait) = oneshot::channel();
+        h.dispatch(HubCommand::Attach {
+            client: member.clone(),
+            admission: Box::new(admission("left")),
+            conn_id: 7,
+            clean_start: !persistent,
+            session_expiry: if persistent { u32::MAX } else { 0 },
+            receive_maximum: u16::MAX,
+            will: None,
+            outbound,
+            reply,
+        })
+        .await;
+        quiesce(&mut h).await;
+        assert!(matches!(wait.await, Ok(AttachOutcome::Present(false))));
+        // The connection task ends. Its `Detach` has not been dispatched.
+        drop(orx);
+        assert!(
+            h.online.contains_key(&member),
+            "{case}: still listed online"
+        );
+
+        h.dispatch(HubCommand::RemoteSharedDeliverAcked {
+            node: NodeId("so-origin".into()),
+            seq: 7,
+            client: member.clone(),
+            topic: TOPIC.into(),
+            payload: Bytes::from_static(b"x"),
+            qos,
+            message_expiry: None,
+            app: AppProperties::default(),
+        })
+        .await;
+        quiesce(&mut h).await;
+        let queued = store.pending(&member, 0, 16).await.unwrap_or_default();
+        if persistent {
+            assert_eq!(verdicts(&mut origin), vec![(7, ForwardVerdict::Stored)]);
+            assert_eq!(queued.len(), 1, "{case}: in the session's queue");
+        } else {
+            assert_eq!(
+                verdicts(&mut origin),
+                vec![(
+                    7,
+                    ForwardVerdict::Refused {
+                        code: REFUSAL_SHARED_MEMBER_GONE
+                    }
+                )],
+                "{case}: nobody took it"
+            );
+            assert!(queued.is_empty(), "{case}");
+        }
+    }
 }
 
 /// CHARACTERISATION of what the receiver's test does not cover: it asks whether the
@@ -706,9 +913,8 @@ fn a_share_delivery_held_for_a_member_that_left_during_the_outage_is_placed_agai
     }
 }
 
-/// A delivery the peer was SENT — in flight when the link went, or sent on the new
-/// link by the sweep before the snapshot came — may have been taken by its member
-/// before the member left. When the first snapshot on the new link no longer lists
+/// A delivery the peer was SENT — in flight when the link went — may have been taken
+/// by its member before the member left. When the first snapshot on the new link no longer lists
 /// that member, such a delivery is left for the peer to answer, if the peer can:
 /// it answers a repeat from its window, or says the member is gone, and only then
 /// is the delivery placed with another member. Placing it again at the snapshot

@@ -292,7 +292,17 @@ protocol, forward window and every obligation toward it. `peer_disconnected` kee
   the settle pass delivers to and discharges on). The window is the half second the
   redial takes. T5. *(0087-T2b: only with a durable plane. Without one — `MQTTD_DURABLE=0`
   — no session moves between nodes, so nothing is discharged: the newcomer is sent the
-  publish and the unreachable peer stays owed it.)*
+  publish and the unreachable peer stays owed it. Two things follow, both stated here
+  rather than hidden. After a REAL peer death in plain mode, a publish whose subscriber
+  has reconnected through another node is delivered to it at once, but its publisher's
+  acknowledgement now waits out the dead peer's hold — up to 8 ticks — where the
+  newcomer's answer used to release it. And a peer that was only falsely held dead and
+  still keeps a persistent session under that client id gets its copy too, queued for
+  that session: the client then has two sessions on two nodes, each with the message,
+  and sees it again if it reconnects to the first node with `clean_session=0`. That is
+  how plain mode already behaves with every link up — a session is per node there, both
+  nodes announce the filter, and every publish is queued on both — so it is not new;
+  what is new is that the falsely-dead window no longer happens to skip it.)*
 - *`$share`.* A member behind a lost link or on a peer under a verdict stays in its
   group, marked not reachable: the selector takes any member that can receive now, then a
   local persistent member, then a remote member on a node with a link, and one of these
@@ -335,7 +345,11 @@ protocol, forward window and every obligation toward it. `peer_disconnected` kee
   - **The receiver says so.** A node asked to deliver to a named member that is not on
     it — not connected, and no session of that name to queue for — used to answer
     `Stored`. It answers `Refused` with code 3 ("the named member is gone": nothing was
-    stored). While it cannot yet say who is on it it answers `Failed` instead, as an
+    stored). That includes the likelier way for a consumer to be gone on a busy node:
+    its connection has ended and its `Detach` is still queued, so the hub lists it as
+    online; the send finds the channel closed, and for a clean session that is nobody
+    having taken the message (a persistent session in that state has it in its queue,
+    and the answer is `Stored`). While it cannot yet say who is on it it answers `Failed` instead, as an
     ordinary forward that matched nobody is answered then: a session about to be
     materialised looks the same as one that is gone. That is narrower than "routing
     unsettled": its own view is not authoritative yet (no complete boot scan over a
@@ -362,7 +376,14 @@ protocol, forward window and every obligation toward it. `peer_disconnected` kee
     peer it is placed again all the same, a possible duplicate over a certain loss;
     then deliveries held for
     members on *other* unreachable nodes may move to this peer's; then what is owed
-    goes out, oldest first. This is what covers a v1.1.0 peer, which answers `Stored`
+    goes out, oldest first. Unlike an ordinary forward, a `$share` delivery is never
+    sent to a peer that stays silent, however long: a peer that has not sent its
+    snapshot cannot yet say who is on it and could only answer `Failed`, withholding
+    an acknowledgement the snapshot would have let the origin place again; every
+    build sends it within ten ticks of starting. And a snapshot is taken as a link's
+    first only if it arrived ON that link: the snapshot commands carry the link they
+    came in on, and one left over from a link the peer has since replaced is dropped
+    (it could name a consumer that has left). This is what covers a v1.1.0 peer, which answers `Stored`
     for anyone.
   - **Where a delivery goes when its member is gone.** As a first placement would: to a
     member that can take it now, else to one on a node that is out of reach, where it
@@ -393,11 +414,19 @@ protocol, forward window and every obligation toward it. `peer_disconnected` kee
   that has not announced on that link — its interest snapshot for an ordinary forward,
   its membership snapshot for a `$share` delivery — and at the announcement everything
   of that kind owed to the peer is sent in the order the publishes were accepted (the
-  pending table is ordered by publish id). A linked peer that has not announced within
-  a tick is still sent what is overdue, as the sweep always did, but all of it, oldest
-  first, once — the link is then open, and later forwards are sent as they are
-  registered (a `$share` delivery only if the peer can refuse it for a missing member:
-  proto 13 or more). **The guarantee:** the QoS 1 and QoS 2 messages one node forwards
+  pending table is ordered by publish id). That flush includes what the origin learns
+  it owes only then: a publish that matched nobody when it was made and is kept for
+  the settle pass — the peer's subscriber subscribed during the outage, or the peer's
+  interest had been erased when its hold ran out — is re-routed to the peer at its
+  announcement, before the link opens, where the settle pass did it up to a tick
+  later and behind everything published in between. A linked peer that stays silent
+  is still sent its ordinary forwards, as the sweep always did — once the LINK is a
+  sweep interval old (what was held across an outage is overdue the moment the link
+  forms), all of them, oldest first, once; the link is then open, and later forwards
+  are sent as they are registered. (If a peer announces only after that, what is
+  re-routed to it then goes out behind what was already sent: the one case, a peer
+  silent for over a second on a new link, where the order below is not kept for
+  interest it had not announced before.) **The guarantee:** the QoS 1 and QoS 2 messages one node forwards
   to another are applied on the receiving node in the order the origin accepted them —
   in the steady state as before (one ordered link, each forward sent as it is
   registered) and now across a lost link or a false verdict between the two as well.
@@ -619,7 +648,7 @@ speaks proto 12 and does not know it, so the code is said only on a link that ne
 | Origin | Receiver | A `$share` delivery whose member is not on the receiver |
 |---|---|---|
 | this build | this build | refused with code 3; the origin places it with another member, or acknowledges a group with nobody |
-| v1.1.0 | this build | refused with brownout's code (1: "nothing was stored here"), which v1.1.0 already re-selects on; only with no other member does its publisher hear `0x97` (a v3.1.1 publisher: a closed connection) and retry — into a group that by then has the new membership |
+| v1.1.0 | this build | refused with brownout's code (1: "nothing was stored here"), which v1.1.0 already re-selects on. With another member, that is all. With none, the v1.1.0 node refuses its publisher as it would for a brownout: a v5 publisher gets PUBACK/PUBREC `0x97` (Quota exceeded), a v3.1.1 publisher's connection is closed — for a consumer that simply disconnected, on a cluster that is not in a brownout — and the retry finds a group with the new membership. On the v1.1.0 node this is a WARN line per publish ("publish refused; the publisher is told rather than acked", `refusal=brownout`) and no metric: v1.1.0 counts brownout refusals where the refusal is DECIDED (the receiving node), not where it is relayed, and this build counts none for it. Between two v1.1.0 nodes the same publish is acknowledged and lost |
 | this build | v1.1.0 | **held across an outage:** never sent before the peer's membership snapshot, and placed again if the member is not in it — the origin's own check. **In flight in the steady state** (the consumer leaves in the milliseconds between the selection and the delivery): v1.1.0 answers `Stored` and the publisher is acknowledged, as between two v1.1.0 nodes. This residual ends when the receiver is upgraded |
 | v1.1.0 | v1.1.0 | answered `Stored`: today's behaviour |
 

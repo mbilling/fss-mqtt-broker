@@ -229,6 +229,7 @@ impl Rig {
                 rig.tx
                     .send(HubCommand::RemoteInterest {
                         node: node.clone(),
+                        conn_id: None,
                         filters: vec![],
                     })
                     .unwrap();
@@ -236,6 +237,7 @@ impl Rig {
             rig.tx
                 .send(HubCommand::RemoteSharedInterest {
                     node,
+                    conn_id: None,
                     groups: (0..6)
                         .map(|g| RemoteSharedGroup {
                             group: if shape.matching && g == 0 {

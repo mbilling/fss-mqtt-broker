@@ -1409,7 +1409,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 787 test(s)
+## `crates/mqttd/src/lib.rs` — 790 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1947,7 +1947,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::share_obligations::a_drain_gated_share_delivery_behind_a_lost_link_does_not_hold_the_drain`
 - `hub::tests::share_obligations::a_drain_gated_share_delivery_with_nobody_to_hand_it_to_is_dropped_and_counted`
 - `hub::tests::share_obligations::a_node_whose_view_is_unsettled_does_not_call_a_share_member_gone`
-- `hub::tests::share_obligations::a_peer_that_has_not_announced_within_a_tick_is_sent_what_it_is_owed_oldest_first`
+- `hub::tests::share_obligations::a_peer_silent_for_a_sweep_interval_is_sent_its_ordinary_forwards_oldest_first`
 - `hub::tests::share_obligations::a_publish_made_before_the_peer_announces_on_a_new_link_goes_out_behind_what_was_held`
 - `hub::tests::share_obligations::a_share_delivery_follows_a_consumer_that_reconnected_through_another_node`
 - `hub::tests::share_obligations::a_share_delivery_held_for_a_member_that_left_during_the_outage_is_placed_again`
@@ -1960,6 +1960,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::share_obligations::a_share_delivery_whose_member_is_gone_is_held_for_a_member_out_of_reach`
 - `hub::tests::share_obligations::a_shared_delivery_for_a_connected_client_that_is_no_longer_subscribed_is_delivered`
 - `hub::tests::share_obligations::a_shared_delivery_for_a_member_that_is_not_here_is_refused_not_answered_stored`
+- `hub::tests::share_obligations::a_shared_delivery_for_a_member_whose_connection_has_ended_is_refused`
+- `hub::tests::share_obligations::a_snapshot_from_a_replaced_link_does_not_open_the_new_one`
+- `hub::tests::share_obligations::what_is_first_owed_at_the_heal_goes_out_in_publish_order_too`
 - `hub::tests::shared_capacity::controls::qos0_shared_capacity_includes_application_properties`
 - `hub::tests::shared_capacity::controls::qos0_shared_does_not_escape_into_another_group_or_a_down_link`
 - `hub::tests::shared_capacity::controls::qos0_shared_rechecks_capacity_between_matching_groups`

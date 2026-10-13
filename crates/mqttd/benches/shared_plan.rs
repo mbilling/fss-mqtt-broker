@@ -90,6 +90,7 @@ fn hub_with_peers(
     for n in 0..peers {
         let _ = tx.send(HubCommand::RemoteSharedInterest {
             node: NodeId(format!("peer{n}")),
+            conn_id: None,
             groups: peer_groups(n, groups_per_node),
         });
     }

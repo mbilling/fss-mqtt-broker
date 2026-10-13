@@ -537,7 +537,8 @@ impl Hub {
 
     /// [`deliver_to_client`](Self::deliver_to_client), for a caller that named the
     /// recipient itself and must know whether it was there: `None` when `client` is
-    /// neither connected nor a session this node keeps — nothing was sent and
+    /// neither connected nor a session this node keeps — or its connection has
+    /// already ended, with its `Detach` not yet processed — so nothing was sent and
     /// nothing queued. A peer's acknowledged `$share` delivery asks this, because
     /// "delivered to nobody" is not something it may answer `Stored` for
     /// (ADR 0087).
@@ -697,6 +698,15 @@ impl Hub {
                 if let Some(m) = &self.metrics {
                     m.publish_delivered(qos_num(qos));
                 }
+            } else if qos != QoS::AtMostOnce {
+                // A `QoS` > 0 message is only ever NOT handed over here because the
+                // connection has already ended: its task is gone and its `Detach` is
+                // still queued behind the commands ahead of it, so `online` had not
+                // caught up (`send_to_client` has just reaped it). There is no
+                // session to queue for on this branch, so nobody took the message —
+                // the same outcome as the fall-through below, a moment early, and
+                // the likelier way for a consumer to be gone when the hub is busy.
+                *absent = true;
             }
             return DurableOutcome::Ok;
         }

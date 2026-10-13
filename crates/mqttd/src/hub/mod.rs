@@ -1614,6 +1614,13 @@ pub enum HubCommand {
     RemoteInterest {
         /// The announcing node.
         node: NodeId,
+        /// The link the snapshot arrived on ([`PeerConnected`](Self::PeerConnected)'s
+        /// `conn_id`). A snapshot from a link that has since been REPLACED is
+        /// dropped: the first snapshot on a link is what opens it for forwards
+        /// (ADR 0087), and one left over from the link before must not do that.
+        /// `None` — a caller that is not a link — is taken as the node's current
+        /// link.
+        conn_id: Option<u64>,
         /// Every topic filter with subscribers on that node.
         filters: Vec<String>,
     },
@@ -1622,6 +1629,9 @@ pub enum HubCommand {
     RemoteSharedInterest {
         /// The announcing node.
         node: NodeId,
+        /// The link the snapshot arrived on; as for
+        /// [`RemoteInterest`](Self::RemoteInterest).
+        conn_id: Option<u64>,
         /// That node's shared groups with members.
         groups: Vec<RemoteSharedGroup>,
     },
@@ -2091,7 +2101,7 @@ struct Misplaced {
 }
 
 /// A connected peer node's link.
-// Five independent facts about one link — what its far end asked for, what it has
+// Four independent facts about one link — what its far end asked for, what it has
 // said on it, and what may be sent on it. They do not form a state machine: a link
 // can be open for forwards before or after the peer has announced.
 #[allow(clippy::struct_excessive_bools)]
@@ -2140,12 +2150,14 @@ struct Peer {
     shared_synced: bool,
     /// Whether ordinary forwards are being sent on this link: the peer has
     /// announced on it ([`interest_synced`](Self::interest_synced)), or it stayed
-    /// silent for a tick with a forward overdue and was sent everything it was owed
+    /// silent for a sweep interval and was then sent everything it was owed
     /// ([`Hub::sweep_pending_forwards`]). Either way everything recorded before has
     /// gone out, oldest first, so what is registered from here on is sent at once.
+    /// (`$share` deliveries have no such second way in: they wait for
+    /// [`shared_synced`](Self::shared_synced).)
     forwards_open: bool,
-    /// The same for `$share` deliveries, and the peer's membership snapshot.
-    shared_open: bool,
+    /// When this link formed: what "silent for a sweep interval" is measured from.
+    linked_at: Instant,
 }
 
 /// One subscription a client holds: its filter and everything MQTT 5 attaches to
@@ -4102,11 +4114,23 @@ impl Hub {
             HubCommand::RemoteMessageEvents { node, wanted } => {
                 self.remote_message_events(&node, wanted);
             }
-            HubCommand::RemoteInterest { node, filters } => {
-                self.peer_announced_interest(&node, filters);
+            HubCommand::RemoteInterest {
+                node,
+                conn_id,
+                filters,
+            } => {
+                if !self.arrived_on_a_replaced_link(&node, conn_id) {
+                    self.peer_announced_interest(&node, filters);
+                }
             }
-            HubCommand::RemoteSharedInterest { node, groups } => {
-                self.peer_announced_shared(&node, groups);
+            HubCommand::RemoteSharedInterest {
+                node,
+                conn_id,
+                groups,
+            } => {
+                if !self.arrived_on_a_replaced_link(&node, conn_id) {
+                    self.peer_announced_shared(&node, groups);
+                }
             }
             HubCommand::RemoteRetainedSnapshot { node, messages } => {
                 self.apply_retained_snapshot(&node, messages).await;
@@ -7696,7 +7720,7 @@ impl Hub {
                 interest_synced: false,
                 shared_synced: false,
                 forwards_open: false,
-                shared_open: false,
+                linked_at: Instant::now(),
                 proto,
                 wants_origin: false,
             },
@@ -7838,6 +7862,16 @@ impl Hub {
         }
     }
 
+    /// Whether a snapshot that arrived on link `conn_id` is left over from a link
+    /// `node` has since replaced. One from a link that is simply gone — the node
+    /// has none now — is still the last thing the node said, and is kept.
+    fn arrived_on_a_replaced_link(&self, node: &NodeId, conn_id: Option<u64>) -> bool {
+        match (conn_id, self.peers.get(node)) {
+            (Some(arrived_on), Some(current)) => current.conn_id != arrived_on,
+            _ => false,
+        }
+    }
+
     /// A peer's interest snapshot arrived ([`PeerMessage::Interest`]).
     fn peer_announced_interest(&mut self, node: &NodeId, filters: Vec<String>) {
         debug!(node = %node.0, filters = filters.len(), "remote interest updated");
@@ -7846,13 +7880,9 @@ impl Hub {
         // `mesh_settled`, and a scan can settle held publishes against
         // its (possibly new) interest.
         let mut synced_now = false;
-        // Whether the link still has to be opened for forwards: not if the sweep
-        // already sent the peer everything it was owed, after a tick of silence.
-        let mut open_now = false;
         if let Some(peer) = self.peers.get_mut(node) {
             if !peer.interest_synced {
                 peer.interest_synced = true;
-                open_now = !std::mem::replace(&mut peer.forwards_open, true);
                 synced_now = true;
                 if !self.pending_publishes.is_empty() {
                     self.takeover_reconcile_ticks = self.takeover_reconcile_ticks.max(2);
@@ -7880,8 +7910,54 @@ impl Hub {
         // they were published. (If the peer stayed silent for a tick, the sweep
         // has opened the link already, with the same oldest-first flush, and there
         // is nothing left to send here.)
-        if open_now {
-            self.send_owed_to(node, false);
+        //
+        // What this node HOLDS but does not yet owe the peer belongs in the same
+        // flush: a publish kept for the settle pass because it matched nobody
+        // when it was made — the peer's subscriber subscribed during the outage,
+        // or the peer's interest had been erased with its hold — is re-routed to
+        // whoever announces the interest, and the settle pass did that up to a
+        // tick later, behind everything published in between. So it becomes an
+        // obligation here, before the link opens, and goes out in its place.
+        if synced_now {
+            self.reroute_held_to(node);
+            // Not if the sweep already sent the peer everything it was owed.
+            let open_now = self
+                .peers
+                .get_mut(node)
+                .is_some_and(|peer| !std::mem::replace(&mut peer.forwards_open, true));
+            if open_now {
+                self.send_owed_to(node, false);
+            }
+        }
+    }
+
+    /// Re-route to `node` every held publish it has just announced interest in and
+    /// has not been sent: the settle pass's re-route
+    /// ([`settle_pending_publishes`](Self::settle_pending_publishes)), for one peer,
+    /// at the moment it announces. With the link not yet open the forwards are
+    /// recorded, and the flush that follows sends them among the rest in publish
+    /// order. Walks the pending table once; an entry outside the settle pass's work
+    /// set costs three field reads.
+    fn reroute_held_to(&mut self, node: &NodeId) {
+        let unreachable = self.unreachable_peers();
+        let held: Vec<u64> = self
+            .pending_publishes
+            .iter()
+            .filter(|(_, p)| {
+                (p.awaiting_settle
+                    || p.reroute_grace.is_some()
+                    || forwarding::owes_ordinary_to(p, &unreachable))
+                    && !p.acked_nodes.iter().any(|a| a == node)
+                    && !p.awaiting.values().any(|o| &o.node == node)
+                    && self.interest.nodes_matching(&p.topic).contains(node)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in held {
+            if let Some(p) = self.pending_publishes.get_mut(id) {
+                p.reroute_grace = None;
+            }
+            self.reroute(id, vec![node.clone()]);
         }
     }
 
@@ -7903,8 +7979,10 @@ impl Hub {
     ///    member here, if the group has one — the same consumer, reconnected
     ///    through this peer;
     /// 3. everything now owed to this peer's members goes out, oldest publish
-    ///    first — unless the sweep already sent it all, after a tick of silence
-    ///    from a peer that can refuse a delivery for a missing member.
+    ///    first. No `$share` delivery was sent on this link before: unlike an
+    ///    ordinary forward, one is never sent to a peer that has not announced,
+    ///    however long it stays silent — a peer that cannot yet say who is on it
+    ///    could only answer `Failed`, and its snapshot comes within ten ticks.
     ///
     /// [`REFUSAL_SHARED_MEMBER_GONE`]: mqtt_cluster::peer::REFUSAL_SHARED_MEMBER_GONE
     fn peer_announced_shared(&mut self, node: &NodeId, groups: Vec<RemoteSharedGroup>) {
@@ -7917,14 +7995,10 @@ impl Hub {
         }
         self.replace_shared_owed_to_absent_members(node);
         self.move_shared_from_unreachable();
-        let mut open_now = false;
         if let Some(peer) = self.peers.get_mut(node) {
             peer.shared_synced = true;
-            open_now = !std::mem::replace(&mut peer.shared_open, true);
         }
-        if open_now {
-            self.send_owed_to(node, true);
-        }
+        self.send_owed_to(node, true);
     }
 
     /// Place again every `$share` delivery owed to a member of `node` that its
@@ -7932,9 +8006,8 @@ impl Hub {
     /// The pending table is walked once; the snapshot is indexed only if a delivery
     /// is owed to the node at all.
     ///
-    /// A delivery that was WRITTEN TO A LINK — in flight when the old link went, or
-    /// sent on this one by the sweep before the snapshot came — is left for the peer
-    /// to answer, when the peer can: it may have taken the message before the member
+    /// A delivery that was WRITTEN TO A LINK — in flight when the old link went — is
+    /// left for the peer to answer, when the peer can: it may have taken the message before the member
     /// left, and then it answers the repeat from its window; if it did not, it says
     /// the member is gone. Placing it again here could hand a second member a
     /// message the first one got (at `QoS` 2 too), which is what
@@ -9792,6 +9865,7 @@ mod tests {
     fn remote_interest(tx: &HubTx, node: &str, filters: &[&str]) {
         tx.send(HubCommand::RemoteInterest {
             node: NodeId(node.into()),
+            conn_id: None,
             filters: filters.iter().map(|f| (*f).to_string()).collect(),
         })
         .unwrap();
@@ -9815,6 +9889,7 @@ mod tests {
     ) {
         tx.send(HubCommand::RemoteSharedInterest {
             node: NodeId(node.into()),
+            conn_id: None,
             groups: vec![RemoteSharedGroup {
                 group: group.into(),
                 filter: filter.into(),
@@ -9839,6 +9914,7 @@ mod tests {
     ) {
         tx.send(HubCommand::RemoteSharedInterest {
             node: NodeId(node.into()),
+            conn_id: None,
             groups: vec![RemoteSharedGroup {
                 group: group.into(),
                 filter: filter.into(),
@@ -17999,6 +18075,7 @@ mod tests {
     fn peer_gossips_interest(tx: &HubTx, node: &NodeId, filters: &[&str]) {
         tx.send(HubCommand::RemoteInterest {
             node: node.clone(),
+            conn_id: None,
             filters: filters.iter().map(|f| (*f).to_string()).collect(),
         })
         .unwrap();

@@ -1052,8 +1052,8 @@ impl Hub {
     /// outage (ADR 0087; [MQTT-4.6.0-6] for a non-shared subscription).
     ///
     /// Called when the peer's first interest snapshot (ordinary) and first `$share`
-    /// snapshot (shared) arrive on a new link, and by the sweep for a linked peer
-    /// that has not announced within a tick
+    /// snapshot (shared) arrive on a new link, and by the sweep — ordinary forwards
+    /// only — for a peer that has stayed silent on a link a sweep interval old
     /// ([`sweep_pending_forwards`](Self::sweep_pending_forwards)).
     pub(super) fn send_owed_to(&mut self, node: &NodeId, shared: bool) {
         let Some(peer) = self.peers.get(node) else {
@@ -1145,8 +1145,9 @@ impl Hub {
     ///
     /// And only when the link is OPEN for that kind of forward: the peer has
     /// announced on it — its interest snapshot for an ordinary forward, its `$share`
-    /// snapshot for a shared delivery — or the sweep has sent it everything it was
-    /// owed after a tick of silence (ADR 0087). A link that has just come back
+    /// snapshot for a shared delivery — or, for ordinary forwards only, the sweep
+    /// has sent it everything it was owed after a sweep interval of silence
+    /// (ADR 0087). A link that has just come back
     /// still has everything recorded during the outage to carry, and that goes
     /// out, oldest first, when the peer announces
     /// ([`send_owed_to`](Self::send_owed_to)); a forward registered in the instant
@@ -1163,7 +1164,7 @@ impl Hub {
         };
         let ready = self.peers.get(&obligation.node).filter(|peer| {
             if matches!(obligation.kind, ForwardKind::Shared { .. }) {
-                peer.shared_open
+                peer.shared_synced
             } else {
                 peer.forwards_open
             }
@@ -1732,9 +1733,9 @@ impl Hub {
                     .then_some((*id, overdue))
             })
             .collect();
-        // Linked peers that have not announced on their link and are owed an
-        // overdue forward: `(node, shared)`, each at most once. See below.
-        let mut unannounced: Vec<(NodeId, bool)> = Vec::new();
+        // Linked peers that have not announced on their link, have been linked for
+        // a sweep interval, and are owed an overdue forward. See below.
+        let mut silent: Vec<NodeId> = Vec::new();
         for (id, overdue) in ids {
             // Retransmit overdue forwards over live links.
             let outstanding: Vec<(u64, ForwardObligation)> = self
@@ -1749,34 +1750,34 @@ impl Hub {
                 };
                 // A linked peer that has not announced on this link has been sent
                 // nothing on it ([`register_forward`](Self::register_forward)).
-                // An overdue forward still goes to it, as it always has — a peer
-                // that restarted and cannot yet say what it routes answers with a
-                // failure, and the publisher retries rather than waiting on it —
-                // but never one forward ahead of the older ones recorded beside
-                // it: EVERYTHING of that kind owed to the peer goes, oldest first,
-                // after this pass — once: the link is then open for that kind, what
-                // is registered later is sent as it is registered, and the sweep
-                // retransmits on it as on any other.
                 //
-                // The exception is a `$share` delivery for a peer that cannot say
-                // "that member is not here" (below proto 13): it would answer
-                // `Stored` for a consumer that left during the outage, so the
-                // delivery waits for its membership snapshot, which such a peer
-                // sends within ten ticks of starting at the latest.
-                let shared = matches!(obligation.kind, ForwardKind::Shared { .. });
-                let open = if shared {
-                    peer.shared_open
-                } else {
-                    peer.forwards_open
-                };
-                if !open {
-                    let may_go =
-                        !shared || peer.proto >= mqtt_cluster::peer::PROTO_SHARED_MEMBER_GONE;
-                    let noted = unannounced
-                        .iter()
-                        .any(|(n, s)| *s == shared && n == &obligation.node);
-                    if may_go && !noted {
-                        unannounced.push((obligation.node.clone(), shared));
+                // A `$share` delivery waits for its membership snapshot, however
+                // long: only that says whether the named member is still there, and
+                // a peer that has not sent it cannot yet say who is on it — it
+                // could only answer `Failed`, withholding an acknowledgement that
+                // the snapshot would have let this node place again. Every build
+                // sends it within ten ticks of starting.
+                //
+                // An ORDINARY forward still goes to a peer that stays silent, as it
+                // always has — a peer that restarted and cannot yet say what it
+                // routes answers with a failure, and the publisher retries rather
+                // than waiting on it — but only once the LINK has been there for a
+                // sweep interval (what was held across the outage is overdue the
+                // moment the link forms, and the snapshot is the first thing a
+                // peer says on it), and never one forward ahead of the older ones
+                // recorded beside it: EVERYTHING owed to the peer goes, oldest
+                // first, after this pass — once: the link is then open, what is
+                // registered later is sent as it is registered, and the sweep
+                // retransmits on it as on any other.
+                if matches!(obligation.kind, ForwardKind::Shared { .. }) {
+                    if !peer.shared_synced {
+                        continue;
+                    }
+                } else if !peer.forwards_open {
+                    if now.duration_since(peer.linked_at) >= super::SESSION_SWEEP_INTERVAL
+                        && !silent.contains(&obligation.node)
+                    {
+                        silent.push(obligation.node.clone());
                     }
                     continue;
                 }
@@ -1871,14 +1872,10 @@ impl Hub {
             }
             self.try_complete_pending(id);
         }
-        for (node, shared) in unannounced {
-            self.send_owed_to(&node, shared);
+        for node in silent {
+            self.send_owed_to(&node, false);
             if let Some(peer) = self.peers.get_mut(&node) {
-                if shared {
-                    peer.shared_open = true;
-                } else {
-                    peer.forwards_open = true;
-                }
+                peer.forwards_open = true;
             }
         }
     }
@@ -1886,7 +1883,7 @@ impl Hub {
 
 /// Whether pending publish `p` has an ordinary forward outstanding toward one of
 /// `peers`. With no such peers — the steady state — it reads nothing of `p`.
-fn owes_ordinary_to(p: &PendingPublish, peers: &[NodeId]) -> bool {
+pub(super) fn owes_ordinary_to(p: &PendingPublish, peers: &[NodeId]) -> bool {
     !peers.is_empty()
         && p.awaiting
             .values()
@@ -2385,7 +2382,6 @@ mod zone_fwd_proofs {
         peer.interest_synced = true;
         peer.shared_synced = true;
         peer.forwards_open = true;
-        peer.shared_open = true;
     }
 
     fn fan_out(hub: &mut Hub, topic: &str, qos: QoS, retain: bool, gate: Option<u64>) {

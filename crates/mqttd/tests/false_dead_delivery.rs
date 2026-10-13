@@ -150,6 +150,15 @@ struct Node {
 ///
 /// One link per pair, dialed by the smaller node id — so the relay of the larger of
 /// two ids carries exactly the links dialed by smaller ones.
+///
+/// The relay also makes one instant of a link's life wide enough to test. A node
+/// registers a link when the handshake's `Hello` has crossed, and the first thing
+/// its peer says on it — its interest, then its `$share` members — arrives a
+/// fraction of a millisecond later. What a node does with a publish IN BETWEEN is
+/// what the ordering episodes are about (ADR 0087: it must go out behind everything
+/// held for the peer), and at that width they would meet the instant only by luck.
+/// So the relay passes each side's `Hello` at once and holds what follows it for
+/// [`ANNOUNCEMENT_DELAY`], once per connection, in both directions.
 async fn relay_peer_links(to: SocketAddr) -> (String, watch::Sender<bool>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
@@ -169,14 +178,55 @@ async fn relay_peer_links(to: SocketAddr) -> (String, watch::Sender<bool>) {
                 };
                 let _ = dialer.set_nodelay(true);
                 let _ = listener_side.set_nodelay(true);
+                let (from_dialer, to_dialer) = dialer.split();
+                let (from_listener, to_listener) = listener_side.split();
+                // Either direction ending ends the link, as a closed socket does.
                 tokio::select! {
-                    _ = tokio::io::copy_bidirectional(&mut dialer, &mut listener_side) => {}
+                    () = relay_one_way(from_dialer, to_listener) => {}
+                    () = relay_one_way(from_listener, to_dialer) => {}
                     _ = carried.wait_for(|carried| !*carried) => {}
                 }
             });
         }
     });
     (addr, carried_tx)
+}
+
+/// How long the relay holds what a node says after its `Hello`: ten of the numbered
+/// streams' publishes, on every stream, between a link's return and the peer's
+/// first announcement on it.
+const ANNOUNCEMENT_DELAY: Duration = Duration::from_millis(100);
+
+/// One direction of a relayed peer link: the first frame — the `Hello`, a four-byte
+/// big-endian length and its body — at once, everything after it
+/// [`ANNOUNCEMENT_DELAY`] late.
+async fn relay_one_way(
+    mut from: tokio::net::tcp::ReadHalf<'_>,
+    mut to: tokio::net::tcp::WriteHalf<'_>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut len = [0u8; 4];
+    if from.read_exact(&mut len).await.is_err() {
+        return;
+    }
+    let mut hello = vec![0u8; u32::from_be_bytes(len) as usize];
+    assert!(
+        hello.len() < 64 * 1024,
+        "the first frame of a link is a Hello"
+    );
+    if from.read_exact(&mut hello).await.is_err()
+        || to.write_all(&len).await.is_err()
+        || to.write_all(&hello).await.is_err()
+    {
+        return;
+    }
+    // SETTLE(peer-announcement-held-back): not a wait for a state — the delay IS the
+    // stimulus. It widens the instant between a link forming and the peer's first
+    // announcement on it, which is where a publish overtook what was held; nothing
+    // observable marks that instant from outside the two hubs.
+    tokio::time::sleep(ANNOUNCEMENT_DELAY).await;
+    let _ = tokio::io::copy(&mut from, &mut to).await;
+    let _ = to.shutdown().await;
 }
 
 // The node assembly mirrors production wiring end to end, as `durable_sessions.rs` does.
@@ -2153,6 +2203,14 @@ impl Stream {
              pairs the wrong way round (or twice): {out_of_order:?}. Received: {:?}",
             self.received
         );
+        // Exactly once, at `QoS` 1 too. That is stricter than MQTT, which allows a
+        // `QoS` 1 duplicate, and it is deliberate: nothing in these episodes may
+        // produce one. The publishers never retry; a forward the origin sends
+        // again when the link is back carries the seq it was recorded with, and the
+        // receiving node recognises it in its window of that origin's recent
+        // forwards (16,384 of them — these streams hold a few hundred) and answers
+        // it again instead of applying it again; and no `$share` delivery here has
+        // a second member to move to. A duplicate would mean one of those failed.
         let expected: Vec<u64> = (0..self.sent.len() as u64).collect();
         assert_eq!(
             self.received, expected,
