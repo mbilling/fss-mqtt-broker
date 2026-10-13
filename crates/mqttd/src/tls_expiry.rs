@@ -382,6 +382,8 @@ pub fn describe(kind: Kind, deciding: &Deciding, warn_permille: u16, now: i64) -
     let threshold = threshold_percent(warn_permille);
     match (status(window, warn_permille, now), kind) {
         (Status::Healthy, _) => None,
+        // A revocation list dated ahead is not refused for it; only a certificate is.
+        (Status::NotYetValid, Kind::Crl) => None,
         (Status::NotYetValid, _) => Some(format!(
             "{what} is not valid yet: its validity begins in {}",
             span(window.not_before.saturating_sub(now))
@@ -600,7 +602,7 @@ pub async fn run(expiry: Arc<TlsExpiry>, shutdown: tokio_util::sync::Cancellatio
 }
 
 /// What `--check-config` says about the TLS material `config` would load, at `now`: the
-/// threshold, then one line for each file past it or expired. Empty when the config loads
+/// threshold, then one line for each file past it, expired or not valid yet. Empty when the config loads
 /// none. A file that cannot be read here is passed over: the check runs where configs are
 /// written, which need not hold the files (`--preflight` is what opens them).
 #[must_use]

@@ -134,8 +134,8 @@ one warning while the new Secret travels to the pod. Set `renewBefore` above a t
 `duration` (for a 24-hour certificate, `10h` rather than the default `8h`) and a healthy
 cluster is silent. The alert waits five minutes for the same reason; the log does not. `mqttd --check-tls` and
 `mqttd --check-config` judge against the same value and print it; `--check-config` adds a
-`warning:` line for each file on the host that is past it or expired, and its exit status
-is unchanged (the configuration is valid).
+`warning:` line for each file on the host that is past it, expired or not valid yet, and
+its exit status is unchanged (the configuration is valid).
 
 **The alerts** (chart `PrometheusRule`, [runbook](#alert-tls-material-nearing-expiry)):
 `MqttdTlsExpiryWarning` when a series has been past the node's threshold for five minutes,
