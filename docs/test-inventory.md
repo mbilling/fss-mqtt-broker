@@ -1411,6 +1411,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 ## `crates/mqttd/src/lib.rs` — 759 test(s)
 ## `crates/mqttd/src/lib.rs` — 761 test(s)
+## `crates/mqttd/src/lib.rs` — 763 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1651,6 +1652,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::zone_fwd_proofs::a_qos0_publish_nobody_wants_does_not_walk_the_peer_map`
 - `hub::forwarding::zone_fwd_proofs::a_reached_answer_is_downgraded_for_an_older_peer`
 - `hub::forwarding::zone_fwd_proofs::a_reached_forward_releases_a_held_ack_and_a_stored_one_does_not`
+- `hub::forwarding::zone_fwd_proofs::a_session_that_materialises_here_discharges_what_the_unreachable_peer_was_owed`
+- `hub::forwarding::zone_fwd_proofs::a_share_delivery_does_not_move_from_one_unreachable_member_to_another`
 - `hub::forwarding::zone_fwd_proofs::a_share_delivery_in_flight_at_a_verdict_moves_to_a_reachable_member_or_stays_owed`
 - `hub::forwarding::zone_fwd_proofs::a_share_delivery_owed_to_a_dead_node_moves_to_a_new_member_or_ends_with_the_hold`
 - `hub::forwarding::zone_fwd_proofs::a_share_group_keeps_its_members_across_a_lost_link_and_a_verdict`

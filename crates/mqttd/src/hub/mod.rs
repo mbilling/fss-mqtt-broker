@@ -2839,6 +2839,16 @@ enum VerdictHold {
     /// before this node answered its publisher — so a node that really is dead holds
     /// a publisher no longer than it did when the verdict erased at once.
     ///
+    /// The count is of ticks WITHOUT A LINK since the peer last had one, not of
+    /// ticks since the verdict: every link the peer establishes is evidence, later
+    /// than the verdict, that it is there, and the count starts again when that
+    /// link goes. A peer held dead whose link keeps forming and dropping before it
+    /// answers is therefore held for as long as it does that — it is alive — and
+    /// what bounds its publishers then is the pending table. A node that really
+    /// died completes no handshake, and is held once. A verdict withdrawn while the
+    /// peer has no link ends the count as well: the peer is a member again, and a
+    /// member's lost link holds until it returns or a new verdict falls.
+    ///
     /// **For 0087-T3:** this countdown stands in for the confirmation that a peer is
     /// gone (ADR 0087 D2, open sub-decision O1). When membership raises that as an
     /// event, the event ends the hold and the countdown goes.
@@ -4071,10 +4081,12 @@ impl Hub {
                 // this node already owes it goes out now, under the seqs it was
                 // given when it was recorded, rather than at the sweep that next
                 // finds it overdue — a publisher held for a peer that was out of
-                // reach is held no longer than the peer was (ADR 0087 D1). Not at
-                // link-up: a peer that has just restarted answers a forward it
-                // cannot place with a failure until its own view is settled, and
-                // it does not announce before then.
+                // reach is held no longer than the peer was (ADR 0087 D1). The
+                // snapshot is the trigger because it is the first thing the peer
+                // says; it is not a gate. The sweep still retransmits an overdue
+                // forward on any link, announced on or not, as it always has — so
+                // a peer that has just restarted and not yet announced can still
+                // be sent one, and answer it with a failure, a tick later.
                 if synced_now {
                     self.send_owed_to(&node);
                 }
@@ -7742,8 +7754,8 @@ impl Hub {
     ///   unreachable peer was owed ([`reroute`](Self::reroute)): the durable
     ///   takeover path, unchanged;
     /// - **a `$share` delivery finds another member** — re-selected at once when the
-    ///   group has one on another node, and at any later tick of the hold at which
-    ///   one has appeared;
+    ///   group has one that can take it now, and at any later tick of the hold at
+    ///   which one has appeared;
     /// - **the hold runs out** ([`VerdictHold::Unreachable`]) and the peer's state is
     ///   erased as it used to be at the verdict ([`erase_peer`](Self::erase_peer)).
     fn peer_dead(&mut self, node: &NodeId) {
@@ -7786,12 +7798,12 @@ impl Hub {
     }
 
     /// A SHARED obligation names one member on one node (0041-T12). When that node
-    /// is declared dead and the group has a member on another node, the delivery
-    /// re-selects at once — the rebalance a refusal triggers, and what keeps a group
-    /// spread over several nodes from pausing at all. When it has none, the
-    /// obligation stays where it is: the member is unreachable, not gone. Run again
-    /// at every tick of the node's hold, it moves the delivery to a member that has
-    /// appeared on another node since.
+    /// is declared dead and the group has a member that can take the delivery now —
+    /// on this node, or on a node with a link — the delivery re-selects at once: the
+    /// rebalance a refusal triggers, and what keeps a group spread over several
+    /// nodes from pausing at all. When it has none, the obligation stays where it
+    /// is: the member is unreachable, not gone. Run again at every tick of the
+    /// node's hold, it moves the delivery to such a member that has appeared since.
     fn reselect_shared_away_from(&mut self, node: &NodeId) {
         let mut movable: Vec<(u64, u64)> = Vec::new();
         let mut elsewhere_by_group: HashMap<SharedKey, Vec<(Option<NodeId>, ClientId)>> =
@@ -7804,14 +7816,22 @@ impl Hub {
                 if &o.node != node {
                     continue;
                 }
-                // The members of each group that are not on `node`, resolved once
-                // per pass: a hold can have the whole pending table owed to one
-                // group, and a group can be large.
+                // The members of each group that can take the delivery NOW — on
+                // this node, or on a node with a link — resolved once per pass: a
+                // hold can have the whole pending table owed to one group, and a
+                // group can be large. A member on another node that cannot be
+                // reached either is not somewhere to move to: the delivery would
+                // leave a peer that may return for one that may not, and the peer
+                // it left is never tried again.
                 if !elsewhere_by_group.contains_key(key) {
                     for (group, members) in self.shared_candidates(&p.topic) {
                         let elsewhere: Vec<(Option<NodeId>, ClientId)> = members
                             .into_iter()
-                            .filter(|c| c.node.as_ref() != Some(node))
+                            .filter(|c| {
+                                c.node
+                                    .as_ref()
+                                    .is_none_or(|home| self.peers.contains_key(home))
+                            })
                             .map(|c| (c.node, c.client))
                             .collect();
                         elsewhere_by_group.insert(group, elsewhere);
@@ -7906,7 +7926,10 @@ impl Hub {
         // for a group nobody is in any more is acknowledged, like a publish nobody
         // subscribes to. (When the verdict erased at once, one in flight at that
         // instant was withheld from its publisher and one made a moment later was
-        // acknowledged at once; the hold has made them the same case.)
+        // acknowledged at once; the hold has made them the same case.) And like an
+        // ordinary obligation it is acknowledged only on a whole mesh: while a
+        // member this node holds alive has no link, the last tick of the grace
+        // holds — that peer may have a member of the group this node cannot see.
         let mut gone_seqs: Vec<u64> = Vec::new();
         for (_, p) in self.pending_publishes.iter_mut() {
             let seqs: Vec<u64> = p

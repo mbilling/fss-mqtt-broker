@@ -275,20 +275,32 @@ protocol, forward window and every obligation toward it. `peer_disconnected` kee
   the peer's answer discharges what it is owed. T3 replaces the countdown and that
   resolution with D2's; until it does, a peer that is alive and out of reach for longer
   than the hold — a real partition — is still acknowledged for, undelivered, after it.
+  The 8 ticks are counted *without a link since the peer last had one*, not since the
+  verdict: a peer held dead whose link keeps forming and dropping before it answers is
+  alive, and is held for as long as it does that, with the pending table as the bound
+  on its publishers. A verdict withdrawn while the peer still has no link ends the
+  count too — the peer is then a member whose link is down, held until the link returns
+  or a new verdict falls (today's rule for a lost link, now reachable from a verdict).
 - *The successor.* A peer that newly announces matching interest is sent the publish as
   a re-route, and that forward stands in for what the unreachable peer was owed — today's
   discharge, kept so that a real owner death costs the failover pause and not the hold.
-  It cannot tell a durable session that moved from a clean session that did not (D8), so
-  a clean-session subscriber on a peer falsely held dead still loses a publish for which
-  another node starts announcing the same interest before the peer's link is back. T5.
+  The match is on the topic, not on the subscriber: the hub cannot tell the unreachable
+  peer's session, moved to a new owner, from any other subscription that happens to
+  match (D8). So a subscriber on a peer falsely held dead still loses a publish when any
+  newly matching interest appears before the peer's link is back — on another node (a
+  monitor on `#` reconnecting there) or on this one (a matching session attaching, which
+  the settle pass delivers to and discharges on). The window is the half second the
+  redial takes. T5.
 - *`$share`.* A member behind a lost link or on a peer under a verdict stays in its
   group, marked not reachable: the selector takes any member that can receive now, then a
   local persistent member, then a remote member on a node with a link, and one of these
   only when the group has no other — and then the publish is owed to it and held. A
-  delivery in flight at a verdict re-selects at once when the group has a member on
-  another node, at any later tick of the hold at which one has appeared (the group's
-  consumers reconnecting elsewhere), and stays owed until then (it was withheld from the
-  publisher before). Two things the sentence "all from code that already exists" above did not
+  delivery in flight at a verdict re-selects at once when the group has a member that
+  can take it now — on this node, or on a node with a link — at any later tick of the
+  hold at which one has appeared (the group's consumers reconnecting elsewhere), and
+  stays owed until then (it was withheld from the publisher before). It does not move
+  to a member on another node that cannot be reached either: the member it left is not
+  tried again, so that move could strand it with a peer that never returns. Two things the sentence "all from code that already exists" above did not
   cover: a `$share` delivery to a member with no link was *not* an obligation — the
   frame is chosen by the link's negotiated protocol, which read as the oldest for a peer
   with no link, i.e. fire-and-forget, dropped, the publisher acknowledged — so the hub
@@ -298,8 +310,10 @@ protocol, forward window and every obligation toward it. `peer_disconnected` kee
 - *When a held forward goes out.* The sweep retransmits only a forward that is overdue,
   so one recorded less than a tick before the link returned would wait a further tick.
   What a peer is owed is therefore sent when its first interest snapshot arrives on the
-  new link — not at link-up: a peer that has just restarted answers a forward it cannot
-  place with a failure until its own view is settled, and does not announce before then.
+  new link, the first thing the peer says there. That is a trigger, not a gate: the
+  sweep still retransmits an overdue forward on any link, announced on or not, so a peer
+  that has just restarted can still be sent one before its view is settled and answer
+  it with a failure, as before.
 - *A draining node.* A publish the hub gated itself during the drain has nobody to retry
   it and a deadline: its `$share` delivery does not wait for an unreachable member and
   takes its fallback at the verdict, as before.

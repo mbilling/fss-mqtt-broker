@@ -934,12 +934,17 @@ impl Hub {
     /// its filters, and its answer is the evidence. It is what keeps a real owner
     /// death at the failover pause instead of the whole hold.
     ///
-    /// **For 0087-T5 (D8):** interest does not yet say whether the lease plane owns
-    /// it, so this cannot tell a durable session that moved from a clean session
-    /// that did not, and discharges both. A clean-session subscriber on a peer
-    /// falsely held dead therefore still loses a publish for which another node
-    /// starts announcing the same interest before the peer's link is back. With D8
-    /// the discharge applies to durable interest and to nothing else.
+    /// **For 0087-T5 (D8):** the candidates are matched on the TOPIC, not on the
+    /// subscriber. Interest does not yet say whether the lease plane owns it, so
+    /// this cannot tell the unreachable peer's session, moved to a new owner, from
+    /// any other subscription that happens to match — a monitor on `#` that
+    /// reconnects on another node is a candidate too, and so is a matching session
+    /// that attaches on this node (the settle pass discharges on that as well). A
+    /// subscriber on a peer falsely held dead therefore still loses a publish when
+    /// ANY newly matching interest appears, anywhere, before the peer's link is
+    /// back — half a second, with the dialer of D5. With D8 the discharge applies
+    /// to interest the lease plane owns, announced by its new owner, and to
+    /// nothing else.
     pub(super) fn reroute(&mut self, id: u64, candidates: Vec<NodeId>) {
         if candidates.is_empty() {
             return;
@@ -2791,7 +2796,13 @@ mod zone_fwd_proofs {
     /// interest while the target is held dead is sent the publish as a re-route,
     /// and that forward stands in for what the unreachable peer was owed — so a
     /// real owner death costs its publishers the failover, not the whole hold.
-    /// (0087-T5 narrows this to interest the lease plane owns.)
+    ///
+    /// CHARACTERISATION, for 0087-T5: the "successor" here is any peer whose newly
+    /// announced filter matches the topic. Nothing tells this hub that it took over
+    /// the unreachable peer's subscriber rather than being an unrelated one, so an
+    /// unrelated one discharges the obligation just the same — and if the peer was
+    /// falsely held dead, its subscriber loses the publish. D8 narrows the
+    /// discharge to interest the lease plane owns; this test then needs both kinds.
     #[test]
     fn a_successor_that_announces_the_interest_discharges_what_the_unreachable_peer_was_owed() {
         for at_verdict in [true, false] {
@@ -2835,6 +2846,119 @@ mod zone_fwd_proofs {
                 "at_verdict={at_verdict}: acknowledged on the successor's answer"
             );
         }
+    }
+
+    /// The same discharge, on this node: a matching session that materialises HERE
+    /// during the hold — the takeover scan handing this node the unreachable peer's
+    /// durable session — is delivered to by the settle pass, and that ends what the
+    /// peer was owed. CHARACTERISATION for 0087-T5, as above: any matching session
+    /// that appears here does it, the peer's own or not.
+    #[tokio::test]
+    async fn a_session_that_materialises_here_discharges_what_the_unreachable_peer_was_owed() {
+        let mut h = hub();
+        let dead = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
+        h.peer_dead(&dead.node);
+        let (id, mut rx) = register(&mut h, "t/x");
+        fan_out(&mut h, "t/x", QoS::AtLeastOnce, false, Some(id));
+        h.pending_local_done(id);
+        sweep_tick(&mut h);
+        assert!(
+            rx.try_recv().is_err(),
+            "owed to the unreachable peer, and held"
+        );
+
+        h.inherit_sessions(
+            vec![(
+                ClientId("moved".into()),
+                vec![mqtt_core::Subscription {
+                    filter: "t/x".into(),
+                    max_qos: QoS::AtLeastOnce,
+                    no_local: false,
+                    sub_id: None,
+                }],
+                None,
+            )],
+            true,
+        );
+        assert!(
+            h.pending_publishes
+                .get(id)
+                .is_none_or(|p| p.awaiting.is_empty()),
+            "nothing is owed to the unreachable peer any more"
+        );
+    }
+
+    /// A `$share` delivery owed to an unreachable member does not move to a member
+    /// that cannot be reached either. Both of the group's nodes are held dead; the
+    /// delivery stays with the member it was owed to, that node's link returns and
+    /// it is delivered there — where a move to the other node's member would have
+    /// left it with a peer that never returned, acknowledged when that peer's hold
+    /// ran out, with the member that did return never tried again.
+    #[test]
+    fn a_share_delivery_does_not_move_from_one_unreachable_member_to_another() {
+        let mut h = hub();
+        let group = |member: &str| RemoteSharedGroup {
+            group: "g".into(),
+            filter: "s/#".into(),
+            members: vec![(ClientId(member.into()), QoS::AtLeastOnce, true)],
+        };
+        let b = attach_peer_at(&mut h, "b", PROTO_FORWARD_REACHED, "none");
+        let c = attach_peer_at(&mut h, "c", PROTO_FORWARD_REACHED, "none");
+        h.remote_shared.insert(b.node.clone(), vec![group("m-b")]);
+        h.remote_shared.insert(c.node.clone(), vec![group("m-c")]);
+        h.rebuild_remote_shared_index();
+
+        // In flight to b's member when this node is cut off from both.
+        let (id, mut rx) = register(&mut h, "s/t");
+        let _ = h.deliver_shared(
+            "s/t",
+            &Bytes::from_static(b"x"),
+            QoS::AtLeastOnce,
+            None,
+            &AppProperties::default(),
+            Some(id),
+            false,
+        );
+        h.pending_local_done(id);
+        let owed_to = |h: &Hub| {
+            h.pending_publishes[&id]
+                .awaiting
+                .values()
+                .next()
+                .expect("owed to a member")
+                .node
+                .clone()
+        };
+        assert_eq!(owed_to(&h), b.node, "the rotation starts at b's member");
+        h.peer_dead(&c.node);
+        h.peer_dead(&b.node);
+        sweep_tick(&mut h);
+        sweep_tick(&mut h);
+        assert_eq!(
+            owed_to(&h),
+            b.node,
+            "c's member cannot be reached either: not somewhere to move to"
+        );
+
+        // b returns; c never does, and its hold runs out.
+        let mut b_again = attach_peer_at(&mut h, "b", PROTO_FORWARD_REACHED, "none");
+        h.send_owed_to(&b_again.node);
+        let seq = loop {
+            let frame = b_again.rx.try_recv().expect("sent to b's member");
+            if let PeerMessage::SharedDeliverAcked { seq, client, .. } = frame {
+                assert_eq!(client, "m-b");
+                break seq;
+            }
+        };
+        for _ in 0..REROUTE_GRACE_TICKS {
+            sweep_tick(&mut h);
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "c's hold running out answers nothing that is owed to b"
+        );
+        h.forward_answered(&b_again.node, seq, ForwardVerdict::Stored);
+        assert!(matches!(rx.try_recv(), Ok(PublishOutcome::Accepted)));
     }
 
     /// `$share` membership survives a lost link and a verdict (finding 3 of issue
