@@ -201,17 +201,37 @@ async fn remote_group_index_rebuilds_on_replacement_disconnect_and_death() {
         2,
         "stale link loss must not remove current interest"
     );
+    // The link itself goes. The groups stay (ADR 0087 D1): a member behind a lost
+    // link is unreachable, not gone, and is still the one a publish is owed to when
+    // its group has nobody else.
     hub.dispatch(HubCommand::PeerDisconnected {
         node: NodeId("z".into()),
         conn_id: 7,
     })
     .await;
-    assert!(hub.plan_shared("new/x").is_empty());
+    let behind_the_lost_link = hub.plan_shared("new/x");
+    assert_eq!(behind_the_lost_link.len(), 2);
+    assert!(
+        behind_the_lost_link
+            .iter()
+            .all(|plan| plan.chosen.as_ref().is_some_and(|m| !m.online)),
+        "each group still has its member, marked as not reachable"
+    );
     assert_eq!(hub.plan_shared("keep/x").len(), 1);
+    // A verdict erases nothing either, until its hold has run out with no link.
     hub.dispatch(HubCommand::PeerDead {
         node: NodeId("a".into()),
     })
     .await;
-    assert!(hub.remote_by_filter.is_empty());
+    assert_eq!(hub.plan_shared("keep/x").len(), 1);
+    for _ in 0..crate::hub::REROUTE_GRACE_TICKS {
+        hub.sweep_verdict_holds();
+    }
     assert!(hub.plan_shared("keep/x").is_empty());
+    assert!(!hub.remote_by_filter.contains_key("keep/+"));
+    assert_eq!(
+        hub.plan_shared("new/x").len(),
+        2,
+        "the hold that ran out was the dead node's, not the unlinked member's"
+    );
 }

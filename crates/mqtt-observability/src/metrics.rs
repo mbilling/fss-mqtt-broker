@@ -289,6 +289,7 @@ struct OtelInstruments {
     ingress_credit_bytes: OtelGauge<i64>,
     routing_unsettled: OtelGauge<i64>,
     pending_publishes_awaiting_settle: OtelGauge<i64>,
+    publish_held_for_unreachable: OtelGauge<i64>,
     shared_selected: OtelCounter<u64>,
     append_lane_jobs: OtelGauge<i64>,
     pending_publishes: OtelGauge<i64>,
@@ -401,6 +402,7 @@ impl OtelInstruments {
             pending_publishes_awaiting_settle: meter
                 .i64_gauge("pending_publishes_awaiting_settle")
                 .build(),
+            publish_held_for_unreachable: meter.i64_gauge("publish_held_for_unreachable").build(),
             shared_selected: meter.u64_counter("shared_selected").build(),
             append_lane_jobs: meter.i64_gauge("append_lane_jobs").build(),
             pending_publishes: meter.i64_gauge("pending_publishes").build(),
@@ -543,6 +545,8 @@ pub struct Metrics {
     /// them emitted every scrape so a disappearing series is never read as 0.
     routing_unsettled: Family<ReasonLabel, Gauge>,
     pending_publishes_awaiting_settle: Gauge,
+    /// Gated publishes with a forward owed to a node that has no link.
+    publish_held_for_unreachable: Gauge,
     /// Issue #613 item 3.5: shared selections by locality, incremented exactly
     /// once per DELIVERED message.
     shared_selected_total: Family<LocalityLabel, Counter>,
@@ -908,6 +912,15 @@ impl Metrics {
             "The subset of pending_publishes still held by the settle window \
              (issue #613 item 2.1). Always <= pending_publishes; a persistently \
              high ratio is a routing view that is not converging, not load",
+        );
+        let publish_held_for_unreachable = register_gauge(
+            &mut registry,
+            "publish_held_for_unreachable",
+            "Publishes whose acknowledgement is held for a peer this node cannot \
+             reach: a forward is owed to a node whose link is down, or that \
+             membership holds dead (ADR 0087). A subset of pending_publishes. Above \
+             zero for longer than a link takes to return, a peer is out of reach \
+             and the publishers of what its subscribers are owed are waiting",
         );
         let shared_selected_total = register_family(
             &mut registry,
@@ -1648,6 +1661,7 @@ impl Metrics {
             ingress_credit_bytes,
             routing_unsettled,
             pending_publishes_awaiting_settle,
+            publish_held_for_unreachable,
             shared_selected_total,
             append_lane_jobs,
             pending_publishes,
@@ -2037,6 +2051,16 @@ impl Metrics {
         self.pending_publishes_awaiting_settle.set(clamp_gauge(n));
         self.otel
             .pending_publishes_awaiting_settle
+            .record(clamp_gauge(n), &[]);
+    }
+
+    /// Set how many publishes are held for a peer this node cannot reach: gated
+    /// publishes with a forward owed to a node whose link is down or that
+    /// membership holds dead (ADR 0087 D1, D9). A subset of `pending_publishes`.
+    pub fn set_publish_held_for_unreachable(&self, n: usize) {
+        self.publish_held_for_unreachable.set(clamp_gauge(n));
+        self.otel
+            .publish_held_for_unreachable
             .record(clamp_gauge(n), &[]);
     }
 
@@ -3604,6 +3628,7 @@ mod tests {
         }
         m.set_pending_publishes(40, 4096);
         m.set_pending_publishes_awaiting_settle(3);
+        m.set_publish_held_for_unreachable(2);
         m.shared_selected("local");
         m.shared_selected("local");
         m.shared_selected("remote");
@@ -3654,6 +3679,10 @@ mod tests {
         assert!(out.contains("mqttd_pending_publishes 40"), "{out}");
         assert!(
             out.contains("mqttd_pending_publishes_awaiting_settle 3"),
+            "{out}"
+        );
+        assert!(
+            out.contains("mqttd_publish_held_for_unreachable 2"),
             "{out}"
         );
         assert!(

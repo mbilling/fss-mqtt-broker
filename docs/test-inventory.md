@@ -1409,7 +1409,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 759 test(s)
+## `crates/mqttd/src/lib.rs` — 770 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1642,12 +1642,21 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::pending_bounds::the_entry_cap_evicts_only_the_oldest`
 - `hub::forwarding::pending_bounds::the_reached_record_is_charged_and_released_with_its_entry`
 - `hub::forwarding::pending_bounds::the_sweep_retransmits_only_overdue_forwards`
-- `hub::forwarding::zone_fwd_proofs::a_forward_unanswered_when_its_target_is_declared_dead_is_acked_when_the_grace_runs_out`
+- `hub::forwarding::zone_fwd_proofs::a_forward_unanswered_when_its_target_is_declared_dead_stays_owed_until_the_peer_answers`
+- `hub::forwarding::zone_fwd_proofs::a_hold_at_the_pending_table_bound_evicts_the_oldest_and_withholds_its_ack`
 - `hub::forwarding::zone_fwd_proofs::a_link_under_a_dead_verdict_takes_its_interest_with_it_until_the_verdict_is_withdrawn`
-- `hub::forwarding::zone_fwd_proofs::a_publish_for_a_peer_declared_dead_owes_it_nothing_where_a_link_down_peer_is_owed`
+- `hub::forwarding::zone_fwd_proofs::a_peer_that_stays_dead_holds_its_publishers_no_longer_than_the_grace_did`
+- `hub::forwarding::zone_fwd_proofs::a_publish_for_a_peer_declared_dead_is_owed_to_it_as_it_is_to_a_link_down_peer`
 - `hub::forwarding::zone_fwd_proofs::a_qos0_publish_nobody_wants_does_not_walk_the_peer_map`
 - `hub::forwarding::zone_fwd_proofs::a_reached_answer_is_downgraded_for_an_older_peer`
 - `hub::forwarding::zone_fwd_proofs::a_reached_forward_releases_a_held_ack_and_a_stored_one_does_not`
+- `hub::forwarding::zone_fwd_proofs::a_refused_share_delivery_is_not_moved_to_a_member_that_cannot_be_reached`
+- `hub::forwarding::zone_fwd_proofs::a_session_that_materialises_here_discharges_what_the_unreachable_peer_was_owed`
+- `hub::forwarding::zone_fwd_proofs::a_share_delivery_does_not_move_from_one_unreachable_member_to_another`
+- `hub::forwarding::zone_fwd_proofs::a_share_delivery_in_flight_at_a_verdict_moves_to_a_reachable_member_or_stays_owed`
+- `hub::forwarding::zone_fwd_proofs::a_share_delivery_owed_to_a_dead_node_moves_to_a_new_member_or_ends_with_the_hold`
+- `hub::forwarding::zone_fwd_proofs::a_share_group_keeps_its_members_across_a_lost_link_and_a_verdict`
+- `hub::forwarding::zone_fwd_proofs::a_successor_that_announces_the_interest_discharges_what_the_unreachable_peer_was_owed`
 - `hub::forwarding::zone_fwd_proofs::a_takeover_redelivery_that_reaches_a_session_ends_the_grace_and_the_hold`
 - `hub::forwarding::zone_fwd_proofs::a_takeover_reroute_ends_the_grace`
 - `hub::forwarding::zone_fwd_proofs::after_dead_suspect_alive_a_lost_link_is_a_members_lost_link`
@@ -1697,6 +1706,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_discard_with_an_inflight_append_leaves_no_ghost_queue`
 - `hub::tests::a_discharged_tombstone_is_reaped_after_the_roster_converges`
 - `hub::tests::a_divergent_retained_value_is_detected_and_counted`
+- `hub::tests::a_drain_gated_message_is_not_handed_to_a_member_whose_node_was_declared_dead`
 - `hub::tests::a_dropped_replay_entry_does_not_pin_the_log`
 - `hub::tests::a_failed_durable_append_is_counted_by_reason`
 - `hub::tests::a_failed_local_commit_retries_until_heal_and_keeps_order`
@@ -1822,6 +1832,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::expired_queued_message_is_dropped_at_replay`
 - `hub::tests::flow_control_backlog_is_bounded_drop_oldest`
 - `hub::tests::flush_waits_for_every_publish_sent_before_it`
+- `hub::tests::forward_repeat::a_forward_retransmitted_across_a_dead_verdict_is_applied_once`
 - `hub::tests::forward_repeat::a_re_used_seq_with_new_content_is_applied_and_a_dead_origin_is_forgotten`
 - `hub::tests::forward_repeat::a_repeated_shared_delivery_is_re_answered_not_delivered_twice`
 - `hub::tests::forward_repeat::a_retransmission_after_the_answer_is_re_answered_not_stored_twice`
@@ -2455,14 +2466,15 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `publish_reaches_matching_subscriber`
 - `qos1_publish_is_acked_and_downgraded`
 
-## `crates/mqttd/tests/false_dead_delivery.rs` — 6 test(s)
+## `crates/mqttd/tests/false_dead_delivery.rs` — 7 test(s)
 
 - `durable_a_follower_evictor_dials_and_a_durable_session_is_served`
 - `durable_a_leader_evictor_dials_the_lease_moves_and_sessions_follow_it`
 - `durable_the_evicted_peer_dials_the_link_returns_and_sessions_follow_the_lease`
+- `plain_a_link_cut_with_no_verdict_holds_every_publish_and_delivers_it`
 - `plain_a_verdict_withdrawn_after_two_seconds_finds_the_link_already_back`
-- `plain_the_evicted_peer_dials_the_link_returns_and_only_a_memberless_share_group_loses`
-- `plain_the_evictor_dials_the_link_returns_and_only_a_memberless_share_group_loses`
+- `plain_the_evicted_peer_dials_the_link_returns_and_nothing_is_lost`
+- `plain_the_evictor_dials_the_link_returns_and_nothing_is_lost`
 
 ## `crates/mqttd/tests/http_auth.rs` — 7 test(s)
 

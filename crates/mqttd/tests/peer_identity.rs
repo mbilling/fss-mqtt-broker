@@ -760,8 +760,8 @@ async fn a_dialer_under_a_dead_verdict_refuses_another_nodes_valid_certificate()
         seen.verdicts() == 1
     })
     .await;
-    // The verdict brings the dialer back to the address once more — membership has
-    // spoken of the member — and `node-c` answers again.
+    // The verdict brings the dialer back to the address once more — the member's
+    // standing changed — and `node-c` answers again.
     let before = at_other.links();
     until("the dialer has come back under the verdict", || {
         at_other.links() > before

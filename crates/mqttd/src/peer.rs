@@ -166,14 +166,17 @@ const HELD_DEAD_REDIAL_MAX: Duration = Duration::from_secs(5);
 /// that attempt a returning peer would have to wait out.
 const MEMBER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a dialer stays away from an address where a node other than its member
-/// answered ([`LinkOutcome::WrongNode`]), unless membership speaks first.
+/// answered ([`LinkOutcome::WrongNode`]), unless the member's standing changes first:
+/// a `Dead` verdict lands, or one is withdrawn. (A further `Alive` for a member
+/// already in good standing at this same address changes nothing, and does not end
+/// the wait.)
 ///
 /// The dialer hangs up on that node, but the node cannot know why it was dialed: its
 /// accept path takes the connection for this node's link to IT, registers it — in
 /// place of the real one, which it closes — and only then sees the hang-up. So every
 /// attempt at a member's stale address costs the pair that really lives there one
 /// link flap. An `Alive` that names the member elsewhere replaces this dialer, and
-/// any change of standing ends the wait; this is what bounds the flaps when neither
+/// a change of standing ends the wait; this is what bounds the flaps when neither
 /// comes. (Refusing before the other node registers needs the expected node id in
 /// the `Hello`, which is a wire change — ADR 0087 T5's protocol step is the place.)
 const WRONG_NODE_REDIAL_DELAY: Duration = Duration::from_mins(1);
@@ -479,7 +482,7 @@ pub async fn dial_forever_with_ingress(
 ///   [`DIAL_HANDSHAKE_TIMEOUT`] each — and a connect still under way when
 ///   membership changes its mind about the peer is dropped for a fresh one;
 /// - an address where another node answers is left alone for
-///   [`WRONG_NODE_REDIAL_DELAY`], or until membership speaks;
+///   [`WRONG_NODE_REDIAL_DELAY`], or until the member's standing changes;
 /// - once the peer has been `Dead` with no link for [`DialTarget::held_dead_for`],
 ///   the dialer dials no more. It does not end: it waits for its standing to
 ///   change, and the `Alive` that withdraws the verdict sets it dialing again. (A
@@ -680,7 +683,7 @@ async fn dial(
                                 answered = %answered.0,
                                 "the node answering at a member's routing address is not that \
                                  member; no link (the address has changed hands — the dialer \
-                                 stays away until membership speaks of the member again)"
+                                 stays away for a minute, or until the member's standing changes)"
                             );
                         }
                         Attempt::WrongNode
@@ -698,8 +701,8 @@ async fn dial(
         };
         if attempt == Attempt::WrongNode {
             // Each attempt here flaps the link of the pair that lives at this
-            // address ([`WRONG_NODE_REDIAL_DELAY`]): stay away until membership has
-            // something new to say about the member, or for a long while.
+            // address ([`WRONG_NODE_REDIAL_DELAY`]): stay away until the member's
+            // standing changes (a verdict lands or is withdrawn), or for a minute.
             if let Some(standing) = target.as_mut().map(|t| &mut t.standing) {
                 standing.borrow_and_update();
                 tokio::select! {

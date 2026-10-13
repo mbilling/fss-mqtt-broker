@@ -167,6 +167,13 @@ async fn the_pending_publish_gauges_report_the_ledger_depth() {
         out.contains("mqttd_pending_publishes_awaiting_settle 0"),
         "{out}"
     );
+    // None of the three is held for a peer: this hub knows of none (ADR 0087 D9).
+    // The non-zero case is `false_dead_delivery.rs`, which cuts a real link and
+    // waits for this series on both nodes.
+    assert!(
+        out.contains("mqttd_publish_held_for_unreachable 0"),
+        "{out}"
+    );
 }
 
 /// ADR 0083 (review of PR #871): a message a rule derives from an event or a Will

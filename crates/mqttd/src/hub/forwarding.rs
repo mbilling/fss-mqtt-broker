@@ -281,9 +281,12 @@ pub(super) struct PendingPublish {
     /// retransmit that is not due is still traffic offered to a peer already
     /// behind.)
     pub(super) forwarded_after_ms: u32,
-    /// Engaged when a forward target died: counts down sweep ticks with no
-    /// re-routable remote interest before the obligation is considered moot
-    /// (see [`REROUTE_GRACE_TICKS`]).
+    /// Engaged when a forward's target was erased — held dead, and out of reach
+    /// until its hold ran out ([`Hub::erase_peer`]): the obligation is gone, and
+    /// this counts down the sweep ticks left to find a successor or a session
+    /// materialised here before the publisher is answered. Since ADR 0087 D1 the
+    /// waiting is done while the obligation is still held, so this is armed with
+    /// one tick: the last look.
     pub(super) reroute_grace: Option<u8>,
     /// Every local recipient this publish has already been handed to — by its
     /// original fan-out and by each settle-window re-delivery since — so
@@ -402,7 +405,8 @@ impl PendingPublish {
 /// forwards ARRIVE, so a link outage does not age it: the copies the sender
 /// re-sends when the link returns meet the same window they left. At 16,384
 /// entries it spans several seconds of a heavily loaded origin, at roughly 40 bytes
-/// an entry — about 640 KiB per peer, bounded, and freed when the peer dies.
+/// an entry — about 640 KiB per peer, bounded, and freed when the peer's routing
+/// state is erased (not at a `Dead` verdict: ADR 0087 D6).
 /// A retransmission older than the window is applied again, as before.
 pub(super) const FORWARD_WINDOW: usize = 16_384;
 
@@ -634,10 +638,18 @@ impl Hub {
     /// ack into the void, exhibit ⑥), then re-checks remote
     /// interest via the sweep's re-route path before its ack can release.
     pub(super) fn settle_pending_publishes(&mut self) {
+        // A publish that owes a forward to a peer held dead and out of reach is in
+        // the work set too (ADR 0087 D1): the obligation is kept, and this pass is
+        // where a successor that materialised the subscriber — here, or on another
+        // node — is found, as it was when the verdict discarded the obligation and
+        // armed the grace instead.
+        let unreachable = self.unreachable_peers();
         let held: Vec<u64> = self
             .pending_publishes
             .iter()
-            .filter(|(_, p)| p.awaiting_settle || p.reroute_grace.is_some())
+            .filter(|(_, p)| {
+                p.awaiting_settle || p.reroute_grace.is_some() || owes_ordinary_to(p, &unreachable)
+            })
             .map(|(id, _)| *id)
             .collect();
         // The hold clears only when the whole takeover WINDOW is over: one scan
@@ -681,6 +693,9 @@ impl Hub {
                     // time is: the ack no longer needs the window to close.
                     p.ack_awaits_settle = false;
                 }
+                // The subscriber is here now, so what was owed to the unreachable
+                // peer for it is discharged ([`reroute`](Self::reroute) says why).
+                self.discharge_unreachable(id);
             }
             // The successor may have materialized the subscriber on ANOTHER node
             // and advertised its interest since this publish's original fan-out
@@ -696,9 +711,7 @@ impl Hub {
                     p.reroute_grace = None;
                 }
             }
-            for node in candidates {
-                self.send_acked_forward(id, &node, true);
-            }
+            self.reroute(id, candidates);
             if window_over {
                 if let Some(p) = self.pending_publishes.get_mut(id) {
                     // The window closing ends the replay obligation and, for a
@@ -741,8 +754,10 @@ impl Hub {
         // the sweep retransmits while unanswered. Targets come from the INTEREST
         // map, not the connected-peer map: a link-down (but not dead) peer's
         // subscribers are still owed the publish — the obligation is recorded
-        // now, the frame flows when the link returns (sweep), or re-routes to
-        // the successor when membership confirms death (`peer_dead`).
+        // now, and the frame flows when the link returns. The same holds for a
+        // peer membership holds dead (ADR 0087 D1): a verdict keeps the interest,
+        // so the publish is owed to it too, until it answers, a successor does,
+        // or its hold runs out.
         let gated = gate.is_some() && qos_num(qos) >= 1;
         // ONE trie walk answers both questions below — who must be forwarded to,
         // and whether a given connected peer is interested. This used to be a
@@ -898,6 +913,132 @@ impl Hub {
             .collect()
     }
 
+    /// The peers membership holds `Dead` that have no link and whose routing state
+    /// is still being kept ([`VerdictHold::Unreachable`]). Empty in the steady
+    /// state — and then nothing that takes this list does any work.
+    pub(super) fn unreachable_peers(&self) -> Vec<NodeId> {
+        self.held_dead
+            .iter()
+            .filter(|(_, hold)| matches!(hold, VerdictHold::Unreachable { .. }))
+            .map(|(node, _)| node.clone())
+            .collect()
+    }
+
+    /// Re-route pending publish `id` to `candidates` — peers that announce matching
+    /// interest now and were not sent it before — and let those forwards stand in
+    /// for what the publish still owes, as an ordinary forward, to a peer held dead
+    /// and out of reach.
+    ///
+    /// That discharge is the durable takeover path as it has always worked: the
+    /// subscriber's session moved to the lease's new owner, the new owner announced
+    /// its filters, and its answer is the evidence. It is what keeps a real owner
+    /// death at the failover pause instead of the whole hold.
+    ///
+    /// **For 0087-T5 (D8):** the candidates are matched on the TOPIC, not on the
+    /// subscriber. Interest does not yet say whether the lease plane owns it, so
+    /// this cannot tell the unreachable peer's session, moved to a new owner, from
+    /// any other subscription that happens to match — a monitor on `#` that
+    /// reconnects on another node is a candidate too, and so is a matching session
+    /// that attaches on this node (the settle pass discharges on that as well). A
+    /// subscriber on a peer falsely held dead therefore still loses a publish when
+    /// ANY newly matching interest appears, anywhere, before the peer's link is
+    /// back — half a second, with the dialer of D5. With D8 the discharge applies
+    /// to interest the lease plane owns, announced by its new owner, and to
+    /// nothing else.
+    pub(super) fn reroute(&mut self, id: u64, candidates: Vec<NodeId>) {
+        if candidates.is_empty() {
+            return;
+        }
+        self.discharge_unreachable(id);
+        for node in candidates {
+            self.send_acked_forward(id, &node, true);
+        }
+    }
+
+    /// Drop the ordinary forward obligations pending publish `id` holds toward peers
+    /// held dead and out of reach. See [`reroute`](Self::reroute).
+    pub(super) fn discharge_unreachable(&mut self, id: u64) {
+        let unreachable = self.unreachable_peers();
+        if unreachable.is_empty() {
+            return;
+        }
+        let Some(p) = self.pending_publishes.get_mut(id) else {
+            return;
+        };
+        let seqs: Vec<u64> = p
+            .awaiting
+            .iter()
+            .filter(|(_, o)| {
+                matches!(o.kind, ForwardKind::Ordinary { .. }) && unreachable.contains(&o.node)
+            })
+            .map(|(seq, _)| *seq)
+            .collect();
+        for seq in seqs {
+            p.awaiting.remove(&seq);
+            self.forward_index.remove(&seq);
+        }
+    }
+
+    /// Send every forward this node owes `node` and has not had answered, under the
+    /// seq each was recorded with — so a forward the peer did apply before its link
+    /// went is recognised as a repeat and answered again, not applied again
+    /// (issue #648), and one it never saw is applied once. Called when a peer's
+    /// first interest snapshot arrives on a new link; the sweep's retransmission of
+    /// overdue forwards remains the backstop for every other case.
+    pub(super) fn send_owed_to(&mut self, node: &NodeId) {
+        let Some(peer) = self.peers.get(node) else {
+            return;
+        };
+        for (id, p) in self.pending_publishes.iter_mut() {
+            let mut sent = false;
+            for (seq, obligation) in &p.awaiting {
+                if &obligation.node != node {
+                    continue;
+                }
+                let _ = peer.tx.send(forward_frame(
+                    *id,
+                    p,
+                    *seq,
+                    obligation,
+                    peer.proto,
+                    peer.wants_origin,
+                ));
+                sent = true;
+            }
+            if sent {
+                // Sent now: not overdue at the sweep a moment from now (issue #644).
+                p.forwarded_after_ms =
+                    u32::try_from(p.created_at.elapsed().as_millis()).unwrap_or(u32::MAX);
+            }
+        }
+    }
+
+    /// How many publishes are held for a peer that cannot be reached: gated
+    /// publishes with a forward outstanding toward a node that has no link —
+    /// its link is down, or membership holds it dead (ADR 0087 D1, D9). The
+    /// pending table is walked only when some node this hub knows of has no link.
+    pub(super) fn publishes_held_for_unreachable(&self) -> usize {
+        let unlinked = |node: &NodeId| !self.peers.contains_key(node);
+        if !self.interest.any_node(unlinked) && !self.remote_shared.keys().any(unlinked) {
+            return 0;
+        }
+        self.pending_publishes
+            .values()
+            .filter(|p| p.awaiting.values().any(|o| unlinked(&o.node)))
+            .count()
+    }
+
+    /// Forget the forward seqs of a pending publish that is leaving the table.
+    /// Every seq in the index is a key of its entry's `awaiting` (they are written
+    /// together in [`register_forward`](Self::register_forward)), so this is the
+    /// whole of what the entry has there — without walking the index, which at the
+    /// table's bound is tens of thousands of seqs per evicted entry.
+    fn forget_forwards(&mut self, entry: &PendingPublish) {
+        for seq in entry.awaiting.keys() {
+            self.forward_index.remove(seq);
+        }
+    }
+
     /// Send (or re-send, on re-route) one acked forward of pending publish `id` to
     /// `node`, recording the obligation (ADR 0042 T9, exhibit ⑤). `replay` marks a
     /// takeover re-route (#784).
@@ -986,7 +1127,7 @@ impl Hub {
             let Some((old_id, old)) = self.pending_publishes.pop_first() else {
                 break;
             };
-            self.forward_index.retain(|_, pid| *pid != old_id);
+            self.forget_forwards(&old);
             // Issue #613 item 2.1 makes a second kind of entry possible: one
             // already ANSWERED and kept only for the settle window's replay. The
             // oldest-first policy is unchanged, but dropping such an entry
@@ -1107,20 +1248,29 @@ impl Hub {
         self.try_complete_pending(id);
     }
 
-    /// The peer-bus proto this link negotiated, or
-    /// [`peer::PROTO_MIN`](mqtt_cluster::peer::PROTO_MIN) when there is no link — fail
-    /// safe toward the OLD frame, which every peer can decode (0041-T12).
+    /// The peer-bus proto this link negotiated; with no link, the one the node's
+    /// last link negotiated (kept until the node's routing state is erased); and
+    /// [`peer::PROTO_MIN`](mqtt_cluster::peer::PROTO_MIN) for a node never linked —
+    /// fail safe toward the OLD frame, which every peer can decode (0041-T12).
+    ///
+    /// The middle case is what makes a `$share` delivery to a member behind a lost
+    /// link an obligation (ADR 0087 D1): answering "proto 6" for it chose the
+    /// fire-and-forget frame, which a missing link drops, with the publisher
+    /// acknowledged all the same. Nothing is sent on this answer — a frame is built
+    /// against the live link's own proto when there is a link to send it on.
     pub(super) fn peer_proto(&self, node: &NodeId) -> u32 {
         self.peers
             .get(node)
-            .map_or(mqtt_cluster::peer::PROTO_MIN, |p| p.proto)
+            .map(|p| p.proto)
+            .or_else(|| self.known_peer_protos.get(node).copied())
+            .unwrap_or(mqtt_cluster::peer::PROTO_MIN)
     }
 
     /// Drop a pending publish, WITHHOLDING its acknowledgement (the sender side
     /// of fail-closed: the publisher's connection sees no ack and retries).
     pub(super) fn drop_pending(&mut self, id: u64) {
         if let Some(p) = self.pending_publishes.remove(id) {
-            self.forward_index.retain(|_, pid| *pid != id);
+            self.forget_forwards(&p);
             // Issue #613 item 2.1: this entry may have been answered already and
             // be alive only for the settle window's replay. Dropping it then
             // withholds NOTHING — `send` consumed the sender, so there is no
@@ -1183,7 +1333,7 @@ impl Hub {
         let Some(mut p) = self.pending_publishes.remove(id) else {
             return;
         };
-        self.forward_index.retain(|_, pid| *pid != id);
+        self.forget_forwards(&p);
         // Issue #613 item 2.1. A publish whose ack already released cannot be
         // refused: `Refused` is a claim made TO a publisher, and this one has been
         // told `Accepted` — truthfully, against a fan-out that placed the message.
@@ -1412,11 +1562,12 @@ impl Hub {
     #[allow(clippy::too_many_lines)]
     /// The sweep-tick half of acked forwards (ADR 0042 T9, exhibit ⑤): retransmit
     /// unanswered forwards whose target link is up (same seq — duplicates are
-    /// legal at `QoS` 1), and drive takeover re-routes: a forward whose target
-    /// DIED re-forwards to whichever peers now advertise matching interest (the
-    /// dead owner's successor, once it materializes inherited sessions —
-    /// exhibit ⑥); with no such interest for [`REROUTE_GRACE_TICKS`] ticks the
-    /// obligation is moot (the interest genuinely ended) and the ack releases.
+    /// legal at `QoS` 1), and drive takeover re-routes: a forward whose target is
+    /// held DEAD and out of reach re-forwards to whichever peers now advertise
+    /// matching interest (the dead owner's successor, once it materializes
+    /// inherited sessions — exhibit ⑥). With no such interest for
+    /// [`REROUTE_GRACE_TICKS`] ticks the target's hold runs out, the obligation is
+    /// discharged ([`Hub::erase_peer`]) and the ack releases.
     // Retransmit, downgrade, re-route, grace: one linear sweep pass per pending —
     // splitting it would scatter the obligation lifecycle.
     pub(super) fn sweep_pending_forwards(&mut self) {
@@ -1428,6 +1579,9 @@ impl Hub {
         // table's DEPTH, offered to the peers exactly when they were already
         // behind (issue #633) — or a re-route grace that must count this tick.
         let now = Instant::now();
+        // Peers held dead and out of reach (ADR 0087 D1): empty in the steady state,
+        // and then the test below is one `is_empty` per entry.
+        let unreachable = self.unreachable_peers();
         let ids: Vec<(u64, bool)> = self
             .pending_publishes
             .iter()
@@ -1439,7 +1593,8 @@ impl Hub {
                     p.created_at + Duration::from_millis(u64::from(p.forwarded_after_ms));
                 let overdue = !p.awaiting.is_empty()
                     && now.duration_since(last_forward) >= super::SESSION_SWEEP_INTERVAL;
-                (overdue || p.reroute_grace.is_some()).then_some((*id, overdue))
+                (overdue || p.reroute_grace.is_some() || owes_ordinary_to(p, &unreachable))
+                    .then_some((*id, overdue))
             })
             .collect();
         for (id, overdue) in ids {
@@ -1473,13 +1628,16 @@ impl Hub {
                     peer.wants_origin,
                 ));
             }
-            // Re-route after a target death (grace engaged by peer_dead).
+            // Re-route when a forward's target is held dead and out of reach, or
+            // was (the grace `erase_peer` leaves behind): a peer that announces the
+            // interest now is its successor.
             let Some(p) = self.pending_publishes.get(id) else {
                 continue;
             };
-            let Some(grace) = p.reroute_grace else {
+            let grace = p.reroute_grace;
+            if grace.is_none() && !owes_ordinary_to(p, &unreachable) {
                 continue;
-            };
+            }
             let candidates = self.reroute_candidates(id);
             if !candidates.is_empty() {
                 debug!(
@@ -1490,11 +1648,17 @@ impl Hub {
                 if let Some(p) = self.pending_publishes.get_mut(id) {
                     p.reroute_grace = None;
                 }
-                for node in candidates {
-                    self.send_acked_forward(id, &node, true);
-                }
+                self.reroute(id, candidates);
                 continue;
             }
+            // Nothing to re-route to. A publish that is only OWED waits for its
+            // peer or for the hold to end; one in its grace counts the tick.
+            let Some(grace) = grace else {
+                continue;
+            };
+            let Some(p) = self.pending_publishes.get(id) else {
+                continue;
+            };
             let awaiting_empty = p.awaiting.is_empty();
             if awaiting_empty && grace <= 1 && !self.mesh_whole() {
                 // An alive peer is unreachable: its interest is invisible, so
@@ -1537,6 +1701,15 @@ impl Hub {
             self.try_complete_pending(id);
         }
     }
+}
+
+/// Whether pending publish `p` has an ordinary forward outstanding toward one of
+/// `peers`. With no such peers — the steady state — it reads nothing of `p`.
+fn owes_ordinary_to(p: &PendingPublish, peers: &[NodeId]) -> bool {
+    !peers.is_empty()
+        && p.awaiting
+            .values()
+            .any(|o| matches!(o.kind, ForwardKind::Ordinary { .. }) && peers.contains(&o.node))
 }
 
 /// Inverted interest index: which peer nodes want a given topic.
@@ -1650,6 +1823,11 @@ impl InterestIndex {
     #[cfg(test)]
     pub(super) fn has_node(&self, node: &NodeId) -> bool {
         self.nodes.contains(node)
+    }
+
+    /// Whether any node that has advertised interest satisfies `pred`.
+    pub(super) fn any_node(&self, pred: impl Fn(&NodeId) -> bool) -> bool {
+        self.nodes.iter().any(pred)
     }
 }
 
@@ -2456,21 +2634,35 @@ mod zone_fwd_proofs {
         }
     }
 
-    // ---- issue #973 / ADR 0087: what `PeerDead` does to a gated publish ------
-    //
-    // CHARACTERISATION of today's behaviour, at the hub. ADR 0087 decides that a
-    // peer under a `Dead` verdict keeps its interest (as unreachable) until it is
-    // confirmed gone; when that lands, the `dead` arms below must behave as the
-    // `link down` arms do, and these tests are flipped with it.
+    // ---- issue #973 / ADR 0087 D1: a peer held dead is unreachable, not erased ----
 
-    /// The gap of issue #973 in one hub: the SAME publish toward the SAME peer is an
-    /// obligation that holds the publisher's acknowledgement while the peer's link is
-    /// merely down, and nothing at all once the peer has been declared dead — the
-    /// forward is derived from the interest table, and `peer_dead` empties it. The
-    /// acknowledged-forward path itself is never reached.
+    /// One sweep tick as the hub runs it: the holds first, then the pending table.
+    fn sweep_tick(h: &mut Hub) {
+        h.sweep_verdict_holds();
+        h.sweep_pending_forwards();
+    }
+
+    /// Whether `link` was sent an acked forward since it was last read.
+    fn was_sent_a_forward(link: &mut PeerLink) -> bool {
+        std::iter::from_fn(|| link.rx.try_recv().ok()).any(|frame| {
+            matches!(
+                frame,
+                PeerMessage::PublishAcked { .. }
+                    | PeerMessage::PublishAckedTagged { .. }
+                    | PeerMessage::SharedDeliverAcked { .. }
+            )
+        })
+    }
+
+    /// The gap of issue #973, closed: a publish toward a peer is an obligation that
+    /// holds the publisher's acknowledgement whether the peer's link is merely down
+    /// or the peer has been declared dead. The forward is derived from the interest
+    /// table, and a verdict no longer empties it. (This was
+    /// `a_publish_for_a_peer_declared_dead_owes_it_nothing_where_a_link_down_peer_is_owed`,
+    /// which pinned the dead arm as owing nothing.)
     #[test]
-    fn a_publish_for_a_peer_declared_dead_owes_it_nothing_where_a_link_down_peer_is_owed() {
-        for (dead, owed) in [(false, true), (true, false)] {
+    fn a_publish_for_a_peer_declared_dead_is_owed_to_it_as_it_is_to_a_link_down_peer() {
+        for dead in [false, true] {
             let mut h = hub();
             let peer = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
             if dead {
@@ -2478,51 +2670,662 @@ mod zone_fwd_proofs {
             } else {
                 h.peer_disconnected(&peer.node, 0);
             }
-            assert_eq!(h.interest.has_node(&peer.node), owed, "dead={dead}");
+            assert!(h.interest.has_node(&peer.node), "dead={dead}");
 
             let (id, mut rx) = register(&mut h, "t/x");
             fan_out(&mut h, "t/x", QoS::AtLeastOnce, false, Some(id));
             h.pending_local_done(id);
-            assert_eq!(
+            assert!(
                 h.pending_publishes
                     .get(id)
                     .is_some_and(|p| p.awaiting.values().any(|o| o.node == peer.node)),
-                owed,
                 "dead={dead}: a forward obligation toward the peer"
             );
-            assert_eq!(
+            assert!(
+                rx.try_recv().is_err(),
+                "dead={dead}: the publisher's acknowledgement is held"
+            );
+            assert_eq!(h.publishes_held_for_unreachable(), 1, "dead={dead}");
+
+            // The link returns and the peer says what it routes: the forward goes
+            // out under the seq it was recorded with, and the peer's own verdict
+            // is what acknowledges the publisher.
+            let seq = *h.pending_publishes[&id].awaiting.keys().next().unwrap();
+            let mut back = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
+            h.send_owed_to(&back.node);
+            assert!(was_sent_a_forward(&mut back), "dead={dead}");
+            assert_eq!(h.publishes_held_for_unreachable(), 0, "dead={dead}");
+            h.forward_answered(&back.node, seq, ForwardVerdict::Reached);
+            assert!(
                 matches!(rx.try_recv(), Ok(PublishOutcome::Accepted)),
-                !owed,
-                "dead={dead}: the publisher is acknowledged at once exactly when nothing is owed"
+                "dead={dead}: acknowledged on the peer's answer"
             );
         }
     }
 
-    /// The in-flight face of the same gap: a forward that was SENT and is still
-    /// unanswered when its target is declared dead. `peer_dead` discards the
-    /// obligation and arms the re-route grace; with no successor announcing the
-    /// interest, the grace runs out after `REROUTE_GRACE_TICKS` sweeps and the
-    /// publisher is told `Accepted` — whether or not the target ever stored it.
+    /// The in-flight face, closed: a forward that was SENT and is still unanswered
+    /// when its target is declared dead stays an obligation. When the peer's link
+    /// returns it is sent again under the same seq, and the peer's answer — not the
+    /// passing of eight ticks — acknowledges the publisher. (This was
+    /// `a_forward_unanswered_when_its_target_is_declared_dead_is_acked_when_the_grace_runs_out`.)
     #[test]
-    fn a_forward_unanswered_when_its_target_is_declared_dead_is_acked_when_the_grace_runs_out() {
+    fn a_forward_unanswered_when_its_target_is_declared_dead_stays_owed_until_the_peer_answers() {
         let mut h = hub();
         let peer = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
-        let (id, _seq, mut rx) = held_forward(&mut h, &peer.node);
+        let (id, seq, mut rx) = held_forward(&mut h, &peer.node);
         assert!(rx.try_recv().is_err(), "held for the peer's answer");
 
         h.peer_dead(&peer.node);
         let p = &h.pending_publishes[&id];
-        assert!(p.awaiting.is_empty(), "the obligation is discarded");
-        assert_eq!(p.reroute_grace, Some(REROUTE_GRACE_TICKS));
+        assert!(
+            p.awaiting.get(&seq).is_some_and(|o| o.node == peer.node),
+            "the obligation is kept, under its seq"
+        );
 
-        for tick in 1..=REROUTE_GRACE_TICKS {
-            assert!(rx.try_recv().is_err(), "still held before sweep {tick}");
-            h.sweep_pending_forwards();
+        // Most of the hold passes; nothing is said to the publisher.
+        for tick in 1..REROUTE_GRACE_TICKS {
+            sweep_tick(&mut h);
+            assert!(rx.try_recv().is_err(), "still held after sweep {tick}");
+        }
+
+        let mut back = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
+        h.send_owed_to(&back.node);
+        assert!(
+            was_sent_a_forward(&mut back),
+            "retransmitted on the new link"
+        );
+        // The link is back, so no number of further ticks ends the hold.
+        for _ in 0..REROUTE_GRACE_TICKS * 2 {
+            h.sweep_verdict_holds();
         }
         assert!(
-            matches!(rx.try_recv(), Ok(PublishOutcome::Accepted)),
-            "acknowledged when the grace runs out, with no answer from anyone"
+            rx.try_recv().is_err(),
+            "held for the answer, not for a clock"
         );
+        h.forward_answered(&back.node, seq, ForwardVerdict::Reached);
+        assert!(matches!(rx.try_recv(), Ok(PublishOutcome::Accepted)));
+    }
+
+    /// The bound this change keeps until confirmation exists (ADR 0087 T3): a peer
+    /// that stays dead and out of reach is held for `REROUTE_GRACE_TICKS` sweeps
+    /// from the verdict and no longer, and then its publishers are answered as they
+    /// were when the verdict erased at once — a forward in flight at the verdict on
+    /// exactly the sweep it was answered on before, and a publish that arrived
+    /// during the hold with it. So a node that really died stalls nobody longer
+    /// than it did.
+    #[test]
+    fn a_peer_that_stays_dead_holds_its_publishers_no_longer_than_the_grace_did() {
+        let mut h = hub();
+        let peer = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
+        let (_in_flight, _seq, mut before) = held_forward(&mut h, &peer.node);
+
+        h.peer_dead(&peer.node);
+        // A publish that arrives two ticks into the hold.
+        sweep_tick(&mut h);
+        sweep_tick(&mut h);
+        let (late, mut during) = register(&mut h, "t/x");
+        fan_out(&mut h, "t/x", QoS::AtLeastOnce, false, Some(late));
+        h.pending_local_done(late);
+        assert!(during.try_recv().is_err(), "owed to the unreachable peer");
+
+        for tick in 3..REROUTE_GRACE_TICKS {
+            sweep_tick(&mut h);
+            assert!(
+                before.try_recv().is_err() && during.try_recv().is_err(),
+                "both still held after sweep {tick}"
+            );
+        }
+        sweep_tick(&mut h);
+        assert!(
+            matches!(before.try_recv(), Ok(PublishOutcome::Accepted)),
+            "answered on sweep {REROUTE_GRACE_TICKS}, as the grace answered it"
+        );
+        assert!(matches!(during.try_recv(), Ok(PublishOutcome::Accepted)));
+        assert!(!h.interest.has_node(&peer.node), "and the peer is erased");
+        assert!(h.pending_publishes.is_empty());
+        assert_eq!(h.publishes_held_for_unreachable(), 0);
+
+        // What arrives after the hold finds nobody to owe, as before.
+        let (id, mut after) = register(&mut h, "t/x");
+        fan_out(&mut h, "t/x", QoS::AtLeastOnce, false, Some(id));
+        h.pending_local_done(id);
+        assert!(matches!(after.try_recv(), Ok(PublishOutcome::Accepted)));
+    }
+
+    /// The durable takeover path is unchanged: a peer that newly announces the
+    /// interest while the target is held dead is sent the publish as a re-route,
+    /// and that forward stands in for what the unreachable peer was owed — so a
+    /// real owner death costs its publishers the failover, not the whole hold.
+    ///
+    /// CHARACTERISATION, for 0087-T5: the "successor" here is any peer whose newly
+    /// announced filter matches the topic. Nothing tells this hub that it took over
+    /// the unreachable peer's subscriber rather than being an unrelated one, so an
+    /// unrelated one discharges the obligation just the same — and if the peer was
+    /// falsely held dead, its subscriber loses the publish. D8 narrows the
+    /// discharge to interest the lease plane owns; this test then needs both kinds.
+    #[test]
+    fn a_successor_that_announces_the_interest_discharges_what_the_unreachable_peer_was_owed() {
+        for at_verdict in [true, false] {
+            let mut h = hub();
+            let dead = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
+            let mut successor = attach_peer_at(&mut h, "succ", PROTO_FORWARD_REACHED, "other");
+            let (id, mut rx) = if at_verdict {
+                // In flight at the verdict.
+                let (id, _seq, rx) = held_forward(&mut h, &dead.node);
+                h.peer_dead(&dead.node);
+                (id, rx)
+            } else {
+                // Published under the verdict.
+                h.peer_dead(&dead.node);
+                let (id, rx) = register(&mut h, "t/x");
+                fan_out(&mut h, "t/x", QoS::AtLeastOnce, false, Some(id));
+                h.pending_local_done(id);
+                (id, rx)
+            };
+            sweep_tick(&mut h);
+            assert!(rx.try_recv().is_err(), "at_verdict={at_verdict}: held");
+            assert!(!was_sent_a_forward(&mut successor));
+
+            // The lease's new owner materialises the session and announces it.
+            h.interest
+                .replace(successor.node.clone(), vec!["t/x".to_string()]);
+            sweep_tick(&mut h);
+            assert!(
+                was_sent_a_forward(&mut successor),
+                "at_verdict={at_verdict}: re-routed to the successor"
+            );
+            let p = &h.pending_publishes[&id];
+            assert!(
+                p.awaiting.values().all(|o| o.node == successor.node),
+                "at_verdict={at_verdict}: and only the successor is still owed an answer"
+            );
+            let seq = *p.awaiting.keys().next().unwrap();
+            h.forward_answered(&successor.node, seq, ForwardVerdict::Reached);
+            assert!(
+                matches!(rx.try_recv(), Ok(PublishOutcome::Accepted)),
+                "at_verdict={at_verdict}: acknowledged on the successor's answer"
+            );
+        }
+    }
+
+    /// The same discharge, on this node: a matching session that materialises HERE
+    /// during the hold — the takeover scan handing this node the unreachable peer's
+    /// durable session — is delivered to by the settle pass, and that ends what the
+    /// peer was owed. CHARACTERISATION for 0087-T5, as above: any matching session
+    /// that appears here does it, the peer's own or not.
+    #[tokio::test]
+    async fn a_session_that_materialises_here_discharges_what_the_unreachable_peer_was_owed() {
+        let mut h = hub();
+        let dead = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
+        h.peer_dead(&dead.node);
+        let (id, mut rx) = register(&mut h, "t/x");
+        fan_out(&mut h, "t/x", QoS::AtLeastOnce, false, Some(id));
+        h.pending_local_done(id);
+        sweep_tick(&mut h);
+        assert!(
+            rx.try_recv().is_err(),
+            "owed to the unreachable peer, and held"
+        );
+
+        h.inherit_sessions(
+            vec![(
+                ClientId("moved".into()),
+                vec![mqtt_core::Subscription {
+                    filter: "t/x".into(),
+                    max_qos: QoS::AtLeastOnce,
+                    no_local: false,
+                    sub_id: None,
+                }],
+                None,
+            )],
+            true,
+        );
+        assert!(
+            h.pending_publishes
+                .get(id)
+                .is_none_or(|p| p.awaiting.is_empty()),
+            "nothing is owed to the unreachable peer any more"
+        );
+    }
+
+    /// A `$share` delivery owed to an unreachable member does not move to a member
+    /// that cannot be reached either. Both of the group's nodes are held dead; the
+    /// delivery stays with the member it was owed to, that node's link returns and
+    /// it is delivered there — where a move to the other node's member would have
+    /// left it with a peer that never returned, acknowledged when that peer's hold
+    /// ran out, with the member that did return never tried again.
+    #[test]
+    fn a_share_delivery_does_not_move_from_one_unreachable_member_to_another() {
+        let mut h = hub();
+        let group = |member: &str| RemoteSharedGroup {
+            group: "g".into(),
+            filter: "s/#".into(),
+            members: vec![(ClientId(member.into()), QoS::AtLeastOnce, true)],
+        };
+        let b = attach_peer_at(&mut h, "b", PROTO_FORWARD_REACHED, "none");
+        let c = attach_peer_at(&mut h, "c", PROTO_FORWARD_REACHED, "none");
+        h.remote_shared.insert(b.node.clone(), vec![group("m-b")]);
+        h.remote_shared.insert(c.node.clone(), vec![group("m-c")]);
+        h.rebuild_remote_shared_index();
+
+        // In flight to b's member when this node is cut off from both.
+        let (id, mut rx) = register(&mut h, "s/t");
+        let _ = h.deliver_shared(
+            "s/t",
+            &Bytes::from_static(b"x"),
+            QoS::AtLeastOnce,
+            None,
+            &AppProperties::default(),
+            Some(id),
+            false,
+        );
+        h.pending_local_done(id);
+        let owed_to = |h: &Hub| {
+            h.pending_publishes[&id]
+                .awaiting
+                .values()
+                .next()
+                .expect("owed to a member")
+                .node
+                .clone()
+        };
+        assert_eq!(owed_to(&h), b.node, "the rotation starts at b's member");
+        h.peer_dead(&c.node);
+        h.peer_dead(&b.node);
+        sweep_tick(&mut h);
+        sweep_tick(&mut h);
+        assert_eq!(
+            owed_to(&h),
+            b.node,
+            "c's member cannot be reached either: not somewhere to move to"
+        );
+
+        // b returns; c never does, and its hold runs out.
+        let mut b_again = attach_peer_at(&mut h, "b", PROTO_FORWARD_REACHED, "none");
+        h.send_owed_to(&b_again.node);
+        let seq = loop {
+            let frame = b_again.rx.try_recv().expect("sent to b's member");
+            if let PeerMessage::SharedDeliverAcked { seq, client, .. } = frame {
+                assert_eq!(client, "m-b");
+                break seq;
+            }
+        };
+        for _ in 0..REROUTE_GRACE_TICKS {
+            sweep_tick(&mut h);
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "c's hold running out answers nothing that is owed to b"
+        );
+        h.forward_answered(&b_again.node, seq, ForwardVerdict::Stored);
+        assert!(matches!(rx.try_recv(), Ok(PublishOutcome::Accepted)));
+    }
+
+    /// Nor does a refusal move it there. The delivery owed to b's member moves to
+    /// d's, on a node with a link, at b's verdict; d refuses (its node in a
+    /// brownout). The only member not yet tried is c's, and c cannot be reached: the
+    /// pass is exhausted, and the publisher is told of the refusal and retries —
+    /// where holding the delivery for c would have ended, if c's hold ran out, in an
+    /// acknowledgement for a publish nobody received, with b never tried again.
+    #[test]
+    fn a_refused_share_delivery_is_not_moved_to_a_member_that_cannot_be_reached() {
+        let mut h = hub();
+        let group = |member: &str| RemoteSharedGroup {
+            group: "g".into(),
+            filter: "s/#".into(),
+            members: vec![(ClientId(member.into()), QoS::AtLeastOnce, true)],
+        };
+        let b = attach_peer_at(&mut h, "b", PROTO_FORWARD_REACHED, "none");
+        let c = attach_peer_at(&mut h, "c", PROTO_FORWARD_REACHED, "none");
+        let mut d = attach_peer_at(&mut h, "d", PROTO_FORWARD_REACHED, "none");
+        for (link, member) in [(&b, "m-b"), (&c, "m-c"), (&d, "m-d")] {
+            h.remote_shared
+                .insert(link.node.clone(), vec![group(member)]);
+        }
+        h.rebuild_remote_shared_index();
+        let (id, mut rx) = register(&mut h, "s/t");
+        let _ = h.deliver_shared(
+            "s/t",
+            &Bytes::from_static(b"x"),
+            QoS::AtLeastOnce,
+            None,
+            &AppProperties::default(),
+            Some(id),
+            false,
+        );
+        h.pending_local_done(id);
+
+        h.peer_dead(&c.node);
+        h.peer_dead(&b.node);
+        let moved = loop {
+            let frame =
+                d.rx.try_recv()
+                    .expect("moved to d's member, on a linked node");
+            if let PeerMessage::SharedDeliverAcked { seq, client, .. } = frame {
+                assert_eq!(client, "m-d");
+                break seq;
+            }
+        };
+        h.forward_answered(
+            &d.node,
+            moved,
+            ForwardVerdict::Refused {
+                code: PublishRefusal::Brownout.wire_code(),
+            },
+        );
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Ok(PublishOutcome::Refused(PublishRefusal::Brownout))
+            ),
+            "the publisher is told, and nothing is held for the unreachable member"
+        );
+        assert!(h.pending_publishes.is_empty() && h.forward_index.is_empty());
+    }
+
+    /// `$share` membership survives a lost link and a verdict (finding 3 of issue
+    /// #973: it was dropped by both, so a link flap alone lost `$share` deliveries).
+    /// A member on a node with a link is always preferred; when the group has none,
+    /// the publish is OWED to a member that cannot be reached, and held.
+    #[test]
+    fn a_share_group_keeps_its_members_across_a_lost_link_and_a_verdict() {
+        let group = |members: &[&str]| RemoteSharedGroup {
+            group: "g".into(),
+            filter: "s/#".into(),
+            members: members
+                .iter()
+                .map(|m| (ClientId((*m).into()), QoS::AtLeastOnce, true))
+                .collect(),
+        };
+        for (dead, elsewhere) in [(false, false), (true, false), (false, true), (true, true)] {
+            let case = format!("dead={dead} elsewhere={elsewhere}");
+            let mut h = hub();
+            let away = attach_peer_at(&mut h, "away", PROTO_FORWARD_REACHED, "none");
+            h.remote_shared
+                .insert(away.node.clone(), vec![group(&["m-away"])]);
+            let mut other = attach_peer_at(&mut h, "other", PROTO_FORWARD_REACHED, "none");
+            if elsewhere {
+                h.remote_shared
+                    .insert(other.node.clone(), vec![group(&["m-other"])]);
+            }
+            h.rebuild_remote_shared_index();
+
+            if dead {
+                h.peer_dead(&away.node);
+            } else {
+                h.peer_disconnected(&away.node, 0);
+            }
+
+            // Several publishes, so the rotation would reach the unreachable member
+            // if it were still taking turns.
+            let mut held = Vec::new();
+            for _ in 0..4 {
+                let (id, mut rx) = register(&mut h, "s/t");
+                let (durable, placed) = h.deliver_shared(
+                    "s/t",
+                    &Bytes::from_static(b"x"),
+                    QoS::AtLeastOnce,
+                    None,
+                    &AppProperties::default(),
+                    Some(id),
+                    false,
+                );
+                assert!(matches!(durable, DurableOutcome::Ok) && placed, "{case}");
+                h.pending_local_done(id);
+                assert!(rx.try_recv().is_err(), "{case}: owed to a member");
+                let target = h.pending_publishes[&id]
+                    .awaiting
+                    .values()
+                    .next()
+                    .expect("a shared obligation")
+                    .node
+                    .clone();
+                assert_eq!(
+                    target == other.node,
+                    elsewhere,
+                    "{case}: the reachable member takes it whenever there is one"
+                );
+                held.push((id, rx));
+            }
+            assert_eq!(was_sent_a_forward(&mut other), elsewhere, "{case}");
+            assert_eq!(
+                h.publishes_held_for_unreachable(),
+                if elsewhere { 0 } else { 4 },
+                "{case}"
+            );
+            if elsewhere {
+                continue;
+            }
+
+            // The member's node is linked again: every held delivery goes out to it,
+            // and its answer acknowledges the publisher.
+            let mut back = attach_peer_at(&mut h, "away", PROTO_FORWARD_REACHED, "none");
+            h.send_owed_to(&back.node);
+            let mut sent = 0;
+            while let Ok(frame) = back.rx.try_recv() {
+                if let PeerMessage::SharedDeliverAcked { seq, client, .. } = frame {
+                    assert_eq!(client, "m-away", "{case}");
+                    h.forward_answered(&back.node, seq, ForwardVerdict::Stored);
+                    sent += 1;
+                }
+            }
+            assert_eq!(sent, 4, "{case}: each held delivery was sent once");
+            for (_, mut rx) in held {
+                assert!(
+                    matches!(rx.try_recv(), Ok(PublishOutcome::Accepted)),
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    /// A `$share` delivery in flight to a member whose node is declared dead moves
+    /// at once to a member on another node, when the group has one (0041-T12: the
+    /// rebalance a refusal triggers) — and stays owed to the unreachable member
+    /// when it has none, where it used to be withheld from the publisher.
+    #[test]
+    fn a_share_delivery_in_flight_at_a_verdict_moves_to_a_reachable_member_or_stays_owed() {
+        for elsewhere in [true, false] {
+            let mut h = hub();
+            let mut links = Vec::new();
+            for (node, member) in [("n1", "m1"), ("n2", "m2")] {
+                let link = attach_peer_at(&mut h, node, PROTO_FORWARD_REACHED, "none");
+                if node == "n1" || elsewhere {
+                    h.remote_shared.insert(
+                        link.node.clone(),
+                        vec![RemoteSharedGroup {
+                            group: "g".into(),
+                            filter: "s/#".into(),
+                            members: vec![(ClientId(member.into()), QoS::AtLeastOnce, true)],
+                        }],
+                    );
+                }
+                links.push(link);
+            }
+            h.rebuild_remote_shared_index();
+            let (id, mut rx) = register(&mut h, "s/t");
+            let _ = h.deliver_shared(
+                "s/t",
+                &Bytes::from_static(b"x"),
+                QoS::AtLeastOnce,
+                None,
+                &AppProperties::default(),
+                Some(id),
+                false,
+            );
+            h.pending_local_done(id);
+            let first = h.pending_publishes[&id]
+                .awaiting
+                .values()
+                .next()
+                .expect("a shared obligation")
+                .node
+                .clone();
+
+            h.peer_dead(&first);
+            assert!(
+                rx.try_recv().is_err(),
+                "elsewhere={elsewhere}: neither acknowledged nor withheld"
+            );
+            let now = h.pending_publishes[&id]
+                .awaiting
+                .values()
+                .next()
+                .expect("still owed to a member")
+                .node
+                .clone();
+            assert_eq!(
+                now != first,
+                elsewhere,
+                "elsewhere={elsewhere}: moved exactly when there is somewhere to move to"
+            );
+        }
+    }
+
+    /// What becomes of a `$share` delivery owed to a member on a node that stays
+    /// dead and out of reach. If a member appears on another node while the hold
+    /// runs — the group's consumers reconnecting elsewhere — the delivery moves to
+    /// it at the next tick. If none does, the hold runs out and the publisher is
+    /// acknowledged, as for any publish nobody is left to receive; its connection
+    /// is not closed on it.
+    #[test]
+    fn a_share_delivery_owed_to_a_dead_node_moves_to_a_new_member_or_ends_with_the_hold() {
+        for reappears in [true, false] {
+            let mut h = hub();
+            let away = attach_peer_at(&mut h, "away", PROTO_FORWARD_REACHED, "none");
+            let mut other = attach_peer_at(&mut h, "other", PROTO_FORWARD_REACHED, "none");
+            let group = |member: &str| RemoteSharedGroup {
+                group: "g".into(),
+                filter: "s/#".into(),
+                members: vec![(ClientId(member.into()), QoS::AtLeastOnce, true)],
+            };
+            h.remote_shared
+                .insert(away.node.clone(), vec![group("consumer")]);
+            h.rebuild_remote_shared_index();
+            h.peer_dead(&away.node);
+
+            let (id, mut rx) = register(&mut h, "s/t");
+            let _ = h.deliver_shared(
+                "s/t",
+                &Bytes::from_static(b"x"),
+                QoS::AtLeastOnce,
+                None,
+                &AppProperties::default(),
+                Some(id),
+                false,
+            );
+            h.pending_local_done(id);
+            sweep_tick(&mut h);
+            assert!(rx.try_recv().is_err(), "reappears={reappears}: held");
+
+            if reappears {
+                // The same consumer, connected to another node now.
+                h.remote_shared
+                    .insert(other.node.clone(), vec![group("consumer")]);
+                h.rebuild_remote_shared_index();
+                sweep_tick(&mut h);
+                let seq = loop {
+                    let frame = other
+                        .rx
+                        .try_recv()
+                        .expect("the delivery moved to the new member");
+                    if let PeerMessage::SharedDeliverAcked { seq, .. } = frame {
+                        break seq;
+                    }
+                };
+                h.forward_answered(&other.node, seq, ForwardVerdict::Stored);
+                assert!(matches!(rx.try_recv(), Ok(PublishOutcome::Accepted)));
+            } else {
+                for _ in 2..REROUTE_GRACE_TICKS {
+                    sweep_tick(&mut h);
+                    assert!(rx.try_recv().is_err(), "still held inside the hold");
+                }
+                sweep_tick(&mut h);
+                assert!(
+                    matches!(rx.try_recv(), Ok(PublishOutcome::Accepted)),
+                    "acknowledged when the hold runs out, not withheld"
+                );
+                assert!(h.pending_publishes.is_empty() && h.forward_index.is_empty());
+            }
+        }
+    }
+
+    /// At the pending table's bound a hold behaves as the table always has: the
+    /// OLDEST entry is evicted with its acknowledgement withheld and counted
+    /// (`pending-cap`), the newest is admitted, and neither bound is exceeded —
+    /// 65,536 entries and 64 MiB hold whatever is owed to a peer that cannot be
+    /// reached, and no more. An evicted publish leaves nothing behind in the index
+    /// of outstanding forwards.
+    #[test]
+    fn a_hold_at_the_pending_table_bound_evicts_the_oldest_and_withholds_its_ack() {
+        let mut h = hub();
+        let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("held"));
+        h.attach_metrics(metrics.clone());
+        let peer = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/#");
+        h.peer_dead(&peer.node);
+
+        let over = 64;
+        let mut waiting = Vec::new();
+        for _ in 0..PENDING_PUBLISH_CAP + over {
+            let (id, rx) = register(&mut h, "t/x");
+            fan_out(&mut h, "t/x", QoS::AtLeastOnce, false, Some(id));
+            h.pending_local_done(id);
+            waiting.push(rx);
+        }
+        assert_eq!(h.pending_publishes.len(), PENDING_PUBLISH_CAP);
+        assert!(h.pending_publishes.bytes() <= PENDING_PUBLISH_MAX_BYTES);
+        assert_eq!(
+            h.forward_index.len(),
+            PENDING_PUBLISH_CAP,
+            "one outstanding forward per entry held, none for an evicted one"
+        );
+        assert_eq!(h.publishes_held_for_unreachable(), PENDING_PUBLISH_CAP);
+        for (i, rx) in waiting.iter_mut().enumerate() {
+            let evicted = i < over;
+            assert_eq!(
+                matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Closed)),
+                evicted,
+                "publish {i}: the {over} oldest are withheld, the rest still held"
+            );
+        }
+        assert!(
+            metrics.render().contains(&format!(
+                "mqttd_publish_dropped_total{{reason=\"pending-cap\"}} {over}"
+            )),
+            "each eviction is counted"
+        );
+
+        // The byte bound, with payloads large enough for it to bind first.
+        let mut h = hub();
+        let peer = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/#");
+        h.peer_dead(&peer.node);
+        let payload = Bytes::from(vec![0u8; 1 << 20]);
+        let mut waiting = Vec::new();
+        for _ in 0..80 {
+            let (done, rx) = oneshot::channel();
+            let id = h.register_pending(
+                done,
+                "t/x",
+                &payload,
+                QoS::AtLeastOnce,
+                false,
+                None,
+                &AppProperties::default(),
+            );
+            h.send_acked_forward(id, &peer.node, false);
+            h.pending_local_done(id);
+            waiting.push(rx);
+        }
+        assert!(h.pending_publishes.bytes() <= PENDING_PUBLISH_MAX_BYTES);
+        assert!(h.pending_publishes.len() < 80, "the byte bound evicted");
+        assert_eq!(h.forward_index.len(), h.pending_publishes.len());
+        let mut withheld = 0;
+        for rx in &mut waiting {
+            if matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Closed)) {
+                withheld += 1;
+            }
+        }
+        assert_eq!(withheld, 80 - h.pending_publishes.len());
     }
 
     // ---- ADR 0087 D5: a link under a `Dead` verdict --------------------------
@@ -2531,27 +3334,25 @@ mod zone_fwd_proofs {
     /// was told is dead can be linked again, announce its interest, and be routed
     /// to — the verdict still standing. What the verdict then decides is what the
     /// loss of THAT link means. Membership says `Dead` once: no second verdict
-    /// follows when the link goes, so the interest the link brought back goes with
-    /// it — or a node that has finished the graceful stop it announced would be
-    /// owed every matching publish for good. Once membership holds the peer alive
-    /// again, a lost link keeps its interest, as for any member.
+    /// follows when the link goes, so the hold starts again, and when it has run
+    /// out the interest the link brought back goes — or a node that has finished
+    /// the graceful stop it announced would be owed every matching publish for
+    /// good. Once membership holds the peer alive again, a lost link keeps its
+    /// interest for as long as it takes, as for any member.
     #[test]
     fn a_link_under_a_dead_verdict_takes_its_interest_with_it_until_the_verdict_is_withdrawn() {
         for withdrawn in [false, true] {
             let mut h = hub();
             let first = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
             h.peer_dead(&first.node);
-            assert!(!h.interest.has_node(&first.node), "the verdict erases");
 
             // Linked again under the verdict, and routed to.
             let mut again = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
-            let (id, _rx) = register(&mut h, "t/x");
+            let (id, mut rx) = register(&mut h, "t/x");
             fan_out(&mut h, "t/x", QoS::AtLeastOnce, false, Some(id));
+            h.pending_local_done(id);
             assert!(
-                std::iter::from_fn(|| again.rx.try_recv().ok()).any(|frame| matches!(
-                    frame,
-                    PeerMessage::PublishAcked { .. } | PeerMessage::PublishAckedTagged { .. }
-                )),
+                was_sent_a_forward(&mut again),
                 "withdrawn={withdrawn}: a peer held dead with a link is forwarded to"
             );
 
@@ -2559,18 +3360,18 @@ mod zone_fwd_proofs {
                 h.peer_alive(&again.node);
             }
             h.peer_disconnected(&again.node, 0);
+            for _ in 0..REROUTE_GRACE_TICKS {
+                sweep_tick(&mut h);
+            }
             assert_eq!(
                 h.interest.has_node(&again.node),
                 withdrawn,
-                "withdrawn={withdrawn}: the interest outlives the link only for a member"
+                "withdrawn={withdrawn}: the interest outlives the hold only for a member"
             );
             assert_eq!(
-                h.pending_publishes[&id]
-                    .awaiting
-                    .values()
-                    .any(|o| o.node == again.node),
+                rx.try_recv().is_err(),
                 withdrawn,
-                "withdrawn={withdrawn}: and so does the forward that was in flight"
+                "withdrawn={withdrawn}: and so does what the peer is owed"
             );
         }
     }
@@ -2583,7 +3384,8 @@ mod zone_fwd_proofs {
     /// After either, the member is a member: its link is lost, and its interest and
     /// the forward in flight to it are kept. (The link manager used to withdraw the
     /// verdict only when `Dead` was the event just before `Alive`; with `Suspect`
-    /// in between the hub held the verdict for good, and this flap erased both.)
+    /// in between the hub held the verdict for good, and every later flap that
+    /// outlasted the hold erased both.)
     #[tokio::test]
     async fn after_dead_suspect_alive_a_lost_link_is_a_members_lost_link() {
         use mqtt_cluster::swim::MemberState;
@@ -2643,8 +3445,13 @@ mod zone_fwd_proofs {
             fan_out(&mut h, "t/x", QoS::AtLeastOnce, false, Some(id));
             h.pending_local_done(id);
 
-            // An ordinary link flap, some time later.
+            // An ordinary link flap, some time later — and the link stays down for
+            // longer than a hold lasts. A node still held dead would be erased by
+            // then; a member is not.
             h.peer_disconnected(&again.node, 0);
+            for _ in 0..REROUTE_GRACE_TICKS * 2 {
+                sweep_tick(&mut h);
+            }
             assert!(
                 h.interest.has_node(&again.node),
                 "{returns_at}: a member's lost link keeps its interest"

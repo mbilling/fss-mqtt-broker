@@ -26,6 +26,8 @@ trait SharedSelectable {
     fn online(&self) -> bool;
     fn is_local(&self) -> bool;
     fn client(&self) -> &ClientId;
+    /// The member's home node; `None` for a member on this node.
+    fn node(&self) -> Option<&NodeId>;
 }
 
 impl SharedSelectable for SharedCandidate {
@@ -37,6 +39,9 @@ impl SharedSelectable for SharedCandidate {
     }
     fn client(&self) -> &ClientId {
         &self.client
+    }
+    fn node(&self) -> Option<&NodeId> {
+        self.node.as_ref()
     }
 }
 
@@ -70,6 +75,9 @@ impl SharedSelectable for SharedCandidateRef<'_> {
     }
     fn client(&self) -> &ClientId {
         self.client
+    }
+    fn node(&self) -> Option<&NodeId> {
+        self.node
     }
 }
 
@@ -886,6 +894,15 @@ impl Hub {
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|c| !tried.iter().any(|(n, cl)| *n == c.node && *cl == c.client))
+                // A re-selection moves a delivery to a member that can take it NOW.
+                // A member that cannot be reached — it stays in its group since ADR
+                // 0087 D1 — is where a publish is first placed when its group has
+                // nobody else, never where one is moved to: the member it would
+                // leave is not tried again, so the move could only strand it. With
+                // no member left that can take it, the pass is exhausted and the
+                // publisher hears the last answer, as it did when a lost link
+                // removed the member from the group.
+                .filter(|c| self.shared_member_can_take_it_now(c))
                 .collect();
             let Some(chosen) = self.select_shared(&key, &candidates) else {
                 debug!(
@@ -956,11 +973,12 @@ impl Hub {
     /// final answer. A publish the hub gated itself during the drain (ADR 0083) has
     /// nobody to retry it, however the pass ended — members refusing it (their nodes in
     /// a brownout, before any side effect) or their nodes dying: the first one tried
-    /// still in the group gets it unanswered, as the group would have had the drain not
-    /// gated it. A dead member has left the group already. A member whose node died may
-    /// have delivered it first, so this path is at least once, even at `QoS` 2 (as the
-    /// re-selection after a peer's death already is). Anything else answers the
-    /// publisher.
+    /// that is still in the group and can be handed it gets it unanswered, as the group
+    /// would have had the drain not gated it. A member on a node declared dead is still
+    /// in its group (ADR 0087 D1) and has no link, so it is passed over. A member whose
+    /// node died may have delivered it first, so this path is at least once, even at
+    /// `QoS` 2 (as the re-selection after a peer's death already is). Anything else
+    /// answers the publisher.
     fn shared_exhausted(
         &mut self,
         id: u64,
@@ -1005,10 +1023,20 @@ impl Hub {
             .find(|(k, _)| k == key)
             .map(|(_, cs)| cs)
             .unwrap_or_default();
+        // "Still in the group" is not enough since ADR 0087 D1: a member whose node
+        // has no link stays in its group, and there is no link to hand it this on.
+        // A local member needs no such test here, unlike in a re-selection
+        // ([`shared_member_can_take_it_now`](Self::shared_member_can_take_it_now)):
+        // this hand-off is ungated, and `deliver_to_client` below already does what
+        // can be done for one that is offline.
         let Some(member) = tried.iter().find_map(|(node, client)| {
-            members
-                .iter()
-                .find(|c| c.node == *node && c.client == *client)
+            members.iter().find(|c| {
+                c.node == *node
+                    && c.client == *client
+                    && c.node
+                        .as_ref()
+                        .is_none_or(|home| self.peers.contains_key(home))
+            })
         }) else {
             return;
         };
@@ -1042,6 +1070,19 @@ impl Hub {
                     &AppendGate::None,
                 );
             }
+        }
+    }
+
+    /// Whether `member` can be handed a delivery now, by the selector's own rules:
+    /// a local member that is online, or persistent (it queues); a remote member
+    /// whose node has a link (it is delivered to, or queues at its home). What is
+    /// left is a member that cannot be reached — on a node whose link is down or
+    /// that membership holds dead — which a publish may be owed to and held for, but
+    /// which nothing is moved to.
+    pub(super) fn shared_member_can_take_it_now(&self, member: &SharedCandidate) -> bool {
+        match &member.node {
+            None => member.online || self.is_persistent(&member.client),
+            Some(home) => self.peers.contains_key(home),
         }
     }
 
@@ -1549,7 +1590,17 @@ impl Hub {
                     candidates[i].is_local() && self.is_persistent(candidates[i].client())
                 })
             })
-            // ...else a remote member (it queues at its home) so the message is not dropped.
+            // ...else a remote member (it queues at its home) so the message is not
+            // dropped — one whose node has a link, if any has: a member behind a lost
+            // link, or on a node membership holds dead, stays in its group (ADR 0087
+            // D1) and is owed the message only when there is nobody else to give it to.
+            .or_else(|| {
+                rotated().find(|&i| {
+                    candidates[i]
+                        .node()
+                        .is_some_and(|node| self.peers.contains_key(node))
+                })
+            })
             .or_else(|| rotated().find(|&i| !candidates[i].is_local()))
     }
 
