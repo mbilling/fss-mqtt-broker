@@ -1591,6 +1591,15 @@ pub enum HubCommand {
         /// The dead node.
         node: NodeId,
     },
+    /// Membership holds a node alive again that it had declared dead: the verdict
+    /// [`PeerDead`](Self::PeerDead) carried is withdrawn (ADR 0087 D5). Nothing is
+    /// routed differently at once — a link, if there is one, already carries the
+    /// node's routing state — but from here on the node is an ordinary member whose
+    /// lost link keeps its interest.
+    PeerAlive {
+        /// The node.
+        node: NodeId,
+    },
     /// A peer said whether its rules select a message event (ADR 0083; proto 13):
     /// while they do, publishes forwarded to it carry their origin
     /// ([`PeerMessage::OriginPublish`]), and every publish here is stamped with one.
@@ -1988,6 +1997,7 @@ impl HubCommand {
             | Self::PeerConnected { .. }
             | Self::PeerDisconnected { .. }
             | Self::PeerDead { .. }
+            | Self::PeerAlive { .. }
             | Self::RemoteInterest { .. }
             | Self::RemoteMessageEvents { .. }
             | Self::RemoteSharedInterest { .. }
@@ -2677,6 +2687,18 @@ pub struct Hub {
     /// again instead of applied again. Bounded per origin by
     /// [`forwarding::FORWARD_WINDOW`]; an origin's window is dropped when it dies.
     forward_windows: HashMap<NodeId, forwarding::ForwardWindow>,
+    /// Nodes membership holds `Dead` ([`HubCommand::PeerDead`]) and has not since
+    /// held alive ([`HubCommand::PeerAlive`]).
+    ///
+    /// A link is admitted by its handshake, not by membership (ADR 0087 D5), so such
+    /// a node can have a link, and with it the interest it announced on that link.
+    /// This set is what keeps that state from outliving the link: SWIM says `Dead`
+    /// once, so when the link of a node already held dead goes — the node finished
+    /// the graceful stop it had announced, or died after a false verdict — no second
+    /// verdict follows to clear what the link brought back, and every gated publish
+    /// matching it would be held for a node that is not coming back
+    /// ([`peer_disconnected`](Self::peer_disconnected)).
+    held_dead: HashSet<NodeId>,
     /// Prometheus metrics (ADR 0020), when enabled. Updated on the publish/deliver paths.
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
     /// The node's ingress credit (ADR 0082 T3), held only to export its gauges: the hub
@@ -2854,6 +2876,7 @@ impl Hub {
                 qos2_epoch: HashMap::new(),
                 remote_append_pending: HashMap::new(),
                 forward_windows: HashMap::new(),
+                held_dead: HashSet::new(),
                 node_id,
                 online: HashMap::new(),
                 pending_wills: HashMap::new(),
@@ -3958,6 +3981,7 @@ impl Hub {
                 // subscriptions materialize within seconds of the owner's death.
                 self.takeover_reconcile_ticks = 8;
             }
+            HubCommand::PeerAlive { node } => self.peer_alive(&node),
             HubCommand::DurableFrame { node, frame } => {
                 self.handle_durable_frame(&node, frame);
             }
@@ -7614,6 +7638,23 @@ impl Hub {
         // Mesh transition 2 of 5 (issue #613 item 1.1): a membership-alive peer
         // just lost its link, so the mesh is no longer whole.
         self.recompute_mesh();
+        // A node membership holds `Dead` had a link all the same — admitted by its
+        // handshake (ADR 0087 D5) — and that link is now gone. No second verdict
+        // will follow this one, so the verdict that stands is applied to what the
+        // link brought back: the node's interest and whatever is still owed to it
+        // go the way they went when it was declared dead.
+        if self.held_dead.contains(node) {
+            self.peer_dead(node);
+            // And the takeover window opens, as it does at a verdict: if the node
+            // has now really gone, this is the moment its sessions are inherited.
+            self.takeover_reconcile_ticks = 8;
+        }
+    }
+
+    /// Membership holds `node` alive again: the verdict of an earlier
+    /// [`peer_dead`](Self::peer_dead) is withdrawn.
+    fn peer_alive(&mut self, node: &NodeId) {
+        self.held_dead.remove(node);
     }
 
     /// Drop all routing state for a node the failure detector confirmed dead.
@@ -7621,6 +7662,7 @@ impl Hub {
     /// Removing the peer entry also drops its outbound sender, which closes the
     /// link's pump on whichever side still holds the socket open.
     fn peer_dead(&mut self, node: &NodeId) {
+        self.held_dead.insert(node.clone());
         let had_link = self.peers.remove(node).is_some();
         self.recompute_peers_want_origin();
         // A dead origin retransmits nothing: its forwards died with it, and a

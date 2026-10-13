@@ -10,20 +10,32 @@
 //! `Dead` claim is gossiped, so more than one node can hold it at once, and it ends when
 //! B's refutation arrives first-hand or the tombstone is pruned (30 s).
 //!
-//! **Most of these tests are characterisation**: they pin what the broker does TODAY,
-//! including where it acknowledges a publish and delivers it to nobody. Each such test
-//! states the lossy outcome as [`Fate::AckedAndLost`] (or [`Fate::HeldThenLost`]),
-//! asserted exactly — so the test fails in BOTH directions: if the loss gets worse, and
-//! if a fix lands and the message starts arriving. When #973 is fixed, change that row
-//! to the fate the fix promises ([`Fate::Delivered`], [`Fate::HeldUntilHeal`],
-//! [`Fate::DeliveredOnHeal`] or [`Fate::NotAcked`]); the assertion helper is already
-//! written for all of them. Nothing here is `#[ignore]`d: an ignored
-//! "must deliver" twin would run in no tier (`scripts/check-test-hygiene.py`), and a
-//! known defect is better held by a test that fails when it stops being true.
+//! **Some rows here are still characterisation**: they pin what the broker does TODAY,
+//! including where it acknowledges a publish and delivers it to nobody. Each such row
+//! states the lossy outcome as [`Fate::AckedAndLost`] (or [`Fate::HeldThenLost`]) with
+//! its issue, and fails in BOTH directions: if the loss gets worse, and if a fix lands
+//! and the message starts arriving. When the fix lands, change the row to the fate it
+//! promises ([`Fate::Delivered`], [`Fate::HeldUntilHeal`], [`Fate::DeliveredOnHeal`] or
+//! [`Fate::NotAcked`]). Nothing here is `#[ignore]`d: an ignored "must deliver" twin
+//! would run in no tier (`scripts/check-test-hygiene.py`), and a known defect is better
+//! held by a test that fails when it stops being true.
 //!
 //! ADR 0087 reads these results and holds the decision (2026-10-13): a `QoS` ≥ 1
 //! publish is acknowledged only when every node that owns a subscriber has accepted
-//! it, and a `Dead` verdict no longer erases what the publish is owed to.
+//! it, and a `Dead` verdict no longer erases what the publish is owed to. What has
+//! landed of it:
+//!
+//! - **T4 (D5), keep dialing.** The node that holds the verdict no longer stops its
+//!   dialer, so the link is back about a second after the verdict whichever of the
+//!   pair dials it, and the two orientations of every episode now assert the same
+//!   rows ([`expect_the_link_returns_within_a_second`]). Before it, every row of the
+//!   orientation in which the node that is wrong dials was acknowledged and lost for
+//!   as long as the verdict stood.
+//!
+//! What is left, and stays pinned as lost until ADR 0087 T2 lands (issue #973): the
+//! first publish for a `$share` group whose only member is on the peer just written
+//! off — in both directions — which is acknowledged at the end of the routing-settle
+//! window and never placed, although the member was back seven seconds earlier.
 
 mod common;
 
@@ -64,9 +76,12 @@ enum Mode {
 /// Which of the pair dials the peer link (the smaller node id does).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Link {
-    /// The node holding the false verdict owns the link: nothing redials until `Alive`.
+    /// The node holding the false verdict owns the link. Its dialer keeps dialing
+    /// under the verdict (ADR 0087 D5); until that landed nothing redialed before
+    /// `Alive`, and this was the orientation that lost everything.
     EvictorDials,
-    /// The evicted node owns the link: its dialer redials on its own.
+    /// The evicted node owns the link: its dialer redials on its own, and the node
+    /// holding the verdict accepts — a link is admitted by its handshake.
     EvictedDials,
 }
 
@@ -122,6 +137,10 @@ struct Node {
     raised: Arc<Mutex<Vec<(NodeId, MemberState)>>>,
     metrics: Arc<mqtt_observability::metrics::Metrics>,
     plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
+    /// The hub, to ask it whether it has caught up ([`HubCommand::Flush`]).
+    hub: mpsc::UnboundedSender<HubCommand>,
+    /// How many `Dead` verdicts this node's link manager has handed its hub.
+    verdicts_handed_to_the_hub: Arc<AtomicUsize>,
 }
 
 // The node assembly mirrors production wiring end to end, as `durable_sessions.rs` does.
@@ -276,10 +295,30 @@ async fn start_node(id: &str, seeds: Vec<String>, mode: Mode) -> Node {
         None,
         std::future::pending(),
     ));
+    // The link manager reaches the hub through a tap that counts the verdicts it
+    // has handed on, so a test can wait for the hub to have APPLIED one. (The
+    // members gauge is no such observable: the link manager publishes it before it
+    // tells the hub.)
+    let verdicts_handed_to_the_hub = Arc::new(AtomicUsize::new(0));
+    let (to_hub, mut from_link_manager) = mpsc::unbounded_channel::<HubCommand>();
+    {
+        let (hub, handed) = (hub_tx.clone(), verdicts_handed_to_the_hub.clone());
+        tokio::spawn(async move {
+            while let Some(command) = from_link_manager.recv().await {
+                let verdict = matches!(command, HubCommand::PeerDead { .. });
+                if hub.send(command).is_err() {
+                    break;
+                }
+                if verdict {
+                    handed.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+    }
     tokio::spawn(mqttd::cluster::maintain_peer_links(
         event_rx,
         node_id.clone(),
-        hub_tx,
+        to_hub,
         None,
         Some(placement.clone()),
         Some(metrics.clone()),
@@ -296,6 +335,8 @@ async fn start_node(id: &str, seeds: Vec<String>, mode: Mode) -> Node {
         raised,
         metrics,
         plane,
+        hub: hub_tx,
+        verdicts_handed_to_the_hub,
     }
 }
 
@@ -422,16 +463,21 @@ impl Cluster {
     }
 
     /// A — and only A — is told B is dead: the event A's SWIM driver emits for a `Dead`.
-    /// Returns once A's link manager has applied it (the members gauge shows it) — and,
-    /// where the link stays down (`link` is [`Link::EvictorDials`]), once BOTH hubs have
-    /// dropped it: A's by its `PeerDead`, B's by the disconnect it then sees. Each hub
-    /// publishes its link count on its sweep tick, so this costs up to a second of the
-    /// eight-second settle window; without it the first publishes race the hubs (a
-    /// publish B dispatches before it has seen the link go is still owed to A's
-    /// `$share` member, and is held rather than lost).
-    async fn falsely_declare_b_dead_on_a(&self, link: Link) {
+    /// Returns once A's HUB has applied the verdict — the link to B dropped, and
+    /// whatever else the verdict does to routing done — so that the first publish of
+    /// every flow is made under the verdict and has to cross the redial. Returning
+    /// on the members gauge alone would not do: the link manager publishes it before
+    /// it tells the hub, and a publish made in between travels the old link and
+    /// reads as delivered without having tested anything.
+    ///
+    /// Nothing waits for the link to be seen DOWN, in either orientation: whichever
+    /// node dials it, dials it again within half a second (ADR 0087 D5), and each
+    /// hub publishes its link count once a second.
+    async fn falsely_declare_b_dead_on_a(&self) {
         self.raised_at_verdict
             .store(self.a.raised.lock().unwrap().len(), Ordering::SeqCst);
+        let handed = self.a.verdicts_handed_to_the_hub.clone();
+        let before = handed.load(Ordering::SeqCst);
         self.a.events.send(self.event(MemberState::Dead)).unwrap();
         let metrics = self.a.metrics.clone();
         wait_until(
@@ -440,16 +486,19 @@ impl Cluster {
             || metrics.render().contains("mqttd_members{state=\"dead\"} 1"),
         )
         .await;
-        if link == Link::EvictorDials {
-            for node in [&self.a, &self.b] {
-                wait_until(
-                    "the hub's link count drops to the one link that is left",
-                    Duration::from_secs(20),
-                    || series(node).get("mqttd_peer_links").copied() == Some(1.0),
-                )
-                .await;
-            }
-        }
+        wait_until(
+            "A's link manager has handed the verdict to A's hub",
+            Duration::from_secs(10),
+            || handed.load(Ordering::SeqCst) > before,
+        )
+        .await;
+        // The verdict is in the hub's queue; this barrier is behind it.
+        let (reply, applied) = tokio::sync::oneshot::channel();
+        self.a.hub.send(HubCommand::Flush { reply }).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), applied)
+            .await
+            .expect("A's hub applies the verdict")
+            .expect("A's hub is running");
     }
 
     /// A's membership heals: the `Alive` event a first-hand refutation raises. Only
@@ -1047,6 +1096,8 @@ struct Episode {
     /// The committed owner of B's persistent session as A, B and C saw it while the
     /// verdict stood (`None` in plain mode, where there are no leases).
     owner_during: [Option<NodeId>; 3],
+    /// B's node id.
+    b_id: NodeId,
 }
 
 impl Episode {
@@ -1250,7 +1301,7 @@ async fn episode(
     let mut retained_pub = Publisher::connect(&cluster, On::A, "pub-retained").await;
 
     let before = series(&cluster.a);
-    cluster.falsely_declare_b_dead_on_a(link).await;
+    cluster.falsely_declare_b_dead_on_a().await;
     let verdict = Instant::now();
 
     // Every flow publishes at once, each on its own connection: an acknowledgement
@@ -1319,6 +1370,7 @@ async fn episode(
         reached_bystander,
         reached_b_healed,
         owner_during,
+        b_id: cluster.b.id.clone(),
     };
     cluster.membership_moved_only_as_injected();
     println!("--- {mode:?}, {link:?}, founder {founder:?}, heal after {heal_after:?}");
@@ -1365,129 +1417,40 @@ async fn episode(
 }
 
 // ---------------------------------------------------------------------------------
-// Plain mode (`MQTTD_DURABLE=0`): sessions in memory on the node that hosts them
+// What every episode shows, whichever node dials the link (ADR 0087 D5)
 // ---------------------------------------------------------------------------------
 
-use Fate::{AckedAndLost, Delivered, DeliveredOnHeal, HeldThenLost, HeldUntilHeal, NotAcked};
+use Fate::{AckedAndLost, Delivered, DeliveredOnHeal, NotAcked};
 
-/// CHARACTERISATION of issue #973 — the orientation that loses. The node holding the
-/// false verdict dials the pair's link, so nothing redials it until membership heals.
+/// The rows that do not depend on the mode, asserted identically for both link
+/// orientations — 0087-T4's acceptance is that the "A dials" and "B dials" columns
+/// are the same.
 ///
-/// Every `QoS` 1 and `QoS` 2 publish that enters at A for a subscriber only B has —
-/// clean session, persistent session (connected or offline), a `$share` group with no
-/// member elsewhere, the target of a rule's republish — is acknowledged with a success
-/// code and delivered to nobody, then or later. The first is held for A's
-/// routing-settle window (about eight seconds) and then acknowledged; after that the
-/// acknowledgement is immediate. No `publish_dropped` reason moves; the rule's action
-/// is counted as `ok`.
+/// A's hub drops the link with the routing state; whichever node owns the link dials
+/// again within its 500 ms retry, the accept path asks membership nothing, and both
+/// sides announce their interest again — so the data path heals in about a second
+/// while A's membership still says `Dead`. The first publish waits that second out
+/// in A's settle window and is then routed; the second finds the link there.
 ///
-/// What is NOT lost: a `$share` group with a member elsewhere re-selects it; the
-/// bystander C still delivers to B; and B's own publishers are HELD, not acknowledged,
-/// until the link returns (B kept A's interest — a lost link is not a death).
-///
-/// With one exception on B's side, which needs no verdict at all, only a lost link:
-/// `peer_disconnected` keeps a peer's ordinary interest but drops its `$share`
-/// membership, so B's publish for a group whose only member is on A finds no group. It
-/// is held while B's mesh is not whole — and acknowledged when the link is back,
-/// undelivered (`reverse-share`).
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn plain_the_evictor_dials_acked_publishes_for_the_evicted_peers_subscribers_are_lost() {
-    let e = episode(Mode::Plain, Link::EvictorDials, Founder::Evictor, None).await;
-
-    for flow in [
-        "clean",
-        "clean-qos2",
-        "persistent",
-        "offline",
-        "share-b",
-        "rule",
-    ] {
-        e.expect(flow, [AckedAndLost, AckedAndLost]);
-    }
-    e.expect("share-bc", [Delivered, Delivered]);
-    assert_eq!(
-        e.flow("share-bc")
-            .during
-            .keys()
-            .copied()
-            .collect::<Vec<_>>(),
-        ["c"],
-        "the member on C took both"
-    );
-    e.expect("from-c", [Delivered, Delivered]);
-    e.expect("reverse", [HeldUntilHeal, HeldUntilHeal]);
-    e.expect("reverse-share", [HeldThenLost, HeldThenLost]);
-
-    // The offline session lost nothing it was owed BEFORE the verdict.
-    assert!(e.flow("offline").ever["b"].contains(&"healthy"));
-
-    // The publisher's view: the first acknowledgement is held for the routing-settle
-    // window (eight sweep ticks of a second; the lower bound is far below it and no
-    // load can shorten a hold), the second is not — and each carries a success code.
-    let clean = e.flow("clean");
-    let (held, prompt) = (
-        clean.first.after().expect("acked"),
-        clean.second.after().expect("acked"),
-    );
-    assert!(
-        held > Duration::from_secs(3),
-        "the first publish is held for the routing-settle window: {held:?}"
-    );
-    assert!(
-        prompt < held,
-        "the second is acknowledged without that hold: {prompt:?} against {held:?}"
-    );
-
-    // The operator's view.
-    e.expect_no_drop_was_counted();
-    assert!(
-        (e.moved("mqttd_rule_actions_total{rule=\"fwd\",result=\"ok\"}") - 2.0).abs()
-            < f64::EPSILON,
-        "the lost republishes are counted as successful actions: {:?}",
-        e.moved_on_a
-    );
-
-    // (f) Retained: acknowledged, absent on B while the verdict stands (the broadcast
-    // had no link to go out on), present on C, and on B again after the heal — the
-    // link-up digest back-fills it (ADR 0014 §3). Late, not lost.
-    assert!(e.retained.acked_ok());
-    assert!(!e.reached_b_standing);
-    assert!(e.reached_bystander);
-    assert!(e.reached_b_healed);
-}
-
-/// The other orientation: the evicted node dials the link. A's hub drops the link with
-/// the routing state; B's dialer has it back within its 500 ms retry, the accept path
-/// asks membership nothing, and both sides announce their interest again — so the data
-/// path heals in about a second while A's membership still says `Dead`.
-///
-/// The first publish waits out that second in A's settle window and is then routed;
-/// nothing is lost — with one exception: the settle pass re-routes ordinary interest
-/// only, so a publish that found its `$share` group without a member is acknowledged
-/// at the end of the window and never placed (`share-b`, first publish), although the
-/// member was back seven seconds earlier. That row races the redial, so it is allowed
-/// either way here; it is pinned exactly where there is no redial, in the test above.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn plain_the_evicted_peer_dials_the_link_returns_and_only_a_memberless_share_group_loses() {
-    let e = episode(Mode::Plain, Link::EvictedDials, Founder::Evictor, None).await;
-
-    for flow in [
-        "clean",
-        "clean-qos2",
-        "persistent",
-        "rule",
-        "from-c",
-        "reverse",
-        "share-bc",
-    ] {
+/// **Still lost, pinned here until ADR 0087 T2 (issue #973):** the settle pass
+/// re-routes ordinary interest only, so a publish that found its `$share` group
+/// without a member is acknowledged at the end of the window and never placed —
+/// `share-b`'s first publish, and `reverse-share`'s (B merely lost a link, and
+/// `peer_disconnected` drops `$share` membership). Each races the redial: sent the
+/// moment the verdict is applied it is lost, as every run on an idle machine shows; a
+/// runner slow enough to dispatch it only after the group is back delivers it. The
+/// second always finds the group.
+#[track_caller]
+fn expect_the_link_returns_within_a_second(e: &Episode) {
+    for flow in ["clean", "rule", "from-c", "reverse", "share-bc"] {
         e.expect(flow, [Delivered, Delivered]);
     }
     e.expect("offline", [DeliveredOnHeal, DeliveredOnHeal]);
-    // Both directions of the same gap: neither node's settle pass places a publish
-    // whose `$share` group came back with the link. The first publish races the
-    // redial (500 ms): sent the moment the verdict is applied it is lost, as every
-    // run on an idle machine shows; a runner slow enough to dispatch it only after
-    // the group is back delivers it. The second always finds the group.
+    // The offline session lost nothing it was owed BEFORE the verdict.
+    assert!(e.flow("offline").ever["b"].contains(&"healthy"));
+
+    // Issue #973, ADR 0087 T2: flip both to `[Delivered]` when `$share` membership
+    // survives a lost link and a verdict.
     let races_the_redial: &[Fate] = &[AckedAndLost, Delivered];
     e.expect_one_of("share-b", [races_the_redial, &[Delivered]]);
     e.expect_one_of("reverse-share", [races_the_redial, &[Delivered]]);
@@ -1502,23 +1465,69 @@ async fn plain_the_evicted_peer_dials_the_link_returns_and_only_a_memberless_sha
         "the first publish waits for the redial ({waited:?}), not for the whole \
          window ({whole_window:?})"
     );
+
+    // The operator's view: the verdict is on the members gauge, and nothing was
+    // dropped.
     e.expect_no_drop_was_counted();
+    // (f) Retained reaches B while the verdict stands: the link is there to carry it.
     assert!(e.retained.acked_ok() && e.reached_b_standing && e.reached_b_healed);
 }
 
-/// A verdict withdrawn inside A's routing-settle window loses (almost) nothing, in the
-/// losing orientation too: the publishes the window was still holding are re-routed
-/// when B's interest returns, and only then acknowledged — here after 2.3 s instead of
-/// 7.2 s. This is the protection the window already gives, for the first seven
-/// seconds or so of a false verdict and no longer: withdrawn just after the window
-/// has closed, the same first publish is lost (seen while this was written).
-///
-/// The exception: the settle pass does not re-select a `$share` group, so `share-b`'s
-/// first publish is lost even so (allowed either way here, since a runner slow enough
-/// to dispatch it after the withdrawal delivers it; pinned exactly in the first test).
+// ---------------------------------------------------------------------------------
+// Plain mode (`MQTTD_DURABLE=0`): sessions in memory on the node that hosts them
+// ---------------------------------------------------------------------------------
+
+/// Plain mode, either orientation: nothing owed to a session is lost.
+#[track_caller]
+fn expect_plain_sessions_are_served(e: &Episode) {
+    expect_the_link_returns_within_a_second(e);
+    for flow in ["clean-qos2", "persistent"] {
+        e.expect(flow, [Delivered, Delivered]);
+    }
+    assert!(
+        (e.moved("mqttd_rule_actions_total{rule=\"fwd\",result=\"ok\"}") - 2.0).abs()
+            < f64::EPSILON,
+        "both republishes were delivered and counted: {:?}",
+        e.moved_on_a
+    );
+}
+
+/// The orientation that used to lose everything (issue #973): the node holding the
+/// false verdict dials the pair's link. Until ADR 0087 D5 its `Dead` arm stopped its
+/// own dialer, nothing redialed before membership healed, and every `QoS` 1 and
+/// `QoS` 2 publish that entered at A for a subscriber only B has — clean session,
+/// persistent session (connected or offline), the target of a rule's republish — was
+/// acknowledged with a success code and delivered to nobody, the first after the
+/// eight-second settle window and the rest at once. Now A keeps dialing a peer it
+/// holds `Dead`, and the episode reads as the other orientation does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn plain_a_verdict_withdrawn_inside_the_settle_window_loses_only_the_memberless_share_group()
-{
+async fn plain_the_evictor_dials_the_link_returns_and_only_a_memberless_share_group_loses() {
+    let e = episode(Mode::Plain, Link::EvictorDials, Founder::Evictor, None).await;
+    expect_plain_sessions_are_served(&e);
+}
+
+/// The other orientation: the evicted node dials the link, and the node holding the
+/// verdict accepts and serves it — a link is admitted by its handshake, not by
+/// membership.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn plain_the_evicted_peer_dials_the_link_returns_and_only_a_memberless_share_group_loses() {
+    let e = episode(Mode::Plain, Link::EvictedDials, Founder::Evictor, None).await;
+    expect_plain_sessions_are_served(&e);
+}
+
+/// A verdict withdrawn after two seconds, in the orientation where the node that
+/// holds it dials. The link was back a second before the withdrawal, so the `Alive`
+/// finds a dialer that is already linked and changes nothing: every flow is
+/// delivered, and the first publish was acknowledged when the link returned, not when
+/// membership healed. (Every delivery of this episode is read after the withdrawal,
+/// so a delivered row reads [`Fate::DeliveredOnHeal`] here.)
+///
+/// The exception is the one every episode has until ADR 0087 T2 (issue #973): the
+/// settle pass does not re-select a `$share` group, so `share-b`'s first publish is
+/// lost even so — allowed either way here, since a runner slow enough to dispatch it
+/// after the redial delivers it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn plain_a_verdict_withdrawn_after_two_seconds_finds_the_link_already_back() {
     let e = episode(
         Mode::Plain,
         Link::EvictorDials,
@@ -1532,24 +1541,24 @@ async fn plain_a_verdict_withdrawn_inside_the_settle_window_loses_only_the_membe
         "persistent",
         "offline",
         "rule",
+        "from-c",
         "reverse",
+        "share-bc",
     ] {
         e.expect(flow, [DeliveredOnHeal, DeliveredOnHeal]);
     }
-    // Lost on every idle run; a runner that dispatches the first publish only after
-    // the verdict was withdrawn (two seconds late) would deliver it.
+    // Issue #973, ADR 0087 T2: flip both to `[DeliveredOnHeal]`.
     let lost_unless_late: &[Fate] = &[AckedAndLost, DeliveredOnHeal];
     e.expect_one_of("share-b", [lost_unless_late, &[DeliveredOnHeal]]);
     e.expect_one_of("reverse-share", [lost_unless_late, &[DeliveredOnHeal]]);
-    // Relative again: the `rule` flow's first publish (the original, which nobody
-    // subscribes to) is acknowledged at the end of the window, the clean session's
-    // when B's interest returned.
+    // The first publish was acknowledged when the link returned — well inside the two
+    // seconds the verdict stood — not when the verdict was withdrawn.
     let at_return = e.flow("clean").first.after().expect("acked");
     let at_window_end = e.flow("rule").first.after().expect("acked");
     assert!(
         at_return < at_window_end,
-        "acknowledged when the interest returned ({at_return:?}), not at the end of \
-         the window ({at_window_end:?})"
+        "acknowledged when the link returned ({at_return:?}), not at the end of the \
+         window ({at_window_end:?})"
     );
 }
 
@@ -1557,108 +1566,74 @@ async fn plain_a_verdict_withdrawn_inside_the_settle_window_loses_only_the_membe
 // Durable mode (the default): the lease group and the replicated session store
 // ---------------------------------------------------------------------------------
 
-/// CHARACTERISATION of issue #973 in durable mode, the false verdict held by a node
-/// that is NOT the lease group's leader. Nothing moves the leases, so the durable
-/// plane never hears of the publish: A drops B's interest and acknowledges exactly as
-/// in plain mode. A persistent session that B's lease group owns — the subscriber the
-/// README's durability claim is about — loses both publishes, connected or offline.
+/// A `QoS` 2 publish also records its packet id durably, for the PUBLISHER's session;
+/// with a replica of that group on the node A has just written off, the first such
+/// write can fail, and the broker then closes the connection rather than acknowledge
+/// (not delivered, and the publisher knows). ADR 0087 D4 records it as observed and
+/// unchanged by the design; the second publish is delivered.
+#[track_caller]
+fn expect_durable_qos2(e: &Episode) {
+    e.expect_one_of("clean-qos2", [&[Delivered, NotAcked], &[Delivered]]);
+}
+
+/// Durable mode, the false verdict held by a node that is NOT the lease group's
+/// leader, which dials the link. Nothing moves the leases, and since ADR 0087 D5 the
+/// link is back in a second: a persistent session that B's lease group owns — the
+/// subscriber the README's durability claim is about — receives both publishes while
+/// the verdict stands. (Until D5 this episode lost both, connected or offline, and
+/// the durable plane never heard of them.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn durable_a_follower_evictor_loses_acked_publishes_for_a_durable_session() {
+async fn durable_a_follower_evictor_dials_and_a_durable_session_is_served() {
     let e = episode(Mode::Durable, Link::EvictorDials, Founder::Bystander, None).await;
 
-    for flow in ["clean", "persistent", "offline", "share-b", "rule"] {
-        e.expect(flow, [AckedAndLost, AckedAndLost]);
-    }
-    // A `QoS` 2 publish also records its packet id durably, for the PUBLISHER's
-    // session; with a replica of that group on the node A has just written off, the
-    // first such write can fail, and the broker then closes rather than acknowledge.
-    e.expect_one_of("clean-qos2", [&[AckedAndLost, NotAcked], &[AckedAndLost]]);
-    e.expect("share-bc", [Delivered, Delivered]);
-    e.expect("from-c", [Delivered, Delivered]);
-    e.expect("reverse", [HeldUntilHeal, HeldUntilHeal]);
-    e.expect("reverse-share", [HeldThenLost, HeldThenLost]);
-    assert!(e.flow("offline").ever["b"].contains(&"healthy"));
-    e.expect_no_drop_was_counted();
+    expect_the_link_returns_within_a_second(&e);
+    expect_durable_qos2(&e);
+    e.expect("persistent", [Delivered, Delivered]);
 
     // The leases did not move: B and C still name B the session's owner. (A has no
     // committed owner for it at all — the owner is not a member in A's view.)
     let b = e.owner_during[1].clone().expect("B knows the owner");
     assert_eq!(e.owner_during, [None, Some(b.clone()), Some(b)]);
-
-    // Durable retained (ADR 0037) commits through the topic's owner and fans out from
-    // there, so the value reaches B even now.
-    assert!(e.retained.acked_ok() && e.reached_b_standing && e.reached_b_healed);
 }
 
-/// CHARACTERISATION of issue #973 in durable mode, the false verdict held by the lease
-/// group's LEADER. Here the verdict does more than drop routing state: the leader
-/// reassigns B's groups, so the durable session's committed owner becomes C while B —
-/// alive, serving the session's connected client, told nothing — still believes it
-/// owns it.
+/// Durable mode, the false verdict held by the lease group's LEADER — either
+/// orientation. Here the verdict does more than drop routing state: the leader
+/// reassigns B's groups, so the durable session's committed owner becomes C while B
+/// is alive and serving the session's connected client. The link is back within a
+/// second and the data path with it, so nothing owed to a session is lost — B closes
+/// the durable session's connection for its client to follow the lease, and the
+/// publishes reach that client as it resumes (a duplicate is possible: the client is
+/// moved).
 ///
-/// For the durable session that makes the outcome a race. If C materialises the
-/// inherited session and announces its interest before A's settle window closes, A's
-/// held publishes are re-routed to C and stored in the session's replicated log, and
-/// the subscriber gets them once ownership has moved back; otherwise they are
-/// acknowledged and lost like the rest. Both outcomes are allowed here, and the lost
-/// one is the common one (5 of 7 runs while this was written). Everything that is not
-/// a durable session is lost as in plain mode.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn durable_a_leader_evictor_moves_the_lease_and_still_loses_acked_publishes() {
-    let e = episode(Mode::Durable, Link::EvictorDials, Founder::Evictor, None).await;
-
-    for flow in ["clean", "share-b", "rule"] {
-        e.expect(flow, [AckedAndLost, AckedAndLost]);
-    }
-    e.expect_one_of("clean-qos2", [&[AckedAndLost, NotAcked], &[AckedAndLost]]);
-    for flow in ["persistent", "offline"] {
-        e.expect_one_of(
-            flow,
-            [
-                &[AckedAndLost, DeliveredOnHeal],
-                &[AckedAndLost, DeliveredOnHeal],
-            ],
-        );
-    }
-    e.expect("share-bc", [Delivered, Delivered]);
-    e.expect("from-c", [Delivered, Delivered]);
-    e.expect("reverse", [HeldUntilHeal, HeldUntilHeal]);
-    e.expect("reverse-share", [HeldThenLost, HeldThenLost]);
-    assert!(e.flow("offline").ever["b"].contains(&"healthy"));
-    e.expect_no_drop_was_counted();
+/// That the lease moves at all on a false verdict is the availability cost ADR 0087
+/// §4 names; what keeps a publish safe across it without relying on the redial is
+/// T5 (D8).
+#[track_caller]
+fn expect_sessions_follow_the_lease(e: &Episode) {
+    expect_the_link_returns_within_a_second(e);
+    expect_durable_qos2(e);
+    let reaches_the_session: &[Fate] = &[Delivered, DeliveredOnHeal];
+    e.expect_one_of("persistent", [reaches_the_session, reaches_the_session]);
 
     // The false verdict moved the session's lease away from the node serving it.
-    let [a_says, b_says, c_says] = e.owner_during.clone();
+    let [a_says, _, c_says] = e.owner_during.clone();
     assert_eq!(a_says, c_says, "the leader's reassignment is committed");
     assert_ne!(
-        a_says, b_says,
-        "and B has not learned of it: {:?}",
+        a_says.as_ref(),
+        Some(&e.b_id),
+        "and it is no longer B's: {:?}",
         e.owner_during
     );
-    assert!(e.retained.acked_ok() && e.reached_b_standing && e.reached_b_healed);
 }
 
-/// Durable mode, the evicted node dials, the evictor leads the lease group: the link
-/// is back within a second and the data path with it, so nothing owed to a session is
-/// lost — though the lease has moved, B closes the durable session's connection for
-/// its client to follow it, and the publishes reach that client as it resumes.
-///
-/// The one loss is the one plain mode has in this orientation (`share-b`, first
-/// publish), racing the redial as there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn durable_a_leader_evictor_dials_the_lease_moves_and_sessions_follow_it() {
+    let e = episode(Mode::Durable, Link::EvictorDials, Founder::Evictor, None).await;
+    expect_sessions_follow_the_lease(&e);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn durable_the_evicted_peer_dials_the_link_returns_and_sessions_follow_the_lease() {
     let e = episode(Mode::Durable, Link::EvictedDials, Founder::Evictor, None).await;
-
-    for flow in ["clean", "rule", "from-c", "reverse", "share-bc"] {
-        e.expect(flow, [Delivered, Delivered]);
-    }
-    e.expect_one_of("clean-qos2", [&[Delivered, NotAcked], &[Delivered]]);
-    let reaches_the_session: &[Fate] = &[Delivered, DeliveredOnHeal];
-    e.expect_one_of("persistent", [reaches_the_session, reaches_the_session]);
-    e.expect("offline", [DeliveredOnHeal, DeliveredOnHeal]);
-    let races_the_redial: &[Fate] = &[AckedAndLost, Delivered];
-    e.expect_one_of("share-b", [races_the_redial, &[Delivered]]);
-    e.expect_one_of("reverse-share", [races_the_redial, &[Delivered]]);
-    e.expect_no_drop_was_counted();
-    assert!(e.retained.acked_ok() && e.reached_b_standing && e.reached_b_healed);
+    expect_sessions_follow_the_lease(&e);
 }

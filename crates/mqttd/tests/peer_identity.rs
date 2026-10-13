@@ -509,3 +509,343 @@ async fn a_cluster_crl_reload_tears_down_the_revoked_nodes_link() {
         other => panic!("node A's local delivery must keep working, got {other:?}"),
     }
 }
+
+// --- ADR 0087 D5: a link is admitted by its handshake, not by membership -------
+
+/// What passed through a [`tapped`] sender on its way to a hub.
+#[derive(Default)]
+struct Seen {
+    /// Links registered (`PeerConnected`).
+    links: std::sync::atomic::AtomicUsize,
+    /// `Dead` verdicts the link manager handed the hub (`PeerDead`).
+    verdicts: std::sync::atomic::AtomicUsize,
+}
+
+impl Seen {
+    fn links(&self) -> usize {
+        self.links.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn verdicts(&self) -> usize {
+        self.verdicts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// A sender that counts links and verdicts on their way to `hub`. A command is
+/// counted once it has been handed on, so a count read here is of commands the hub
+/// already holds.
+fn tapped(
+    hub: tokio::sync::mpsc::UnboundedSender<mqttd::HubCommand>,
+) -> (
+    tokio::sync::mpsc::UnboundedSender<mqttd::HubCommand>,
+    std::sync::Arc<Seen>,
+) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (tap_tx, mut tap_rx) = tokio::sync::mpsc::unbounded_channel();
+    let seen = std::sync::Arc::new(Seen::default());
+    let counted = seen.clone();
+    tokio::spawn(async move {
+        while let Some(command) = tap_rx.recv().await {
+            let (link, verdict) = (
+                matches!(command, mqttd::HubCommand::PeerConnected { .. }),
+                matches!(command, mqttd::HubCommand::PeerDead { .. }),
+            );
+            if hub.send(command).is_err() {
+                break;
+            }
+            if link {
+                counted.links.fetch_add(1, SeqCst);
+            }
+            if verdict {
+                counted.verdicts.fetch_add(1, SeqCst);
+            }
+        }
+    });
+    (tap_tx, seen)
+}
+
+/// The membership event a SWIM driver raises about node `id` at `peer_addr`.
+fn membership(
+    id: &str,
+    peer_addr: SocketAddr,
+    state: mqtt_cluster::swim::MemberState,
+) -> mqtt_cluster::swim_driver::MembershipEvent {
+    mqtt_cluster::swim_driver::MembershipEvent {
+        id: NodeId(id.into()),
+        addr: String::new(),
+        peer_addr: peer_addr.to_string(),
+        state,
+        domain: None,
+    }
+}
+
+/// Wait until `reached` holds, for at most thirty seconds.
+async fn until(what: &str, reached: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !reached() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting until {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Run `node`'s links as production does: from its membership's events, through a
+/// tap. Returns the event feed and what the tap has seen.
+fn managed_links(
+    node: &mut NodeHandles,
+    tls: PeerTls,
+) -> (
+    tokio::sync::mpsc::UnboundedSender<mqtt_cluster::swim_driver::MembershipEvent>,
+    std::sync::Arc<Seen>,
+) {
+    let (hub, seen) = tapped(node.hub_tx.clone());
+    node.hub_tx = hub;
+    let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(mqttd::cluster::maintain_peer_links(
+        events,
+        node.node_id.clone(),
+        node.hub_tx.clone(),
+        Some(tls),
+        None,
+        None,
+        None,
+    ));
+    (events_tx, seen)
+}
+
+/// ADR 0087 D5, both orientations, over mutual TLS: node `holder` is told by its own
+/// membership that the live node `peer` is `Dead`. Its hub drops the link — and a
+/// second link is registered while the verdict stands, and serves: a publish on the
+/// peer reaches a subscriber on the holder. Whoever dials (the smaller node id), the
+/// holder's membership is asked nothing on the way: everything a link needs — the
+/// cluster CA's certificate on both ends, the node id it attests — it still needs,
+/// and the tests after this one show it is still refused without.
+async fn a_link_returns_under_a_dead_verdict(holder_id: &str, peer_id: &str) {
+    use mqtt_cluster::swim::MemberState;
+
+    let pki = ClusterPki::new("held-dead");
+    let mut holder = bind_node(NodeId(holder_id.into())).await;
+    let mut peer = bind_node(NodeId(peer_id.into())).await;
+    // Each node's links are its membership's to manage, as in production.
+    let (holder_events, seen) = managed_links(&mut holder, pki.peer_tls(holder_id));
+    let (peer_events, _) = managed_links(&mut peer, pki.peer_tls(peer_id));
+    holder.serve(Some(pki.peer_tls(holder_id)));
+    peer.serve(Some(pki.peer_tls(peer_id)));
+    holder_events
+        .send(membership(peer_id, peer.peer_addr, MemberState::Alive))
+        .unwrap();
+    peer_events
+        .send(membership(holder_id, holder.peer_addr, MemberState::Alive))
+        .unwrap();
+
+    let mut sub = Client::connect(holder.client_addr, "sub").await;
+    sub.subscribe("held/+").await;
+    let mut pubr = Client::connect(peer.client_addr, "pub").await;
+    assert!(
+        crosses(&mut sub, &mut pubr, "held/before", b"before").await,
+        "the mesh must route before the verdict"
+    );
+    until("the first link is registered", || seen.links() >= 1).await;
+
+    // The false verdict, at the holder only. The peer is told nothing.
+    holder_events
+        .send(membership(peer_id, peer.peer_addr, MemberState::Dead))
+        .unwrap();
+    until("the holder's hub holds the verdict", || {
+        seen.verdicts() == 1
+    })
+    .await;
+
+    // The link the verdict dropped is replaced while the verdict stands...
+    until("a second link is registered", || seen.links() >= 2).await;
+    // ...and is served: nothing between the two nodes asks membership.
+    assert!(
+        crosses(&mut sub, &mut pubr, "held/during", b"during").await,
+        "a link from a peer held dead must be accepted and served"
+    );
+}
+
+#[tokio::test]
+async fn the_node_holding_a_peer_dead_keeps_dialing_it_and_serves_the_link() {
+    // "node-a" < "node-b": the node that holds the verdict owns the link.
+    a_link_returns_under_a_dead_verdict("node-a", "node-b").await;
+}
+
+#[tokio::test]
+async fn a_node_accepts_and_serves_a_link_from_a_peer_it_holds_dead() {
+    // "node-b" > "node-a": the peer held dead dials, and the holder accepts.
+    a_link_returns_under_a_dead_verdict("node-b", "node-a").await;
+}
+
+/// An INVARIANT, not a change: this test passes before ADR 0087 D5 as after it,
+/// because the accept path has never had membership as an input. It is here so that
+/// "a link is admitted by its handshake, not by membership" is pinned in the
+/// direction that matters for an attacker too — a verdict admits nobody the
+/// handshake would refuse. The node holds `node-a` `Dead` (the verdict is in its hub
+/// before anything dials), and is then dialed by something that claims to be
+/// `node-a` with a certificate that attests another name: refused, exactly as for a
+/// member in good standing (`cert_cn_mismatch_with_hello_node_id_is_rejected`).
+#[tokio::test]
+async fn a_node_held_dead_is_not_a_node_anyone_may_claim_to_be() {
+    use mqtt_cluster::swim::MemberState;
+
+    let pki = ClusterPki::new("held-dead-impostor");
+    // The impostor: its Hello says "node-a", its certificate says "node-evil".
+    let evil = bind_node(NodeId("node-a".into())).await;
+    let mut honest = bind_node(NodeId("node-b".into())).await;
+    let (events, seen) = managed_links(&mut honest, pki.peer_tls("node-b"));
+    honest.serve(Some(pki.peer_tls("node-b")));
+
+    events
+        .send(membership("node-a", evil.peer_addr, MemberState::Dead))
+        .unwrap();
+    until("the honest node's hub holds the verdict", || {
+        seen.verdicts() == 1
+    })
+    .await;
+    evil.dial(honest.peer_addr, Some(pki.peer_tls("node-evil")));
+
+    let mut sub = Client::connect(honest.client_addr, "sub").await;
+    sub.subscribe("evil/+/data").await;
+    let mut pubr = Client::connect(evil.client_addr, "pub").await;
+    assert!(
+        never_crosses(&mut sub, &mut pubr, "evil/zone/data").await,
+        "a node held dead is not a node anyone may claim to be"
+    );
+    assert_eq!(
+        seen.links(),
+        0,
+        "no link was ever registered for the impostor"
+    );
+}
+
+/// The dial side, which D5 did change: a node now goes on dialing the address of a
+/// member it holds `Dead`, and an address can change hands. Here `node-a` holds
+/// `node-b` dead and keeps dialing its address — where `node-c` now answers, with a
+/// certificate the cluster CA issued for `node-c` and a `Hello` that says so. Every
+/// check a link had before D5 passes: the certificate verifies, and the `Hello`
+/// matches it. The dialer hangs up all the same, because the node that answered is
+/// not the member it dialed. Nothing reaches `node-a`'s hub — no link, so no frame
+/// of `node-c`'s after its `Hello` is ever read — and nothing is routed between the
+/// two; under the verdict as before it.
+#[tokio::test]
+async fn a_dialer_under_a_dead_verdict_refuses_another_nodes_valid_certificate() {
+    use mqtt_cluster::swim::MemberState;
+
+    let pki = ClusterPki::new("held-dead-other-node");
+    let mut holder = bind_node(NodeId("node-a".into())).await;
+    let mut other = bind_node(NodeId("node-c".into())).await;
+    let (events, seen) = managed_links(&mut holder, pki.peer_tls("node-a"));
+    // `node-c` accepts whoever the cluster CA vouches for; what it registers is
+    // counted, to see the dialer come back.
+    let (other_hub, at_other) = tapped(other.hub_tx.clone());
+    other.hub_tx = other_hub;
+    holder.serve(Some(pki.peer_tls("node-a")));
+    other.serve(Some(pki.peer_tls("node-c")));
+
+    // Membership names `node-b` at the address `node-c` answers on, then holds
+    // `node-b` dead. No node-b exists.
+    events
+        .send(membership("node-b", other.peer_addr, MemberState::Alive))
+        .unwrap();
+    until("the dialer has reached the address once", || {
+        at_other.links() >= 1
+    })
+    .await;
+    events
+        .send(membership("node-b", other.peer_addr, MemberState::Dead))
+        .unwrap();
+    until("the holder's hub holds the verdict", || {
+        seen.verdicts() == 1
+    })
+    .await;
+    // The verdict brings the dialer back to the address once more — membership has
+    // spoken of the member — and `node-c` answers again.
+    let before = at_other.links();
+    until("the dialer has come back under the verdict", || {
+        at_other.links() > before
+    })
+    .await;
+
+    // A subscriber on the holder, a publisher on the node that answered.
+    let mut sub = Client::connect(holder.client_addr, "sub").await;
+    sub.subscribe("other/+").await;
+    let mut pubr = Client::connect(other.client_addr, "pub").await;
+    assert!(
+        never_crosses(&mut sub, &mut pubr, "other/x").await,
+        "nothing is routed over a link the dialer refused"
+    );
+    assert_eq!(
+        seen.links(),
+        0,
+        "the holder never registered a link to the node that answered"
+    );
+}
+
+/// What the dial-side pin cannot do by itself, and what bounds it. The node that
+/// answers at a member's stale address cannot know why it was dialed: its accept
+/// path takes the connection for the dialing node's link to IT, registers it in
+/// place of the real one — closing that — and only then sees the dialer hang up.
+/// So every attempt at such an address costs the pair that really lives there a
+/// link flap, and a dialer that came back twice a second would keep that pair's link
+/// down for good.
+///
+/// Here `node-a` and `node-c` have a real link, and membership also names `node-b`
+/// at `node-c`'s address. `node-c` registers the real link, the stale dialer's
+/// connection, and the real link's redial — and then nothing more: the dialer aimed
+/// at `node-b` stays away from the address, and the a↔c link is up and routing.
+#[tokio::test]
+async fn a_stale_address_does_not_keep_flapping_the_link_of_the_node_that_answers() {
+    use mqtt_cluster::swim::MemberState;
+
+    let pki = ClusterPki::new("stale-address");
+    let mut holder = bind_node(NodeId("node-a".into())).await;
+    let mut other = bind_node(NodeId("node-c".into())).await;
+    let (events, _) = managed_links(&mut holder, pki.peer_tls("node-a"));
+    let (other_hub, at_other) = tapped(other.hub_tx.clone());
+    other.hub_tx = other_hub;
+    holder.serve(Some(pki.peer_tls("node-a")));
+    other.serve(Some(pki.peer_tls("node-c")));
+
+    // The real pair.
+    events
+        .send(membership("node-c", other.peer_addr, MemberState::Alive))
+        .unwrap();
+    let mut sub = Client::connect(other.client_addr, "sub").await;
+    sub.subscribe("stale/+").await;
+    let mut pubr = Client::connect(holder.client_addr, "pub").await;
+    assert!(
+        crosses(&mut sub, &mut pubr, "stale/before", b"before").await,
+        "the a↔c link must route to begin with"
+    );
+
+    // Membership names a third node at the same address.
+    let before = at_other.links();
+    events
+        .send(membership("node-b", other.peer_addr, MemberState::Alive))
+        .unwrap();
+    until("the stale dialer has reached the address", || {
+        at_other.links() > before
+    })
+    .await;
+
+    // SETTLE(stale-dialer-stays-away): a negative. Five seconds is ten of the
+    // intervals at which a member in good standing is redialed, so a dialer that
+    // kept coming would register about ten more links at `node-c` in it; nothing
+    // observable says "the dialer has decided to stay away". A slow machine gives a
+    // wrong dialer fewer attempts, which is why the bound below is two, not ten.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    // The stale attempt, and the real link's redial after the flap it caused. One
+    // more is allowed for a redial that raced the flap; a dialer that had kept
+    // coming would be far past this.
+    let after = at_other.links() - before;
+    assert!(
+        (1..=3).contains(&after),
+        "node-c registered {after} link(s) from node-a since the stale address was named"
+    );
+    assert!(
+        crosses(&mut sub, &mut pubr, "stale/after", b"after").await,
+        "the a↔c link is up and routing again"
+    );
+}

@@ -1409,7 +1409,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 747 test(s)
+## `crates/mqttd/src/lib.rs` — 759 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1503,8 +1503,12 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `backup::tests::the_exporter_borrows_the_running_handle_and_never_opens_its_own`
 - `backup::tests::the_headers_created_at_is_a_parseable_rfc_3339_instant`
 - `backup::tests::the_utc_stamp_is_sortable_and_correct`
-- `cluster::tests::alive_after_dead_restarts_the_dialer`
-- `cluster::tests::alive_dials_and_dead_aborts_link_and_notifies_hub`
+- `cluster::tests::a_dialer_that_gave_up_on_a_dead_peer_is_started_again_by_alive`
+- `cluster::tests::a_suspect_between_dead_and_alive_still_withdraws_the_verdict_at_the_hub`
+- `cluster::tests::alive_after_dead_tells_the_hub_the_verdict_is_withdrawn`
+- `cluster::tests::alive_at_a_new_address_replaces_the_dialer_of_a_peer_held_dead`
+- `cluster::tests::alive_dials_and_dead_tells_the_hub_and_keeps_dialing`
+- `cluster::tests::alive_without_a_routing_address_still_withdraws_the_verdict_from_the_dialer`
 - `cluster::tests::alive_without_routing_address_is_skipped`
 - `cluster::tests::larger_node_id_does_not_dial`
 - `cluster::tests::member_states_drive_the_gauge`
@@ -1639,12 +1643,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::pending_bounds::the_reached_record_is_charged_and_released_with_its_entry`
 - `hub::forwarding::pending_bounds::the_sweep_retransmits_only_overdue_forwards`
 - `hub::forwarding::zone_fwd_proofs::a_forward_unanswered_when_its_target_is_declared_dead_is_acked_when_the_grace_runs_out`
+- `hub::forwarding::zone_fwd_proofs::a_link_under_a_dead_verdict_takes_its_interest_with_it_until_the_verdict_is_withdrawn`
 - `hub::forwarding::zone_fwd_proofs::a_publish_for_a_peer_declared_dead_owes_it_nothing_where_a_link_down_peer_is_owed`
 - `hub::forwarding::zone_fwd_proofs::a_qos0_publish_nobody_wants_does_not_walk_the_peer_map`
 - `hub::forwarding::zone_fwd_proofs::a_reached_answer_is_downgraded_for_an_older_peer`
 - `hub::forwarding::zone_fwd_proofs::a_reached_forward_releases_a_held_ack_and_a_stored_one_does_not`
 - `hub::forwarding::zone_fwd_proofs::a_takeover_redelivery_that_reaches_a_session_ends_the_grace_and_the_hold`
 - `hub::forwarding::zone_fwd_proofs::a_takeover_reroute_ends_the_grace`
+- `hub::forwarding::zone_fwd_proofs::after_dead_suspect_alive_a_lost_link_is_a_members_lost_link`
 - `hub::forwarding::zone_fwd_proofs::an_already_acknowledged_entry_is_never_refused_or_withheld`
 - `hub::forwarding::zone_fwd_proofs::an_already_answered_victim_is_not_counted_as_a_withheld_ack`
 - `hub::forwarding::zone_fwd_proofs::closing_the_window_clears_both_holds_and_acks`
@@ -1988,8 +1994,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `memory_watch::tests::the_watcher_drives_brownout_on_watermark_transitions`
 - `memory_watch::tests::vm_rss_is_parsed_in_bytes_from_the_right_line`
 - `memory_watch::tests::without_a_watermark_nothing_is_ever_browned_out`
+- `peer::tests::a_dialer_links_only_the_member_it_was_aimed_at`
+- `peer::tests::a_dialer_whose_window_is_spent_stops_dialing_and_is_set_going_again_by_alive`
 - `peer::tests::a_frame_produced_during_the_yield_joins_the_same_write`
+- `peer::tests::a_link_served_under_the_verdict_restarts_the_dialers_window`
 - `peer::tests::a_link_that_negotiated_13_carries_no_rule_state`
+- `peer::tests::a_peer_held_dead_is_redialed_with_a_growing_delay_until_the_verdict_is_withdrawn`
+- `peer::tests::a_peer_that_accepts_and_never_speaks_does_not_wedge_the_dialer`
+- `peer::tests::an_alive_that_arrives_during_the_attempt_that_spends_the_window_is_not_lost`
 - `peer::tests::control_frames_jump_the_bulk_queue`
 - `peer::tests::peer_qos0_is_shed_when_the_pool_is_full_and_nothing_else_is`
 - `peer::tests::rule_state_is_applied_by_the_link_and_enters_no_hub_lane`
@@ -2445,12 +2457,12 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 ## `crates/mqttd/tests/false_dead_delivery.rs` — 6 test(s)
 
-- `durable_a_follower_evictor_loses_acked_publishes_for_a_durable_session`
-- `durable_a_leader_evictor_moves_the_lease_and_still_loses_acked_publishes`
+- `durable_a_follower_evictor_dials_and_a_durable_session_is_served`
+- `durable_a_leader_evictor_dials_the_lease_moves_and_sessions_follow_it`
 - `durable_the_evicted_peer_dials_the_link_returns_and_sessions_follow_the_lease`
-- `plain_a_verdict_withdrawn_inside_the_settle_window_loses_only_the_memberless_share_group`
+- `plain_a_verdict_withdrawn_after_two_seconds_finds_the_link_already_back`
 - `plain_the_evicted_peer_dials_the_link_returns_and_only_a_memberless_share_group_loses`
-- `plain_the_evictor_dials_acked_publishes_for_the_evicted_peers_subscribers_are_lost`
+- `plain_the_evictor_dials_the_link_returns_and_only_a_memberless_share_group_loses`
 
 ## `crates/mqttd/tests/http_auth.rs` — 7 test(s)
 
@@ -2499,12 +2511,17 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `an_empty_password_is_refused_with_exit_2`
 - `spaces_and_punctuation_survive_the_round_trip`
 
-## `crates/mqttd/tests/peer_identity.rs` — 4 test(s)
+## `crates/mqttd/tests/peer_identity.rs` — 9 test(s)
 
 - `a_cluster_crl_reload_tears_down_the_revoked_nodes_link`
+- `a_dialer_under_a_dead_verdict_refuses_another_nodes_valid_certificate`
+- `a_node_accepts_and_serves_a_link_from_a_peer_it_holds_dead`
+- `a_node_held_dead_is_not_a_node_anyone_may_claim_to_be`
+- `a_stale_address_does_not_keep_flapping_the_link_of_the_node_that_answers`
 - `cert_cn_mismatch_with_hello_node_id_is_rejected`
 - `honest_nodes_with_matching_cert_cn_link_and_route`
 - `plaintext_mesh_without_binding_still_routes`
+- `the_node_holding_a_peer_dead_keeps_dialing_it_and_serves_the_link`
 
 ## `crates/mqttd/tests/persistence.rs` — 2 test(s)
 
