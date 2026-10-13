@@ -150,6 +150,15 @@ struct Node {
 ///
 /// One link per pair, dialed by the smaller node id — so the relay of the larger of
 /// two ids carries exactly the links dialed by smaller ones.
+///
+/// The relay also makes one instant of a link's life wide enough to test. A node
+/// registers a link when the handshake's `Hello` has crossed, and the first thing
+/// its peer says on it — its interest, then its `$share` members — arrives a
+/// fraction of a millisecond later. What a node does with a publish IN BETWEEN is
+/// what the ordering episodes are about (ADR 0087: it must go out behind everything
+/// held for the peer), and at that width they would meet the instant only by luck.
+/// So the relay passes each side's `Hello` at once and holds what follows it for
+/// [`ANNOUNCEMENT_DELAY`], once per connection, in both directions.
 async fn relay_peer_links(to: SocketAddr) -> (String, watch::Sender<bool>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
@@ -169,14 +178,55 @@ async fn relay_peer_links(to: SocketAddr) -> (String, watch::Sender<bool>) {
                 };
                 let _ = dialer.set_nodelay(true);
                 let _ = listener_side.set_nodelay(true);
+                let (from_dialer, to_dialer) = dialer.split();
+                let (from_listener, to_listener) = listener_side.split();
+                // Either direction ending ends the link, as a closed socket does.
                 tokio::select! {
-                    _ = tokio::io::copy_bidirectional(&mut dialer, &mut listener_side) => {}
+                    () = relay_one_way(from_dialer, to_listener) => {}
+                    () = relay_one_way(from_listener, to_dialer) => {}
                     _ = carried.wait_for(|carried| !*carried) => {}
                 }
             });
         }
     });
     (addr, carried_tx)
+}
+
+/// How long the relay holds what a node says after its `Hello`: ten of the numbered
+/// streams' publishes, on every stream, between a link's return and the peer's
+/// first announcement on it.
+const ANNOUNCEMENT_DELAY: Duration = Duration::from_millis(100);
+
+/// One direction of a relayed peer link: the first frame — the `Hello`, a four-byte
+/// big-endian length and its body — at once, everything after it
+/// [`ANNOUNCEMENT_DELAY`] late.
+async fn relay_one_way(
+    mut from: tokio::net::tcp::ReadHalf<'_>,
+    mut to: tokio::net::tcp::WriteHalf<'_>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut len = [0u8; 4];
+    if from.read_exact(&mut len).await.is_err() {
+        return;
+    }
+    let mut hello = vec![0u8; u32::from_be_bytes(len) as usize];
+    assert!(
+        hello.len() < 64 * 1024,
+        "the first frame of a link is a Hello"
+    );
+    if from.read_exact(&mut hello).await.is_err()
+        || to.write_all(&len).await.is_err()
+        || to.write_all(&hello).await.is_err()
+    {
+        return;
+    }
+    // SETTLE(peer-announcement-held-back): not a wait for a state — the delay IS the
+    // stimulus. It widens the instant between a link forming and the peer's first
+    // announcement on it, which is where a publish overtook what was held; nothing
+    // observable marks that instant from outside the two hubs.
+    tokio::time::sleep(ANNOUNCEMENT_DELAY).await;
+    let _ = tokio::io::copy(&mut from, &mut to).await;
+    let _ = to.shutdown().await;
 }
 
 // The node assembly mirrors production wiring end to end, as `durable_sessions.rs` does.
@@ -388,6 +438,13 @@ struct Cluster {
     /// when it was withdrawn (`usize::MAX` until then).
     raised_at_verdict: AtomicUsize,
     raised_at_heal: AtomicUsize,
+    /// [`Fault::LinkCut`]: the instant after the relay stopped carrying the link,
+    /// when both hubs had seen it go, and the instant before the relay was told to
+    /// carry links again. A publish sent between the first and the last was made
+    /// with no link, and no node across it can have answered before the last.
+    cut_at: Mutex<Option<Instant>>,
+    cut_seen: Mutex<Option<Instant>>,
+    restored: Mutex<Option<Instant>>,
 }
 
 /// Which node founds the cluster — in durable mode, the lease group's first leader.
@@ -425,6 +482,9 @@ impl Cluster {
             mode,
             raised_at_verdict: AtomicUsize::new(0),
             raised_at_heal: AtomicUsize::new(usize::MAX),
+            cut_at: Mutex::new(None),
+            cut_seen: Mutex::new(None),
+            restored: Mutex::new(None),
         };
         let nodes = cluster.nodes();
         wait_until(
@@ -557,6 +617,7 @@ impl Cluster {
         self.raised_at_verdict
             .store(self.a.raised.lock().unwrap().len(), Ordering::SeqCst);
         self.link_between_a_and_b().send_replace(false);
+        *self.cut_at.lock().unwrap() = Some(Instant::now());
         for node in [&self.a, &self.b] {
             wait_until(
                 "the hub's link count drops to the one link that is left",
@@ -565,6 +626,7 @@ impl Cluster {
             )
             .await;
         }
+        *self.cut_seen.lock().unwrap() = Some(Instant::now());
     }
 
     /// The link is restored once an operator could have SEEN the hold, on both
@@ -589,7 +651,16 @@ impl Cluster {
             Ordering::SeqCst,
             Ordering::SeqCst,
         );
+        *self.restored.lock().unwrap() = Some(Instant::now());
         self.link_between_a_and_b().send_replace(true);
+    }
+
+    /// When the cut link was restored ([`Fault::LinkCut`] only).
+    fn restored_at(&self) -> Instant {
+        self.restored
+            .lock()
+            .unwrap()
+            .expect("the link was restored")
     }
 
     /// A's membership heals: the `Alive` event a first-hand refutation raises. Only
@@ -675,6 +746,9 @@ struct Publisher {
     /// after the wait for them had ended — an acknowledgement the broker held.
     last_pkid: u16,
     late_acks: Vec<u16>,
+    /// When the last publish's success acknowledgement arrived, if it did within
+    /// the wait.
+    last_acked_at: Option<Instant>,
 }
 
 impl Publisher {
@@ -690,6 +764,7 @@ impl Publisher {
             next_pkid: 1,
             last_pkid: 0,
             late_acks: Vec::new(),
+            last_acked_at: None,
         }
     }
 
@@ -734,6 +809,7 @@ impl Publisher {
         if answer == Answer::Closed {
             self.client = Client::connect_v5_ok(self.addr, &self.id).await;
         }
+        self.last_acked_at = answer.acked_ok().then(Instant::now);
         answer
     }
 }
@@ -931,6 +1007,8 @@ struct Seen {
     ever: BTreeMap<&'static str, Vec<&'static str>>,
     /// Whether each publish's acknowledgement arrived only after the wait for it ended.
     acked_late: [bool; 2],
+    /// When the first publish's success acknowledgement arrived.
+    first_acked_at: Option<Instant>,
     /// A subscriber of this flow had its connection closed while the verdict stood.
     subscriber_closed: bool,
     /// From the `Alive` event to the first publish that reached a subscriber again,
@@ -982,6 +1060,7 @@ struct Flow {
     second: Answer,
     /// The packet ids of the two publishes, to recognise a late acknowledgement.
     pkids: [u16; 2],
+    first_acked_at: Option<Instant>,
     healed_after: Option<Duration>,
     unanswered_after_heal: u32,
 }
@@ -1004,6 +1083,7 @@ impl Flow {
             first: Answer::Withheld,
             second: Answer::Withheld,
             pkids: [0; 2],
+            first_acked_at: None,
             healed_after: None,
             unanswered_after_heal: 0,
         }
@@ -1089,6 +1169,7 @@ impl Flow {
             first: self.first,
             second: self.second,
             acked_late: self.pkids.map(|p| self.publisher.late_acks.contains(&p)),
+            first_acked_at: self.first_acked_at,
             during: self
                 .subs
                 .iter()
@@ -1189,6 +1270,10 @@ struct Episode {
     owner_during: [Option<NodeId>; 3],
     /// B's node id.
     b_id: NodeId,
+    /// [`Fault::LinkCut`]: when both hubs had seen the link go, and the instant
+    /// before it was restored.
+    cut_seen: Option<Instant>,
+    restored: Option<Instant>,
 }
 
 impl Episode {
@@ -1445,6 +1530,7 @@ async fn episode_under(mode: Mode, link: Link, founder: Founder, fault: Fault) -
     for (flow, answer) in flows.iter_mut().zip(firsts) {
         flow.first = answer;
         flow.pkids[0] = flow.publisher.last_pkid;
+        flow.first_acked_at = flow.publisher.last_acked_at;
     }
     let seconds = join_all(flows.iter_mut().map(|f| f.publish("second", ACK_BOUND))).await;
     for (flow, answer) in flows.iter_mut().zip(seconds) {
@@ -1498,6 +1584,8 @@ async fn episode_under(mode: Mode, link: Link, founder: Founder, fault: Fault) -
         reached_b_healed,
         owner_during,
         b_id: cluster.b.id.clone(),
+        cut_seen: *cluster.cut_seen.lock().unwrap(),
+        restored: *cluster.restored.lock().unwrap(),
     };
     cluster.membership_moved_only_as_injected();
     println!("--- {mode:?}, {link:?}, founder {founder:?}, {fault:?}");
@@ -1691,6 +1779,20 @@ const ALL_FLOWS: [&str; 10] = [
     "reverse-share",
 ];
 
+/// The flows whose subscriber is on the other side of the A–B link from their
+/// publisher: every one but `from-c` (C to B) and `share-bc`, whose group has a
+/// member on C.
+const ACROSS_THE_CUT_LINK: [&str; 8] = [
+    "clean",
+    "clean-qos2",
+    "persistent",
+    "offline",
+    "share-b",
+    "rule",
+    "reverse",
+    "reverse-share",
+];
+
 /// The link-cut-only row of the matrix: no verdict anywhere. The link between A and
 /// B is cut — nothing else — and stays cut until both nodes report publishes held for
 /// the peer they cannot reach; then it is restored.
@@ -1719,6 +1821,30 @@ async fn plain_a_link_cut_with_no_verdict_holds_every_publish_and_delivers_it() 
         for flow in ["clean", "share-b", "reverse", "reverse-share"] {
             let held = e.flow(flow).first.after().expect("acked");
             println!("  held: `{flow}` waited {held:?} with the link cut ({link:?})");
+        }
+        // HELD, and not merely delivered in the end: every flow whose subscriber is
+        // across the cut link made its first publish after both hubs had seen the
+        // link go, and none of them was acknowledged before the link was restored.
+        // (An acknowledgement given while the link was down and a delivery made
+        // after it came back reads `DeliveredOnHeal` just the same; that is the
+        // acknowledged-before-anybody-had-it shape of issue #973.)
+        let (cut_seen, restored) = (
+            e.cut_seen.expect("the link was cut"),
+            e.restored.expect("the link was restored"),
+        );
+        assert!(cut_seen < restored);
+        for flow in ACROSS_THE_CUT_LINK {
+            let acked_at = e
+                .flow(flow)
+                .first_acked_at
+                .expect("acknowledged with success");
+            assert!(
+                acked_at >= restored,
+                "{link:?}: `{flow}`'s first publish was made with the link cut and \
+                 acknowledged {:?} BEFORE the link was restored — no node that owns \
+                 its subscriber can have accepted it",
+                restored.duration_since(acked_at)
+            );
         }
         // No verdict was involved, and nothing was dropped.
         assert!(
@@ -1805,4 +1931,508 @@ async fn durable_a_leader_evictor_dials_the_lease_moves_and_sessions_follow_it()
 async fn durable_the_evicted_peer_dials_the_link_returns_and_sessions_follow_the_lease() {
     let e = episode(Mode::Durable, Link::EvictedDials, Founder::Evictor, None).await;
     expect_sessions_follow_the_lease(&e);
+}
+
+// ---------------------------------------------------------------------------------
+// Publish order across a heal (ADR 0087, 0087-T2b)
+// ---------------------------------------------------------------------------------
+
+/// How often a numbered stream publishes: fast enough that publishes are arriving
+/// at the origin in the instant the link returns.
+const PACE: Duration = Duration::from_millis(10);
+
+/// The most publishes a numbered stream has unacknowledged at once. A v5 publisher
+/// honours the broker's Receive Maximum (256 by default; exceeding it is `0x93` and a
+/// closed connection), so one whose acknowledgements are held for an outage stops
+/// here and goes on when they arrive — as a real client's flow control does.
+const WINDOW: usize = 200;
+
+/// One numbered stream: a publisher that sends `0, 1, 2, …` to ONE topic without
+/// waiting for acknowledgements — as a telemetry source does — and the subscriber
+/// on another node that is owed every one of them, in that order.
+struct Stream {
+    name: &'static str,
+    qos: QoS,
+    topic: String,
+    publisher: Client,
+    subscriber: Client,
+    /// Per number: when it was sent, and when its PUBACK (`QoS` 1) or PUBREC
+    /// (`QoS` 2: the answer the broker gates) arrived, with the reason code.
+    sent: Vec<Instant>,
+    acked: Vec<Option<(Instant, u8)>>,
+    /// The numbers the subscriber received, in arrival order.
+    received: Vec<u64>,
+    publisher_closed: bool,
+    subscriber_closed: bool,
+    /// How many have been sent so far, and how many of them are unanswered, for
+    /// the conductor to read.
+    sent_so_far: Arc<AtomicUsize>,
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Stream {
+    /// `filter` is what the subscriber subscribes with — the topic's own tree, or a
+    /// `$share` group over it with this subscriber as its only member.
+    async fn start(
+        cluster: &Cluster,
+        name: &'static str,
+        from: On,
+        to: On,
+        qos: QoS,
+        clean: bool,
+        shared: bool,
+    ) -> Self {
+        let topic = format!("ord/{name}/n");
+        let filter = if shared {
+            format!("$share/g-{name}/ord/{name}/#")
+        } else {
+            format!("ord/{name}/#")
+        };
+        let to_node = cluster.node(to);
+        let sub_id = cluster
+            .client_id_on(&format!("ord-sub-{name}"), to_node)
+            .await;
+        let (mut subscriber, _) = Client::connect_v311_explained(
+            to_node.client_addr,
+            &sub_id,
+            clean,
+            Duration::from_secs(8),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("stream `{name}`: the subscriber connects: {e}"));
+        subscriber.subscribe(1, &filter, qos).await;
+        let from_node = cluster.node(from);
+        let pub_id = cluster
+            .client_id_on(&format!("ord-pub-{name}"), from_node)
+            .await;
+        let mut publisher = Client::connect_v5_ok(from_node.client_addr, &pub_id).await;
+
+        // Healthy cluster: publish beside the numbered topic until the subscriber
+        // receives one — until then the publishing node has not learned the
+        // interest — and let the rest arrive.
+        let warm = format!("ord/{name}/warm");
+        let mut routed = false;
+        for i in 0..200u16 {
+            publisher
+                .publish_full(&warm, b"w", QoS::AtLeastOnce, false, Some(60_001 + i))
+                .await;
+            let until = Instant::now() + Duration::from_millis(150);
+            while let Some(left) = until.checked_duration_since(Instant::now()) {
+                match subscriber.recv_bounded(left).await {
+                    Recv::Packet(Packet::Publish(p)) => {
+                        acknowledge(&mut subscriber, &p).await;
+                        routed = true;
+                    }
+                    Recv::Packet(Packet::PubRel(a)) => subscriber.pubcomp(a.pkid).await,
+                    Recv::Packet(_) => {}
+                    Recv::Quiet | Recv::Closed => break,
+                }
+            }
+            if routed {
+                break;
+            }
+        }
+        assert!(routed, "stream `{name}`: the healthy cluster routes it");
+        // Nothing of the warm-up is left on either connection.
+        while let Recv::Packet(_) = publisher.recv_bounded(Duration::from_millis(300)).await {}
+        loop {
+            match subscriber.recv_bounded(Duration::from_millis(300)).await {
+                Recv::Packet(Packet::Publish(p)) => acknowledge(&mut subscriber, &p).await,
+                Recv::Packet(Packet::PubRel(a)) => subscriber.pubcomp(a.pkid).await,
+                Recv::Packet(_) => {}
+                Recv::Quiet | Recv::Closed => break,
+            }
+        }
+        Stream {
+            name,
+            qos,
+            topic,
+            publisher,
+            subscriber,
+            sent: Vec::new(),
+            acked: Vec::new(),
+            received: Vec::new(),
+            publisher_closed: false,
+            subscriber_closed: false,
+            sent_so_far: Arc::new(AtomicUsize::new(0)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Publish a number every [`PACE`] until `stop`, then wait for what is still
+    /// unacknowledged; and read the subscriber until it has every number, or
+    /// nothing more comes.
+    // One publisher loop and one subscriber loop over the same stream, side by side.
+    #[allow(clippy::too_many_lines)]
+    async fn run(&mut self, stop: &std::sync::atomic::AtomicBool) {
+        let Stream {
+            qos,
+            topic,
+            publisher,
+            subscriber,
+            sent,
+            acked,
+            received,
+            publisher_closed,
+            subscriber_closed,
+            sent_so_far,
+            in_flight,
+            ..
+        } = self;
+        let (sent_so_far, in_flight) = (&**sent_so_far, &**in_flight);
+        let published = std::sync::atomic::AtomicBool::new(false);
+        let publish = async {
+            let mut next = Instant::now();
+            let mut stopped: Option<Instant> = None;
+            let mut answered = 0usize;
+            loop {
+                let stopping = stop.load(Ordering::SeqCst);
+                if stopping && stopped.is_none() {
+                    stopped = Some(Instant::now());
+                }
+                in_flight.store(sent.len() - answered, Ordering::SeqCst);
+                if !stopping && Instant::now() >= next && sent.len() - answered < WINDOW {
+                    let n = sent.len();
+                    let pkid = u16::try_from(n + 1).expect("fewer than 60,000 numbers");
+                    publisher
+                        .publish_full(topic, n.to_string().as_bytes(), *qos, false, Some(pkid))
+                        .await;
+                    sent.push(Instant::now());
+                    acked.push(None);
+                    sent_so_far.store(sent.len(), Ordering::SeqCst);
+                    next += PACE;
+                }
+                if let Some(at) = stopped {
+                    if acked.iter().all(Option::is_some) || at.elapsed() > ACK_BOUND {
+                        break;
+                    }
+                }
+                let wait = next
+                    .checked_duration_since(Instant::now())
+                    .filter(|_| !stopping)
+                    .unwrap_or(PACE);
+                match publisher.recv_bounded(wait).await {
+                    Recv::Packet(Packet::PubAck(a)) => {
+                        answered += usize::from(record(acked, a.pkid, a.reason));
+                    }
+                    Recv::Packet(Packet::PubRec(a)) => {
+                        answered += usize::from(record(acked, a.pkid, a.reason));
+                        if a.reason < 0x80 {
+                            publisher.pubrel(a.pkid).await;
+                        }
+                    }
+                    Recv::Packet(_) | Recv::Quiet => {}
+                    Recv::Closed => {
+                        *publisher_closed = true;
+                        break;
+                    }
+                }
+            }
+            published.store(true, Ordering::SeqCst);
+        };
+        let subscribe = async {
+            let mut done: Option<Instant> = None;
+            loop {
+                match subscriber.recv_bounded(Duration::from_millis(100)).await {
+                    Recv::Packet(Packet::Publish(p)) => {
+                        acknowledge(subscriber, &p).await;
+                        if p.topic == *topic {
+                            let number = std::str::from_utf8(&p.payload)
+                                .ok()
+                                .and_then(|s| s.parse().ok())
+                                .expect("a numbered payload");
+                            received.push(number);
+                        }
+                    }
+                    Recv::Packet(Packet::PubRel(a)) => subscriber.pubcomp(a.pkid).await,
+                    Recv::Packet(_) => {}
+                    Recv::Quiet => {
+                        if !published.load(Ordering::SeqCst) {
+                            continue;
+                        }
+                        let since = *done.get_or_insert_with(Instant::now);
+                        let all = sent_so_far.load(Ordering::SeqCst);
+                        if received.len() >= all || since.elapsed() > ACK_BOUND {
+                            break;
+                        }
+                    }
+                    Recv::Closed => {
+                        *subscriber_closed = true;
+                        break;
+                    }
+                }
+            }
+        };
+        tokio::join!(publish, subscribe);
+    }
+
+    /// Every number was acknowledged with success and delivered, once, in the order
+    /// it was published.
+    #[track_caller]
+    fn expect_everything_arrived_in_publish_order(&self, what: &str) {
+        let name = self.name;
+        assert!(
+            !self.publisher_closed && !self.subscriber_closed,
+            "{what}, stream `{name}`: no connection is closed on a client \
+             (publisher {}, subscriber {})",
+            self.publisher_closed,
+            self.subscriber_closed
+        );
+        let unacked: Vec<usize> = (0..self.sent.len())
+            .filter(|i| !matches!(self.acked[*i], Some((_, 0))))
+            .collect();
+        assert!(
+            unacked.is_empty(),
+            "{what}, stream `{name}`: every publish is acknowledged with success; \
+             these were not: {unacked:?} (answers {:?})",
+            unacked
+                .iter()
+                .map(|i| self.acked[*i].map(|(_, reason)| reason))
+                .collect::<Vec<_>>()
+        );
+        let out_of_order: Vec<(u64, u64)> = self
+            .received
+            .windows(2)
+            .filter(|w| w[1] <= w[0])
+            .map(|w| (w[0], w[1]))
+            .collect();
+        assert!(
+            out_of_order.is_empty(),
+            "{what}, stream `{name}`: the subscriber must see one publisher's messages \
+             on one topic in the order they were published [MQTT-4.6.0-6]; it saw these \
+             pairs the wrong way round (or twice): {out_of_order:?}. Received: {:?}",
+            self.received
+        );
+        // Exactly once, at `QoS` 1 too. That is stricter than MQTT, which allows a
+        // `QoS` 1 duplicate, and it is deliberate: nothing in these episodes may
+        // produce one. The publishers never retry; a forward the origin sends
+        // again when the link is back carries the seq it was recorded with, and the
+        // receiving node recognises it in its window of that origin's recent
+        // forwards (16,384 of them — these streams hold a few hundred) and answers
+        // it again instead of applying it again; and no `$share` delivery here has
+        // a second member to move to. A duplicate would mean one of those failed.
+        let expected: Vec<u64> = (0..self.sent.len() as u64).collect();
+        assert_eq!(
+            self.received, expected,
+            "{what}, stream `{name}`: every acknowledged publish is delivered, once"
+        );
+    }
+
+    /// The numbers sent in `[from, to)`, with when each was acknowledged.
+    fn sent_between(&self, from: Instant, to: Instant) -> Vec<(usize, Instant)> {
+        (0..self.sent.len())
+            .filter(|i| self.sent[*i] >= from && self.sent[*i] < to)
+            .filter_map(|i| Some((i, self.acked[i]?.0)))
+            .collect()
+    }
+}
+
+/// Acknowledge one delivery (the first step, at `QoS` 2).
+async fn acknowledge(client: &mut Client, p: &mqtt_codec::packet::Publish) {
+    match (p.qos, p.pkid) {
+        (QoS::AtLeastOnce, Some(pkid)) => client.puback(pkid).await,
+        (QoS::ExactlyOnce, Some(pkid)) => client.pubrec(pkid).await,
+        _ => {}
+    }
+}
+
+/// Record the first answer to the numbered publish with packet id `pkid`; whether
+/// this was it.
+fn record(acked: &mut [Option<(Instant, u8)>], pkid: u16, reason: u8) -> bool {
+    match usize::from(pkid)
+        .checked_sub(1)
+        .and_then(|i| acked.get_mut(i))
+    {
+        Some(slot @ None) => {
+            *slot = Some((Instant::now(), reason));
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The numbered streams of one ordering episode, each with its own publisher,
+/// topic and subscriber:
+///
+/// | stream | publisher | subscriber |
+/// |---|---|---|
+/// | `q1`, `q2` | A | a clean session on B, at `QoS` 1 and at `QoS` 2 |
+/// | `pers` | A | a persistent session on B (its deliveries go through its queue) |
+/// | `share-q1`, `share-q2` | A | a `$share` group whose only member is on B |
+/// | `rev` | B | a clean session on A — the other direction over the same link |
+/// | `rev-share` | B | a `$share` group whose only member is on A |
+async fn numbered_streams(cluster: &Cluster) -> Vec<Stream> {
+    let (q1, q2) = (QoS::AtLeastOnce, QoS::ExactlyOnce);
+    vec![
+        Stream::start(cluster, "q1", On::A, On::B, q1, true, false).await,
+        Stream::start(cluster, "q2", On::A, On::B, q2, true, false).await,
+        Stream::start(cluster, "pers", On::A, On::B, q1, false, false).await,
+        Stream::start(cluster, "share-q1", On::A, On::B, q1, true, true).await,
+        Stream::start(cluster, "share-q2", On::A, On::B, q2, true, true).await,
+        Stream::start(cluster, "rev", On::B, On::A, q1, true, false).await,
+        Stream::start(cluster, "rev-share", On::B, On::A, q1, true, true).await,
+    ]
+}
+
+/// Run every stream across `fault`: publishing before it, all the way through it,
+/// and after it has healed.
+async fn publish_numbered_streams_across(link: Link, fault: Fault) -> (Cluster, Vec<Stream>) {
+    let cluster = Cluster::start(Mode::Plain, link, Founder::Evictor).await;
+    let mut streams = numbered_streams(&cluster).await;
+    let counters: Vec<(Arc<AtomicUsize>, Arc<AtomicUsize>)> = streams
+        .iter()
+        .map(|s| (s.sent_so_far.clone(), s.in_flight.clone()))
+        .collect();
+    let every_stream_has_sent = |at_least: &[usize]| {
+        counters
+            .iter()
+            .zip(at_least)
+            .all(|((sent, _), least)| sent.load(Ordering::SeqCst) >= *least)
+    };
+    // ... or cannot send more until an acknowledgement arrives.
+    let every_stream_has_sent_or_waits = |at_least: &[usize]| {
+        counters
+            .iter()
+            .zip(at_least)
+            .all(|((sent, in_flight), least)| {
+                sent.load(Ordering::SeqCst) >= *least || in_flight.load(Ordering::SeqCst) >= WINDOW
+            })
+    };
+    let so_far_plus = |more: usize| -> Vec<usize> {
+        counters
+            .iter()
+            .map(|(sent, _)| sent.load(Ordering::SeqCst) + more)
+            .collect()
+    };
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let conduct = async {
+        let healthy = so_far_plus(10);
+        wait_until(
+            "every stream has published on the healthy cluster",
+            Duration::from_secs(30),
+            || every_stream_has_sent(&healthy),
+        )
+        .await;
+        match fault {
+            Fault::LinkCut => {
+                // The streams publish on while both hubs come to see the link gone.
+                cluster.cut_the_link().await;
+                let under_the_cut = so_far_plus(20);
+                wait_until(
+                    "every stream has published with the link cut",
+                    Duration::from_secs(30),
+                    || every_stream_has_sent_or_waits(&under_the_cut),
+                )
+                .await;
+                cluster.restore_the_link_once_the_hold_is_visible().await;
+            }
+            Fault::FalseDead { .. } => {
+                cluster.falsely_declare_b_dead_on_a().await;
+                // The link is dialed again half a second after the verdict; the
+                // streams publish through its loss, its return and the instant in
+                // between, and for a while under the verdict with the link back.
+                let under_the_verdict = so_far_plus(200);
+                wait_until(
+                    "every stream has published under the verdict",
+                    Duration::from_mins(1),
+                    || every_stream_has_sent(&under_the_verdict),
+                )
+                .await;
+                cluster.heal();
+            }
+        }
+        let healed = so_far_plus(50);
+        wait_until(
+            "every stream has published after the heal",
+            Duration::from_mins(1),
+            || every_stream_has_sent(&healed),
+        )
+        .await;
+        stop.store(true, Ordering::SeqCst);
+    };
+    tokio::join!(join_all(streams.iter_mut().map(|s| s.run(&stop))), conduct);
+    cluster.membership_moved_only_as_injected();
+    for s in &streams {
+        println!(
+            "  stream {:<10} {:?}: {} published, {} delivered ({link:?}, {fault:?})",
+            s.name,
+            s.qos,
+            s.sent.len(),
+            s.received.len()
+        );
+    }
+    (cluster, streams)
+}
+
+/// 0087-T2b, order across a heal — the link alone is cut. Seven numbered streams
+/// publish every ten milliseconds before the cut, all through it, and after the
+/// link is restored: ordinary and `$share` subscribers, clean and persistent
+/// sessions, `QoS` 1 and `QoS` 2, in both directions over the link, for both
+/// orientations of the dialer.
+///
+/// - **Order.** Each subscriber sees its publisher's numbers strictly increasing,
+///   and all of them, once. What was held for the peer while the link was down
+///   reaches it ahead of what was published after the link came back.
+/// - **The acknowledgement was HELD** — for EVERY publish made with the link cut,
+///   not only the first of a flow: none of them is acknowledged before the instant
+///   the link was restored. (A publish is made with the link cut when it is sent
+///   after the relay stopped carrying the link: from then on nothing crosses it,
+///   whether or not the hubs have noticed.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn plain_a_link_cut_keeps_publish_order_and_holds_every_acknowledgement_until_the_heal() {
+    for link in [Link::EvictorDials, Link::EvictedDials] {
+        let what = format!("link cut, {link:?}");
+        let (cluster, streams) = publish_numbered_streams_across(link, Fault::LinkCut).await;
+        let cut_at = cluster.cut_at.lock().unwrap().expect("the link was cut");
+        let restored = cluster.restored_at();
+        for s in &streams {
+            s.expect_everything_arrived_in_publish_order(&what);
+            let under_the_cut = s.sent_between(cut_at, restored);
+            assert!(
+                under_the_cut.len() >= 20,
+                "{what}, stream `{}`: publishes were made with the link cut ({})",
+                s.name,
+                under_the_cut.len()
+            );
+            let early: Vec<usize> = under_the_cut
+                .iter()
+                .filter(|(_, acked_at)| *acked_at < restored)
+                .map(|(i, _)| *i)
+                .collect();
+            assert!(
+                early.is_empty(),
+                "{what}, stream `{}`: {} of the {} publishes made with the link cut were \
+                 acknowledged BEFORE it was restored — no node that owns their subscriber \
+                 can have accepted them: {early:?}",
+                s.name,
+                early.len(),
+                under_the_cut.len()
+            );
+            println!(
+                "  stream {:<10} {} publishes made with the link cut, none acknowledged \
+                 before it was restored",
+                s.name,
+                under_the_cut.len()
+            );
+        }
+    }
+}
+
+/// 0087-T2b, order across a heal — the false verdict. A is told the live B is
+/// `Dead` while the same seven streams publish; the link is dropped and dialed
+/// again half a second later, and the streams publish through all of it. Each
+/// subscriber sees its publisher's numbers strictly increasing, and all of them,
+/// once — for both orientations of the dialer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn plain_a_false_verdict_keeps_publish_order_for_every_subscriber() {
+    for link in [Link::EvictorDials, Link::EvictedDials] {
+        let what = format!("false verdict, {link:?}");
+        let fault = Fault::FalseDead {
+            withdrawn_after: None,
+        };
+        let (_cluster, streams) = publish_numbered_streams_across(link, fault).await;
+        for s in &streams {
+            s.expect_everything_arrived_in_publish_order(&what);
+        }
+    }
 }

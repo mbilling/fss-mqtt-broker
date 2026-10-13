@@ -120,7 +120,7 @@ fn partitioned_fixture() -> Fix {
 /// because an off-loop completion takes several polls to travel (the lane
 /// worker is woken, its store future resolves, then it sends), and returning on
 /// the first quiet round would be a race dressed up as a quiescence check.
-pub(super) async fn quiesce(hub: &mut Hub) {
+pub(in crate::hub) async fn quiesce(hub: &mut Hub) {
     const IDLE_ROUNDS: u32 = 8;
     let mut idle = 0;
     for _ in 0..256 {
@@ -480,9 +480,12 @@ async fn an_early_acked_publish_still_replays_to_a_session_the_scan_materialises
 /// the entry would already be gone, `reroute_candidates(id)` returns
 /// `Vec::new()` for an absent id, and `register_forward` bails at its
 /// `get_mut(&id)` guard — so the forward is silently never sent, with no error
-/// anywhere. Note that `HubCommand::RemoteInterest` itself re-routes nothing:
-/// `settle_pending_publishes` is the only path that does, which is what makes
-/// this a statement about the work set.
+/// anywhere. Note that a `HubCommand::RemoteInterest` on a link the peer has
+/// already announced on re-routes nothing itself: `settle_pending_publishes` is
+/// the only path that does, which is what makes this a statement about the work
+/// set. (The FIRST snapshot on a link does re-route, since ADR 0087 — what is
+/// held goes out in publish order as the link opens — so the successor here has
+/// announced once before the publish.)
 #[tokio::test]
 async fn an_early_acked_publish_still_re_routes_to_a_peer_that_advertises_interest_later() {
     let mut fix = clustered_fixture();
@@ -499,6 +502,13 @@ async fn an_early_acked_publish_still_re_routes_to_a_peer_that_advertises_intere
         depth: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     })
     .await;
+    // The successor says what it routes, first thing on its link: nothing yet.
+    fix.dispatch(HubCommand::RemoteInterest {
+        node: NodeId("successor".into()),
+        conn_id: Some(1),
+        filters: Vec::new(),
+    })
+    .await;
 
     let mut ack = fix.publish_gated("settle/r").await;
     let id = fix.only_pending();
@@ -512,13 +522,14 @@ async fn an_early_acked_publish_still_re_routes_to_a_peer_that_advertises_intere
     // The successor materialises the inherited subscriber and re-advertises.
     fix.dispatch(HubCommand::RemoteInterest {
         node: NodeId("successor".into()),
+        conn_id: None,
         filters: vec!["settle/r".into()],
     })
     .await;
     assert!(
         fix.hub.pending_publishes[&id].awaiting.is_empty(),
-        "fixture invariant: RemoteInterest alone must not re-route — only the \
-         settle pass does, which is what this test is about"
+        "fixture invariant: a later RemoteInterest alone must not re-route — only \
+         the settle pass does, which is what this test is about"
     );
 
     fix.scan_lands(&[], false).await;
@@ -1165,6 +1176,7 @@ async fn a_proto_11_peer_gets_the_untagged_forward_and_an_untagged_replay_still_
     .await;
     fix.dispatch(HubCommand::RemoteInterest {
         node: NodeId("old-peer".into()),
+        conn_id: None,
         filters: vec!["q/#".into()],
     })
     .await;

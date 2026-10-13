@@ -19,6 +19,7 @@ fn group(name: &str, filter: &str, clients: &[&str], qos: QoS) -> RemoteSharedGr
 async fn interest(hub: &mut Hub, node: &str, groups: Vec<RemoteSharedGroup>) {
     hub.dispatch(HubCommand::RemoteSharedInterest {
         node: NodeId(node.into()),
+        conn_id: None,
         groups,
     })
     .await;

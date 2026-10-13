@@ -202,6 +202,7 @@ impl Rig {
         .await;
         hub.dispatch(HubCommand::RemoteSharedInterest {
             node: NodeId(PEER.into()),
+            conn_id: None,
             groups: vec![RemoteSharedGroup {
                 group: GROUP.into(),
                 filter: TOPIC.into(),

@@ -1055,6 +1055,7 @@ where
             &mut buf,
             &hub,
             &remote,
+            conn_id,
             &mut ctl_rx,
             &mut out_rx,
             &reply_ctl,
@@ -1109,6 +1110,7 @@ async fn pump<R, W>(
     buf: &mut BytesMut,
     hub: &mpsc::UnboundedSender<HubCommand>,
     remote: &NodeId,
+    conn_id: u64,
     ctl_rx: &mut mpsc::UnboundedReceiver<PeerMessage>,
     out_rx: &mut mpsc::UnboundedReceiver<PeerMessage>,
     reply_ctl: &mpsc::WeakUnboundedSender<PeerMessage>,
@@ -1184,7 +1186,7 @@ where
                     }
                     Some(msg) => {
                         stats.frames_in.fetch_add(1, Ordering::Relaxed);
-                        forward_inbound(msg, hub, remote, plane, ingress, reply_ctl, reply_bulk);
+                        forward_inbound(msg, hub, remote, conn_id, plane, ingress, reply_ctl, reply_bulk);
                     }
                 }
             }
@@ -1280,10 +1282,12 @@ fn peer_credit(
 /// Translate an inbound peer message into a hub command.
 // One arm per wire variant — a flat dispatch table, not a refactor smell.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)] // the link's handles, as `pump` holds them
 fn forward_inbound(
     msg: PeerMessage,
     hub: &mpsc::UnboundedSender<HubCommand>,
     remote: &NodeId,
+    conn_id: u64,
     plane: Option<&DurablePlane>,
     ingress: Option<&IngressCredit>,
     reply_ctl: &mpsc::WeakUnboundedSender<PeerMessage>,
@@ -1377,6 +1381,7 @@ fn forward_inbound(
         PeerMessage::Interest { filters } => {
             let _ = hub.send(HubCommand::RemoteInterest {
                 node: remote.clone(),
+                conn_id: Some(conn_id),
                 filters,
             });
         }
@@ -1519,6 +1524,7 @@ fn forward_inbound(
                 .collect();
             let _ = hub.send(HubCommand::RemoteSharedInterest {
                 node: remote.clone(),
+                conn_id: Some(conn_id),
                 groups,
             });
         }
@@ -1910,6 +1916,7 @@ mod tests {
                 &mut buf,
                 &hub_tx,
                 &remote,
+                1,
                 &mut ctl_rx,
                 &mut out_rx,
                 &reply_ctl,
@@ -1978,6 +1985,7 @@ mod tests {
                     &mut buf,
                     &hub_tx,
                     &NodeId("peer-under-test".into()),
+                    1,
                     &mut ctl_rx,
                     &mut out_rx,
                     &reply_ctl,
@@ -2065,7 +2073,8 @@ mod tests {
         let remote = NodeId("n2".into());
         let unit = 1 + 200 + crate::ingress::COMMAND_OVERHEAD; // topic + payload + overhead
         let credit = IngressCredit::new(4 * unit, 2 * unit, OverloadMode::Pause);
-        let forward = |msg| forward_inbound(msg, &hub, &remote, None, Some(&credit), &ctl, &bulk);
+        let forward =
+            |msg| forward_inbound(msg, &hub, &remote, 1, None, Some(&credit), &ctl, &bulk);
 
         // With credit: the permit rides inside the command until the hub drops it.
         forward(publish(0, false));
@@ -2109,7 +2118,7 @@ mod tests {
         drop(full);
 
         // No credit configured: nothing is charged or shed.
-        forward_inbound(publish(0, false), &hub, &remote, None, None, &ctl, &bulk);
+        forward_inbound(publish(0, false), &hub, &remote, 1, None, None, &ctl, &bulk);
         assert!(matches!(
             rx.try_recv(),
             Ok(HubCommand::RemotePublish { credit: None, .. })
@@ -2172,6 +2181,7 @@ mod tests {
                     &mut buf,
                     &hub_tx,
                     &remote,
+                    1,
                     &mut ctl_rx,
                     &mut out_rx,
                     &reply_ctl,

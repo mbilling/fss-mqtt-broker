@@ -55,6 +55,8 @@ impl Rig {
             mqtt_cluster::peer::PROTO_MAX,
             Arc::default(),
         );
+        // The receiver has announced on the link: forwards to it are sent.
+        sender.peer_announced_interest(&target(), Vec::new());
 
         let store = Arc::new(MemorySessionStore::new());
         let (receiver, _) = Hub::with_config(target(), store.clone() as Arc<dyn SessionStore>);

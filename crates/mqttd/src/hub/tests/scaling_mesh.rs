@@ -143,6 +143,7 @@ impl Mesh {
             // and therefore the only way `mesh_settled` can become true.
             hub.dispatch(HubCommand::RemoteInterest {
                 node: node.clone(),
+                conn_id: None,
                 filters: filters.iter().map(|f| (*f).to_string()).collect(),
             })
             .await;
@@ -627,6 +628,7 @@ async fn shared_planning_takes_no_scratch_when_no_peer_announced_a_group() {
         }
         hub.dispatch(HubCommand::RemoteSharedInterest {
             node: NodeId("peer-0".into()),
+            conn_id: None,
             groups: vec![RemoteSharedGroup {
                 group: "pool-remote".into(),
                 filter: "site/#".into(),

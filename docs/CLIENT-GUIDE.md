@@ -78,6 +78,31 @@ setting: `0` is refused at config validation.
 Inbound publish *rate* (`MQTTD_MAX_PUBLISH_RATE`) pauses the socket read — TCP
 backpressure — it does not drop or disconnect.
 
+## Message order
+
+For an ordinary (non-shared) subscription, **the QoS 1 and QoS 2 messages one
+publisher connection sends arrive in the order it published them** — on one node,
+and in a cluster when the subscriber is on another node than the publisher
+([MQTT-4.6.0-6]; in fact across that publisher's topics and across QoS 1 and 2, not
+only per topic). It holds across an outage between the two nodes as well
+([ADR 0087](adr/0087-delivery-across-a-false-dead-verdict.md)): publishes for a
+subscriber whose node cannot be reached are held, their acknowledgements with them,
+and when the link is back they are delivered oldest first, ahead of anything
+published after it returned.
+
+What it does not cover:
+
+- **Different publishers.** Two connections' messages interleave as the broker
+  received them; publishers connected to different nodes have no mutual order.
+- **QoS 0.** A QoS 0 message is not held for a node that cannot be reached (it is
+  not delivered there), and one published in the instant a link returns can arrive
+  ahead of older QoS 1/2 messages that were held. The specification orders per QoS.
+- **Retries and resumed sessions.** A publish the publisher sends again after a
+  reconnect arrives when it is sent again. A session that resumes — on the same node
+  or, when its node is lost, on another — gets its unacknowledged messages again
+  (`DUP` set) before or among new ones.
+- **Shared subscriptions**, below.
+
 ## Refusal behaviour
 
 A refused operation is an **answered refusal**, not a silent drop (except where
@@ -123,6 +148,23 @@ same group can be selected. Locals with room remain preferred; remote capacity i
 unknown. No alternative means a counted QoS 0 drop, not unlimited buffering or a
 retry after an ambiguous send. This does not yet make the group an end-to-end
 capacity-aware bridge pool; see [the measured scope](benchmarks/SHARED-CAPACITY.md).
+
+**A QoS 1/2 publish is acknowledged when a member took it**
+([ADR 0087](adr/0087-delivery-across-a-false-dead-verdict.md)). If the chosen member
+is on another node and its session has gone by the time the message gets there — it
+disconnected with a clean session — that node refuses the delivery and it is given
+to another member. (A member that only *unsubscribed* in that instant, and is still
+connected or keeps a session, still gets the message: a broker may complete a
+delivery it had started when the UNSUBSCRIBE arrived [MQTT-3.10.4-3]. A message held
+across an outage is checked against the node's membership when the link returns, so
+there an unsubscribe counts too.) If the member's node cannot be reached, the
+message goes to a member that can be, and only when the group has none is it held
+for the one that cannot (the publisher's acknowledgement waits with it). A publish
+for a group whose last member has left is acknowledged like one nobody subscribes
+to. A message that had to move to another member this way can arrive after later
+ones, and one that was already in flight to a member whose node is then written off
+can be delivered twice (also at QoS 2): MQTT leaves shared subscriptions unordered,
+and with a single member per group the order above holds.
 
 ## Emitted reason codes (failure, `>= 0x80`)
 
