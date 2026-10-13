@@ -3384,7 +3384,8 @@ mod zone_fwd_proofs {
     /// After either, the member is a member: its link is lost, and its interest and
     /// the forward in flight to it are kept. (The link manager used to withdraw the
     /// verdict only when `Dead` was the event just before `Alive`; with `Suspect`
-    /// in between the hub held the verdict for good, and this flap erased both.)
+    /// in between the hub held the verdict for good, and every later flap that
+    /// outlasted the hold erased both.)
     #[tokio::test]
     async fn after_dead_suspect_alive_a_lost_link_is_a_members_lost_link() {
         use mqtt_cluster::swim::MemberState;
@@ -3444,8 +3445,13 @@ mod zone_fwd_proofs {
             fan_out(&mut h, "t/x", QoS::AtLeastOnce, false, Some(id));
             h.pending_local_done(id);
 
-            // An ordinary link flap, some time later.
+            // An ordinary link flap, some time later — and the link stays down for
+            // longer than a hold lasts. A node still held dead would be erased by
+            // then; a member is not.
             h.peer_disconnected(&again.node, 0);
+            for _ in 0..REROUTE_GRACE_TICKS * 2 {
+                sweep_tick(&mut h);
+            }
             assert!(
                 h.interest.has_node(&again.node),
                 "{returns_at}: a member's lost link keeps its interest"
