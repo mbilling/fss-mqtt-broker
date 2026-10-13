@@ -752,7 +752,7 @@ turned a healthy member `Dead`.
 
 | Detector | Nodes | 0.5 s | 1 s | 1.5 s | 2 s | 3 s | 5 s |
 |---|---|---|---|---|---|---|---|
-| **today**: 4 s, 1.5 s with three suspecters | 3 | 0 | 0 | 0 | 0 | 3 | 32 |
+| **before T10**: 4 s, 1.5 s with three suspecters, no last probe | 3 | 0 | 0 | 0 | 0 | 3 | 32 |
 | | 5 | 0 | 0 | 3 | 7 | 18 | 32 |
 | | 10 | 4 | 4 | 7 | 13 | 25 | 32 |
 | | 14 | 6 | 10 | 16 | 21 | 25 | 32 |
@@ -763,33 +763,63 @@ turned a healthy member `Dead`.
 | | 30 | 0 | 1 | 1 | 6 | 11 | 31 |
 | memberlist's defaults (floor `4·max(1, log10 N)` s, ceiling ×6) | 14 | 0 | 0 | 0 | 0 | 1 | 30 |
 | | 30 | 0 | 0 | 0 | 0 | 0 | 23 |
-| **one last direct probe before `Dead`** | 5 | 0 | 0 | 0 | 0 | 6 | 29 |
+| **one last direct probe before `Dead`** (the default since T10) | 3 | 0 | 0 | 0 | 0 | 0 | 32 |
+| | 5 | 0 | 0 | 0 | 0 | 6 | 29 |
 | | 10 | 0 | 0 | 0 | 0 | 3 | 31 |
 | | 14 | 0 | 0 | 0 | 0 | 8 | 30 |
 | | 30 | 0 | 0 | 0 | 0 | 0 | 28 |
 
-Up to 3 s every one of today's verdicts was reached after the outage had ended; each stood
-for the tombstone's 30 s. What is left with the probe at 3 s is a `Dead` declared *during*
+Up to 3 s every one of the verdicts without the probe was reached after the outage had
+ended; each stood for the tombstone's 30 s. What is left with the probe at 3 s is a `Dead` declared *during*
 the outage — three suspecters shorten the window to 1.5 s, and the member really was
 silent when it was asked — and adopted from gossip by the others afterwards. What each costs when the member is really dead (ms until the
-last survivor holds it `Dead`, median / worst): today 5313 / 8037 at 14 nodes and
-6500 / 8347 at 30; the last direct probe 5613 / 8337 and 7005 / 8347; memberlist's
+last survivor holds it `Dead`, median / worst): without the probe 5313 / 8037 at 14 nodes
+and 6500 / 8347 at 30; the last direct probe 5613 / 8337 and 7005 / 8347; memberlist's
 defaults 7775 / 20079 and 10869 / 23494. The full table and the mixed-version rows are in
 #975.
 
 The last direct probe is `Config::confirm_before_dead`, added with this record so that it
-could be measured, **off by default**; so is `Config::suspicion_scales_with_log_n`.
-Neither is operator configuration. The probe's rule is that a suspect which answers it is
+could be measured, off; `Config::suspicion_scales_with_log_n` was added the same way and
+is still off. Neither is operator configuration. The probe's rule is that a suspect which answers it is
 never declared dead on that window, whatever its `Ack` carries: usually the `Ack` carries
 the refutation; when it cannot (the suspect is already an incarnation ahead of a stale
 claim and has nothing left to gossip about itself, or is an older build), the `Ack` alone
 keeps it and it is asked for its own claim with a `Join`. That second half was added on
-review; without it the 30-node row read 0, 0, 0, 2, 3, 30. The default is not changed here, although the probe is
+review; without it the 30-node row read 0, 0, 0, 2, 3, 30. The default was not changed with this record, although the probe was
 never worse in any cell and adds no wire element: ADR 0016 asks that a change to failure
 detection be a change of its own, a clean cut on a lossless network is one fault shape,
 and in a cluster part-way through an upgrade the nodes still on v1.1.0 keep declaring —
 and spreading — the verdicts the rule would have prevented (14 nodes, 1.5 s: 0 runs of 32
 with every node on the rule, 5 with one node left on v1.1.0, 11 with half, 16 with all).
+
+**As built (0087-T10, 2026-10-13).** The maintainer decided the same day to make the
+last direct probe the default, and it is: `confirm_before_dead` defaults to `true`, with
+no operator switch — none of the detector's settings has one. The change and its
+evidence are [ADR 0016](0016-swim-membership-stability.md)'s amendment of 2026-10-13
+("a suspect is asked once more"), which re-ran the table above on the final tree (the
+same figures) and measured what the table leaves out:
+
+- **the bound**, now a test (`a_member_cut_off_for_up_to_two_seconds_is_not_declared_dead`,
+  in place of `a_short_cut_still_ends_in_a_false_dead_on_the_default_window`): a member
+  cut off for up to 2 s is declared `Dead` by no node, at 3 to 30 nodes;
+- **the price**: a member that really died is held `Dead` by every survivor about
+  0.3 s later in the median, up to 0.6 s later at worst;
+- **formation** is untouched (a formation raises no suspicion, so no probe is sent);
+- **packet loss**: fewer false verdicts in every cell, not none — at 30 nodes and 10 %
+  loss a third of the runs still see one within 75 s — and a dead member is always
+  buried;
+- **one-way reachability**: the probe spares a suspect only on a round trip between
+  the prober and the suspect, so a member that hears nothing, or cannot be heard, is
+  declared `Dead` as before; one link lost one way raises no suspicion at all, as
+  before, and is D1's member without a link;
+- **a stopped process**: one of twelve real brokers stopped for 2 s, 68 times, was
+  declared `Dead` in none.
+
+Under this record's design a verdict costs latency, not a message; with the probe a
+short outage of one member no longer costs that either. What is left of #975 —
+checking a *relayed* `Dead` about a member this node can still reach, which is what
+the 3 s cells and the mixed-version rows need, and whether the window should grow with
+the cluster, which is what the packet-loss cells need — is 0087-T10b.
 
 ## Alternatives considered
 
@@ -846,4 +876,8 @@ with every node on the rule, 5 with one node left on v1.1.0, 11 with half, 16 wi
   A host that accepts the connection and then says nothing is run, on loopback, against
   the handshake's deadline; a host that stops after the link is established is not —
   that such a link ends at the next write is from TCP, not from a test here.
-- §7 is a simulation of one fault shape; #975 lists what it leaves out.
+- §7's table is a simulation of one fault shape. ADR 0016's amendment of 2026-10-13
+  adds packet loss, one-way reachability, a late member and a stopped process; several
+  members at fault at once, a fault during formation, and the rig under load are not
+  measured. The probe's effect on the membership flap the rig saw near saturation
+  (README) has not been run.

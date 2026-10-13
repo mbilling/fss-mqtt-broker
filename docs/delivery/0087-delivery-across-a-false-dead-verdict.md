@@ -58,10 +58,15 @@ tasks:
     issue: 973
     notes: "Size M, plus rig time. Last: it certifies the rest. Until it has run, the README's 'none lost' carries the condition it was measured under (O8)."
   - id: 0087-T10
-    title: "Failure detection: one last direct probe before Dead on by default, and the same check before adopting a relayed Dead; decide the window's scaling"
+    title: "Failure detection: one last direct probe of a suspect before it is declared Dead, on by default"
+    status: in-progress
+    issue: 999
+    notes: "swim.rs: Config::confirm_before_dead defaults to true; not operator configuration (none of the detector's settings is). The formation simulation gains packet loss, one-way reachability, one link lost one way and a late member, and a second report (fault_shapes_report); the characterisation test is replaced by the bound the default keeps (a cut of up to 2 s ends in no Dead at 5, 14 and 30 nodes), with the old behaviour pinned as what the switch off gives. A driver test that only a datagram signed by the suspect answers the probe. Twelve real brokers with one stopped for 2 s (nightly tier). ADR 0016's amendment of 2026-10-13 carries the tables."
+  - id: 0087-T10b
+    title: "Failure detection: the same check before adopting a relayed Dead about a member this node can reach; decide whether the suspicion window scales with the cluster's size"
     status: planned
     issue: 975
-    notes: "Size M (3-5 days). Independent of T2-T9 and may go first. swim.rs (confirm_before_dead exists, off), swim_sim.rs for loss and one-way faults, the formation simulation's bounds. ADR 0016 gets the amendment."
+    notes: "Size M. What T10 leaves of #975: the 3 s cells and the mixed-version rows (a Dead declared by another node, or by a v1.1.0 node, is adopted unchecked) and the packet-loss cells at 14 nodes and more (the window does not grow with the cluster). suspicion_scales_with_log_n exists, off. ADR 0016 gets the amendment."
 ---
 
 # Delivery 0087 — acknowledged only when the owning node has accepted it
@@ -82,8 +87,8 @@ without making durable failover slower: T2 is the rule, T3 is what ends a hold w
 peer really is gone, T4 makes a false verdict heal in a second in either link
 orientation, T5 keeps a real owner death at today's failover pause, T6 and T7 make the
 hold bounded and visible, and T8 is the evidence. In working days for one person, by the
-sizes above: about five to seven weeks, then the rig. T10 is separate, smaller, and
-reduces how often any of it is exercised.
+sizes above: about five to seven weeks, then the rig. T10 and T10b are separate,
+smaller, and reduce how often any of it is exercised.
 
 Tasks T2–T9 are tracked under #973 until the ADR is accepted; each gets its own issue
 then, once its sub-decision is settled (T3: O1, O4; T5: O2, O5; T6: O3).
@@ -102,7 +107,8 @@ then, once its sub-decision is settled (T3: O1, O4; T5: O2, O5; T6: O3).
 | **0087-T7** Observability (D9) | An operator can see, from metrics alone, that publishes are held for a peer and how each hold ended; the alert fires in the chart's test; OPERATIONS has the runbook. |
 | **0087-T8** Tests (D11) | `cluster_stress` holds acked durability for clean-session, persistent and `$share` subscribers across seeded false verdicts and partitions; `cluster_proc`'s `SIGSTOP` nemesis passes the acked-facts oracle. |
 | **0087-T9** Rig | A ledgered run with a membership fault under load loses nothing; the re-measured rungs are published with the README. |
-| **0087-T10** Failure detection (#975) | `a_short_cut_still_ends_in_a_false_dead_on_the_default_window` is replaced by the bound the new default keeps; no formation regression. |
+| **0087-T10** Failure detection: the last direct probe, on by default (#999) | `a_short_cut_still_ends_in_a_false_dead_on_the_default_window` is replaced by the bound the new default keeps; no formation regression. |
+| **0087-T10b** Failure detection: a relayed `Dead`, and the window's scaling (#975) | A `Dead` relayed about a member the node can reach is checked before it is adopted, or the decision not to is recorded with its measurement; the 3 s cells and the mixed-version rows of ADR 0016's table say what changed. The window's scaling is decided, with the packet-loss cells at 14 and 30 nodes as its measure. |
 
 ## Progress
 
@@ -119,7 +125,8 @@ then, once its sub-decision is settled (T3: O1, O4; T5: O2, O5; T6: O3).
 | 0087-T7 | ⬜ planned | [#973](https://github.com/mbilling/fss-mqtt-broker/issues/973) | — | "Size M (3-4 days). mqtt-observability, hub, admin API and CLI, the chart's PrometheusRule (re-vendor the mqttui bundle), OPERATIONS, TROUBLESHOOTING, GUIDE. Also settles the no-subscriber reason that is documented and never emitted." |
 | 0087-T8 | ⬜ planned | [#973](https://github.com/mbilling/fss-mqtt-broker/issues/973) | — | "Size L (1-2 weeks), alongside T2-T5 rather than after them: each of those lands with its rows flipped. The stress and out-of-process injections are what makes the claim more than six scripted episodes." |
 | 0087-T9 | ⬜ planned | [#973](https://github.com/mbilling/fss-mqtt-broker/issues/973) | — | "Size M, plus rig time. Last: it certifies the rest. Until it has run, the README's 'none lost' carries the condition it was measured under (O8)." |
-| 0087-T10 | ⬜ planned | [#975](https://github.com/mbilling/fss-mqtt-broker/issues/975) | — | "Size M (3-5 days). Independent of T2-T9 and may go first. swim.rs (confirm_before_dead exists, off), swim_sim.rs for loss and one-way faults, the formation simulation's bounds. ADR 0016 gets the amendment." |
+| 0087-T10 | 🚧 in-progress | [#999](https://github.com/mbilling/fss-mqtt-broker/issues/999) | — | "swim.rs: Config::confirm_before_dead defaults to true; not operator configuration (none of the detector's settings is). The formation simulation gains packet loss, one-way reachability, one link lost one way and a late member, and a second report (fault_shapes_report); the characterisation test is replaced by the bound the default keeps (a cut of up to 2 s ends in no Dead at 5, 14 and 30 nodes), with the old behaviour pinned as what the switch off gives. A driver test that only a datagram signed by the suspect answers the probe. Twelve real brokers with one stopped for 2 s (nightly tier). ADR 0016's amendment of 2026-10-13 carries the tables." |
+| 0087-T10b | ⬜ planned | [#975](https://github.com/mbilling/fss-mqtt-broker/issues/975) | — | "Size M. What T10 leaves of #975: the 3 s cells and the mixed-version rows (a Dead declared by another node, or by a v1.1.0 node, is adopted unchecked) and the packet-loss cells at 14 nodes and more (the window does not grow with the cluster). suspicion_scales_with_log_n exists, off. ADR 0016 gets the amendment." |
 <!-- /status-table:0087 -->
 
 ## Changelog
@@ -215,3 +222,16 @@ then, once its sub-decision is settled (T3: O1, O4; T5: O2, O5; T6: O3).
   commands now carry their link). The ordering episodes were made deterministic: the
   test relay holds what a node says after its `Hello` for 100 ms, and with the gate
   taken out both episodes then fail in 5 runs of 5.
+- 2026-10-13 — T10 built: the last direct probe before `Dead` is the default (decided
+  by the maintainer the same day). Re-measured on the final tree, 32 seeds per cell: a
+  member cut off for up to 2 s is declared dead in no run at 3 to 30 nodes (without the
+  probe: 16 of 32 at 14 nodes and 1.5 s, 28 of 32 at 30 nodes and 2 s); a real death is
+  held `Dead` by every survivor about 0.3 s later in the median (5.6 s against 5.3 s at
+  14 nodes), 0.6 s at worst. Formation is untouched. New in the simulation: packet loss
+  (fewer false verdicts in every cell, not none: 10 of 32 runs at 30 nodes and 10 %
+  loss, against 28), a member reachable one way only (declared dead as before — the
+  probe needs a round trip), one link lost one way (no suspicion, as before), a member
+  whose datagrams are late. Twelve real brokers, one stopped for 2 s 68 times:
+  declared dead in none. No operator switch; no wire change. The task is narrowed to
+  what was built and the rest of #975 — a relayed `Dead`, the window's scaling — is
+  T10b.

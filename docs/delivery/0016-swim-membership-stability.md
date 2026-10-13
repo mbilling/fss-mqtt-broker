@@ -82,6 +82,12 @@ the issue). Self-refutation is the unambiguous "others cannot reach us" signal.
 
 ## Changelog
 
+- **2026-10-13** — The detector changed, as a change of its own with its own evidence
+  (the ADR's amendment of that date): a suspect is asked once more, directly, before it
+  is declared `Dead`, by default. Built and tracked as delivery task 0087-T10 (issue
+  #999), because it was measured and decided under ADR 0087; what is left of the
+  question — a relayed `Dead`, and whether the window scales with the cluster — is
+  0087-T10b (issue #975).
 - **2026-07-02** — T6 (CA-attested labels) landed the same day its analysis was recorded,
   choosing option (1) and shipping it together with 0022-T7 (gossip cert revocation) since
   they share the PKI surface. The cluster-bus certificate now carries the failure domain

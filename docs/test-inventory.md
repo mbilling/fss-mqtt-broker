@@ -262,7 +262,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 396 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 401 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -577,6 +577,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `swim::tests::a_stale_circulating_dead_claim_cannot_rekill_the_refuted_member`
 - `swim::tests::a_suspect_ahead_of_a_stale_claim_is_saved_by_its_ack_alone`
 - `swim::tests::a_suspect_is_probed_once_more_before_it_is_declared_dead`
+- `swim::tests::a_suspect_that_answers_without_ever_refuting_is_asked_once_per_window`
 - `swim::tests::a_suspect_that_refutes_in_its_ack_is_not_declared_dead`
 - `swim::tests::a_tombstone_fences_the_dead_life_but_not_a_new_one`
 - `swim::tests::a_tombstone_is_pruned_after_its_ttl_and_the_id_can_rejoin`
@@ -587,6 +588,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `swim::tests::awareness_is_capped_at_awareness_max`
 - `swim::tests::awareness_rises_on_self_refutation_and_decays_on_a_clean_probe`
 - `swim::tests::awareness_scales_the_suspicion_timeout`
+- `swim::tests::by_default_a_suspect_is_asked_before_it_is_declared_dead`
 - `swim::tests::claims_about_a_previous_life_are_ignored_whatever_they_say`
 - `swim::tests::dead_members_are_not_probed`
 - `swim::tests::direct_ack_clears_the_probe`
@@ -610,6 +612,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `swim::tests::probe_failure_leads_to_suspect_then_dead`
 - `swim::tests::refutation_resets_accumulated_suspicions`
 - `swim::tests::refutes_suspicion_about_self`
+- `swim::tests::the_last_probe_is_one_datagram_per_suspect_per_window`
 - `swim::tests::the_suspicion_window_grows_with_log_n_only_when_asked`
 - `swim::tests::with_the_v1_1_rule_a_rescued_probe_resets_the_regreet_count`
 - `swim_auth::first_contact_tests::a_rotated_signer_primes_every_destination_again`
@@ -654,7 +657,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `swim_driver::cert_request_tests::a_peer_pruned_after_a_false_dead_is_readmitted_on_its_next_probe`
 - `swim_driver::cert_request_tests::a_restarted_member_is_shown_our_certificate_again_in_the_very_next_datagram`
 - `swim_driver::cert_request_tests::a_v1_1_evictor_is_reprimed_after_three_probes_rescued_only_by_a_helper`
+- `swim_driver::cert_request_tests::only_a_datagram_signed_by_the_suspect_answers_its_last_probe`
 - `swim_driver::cert_request_tests::the_request_limiter_bounds_its_rate_and_its_table`
+- `swim_driver::cert_request_tests::the_suspects_own_signed_ack_answers_its_last_probe`
 - `swim_driver::tests::a_self_claim_contradicting_the_certificate_is_rejected`
 - `swim_driver::tests::a_signed_relay_cannot_assert_a_third_partys_domain`
 - `swim_driver::tests::an_agreeing_self_claim_passes_and_an_unattested_one_is_kept`
@@ -686,17 +691,22 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `three_nodes_converge_then_detect_failure`
 - `two_nodes_discover_each_other`
 
-## `crates/mqtt-cluster/tests/swim_formation_sim.rs` — 9 test(s)
+## `crates/mqtt-cluster/tests/swim_formation_sim.rs` — 14 test(s)
 
 - `a_cluster_part_way_through_the_upgrade_from_v1_1_forms`
 - `a_formation_run_is_reproducible_from_its_seed`
-- `a_last_direct_probe_spares_a_member_cut_off_for_less_than_the_window`
+- `a_member_cut_off_for_up_to_two_seconds_is_not_declared_dead`
 - `a_member_falsely_declared_dead_is_readmitted_within_the_tombstone_ttl`
-- `a_short_cut_still_ends_in_a_false_dead_on_the_default_window`
+- `a_member_that_cannot_complete_a_round_trip_is_declared_dead_as_before`
 - `a_signed_cluster_forms_with_no_false_suspicion_at_any_size`
+- `a_v1_1_node_still_declares_what_the_last_probe_would_have_spared`
 - `false_dead_report` — `#[ignore]`d
+- `fault_shapes_report` — `#[ignore]`d
 - `formation_report` — `#[ignore]`d
+- `one_link_lost_one_way_raises_no_verdict`
+- `packet_loss_neither_keeps_a_dead_member_nor_adds_false_verdicts`
 - `the_v1_1_rules_reproduce_the_formation_storm_and_preshared_certificates_remove_it`
+- `without_the_last_probe_a_short_cut_ends_in_a_false_dead`
 
 ## `crates/mqtt-cluster/tests/swim_sim.rs` — 6 test(s)
 
@@ -2967,8 +2977,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `membership_receipt_oracle_rejects_loss_duplicates_and_stale_bursts`
 - `membership_tcp_fixture_receives_all_data_before_each_socket_fence`
 
-## `crates/mqttd/tests/swim_formation_proc.rs` — 1 test(s)
+## `crates/mqttd/tests/swim_formation_proc.rs` — 2 test(s)
 
+- `a_broker_stopped_for_two_seconds_is_declared_dead_by_no_one` — `#[ignore]`d
 - `twelve_signed_brokers_form_a_whole_mesh_without_a_certificate_storm`
 
 ## `crates/mqttd/tests/swim_routing.rs` — 3 test(s)

@@ -304,6 +304,7 @@ detectors and what each costs when the member really died is in
 
 Two `Config` switches were added to measure the candidates. **Both are off by default and
 neither is operator configuration**; with both off the state machine is what it was.
+(The first became the default the same day: the next amendment.)
 
 - `confirm_before_dead` — Lifeguard's direct refutation path in its smallest form: when a
   suspect's window lapses it is sent one `Ping` carrying the suspicion and given one ack
@@ -322,3 +323,295 @@ neither is operator configuration**; with both off the state machine is what it 
 
 Whether either becomes the default is #975's decision, as a change of its own, as this
 record asks of any change to failure detection.
+
+## Amendment (2026-10-13): a suspect is asked once more, directly, before it is declared `Dead` (issue #975, ADR 0087 T10)
+
+Decided by the maintainer on 2026-10-13: the last direct probe of the amendment above
+is the default. This is the change of its own that this record asks for, with its
+evidence.
+
+### Decision
+
+`Config::confirm_before_dead` defaults to `true`. When a suspect's window lapses
+(§3: 4 s for one suspecter, 1.5 s with three, times the local-health multiplier of §2)
+the node does not declare it `Dead`. It sends the suspect one `Ping` that carries the
+suspicion and waits one ack timeout (250 ms, times the same multiplier):
+
+- a suspect that stays silent is declared `Dead`, one ack timeout later than before;
+- a suspect whose `Ack` carries its refutation — the usual case: a node told it is
+  suspected bumps its incarnation and puts the refutation at the head of its gossip —
+  is `Alive` at once, first-hand;
+- a suspect whose `Ack` carries none (the claim was stale to it, or it is a v1.1.0
+  node, which queues its refutation behind other gossip) is kept on the `Ack` alone:
+  the window restarts at its full length and the member is sent one `Join`, whose
+  `Sync` states its incarnation. If that `Sync` is lost the member stays `Suspect`
+  and is asked again when the new window lapses: one `Ping` and one `Join` per
+  window, on top of the ordinary round-robin probes a suspect keeps receiving, for
+  as long as it answers, and `Dead` the first time it does not
+  (`a_suspect_that_answers_without_ever_refuting_is_asked_once_per_window`).
+
+Only the suspect's own `Ack` to that very probe counts, so the probe spares a member
+only on a datagram round trip between the two nodes concerned. §1 (the tombstone), §2,
+§3 and the generation rules are unchanged; so is everything a node does with a `Dead`
+it is *told* about. Nothing is added to the wire: a `Ping`, an `Ack`, a `Join` and a
+`Sync`, as every release has sent them.
+
+**It is not operator configuration, and there is no switch.** None of the detector's
+settings is: the protocol period, the ack timeout, the window, the tombstone's lifetime
+and the rules of the 2026-10-12 amendment are constants of the release, and
+`[cluster.swim]` configures addresses, seeds, keys and the signing and anti-replay
+postures only. A key for this one rule would be the first of its kind, for a rule
+whose benefit depends on every node running it (a node without it declares, and
+spreads, the verdicts the others would have spared), and whose off position was not
+better in any measured cell below. A release that turns out to need the old behaviour
+back gets it from the previous release; the field stays on `Config` so that the
+formation simulation can run a v1.1.0 node, which lacks the rule, beside a current one.
+
+### Evidence
+
+All of it from `crates/mqtt-cluster/tests/swim_formation_sim.rs` — the driver's real
+gossip endpoint (signing, certificate cache, state machine) over a virtual clock, with
+the broker's default timings — re-run on the tree that makes the change. A fault is
+put on one member of a formed cluster a minute after formation. Unless stated, a cell
+is **the number of runs, of 32 seeds, in which some node turned a healthy member
+`Dead`**, during the fault or after it.
+
+```
+cargo test -p mqtt-cluster --release --test swim_formation_sim false_dead_report  -- --ignored --nocapture
+cargo test -p mqtt-cluster --release --test swim_formation_sim fault_shapes_report -- --ignored --nocapture
+cargo test -p mqtt-cluster --release --test swim_formation_sim formation_report    -- --ignored --nocapture
+```
+
+**A clean cut: nothing in, nothing out.** With the probe / without it.
+
+| nodes | cut 0.5 s | 1 s | 1.5 s | 2 s | 3 s | 5 s |
+|---|---|---|---|---|---|---|
+| 3 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 3 | 32 / 32 |
+| 5 | 0 / 0 | 0 / 0 | 0 / 3 | 0 / 7 | 6 / 18 | 29 / 32 |
+| 10 | 0 / 4 | 0 / 4 | 0 / 7 | 0 / 13 | 3 / 25 | 31 / 32 |
+| 14 | 0 / 6 | 0 / 10 | 0 / 16 | 0 / 21 | 8 / 25 | 30 / 32 |
+| 30 | 0 / 6 | 0 / 20 | 0 / 25 | 0 / 28 | 0 / 31 | 28 / 32 |
+
+A cut of up to 2 s ends in no verdict at any size. The members are still *suspected*
+(a median of 20 `Suspect` transitions across a 14-node cluster after a 1.5 s cut, the
+same with and without the probe); what changes is how the suspicion ends. At 3 s the
+probe no longer holds: three suspecters shorten the window to 1.5 s, the member really
+is silent when it is asked, and the `Dead` declared during the cut is adopted from
+gossip by the rest after it. A 5 s cut is longer than the window and is a death to
+every detector.
+
+**The price: a member that really died.** Milliseconds from the death until the last
+survivor holds it `Dead`, median / worst of 16 seeds.
+
+| | 3 nodes | 5 | 10 | 14 | 30 |
+|---|---|---|---|---|---|
+| with the probe | 4089 / 4996 | 4716 / 6982 | 4997 / 6011 | 5613 / 8337 | 7005 / 8347 |
+| without | 4010 / 4696 | 4787 / 6682 | 4729 / 5404 | 5313 / 8037 | 6500 / 8347 |
+
+About 0.3 s later in the median (between 0.07 s sooner and 0.5 s later, by size), and
+up to 0.6 s later at worst: one ack timeout per node that has to reach the verdict for
+itself, less where the verdict arrives by gossip first.
+
+**Formation.** The rig's bring-up, 16 seeds per size, with the probe / without it:
+milliseconds until every view is whole for good after the last start, median and
+worst. No run of either raised a `Suspect` or a `Dead`, so the probe was never sent
+and the two columns are the same runs.
+
+| | 3 nodes | 5 | 10 | 12 | 14 | 20 | 30 |
+|---|---|---|---|---|---|---|---|
+| with the probe | 56 / 98 | 43 / 100 | 4532 / 8040 | 6638 / 9317 | 7490 / 11933 | 15853 / 19089 | 26298 / 32065 |
+| without | 56 / 98 | 43 / 100 | 4532 / 8040 | 6638 / 9317 | 7490 / 11933 | 15853 / 19089 | 26298 / 32065 |
+
+A formation part-way through the upgrade is not as clean, either way. With one node
+left on v1.1.0 the two rows are again the same up to 20 nodes (at 30: a median of
+23.9 s with the probe and 24.6 s without, 33.7 s at worst for both). With half the
+nodes on v1.1.0 the formation is still the storm of the 2026-10-12 amendment among
+those nodes, and the probe changes its course without clearly improving or worsening
+it: fewer false `Dead` per node at every size (0.1 against 0.9 at 12 nodes, 0.7 against
+1.6 at 14, 4.8 against 5.5 at 20, 15.4 against 17.0 at 30), and a settling time that is
+sooner at 12 nodes (a median of 27 s against 48 s) and later at 14, 20 and 30 (88 s
+against 53 s, 148 s against 131 s, 269 s against 257 s), with 1, 3, 1 and 10 runs of
+16 still unsettled after five minutes against 0, 1, 3 and 6. A cluster is cold-started
+half upgraded only by accident: the roll itself restarts one node at a time into a
+formed cluster, which is the next table.
+
+`a_signed_cluster_forms_with_no_false_suspicion_at_any_size` asserts it at 3 to 30
+nodes with the new default, and `swim_formation_proc` forms twelve real brokers.
+
+**A cluster part-way through the upgrade from v1.1.0** (14 nodes). A v1.1.0 node
+answers the probe and the `Join` as it answers any; it does not send them, and a
+`Dead` it declares is adopted by the upgraded nodes like any other.
+
+| | 0.5 s | 1 s | 1.5 s | 2 s | 3 s | 5 s |
+|---|---|---|---|---|---|---|
+| every node upgraded | 0 | 0 | 0 | 0 | 8 | 30 |
+| one node left on v1.1.0 | 1 | 4 | 5 | 4 | 12 | 31 |
+| half the nodes on v1.1.0 | 4 | 8 | 11 | 14 | 21 | 31 |
+| one node upgraded | 5 | 9 | 15 | 20 | 24 | 32 |
+| every node on v1.1.0 | 6 | 10 | 16 | 21 | 25 | 32 |
+
+The benefit arrives as the roll proceeds, and no row is worse than the one below it.
+
+**Packet loss.** Every datagram lost with the given probability, from 30 s after
+formation. The probe and its answer are two datagrams and either can be lost; then
+the member is declared `Dead` as it would have been. With the probe / without it.
+
+| nodes | nobody at fault, 75 s: 5 % | 10 % | 20 % | a 1.5 s cut as well: 5 % | 10 % | 20 % |
+|---|---|---|---|---|---|---|
+| 3 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 1 |
+| 5 | 0 / 0 | 0 / 0 | 2 / 2 | 0 / 1 | 0 / 1 | 2 / 6 |
+| 10 | 0 / 0 | 0 / 2 | 8 / 28 | 1 / 7 | 1 / 6 | 14 / 32 |
+| 14 | 0 / 1 | 1 / 9 | 31 / 32 | 1 / 11 | 5 / 19 | 31 / 32 |
+| 30 | 0 / 5 | 10 / 28 | 32 / 32 | 2 / 22 | 17 / 31 | 32 / 32 |
+
+Fewer in every cell, and not none: at 30 nodes a network losing one datagram in ten
+still produces a false verdict in a third of the runs within 75 s. That is the window
+not growing with the cluster, which this amendment does not change.
+
+A member that really died is buried by every survivor in every run at every loss rate
+(ms, median / worst of 16; with the probe, then without):
+
+| loss | 3 nodes | 5 | 10 | 14 | 30 |
+|---|---|---|---|---|---|
+| 5 % | 4135 / 5019 | 4614 / 5246 | 5557 / 7602 | 5719 / 7254 | 6662 / 8498 |
+| | 4135 / 5019 | 4359 / 4946 | 5471 / 6914 | 5294 / 7254 | 6441 / 7799 |
+| 10 % | 4271 / 5098 | 4409 / 6364 | 5487 / 7465 | 5125 / 7292 | 6250 / 9316 |
+| | 4060 / 5010 | 4073 / 6362 | 5410 / 7165 | 4689 / 9800 | 5880 / 7471 |
+| 20 % | 4135 / 13071 | 4655 / 5347 | 4953 / 6167 | 5988 / 9463 | 9550 / 28956 |
+| | 4089 / 12697 | 4203 / 5346 | 5029 / 6704 | 5694 / 9149 | 16305 / 33968 |
+
+**A member reachable one way only.** *Deaf*: nothing reaches it, what it sends
+arrives (its own probes, and acks to nothing). *Mute*: it hears everything and nothing
+it sends arrives. Neither can complete the round trip, so neither is kept: for good,
+every survivor declares it `Dead` in every run (ms, median / worst of 16).
+
+| | 3 nodes | 5 | 10 | 14 | 30 |
+|---|---|---|---|---|---|
+| deaf, with the probe | 4958 / 5098 | 4852 / 6361 | 5014 / 6467 | 5714 / 9200 | 6747 / 8094 |
+| deaf, without | 4658 / 5078 | 4610 / 6361 | 4596 / 6467 | 5313 / 8349 | 6500 / 7762 |
+| mute, with the probe | 4090 / 4996 | 4717 / 6982 | 4997 / 6009 | 5613 / 8337 | 7004 / 8346 |
+| mute, without | 4009 / 4696 | 4788 / 6682 | 4730 / 5405 | 5313 / 8037 | 6489 / 8347 |
+
+For a while, it behaves as the clean cut does (runs of 32 with a false `Dead`; with
+the probe / without it):
+
+| nodes | deaf 1.5 s | 2 s | 3 s | mute 1.5 s | 2 s | 3 s |
+|---|---|---|---|---|---|---|
+| 3 | 0 / 0 | 0 / 0 | 0 / 4 | 0 / 0 | 0 / 0 | 0 / 3 |
+| 5 | 0 / 1 | 0 / 5 | 4 / 16 | 0 / 4 | 0 / 8 | 6 / 22 |
+| 10 | 0 / 5 | 0 / 12 | 7 / 23 | 0 / 7 | 0 / 12 | 2 / 30 |
+| 14 | 0 / 14 | 0 / 21 | 6 / 28 | 0 / 14 | 0 / 21 | 8 / 28 |
+| 30 | 0 / 26 | 0 / 27 | 1 / 31 | 0 / 25 | 0 / 28 | 0 / 31 |
+
+**One link lost one way.** What one node, A, sends one member, B, never arrives;
+everything else flows, B's own datagrams to A included. For a minute and for good, at
+every size: no `Dead` and no `Suspect` in any run, with the probe or without it. A's
+probes of B are rescued by its helpers every round, as they have been since this
+record was accepted, so A never suspects B and there is no suspicion for a last probe
+to confirm. The probe enters only if some other node's suspicion of B reaches A; then
+A's probe goes unanswered — B cannot hear it — and A declares B `Dead` exactly as it
+did before, unless B's refutation arrives first, exactly as before. In the mirrored
+case (B hears A, A does not hear B) the `Ack` is what is lost, with the same result.
+So the probe never keeps, in a node's view, a member that node cannot exchange a
+datagram with in both directions.
+
+What this means for [ADR 0087](0087-delivery-across-a-false-dead-verdict.md): a pair
+whose membership says `Alive` while the peer link between them (TCP, both directions)
+is down is that record's "member without a link" — what A owes B's subscribers is
+held, A keeps dialing, and the hold has ADR 0087's bound (D1: eight sweep ticks without
+a link until D2 is built; the pending table's bound throughout). That state is as old
+as indirect probes and the last probe neither creates nor prolongs it. What the probe
+changes for ADR 0087 is how often its machinery is needed at all.
+
+**A member whose datagrams arrive late**, for 20 s (runs of 32 with a `Dead`, nearly
+most of them declared while the member was late; with the probe / without it):
+
+| nodes | 200 ms late | 300 ms | 600 ms | 1 s | 2 s |
+|---|---|---|---|---|---|
+| 3 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 1 |
+| 5 | 0 / 0 | 0 / 0 | 0 / 1 | 4 / 10 | 26 / 30 |
+| 10 | 0 / 0 | 0 / 0 | 5 / 17 | 25 / 30 | 32 / 32 |
+| 14 | 0 / 0 | 0 / 0 | 19 / 30 | 28 / 32 | 32 / 32 |
+| 30 | 0 / 0 | 0 / 0 | 32 / 32 | 32 / 32 | 32 / 32 |
+
+Up to 300 ms late it is not suspected at all. From 600 ms it answers neither the
+direct probe nor the indirect one in time (250 ms each) and is suspected by every
+node, round after round; its answer to the last probe is late too. The probe helps
+where the late `Ack`'s refutation still arrives before the verdict, and does not make
+a cell worse.
+
+**Real processes.** Twelve brokers with signed gossip on loopback, one stopped
+(`SIGSTOP`) for 2 s and resumed, repeatedly
+(`a_broker_stopped_for_two_seconds_is_declared_dead_by_no_one`, nightly tier: a
+verdict is a matter of deadlines, and a loaded per-PR runner misses them for reasons
+of its own). On a development machine: 68 stops over ten runs (three of four stops
+each, then seven of eight), the stopped broker suspected by a peer in 50 of them and
+declared `Dead` in none. With the probe
+switched off, four runs of four stops each produced one `Dead`. That is fewer than the
+simulation's cut would suggest, because a stopped process is not a cut network: the
+kernel queues what arrives, and the broker answers all of it the moment it resumes.
+
+### Who can answer the probe, and what it can be made to send
+
+The probe is an ordinary `Ping` answered by an ordinary `Ack`, accepted on the terms
+every `Ack` has been accepted on since [ADR 0003](0003-gossip-authentication.md) and
+[ADR 0022](0022-signed-gossip.md): the rule adds a use of that check, not a check.
+
+- **Signed gossip.** An `Ack` is the suspect's when the datagram is signed with the
+  suspect's certificate and names the suspect as its sender. A holder of the cluster
+  key without that key cannot produce one (dropped as `auth`); one with a certificate
+  of its own cannot claim to be the suspect (dropped as `identity`); a member in good
+  standing can send the probe's sequence number only as itself, which is not the
+  suspect's answer. Tested at the driver:
+  `only_a_datagram_signed_by_the_suspect_answers_its_last_probe`. So a member that is
+  really dead cannot be kept by anyone who does not hold its private key.
+- **Replay.** An `Ack` counts only if it carries the sequence number of this probe,
+  drawn from the prober's own counter when the probe is sent. An attacker who can
+  record the suspect's datagrams and inject datagrams holds, once the suspect is
+  dead, only `Ack`s it sent before: to this node (to earlier, lower numbers — or to
+  the same number, if this node has restarted since and its counter began again) and
+  to other nodes (a datagram is not bound to its destination). Anti-replay
+  ([ADR 0023](0023-gossip-anti-replay.md)) drops what this node has already received
+  and anything older than its window; it does not drop a recent datagram that was
+  addressed elsewhere. Each replayed `Ack` with the right number buys one more
+  window, from a finite stock. This is the exposure of the ordinary probe, by which
+  the same attacker could keep the member from being suspected at all, and not a new
+  one. (From the code; not tested.)
+- **The shared-key posture** (no signatures) trusts every key-holder with every
+  statement, this one included: a key-holder could already answer the ordinary probe
+  or forge the refutation.
+- **What it can be made to send.** One `Ping` per suspect per lapsed window, of the
+  usual bounded size (`the_last_probe_is_one_datagram_per_suspect_per_window`), to the
+  address the member is known at; one `Ack` in return; and, where that `Ack` carries
+  no refutation, one `Join` and its `Sync`. A node holding every other member suspect
+  therefore sends at most N−1 probes per window (1.5 s at the shortest), against the
+  one probe a second it sends anyway. Making a node hold members suspect takes a
+  datagram it accepts — in the signed posture, a member's — and such a member can
+  already do worse: without the probe the same lie ends with those members declared
+  `Dead`. A datagram from a key-holder whose certificate is not cached reaches no
+  rule here (the 2026-10-12 amendment's bounded certificate request is all it draws).
+
+### What this does not change
+
+- **A `Dead` a node is told about is adopted unchecked**, including about a member it
+  can reach. That is where the 3 s cells and the mixed-version rows come from.
+- **The window does not grow with the cluster.** Under packet loss that still shows
+  from about 14 nodes up.
+- A v1.1.0 node in a mixed cluster does not probe.
+
+The first two stay with #975 (0087-T10b).
+
+### Tests
+
+- `a_member_cut_off_for_up_to_two_seconds_is_not_declared_dead` — the bound: at 5, 14
+  and 30 nodes a clean cut of up to 2 s ends in no `Dead` and a whole view, over the
+  suite's seeds (the 32-seed table above is zero from 3 to 30 nodes at 0.5 s to 2 s),
+  and a real death is still buried. It replaces
+  `a_short_cut_still_ends_in_a_false_dead_on_the_default_window`.
+- `without_the_last_probe_a_short_cut_ends_in_a_false_dead` — the old behaviour is
+  what `confirm_before_dead = false` gives, on this tree and in the v1.1.0 model.
+- `a_v1_1_node_still_declares_what_the_last_probe_would_have_spared`,
+  `a_member_that_cannot_complete_a_round_trip_is_declared_dead_as_before`,
+  `one_link_lost_one_way_raises_no_verdict`,
+  `packet_loss_neither_keeps_a_dead_member_nor_adds_false_verdicts`.
+- The simulations (`swim_sim.rs`) and the real-socket cluster suites run the default.

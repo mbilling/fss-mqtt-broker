@@ -516,6 +516,17 @@ load; the client-facing cost scales with the rolled pod's share, not the fleet):
   delay and its cancellation to survive the client reconnecting on a *different*
   node, which no peer frame expresses today.
 
+**Failure detection during the roll from 1.1.0.** From 1.2.0 a node asks a suspected
+member once more, directly, before declaring it dead, so a member that is out of
+reach for up to two seconds is not declared dead
+([TROUBLESHOOTING](TROUBLESHOOTING.md#the-log-says-membership-peer-suspect-or-peer-dead-about-a-broker-that-is-running)).
+A 1.1.0 node answers that question and does not ask it, and a verdict it reaches is
+adopted by the upgraded nodes like any other: while the roll is in progress a short
+outage of one member can still end in a 30 s `DEAD` verdict, less often with each node
+upgraded (in simulation at 14 nodes, a 1.5 s outage: 16 runs of 32 with every node on
+1.1.0, 11 with half upgraded, 5 with one node left, none after). Nothing needs to be
+done about it; it is one more reason not to leave a roll half finished.
+
 **Pacing.** The chart already enforces the safe motion — OrderedReady +
 RollingUpdate roll one pod at a time and the PDB (`maxUnavailable: 1`) stops a
 node drain from taking two. Keep it that way (never parallelize a roll), let each

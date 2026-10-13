@@ -188,6 +188,49 @@ not route traffic.
   `peer_advertise` host fails name verification at the dialer (rustls checks SANs only, never
   the CN), and a leaf **missing the `clientAuth` EKU** is rejected when the node dials out.
 
+## The log says `membership: peer SUSPECT` or `peer DEAD` about a broker that is running
+
+**Symptom:** WARN lines `membership: peer SUSPECT`, `peer RECOVERED to alive` or
+`peer DEAD` name a broker that never stopped; `mqttd_members{state="suspect"}` or
+`{state="dead"}` is above zero for a while.
+
+How a node reaches each line. The timings are constants of the release, not settings,
+and they are those of a healthy node: a node that has itself been suspected lately
+multiplies its own ack timeouts and windows, so it is slower to accuse others
+([ADR 0016](adr/0016-swim-membership-stability.md) §2).
+
+- **`SUSPECT`**: a probe of the member went unanswered for 0.25 s and so did the same
+  probe relayed through three other members for another 0.25 s. Routing is not
+  touched. A `SUSPECT` followed by `RECOVERED` within a few seconds is the detector
+  working: the member was slow or unreachable for a moment, was told, and answered.
+- **`DEAD`**: the suspicion stood for its window — 4 s, shortening to 1.5 s once three
+  nodes suspect the member — and the member then also failed to answer one last probe
+  sent to it directly (0.25 s). A broker that really died is held dead by every other
+  node in about 4 to 7 s (8.4 s at worst), some 0.3 s later than on 1.1.0, which did
+  not ask. The verdict stands for 30 s; a member that was alive is then greeted and
+  comes back.
+
+What a `DEAD` about a live broker points to:
+
+- **An outage of that broker of about three seconds or more that then ended** — a
+  long pause of the process or its host, a network cut. Up to two seconds does not end
+  in a verdict.
+- **Packet loss on the gossip network.** The last probe and its answer are two
+  datagrams. Look for many `SUSPECT`/`RECOVERED` pairs about different members on
+  every node; larger clusters are affected first.
+- **A cluster part-way through the upgrade from 1.1.0.** A 1.1.0 node declares a
+  suspect dead without asking it, and the other nodes adopt that verdict from gossip.
+  It ends when the roll does.
+- **A member reachable in one direction only.** A member that cannot hear the others
+  (its own log then says `SWIM isolation`), or cannot be heard, is declared dead. If only
+  the path from one node to it is broken, no verdict is raised at all: the other
+  members answer for it. That node's peer link to it may still be down — compare
+  `mqttd_peer_links` with `mqttd_cluster_members` on that node.
+
+While a member is held dead by a node, publishes that node owes its subscribers are
+held, not dropped (`mqttd_publish_held_for_unreachable`), within the bound the 1.2.0
+release notes state.
+
 ## A node warns that its certificate is running out (`TLS material: …`)
 
 **Symptom:** the log carries a `WARN` or `ERROR` from `mqttd::tls_expiry`, once an hour:
