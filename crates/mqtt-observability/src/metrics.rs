@@ -678,8 +678,8 @@ pub struct Metrics {
     /// quiet for seconds at a time and coming back — the `suspect` gauge shows that
     /// only if it is read at the right moment.
     swim_last_probes_total: Family<RunOutcomeLabel, Counter>,
-    /// Times the SWIM driver found that this node itself had been stalled: its loop,
-    /// which runs every 100 ms, was not scheduled for more than 200 ms. A stall moves no
+    /// Times the SWIM driver found that this node itself had been stalled: its loop
+    /// was not scheduled for more than two of its ticks. A stall moves no
     /// timer and reaches no verdict about a peer (the driver reads its socket before
     /// it ticks); it is time in which this node answered nobody.
     swim_stalls_total: Counter,
@@ -1294,8 +1294,7 @@ impl Metrics {
         let swim_stalls_total = register_counter(
             &mut registry,
             "swim_stalls",
-            "Times this node's SWIM driver was not scheduled for more than two of its \
-             100 ms ticks",
+            "Times this node's SWIM driver was not scheduled for more than two of its ticks",
         );
         let swim_stalled_milliseconds_total = register_counter(
             &mut registry,

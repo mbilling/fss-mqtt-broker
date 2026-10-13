@@ -2356,7 +2356,7 @@ fn a_real_death_is_seen_on_time_by_survivors_that_are_all_late() {
 /// ticks stop, what is sent to it queues on its socket — for four ack timeouts, and the
 /// member's `Ack` is in that queue when it wakes. On this tree's driver loop that node
 /// gives up on no probe, and the member that was cut off is turned `Dead` in no run:
-/// the queue is read before the tick, and the stalled time is not on the node's clock.
+/// the queue is read before the tick.
 ///
 /// The simulation must be able to see what it guards against: the same state machine
 /// on the loop as it was — the wall clock, the tick ahead of the queue — gives up on

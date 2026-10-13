@@ -3053,8 +3053,23 @@ mod tests {
             lapsed + 5,
         );
         assert_eq!(member_state(&s, "b"), Some(MemberState::Alive));
+        // Counted as answered: the usual way a probe is, its refutation riding its ack.
+        let counted = s.last_probes();
+        assert_eq!((counted.sent, counted.spared, counted.silent), (1, 1, 0));
         s.expire_suspects(lapsed + 10 * cfg.ack_timeout_ms, &mut out);
         assert_eq!(member_state(&s, "b"), Some(MemberState::Alive));
+        // A refutation that comes round by gossip instead ends the suspicion too, and
+        // is not the suspect's answer to the probe.
+        let mut relayed = node_with("a", "a:1", cfg.clone());
+        relayed.apply_update(&suspect_from("b", "b:1", 0, "x"), 0, &mut out);
+        relayed.expire_suspects(lapsed, &mut out);
+        relayed.handle(
+            m("c", "c:1", Kind::Sync, vec![alive_update("b", "b:1", 1)]),
+            lapsed + 5,
+        );
+        assert_eq!(member_state(&relayed, "b"), Some(MemberState::Alive));
+        let counted = relayed.last_probes();
+        assert_eq!((counted.sent, counted.spared, counted.silent), (1, 0, 0));
 
         // Suspected again at the new incarnation: the window, then a fresh last probe.
         let again = lapsed + 100;
