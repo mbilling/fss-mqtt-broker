@@ -15,15 +15,119 @@
 //! the first datagram to it, again when it restarts, and on request when this node
 //! drops a datagram as `cert-miss`.
 
+//!
+//! The shell also answers for the one thing the state machine cannot know: whether the
+//! clock it is fed is one this node was awake for. See [`StallClock`] and [`run_gossip`].
+
 use crate::replay::{ReplayWindow, SeqStore, SequenceAllocator};
-use crate::swim::{Action, Kind, MemberState, Message, Swim};
+use crate::swim::{Action, Kind, LastProbes, MemberState, Message, Swim};
 use crate::swim_auth::{OpenReject, Opened, SwimAuth};
 use crate::NodeId;
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, trace};
+
+/// The interval at which the broker ticks the state machine. It must stay below the ack
+/// timeout (250 ms), so that a probe's deadline is noticed promptly — and the bound the
+/// last direct probe keeps is arithmetic on it (ADR 0016's amendment for issue #1002:
+/// a deadline is acted on at the first tick at or after it, so each timeout is in effect
+/// rounded up to this). One constant for the broker and for the formation simulation
+/// (`tests/swim_formation_sim.rs`), so that what the simulation measures is what the
+/// broker runs.
+pub const TICK: Duration = Duration::from_millis(100);
+
+/// A wake-up of the driver's loop more than this many ticks after the one before it is
+/// a stall: the loop wakes at least once a tick, so a whole tick went missing.
+const STALL_TICKS: u64 = 2;
+
+/// The most datagrams read off the socket ahead of one tick ([`run_gossip`]). More
+/// than Linux's default receive buffer holds of gossip-sized datagrams, so in a
+/// cluster going about its business the read ends because the socket is empty.
+pub const DRAIN_MAX_DATAGRAMS: usize = 1024;
+
+/// The most time spent reading ahead of one tick, as a fraction of the tick: a quarter.
+const DRAIN_TICK_FRACTION: u32 = 4;
+
+/// The clock the driver feeds the state machine: time this node was awake for.
+///
+/// Every timer in [`Swim`] is a wait for something to arrive — an `Ack` inside the ack
+/// timeout, a refutation inside the suspicion window — measured on the `now` it is
+/// given. A node that is not scheduled for a while (a saturated runtime, a stopped
+/// process, a suspended VM) hears nothing and sends nothing for that time, and on a
+/// wall clock comes back to find that all its deadlines "passed": it would conclude
+/// from its own absence that its peers were silent.
+///
+/// So the stalled time is left out. The driver's loop wakes at least once a tick; it
+/// [`observe`](Self::observe)s the monotonic clock on every wake-up, and a wake-up
+/// more than two ticks after the one before it is a stall, counted as ONE tick (the
+/// tick that was due) however long it was. Whatever the node does, its clock then
+/// advances by at most two ticks per wake-up — less than one ack timeout — so no
+/// deadline can be set and found expired without the loop having run, and read its
+/// socket, in between.
+///
+/// Slow is safe here and fast is not: every timer only ever runs LONGER in wall time
+/// than configured, including the tombstone's (ADR 0016 §1), which must outlast the
+/// gossip it fences.
+#[derive(Debug)]
+pub struct StallClock {
+    tick_ms: u64,
+    /// The monotonic reading at the last wake-up.
+    last: u64,
+    /// Stalled time left out so far.
+    lost: u64,
+}
+
+impl StallClock {
+    /// A clock for a loop that wakes every `tick`.
+    #[must_use]
+    pub fn new(tick: Duration) -> Self {
+        Self {
+            tick_ms: u64::try_from(tick.as_millis()).unwrap_or(u64::MAX).max(1),
+            last: 0,
+            lost: 0,
+        }
+    }
+
+    /// Record a wake-up at monotonic time `real_ms` (ms since the driver started).
+    /// Returns the state machine's `now`, and how long this node was stalled before
+    /// this wake-up if it was.
+    pub fn observe(&mut self, real_ms: u64) -> (u64, Option<u64>) {
+        let real_ms = real_ms.max(self.last);
+        let gap = real_ms - self.last;
+        self.last = real_ms;
+        let stalled = (gap > STALL_TICKS.saturating_mul(self.tick_ms)).then(|| gap - self.tick_ms);
+        self.lost += stalled.unwrap_or(0);
+        (real_ms - self.lost, stalled)
+    }
+}
+
+/// How much one tick may read off the socket before it runs: a count and a deadline.
+struct DrainBudget {
+    datagrams: usize,
+    until: std::time::Instant,
+}
+
+impl DrainBudget {
+    fn for_tick(tick: Duration) -> Self {
+        Self {
+            datagrams: DRAIN_MAX_DATAGRAMS,
+            // Real time, whatever clock the runtime keeps: this bounds work done.
+            until: std::time::Instant::now() + tick / DRAIN_TICK_FRACTION,
+        }
+    }
+
+    /// Whether one more datagram may be read; a `true` is spent.
+    fn take(&mut self) -> bool {
+        if self.datagrams == 0 || std::time::Instant::now() >= self.until {
+            return false;
+        }
+        self.datagrams -= 1;
+        true
+    }
+}
 
 /// The per-node monotonic sequence source for outgoing v3 datagrams (ADR 0023). The driver
 /// holds it behind a boxed [`SeqStore`] so the broker can inject the file-backed persistence.
@@ -58,6 +162,18 @@ pub struct MembershipEvent {
 /// to the source of a datagram it had to drop as `cert-miss` (issue #971). A callback
 /// for the same reason as [`RejectCounter`].
 pub type CertRequestCounter = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+/// A sink for what becomes of the **last direct probes** this node sends before
+/// declaring a suspect `Dead` (ADR 0016's amendment of 2026-10-13), called with a
+/// bounded outcome — `"sent"`, `"spared"` (the suspect answered) or `"silent"` (it was
+/// declared `Dead`) — and how many. See [`LastProbes`] for what each counts. A callback
+/// for the same reason as [`RejectCounter`]; no member is named, so the series stay
+/// three however large the cluster.
+pub type LastProbeCounter = std::sync::Arc<dyn Fn(&'static str, u64) + Send + Sync>;
+
+/// A sink called once per **stall** of this node that the driver observed
+/// ([`StallClock`]), with how long it lasted in milliseconds.
+pub type StallCounter = std::sync::Arc<dyn Fn(u64) + Send + Sync>;
 
 /// At most one certificate request per source address in this many milliseconds: the
 /// protocol period, so a peer whose `Sync` reply was lost is asked again on its next
@@ -148,6 +264,10 @@ pub struct Gossip {
     seq_alloc: Option<SeqAlloc>,
     reject: Option<RejectCounter>,
     cert_requested: Option<CertRequestCounter>,
+    last_probe: Option<LastProbeCounter>,
+    stalled: Option<StallCounter>,
+    /// The state machine's last-probe counts as last handed to `last_probe`.
+    last_probes_reported: LastProbes,
     identity: Option<std::sync::Arc<crate::cluster_identity::ClusterIdentity>>,
     /// Per-sender replay windows, keyed by the authenticated sender id (ADR 0023).
     windows: HashMap<String, ReplayWindow>,
@@ -174,9 +294,58 @@ impl Gossip {
             seq_alloc,
             reject: None,
             cert_requested: None,
+            last_probe: None,
+            stalled: None,
+            last_probes_reported: LastProbes::default(),
             identity: None,
             windows: HashMap::new(),
             cert_requests: CertRequests::default(),
+        }
+    }
+
+    /// Count the last direct probes sent, spared and silent (ADR 0016).
+    #[must_use]
+    pub fn with_last_probe_counter(mut self, counter: Option<LastProbeCounter>) -> Self {
+        self.last_probe = counter;
+        self
+    }
+
+    /// Count the stalls of this node the driver observes ([`StallClock`]).
+    #[must_use]
+    pub fn with_stall_counter(mut self, counter: Option<StallCounter>) -> Self {
+        self.stalled = counter;
+        self
+    }
+
+    /// This node was stalled for `stalled_ms` before the wake-up now being handled
+    /// ([`StallClock::observe`]): count it, and tell the state machine, which takes it
+    /// as evidence about its own health ([`Swim::local_stall`]). Call it before the
+    /// [`tick`](Self::tick) or [`receive`](Self::receive) of that wake-up.
+    pub fn local_stall(&mut self, stalled_ms: u64) {
+        debug!(
+            stalled_ms,
+            "the SWIM driver was not scheduled: the stalled time is left out of its \
+             clock, and awareness is raised"
+        );
+        if let Some(c) = &self.stalled {
+            c(stalled_ms);
+        }
+        self.swim.local_stall();
+    }
+
+    /// Hand the last-probe counts that changed since the last call to the sink.
+    fn report_last_probes(&mut self) {
+        let now = self.swim.last_probes();
+        let was = std::mem::replace(&mut self.last_probes_reported, now);
+        let Some(c) = &self.last_probe else { return };
+        for (outcome, now, was) in [
+            ("sent", now.sent, was.sent),
+            ("spared", now.spared, was.spared),
+            ("silent", now.silent, was.silent),
+        ] {
+            if now > was {
+                c(outcome, now - was);
+            }
         }
     }
 
@@ -230,6 +399,7 @@ impl Gossip {
 
     /// Seal and serialize the state machine's actions.
     fn outputs(&mut self, actions: Vec<Action>) -> Vec<Output> {
+        self.report_last_probes();
         // A member that restarted lost every certificate it had cached, ours with the
         // rest (issue #971): un-prime it BEFORE sealing, so the first datagram it gets
         // from us — usually among `actions`, the reply to the datagram that showed us
@@ -458,7 +628,37 @@ pub async fn run(
 }
 
 /// [`run`] over an endpoint the caller assembled — for a caller that attaches more
-/// than `run`'s parameters carry (the certificate-request counter).
+/// than `run`'s parameters carry (the certificate-request, last-probe and stall
+/// counters).
+///
+/// # A node that was itself stalled
+///
+/// This task shares its runtime with whatever else the process runs (in the broker:
+/// the data path), so it can be kept off the CPU for longer than a tick — and a
+/// stopped process or a suspended VM is kept off for as long as it lasts. Three rules
+/// keep a node from turning its own absence into a verdict about a peer:
+///
+/// 1. **Read before expiring.** A tick first reads everything the socket held when
+///    the tick came due, then advances the state machine. Deadlines are only ever
+///    acted on by a tick, so an `Ack` that arrived in time is never beaten by the tick
+///    that would have given up on it. (What the socket "held" is what the runtime's
+///    reactor had seen arrive when it fired the tick's timer — it polls the socket and
+///    the timers in one turn, socket first. A datagram that arrives between that turn
+///    and this task running arrived after the tick was due.) (`select!` picks at random among ready branches: without
+///    this, a late tick and the `Ack` queued behind it were a coin toss.) The read is
+///    bounded — [`DRAIN_MAX_DATAGRAMS`] datagrams and a quarter of the tick — so a
+///    flood cannot keep the tick from running; a flood that outruns the bound leaves
+///    datagrams unread behind it at that tick, which is the order every tick had
+///    before. Without the gossip key nothing a sender queues gets past
+///    authentication, so all it can do is spend this budget; forging the `Ack`
+///    takes the suspect's own key.
+/// 2. **Stalled time is not time.** [`StallClock`]: the state machine's `now` leaves
+///    out the time this loop was not running.
+/// 3. **A stall is a finding about this node.** [`Gossip::local_stall`] raises the
+///    local-health awareness (ADR 0016 §2) and counts the stall.
+///
+/// Missed ticks are not made up ([`MissedTickBehavior::Delay`]): after a stall the
+/// loop ticks once, and again a full interval later.
 pub async fn run_gossip(
     socket: UdpSocket,
     mut gossip: Gossip,
@@ -494,6 +694,8 @@ pub async fn run_gossip(
         }
     };
     let mut ticker = tokio::time::interval(tick_interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut clock = StallClock::new(tick_interval);
     let mut buf = vec![0u8; RECV_BUF];
     tokio::pin!(shutdown);
 
@@ -507,14 +709,25 @@ pub async fn run_gossip(
                 return;
             }
             _ = ticker.tick() => {
-                let outputs = gossip.tick(elapsed_ms(start));
+                let now = wake(&mut clock, &mut gossip, start);
+                // Everything already received, before this tick may expire anything.
+                let mut budget = DrainBudget::for_tick(tick_interval);
+                while budget.take() {
+                    // Empty (`WouldBlock`), or an error `recv_from` will meet again.
+                    let Ok((n, src)) = socket.try_recv_from(&mut buf) else { break };
+                    let outputs = gossip.receive(&buf[..n], &src.to_string(), now);
+                    emit(&socket, &events, outputs).await;
+                }
+                let outputs = gossip.tick(now);
                 emit(&socket, &events, outputs).await;
-                // Probe rounds conclude on ticks — isolation can only TRIP here.
+                // Probe rounds conclude on ticks, and acks were read just above:
+                // isolation can trip or clear here.
                 publish_isolation(gossip.swim(), &mut was_isolated);
             }
             recv = socket.recv_from(&mut buf) => {
                 let Ok((n, src)) = recv else { continue };
-                let outputs = gossip.receive(&buf[..n], &src.to_string(), elapsed_ms(start));
+                let now = wake(&mut clock, &mut gossip, start);
+                let outputs = gossip.receive(&buf[..n], &src.to_string(), now);
                 emit(&socket, &events, outputs).await;
                 // Acks land in handle() — isolation can only CLEAR here.
                 publish_isolation(gossip.swim(), &mut was_isolated);
@@ -523,8 +736,15 @@ pub async fn run_gossip(
     }
 }
 
-fn elapsed_ms(start: Instant) -> u64 {
-    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+/// One wake-up of the loop: the state machine's `now`, with a stall — if this wake-up
+/// came after one — reported to the endpoint first.
+fn wake(clock: &mut StallClock, gossip: &mut Gossip, start: Instant) -> u64 {
+    let real_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let (now, stalled) = clock.observe(real_ms);
+    if let Some(stalled_ms) = stalled {
+        gossip.local_stall(stalled_ms);
+    }
+    now
 }
 
 /// Put the endpoint's outputs on the socket and the event channel, in order.
@@ -1376,5 +1596,358 @@ mod cert_request_tests {
         alive.incarnation += 1;
         a.receive(&b.full(Kind::Sync, vec![alive]), "b:1", gives_up + 300);
         assert_eq!(state_of(&a, "b"), Some(MemberState::Alive));
+    }
+}
+
+/// The driver when the node it drives was itself stalled (ADR 0016's amendment for
+/// issue #1002): the real loop ([`run_gossip`]) over a real loopback socket, on tokio's
+/// paused clock, so the test decides when the loop runs and what time it finds.
+#[cfg(test)]
+mod stall_tests {
+    use super::{run_gossip, DrainBudget, Gossip, MembershipEvent, StallClock, TICK};
+    use super::{DRAIN_MAX_DATAGRAMS, STALL_TICKS};
+    use crate::swim::{Config, Kind, MemberState, Message, Swim, Update};
+    use crate::NodeId;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    type Counts = Arc<Mutex<HashMap<&'static str, u64>>>;
+
+    /// Node `a`, driven by the real loop with the broker's timings, and its one peer
+    /// `b`, played by the test on a plain socket.
+    struct Rig {
+        b: std::net::UdpSocket,
+        a_addr: std::net::SocketAddr,
+        /// A second handle on `a`'s socket, only ever peeked: how the test knows that a
+        /// datagram it sent is in `a`'s receive buffer (loopback delivery is not part
+        /// of `send_to` on every kernel).
+        a_socket: std::net::UdpSocket,
+        events: mpsc::UnboundedReceiver<MembershipEvent>,
+        counts: Counts,
+        driver: tokio::task::JoinHandle<()>,
+    }
+
+    /// Wait, in real time and bounded, for the kernel: `ready` is about a loopback
+    /// datagram already sent, which arrives within microseconds.
+    fn until(what: &str, mut ready: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !ready() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            std::thread::yield_now();
+        }
+    }
+
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            self.driver.abort();
+        }
+    }
+
+    impl Rig {
+        fn count(&self, what: &'static str) -> u64 {
+            self.counts.lock().unwrap().get(what).copied().unwrap_or(0)
+        }
+
+        fn send(&self, kind: Kind, gossip: Vec<Update>) {
+            let msg = Message {
+                from: "b".to_string(),
+                from_addr: String::new(), // the driver stamps the UDP source
+                from_peer_addr: "b:7001".to_string(),
+                from_domain: None,
+                from_generation: 1,
+                kind,
+                gossip,
+                cluster_id: None,
+            };
+            self.b
+                .send_to(&postcard::to_allocvec(&msg).unwrap(), self.a_addr)
+                .unwrap();
+            // In `a`'s receive buffer before the test goes on. (`a` is not running:
+            // the test is the one task on this runtime that is.)
+            until("the datagram never reached a's socket", || {
+                self.a_socket.peek_from(&mut [0u8; 1]).is_ok()
+            });
+        }
+
+        /// Everything `a` has sent `b` so far, in order. `b` pings `a` with a sequence
+        /// number `a` has never used and lets it run without any time passing; `a`'s
+        /// `Ack` to that is the last datagram it has sent, and when it is here so is
+        /// everything before it.
+        async fn inbox(&self) -> Vec<Message> {
+            const MARK: u64 = u64::MAX;
+            self.send(Kind::Ping { seq: MARK }, Vec::new());
+            turn().await;
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut out = Vec::new();
+            let mut marked = false;
+            until("a never answered b's ping", || {
+                while let Ok((n, _)) = self.b.recv_from(&mut buf) {
+                    let msg = Message::decode(&buf[..n]).expect("a's datagrams decode");
+                    if msg.kind == (Kind::Ack { seq: MARK }) {
+                        marked = true;
+                    } else {
+                        out.push(msg);
+                    }
+                }
+                marked
+            });
+            out
+        }
+
+        /// Whether `a` has declared `b` dead since this was last asked.
+        fn declared_dead(&mut self) -> bool {
+            let mut dead = false;
+            while let Ok(event) = self.events.try_recv() {
+                dead |= event.id.0 == "b" && event.state == MemberState::Dead;
+            }
+            dead
+        }
+    }
+
+    /// Let `a`'s loop run: the test yields, the runtime turns its I/O and timer
+    /// drivers and polls the loop, which runs until it has nothing ready.
+    async fn turn() {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// `ms` pass with `a`'s loop not running, and then it runs: on the paused clock
+    /// nothing is scheduled between the two halves of this.
+    async fn pass(ms: u64) {
+        tokio::time::advance(Duration::from_millis(ms)).await;
+        turn().await;
+    }
+
+    /// `a` holds `b` suspect, its window has lapsed, and the last direct probe has
+    /// just gone out, on the tick that just ran. Returns the rig and that probe's
+    /// sequence number.
+    async fn a_with_its_last_probe_out() -> (Rig, u64) {
+        let a_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        a_socket.set_nonblocking(true).unwrap();
+        let socket = tokio::net::UdpSocket::from_std(a_socket.try_clone().unwrap()).unwrap();
+        let a_addr = socket.local_addr().unwrap();
+        let b = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        b.set_nonblocking(true).unwrap();
+        let swim = Swim::new(
+            NodeId("a".to_string()),
+            a_addr.to_string(),
+            "a:7001".to_string(),
+            None,
+            1,
+            Config::default(),
+            Vec::new(),
+        );
+        let counts: Counts = Arc::new(Mutex::new(HashMap::new()));
+        let (probes, stalls) = (counts.clone(), counts.clone());
+        let gossip = Gossip::new(swim, None, None)
+            .with_last_probe_counter(Some(Arc::new(move |outcome, n| {
+                *probes.lock().unwrap().entry(outcome).or_default() += n;
+            })))
+            .with_stall_counter(Some(Arc::new(move |_| {
+                *stalls.lock().unwrap().entry("stalls").or_default() += 1;
+            })));
+        let (tx, events) = mpsc::unbounded_channel();
+        let driver = tokio::spawn(run_gossip(
+            socket,
+            gossip,
+            TICK,
+            tx,
+            None,
+            std::future::pending(),
+        ));
+        let mut rig = Rig {
+            b,
+            a_addr,
+            a_socket,
+            events,
+            counts,
+            driver,
+        };
+
+        // `b` introduces itself and then answers no probe: probed, suspected (one
+        // suspecter: the full 4 s window), and asked once more when that lapses.
+        rig.send(Kind::Sync, Vec::new());
+        turn().await;
+        for _ in 0..200 {
+            pass(100).await;
+            if rig.count("sent") == 0 {
+                continue;
+            }
+            // The tick that just ran sent the last probe, and nothing after it: with
+            // these timings the window lapses between two rounds of ordinary probes.
+            let sent = rig.inbox().await;
+            let probe = sent.last().expect("a sent b its last probe");
+            let Kind::Ping { seq } = probe.kind else {
+                panic!("the last datagram is not the last probe: {probe:?}");
+            };
+            assert_eq!(probe.gossip.len(), 1, "{probe:?}");
+            assert_eq!(probe.gossip[0].state, MemberState::Suspect);
+            assert_eq!(probe.gossip[0].suspecter.as_deref(), Some("a"));
+            assert!(!rig.declared_dead());
+            assert_eq!(rig.count("sent"), 1);
+            assert_eq!(rig.count("stalls"), 0, "a ran on time up to here");
+            return (rig, seq);
+        }
+        panic!("a never sent b a last probe");
+    }
+
+    /// The finding this change closes. `a`'s last probe is out; `b` answers at once;
+    /// and `a` does not run again for three seconds — twelve ack timeouts. When it
+    /// does, the tick that is due and the `Ack` in its socket are both ready. `b` is
+    /// not declared dead: the `Ack` is read before the tick, and those three seconds
+    /// are not on `a`'s clock. `a` knows it was stalled, and says so.
+    #[tokio::test(start_paused = true)]
+    async fn a_prober_stalled_past_the_ack_timeout_reads_the_ack_before_it_gives_up() {
+        // The loop picks between its ready branches at random: often enough that a
+        // loop which could give up first would.
+        for _ in 0..24 {
+            let (mut rig, seq) = a_with_its_last_probe_out().await;
+            rig.send(Kind::Ack { seq }, Vec::new());
+            pass(3000).await;
+            assert!(!rig.declared_dead(), "declared dead with its ack unread");
+            assert_eq!((rig.count("spared"), rig.count("silent")), (1, 0));
+            assert_eq!(rig.count("stalls"), 1);
+
+            // And it stays that way: `b` is asked for its claim, and answers it.
+            let asked = rig.inbox().await;
+            assert!(asked.iter().any(|m| m.kind == Kind::Join), "{asked:?}");
+            rig.send(
+                Kind::Sync,
+                vec![Update {
+                    id: "b".to_string(),
+                    addr: String::new(),
+                    peer_addr: "b:7001".to_string(),
+                    incarnation: 1,
+                    generation: 1,
+                    state: MemberState::Alive,
+                    suspecter: None,
+                    failure_domain: None,
+                }],
+            );
+            for _ in 0..10 {
+                pass(100).await;
+            }
+            assert!(!rig.declared_dead());
+            assert_eq!(rig.count("silent"), 0);
+        }
+    }
+
+    /// The same race without a stall the clock would catch: the `Ack` arrives inside
+    /// the ack timeout, and the next time `a` runs is the tick at which that timeout
+    /// has passed — two ticks on, which is late but not a stall. Reading before
+    /// expiring is what decides it, on its own.
+    #[tokio::test(start_paused = true)]
+    async fn an_ack_already_in_the_socket_beats_the_tick_that_would_give_up_on_it() {
+        let ack_timeout = Config::default().ack_timeout_ms;
+        let late = STALL_TICKS * 100;
+        assert!(
+            100 + late >= ack_timeout,
+            "the tick below is past the deadline"
+        );
+        for _ in 0..24 {
+            let (mut rig, seq) = a_with_its_last_probe_out().await;
+            pass(100).await;
+            assert_eq!(rig.count("spared") + rig.count("silent"), 0);
+            rig.send(Kind::Ack { seq }, Vec::new());
+            pass(late).await;
+            assert!(!rig.declared_dead(), "the tick won against a queued ack");
+            assert_eq!((rig.count("spared"), rig.count("silent")), (1, 0));
+            assert_eq!(rig.count("stalls"), 0, "not a stall: the read decided it");
+        }
+    }
+
+    /// None of this keeps a member that is not there. The same stall with no `Ack`:
+    /// `b` is not declared dead by the stall itself — those three seconds are not on
+    /// `a`'s clock, and a node that was just stalled holds its suspects for longer
+    /// (ADR 0016 §2), so the verdict is no longer due. When the longer window lapses
+    /// `b` is asked afresh, stays silent, and is declared dead.
+    #[tokio::test(start_paused = true)]
+    async fn a_suspect_that_stays_silent_is_declared_dead_after_the_stall() {
+        let (mut rig, _) = a_with_its_last_probe_out().await;
+        pass(3000).await;
+        assert!(
+            !rig.declared_dead(),
+            "the stall is not the suspect's silence"
+        );
+        assert_eq!(rig.count("stalls"), 1);
+
+        // The window, doubled, has about four seconds left; then one doubled ack
+        // timeout. Ten seconds of ticks is ample, and each is on time.
+        let mut ticks = 0;
+        while !rig.declared_dead() {
+            ticks += 1;
+            assert!(ticks <= 100, "a never declared a silent suspect dead");
+            pass(100).await;
+        }
+        assert!(ticks > 5, "declared dead {ticks} ticks after the stall");
+        assert_eq!(
+            (rig.count("sent"), rig.count("spared"), rig.count("silent")),
+            (2, 0, 1)
+        );
+        assert_eq!(rig.count("stalls"), 1);
+    }
+
+    /// The clock: a late wake-up counts as one tick, however late; time only goes
+    /// forward; and no single wake-up moves it a whole ack timeout.
+    #[test]
+    fn the_stall_clock_leaves_out_the_time_the_loop_did_not_run() {
+        let tick = u64::try_from(TICK.as_millis()).unwrap();
+        let mut clock = StallClock::new(TICK);
+        // On time, and late by less than a whole tick: the clock is the wall clock.
+        assert_eq!(clock.observe(0), (0, None));
+        assert_eq!(clock.observe(tick), (tick, None));
+        assert_eq!(clock.observe(tick + 7), (tick + 7, None));
+        assert_eq!(clock.observe(3 * tick), (3 * tick, None));
+        assert_eq!(clock.observe(5 * tick), (5 * tick, None));
+        // More than two ticks since the last wake-up: a stall, worth one tick.
+        assert_eq!(clock.observe(7 * tick + 1), (6 * tick, Some(tick + 1)));
+        assert_eq!(
+            clock.observe(60_000),
+            (7 * tick, Some(60_000 - 8 * tick - 1))
+        );
+        // Afterwards it runs at the wall clock's rate again, from where it was.
+        assert_eq!(clock.observe(60_040), (7 * tick + 40, None));
+        // A monotonic clock does not go back; if a reading did, this would not.
+        assert_eq!(clock.observe(59_000), (7 * tick + 40, None));
+
+        // The property the driver's rules rest on, for the broker's timings: whatever
+        // the gaps, one wake-up advances the clock by less than the ack timeout, so a
+        // deadline set on one wake-up cannot be found expired on the next.
+        let ack_timeout = Config::default().ack_timeout_ms;
+        assert!(
+            STALL_TICKS * tick < ack_timeout,
+            "a wake-up may advance the clock {} ms and the ack timeout is {ack_timeout} ms: \
+             one late tick could expire a probe it had no chance to hear answered",
+            STALL_TICKS * tick
+        );
+        let mut clock = StallClock::new(TICK);
+        let (mut real, mut was) = (0u64, 0u64);
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        for _ in 0..10_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            real += seed % 1500;
+            let (now, _) = clock.observe(real);
+            assert!(now >= was && now - was <= STALL_TICKS * tick);
+            was = now;
+        }
+    }
+
+    /// The read ahead of a tick is bounded in datagrams and in time, so a flood cannot
+    /// keep the tick from running.
+    #[test]
+    fn the_read_ahead_of_a_tick_is_bounded() {
+        let mut budget = DrainBudget::for_tick(Duration::from_hours(1));
+        let granted = (0..2 * DRAIN_MAX_DATAGRAMS)
+            .filter(|_| budget.take())
+            .count();
+        assert_eq!(granted, DRAIN_MAX_DATAGRAMS);
+
+        let mut budget = DrainBudget::for_tick(Duration::ZERO);
+        assert!(!budget.take(), "no time, no read");
     }
 }

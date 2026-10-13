@@ -17,10 +17,14 @@
 //! measures each cause on its own, and runs a mixed-version cluster.
 //!
 //! Every choice (start stagger, tick phase, latency) comes from one seed, so a run is a
-//! pure function of `(n, seed, variant)` and a failure reruns identically.
+//! pure function of `(n, seed, variant)` and a failure reruns identically. Which
+//! datagrams a lossy network drops is a function of the seed, the link and the moment
+//! and of nothing a node does ([`Sim::lost`]), so two detectors run on one seed are run
+//! on the same network.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap};
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -28,11 +32,17 @@ use mqtt_cluster::swim::{Action, Config, Kind, MemberState, Message, Swim};
 use mqtt_cluster::swim_auth::{
     GossipSign, GossipVerify, OpenReject, SwimAuth, VerifiedIdentity, KEY_LEN,
 };
-use mqtt_cluster::swim_driver::{CertRequests, Gossip, MembershipEvent, Output};
+use mqtt_cluster::swim_driver::{
+    CertRequests, Gossip, MembershipEvent, Output, StallClock, DRAIN_MAX_DATAGRAMS, TICK,
+};
 use mqtt_cluster::NodeId;
 
-/// The broker's driver tick (`SWIM_TICK` in `mqttd`).
-const TICK_MS: u64 = 100;
+/// The broker's driver tick: the constant the broker itself passes its driver, so the
+/// simulation cannot measure one tick while the broker runs another.
+#[allow(clippy::cast_possible_truncation)] // 100
+const TICK_MS: u64 = TICK.as_millis() as u64;
+/// The longest a datagram takes on the simulated network, ms ([`Sim::apply`]).
+const MAX_LATENCY_MS: u64 = 1;
 /// A realistic ECDSA P-256 leaf certificate size (DER), so datagram sizes are honest.
 const CERT_LEN: usize = 560;
 /// The size signed gossip must stay under: a 1500-byte Ethernet MTU less the IPv6 and
@@ -271,6 +281,14 @@ impl Endpoint {
             .collect()
     }
 
+    /// The driver found that this node had been stalled. (v1.1.0's driver finds
+    /// nothing: it reads the wall clock.)
+    fn local_stall(&mut self, stalled_ms: u64) {
+        if let Endpoint::Real { gossip, .. } = self {
+            gossip.local_stall(stalled_ms);
+        }
+    }
+
     fn tick(&mut self, now: u64) -> Vec<Emit> {
         match self {
             Endpoint::Real { gossip, .. } => Self::from_outputs(gossip.tick(now)),
@@ -337,13 +355,36 @@ struct Variant {
     /// default a clean cut (nothing in, nothing out). Times in the outcome are then
     /// measured from the end of the fault.
     isolate: Option<Isolate>,
-    /// From [`LOSS_AFTER_MS`] after formation, every datagram is dropped with this
-    /// probability, in thousandths, for the rest of the run. With no node isolated
-    /// the outcome is measured from that moment.
+    /// Every datagram is dropped with this probability, in thousandths, for the rest
+    /// of the run: from [`LOSS_AFTER_MS`] after formation when no node is isolated,
+    /// and the outcome is measured from that moment; from the moment the fault begins
+    /// when one is — so that nothing the loss does goes uncounted before the fault,
+    /// and the member the fault is put on is a member in good standing.
     loss_permille: u64,
     /// Applied to the configuration of every node on this tree ([`Flavor::Current`]):
     /// how a failure-detection variant is measured against the default (issue #973).
     tune: fn(Config) -> Config,
+    /// The driver loop the nodes on this tree run when one of them is stalled.
+    shell: Shell,
+    /// Stall a PROBER at the worst moment: the first node on this tree, other than the
+    /// isolated one, to send a last direct probe stops for this long from the instant
+    /// it has sent it. One node, once per run.
+    stall_prober_ms: Option<u64>,
+}
+
+/// What a node's driver loop does on the first tick after the node was stalled — its
+/// ticks stopped while datagrams queued on its socket.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Shell {
+    /// This tree's (`swim_driver::run_gossip`): the stalled time is left out of the
+    /// clock and reported to the state machine; then everything queued is read; then
+    /// the tick.
+    Current,
+    /// The loop as it was up to #1000, at its worst: the wall clock, and the tick
+    /// ahead of what is queued. (It picked between the two at random; a simulation
+    /// that wants to see the bug takes the order that shows it.) v1.1.0 nodes always
+    /// run this one.
+    TickFirst,
 }
 
 #[derive(Clone, Copy)]
@@ -369,10 +410,21 @@ enum Fault {
     /// Everything it sends arrives this many ms late: a node whose replies come, but
     /// after the deadline they were wanted by.
     Slow(u64),
+    /// The node itself stops — a stopped process, a suspended VM, a runtime that does
+    /// not schedule it: its ticks stop, and what is sent to it is not lost but queues
+    /// on its socket (without limit here; a kernel's buffer holds a few hundred
+    /// datagrams) until it runs again. It is then both things at once: a member that
+    /// was silent, and a prober whose deadlines all passed while it was away.
+    Stall,
 }
 
-/// How long after formation the loss of [`Variant::loss_permille`] begins.
-const LOSS_AFTER_MS: u64 = 30_000;
+/// How long after formation the reports put a fault on a member: a minute.
+const FAULT_AFTER_MS: u64 = 60_000;
+/// How long after formation the loss of [`Variant::loss_permille`] begins when no node
+/// is isolated: the moment a fault would have begun. A lossy cell with a fault and the
+/// one without are then the same network from the same moment — the loss is a function
+/// of the time ([`Sim::lost`]) — and differ by the fault alone.
+const LOSS_AFTER_MS: u64 = FAULT_AFTER_MS;
 /// An [`Isolate::for_ms`] that outlasts every run: the fault never ends.
 const FOREVER_MS: u64 = 10_000_000;
 
@@ -387,6 +439,8 @@ impl Variant {
             isolate: None,
             loss_permille: 0,
             tune: |cfg| cfg,
+            shell: Shell::Current,
+            stall_prober_ms: None,
         }
     }
 }
@@ -424,8 +478,16 @@ fn one_upgraded(i: usize, n: usize) -> Flavor {
 
 struct Node {
     endpoint: Endpoint,
-    /// Global time this process started; its clock is `now - started`, like the driver's.
+    /// Global time this process started; its monotonic clock is `now - started`.
     started: u64,
+    /// The loop this node's driver runs.
+    shell: Shell,
+    /// The clock a [`Shell::Current`] driver feeds its state machine: the monotonic
+    /// one less the time the node was stalled. Equal to it in a run with no stall.
+    clock: StallClock,
+    /// Datagrams that arrived while the node was stalled, oldest first: its socket's
+    /// receive buffer.
+    backlog: Vec<(usize, Vec<u8>)>,
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -472,6 +534,26 @@ struct Outcome {
     /// Largest sealed datagram, bytes, and how many were sent.
     max_datagram: usize,
     datagrams: u64,
+    /// Datagrams the lossy network dropped.
+    lost: u64,
+    /// [`Variant::stall_prober_ms`]: a node sent a last probe and was stalled on it,
+    /// and what came of that.
+    stalled_prober: Option<StalledProber>,
+    /// The isolated member was turned `Dead` by some node, from the fault's start on.
+    dead_about_isolated: bool,
+    /// Last direct probes sent, answered by the suspect, and run out in silence,
+    /// summed over the nodes at the end of the run.
+    last_probes: (u64, u64, u64),
+}
+
+/// What came of stalling a prober on its last probe.
+#[derive(Debug, Default, Clone, Copy)]
+struct StalledProber {
+    /// It gave up on a last probe of its own (it counted one silent) by the end of
+    /// the run.
+    gave_up: bool,
+    /// It was itself turned `Dead` by some node: silent while it was stopped.
+    turned_dead: bool,
 }
 
 impl Outcome {
@@ -505,6 +587,14 @@ struct Sim {
     deaf_to: usize,
     /// Global ms from which datagrams are lost at random; `u64::MAX` for never.
     loss_from: u64,
+    /// The run's seed, for the lossy network's own choices ([`Sim::lost`]).
+    seed: u64,
+    /// Per directed link: the last millisecond a datagram was offered to the lossy
+    /// network on it, and how many have been in that millisecond.
+    offered: BTreeMap<(usize, usize), (u64, u64)>,
+    /// `(node, from, until)` in global ms: the prober stalled by
+    /// [`Variant::stall_prober_ms`], once it has been.
+    prober_stall: Option<(usize, u64, u64)>,
     /// The nodes that have declared the cut-off member `Dead` since the cut began.
     buriers: std::collections::BTreeSet<usize>,
 }
@@ -539,6 +629,9 @@ impl Sim {
             // The founder: never the isolated node.
             deaf_to: 0,
             loss_from: u64::MAX,
+            seed,
+            offered: BTreeMap::new(),
+            prober_stall: None,
             buriers: std::collections::BTreeSet::new(),
         };
         // Founder first; the rig waits for it to be ready before starting anyone else.
@@ -566,6 +659,13 @@ impl Sim {
             let node = 2 + usize::try_from(sim.rng.range(0, (n - 3) as u64)).expect("small");
             let from = t + iso.at_ms;
             sim.cut = Some((node, from, from + iso.for_ms));
+            if sim.variant.loss_permille > 0 {
+                // The network turns lossy as the fault begins. (It used to turn lossy
+                // 30 s earlier while the counting began at the fault's end: what the
+                // loss did in between was in no column, and the member the fault was
+                // put on could already be a tombstone.)
+                sim.loss_from = from;
+            }
             // A fault that never ends is measured from its start.
             sim.out.measured_from = if iso.for_ms >= FOREVER_MS {
                 from
@@ -628,6 +728,13 @@ impl Sim {
         self.nodes[i] = Some(Node {
             endpoint: Endpoint::new(swim, auth, flavor),
             started: self.now,
+            shell: if flavor == Flavor::Current {
+                self.variant.shell
+            } else {
+                Shell::TickFirst
+            },
+            clock: StallClock::new(TICK),
+            backlog: Vec::new(),
         });
         if !restarted {
             let phase = self.rng.range(0, TICK_MS - 1);
@@ -652,10 +759,49 @@ impl Sim {
             || (receiver == Some(Fault::DeafToOne) && from == self.deaf_to)
     }
 
-    /// Whether this datagram is one the lossy network drops. Draws from the run's
-    /// generator only while loss is on, so a lossless run's schedule is what it was.
-    fn lost(&mut self) -> bool {
-        self.now >= self.loss_from && self.rng.range(0, 999) < self.variant.loss_permille
+    /// Until when node `i` is stalled, if it is at this moment: the isolated node under
+    /// [`Fault::Stall`], or the prober stalled by [`Variant::stall_prober_ms`].
+    fn stalled_until(&self, i: usize) -> Option<u64> {
+        if self.fault_on(i) == Some(Fault::Stall) {
+            return self.cut.map(|(_, _, until)| until);
+        }
+        self.prober_stall
+            .filter(|(node, from, until)| *node == i && self.now >= *from && self.now < *until)
+            .map(|(_, _, until)| until)
+    }
+
+    /// Whether the lossy network drops the datagram `from` is sending `to` now.
+    ///
+    /// A function of the run's seed, the directed link, the millisecond, and the
+    /// datagram's place among those offered on that link in that millisecond — and of
+    /// nothing else. It draws on no generator, so what one node sends does not change
+    /// which of another's datagrams are lost, and two runs of one seed under two
+    /// detectors lose the same datagrams wherever their traffic is the same: an extra
+    /// datagram in one of them (a last probe, say) meets its own fate and moves nobody
+    /// else's. (The fate of each datagram used to be the next draw from the generator
+    /// that also supplies latency, so one datagram more or less reshuffled every loss
+    /// after it.) A lossless run draws nothing here, as before.
+    fn lost(&mut self, from: usize, to: usize) -> bool {
+        if self.variant.loss_permille == 0 || self.now < self.loss_from {
+            return false;
+        }
+        let offered = self.offered.entry((from, to)).or_insert((self.now, 0));
+        if offered.0 != self.now {
+            *offered = (self.now, 0);
+        }
+        let nth = offered.1;
+        offered.1 += 1;
+        // splitmix64 over the four coordinates, chained.
+        let mut h = self.seed ^ 0x6A09_E667_F3BC_C908;
+        for word in [from as u64, to as u64, self.now, nth] {
+            h = h.wrapping_add(word).wrapping_add(0x9E37_79B9_7F4A_7C15);
+            h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            h ^= h >> 31;
+        }
+        let lost = h % 1000 < self.variant.loss_permille;
+        self.out.lost += u64::from(lost);
+        lost
     }
 
     fn counting(&self) -> bool {
@@ -672,11 +818,11 @@ impl Sim {
                     };
                     self.out.max_datagram = self.out.max_datagram.max(bytes.len());
                     self.out.datagrams += 1;
-                    if self.severed(from, j) || self.lost() {
+                    if self.severed(from, j) || self.lost(from, j) {
                         continue;
                     }
                     // A private network: well under a millisecond, sometimes over.
-                    let mut lat = self.rng.range(0, 1);
+                    let mut lat = self.rng.range(0, MAX_LATENCY_MS);
                     if let Some(Fault::Slow(late)) = self.fault_on(from) {
                         lat += late;
                     }
@@ -701,8 +847,17 @@ impl Sim {
                             }) {
                                 self.out.deads_during_cut += 1;
                             }
+                            if self
+                                .prober_stall
+                                .is_some_and(|(node, _, _)| node == subject)
+                            {
+                                if let Some(prober) = &mut self.out.stalled_prober {
+                                    prober.turned_dead = true;
+                                }
+                            }
                             if let Some((node, cut_from, _)) = self.cut {
                                 if subject == node && self.now >= cut_from {
+                                    self.out.dead_about_isolated = true;
                                     self.buriers.insert(from);
                                     if self.buriers.len() == self.n - 1
                                         && self.out.buried_after.is_none()
@@ -730,14 +885,90 @@ impl Sim {
         }
     }
 
-    fn hand_over(&mut self, to: usize, from: usize, bytes: &[u8]) {
+    /// A wake-up of node `i`'s driver loop: the `now` it feeds its state machine. This
+    /// tree's loop leaves stalled time out of it and reports the stall; the loop
+    /// before it read the wall clock.
+    fn wake(&mut self, i: usize) -> u64 {
+        let node = self.nodes[i].as_mut().expect("a node that is up");
+        let real = self.now - node.started;
+        if node.shell == Shell::TickFirst {
+            return real;
+        }
+        let (now, stalled) = node.clock.observe(real);
+        if let Some(stalled_ms) = stalled {
+            node.endpoint.local_stall(stalled_ms);
+        }
+        now
+    }
+
+    /// A datagram reaches node `to`'s socket: handed to its driver, or — while the
+    /// node is stalled, and until the tick that ends the stall has read what queued
+    /// before it — left in the socket's buffer.
+    fn arrive(&mut self, to: usize, from: usize, bytes: Vec<u8>) {
         if self.severed(from, to) {
             return;
         }
+        let stalled = self.stalled_until(to).is_some();
         let Some(node) = self.nodes[to].as_mut() else {
             return; // not started yet: the datagram hits a closed port
         };
-        let now = self.now - node.started;
+        if stalled || !node.backlog.is_empty() {
+            node.backlog.push((from, bytes));
+            return;
+        }
+        let now = self.wake(to);
+        self.hand_over(to, from, &bytes, now);
+    }
+
+    /// One tick of node `i`'s driver loop.
+    fn tick(&mut self, i: usize) {
+        if let Some(until) = self.stalled_until(i) {
+            // Stalled: no tick. The loop runs again when the stall ends, and does not
+            // make up the ticks it missed.
+            self.push(until, Ev::Tick(i));
+            return;
+        }
+        let node = self.nodes[i].as_mut().expect("ticking node is up");
+        let mut queued = std::mem::take(&mut node.backlog);
+        let shell = node.shell;
+        let now = self.wake(i);
+        // This tree's loop reads what its socket holds before the tick, up to its
+        // bound; the loop before it ticked first (at its worst).
+        let after_tick = match shell {
+            Shell::Current => queued.split_off(queued.len().min(DRAIN_MAX_DATAGRAMS)),
+            Shell::TickFirst => std::mem::take(&mut queued),
+        };
+        for (from, bytes) in queued {
+            self.hand_over(i, from, &bytes, now);
+        }
+        let sent_before = self.last_probes_sent(i);
+        let node = self.nodes[i].as_mut().expect("ticking node is up");
+        let emitted = node.endpoint.tick(now);
+        self.apply(i, emitted);
+        for (from, bytes) in after_tick {
+            self.hand_over(i, from, &bytes, now);
+        }
+        self.push(self.now + TICK_MS, Ev::Tick(i));
+
+        // The adversarial stall: this node has just sent a last probe, and stops.
+        if let Some(for_ms) = self.variant.stall_prober_ms {
+            let isolated = self.cut.is_some_and(|(node, _, _)| node == i);
+            if self.prober_stall.is_none() && !isolated && self.last_probes_sent(i) > sent_before {
+                self.prober_stall = Some((i, self.now, self.now + for_ms));
+                self.out.stalled_prober = Some(StalledProber::default());
+            }
+        }
+    }
+
+    /// Last direct probes node `i` has sent so far.
+    fn last_probes_sent(&self, i: usize) -> u64 {
+        self.nodes[i]
+            .as_ref()
+            .map_or(0, |n| n.endpoint.swim().last_probes().sent)
+    }
+
+    fn hand_over(&mut self, to: usize, from: usize, bytes: &[u8], now: u64) {
+        let node = self.nodes[to].as_mut().expect("a node that is up");
         let (emitted, miss) = node.endpoint.receive(bytes, &addr_of(from), now);
         if let Endpoint::Real { cert_miss, .. } = &node.endpoint {
             // Nothing in a lossless cluster of honest nodes is dropped for any reason
@@ -777,14 +1008,8 @@ impl Sim {
             match ev {
                 Ev::Start(i) => self.start(i, false),
                 Ev::Arm => self.start(0, true),
-                Ev::Tick(i) => {
-                    let node = self.nodes[i].as_mut().expect("ticking node is up");
-                    let now = self.now - node.started;
-                    let emitted = node.endpoint.tick(now);
-                    self.apply(i, emitted);
-                    self.push(self.now + TICK_MS, Ev::Tick(i));
-                }
-                Ev::Deliver { to, from, bytes } => self.hand_over(to, from, &bytes),
+                Ev::Tick(i) => self.tick(i),
+                Ev::Deliver { to, from, bytes } => self.arrive(to, from, bytes),
             }
             if self.now >= self.out.measured_from {
                 if self.full_view() {
@@ -803,6 +1028,19 @@ impl Sim {
             let from_ms = since.max(self.out.measured_from);
             self.out.longest_eviction = self.out.longest_eviction.max(end - from_ms);
             self.out.evicted_at_deadline.push(pair);
+        }
+        for node in self.nodes.iter().flatten() {
+            let probes = node.endpoint.swim().last_probes();
+            self.out.last_probes.0 += probes.sent;
+            self.out.last_probes.1 += probes.spared;
+            self.out.last_probes.2 += probes.silent;
+        }
+        if let (Some((node, _, _)), Some(prober)) =
+            (self.prober_stall, &mut self.out.stalled_prober)
+        {
+            prober.gave_up = self.nodes[node]
+                .as_ref()
+                .is_some_and(|n| n.endpoint.swim().last_probes().silent > 0);
         }
         self.out
     }
@@ -975,7 +1213,7 @@ fn cut_off(flavor: fn(usize, usize) -> Flavor, for_ms: u64) -> Variant {
     Variant {
         preshared_certs: true,
         isolate: Some(Isolate {
-            at_ms: 60_000,
+            at_ms: FAULT_AFTER_MS,
             for_ms,
             shape: Fault::Cut,
         }),
@@ -1257,7 +1495,7 @@ fn cut_under_mixed(detector: Detector, flavor: fn(usize, usize) -> Flavor, for_m
 fn fault_under(detector: Detector, shape: Fault, for_ms: u64, loss_permille: u64) -> Variant {
     Variant {
         isolate: Some(Isolate {
-            at_ms: 60_000,
+            at_ms: FAULT_AFTER_MS,
             for_ms,
             shape,
         }),
@@ -1294,6 +1532,21 @@ struct CutCell {
     longest_eviction: u64,
     /// Runs whose views were not whole again at the deadline.
     unsettled: usize,
+    /// Runs in which a prober was stalled on its last probe
+    /// ([`Variant::stall_prober_ms`]).
+    prober_stalled: usize,
+    /// Of those: the runs in which that prober gave up on a last probe of its own; the
+    /// runs in which the member that had been cut off was turned `Dead`; and the runs
+    /// in which the stalled prober itself was.
+    prober_gave_up: usize,
+    dead_about_isolated: usize,
+    dead_about_prober: usize,
+    /// Runs in which a member was turned `Dead` although no last probe of any node
+    /// ran out unanswered. Under the default there is no such run: a `Dead` is declared
+    /// on a silent last probe and reaches the other nodes from the one that declared it.
+    dead_without_a_silent_probe: usize,
+    /// Last direct probes over all runs: sent, answered by the suspect, silent.
+    last_probes: (u64, u64, u64),
 }
 
 fn cut_cell(detector: Detector, n: usize, for_ms: u64, seeds: u64) -> CutCell {
@@ -1321,8 +1574,68 @@ fn cut_cell_of(variant: &Variant, n: usize, seeds: u64) -> CutCell {
         suspicions: suspicions[suspicions.len() / 2],
         longest_eviction: runs.iter().map(|o| o.longest_eviction).max().unwrap_or(0),
         unsettled: runs.iter().filter(|o| o.settled.is_none()).count(),
+        prober_stalled: runs.iter().filter(|o| o.stalled_prober.is_some()).count(),
+        prober_gave_up: runs
+            .iter()
+            .filter(|o| o.stalled_prober.is_some_and(|p| p.gave_up))
+            .count(),
+        dead_about_isolated: runs
+            .iter()
+            .filter(|o| o.stalled_prober.is_some() && o.dead_about_isolated)
+            .count(),
+        dead_about_prober: runs
+            .iter()
+            .filter(|o| o.stalled_prober.is_some_and(|p| p.turned_dead))
+            .count(),
+        dead_without_a_silent_probe: runs
+            .iter()
+            .filter(|o| o.deads_during_cut + o.total_deads() > 0 && o.last_probes.2 == 0)
+            .count(),
+        last_probes: runs.iter().fold((0, 0, 0), |sum, o| {
+            (
+                sum.0 + o.last_probes.0,
+                sum.1 + o.last_probes.1,
+                sum.2 + o.last_probes.2,
+            )
+        }),
     }
 }
+
+/// The length of the longest clean cut that CANNOT end in a `Dead` under the default
+/// detector on a network that loses nothing, in ms: by arithmetic, for any cluster
+/// size and any schedule. [`BOUND_DERIVATION`] is the argument; this is its last line.
+fn last_probe_bound_ms(cfg: &Config) -> u64 {
+    // A deadline is acted on by the first tick at or after it.
+    let on_a_tick = |ms: u64| ms.div_ceil(TICK_MS) * TICK_MS;
+    let suspected_after = 2 * on_a_tick(cfg.ack_timeout_ms);
+    let window = cfg.suspicion_min_timeout_ms.min(cfg.suspicion_timeout_ms);
+    suspected_after + window - 2 * MAX_LATENCY_MS
+}
+
+/// Why a member cut off for no longer than [`last_probe_bound_ms`] is declared `Dead`
+/// by no node. Printed when the bound test fails, which it does when a timeout or the
+/// tick is changed.
+const BOUND_DERIVATION: &str = "\
+A node declares a member Dead on its own account only when a last direct probe of it
+runs out unanswered; so if every last probe is sent after the cut has ended, the member
+answers each, and there is no Dead for anyone to adopt. The cut begins at c.
+
+  1. The earliest probe the cut leaves unanswered started at c - 2 x latency (its Ping
+     arrived just before c and its Ack just after).
+  2. Its prober acts on deadlines at its ticks. The ack timeout runs out and it asks its
+     helpers at the first tick at or after start + ack timeout; the indirect timeout
+     runs out one more such step later. So no node suspects the member before
+         start + 2 x roundup(ack timeout, tick).
+  3. The suspicion window is never shorter than its floor (three suspecters), and local
+     health only lengthens it. So no last probe is sent before
+         start + 2 x roundup(ack timeout, tick) + window floor.
+  4. With the defaults: 2 x roundup(250, 100) + 1500 - 2 x 1 = 2098 ms after c.
+
+A cut of up to 2098 ms has therefore ended before the first last probe is sent. The
+margin over a 2000 ms cut is 98 ms, and all of it is the tick: with a 50 ms tick the
+same line gives 2 x 250 + 1500 - 2 = 1998 ms, and a 2 s cut could swallow the probe.
+(The member's own suspicions of others need no line: it hears nobody, so it is the only
+suspecter, and its window is the full 4 s.)";
 
 /// How long the survivors took to bury a member whose fault never ends: ms from its
 /// start to the last survivor's `Dead`, per run that got there, sorted.
@@ -1387,7 +1700,9 @@ fn burial_under(
 }
 
 const CUT_SIZES: [usize; 5] = [3, 5, 10, 14, 30];
-const CUTS_MS: [u64; 6] = [500, 1000, 1500, 2000, 3000, 5000];
+/// 2 s and 2.5 s sit either side of where the last probe's bound ends
+/// ([`last_probe_bound_ms`]: 2098 ms).
+const CUTS_MS: [u64; 7] = [500, 1000, 1500, 2000, 2500, 3000, 5000];
 
 /// One cell of a report: `runs with any DEAD / runs with a DEAD after the fault ended
 /// [DEAD transitions median..worst; SUSPECT median; longest eviction, s; unsettled]`.
@@ -1429,17 +1744,33 @@ fn false_dead_report() {
         LAST_PROBE_LOG_N,
     ];
     println!("false DEAD after one member is cut off, {seeds} seeds per cell: {CELL_LEGEND}");
+    // The default's last probes, from the same runs as its row.
+    let mut probes = Vec::new();
     for detector in detectors {
         println!("\n{}", detector.0);
         for n in CUT_SIZES {
             let mut line = format!("  N={n:<3}");
+            let mut counts = format!("  N={n:<3}");
             for for_ms in CUTS_MS {
                 let c = cut_cell(detector, n, for_ms, seeds);
                 assert_eq!(c.runs, usize::try_from(seeds).expect("small"));
                 line.push_str(&show(&seconds(for_ms), &c));
+                let (sent, spared, silent) = c.last_probes;
+                let _ = write!(counts, " | {} {sent}/{spared}/{silent}", seconds(for_ms));
             }
             println!("{line}");
+            if detector.0 == DEFAULT.0 {
+                probes.push(counts);
+            }
         }
+    }
+    println!(
+        "\n{}: its last probes over the {seeds} runs of a cell — sent / answered by the \
+         suspect / silent",
+        DEFAULT.0
+    );
+    for line in probes {
+        println!("{line}");
     }
     // A rolling upgrade: only the upgraded nodes probe a suspect once more; a v1.1.0
     // node is probed and answers as it always has, and declares as it always has.
@@ -1473,10 +1804,12 @@ fn false_dead_report() {
     }
 }
 
-/// The measurement behind ADR 0016's amendment of 2026-10-13, beyond a clean cut on a
+/// The measurement behind ADR 0016's amendments of 2026-10-13, beyond a clean cut on a
 /// lossless network: the default and the same detector without its last probe, under
-/// packet loss, a member reachable one way only, one link lost one way, and a member
-/// whose datagrams arrive late. Not an assertion —
+/// packet loss, a member reachable one way only, one link lost one way, a member whose
+/// datagrams arrive late, and a node that was itself stalled — as a member and as the
+/// prober whose last probe is out. Each pair of rows runs the same seeds, and under
+/// loss the same network ([`Sim::lost`]). Not an assertion —
 /// `cargo test -p mqtt-cluster --release --test swim_formation_sim fault_shapes_report -- --ignored --nocapture`.
 #[test]
 #[ignore = "measurement report for issue #975; run with --ignored --nocapture"]
@@ -1493,7 +1826,10 @@ fn fault_shapes_report() {
         print_grid(&columns, seeds);
     }
 
-    println!("\none member cut off for 1.5 s on a network with that loss");
+    println!(
+        "\none member cut off for 1.5 s on a network that has that loss from the moment of \
+         the cut"
+    );
     for detector in pair {
         println!("  {}", detector.0);
         let columns = losses.map(|loss| {
@@ -1506,8 +1842,8 @@ fn fault_shapes_report() {
     }
 
     println!(
-        "\na member that really died, on a network with that loss: ms until the last \
-         survivor holds it DEAD, median / worst of 16"
+        "\na member that really died, on a network that has that loss from the moment it \
+         does: ms until the last survivor holds it DEAD, median / worst of 16"
     );
     for detector in pair {
         println!("  {}", detector.0);
@@ -1567,6 +1903,90 @@ fn fault_shapes_report() {
         });
         print_grid(&columns, seeds);
     }
+    report_stalled_nodes(seeds);
+}
+
+/// The part of [`fault_shapes_report`] about a node that was itself stalled (issue
+/// #1002): a node that stops and resumes is a silent member AND a prober whose
+/// deadlines all passed while it was away. The second row of each block is the
+/// default's state machine on the driver loop as it was before it read its socket ahead
+/// of a tick and kept stalled time off its clock.
+fn report_stalled_nodes(seeds: u64) {
+    let stalled_rows = [
+        (DEFAULT.0, DEFAULT, Shell::Current),
+        (
+            "default, on the driver loop before this change",
+            DEFAULT,
+            Shell::TickFirst,
+        ),
+        (NO_PROBE.0, NO_PROBE, Shell::Current),
+    ];
+    println!(
+        "\none node stopped and resumed (its ticks stop, what is sent to it queues on its \
+         socket), nobody else at fault"
+    );
+    for (label, detector, shell) in stalled_rows {
+        println!("  {label}");
+        let columns = [1000, 2000, 3000, 5000, 10_000].map(|for_ms| {
+            (
+                seconds(for_ms),
+                Variant {
+                    shell,
+                    ..fault_under(detector, Fault::Stall, for_ms, 0)
+                },
+            )
+        });
+        print_grid(&columns, seeds);
+    }
+    report_stalled_probers(seeds);
+}
+
+/// The stalled PROBER, at the worst moment: per cell, the runs in which a node was
+/// stopped on its last probe, and of those the runs in which that node gave up on a
+/// probe of its own, the runs in which the member that had been cut off was turned
+/// `Dead`, and the runs in which the stopped node itself was (it is silent for as long
+/// as it is stopped, which is a second fault).
+fn report_stalled_probers(seeds: u64) {
+    println!(
+        "\none member cut off for 2 s, and the first node to send a last probe stopped for \
+         the given time from the instant it has sent it: runs in which a node was so \
+         stopped / of those, runs in which it gave up on a last probe of its own / runs in \
+         which the member cut off was turned DEAD / runs in which the stopped node was \
+         [last probes over all runs: sent, answered, silent]"
+    );
+    for (label, shell) in [
+        (DEFAULT.0, Shell::Current),
+        (
+            "default, on the driver loop before this change",
+            Shell::TickFirst,
+        ),
+    ] {
+        println!("  {label}");
+        for n in CUT_SIZES {
+            let mut line = format!("    N={n:<3}");
+            for stall in [300, 1000, 2000] {
+                let variant = Variant {
+                    shell,
+                    stall_prober_ms: Some(stall),
+                    ..cut_under(DEFAULT, PROMISED_CUT_MS)
+                };
+                let c = cut_cell_of(&variant, n, seeds);
+                let _ = write!(
+                    line,
+                    " | {} {:>2}/{:>2}/{:>2}/{:>2} [{}, {}, {}]",
+                    seconds(stall),
+                    c.prober_stalled,
+                    c.prober_gave_up,
+                    c.dead_about_isolated,
+                    c.dead_about_prober,
+                    c.last_probes.0,
+                    c.last_probes.1,
+                    c.last_probes.2,
+                );
+            }
+            println!("{line}");
+        }
+    }
 }
 
 /// One block of a report: a line per cluster size, a cell per `(label, variant)`.
@@ -1595,30 +2015,59 @@ fn burials(detector: Detector, shape: Fault, loss_permille: u64) -> String {
         .join(" | ")
 }
 
-/// The bound the default detector keeps (ADR 0016's amendment of 2026-10-13, ADR 0087
-/// T10): a member of a formed cluster that is cut off — nothing in, nothing out — for
-/// up to 2 s is declared `Dead` by no node, at 5, 14 and 30 nodes, and not suspected
-/// for long either: every view is whole again within the window. Measured over 32
-/// seeds per cell (`false_dead_report`): none at 0.5 s, 1 s, 1.5 s or 2 s at any size
-/// from 3 to 30. At 3 s the bound does not hold — three suspecters shorten the window
-/// to 1.5 s, the member really is silent when it is asked, and the `Dead` declared
-/// during the cut is adopted by the rest after it.
+/// What the documents promise: "a member out of reach for up to two seconds is not
+/// declared dead".
+const PROMISED_CUT_MS: u64 = 2000;
+/// Where the bound actually ends with the broker's timings, as the documents state it
+/// (ADR 0016's amendment for issue #1002, the 1.2.0 release notes, OPERATIONS,
+/// TROUBLESHOOTING, ADR 0087 §7).
+const DOCUMENTED_BOUND_MS: u64 = 2098;
+
+/// The bound the default detector keeps (ADR 0016's amendments of 2026-10-13 for issues
+/// #975 and #1002, ADR 0087 T10): a member of a formed cluster that is cut off — nothing
+/// in, nothing out — for up to 2 s is declared `Dead` by no node, and not suspected
+/// for long either: every view is whole again within the window.
+///
+/// The bound is arithmetic ([`BOUND_DERIVATION`]), so it is tested as arithmetic: the
+/// figure is computed from the broker's own timeouts and tick, must cover the two
+/// seconds the documents promise, and must be the figure they give; and a cut of
+/// exactly that length — to the millisecond the last one the argument covers — ends
+/// in no `Dead` at 5, 14 and 30 nodes. Change a timeout or the tick and this fails
+/// with the derivation. Past the bound nothing is promised: the report's 2.5 s column
+/// is not zero.
 ///
 /// A member that really died is still buried by every survivor, one ack timeout later.
 #[test]
 fn a_member_cut_off_for_up_to_two_seconds_is_not_declared_dead() {
+    let cfg = Config::default();
+    let bound = last_probe_bound_ms(&cfg);
+    let timings = format!(
+        "ack timeout {} ms, suspicion window {} ms down to {} ms, driver tick {TICK_MS} ms, \
+         latency up to {MAX_LATENCY_MS} ms: the bound is {bound} ms",
+        cfg.ack_timeout_ms, cfg.suspicion_timeout_ms, cfg.suspicion_min_timeout_ms,
+    );
+    assert!(
+        bound >= PROMISED_CUT_MS,
+        "the last probe no longer covers a {PROMISED_CUT_MS} ms cut.\n{timings}\n\n{BOUND_DERIVATION}"
+    );
+    assert_eq!(
+        bound, DOCUMENTED_BOUND_MS,
+        "the bound has moved; the documents that state it must move with it.\n{timings}\n\n\
+         {BOUND_DERIVATION}"
+    );
     // A handful of runs per size: this is every tier's test, and the 32-seed table is
     // the report's.
     for (n, cuts) in [
-        (5, &[1500, 2000][..]),
-        (14, &[500, 1500, 2000]),
-        (30, &[1500, 2000]),
+        (5, &[1500, PROMISED_CUT_MS, bound][..]),
+        (14, &[500, PROMISED_CUT_MS, bound]),
+        (30, &[bound]),
     ] {
         for &for_ms in cuts {
             let c = cut_cell(DEFAULT, n, for_ms, seeds(n));
             assert_eq!(
                 c.any_dead, 0,
-                "N={n}, cut {for_ms} ms: {} of {} runs turned a member DEAD",
+                "N={n}, cut {for_ms} ms: {} of {} runs turned a member DEAD.\n{timings}\n\n\
+                 {BOUND_DERIVATION}",
                 c.any_dead, c.runs
             );
             assert_eq!(c.unsettled, 0, "N={n}, cut {for_ms} ms");
@@ -1638,19 +2087,109 @@ fn a_member_cut_off_for_up_to_two_seconds_is_not_declared_dead() {
     );
 }
 
+/// The bound holds when the PROBER is the one that stalls (issue #1002). A member is cut
+/// off for two seconds; the first node to send it a last probe stops on the spot — its
+/// ticks stop, what is sent to it queues on its socket — for four ack timeouts, and the
+/// member's `Ack` is in that queue when it wakes. On this tree's driver loop that node
+/// gives up on no probe, and the member that was cut off is turned `Dead` in no run:
+/// the queue is read before the tick, and the stalled time is not on the node's clock.
+///
+/// The simulation must be able to see what it guards against: the same state machine
+/// on the loop as it was — the wall clock, the tick ahead of the queue — gives up on
+/// the probe, and turns its suspect `Dead`, in EVERY run in which a prober was so
+/// stalled. (Its suspect is usually the member that was cut off and sometimes a third
+/// node that member had suspected during its outage — a node that was never at fault.)
+///
+/// Both halves are properties of each run, not counts of how many runs go which way;
+/// the seeds only have to supply one run in which a last probe is sent at all (17 of
+/// 32 in the report's cell; twelve runs with none has a chance of one in ten thousand).
+///
+/// What is NOT asserted is that no member at all is turned `Dead`. The node that
+/// stopped is itself silent for as long as it is stopped. That alone is inside the
+/// bound; but the member that was cut off may still hold it suspect from its own
+/// outage, on a window that began then, and ask it the last time while it is stopped.
+/// Two faults whose silences add up are past the bound: in the report, one run of the
+/// 64 with a prober stopped for 2 s.
+#[test]
+fn a_prober_stalled_on_its_last_probe_declares_nobody_dead() {
+    let n = 14;
+    let stalled = |shell| Variant {
+        shell,
+        stall_prober_ms: Some(4 * Config::default().ack_timeout_ms),
+        ..cut_under(DEFAULT, PROMISED_CUT_MS)
+    };
+    let now = cut_cell_of(&stalled(Shell::Current), n, 12);
+    assert!(
+        now.prober_stalled > 0,
+        "no run of {} sent a last probe: nothing was stalled, nothing was shown",
+        now.runs
+    );
+    assert_eq!(
+        now.prober_gave_up, 0,
+        "of {} probers stalled on their last probe, {} gave up on one on waking",
+        now.prober_stalled, now.prober_gave_up
+    );
+    assert_eq!(
+        now.dead_about_isolated, 0,
+        "the member that had been cut off was turned DEAD in {} of {} such runs",
+        now.dead_about_isolated, now.prober_stalled
+    );
+    assert_eq!(now.unsettled, 0);
+
+    let before = cut_cell_of(&stalled(Shell::TickFirst), n, 12);
+    assert_eq!(
+        before.prober_stalled, now.prober_stalled,
+        "the two loops are the same run up to the stall"
+    );
+    assert_eq!(
+        before.prober_gave_up, before.prober_stalled,
+        "on the loop as it was, a prober stalled past its ack timeout gives up on waking"
+    );
+    assert!(
+        before.any_dead >= before.prober_stalled && before.dead_about_isolated > 0,
+        "and its suspect is DEAD: {} runs with a DEAD, {} of them the member cut off, of \
+         {} with a stalled prober",
+        before.any_dead,
+        before.dead_about_isolated,
+        before.prober_stalled
+    );
+}
+
+/// A node that stops and resumes — a stopped process, a suspended VM — is a silent
+/// member and a stalled prober at once. Stopped for two seconds it is declared dead by
+/// nobody and declares nobody dead, as a member cut off for two seconds is not: its
+/// own deadlines did not run while it was away.
+#[test]
+fn a_node_stopped_for_two_seconds_neither_dies_nor_declares() {
+    for n in [5, 14] {
+        let c = cut_cell_of(
+            &fault_under(DEFAULT, Fault::Stall, PROMISED_CUT_MS, 0),
+            n,
+            seeds(n),
+        );
+        assert_eq!(c.any_dead, 0, "N={n}: {} of {} runs", c.any_dead, c.runs);
+        assert_eq!(c.unsettled, 0, "N={n}");
+    }
+}
+
 /// What the last direct probe is for, pinned from the other side: with it off
 /// (`confirm_before_dead = false` — v1.1.0's rule, and how this simulation models a
-/// v1.1.0 node) a member of a formed 14-node cluster that is cut off for 1.5 s, less
-/// than half the window, is declared `Dead` by some node in a good share of the
-/// schedules (16 of 32 seeds in the report), after the cut has ended, and each such
-/// verdict stands for the tombstone's 30 s.
+/// v1.1.0 node) a member of a formed 14-node cluster that is cut off for the two
+/// seconds the default spares, half the window, is declared `Dead` by some node in two
+/// schedules of three (21 of 32 seeds in the report), after the cut has ended, and
+/// each such verdict stands for the tombstone's 30 s.
+///
+/// "Some schedule ends in a `Dead`" is a statement about seeds, and a change to SWIM's
+/// traffic that has nothing to do with this rule moves which seeds. So the sweep is
+/// wide enough not to care: at the report's rate the chance that twelve runs show none
+/// is three in a million. (That the default spares the very same cut is not a matter of
+/// seeds at all: `a_member_cut_off_for_up_to_two_seconds_is_not_declared_dead`.)
 #[test]
 fn without_the_last_probe_a_short_cut_ends_in_a_false_dead() {
-    let c = cut_cell(NO_PROBE, 14, 1500, 8);
+    let c = cut_cell(NO_PROBE, 14, PROMISED_CUT_MS, 12);
     assert!(
-        c.dead_after_cut >= 2,
-        "{} of {} runs turned a reachable member DEAD",
-        c.dead_after_cut,
+        c.dead_after_cut >= 1,
+        "no run of {} turned a reachable member DEAD",
         c.runs
     );
     assert!(
@@ -1660,11 +2199,10 @@ fn without_the_last_probe_a_short_cut_ends_in_a_false_dead() {
     );
     assert_eq!(c.unsettled, 0, "and is then healed (issue #971)");
     // The v1.1.0 model is the same rule: a cluster of v1.1.0 nodes sees it too.
-    let c = cut_cell_of(&cut_under_mixed(DEFAULT, all_v1_1, 1500), 14, 8);
+    let c = cut_cell_of(&cut_under_mixed(DEFAULT, all_v1_1, PROMISED_CUT_MS), 14, 12);
     assert!(
-        c.dead_after_cut >= 2,
-        "v1.1.0: {} of {} runs turned a reachable member DEAD",
-        c.dead_after_cut,
+        c.dead_after_cut >= 1,
+        "v1.1.0: no run of {} turned a reachable member DEAD",
         c.runs
     );
 }
@@ -1672,12 +2210,19 @@ fn without_the_last_probe_a_short_cut_ends_in_a_false_dead() {
 /// A cluster part-way through the upgrade from v1.1.0 gets the bound only as it
 /// upgrades: a v1.1.0 node declares a suspect `Dead` without asking it, and a `Dead`
 /// it declared is adopted from gossip by the upgraded nodes like any other. With half
-/// of 14 nodes still on v1.1.0 the same 1.5 s cut still ends in a false `Dead` in some
-/// schedules (11 of 32 in the report; 16 with every node on v1.1.0, none with every
-/// node upgraded) — and every such verdict is healed.
+/// of 14 nodes still on v1.1.0 a 2 s cut — which no upgraded cluster turns into a
+/// verdict — still ends in a false `Dead` in some schedules (14 of 32 in the report;
+/// 21 with every node on v1.1.0), and every such verdict is healed.
+///
+/// A statement about seeds, like the test above; sixteen runs showing none has a
+/// chance of one in ten thousand at the report's rate.
 #[test]
 fn a_v1_1_node_still_declares_what_the_last_probe_would_have_spared() {
-    let c = cut_cell_of(&cut_under_mixed(DEFAULT, half_upgraded, 1500), 14, 8);
+    let c = cut_cell_of(
+        &cut_under_mixed(DEFAULT, half_upgraded, PROMISED_CUT_MS),
+        14,
+        16,
+    );
     assert!(
         c.any_dead >= 1,
         "the limit this test documents is gone: no run of {} turned a member DEAD",
@@ -1726,21 +2271,40 @@ fn one_link_lost_one_way_raises_no_verdict() {
 }
 
 /// Packet loss. The probe and its answer are two datagrams, and either can be lost;
-/// then the member is declared `Dead` as it would have been. So on a network that
-/// loses one datagram in ten the default is not a guarantee — but a member that
-/// really died is still buried by every survivor, and a 14-node cluster with nobody
-/// at fault sees no more false verdicts than without the probe (in the report, of 32
-/// runs: none with it and 1 without at 5 %, 1 and 9 at 10 %).
+/// then the member is declared `Dead` as it would have been. So on a lossy network
+/// the default is not a guarantee. What holds:
+///
+/// - a member that really died is still buried by every survivor;
+/// - the probe adds no verdict of its own: in every run, a `Dead` under the default
+///   has a last probe that ran out in silence behind it — a round trip the network
+///   lost — and never comes without one. That is a property of each run;
+/// - and it removes some: over sixteen seeds of a 10-node cluster losing one datagram
+///   in five, no more runs end in a false `Dead` with the probe than without (in the
+///   report, 10 of 32 against 25). The two arms of a seed run on the same network —
+///   the same datagrams are lost wherever they send the same ones ([`Sim::lost`]) —
+///   so this compares detectors and not draws; it is still a count over seeds, and at
+///   the report's rates the count going the other way has a chance of under one in a
+///   thousand.
 #[test]
 fn packet_loss_neither_keeps_a_dead_member_nor_adds_false_verdicts() {
-    let n = 14;
-    let buried = burial_under(DEFAULT, Fault::Cut, 100, n, 3);
+    let buried = burial_under(DEFAULT, Fault::Cut, 100, 14, 3);
     assert_eq!(buried.unburied, 0, "a dead member was kept under loss");
-    let with = cut_cell_of(&loss_under(DEFAULT, 100), n, seeds(n));
-    let without = cut_cell_of(&loss_under(NO_PROBE, 100), n, seeds(n));
+
+    let n = 10;
+    let with = cut_cell_of(&loss_under(DEFAULT, 200), n, 16);
+    let without = cut_cell_of(&loss_under(NO_PROBE, 200), n, 16);
+    assert!(
+        with.last_probes.0 > 0 && with.last_probes.2 > 0,
+        "one datagram in five lost, and no last probe was sent or none was lost: {:?}",
+        with.last_probes
+    );
+    assert_eq!(
+        with.dead_without_a_silent_probe, 0,
+        "a member was turned DEAD in a run in which no last probe ran out unanswered"
+    );
     assert!(
         with.any_dead <= without.any_dead,
-        "runs with a false DEAD under 10% loss: {} with the last probe, {} without",
+        "runs with a false DEAD under 20% loss: {} with the last probe, {} without",
         with.any_dead,
         without.any_dead
     );
