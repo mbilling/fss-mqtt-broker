@@ -28,13 +28,15 @@ audit-logged. A malformed file is rejected and the running policy kept — fix t
 and the watcher retries on the next poll.
 
 **Check the material before (and after) it lands:** `mqttd --check-tls [--config <path>]`
-reads every certificate, key, CA bundle and CRL the config names — `[tls]` and
-`[cluster.peer_tls]` — and prints one `[ ok ]` / `[warn]` / `[FAIL]` line per check: files
-load, the key matches its certificate, the chain file is in order (leaf first, each
-certificate issued by the next), each certificate's validity window (expired or not yet
-valid fails; under 30 days left warns), the leaf's CN and SANs, a non-empty CA bundle, and
-a CRL that parses and is not past its `nextUpdate`. It binds nothing and exits `1` on any
-failure, so it works as a CI gate, a cron job, or a `kubectl exec` on the distroless image.
+reads every certificate, key, CA bundle and CRL the config names — `[tls]`,
+`[cluster.peer_tls]` and `[admin]` — and prints one `[ ok ]` / `[warn]` / `[FAIL]` line per
+check: files load, the key matches its certificate, the chain file is in order (leaf first,
+each certificate issued by the next), each certificate's validity window (expired or not yet
+valid fails; past the [expiry warning threshold](#certificate-lifetimes-what-the-broker-tells-you-adr-0088)
+of its lifetime warns), the leaf's CN and SANs, a non-empty CA bundle, and a CRL that parses
+and is neither past its `nextUpdate` nor past that threshold of its window (both warn). It
+binds nothing and exits `1` on any failure, so it works as a CI gate, a cron job, or a
+`kubectl exec` on the distroless image.
 
 **See what the node actually runs:** `mqttd --print-config [--config <path>]` prints the
 effective config — defaults, file and `MQTTD_*` env merged and validated exactly as at
@@ -49,6 +51,118 @@ cluster-wide, a denial of service through the security machinery doing its job.
 Protect the policy volume (Secret RBAC, no wide ConfigMap write grants) to the same
 standard as the credentials it revokes; the audit log records each reload with its
 trigger, which is the forensic trail if it happens.
+
+## Certificate lifetimes: what the broker tells you (ADR 0088)
+
+The broker issues no certificates and renews none. The lifetime is chosen where the
+certificate is minted, and **rotating in due time is the operator's duty**, whether the
+operator is cert-manager or a person ([ADR 0088](adr/0088-credential-lifetimes-and-rotation.md)).
+The broker's part is that you are not surprised: for every certificate file, CA bundle and
+revocation list it has loaded, it exports how long is left, warns in its log, and the chart
+ships the alert.
+
+**The gauges.** One series per loaded file, labelled by a fixed `role` and nothing else
+(never a path, a subject or a serial):
+
+| `role` | File | Loaded when |
+|---|---|---|
+| `listener` | `tls.cert` | a TLS, WSS or QUIC listener is bound |
+| `client_ca` | `tls.client_ca` | as `listener`, and set |
+| `client_crl` | `tls.crl` | a TLS or WSS listener is bound, and set |
+| `peer` | `cluster.peer_tls.cert`, this node's own cluster certificate | the cluster bus has its CA, certificate and key |
+| `peer_ca` | `cluster.peer_tls.ca`, the cluster CA | as `peer` |
+| `peer_crl` | `cluster.peer_tls.crl` | as `peer`, and set |
+| `admin` | `admin.cert` | `admin.bind` is set |
+| `admin_ca` | `admin.client_ca` | `admin.bind` is set |
+
+- `mqttd_tls_expiry_seconds{role}`: seconds until expiry. It counts down, reads `0` in the
+  last valid second and is **negative once expired**, by how long.
+- `mqttd_tls_lifetime_spent_ratio{role}`: the fraction of the validity window that is
+  spent. `0` when new (and before `notBefore`), `1` at expiry, above `1` after it. This is
+  the one to alert on: `>= 0.667` means the same for a certificate that lives a day and a
+  CA that lives ten years.
+- `mqttd_tls_expiry_warn_ratio`: the fraction this node warns at, from
+  `tls.expiry_warn_permille` (below), so a rule can compare against the node's own setting.
+
+What a series is about:
+
+- **A certificate file** (`listener`, `peer`, `admin`) is reported by the certificate in it
+  that **expires first**. That is normally the leaf. If the file carries an intermediate
+  that runs out before the leaf, the series is the intermediate's: both numbers come from
+  that one certificate, and the log line and `--check-tls` name it.
+- **A CA bundle** is reported by its earliest-expiring CA. During a CA change the bundle
+  holds the old and the new CA and the series is the old one's until you remove it.
+- **A revocation list** is reported by its `nextUpdate`, over its `thisUpdate..nextUpdate`
+  window. A list that states no `nextUpdate` has no window and **no series**.
+- A file whose expiry cannot be read (it was replaced by something unparseable between
+  the reload and the read) has no series until the next reload, and a warning says so.
+- **Material that is not valid yet** (a certificate dated ahead, a clock that is behind)
+  reads as new on the gauges: `0` spent. Peers refuse it all the same, so the log warns
+  about it (`is not valid yet: its validity begins in …`) and `--check-tls` fails it.
+
+The numbers are computed when `/metrics` is scraped (or OTLP exports), from the validity
+window read at load, so they move between scrapes. They follow a reload: when the watcher
+or `SIGHUP` swaps a renewed certificate in, the series is the new certificate's from that
+moment. A rejected reload leaves the old material in force and its series unchanged. The
+windows are read from the files just after the reload built its TLS contexts from them; a
+file replaced in between is described a tick early, and the watcher's next reload loads
+it. One exception: the QUIC listener serves the certificate it loaded at startup (ADR 0036), so on
+a node whose only client-facing TLS is QUIC the `listener` and `client_ca` series stay
+those of startup until a restart.
+
+**The log.** Once the threshold fraction of a lifetime is spent the node logs a `WARN`
+naming the role, the setting, the file, the certificate, the fraction spent and the time
+left; once it has expired, an `ERROR`:
+
+```
+WARN mqttd::tls_expiry: TLS material: leaf CN=mqttd-0 has spent 71.3% of its lifetime (warning threshold 66.7%): it expires in 6h 53m, on Oct 14 13:12:55 2026 +00:00 — rotate it in time (ADR 0088) role="peer" setting="cluster.peer_tls.cert" path=/etc/mqttd/cluster/mqttd-0.crt
+ERROR mqttd::tls_expiry: TLS material: leaf CN=mqttd-0 EXPIRED 2m 10s ago, on Oct 14 13:12:55 2026 +00:00 — replace it now (ADR 0088) role="peer" setting="cluster.peer_tls.cert" path=/etc/mqttd/cluster/mqttd-0.crt
+```
+
+Each is written when the node first sees it (at startup, after the reload that loaded the
+file, or within a minute of the threshold or the expiry being crossed) and then **at most
+once an hour per role** while it stays so. A reload that leaves a file as it was does not
+repeat its warning. A healthy certificate is never mentioned.
+
+**The threshold** is `tls.expiry_warn_permille` (`MQTTD_TLS_EXPIRY_WARN_PERMILLE`), in
+thousandths of the lifetime: `1..=1000`, default `667`, two thirds. It applies to every
+role, the cluster bus's and the admin listener's included, and is read at startup like the
+rest of `[tls]`. Renewal should be scheduled before it. **cert-manager's default is not
+early enough:** without `renewBefore` it renews at exactly two thirds of `duration`, which
+is the default threshold, so every routine renewal of a short-lived certificate can log
+one warning while the new Secret travels to the pod. Set `renewBefore` above a third of
+`duration` (for a 24-hour certificate, `10h` rather than the default `8h`) and a healthy
+cluster is silent. The alert waits five minutes for the same reason; the log does not. `mqttd --check-tls` and
+`mqttd --check-config` judge against the same value and print it; `--check-config` adds a
+`warning:` line for each file on the host that is past it, expired or not valid yet, and
+its exit status is unchanged (the configuration is valid).
+
+**The alerts** (chart `PrometheusRule`, [runbook](#alert-tls-material-nearing-expiry)):
+`MqttdTlsExpiryWarning` when a series has been past the node's threshold for five minutes,
+`MqttdTlsExpiryImminent`
+(page) when less than a tenth of the lifetime and less than 30 days are left, or it has
+expired. A deployment without alerting takes the risk of a missed rotation knowingly.
+
+**What a ten-year CA does with a fraction.** It warns from two thirds of its life, which
+is years. That is the fraction doing what it says, and a CA change is the one rotation
+that is not hot (below), so the warning is not wrong; if it is too early for you, route
+`role=~".*_ca"` to a quieter receiver. The page waits for the last 30 days.
+
+**What happens today when a node's cluster certificate expires.** Three things, and the
+third is the one to know:
+
+- **Gossip is dropped, per datagram.** Every datagram is checked against its sender's
+  certificate, so the node's gossip is refused by each peer from the moment of expiry
+  (`mqttd_gossip_rejected_total{reason="expired"}`).
+- **New peer handshakes fail.** A peer link that has to be opened after the expiry is not
+  opened.
+- **Established peer links are not ended.** A link that completed its handshake before
+  the expiry stays up for as long as the connection lasts. Ending it at `notAfter` is
+  ADR 0088 D3 (delivery task 0088-T3), which is not built yet.
+
+A revocation list past its `nextUpdate` still loads and is enforced as it is; revocations
+published since are not in it. The gauges, the warning and the alerts change none of this:
+they report, and nothing is refused or ended because of them.
 
 ## Cluster-bus certificates — one per node, and why that is not negotiable
 
@@ -1407,6 +1521,7 @@ the human-readable superset.
 | **Ingress credit saturated** | `mqttd_ingress_credit_bytes{state="in_use"} / ignoring(state) mqttd_ingress_credit_bytes{state="capacity"} > 0.9` for 5m (warn); `histogram_quantile(0.99, rate(mqttd_ingress_paused_seconds_bucket[5m])) > 1` for 10m (warn) | [runbook](#alert-ingress-credit-saturated) |
 | **Publishes shed at ingress** | `rate(mqttd_publish_dropped_total{reason="hub-ingress"}[5m]) > 0` for 5m (warn) | [runbook](#alert-publishes-shed-at-ingress) |
 | **Append lane saturating** | `mqttd_append_lane_jobs` growing sustained (warn); `rate(mqttd_publish_dropped_total{reason="append-backlog-full"}[5m]) > 0` (page) | [runbook](#alert-append-lane-saturating) |
+| **TLS material nearing expiry** | `mqttd_tls_lifetime_spent_ratio >= ignoring(role) group_left() mqttd_tls_expiry_warn_ratio` for 5m (warn); `mqttd_tls_lifetime_spent_ratio >= 0.9 and mqttd_tls_expiry_seconds < 2592000` (page) | [runbook](#alert-tls-material-nearing-expiry) |
 
 ### Alert: Split brain
 
@@ -1577,6 +1692,41 @@ the human-readable superset.
     remote fan-out than it can route. Rebalance subscribers, or add capacity.
   - Read it alongside *Ingress credit saturated*: the same overload, seen from the
     losing side.
+
+### Alert: TLS material nearing expiry
+
+**Rule:** `mqttd_tls_lifetime_spent_ratio >= ignoring(role) group_left() mqttd_tls_expiry_warn_ratio` for 5m (warn, `MqttdTlsExpiryWarning`); `mqttd_tls_lifetime_spent_ratio >= 0.9 and mqttd_tls_expiry_seconds < 2592000` (page, `MqttdTlsExpiryImminent`) — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
+
+**When it fires / what to do:**
+- **What it means:** a certificate, CA bundle or revocation list this node has loaded is
+  running out. The alert's `role` label says which
+  ([the roles](#certificate-lifetimes-what-the-broker-tells-you-adr-0088)), and its
+  instance says where. The warning fires at the node's own threshold
+  (`tls.expiry_warn_permille`, two thirds of the lifetime by default), which the node
+  exports as `mqttd_tls_expiry_warn_ratio`. The page fires when less than a tenth of the
+  lifetime and less than 30 days are left, and stays on after expiry
+  (`mqttd_tls_expiry_seconds` is then negative).
+- **What to do:**
+  - Rotate it: replace the file, or find out why whatever renews it did not. The node's
+    log names the file and the certificate in it (`TLS material: …`), and
+    `mqttd --check-tls` on the node prints every certificate with its time left. The
+    broker reloads a replaced file by itself
+    ([rotation](#certificate--acl--crl-rotation--automatic)); the alert clears on the
+    scrape after the reload.
+  - `role="peer"`: this node's own cluster certificate. Do it before the page: at expiry
+    the node's gossip is dropped and it can open no new peer link
+    ([what happens at expiry](#certificate-lifetimes-what-the-broker-tells-you-adr-0088)).
+  - `role` ending in `_ca`: a CA in that bundle is near its end, and every certificate it
+    issued ends with it. A cluster CA change is not a hot rotation
+    ([cluster-bus certificates](#cluster-bus-certificates--one-per-node-and-why-that-is-not-negotiable)):
+    plan it. During one, the series is the old CA's until it is removed from the bundle.
+  - `role` ending in `_crl`: publish a fresh list.
+  - It fires on every node at once: they were minted together and will expire together.
+    Rotate them one node at a time.
+- **If the alert is absent although a certificate is old:** the series is missing, which
+  is not the same as healthy. `curl <pod>:8080/metrics | grep mqttd_tls_` shows what is
+  exported; a role that should be there and is not is a file whose expiry could not be
+  read (the log says so) or a revocation list without a `nextUpdate`.
 
 `curl <pod>:8080/statusz` is the human-readable superset of all of it.
 

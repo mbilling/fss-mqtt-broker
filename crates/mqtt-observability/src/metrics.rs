@@ -20,6 +20,21 @@ use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{exponential_buckets, Histogram};
 use prometheus_client::registry::Registry;
 
+use crate::validity::{unix_secs, ValidityWindow};
+
+/// The validity windows behind the TLS expiry gauges (ADR 0088 D2), by role. Shared
+/// between the Prometheus render and the OTLP callbacks, which each compute the gauges
+/// from it at the moment they are read.
+type TlsValidity = std::sync::Arc<std::sync::Mutex<Vec<(&'static str, ValidityWindow)>>>;
+
+/// `{role}` for the TLS expiry gauges (ADR 0088 D2): which loaded material the series is
+/// about, from a fixed set — `listener`, `client_ca`, `client_crl`, `peer`, `peer_ca`,
+/// `peer_crl`, `admin`, `admin_ca`. Never a file path, a subject or a serial.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct RoleLabel {
+    role: String,
+}
+
 /// `{version}` label for `mqttd_build_info`.
 /// `{peer, stat}` for `mqttd_peer_link_stat` (#662): one inter-node link's
 /// cumulative work counters, `stat` a bounded set (see `set_peer_link_stat`).
@@ -373,14 +388,54 @@ struct OtelInstruments {
     swim_isolated: OtelGauge<i64>,
     peer_proto_min: OtelGauge<i64>,
     peer_proto_max: OtelGauge<i64>,
+    /// Observed at export time from the stored validity windows, so they keep moving
+    /// between reloads (and the threshold is in every export, whatever the temporality).
+    /// Held so the callbacks stay registered.
+    _tls_expiry_warn_ratio: opentelemetry::metrics::ObservableGauge<f64>,
+    _tls_expiry_seconds: opentelemetry::metrics::ObservableGauge<i64>,
+    _tls_lifetime_spent_ratio: opentelemetry::metrics::ObservableGauge<f64>,
 }
 
 impl OtelInstruments {
     /// Create every instrument from `meter`, naming each to match its Prometheus
     /// counterpart (the `mqttd` prefix is carried by the OTLP resource `service.name`).
     #[allow(clippy::too_many_lines)] // one line per instrument
-    fn new(meter: &Meter) -> Self {
+    fn new(
+        meter: &Meter,
+        tls_validity: &TlsValidity,
+        tls_warn_permille: &std::sync::Arc<std::sync::atomic::AtomicU32>,
+    ) -> Self {
+        let (for_seconds, for_ratio) = (tls_validity.clone(), tls_validity.clone());
+        let warn = tls_warn_permille.clone();
         Self {
+            _tls_expiry_warn_ratio: meter
+                .f64_observable_gauge("tls_expiry_warn_ratio")
+                .with_callback(move |observer| {
+                    // Zero is "not set": the threshold is at least 1.
+                    let permille = warn.load(std::sync::atomic::Ordering::Relaxed);
+                    if permille > 0 {
+                        observer.observe(f64::from(permille) / 1000.0, &[]);
+                    }
+                })
+                .build(),
+            _tls_expiry_seconds: meter
+                .i64_observable_gauge("tls_expiry_seconds")
+                .with_callback(move |observer| {
+                    let now = unix_secs(std::time::SystemTime::now());
+                    for (role, window) in lock_validity(&for_seconds).iter() {
+                        observer.observe(window.seconds_left(now), &[KeyValue::new("role", *role)]);
+                    }
+                })
+                .build(),
+            _tls_lifetime_spent_ratio: meter
+                .f64_observable_gauge("tls_lifetime_spent_ratio")
+                .with_callback(move |observer| {
+                    let now = unix_secs(std::time::SystemTime::now());
+                    for (role, window) in lock_validity(&for_ratio).iter() {
+                        observer.observe(window.spent(now), &[KeyValue::new("role", *role)]);
+                    }
+                })
+                .build(),
             connections_active: meter.i64_up_down_counter("connections_active").build(),
             connections: meter.u64_counter("connections").build(),
             accepts: meter.u64_counter("accepts").build(),
@@ -731,6 +786,17 @@ pub struct Metrics {
     /// version fleet is visible per node.
     peer_proto_min: Gauge,
     peer_proto_max: Gauge,
+    /// Time to expiry of each loaded certificate, CA bundle and revocation list
+    /// (ADR 0088 D2), by role: seconds left (negative once over) and the fraction of the
+    /// validity window spent. Computed from `tls_validity` whenever the metrics are
+    /// read, never stored as a number that would stand still between reloads.
+    tls_expiry_seconds: Family<RoleLabel, Gauge>,
+    tls_lifetime_spent_ratio: Family<RoleLabel, Gauge<f64, std::sync::atomic::AtomicU64>>,
+    /// The fraction of a lifetime past which this node warns (`tls.expiry_warn_permille`).
+    tls_expiry_warn_ratio: Gauge<f64, std::sync::atomic::AtomicU64>,
+    tls_validity: TlsValidity,
+    /// `tls.expiry_warn_permille` as set, for the OTLP callback; 0 until it is.
+    tls_warn_permille: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl Metrics {
@@ -1622,6 +1688,31 @@ impl Metrics {
             "Newest peer-bus protocol version this build speaks (ADR 0038)",
         );
 
+        let tls_expiry_seconds = register_gauge_family(
+            &mut registry,
+            "tls_expiry_seconds",
+            "Seconds until the loaded TLS material in this role expires (ADR 0088): a \
+             certificate file's or CA bundle's earliest notAfter, a revocation list's \
+             nextUpdate. Negative once it is over",
+        );
+        let tls_lifetime_spent_ratio =
+            Family::<RoleLabel, Gauge<f64, std::sync::atomic::AtomicU64>>::default();
+        registry.register(
+            "tls_lifetime_spent_ratio",
+            "Fraction of its validity window the loaded TLS material in this role has \
+             spent (ADR 0088): 0 when new, 1 at expiry, above 1 after it",
+            tls_lifetime_spent_ratio.clone(),
+        );
+        let tls_expiry_warn_ratio = Gauge::<f64, std::sync::atomic::AtomicU64>::default();
+        registry.register(
+            "tls_expiry_warn_ratio",
+            "Fraction of a lifetime past which this node warns about TLS material \
+             (tls.expiry_warn_permille, ADR 0088)",
+            tls_expiry_warn_ratio.clone(),
+        );
+        let tls_validity = TlsValidity::default();
+        let tls_warn_permille = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+
         let build_info = Family::<VersionLabel, Gauge>::default();
         registry.register("build_info", "Build information", build_info.clone());
         let crypto_module_info = Family::<CryptoModuleLabel, Gauge>::default();
@@ -1639,7 +1730,7 @@ impl Metrics {
             .set(1);
 
         Self {
-            otel: OtelInstruments::new(meter),
+            otel: OtelInstruments::new(meter, &tls_validity, &tls_warn_permille),
             provider,
             registry,
             connections_active,
@@ -1764,6 +1855,11 @@ impl Metrics {
             swim_isolated,
             peer_proto_min,
             peer_proto_max,
+            tls_expiry_seconds,
+            tls_lifetime_spent_ratio,
+            tls_expiry_warn_ratio,
+            tls_validity,
+            tls_warn_permille,
         }
     }
 
@@ -1773,6 +1869,17 @@ impl Metrics {
     /// Panics only if formatting into a `String` fails, which the standard library does not do.
     #[must_use]
     pub fn render(&self) -> String {
+        self.render_at(std::time::SystemTime::now())
+    }
+
+    /// [`render`](Self::render) as of `now`: the gauges that are a distance in time from
+    /// `now` (the TLS expiry gauges, ADR 0088) are computed against it.
+    ///
+    /// # Panics
+    /// Panics only if formatting into a `String` fails, which the standard library does not do.
+    #[must_use]
+    pub fn render_at(&self, now: std::time::SystemTime) -> String {
+        self.refresh_tls_expiry(unix_secs(now));
         let mut buf = String::new();
         // Encoding into a `String` cannot fail.
         encode(&mut buf, &self.registry).expect("encode metrics");
@@ -3119,6 +3226,52 @@ impl Metrics {
             .set(clamp_gauge(advice.unwrap_or(0)));
     }
 
+    /// Replace the validity windows behind the TLS expiry gauges (ADR 0088 D2) with
+    /// `windows`, one per role: what this node has loaded, as of startup or the reload
+    /// that just committed. A role that is no longer loaded stops being exported.
+    ///
+    /// `role` is one of a fixed set (see `RoleLabel`). The gauges themselves are
+    /// computed from these windows each time the metrics are read, so they keep counting
+    /// down between reloads at no cost to anything else.
+    pub fn set_tls_validity(&self, windows: Vec<(&'static str, ValidityWindow)>) {
+        let mut held = lock_validity(&self.tls_validity);
+        for (role, _) in held.iter() {
+            if !windows.iter().any(|(r, _)| r == role) {
+                let label = RoleLabel {
+                    role: (*role).to_string(),
+                };
+                self.tls_expiry_seconds.remove(&label);
+                self.tls_lifetime_spent_ratio.remove(&label);
+            }
+        }
+        *held = windows;
+    }
+
+    /// Export the fraction of a lifetime past which this node warns about its TLS
+    /// material (`tls.expiry_warn_permille`), so an alert can compare against the
+    /// node's own setting instead of a copy of it.
+    pub fn set_tls_expiry_warn_permille(&self, permille: u16) {
+        let ratio = f64::from(permille) / 1000.0;
+        self.tls_expiry_warn_ratio.set(ratio);
+        self.tls_warn_permille
+            .store(u32::from(permille), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Set the TLS expiry gauges from the stored windows, as of `now`.
+    fn refresh_tls_expiry(&self, now: i64) {
+        for (role, window) in lock_validity(&self.tls_validity).iter() {
+            let label = RoleLabel {
+                role: (*role).to_string(),
+            };
+            self.tls_expiry_seconds
+                .get_or_create(&label)
+                .set(window.seconds_left(now));
+            self.tls_lifetime_spent_ratio
+                .get_or_create(&label)
+                .set(window.spent(now));
+        }
+    }
+
     /// Force any pending OTLP export to be pushed now (a no-op without OTLP). Best-effort;
     /// used on graceful shutdown and in tests to flush deterministically.
     pub fn flush(&self) {
@@ -3160,6 +3313,16 @@ fn build_otlp_provider(
         .with_reader(reader)
         .with_resource(resource)
         .build())
+}
+
+/// Poison-tolerant lock of the TLS validity windows: a panic elsewhere must not take the
+/// scrape down with it.
+fn lock_validity(
+    windows: &TlsValidity,
+) -> std::sync::MutexGuard<'_, Vec<(&'static str, ValidityWindow)>> {
+    windows
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Cast an in-memory map length to the gauge's signed counter, saturating rather
@@ -3699,6 +3862,156 @@ mod tests {
             out.contains("mqttd_publish_dropped_total{reason=\"pending-cap-replay\"} 1"),
             "{out}"
         );
+    }
+
+    /// ADR 0088 D2: the expiry gauges are computed when the metrics are read, from the
+    /// validity windows stored at load — so they count down between reloads, go negative
+    /// (and past 1) after expiry, follow a reload, and drop a role that is gone.
+    #[test]
+    fn tls_expiry_gauges_are_computed_at_read_time_and_follow_a_reload() {
+        use crate::validity::ValidityWindow;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let m = Metrics::new("t");
+        let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
+        assert!(
+            !m.render_at(at(0)).contains("mqttd_tls_expiry_seconds"),
+            "no TLS material loaded exports no series"
+        );
+        m.set_tls_expiry_warn_permille(667);
+        m.set_tls_validity(vec![
+            (
+                "peer",
+                ValidityWindow {
+                    not_before: 1_000,
+                    not_after: 4_000,
+                },
+            ),
+            (
+                "peer_crl",
+                ValidityWindow {
+                    not_before: 0,
+                    not_after: 10_000,
+                },
+            ),
+        ]);
+        let out = m.render_at(at(2_500));
+        assert!(out.contains("mqttd_tls_expiry_warn_ratio 0.667"), "{out}");
+        assert!(
+            out.contains("mqttd_tls_expiry_seconds{role=\"peer\"} 1500"),
+            "{out}"
+        );
+        assert!(
+            out.contains("mqttd_tls_lifetime_spent_ratio{role=\"peer\"} 0.5"),
+            "{out}"
+        );
+        assert!(
+            out.contains("mqttd_tls_lifetime_spent_ratio{role=\"peer_crl\"} 0.25"),
+            "{out}"
+        );
+        // Nothing was set in between: the same windows, read later.
+        let out = m.render_at(at(5_500));
+        assert!(
+            out.contains("mqttd_tls_expiry_seconds{role=\"peer\"} -1500"),
+            "expired is negative:\n{out}"
+        );
+        assert!(
+            out.contains("mqttd_tls_lifetime_spent_ratio{role=\"peer\"} 1.5"),
+            "{out}"
+        );
+        // A reload to a new certificate, and the revocation list no longer configured.
+        m.set_tls_validity(vec![(
+            "peer",
+            ValidityWindow {
+                not_before: 5_000,
+                not_after: 9_000,
+            },
+        )]);
+        let out = m.render_at(at(5_500));
+        assert!(
+            out.contains("mqttd_tls_expiry_seconds{role=\"peer\"} 3500"),
+            "{out}"
+        );
+        assert!(
+            out.contains("mqttd_tls_lifetime_spent_ratio{role=\"peer\"} 0.125"),
+            "{out}"
+        );
+        assert!(!out.contains("peer_crl"), "a dropped role is gone:\n{out}");
+        // The only label is the fixed role.
+        for forbidden in ["path=", "subject=", "serial=", "file="] {
+            assert!(!out.contains(forbidden), "{forbidden} in:\n{out}");
+        }
+    }
+
+    /// ADR 0088 D2: the expiry gauges reach an OTLP backend too. They are observable
+    /// instruments, read from the stored windows when the export runs, so nothing has to
+    /// record them in between. Multi-thread runtime for the synchronous `flush`, as in
+    /// `otlp_export_posts_to_the_endpoint`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tls_expiry_gauges_are_exported_over_otlp() {
+        use crate::validity::ValidityWindow;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<String>();
+        let server = tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            // Read until both instrument names have arrived (the request may come in
+            // several segments), then answer 200 so the exporter sees success.
+            let mut got = Vec::new();
+            let mut buf = vec![0u8; 8192];
+            loop {
+                let text = String::from_utf8_lossy(&got).into_owned();
+                if [
+                    "tls_expiry_seconds",
+                    "tls_lifetime_spent_ratio",
+                    "tls_expiry_warn_ratio",
+                ]
+                .iter()
+                .all(|name| text.contains(name))
+                {
+                    break;
+                }
+                match sock.read(&mut buf).await {
+                    Ok(n) if n > 0 => got.extend_from_slice(&buf[..n]),
+                    _ => break,
+                }
+            }
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            let _ = seen_tx.send(String::from_utf8_lossy(&got).into_owned());
+        });
+
+        let endpoint = format!("http://{addr}");
+        let m = Metrics::with_otlp("t", &endpoint, Duration::from_hours(1), "node-test").unwrap();
+        m.set_tls_expiry_warn_permille(667);
+        m.set_tls_validity(vec![(
+            "peer",
+            ValidityWindow {
+                not_before: 0,
+                not_after: i64::MAX / 2,
+            },
+        )]);
+        m.flush();
+
+        let req = tokio::time::timeout(Duration::from_secs(5), seen_rx)
+            .await
+            .expect("OTLP export never reached the endpoint")
+            .expect("the capture ended without a request");
+        server.await.unwrap();
+        for name in [
+            "tls_expiry_seconds",
+            "tls_lifetime_spent_ratio",
+            "tls_expiry_warn_ratio",
+            "peer",
+        ] {
+            assert!(req.contains(name), "OTLP payload missing {name}:\n{req}");
+        }
     }
 
     /// Cardinality guard (ADR 0020 §3): label *keys* are only ever from the fixed set; no

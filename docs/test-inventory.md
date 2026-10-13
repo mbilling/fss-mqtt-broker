@@ -776,7 +776,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `publish_codec_round_trip_clears_the_floor`
 
-## `crates/mqtt-config/src/lib.rs` — 49 test(s)
+## `crates/mqtt-config/src/lib.rs` — 50 test(s)
 
 - `tests::a_backup_dir_inside_the_data_dir_is_a_config_error`
 - `tests::a_bad_enum_value_is_rejected`
@@ -823,6 +823,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_rules_watch_keys_load_from_file_and_environment`
 - `tests::the_rules_watch_ranges_are_refused_outside_their_bounds`
 - `tests::the_shared_local_bias_is_a_fraction_stored_as_permille`
+- `tests::the_tls_expiry_warning_threshold_defaults_to_two_thirds_and_is_bounded`
 - `tests::the_watermark_poll_is_bounded_between_one_second_and_five_minutes`
 - `tests::the_watermark_poll_overlays_from_the_environment`
 - `tests::the_whole_env_surface_overlays_without_collision`
@@ -915,7 +916,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tls::tls12_hardening_tests::the_tls12_suites_are_exactly_the_allowlist`
 - `tls::tls12_hardening_tests::tls12_session_tickets_are_off`
 
-## `crates/mqtt-observability/src/lib.rs` — 21 test(s)
+## `crates/mqtt-observability/src/lib.rs` — 27 test(s)
 
 - `audit_export::tests::a_full_queue_sheds_and_counts_instead_of_blocking`
 - `audit_export::tests::frames_reach_a_tcp_listener_and_flush_waits`
@@ -931,6 +932,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `metrics::tests::rule_state_replication_is_reported_per_namespace`
 - `metrics::tests::sandboxed_function_calls_are_counted_by_function_and_kind`
 - `metrics::tests::scaling_metrics_render_with_their_documented_names`
+- `metrics::tests::tls_expiry_gauges_are_computed_at_read_time_and_follow_a_reload`
+- `metrics::tests::tls_expiry_gauges_are_exported_over_otlp`
 - `tests::a_restart_is_a_new_chain_not_a_truncation`
 - `tests::audit_log_hash_chains_recorded_events`
 - `tests::chain_advances_and_is_order_sensitive`
@@ -938,6 +941,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::recording_sink_captures_events_in_order`
 - `tests::sink_records_through_a_trait_object`
 - `tests::tampering_with_any_field_changes_the_head`
+- `validity::tests::a_window_with_no_length_is_spent_from_its_start`
+- `validity::tests::seconds_left_go_negative_after_the_end_and_the_last_second_is_inside`
+- `validity::tests::the_fraction_spent_runs_from_zero_through_one_and_past_it`
+- `validity::tests::the_threshold_is_met_at_exactly_its_fraction`
 
 ## `crates/mqtt-rules/src/lib.rs` — 285 test(s)
 
@@ -1409,7 +1416,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 790 test(s)
+## `crates/mqttd/src/lib.rs` — 807 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -2053,6 +2060,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `reload::tests::committed_config_never_returns_a_rejected_candidate`
 - `reload::tests::every_reload_attempt_is_recorded_with_its_repeats`
 - `reload::tests::reload_increments_the_metric_by_outcome`
+- `reload::tests::the_tls_expiry_refresh_runs_after_a_committed_reload_and_not_a_rejected_one`
 - `rule_state::admin::tests::a_cursor_reads_back_and_a_stale_or_broken_one_is_refused`
 - `rule_state::admin::tests::a_key_whose_expiry_changes_during_a_listing_is_judged_where_the_listing_reaches_it`
 - `rule_state::admin::tests::a_large_backlog_is_counted_whole`
@@ -2198,9 +2206,25 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `store_watch::tests::the_watcher_drives_brownout_on_watermark_transitions`
 - `tls_check::tests::a_chain_in_the_wrong_order_fails`
 - `tls_check::tests::a_key_that_does_not_match_fails`
-- `tls_check::tests::expired_and_expiring_leaves_are_flagged`
+- `tls_check::tests::a_leaf_warns_past_the_threshold_of_its_own_lifetime_and_fails_once_expired`
+- `tls_check::tests::a_revocation_list_warns_past_the_threshold_and_past_its_next_update`
+- `tls_check::tests::an_intermediate_and_a_ca_nearer_their_end_than_the_leaf_are_named`
 - `tls_check::tests::nothing_configured_is_a_single_ok_line`
-- `tls_check::tests::valid_material_passes_and_reports_names`
+- `tls_check::tests::the_cluster_and_admin_sets_are_checked_against_the_same_threshold`
+- `tls_check::tests::the_threshold_is_the_configured_one`
+- `tls_check::tests::valid_material_passes_reports_names_and_states_the_threshold`
+- `tls_expiry::tests::a_ca_bundle_is_decided_by_its_earliest_ca`
+- `tls_expiry::tests::a_certificate_that_is_not_valid_yet_is_warned_about_until_it_is`
+- `tls_expiry::tests::a_chain_is_decided_by_whichever_certificate_expires_first`
+- `tls_expiry::tests::a_leaf_is_read_with_its_own_window_whatever_its_lifetime`
+- `tls_expiry::tests::a_reload_follows_the_new_certificate_and_does_not_repeat_the_old_warning`
+- `tls_expiry::tests::a_revocation_list_is_decided_by_its_next_update`
+- `tls_expiry::tests::a_revocation_list_past_its_next_update_is_an_error_and_an_unreadable_one_is_not_held`
+- `tls_expiry::tests::a_revocation_list_without_a_next_update_has_no_window`
+- `tls_expiry::tests::a_span_is_written_in_its_two_largest_units`
+- `tls_expiry::tests::check_config_states_the_threshold_and_warns_past_it`
+- `tls_expiry::tests::the_log_warns_past_the_threshold_and_errors_at_expiry_at_a_bounded_rate`
+- `tls_expiry::tests::what_is_loaded_follows_the_listeners_and_the_admin_paths_follow_the_live_config`
 
 ## `crates/mqttd/src/main.rs` — 22 test(s)
 
@@ -2972,6 +2996,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tls_pubsub_roundtrip`
 - `tls_without_client_cert_is_not_authorized_under_deny_anonymous`
 - `without_a_crl_the_same_certificate_is_accepted`
+
+## `crates/mqttd/tests/tls_expiry.rs` — 2 test(s)
+
+- `a_node_exports_its_certificates_time_to_expiry_and_follows_a_rotation`
+- `the_offline_checks_apply_the_same_threshold_and_say_so`
 
 ## `crates/mqttd/tests/v5_protocol.rs` — 24 test(s)
 

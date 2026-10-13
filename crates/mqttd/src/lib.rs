@@ -34,5 +34,6 @@ pub mod runtime_probe;
 pub mod store_probe;
 pub mod store_watch;
 pub mod tls_check;
+pub mod tls_expiry;
 
 pub use hub::{Hub, HubCommand};

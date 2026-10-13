@@ -1063,6 +1063,20 @@ requires = ["helm"]
 duration = "~5s"
 
 [[task]]
+id = "k8s-alert-rules"
+group = "Kubernetes"
+name = "Check the chart's alert rules load and fire in their tests"
+script = "scripts/k8s/check-alert-rules.sh"
+about = """
+Renders the chart's PrometheusRule and runs promtool over it: every expression parses, and
+the unit tests in deploy/helm/mqttd/ci/alerts/ feed it the series a broker would export and
+assert which alerts fire, and which do not, at given times. No cluster and no Prometheus
+server.
+"""
+requires = ["helm", "promtool"]
+duration = "~5s"
+
+[[task]]
 id = "k8s-operator-rbac-parity"
 group = "Kubernetes"
 name = "Check the operator's RBAC matches between the chart and the dev manifest"

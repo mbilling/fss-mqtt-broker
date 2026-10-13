@@ -248,4 +248,28 @@ spec:
           annotations:
             summary: QoS 0 publishes are shed for want of ingress credit (peer forwards, or shed-qos0).
             runbook: docs/OPERATIONS.md#alert-publishes-shed-at-ingress
+        - alert: MqttdTlsExpiryWarning
+          # ADR 0088 D2. Per role (peer, listener, admin, their CAs and CRLs). The threshold
+          # is the node's own tls.expiry_warn_permille, which it exports beside the gauge,
+          # so the rule holds no copy of it and no lifetime.
+          expr: mqttd_tls_lifetime_spent_ratio >= ignoring(role) group_left() mqttd_tls_expiry_warn_ratio
+          # Long enough for a renewal that lands on the threshold itself to reach the node:
+          # cert-manager renews at two thirds of the duration unless renewBefore says
+          # otherwise, which is the default threshold.
+          for: 5m
+          labels:
+            severity: warn
+          annotations:
+            summary: A certificate, CA or CRL has spent the warning fraction of its lifetime; rotate it.
+            runbook: docs/OPERATIONS.md#alert-tls-material-nearing-expiry
+        - alert: MqttdTlsExpiryImminent
+          # Less than a tenth of the lifetime left and less than 30 days (2592000 s), or
+          # already expired. The 30 days only matter to lifetimes over 300 days: they keep
+          # a ten-year CA from paging a year ahead.
+          expr: mqttd_tls_lifetime_spent_ratio >= 0.9 and mqttd_tls_expiry_seconds < 2592000
+          labels:
+            severity: page
+          annotations:
+            summary: A certificate, CA or CRL is about to expire or has expired.
+            runbook: docs/OPERATIONS.md#alert-tls-material-nearing-expiry
 {{- end }}

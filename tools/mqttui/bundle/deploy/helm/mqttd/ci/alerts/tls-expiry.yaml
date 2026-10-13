@@ -1,0 +1,166 @@
+# promtool unit test for the chart's TLS expiry alerts (ADR 0088 D2).
+# Run by scripts/k8s/check-alert-rules.sh, which renders the chart's PrometheusRule into
+# rules.yaml beside a copy of this file.
+#
+# The series are what a broker exports: the fraction of its lifetime each loaded
+# certificate, CA or CRL has spent, the seconds it has left, and the node's own warning
+# threshold (tls.expiry_warn_permille, default 667). Values are written per minute.
+rule_files:
+  - rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # A 30-hour node certificate on node-0, scraped from its 18th hour: 60% spent, +1/1800
+  # of its lifetime per minute. It crosses 66.7% at 2h, 90% at 9h, and expires at 12h.
+  # Its CA is young throughout. node-1 is identical but fresh, and must stay quiet.
+  - interval: 1m
+    input_series:
+      - series: 'mqttd_tls_expiry_warn_ratio{instance="node-0"}'
+        values: '0.667x900'
+      - series: 'mqttd_tls_lifetime_spent_ratio{instance="node-0", role="peer"}'
+        values: '0.6+0.00055555555x900'
+      - series: 'mqttd_tls_expiry_seconds{instance="node-0", role="peer"}'
+        values: '43200-60x900'
+      - series: 'mqttd_tls_lifetime_spent_ratio{instance="node-0", role="peer_ca"}'
+        values: '0.01x900'
+      - series: 'mqttd_tls_expiry_seconds{instance="node-0", role="peer_ca"}'
+        values: '312206400x900'
+      - series: 'mqttd_tls_expiry_warn_ratio{instance="node-1"}'
+        values: '0.667x900'
+      - series: 'mqttd_tls_lifetime_spent_ratio{instance="node-1", role="peer"}'
+        values: '0.01x900'
+      - series: 'mqttd_tls_expiry_seconds{instance="node-1", role="peer"}'
+        values: '106920x900'
+    alert_rule_test:
+      # 1h: 63.3% spent. Healthy: nothing fires.
+      - eval_time: 1h
+        alertname: MqttdTlsExpiryWarning
+        exp_alerts: []
+      - eval_time: 1h
+        alertname: MqttdTlsExpiryImminent
+        exp_alerts: []
+      # 2h03m: past two thirds for two minutes. The rule waits five, so that a renewal
+      # landing on the threshold itself has time to reach the node: nothing yet.
+      - eval_time: 2h3m
+        alertname: MqttdTlsExpiryWarning
+        exp_alerts: []
+      # 3h: 70% spent, past the node's two thirds. The warning fires for that node's
+      # certificate alone: not its CA, not the other node.
+      - eval_time: 3h
+        alertname: MqttdTlsExpiryWarning
+        exp_alerts:
+          - exp_labels:
+              severity: warn
+              instance: node-0
+              role: peer
+            exp_annotations:
+              summary: A certificate, CA or CRL has spent the warning fraction of its lifetime; rotate it.
+              runbook: docs/OPERATIONS.md#alert-tls-material-nearing-expiry
+      - eval_time: 3h
+        alertname: MqttdTlsExpiryImminent
+        exp_alerts: []
+      # 10h: 93.3% spent, two hours left. The page fires (and the warning still does).
+      - eval_time: 10h
+        alertname: MqttdTlsExpiryImminent
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              instance: node-0
+              role: peer
+            exp_annotations:
+              summary: A certificate, CA or CRL is about to expire or has expired.
+              runbook: docs/OPERATIONS.md#alert-tls-material-nearing-expiry
+      - eval_time: 10h
+        alertname: MqttdTlsExpiryWarning
+        exp_alerts:
+          - exp_labels:
+              severity: warn
+              instance: node-0
+              role: peer
+            exp_annotations:
+              summary: A certificate, CA or CRL has spent the warning fraction of its lifetime; rotate it.
+              runbook: docs/OPERATIONS.md#alert-tls-material-nearing-expiry
+      # 13h: expired an hour ago (seconds left negative, fraction above 1). Still paging.
+      - eval_time: 13h
+        alertname: MqttdTlsExpiryImminent
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              instance: node-0
+              role: peer
+            exp_annotations:
+              summary: A certificate, CA or CRL is about to expire or has expired.
+              runbook: docs/OPERATIONS.md#alert-tls-material-nearing-expiry
+
+  # The threshold is each node's own. Two nodes hold a certificate that is 75% spent;
+  # node-0 warns at the default two thirds, node-1 was configured to warn at 90%.
+  - interval: 1m
+    input_series:
+      - series: 'mqttd_tls_expiry_warn_ratio{instance="node-0"}'
+        values: '0.667x10'
+      - series: 'mqttd_tls_lifetime_spent_ratio{instance="node-0", role="listener"}'
+        values: '0.75x10'
+      - series: 'mqttd_tls_expiry_seconds{instance="node-0", role="listener"}'
+        values: '7776000x10'
+      - series: 'mqttd_tls_expiry_warn_ratio{instance="node-1"}'
+        values: '0.9x10'
+      - series: 'mqttd_tls_lifetime_spent_ratio{instance="node-1", role="listener"}'
+        values: '0.75x10'
+      - series: 'mqttd_tls_expiry_seconds{instance="node-1", role="listener"}'
+        values: '7776000x10'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: MqttdTlsExpiryWarning
+        exp_alerts:
+          - exp_labels:
+              severity: warn
+              instance: node-0
+              role: listener
+            exp_annotations:
+              summary: A certificate, CA or CRL has spent the warning fraction of its lifetime; rotate it.
+              runbook: docs/OPERATIONS.md#alert-tls-material-nearing-expiry
+
+  # A ten-year cluster CA and a week-long CRL. The CA is 92% spent with 292 days left:
+  # it warns, and does not page until its last 30 days. The CRL is 95% spent with eight
+  # hours left: it pages. The same two rules serve both lifetimes.
+  - interval: 1m
+    input_series:
+      - series: 'mqttd_tls_expiry_warn_ratio{instance="node-0"}'
+        values: '0.667x10'
+      - series: 'mqttd_tls_lifetime_spent_ratio{instance="node-0", role="peer_ca"}'
+        values: '0.92x10'
+      - series: 'mqttd_tls_expiry_seconds{instance="node-0", role="peer_ca"}'
+        values: '25228800x10'
+      - series: 'mqttd_tls_lifetime_spent_ratio{instance="node-0", role="peer_crl"}'
+        values: '0.95x10'
+      - series: 'mqttd_tls_expiry_seconds{instance="node-0", role="peer_crl"}'
+        values: '30240x10'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: MqttdTlsExpiryWarning
+        exp_alerts:
+          - exp_labels:
+              severity: warn
+              instance: node-0
+              role: peer_ca
+            exp_annotations:
+              summary: A certificate, CA or CRL has spent the warning fraction of its lifetime; rotate it.
+              runbook: docs/OPERATIONS.md#alert-tls-material-nearing-expiry
+          - exp_labels:
+              severity: warn
+              instance: node-0
+              role: peer_crl
+            exp_annotations:
+              summary: A certificate, CA or CRL has spent the warning fraction of its lifetime; rotate it.
+              runbook: docs/OPERATIONS.md#alert-tls-material-nearing-expiry
+      - eval_time: 5m
+        alertname: MqttdTlsExpiryImminent
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              instance: node-0
+              role: peer_crl
+            exp_annotations:
+              summary: A certificate, CA or CRL is about to expire or has expired.
+              runbook: docs/OPERATIONS.md#alert-tls-material-nearing-expiry

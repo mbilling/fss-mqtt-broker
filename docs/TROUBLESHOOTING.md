@@ -188,6 +188,47 @@ not route traffic.
   `peer_advertise` host fails name verification at the dialer (rustls checks SANs only, never
   the CN), and a leaf **missing the `clientAuth` EKU** is rejected when the node dials out.
 
+## A node warns that its certificate is running out (`TLS material: …`)
+
+**Symptom:** the log carries a `WARN` or `ERROR` from `mqttd::tls_expiry`, once an hour:
+
+```
+WARN mqttd::tls_expiry: TLS material: leaf CN=mqttd-0 has spent 71.3% of its lifetime (warning threshold 66.7%): it expires in 6h 53m, on Oct 14 13:12:55 2026 +00:00 — rotate it in time (ADR 0088) role="peer" setting="cluster.peer_tls.cert" path=/etc/mqttd/cluster/mqttd-0.crt
+```
+
+or the `MqttdTlsExpiryWarning` / `MqttdTlsExpiryImminent` alert is firing.
+
+- **Nothing is broken yet.** The line is a notice that a certificate, CA or revocation
+  list the node has loaded has spent the configured fraction of its lifetime
+  (`tls.expiry_warn_permille`, two thirds by default). It names the `role`, the config
+  key (`setting`), the file (`path`) and which certificate in the file it is about, with
+  the time left. The broker refuses nothing because of it.
+- **Rotate the file it names.** Replace it (or let cert-manager renew it); the broker
+  reloads it within a watch tick, or on `SIGHUP` where the watcher is off, and the warning
+  stops because the new certificate is young. `mqttd --check-tls` shows every certificate
+  with its time left, before and after
+  ([rotation](OPERATIONS.md#certificate--acl--crl-rotation--automatic)).
+- **It names a `chain certificate` or a `CA`, not the leaf.** A file is reported by the
+  certificate in it that expires first. An intermediate in the chain file, or one CA in
+  the bundle, is nearer its end than the leaf: renewing the leaf alone will not stop it.
+- **It keeps warning right after a renewal.** The renewed certificate is itself past the
+  threshold (its `notBefore` is old), or the renewal runs later than the threshold. Renew
+  earlier than two thirds of the lifetime, or raise `MQTTD_TLS_EXPIRY_WARN_PERMILLE`.
+  cert-manager without `renewBefore` renews at exactly two thirds, so each renewal can
+  log one warning before the new Secret arrives: set `renewBefore` above a third of
+  `duration`.
+- **`is not valid yet`.** The certificate's `notBefore` is ahead of this node's clock: it
+  was dated ahead, or the clock is behind. Peers and clients refuse it until then.
+- **It warns about a file you replaced, and the reload was rejected.** Look for
+  `security reload REJECTED` just before it: the node kept the old material (a key that
+  does not match, a file half written), and the warning is about what it still runs.
+- **`ERROR … EXPIRED`.** The certificate is over. For `role="peer"` the node's gossip is
+  now dropped by its peers and it can open no new peer link; links it already had stay up
+  until they close. Replace the certificate; the reload loads the new one
+  ([what happens at expiry](OPERATIONS.md#certificate-lifetimes-what-the-broker-tells-you-adr-0088)).
+- **A ten-year CA has warned for months.** It has spent two thirds of ten years. That is
+  what the fraction means; plan the CA change, or route `role=~".*_ca"` alerts apart.
+
 ## The broker refuses to start: `EPHEMERAL durability REFUSED`
 
 **Symptom:** durable sessions are on (the default), no data dir is set, and startup (or

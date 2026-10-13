@@ -6,6 +6,7 @@
 
 pub mod audit_export;
 pub mod metrics;
+pub mod validity;
 
 /// A single audit record describing a security-relevant event.
 #[derive(Debug, Clone)]

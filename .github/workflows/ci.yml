@@ -698,6 +698,19 @@ jobs:
       # turning the shared-subscription HA pair into a reconnect loop.
       - name: Bridge chart (opt-in, per-replica client id, schema)
         run: ./scripts/k8s/check-bridge-chart.sh
+      # The chart's PrometheusRule, loaded by promtool and run against unit tests
+      # (deploy/helm/mqttd/ci/alerts/): series a broker would export, and the alerts that
+      # must and must not fire from them. kubeconform checks the object's shape; nothing
+      # else here evaluates an expression. Added with the TLS expiry alerts (ADR 0088 T1).
+      - name: Install promtool
+        run: |
+          curl -fsSL -o prometheus.tar.gz \
+            https://github.com/prometheus/prometheus/releases/download/v3.5.0/prometheus-3.5.0.linux-amd64.tar.gz
+          echo "e811827af26d822afb09a4f28314f61b618b12cff5369835a67f674d8b46f39a  prometheus.tar.gz" | sha256sum -c -
+          tar xzf prometheus.tar.gz --strip-components=1 prometheus-3.5.0.linux-amd64/promtool
+          sudo mv promtool /usr/local/bin/
+      - name: Alert rules load and fire in their tests
+        run: ./scripts/k8s/check-alert-rules.sh
       # ADR 0055 T8 (issue #252): the operator's install chart — lint, render with the
       # CRD included, schema-validate. The CRD's content is separately schema-pinned by
       # the mqttd-operator golden tests (the chart copy must be byte-identical to the

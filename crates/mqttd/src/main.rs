@@ -1156,6 +1156,30 @@ async fn main() -> Result<(), StartupError> {
     // its rebuild, so a reload rotates the admin certificate and CAs too.
     let admin_tls = prepare_admin_tls(&config, &live_config, &mut reloader)?;
 
+    // Expiry is visible (ADR 0088 D2): the validity window of every certificate, CA
+    // bundle and revocation list loaded above feeds two gauges per role and a warning in
+    // the log past `tls.expiry_warn_permille` of its lifetime. Read again after each
+    // reload that commits; looked at every minute in between. It refuses nothing.
+    {
+        use mqttd::tls_expiry::{self, Role, TlsExpiry};
+        let expiry = Arc::new(TlsExpiry::new(
+            config.tls.expiry_warn_permille,
+            Some(metrics.clone()),
+        ));
+        tls_expiry::emit(&expiry.load(&Role::ALL, &tls_expiry::loaded_sources(&config, &config)));
+        let (held, startup, live) = (expiry.clone(), config.clone(), live_config.clone());
+        let scope = tls_expiry::reloaded_roles(&config);
+        reloader.attach_tls_expiry(move || {
+            let live = live
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            tls_expiry::emit(&held.load(&scope, &tls_expiry::loaded_sources(&startup, &live)));
+            tls_expiry::emit(&held.tick(std::time::SystemTime::now()));
+        });
+        tokio::spawn(tls_expiry::run(expiry, shutdown.clone()));
+    }
+
     // Share the (now fully-configured) reloader between the SIGHUP handler and the optional
     // filesystem watcher; both drive the same validate-before-swap routine.
     let reloader = std::sync::Arc::new(reloader);
@@ -4763,17 +4787,19 @@ see docs/mqttd.example.toml and the README.",
 /// located error on failure; exit `2` if the invocation itself is malformed.
 fn check_config() -> ! {
     match check_config_inner() {
-        Ok((Some(path), jq, ceiling)) => {
+        Ok((Some(path), jq, ceiling, tls)) => {
             outln!(
                 "config OK: {} + MQTTD_* env overlay validates",
                 path.display()
             );
             report_jq(jq, ceiling);
+            report_tls_expiry(&tls);
             std::process::exit(0);
         }
-        Ok((None, jq, ceiling)) => {
+        Ok((None, jq, ceiling, tls)) => {
             outln!("config OK: defaults + MQTTD_* env overlay validates (no config file set)");
             report_jq(jq, ceiling);
+            report_tls_expiry(&tls);
             std::process::exit(0);
         }
         Err(CheckError::Usage(e)) => {
@@ -5607,12 +5633,23 @@ fn report_jq(report: Option<Result<String, String>>, ceiling: Option<String>) {
     }
 }
 
-/// The config file checked, what `rules.jq` means on this host, and the ceiling on a
-/// sandboxed call ([`report_jq`]).
+/// What `--check-config` says about the TLS material the config would load (ADR 0088 D2):
+/// the fraction of a lifetime past which the broker warns, then a `warning:` line for each
+/// certificate, CA or revocation list this host holds that is past it or expired. A
+/// report, not a verdict: the config is valid either way, and the exit status is unchanged.
+fn report_tls_expiry(lines: &[String]) {
+    for line in lines {
+        outln!("{line}");
+    }
+}
+
+/// The config file checked, what `rules.jq` means on this host, the ceiling on a
+/// sandboxed call ([`report_jq`]), and the TLS expiry lines ([`report_tls_expiry`]).
 type Checked = (
     Option<std::path::PathBuf>,
     Option<Result<String, String>>,
     Option<String>,
+    Vec<String>,
 );
 
 fn check_config_inner() -> Result<Checked, CheckError> {
@@ -5644,6 +5681,7 @@ fn check_config_inner() -> Result<Checked, CheckError> {
         path,
         jq,
         mqttd::rules::function_ceiling_report(&config.rules),
+        mqttd::tls_expiry::check_config_lines(&config, std::time::SystemTime::now()),
     ))
 }
 
