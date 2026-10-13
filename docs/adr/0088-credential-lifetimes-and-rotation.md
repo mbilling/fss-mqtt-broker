@@ -1,7 +1,7 @@
 # ADR 0088 — Cluster credentials have a lifetime the deployer sets, the broker enforces it strictly, and whoever operates the cluster rotates in time
 
-- **Status:** Proposed
-- **Date:** 2026-10-13
+- **Status:** Accepted
+- **Date:** 2026-10-13 (accepted the same day)
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0088-credential-lifetimes-and-rotation.md](../delivery/0088-credential-lifetimes-and-rotation.md) — plan, progress, and changelog
 - **Related:** [ADR 0004](0004-identity-and-authentication.md) (a node is the Common Name
@@ -27,8 +27,8 @@
 > 4. Two gossip keys are alive while one replaces the other, and only then: *old gossip
 >    keys should be evicted, so an older compromised node can't use them.*
 >
-> The record stays **Proposed** until it is accepted; four sub-decisions in §4 are still
-> open, each with a proposal.
+> **Accepted 2026-10-13** by the maintainer, with the four sub-decisions that were still
+> open (O3, O4, O6's duration, O8) taken as proposed (§4).
 
 ## Context
 
@@ -147,7 +147,7 @@ with it, and every node seals with it before the old one stops being accepted.
 
 ### D8 — One file, several keys (a keyring), and the cluster orders the change itself
 
-Proposed, and the sub-decision with the most consequence (O4):
+Decided (O4):
 
 - The key material becomes a keyring: an ordered list of keys, each with a short
   identifier. A node accepts every key in its keyring.
@@ -185,8 +185,8 @@ v1.1.0 without changing its configuration.
   starts.
 - **The old key is evicted, by the broker itself, and promptly.** The overlap exists for
   the change and for nothing else. Once every current member seals with the new key, a
-  node stops accepting the old one after a short, bounded overlap (O6: proposed ten
-  minutes) whether or not the second write has removed it from the file, logs that it has,
+  node stops accepting the old one after a short, bounded overlap (O6: ten minutes by
+  default) whether or not the second write has removed it from the file, logs that it has,
   and warns for as long as the file still lists it. The operator's retiring write follows
   as soon as the switch is seen; it is tidying, not what the eviction depends on. A key
   that has been superseded is never accepted again, so a copy of it on a node that left,
@@ -229,17 +229,15 @@ Decided by the maintainer on 2026-10-13:
 - **O7 — A cluster identity on the peer link: yes**, as a separate record; it changes the
   `Hello` frame.
 
-Still open, each with its proposal:
+Accepted as proposed on 2026-10-13, with the record:
 
-- **O3 — Clock difference:** proposed 60 s of tolerance on `notBefore`, none on
-  `notAfter`.
-- **O4 — D8's keyring with the cluster ordering the change, or three operator-ordered
-  phases.** Proposed: the keyring. It costs more broker code and removes the one mistake
-  that partitions a cluster.
-- **O6, the duration — how long the overlap may last once every member seals with the new
-  key.** Proposed: ten minutes, configurable down to zero, never unbounded.
-- **O8 — The default threshold for D2's warning.** Proposed: two thirds of the lifetime
-  spent.
+- **O3 — Clock difference:** 60 s of tolerance on `notBefore`, none on `notAfter`.
+- **O4 — The keyring, with the cluster ordering the change** (D8), not three
+  operator-ordered phases. It costs more broker code and removes the one mistake that
+  partitions a cluster.
+- **O6, the duration — the overlap once every member seals with the new key:** ten
+  minutes by default, configurable down to zero, never unbounded.
+- **O8 — The default threshold for D2's warning:** two thirds of the lifetime spent.
 
 ## Alternatives considered
 
