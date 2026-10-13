@@ -1,42 +1,42 @@
 ---
 adr: "0088"
 title: "Cluster credentials have a lifetime the deployer sets, the broker enforces it strictly, and whoever operates the cluster rotates in time"
-adr_status: Proposed
+adr_status: Accepted
 tasks:
   - id: 0088-T1
     title: "D2: expiry is visible — a gauge per loaded certificate (seconds to notAfter, fraction of lifetime spent), CA and CRL nextUpdate included; a rate-bounded warning past the threshold and an error at expiry; the chart's alert; the same threshold in --check-tls and --check-config"
     status: planned
-    issue: 984
-    notes: "Size S-M. mqtt-observability, mqttd (tls_check.rs, reload.rs, the periodic tick), the chart's PrometheusRule (re-vendor the mqttui bundle), OPERATIONS. No behaviour change: safe first. Needs O8."
+    issue: 988
+    notes: "Size S-M. mqtt-observability, mqttd (tls_check.rs, reload.rs, the periodic tick), the chart's PrometheusRule (re-vendor the mqttui bundle), OPERATIONS. No behaviour change: safe first. O8: two thirds of the lifetime."
   - id: 0088-T2
     title: "D1, D5: the lifetime is stated at deployment — gen-certs.sh takes it explicitly and prints the renew-by date, gains renew and revoke; the chart and the operator expose lifetime and renewal lead and pass them to cert-manager; decommission ends with revoke, in the procedure and in what mqttd --decommission prints"
     status: planned
-    issue: 984
+    issue: 989
     notes: "Size M. deploy/systemd/gen-certs.sh and its README, deploy/helm (values, bootstrap.sh, the cert-manager example), mqttd-operator CRD, OPERATIONS, HARDENING. O1 decided: it refuses without a stated lifetime. The scale rig mints its PKI with gen-certs.sh: keep it working."
   - id: 0088-T3
     title: "D3, D4: expiry is enforced on established peer links — a link whose peer's certificate (or this node's own) has passed notAfter is ended within a minute, as a revoked peer's is; no grace; notBefore tolerance per O3; a test that first shows today's link outliving its certificate"
     status: planned
-    issue: 984
-    notes: "Size M. mqttd/src/peer.rs (the link already records what the handshake presented for the revocation sweep), reload.rs. Starts with the characterisation test ADR 0088 'Not verified' asks for. Interacts with ADR 0087 (a link ended for expiry is a lost link: the peer is unreachable, not erased). Needs O3. O2 decided: client sessions join, behind a setting off by default."
+    issue: 990
+    notes: "Size M. mqttd/src/peer.rs (the link already records what the handshake presented for the revocation sweep), reload.rs. Starts with the characterisation test ADR 0088 'Not verified' asks for. Interacts with ADR 0087 (a link ended for expiry is a lost link: the peer is unreachable, not erased). O3: 60 s on notBefore, none on notAfter. O2 decided: client sessions join, behind a setting off by default."
   - id: 0088-T4
     title: "D7: the gossip key and the accepted keys are re-read by the file watcher and SIGHUP; a replaced key takes effect on the next datagram; the three-phase procedure becomes three file replacements"
     status: planned
-    issue: 984
+    issue: 991
     notes: "Size S-M. mqttd main.rs (watched_policy_paths, the SwimAuth construction), reload.rs, mqtt-cluster swim_auth.rs (swap the keys under the driver), OPERATIONS. Useful by itself and the base of T5."
   - id: 0088-T5
     title: "D8, D9, D10: the keyring — at most two keys with identifiers, the key identifier on the datagram, members gossip the identifiers they accept, a node seals with the newest key every current member accepts; the superseded key is evicted by the broker after a bounded overlap whether or not the file still lists it, and never accepted again; metrics, --check-config and log lines for the keys accepted and sealed with"
     status: planned
-    issue: 984
-    notes: "Size L. mqtt-cluster (swim_auth.rs, swim.rs gossip of accepted identifiers, the datagram form: additive, the v1.1.0 single-key form still spoken; pinned bytes, the fuzz target), mqtt-config, mqttd. The formation simulation (swim_formation_sim.rs) gains a key change under formation, a late node, and a node holding only an evicted key. Needs O4 and O6. Mixed-version rule: a cluster with a v1.1.0 member cannot leave the single-key form."
+    issue: 992
+    notes: "Size L. mqtt-cluster (swim_auth.rs, swim.rs gossip of accepted identifiers, the datagram form: additive, the v1.1.0 single-key form still spoken; pinned bytes, the fuzz target), mqtt-config, mqttd. The formation simulation (swim_formation_sim.rs) gains a key change under formation, a late node, and a node holding only an evicted key. O4: the keyring. O6: ten minutes by default. Mixed-version rule: a cluster with a v1.1.0 member cannot leave the single-key form."
   - id: 0088-T6
     title: "D9 on Kubernetes: the operator's rotation controller — the keyring Secret written on a schedule and when a pod leaves for good, gated on every pod reporting the new key accepted; node certificates through cert-manager with the configured lifetime; a kind test that rotates both under publish load with no member lost"
     status: planned
-    issue: 984
+    issue: 993
     notes: "Size L. mqttd-operator (controller, CRD), the chart, the nightly kube-smoke job. Supersedes ADR 0055 T5 (deferred). O5 decided: daily."
   - id: 0088-T7
     title: "D9 elsewhere, and the evidence: the documented procedure for a person (certificates and key), the same on the scale rig — a run that renews every node's certificate and replaces the gossip key under load with a ledger, and a node returning with an expired certificate and an evicted key staying out"
     status: planned
-    issue: 984
+    issue: 994
     notes: "Size M, plus rig time. deploy/systemd README, OPERATIONS, HARDENING, THREAT-MODEL rows (a departed node's credentials; a missed rotation), bench/scale (a rotation step between rungs). Last: it certifies the rest."
 ---
 
@@ -50,16 +50,15 @@ above; the table below is generated from it.
 The direction was decided on 2026-10-13: the deployer sets a certificate lifetime, whoever
 operates the cluster rotates in time, the broker issues nothing and enforces expiry
 strictly; the gossip key is replaced without a restart, with two keys alive only while one
-replaces the other, and old keys are evicted. O1, O2, O5, O7 and the eviction were decided
-the same day; O3, O4, O6's duration and O8 are open, each with a proposal, and the ADR is
-Proposed until it is accepted.
+replaces the other, and old keys are evicted. Every sub-decision is settled and the ADR was accepted the
+same day.
 
 Order: T1 first (it changes no behaviour and is what makes a short lifetime safe to
 adopt), then T2 and T3 (certificates: stated, renewable, revocable, enforced), T4 (the key
 reloads), T5 (the keyring and eviction), T6 (the operator), T7 (the procedure and the rig).
 T1–T4 are useful each by itself.
 
-Tasks are tracked under #984 until the ADR is accepted; each gets its own issue then.
+Each task has its own issue; #984 tracks the record as a whole.
 
 ## Plan
 
@@ -78,17 +77,19 @@ Tasks are tracked under #984 until the ADR is accepted; each gets its own issue 
 <!-- status-table:0088 -->
 | Task | Status | Issue | When | Evidence / notes |
 |------|--------|-------|------|------------------|
-| 0088-T1 | ⬜ planned | [#984](https://github.com/mbilling/fss-mqtt-broker/issues/984) | — | "Size S-M. mqtt-observability, mqttd (tls_check.rs, reload.rs, the periodic tick), the chart's PrometheusRule (re-vendor the mqttui bundle), OPERATIONS. No behaviour change: safe first. Needs O8." |
-| 0088-T2 | ⬜ planned | [#984](https://github.com/mbilling/fss-mqtt-broker/issues/984) | — | "Size M. deploy/systemd/gen-certs.sh and its README, deploy/helm (values, bootstrap.sh, the cert-manager example), mqttd-operator CRD, OPERATIONS, HARDENING. O1 decided: it refuses without a stated lifetime. The scale rig mints its PKI with gen-certs.sh: keep it working." |
-| 0088-T3 | ⬜ planned | [#984](https://github.com/mbilling/fss-mqtt-broker/issues/984) | — | "Size M. mqttd/src/peer.rs (the link already records what the handshake presented for the revocation sweep), reload.rs. Starts with the characterisation test ADR 0088 'Not verified' asks for. Interacts with ADR 0087 (a link ended for expiry is a lost link: the peer is unreachable, not erased). Needs O3. O2 decided: client sessions join, behind a setting off by default." |
-| 0088-T4 | ⬜ planned | [#984](https://github.com/mbilling/fss-mqtt-broker/issues/984) | — | "Size S-M. mqttd main.rs (watched_policy_paths, the SwimAuth construction), reload.rs, mqtt-cluster swim_auth.rs (swap the keys under the driver), OPERATIONS. Useful by itself and the base of T5." |
-| 0088-T5 | ⬜ planned | [#984](https://github.com/mbilling/fss-mqtt-broker/issues/984) | — | "Size L. mqtt-cluster (swim_auth.rs, swim.rs gossip of accepted identifiers, the datagram form: additive, the v1.1.0 single-key form still spoken; pinned bytes, the fuzz target), mqtt-config, mqttd. The formation simulation (swim_formation_sim.rs) gains a key change under formation, a late node, and a node holding only an evicted key. Needs O4 and O6. Mixed-version rule: a cluster with a v1.1.0 member cannot leave the single-key form." |
-| 0088-T6 | ⬜ planned | [#984](https://github.com/mbilling/fss-mqtt-broker/issues/984) | — | "Size L. mqttd-operator (controller, CRD), the chart, the nightly kube-smoke job. Supersedes ADR 0055 T5 (deferred). O5 decided: daily." |
-| 0088-T7 | ⬜ planned | [#984](https://github.com/mbilling/fss-mqtt-broker/issues/984) | — | "Size M, plus rig time. deploy/systemd README, OPERATIONS, HARDENING, THREAT-MODEL rows (a departed node's credentials; a missed rotation), bench/scale (a rotation step between rungs). Last: it certifies the rest." |
+| 0088-T1 | ⬜ planned | [#988](https://github.com/mbilling/fss-mqtt-broker/issues/988) | — | "Size S-M. mqtt-observability, mqttd (tls_check.rs, reload.rs, the periodic tick), the chart's PrometheusRule (re-vendor the mqttui bundle), OPERATIONS. No behaviour change: safe first. O8: two thirds of the lifetime." |
+| 0088-T2 | ⬜ planned | [#989](https://github.com/mbilling/fss-mqtt-broker/issues/989) | — | "Size M. deploy/systemd/gen-certs.sh and its README, deploy/helm (values, bootstrap.sh, the cert-manager example), mqttd-operator CRD, OPERATIONS, HARDENING. O1 decided: it refuses without a stated lifetime. The scale rig mints its PKI with gen-certs.sh: keep it working." |
+| 0088-T3 | ⬜ planned | [#990](https://github.com/mbilling/fss-mqtt-broker/issues/990) | — | "Size M. mqttd/src/peer.rs (the link already records what the handshake presented for the revocation sweep), reload.rs. Starts with the characterisation test ADR 0088 'Not verified' asks for. Interacts with ADR 0087 (a link ended for expiry is a lost link: the peer is unreachable, not erased). O3: 60 s on notBefore, none on notAfter. O2 decided: client sessions join, behind a setting off by default." |
+| 0088-T4 | ⬜ planned | [#991](https://github.com/mbilling/fss-mqtt-broker/issues/991) | — | "Size S-M. mqttd main.rs (watched_policy_paths, the SwimAuth construction), reload.rs, mqtt-cluster swim_auth.rs (swap the keys under the driver), OPERATIONS. Useful by itself and the base of T5." |
+| 0088-T5 | ⬜ planned | [#992](https://github.com/mbilling/fss-mqtt-broker/issues/992) | — | "Size L. mqtt-cluster (swim_auth.rs, swim.rs gossip of accepted identifiers, the datagram form: additive, the v1.1.0 single-key form still spoken; pinned bytes, the fuzz target), mqtt-config, mqttd. The formation simulation (swim_formation_sim.rs) gains a key change under formation, a late node, and a node holding only an evicted key. O4: the keyring. O6: ten minutes by default. Mixed-version rule: a cluster with a v1.1.0 member cannot leave the single-key form." |
+| 0088-T6 | ⬜ planned | [#993](https://github.com/mbilling/fss-mqtt-broker/issues/993) | — | "Size L. mqttd-operator (controller, CRD), the chart, the nightly kube-smoke job. Supersedes ADR 0055 T5 (deferred). O5 decided: daily." |
+| 0088-T7 | ⬜ planned | [#994](https://github.com/mbilling/fss-mqtt-broker/issues/994) | — | "Size M, plus rig time. deploy/systemd README, OPERATIONS, HARDENING, THREAT-MODEL rows (a departed node's credentials; a missed rotation), bench/scale (a rotation step between rungs). Last: it certifies the rest." |
 <!-- /status-table:0088 -->
 
 ## Changelog
 
+- **2026-10-13** — Accepted by the maintainer, with O3, O4, O6's duration and O8 as
+  proposed. One issue per task opened (#988–#994).
 - **2026-10-13** — Sub-decisions settled by the maintainer: O1 the script refuses without a
   stated lifetime; O2 a client session ends at its certificate's expiry, behind a setting off
   by default; O5 the gossip key is replaced daily; O7 a cluster identity on the peer link,
