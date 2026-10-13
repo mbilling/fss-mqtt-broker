@@ -290,7 +290,9 @@ protocol, forward window and every obligation toward it. `peer_disconnected` kee
   newly matching interest appears before the peer's link is back — on another node (a
   monitor on `#` reconnecting there) or on this one (a matching session attaching, which
   the settle pass delivers to and discharges on). The window is the half second the
-  redial takes. T5.
+  redial takes. T5. *(0087-T2b: only with a durable plane. Without one — `MQTTD_DURABLE=0`
+  — no session moves between nodes, so nothing is discharged: the newcomer is sent the
+  publish and the unreachable peer stays owed it.)*
 - *`$share`.* A member behind a lost link or on a peer under a verdict stays in its
   group, marked not reachable: the selector takes any member that can receive now, then a
   local persistent member, then a remote member on a node with a link, and one of these
@@ -315,13 +317,91 @@ protocol, forward window and every obligation toward it. `peer_disconnected` kee
 - *When a held forward goes out.* The sweep retransmits only a forward that is overdue,
   so one recorded less than a tick before the link returned would wait a further tick.
   What a peer is owed is therefore sent when its first interest snapshot arrives on the
-  new link, the first thing the peer says there. That is a trigger, not a gate: the
-  sweep still retransmits an overdue forward on any link, announced on or not, so a peer
-  that has just restarted can still be sent one before its view is settled and answer
-  it with a failure, as before.
+  new link, the first thing the peer says there. *(0087-T2 made that a trigger only, and
+  a forward registered between the link's return and the snapshot was sent at once,
+  ahead of everything held. Since 0087-T2b it is a gate as well: see below.)*
 - *A draining node.* A publish the hub gated itself during the drain has nobody to retry
   it and a deadline: its `$share` delivery does not wait for an unreachable member and
-  takes its fallback at the verdict, as before.
+  takes its fallback at the verdict, as before — and, since 0087-T2b, at the next tick
+  when the member's node has merely lost its link. With no member it can be handed to,
+  it is dropped and counted `publish_dropped{reason="no-shared-member"}` (it left no
+  trace before).
+
+**As built (0087-T2b)** — what an independent read-through of 0087-T2 found still open
+(issue #973), closed without a new frame.
+
+- *A `$share` delivery is acknowledged only when a current member took it.* Three
+  things, because either end can be the one that knows:
+  - **The receiver says so.** A node asked to deliver to a named member that is not on
+    it — not connected, and no session of that name to queue for — used to answer
+    `Stored`. It answers `Refused` with code 3 ("the named member is gone": nothing was
+    stored). While its own view is unsettled (mid-boot, a takeover window) it answers
+    `Failed` instead, as an ordinary forward that matched nobody is answered then: a
+    session about to be materialised looks the same as one that is gone.
+  - **The origin does not ask before it knows.** A `$share` delivery is not sent on a
+    link until the peer's membership snapshot has arrived on it (the frame after its
+    interest snapshot, in every build). At the first one, each delivery held for a
+    member the snapshot no longer lists is placed again; then deliveries held for
+    members on *other* unreachable nodes may move to this peer's; then what is owed
+    goes out, oldest first. This is what covers a v1.1.0 peer, which answers `Stored`
+    for anyone.
+  - **Where a delivery goes when its member is gone.** As a first placement would: to a
+    member that can take it now, else to one on a node that is out of reach, where it
+    is owed and held; a group with nobody left ends as a publish nobody subscribes to —
+    acknowledged (at once on a settled view; else after the last look every discharged
+    obligation gets, which holds while the mesh is not whole). If the only members left
+    are ones this publish was already offered to and that refused it, nothing can be
+    claimed and the acknowledgement is withheld. The rule "an unreachable member is
+    where a publish is first placed, never where one is moved" stands for a member
+    that is still there (a refusal, a lost link); a member that is *gone* is not
+    somewhere the delivery could return to.
+- *A delivery follows its consumer.* The per-tick re-selection ran only for a node held
+  dead, so after a lost link with no verdict a delivery stayed pinned to the node its
+  consumer had left. It now runs for every node without a link, with one distinction:
+  from a node held dead every delivery moves, as before (at least once: the member may
+  have been handed it); from a node that merely lost its link only a delivery that was
+  **never written to a link** moves — one recorded during the outage, which nobody can
+  have received, so the move cannot duplicate it. One that was in flight when the link
+  went stays that node's to answer (a repeat from its window, or "that member is
+  gone"), which keeps a link flap from turning into a duplicate at QoS 2.
+- *A hold that runs out discharges nothing a kept member is owed.* At `erase_peer` the
+  erased node's members are gone, and each `$share` delivery owed to one of them is
+  placed among the members that remain — one on another node that is itself only out
+  of reach included, where it is held under *that* node's hold or lost link. Erasing
+  used to discharge it: with members on b and c, both out of reach, "b expires, c
+  returns" acknowledged the publisher and never offered c's member the message.
+- *Publish order across a heal.* A forward is recorded and **not sent** to a linked peer
+  that has not announced on that link — its interest snapshot for an ordinary forward,
+  its membership snapshot for a `$share` delivery — and at the announcement everything
+  of that kind owed to the peer is sent in the order the publishes were accepted (the
+  pending table is ordered by publish id). A linked peer that has not announced within
+  a tick is still sent what is overdue, as the sweep always did, but all of it, oldest
+  first (a `$share` delivery only if the peer can refuse it for a missing member:
+  proto 13 or more). **The guarantee:** the QoS 1 and QoS 2 messages one node forwards
+  to another are applied on the receiving node in the order the origin accepted them —
+  in the steady state as before (one ordered link, each forward sent as it is
+  registered) and now across a lost link or a false verdict between the two as well.
+  The receiving node hands a session its messages in the order it applied them (one
+  lane per session, issue #242), so for a subscriber on another node than the
+  publisher: **one publisher connection's QoS 1 and QoS 2 messages arrive in the order
+  they were published.** That is [MQTT-4.6.0-6] (order per topic, for a non-shared
+  subscription) and a little more: the order is across topics and across QoS 1 and 2,
+  because it is the order of one stream of forwards. Outside it: messages of
+  publishers on *different* nodes have no mutual order; QoS 0 is not held for a node
+  out of reach and not ordered against QoS 1/2 (a QoS 0 publish made in the instant a
+  link returns can arrive before older held ones — the specification orders per QoS);
+  a publish the publisher retries; a session that moves to another node (the
+  takeover's replay and re-route are at-least-once and unordered against live
+  traffic); and a `$share` delivery that is re-selected — the specification leaves
+  shared subscriptions unordered, and what holds here is that the deliveries to one
+  member arrive in publish order as long as none of them had to move.
+- *What it costs the steady state.* `register_forward` did two peer-map lookups and
+  built the frame whether or not there was a link to send it on; it does one lookup,
+  reads one flag on the peer it found, and builds the frame only when it is sent. The
+  per-tick `$share` pass returns before it touches the pending table unless some node
+  that announced a group has no link. Nothing was added to the pending entry or the
+  obligation (the "was it ever sent" bit sits in padding the variants already had).
+- *Mixed versions.* See D7.
 - *Measured* (`false_dead_delivery.rs`): with T4, every flow's first publish is
   acknowledged 0.50 s after the verdict and delivered — one redial delay and a
   handshake — the `$share` flows included, in both orientations, plain and durable. With
@@ -510,6 +590,25 @@ the peer's interest is treated as not durable, i.e. held until the peer answers 
 confirmed gone. *(Open: O5 — or today's re-route discharge for such links, during the
 upgrade only.)*
 
+**As built (0087-T2b): one refusal code, no frame.** "The named `$share` member is gone"
+is code 3 of `ForwardVerdict::Refused`, a field every proto ≥ 7 build decodes; a build
+that does not know a code treats it as an answer it cannot read and withholds. v1.1.0
+speaks proto 12 and does not know it, so the code is said only on a link that negotiated
+13 or more. With a v1.1.0 node in the mesh:
+
+| Origin | Receiver | A `$share` delivery whose member is not on the receiver |
+|---|---|---|
+| this build | this build | refused with code 3; the origin places it with another member, or acknowledges a group with nobody |
+| v1.1.0 | this build | refused with brownout's code (1: "nothing was stored here"), which v1.1.0 already re-selects on; only with no other member does its publisher hear `0x97` (a v3.1.1 publisher: a closed connection) and retry — into a group that by then has the new membership |
+| this build | v1.1.0 | **held across an outage:** never sent before the peer's membership snapshot, and placed again if the member is not in it — the origin's own check. **In flight in the steady state** (the consumer leaves in the milliseconds between the selection and the delivery): v1.1.0 answers `Stored` and the publisher is acknowledged, as between two v1.1.0 nodes. This residual ends when the receiver is upgraded |
+| v1.1.0 | v1.1.0 | answered `Stored`: today's behaviour |
+
+A build between proto 13 and this change (never released) reads code 3 as unknown and
+withholds — the safe direction. The ordering gate is local to the origin and needs
+nothing of the peer: every build has always sent its interest snapshot, then its
+membership snapshot, first thing on a link, and again when a boot scan made them
+authoritative (within ten ticks at the latest).
+
 ### D8 — Interest that says whether the lease plane owns it (proto 15, additive)
 
 Interest gossip carries filters only, so the hub cannot tell a durable session's filter
@@ -685,6 +784,14 @@ with every node on the rule, 5 with one node left on v1.1.0, 11 with half, 16 wi
 - With D1 built, the hot path was checked by reading the diff — `forward_to_peers`,
   `register_forward` and the constant-time `$share` path are untouched — and by the
   publish-dispatch micro-benchmark (`benches/shared_plan.rs`), not on the rig.
+- 0087-T2b's rows of D7 with a v1.1.0 node are from the code and from unit tests that
+  speak proto 12 to this build's hub; the two-binary upgrade test passes, but it does
+  not disconnect a `$share` consumer during an outage. The ordering episodes run in
+  plain mode only: in durable mode a session can be moved during the episode, and a
+  moved session's replay is outside the guarantee. A receiver's window of recent
+  forwards holds 16,384 per origin (unchanged): a flush of more than that after a long
+  outage, answered slowly enough to be retransmitted, can apply an old forward twice —
+  a late duplicate, as before this work.
 - A peer that is unreachable by TCP while its host is up but silent (a dropped SYN, not a
   refused one) was not run: the 5 s bound on an attempt under a verdict is from the code.
   A host that accepts the connection and then says nothing is run, on loopback, against

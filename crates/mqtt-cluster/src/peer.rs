@@ -150,6 +150,23 @@ pub const PROTO_PUBLISH_ORIGIN: u32 = 12;
 /// [`OriginPublish`](PeerMessage::OriginPublish) (ADR 0083).
 pub const PROTO_MESSAGE_ORIGIN: u32 = 13;
 
+/// The peer-bus proto from which a link's far end reads
+/// [`REFUSAL_SHARED_MEMBER_GONE`] (ADR 0087). No frame and no bump: the code rides
+/// [`ForwardVerdict::Refused`], whose `code` every proto ≥ 7 build decodes, and one
+/// that does not know a code WITHHOLDS on it. The last release that does not know
+/// this one, v1.1.0, speaks 12 — so a link that negotiated 13 or more is to a build
+/// that re-selects on it, and a link below is answered with the refusal an older
+/// origin already re-selects on (brownout's code: "nothing was stored here").
+pub const PROTO_SHARED_MEMBER_GONE: u32 = 13;
+
+/// The [`ForwardVerdict::Refused`] code a node answers a
+/// [`SharedDeliverAcked`](PeerMessage::SharedDeliverAcked) with when the named
+/// member is not on it any more — not connected, and no session of that name to
+/// queue for (ADR 0087): nothing was stored, and the origin places the delivery
+/// with another member of the group. Never said to a publisher. Sent only on a
+/// link at [`PROTO_SHARED_MEMBER_GONE`] or above.
+pub const REFUSAL_SHARED_MEMBER_GONE: u16 = 3;
+
 /// The peer-bus proto at which a link carries rule state:
 /// [`StateKeys`](PeerMessage::StateKeys), [`StateDigest`](PeerMessage::StateDigest),
 /// [`StateWant`](PeerMessage::StateWant) and
@@ -1166,7 +1183,8 @@ pub enum ForwardVerdict {
     /// build does not know is treated as [`Failed`](Self::Failed) — an unknown
     /// refusal must never become the positive claim "nothing was stored".
     Refused {
-        /// The stable refusal code (1 = brownout, 2 = retained quota; 0 reserved).
+        /// The stable refusal code (1 = brownout, 2 = retained quota, 3 = the named
+        /// `$share` member is gone — [`REFUSAL_SHARED_MEMBER_GONE`]; 0 reserved).
         code: u16,
     },
     /// A terminal failure, or an answer this build cannot interpret: the origin

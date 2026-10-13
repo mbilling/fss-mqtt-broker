@@ -509,6 +509,7 @@ impl Hub {
     /// refusal therefore delivers live anyway (recorded nowhere, so nothing is owed) and
     /// is counted as the genuine drop it is (issue #238).
     #[allow(clippy::too_many_arguments)] // the delivery fields, plus the RAP retain flag
+    #[inline]
     pub(super) fn deliver_to_client(
         &mut self,
         client: &ClientId,
@@ -519,6 +520,69 @@ impl Hub {
         app: &AppProperties,
         retain: bool,
         gate: &AppendGate,
+    ) -> DurableOutcome {
+        let mut absent = false;
+        self.deliver_to_client_noting(
+            client,
+            topic,
+            payload,
+            qos,
+            message_expiry,
+            app,
+            retain,
+            gate,
+            &mut absent,
+        )
+    }
+
+    /// [`deliver_to_client`](Self::deliver_to_client), for a caller that named the
+    /// recipient itself and must know whether it was there: `None` when `client` is
+    /// neither connected nor a session this node keeps — nothing was sent and
+    /// nothing queued. A peer's acknowledged `$share` delivery asks this, because
+    /// "delivered to nobody" is not something it may answer `Stored` for
+    /// (ADR 0087).
+    #[allow(clippy::too_many_arguments)] // as `deliver_to_client`
+    pub(super) fn deliver_to_present_client(
+        &mut self,
+        client: &ClientId,
+        topic: &str,
+        payload: &Bytes,
+        qos: QoS,
+        message_expiry: Option<u32>,
+        app: &AppProperties,
+        retain: bool,
+        gate: &AppendGate,
+    ) -> Option<DurableOutcome> {
+        let mut absent = false;
+        let out = self.deliver_to_client_noting(
+            client,
+            topic,
+            payload,
+            qos,
+            message_expiry,
+            app,
+            retain,
+            gate,
+            &mut absent,
+        );
+        (!absent).then_some(out)
+    }
+
+    /// The body of [`deliver_to_client`](Self::deliver_to_client). `absent` is set
+    /// on the one path that hands the message to nobody: the recipient is not
+    /// connected and has no session here to queue for.
+    #[allow(clippy::too_many_arguments)]
+    fn deliver_to_client_noting(
+        &mut self,
+        client: &ClientId,
+        topic: &str,
+        payload: &Bytes,
+        qos: QoS,
+        message_expiry: Option<u32>,
+        app: &AppProperties,
+        retain: bool,
+        gate: &AppendGate,
+        absent: &mut bool,
     ) -> DurableOutcome {
         let answerable = gate.answerable();
         // DECIDE BEFORE COMMITTING, for the single-target callers too (issue #238).
@@ -655,6 +719,7 @@ impl Hub {
                 Submitted::Full => DurableOutcome::Failed,
             };
         }
+        *absent = true;
         DurableOutcome::Ok
     }
 
@@ -822,6 +887,7 @@ impl Hub {
                                     client: chosen.client.clone(),
                                     qos: delivered_qos,
                                     tried: vec![(Some(node), chosen.client.clone())],
+                                    sent: false,
                                 },
                             },
                         ),
@@ -859,22 +925,37 @@ impl Hub {
     /// most once per publish (`tried`), so the pass is bounded; only an EXHAUSTED pass
     /// answers the publisher, with the last refusal it saw — or a withhold when the last
     /// answer claimed nothing.
+    ///
+    /// `why` decides where the delivery may go ([`Reselect`]): away from a member
+    /// that refused or cannot be reached, only to one that can take it now; away
+    /// from a member that is GONE (ADR 0087), to any member the group has left — one
+    /// that cannot be reached included, where it is owed and held, exactly as a
+    /// first placement would be — and with none left, to the publisher's
+    /// acknowledgement ([`shared_group_has_nobody`](Self::shared_group_has_nobody)).
     pub(super) fn reselect_shared(
         &mut self,
         id: u64,
         obligation: ForwardObligation,
-        last: DurableOutcome,
+        why: Reselect,
     ) {
+        let gone_from = obligation.node;
         let ForwardKind::Shared {
             key,
-            qos: _,
+            client: gone_member,
             mut tried,
             ..
         } = obligation.kind
         else {
             return;
         };
-        let mut last = last;
+        let mut last = match why {
+            Reselect::Elsewhere(last) => Some(last),
+            Reselect::MemberGone => None,
+        };
+        // A member that is gone leaves the delivery free to be placed where a first
+        // placement could go. Not for a publish the drain gated: it has a deadline
+        // and nobody to retry it, and does not wait for a member out of reach.
+        let only_now = last.is_some() || self.drain_gated.contains(&id);
         loop {
             let Some(p) = self.pending_publishes.get(id) else {
                 return; // already resolved (cap eviction, an earlier terminal answer)
@@ -886,30 +967,35 @@ impl Hub {
                 p.message_expiry,
                 p.app().clone(),
             );
-            let candidates: Vec<SharedCandidate> = self
-                .shared_candidates(&topic)
-                .into_iter()
-                .find(|(k, _)| *k == key)
-                .map(|(_, cs)| cs)
-                .unwrap_or_default()
+            let members = self.shared_members(&topic, &key);
+            // Whether the group has anybody besides the member that went. (That
+            // member can still be listed: its node's refusal arrives before the
+            // membership snapshot that drops it.)
+            let others = members
+                .iter()
+                .any(|c| !(c.node.as_ref() == Some(&gone_from) && c.client == gone_member));
+            let candidates: Vec<SharedCandidate> = members
                 .into_iter()
                 .filter(|c| !tried.iter().any(|(n, cl)| *n == c.node && *cl == c.client))
-                // A re-selection moves a delivery to a member that can take it NOW.
-                // A member that cannot be reached — it stays in its group since ADR
-                // 0087 D1 — is where a publish is first placed when its group has
-                // nobody else, never where one is moved to: the member it would
-                // leave is not tried again, so the move could only strand it. With
-                // no member left that can take it, the pass is exhausted and the
-                // publisher hears the last answer, as it did when a lost link
-                // removed the member from the group.
-                .filter(|c| self.shared_member_can_take_it_now(c))
+                // A delivery MOVES only to a member that can take it NOW. A member
+                // that cannot be reached — it stays in its group since ADR 0087 D1 —
+                // is where a publish is placed when its group has nobody else,
+                // never where one is moved to from a member that is still there:
+                // the member it would leave is not tried again, so the move could
+                // only strand it. With no member left that can take it, the pass is
+                // exhausted and the publisher hears the last answer, as it did when
+                // a lost link removed the member from the group.
+                .filter(|c| !only_now || self.shared_member_can_take_it_now(c))
                 .collect();
             let Some(chosen) = self.select_shared(&key, &candidates) else {
                 debug!(
                     publish = id, group = %key.0,
                     "shared re-selection exhausted; answering the publisher"
                 );
-                self.shared_exhausted(id, &key, &tried, last);
+                match last {
+                    Some(last) => self.shared_exhausted(id, &key, &tried, last),
+                    None => self.shared_group_has_nobody(id, &key, &tried, others),
+                }
                 return;
             };
             let delivered_qos = min_qos(qos, chosen.qos);
@@ -932,7 +1018,7 @@ impl Hub {
                     DurableOutcome::Failed => self.drop_pending(id),
                     // This member cannot take it either: keep re-balancing.
                     DurableOutcome::Refused(r) => {
-                        last = DurableOutcome::Refused(r);
+                        last = Some(DurableOutcome::Refused(r));
                         continue;
                     }
                 }
@@ -948,6 +1034,7 @@ impl Hub {
                             client: chosen.client.clone(),
                             qos: delivered_qos,
                             tried,
+                            sent: false,
                         },
                     },
                 );
@@ -997,6 +1084,48 @@ impl Hub {
         }
     }
 
+    /// The member a `$share` delivery of pending publish `id` was owed to is gone,
+    /// and group `key` has no member left that it has not been offered to.
+    ///
+    /// `others` is whether the group still has anybody besides the member that
+    /// went. With nobody, the publish has no subscriber in this group any more and
+    /// is resolved as one nobody subscribes to: acknowledged — after the last look
+    /// every discharged obligation gets (the next sweep pass, which holds while the
+    /// mesh is not whole: a member this node holds alive and cannot see may have a
+    /// member of the group). With somebody — members that refused it, or were left
+    /// because they could not be reached, earlier in this publish's life — nothing
+    /// can be claimed either way, and the acknowledgement is withheld: the
+    /// publisher retries, and its retry is placed afresh.
+    ///
+    /// A publish the hub gated itself during the drain takes its fallback, as in
+    /// [`shared_exhausted`](Self::shared_exhausted).
+    fn shared_group_has_nobody(
+        &mut self,
+        id: u64,
+        key: &SharedKey,
+        tried: &[(Option<NodeId>, ClientId)],
+        others: bool,
+    ) {
+        if self.drain_gated.contains(&id) {
+            self.deliver_shared_plain(id, key, tried);
+            self.try_complete_pending(id);
+            return;
+        }
+        if others {
+            self.drop_pending(id);
+            return;
+        }
+        // On a settled view "the group has nobody" can be stood behind now, as it
+        // is for a publish that arrives a moment later and finds no group at all.
+        if !self.routing_unsettled() {
+            self.try_complete_pending(id);
+            return;
+        }
+        if let Some(p) = self.pending_publishes.get_mut(id) {
+            p.reroute_grace = Some(1);
+        }
+    }
+
     /// Deliver pending publish `id` to the first of `tried` still in group `key`,
     /// unanswered: a peer member gets a plain `SharedDeliver`, a local one an ungated
     /// delivery (live, a refused durable copy a counted drop). Not counted in
@@ -1017,12 +1146,7 @@ impl Hub {
             p.message_expiry,
             p.app().clone(),
         );
-        let members = self
-            .shared_candidates(&topic)
-            .into_iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, cs)| cs)
-            .unwrap_or_default();
+        let members = self.shared_members(&topic, key);
         // "Still in the group" is not enough since ADR 0087 D1: a member whose node
         // has no link stays in its group, and there is no link to hand it this on.
         // A local member needs no such test here, unlike in a re-selection
@@ -1038,6 +1162,12 @@ impl Hub {
                         .is_none_or(|home| self.peers.contains_key(home))
             })
         }) else {
+            // Nobody it was offered to can be handed it: the message ends here.
+            // The group exists and none of its members can be reached — the reason
+            // this counter already has (issue #973, the drain's share of it).
+            if let Some(m) = &self.metrics {
+                m.publish_dropped("no-shared-member");
+            }
             return;
         };
         let delivered_qos = min_qos(qos, member.qos);
@@ -1071,6 +1201,15 @@ impl Hub {
                 );
             }
         }
+    }
+
+    /// Every member of group `key`, here and on peers, as far as `topic` matches it.
+    fn shared_members(&self, topic: &str, key: &SharedKey) -> Vec<SharedCandidate> {
+        self.shared_candidates(topic)
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, cs)| cs)
+            .unwrap_or_default()
     }
 
     /// Whether `member` can be handed a delivery now, by the selector's own rules:

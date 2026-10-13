@@ -68,7 +68,7 @@ use tracing::{debug, info, warn};
 // the operator actions, answered on the loop so they see one consistent state.
 pub mod admin;
 mod forwarding;
-use forwarding::{ForwardKind, ForwardObligation, InterestIndex, PendingPublish};
+use forwarding::{ForwardKind, ForwardObligation, InterestIndex, PendingPublish, Reselect};
 mod delivery;
 /// The rule engine's message events, as far as the hub decides them (ADR 0083).
 mod events;
@@ -2122,7 +2122,18 @@ struct Peer {
     /// cannot distinguish "the peer routes nothing" from "the peer has not
     /// finished recovering what it routes", and a gated ack must not conclude
     /// "nobody is owed this" (see [`Hub::mesh_settled`]).
+    ///
+    /// It is also what a forward waits for (ADR 0087): one registered for a linked
+    /// peer that has not announced on this link is recorded and not sent, and
+    /// everything the peer is owed goes out, oldest first, when it does — so what
+    /// was held for it across an outage is not overtaken by what is published in
+    /// the instant after the link returns ([`Hub::register_forward`]).
     interest_synced: bool,
+    /// The same for the peer's `$share` membership snapshot, which follows its
+    /// interest snapshot on every link: until it has arrived on this link, this node
+    /// does not know which of the members it remembers are still there, and a
+    /// `$share` delivery to one of them is recorded and not sent.
+    shared_synced: bool,
 }
 
 /// One subscription a client holds: its filter and everything MQTT 5 attaches to
@@ -3934,7 +3945,7 @@ impl Hub {
                 // re-select within the group instead of acking a message that reached
                 // nobody. Arrives only from a proto-7 sender, so a verdict can always be
                 // sent back.
-                let out = self.deliver_to_client(
+                let delivered = self.deliver_to_present_client(
                     &client,
                     &topic,
                     &payload,
@@ -3949,6 +3960,33 @@ impl Hub {
                         replay: false,
                     },
                 );
+                let Some(out) = delivered else {
+                    // The named member is not here: not connected, and no session
+                    // of that name to queue for. The origin chose it from a
+                    // membership snapshot that has since gone stale — the consumer
+                    // disconnected, or this node restarted — and answering `Stored`,
+                    // as this arm did, acknowledged its publisher for a message
+                    // nobody took (ADR 0087, issue #973). Nothing was stored, and
+                    // the origin is told so in a form it re-selects on.
+                    //
+                    // Unless this node cannot yet say who is here: mid-boot or in a
+                    // takeover window a session it is about to materialise looks
+                    // the same as one that is gone, and the answer is the one the
+                    // ordinary forward gets then — `Failed`, which claims nothing.
+                    let verdict = if self.routing_unsettled() {
+                        ForwardVerdict::Failed
+                    } else {
+                        ForwardVerdict::Refused {
+                            code: mqtt_cluster::peer::REFUSAL_SHARED_MEMBER_GONE,
+                        }
+                    };
+                    debug!(
+                        origin = %node.0, seq, member = %client.0, ?verdict,
+                        "shared delivery for a member that is not here"
+                    );
+                    self.answer_forward(&node, seq, verdict);
+                    return;
+                };
                 // Answered now, or at the append's `AppendDone` (issue #242) —
                 // or, for an uncongested RELAXED delivery, at submit-acceptance
                 // (issue #399).
@@ -4053,48 +4091,10 @@ impl Hub {
                 self.remote_message_events(&node, wanted);
             }
             HubCommand::RemoteInterest { node, filters } => {
-                debug!(node = %node.0, filters = filters.len(), "remote interest updated");
-                // The peer's view is AUTHORITATIVE (it never gossips before it
-                // is — 0043-P4 exhibit ②): its link now counts toward
-                // `mesh_settled`, and a scan can settle held publishes against
-                // its (possibly new) interest.
-                let mut synced_now = false;
-                if let Some(peer) = self.peers.get_mut(&node) {
-                    if !peer.interest_synced {
-                        peer.interest_synced = true;
-                        synced_now = true;
-                        if !self.pending_publishes.is_empty() {
-                            self.takeover_reconcile_ticks = self.takeover_reconcile_ticks.max(2);
-                        }
-                    }
-                }
-                // Mesh transition 4 of 5 (issue #613 item 1.1): the ONLY place
-                // `interest_synced` turns on, so the only place `mesh_settled`
-                // can improve without a link event. Recomputed outside the
-                // `get_mut` borrow, and only on the flip — a repeat snapshot from
-                // an already-synced peer changes nothing.
-                if synced_now {
-                    self.recompute_mesh();
-                }
-                self.interest.replace(node.clone(), filters);
-                // The peer has said what it routes, on a link that is new: what
-                // this node already owes it goes out now, under the seqs it was
-                // given when it was recorded, rather than at the sweep that next
-                // finds it overdue — a publisher held for a peer that was out of
-                // reach is held no longer than the peer was (ADR 0087 D1). The
-                // snapshot is the trigger because it is the first thing the peer
-                // says; it is not a gate. The sweep still retransmits an overdue
-                // forward on any link, announced on or not, as it always has — so
-                // a peer that has just restarted and not yet announced can still
-                // be sent one, and answer it with a failure, a tick later.
-                if synced_now {
-                    self.send_owed_to(&node);
-                }
+                self.peer_announced_interest(&node, filters);
             }
             HubCommand::RemoteSharedInterest { node, groups } => {
-                debug!(node = %node.0, groups = groups.len(), "remote shared interest updated");
-                self.remote_shared.insert(node, groups);
-                self.rebuild_remote_shared_index();
+                self.peer_announced_shared(&node, groups);
             }
             HubCommand::RemoteRetainedSnapshot { node, messages } => {
                 self.apply_retained_snapshot(&node, messages).await;
@@ -7656,6 +7656,7 @@ impl Hub {
                 depth,
                 cert_serial,
                 interest_synced: false,
+                shared_synced: false,
                 proto,
                 wants_origin: false,
             },
@@ -7772,7 +7773,7 @@ impl Hub {
         self.held_dead.insert(node.clone(), hold);
         if hold != VerdictHold::Settled {
             self.mark_shared_unreachable(node);
-            self.reselect_shared_away_from(node);
+            self.move_shared_from_unreachable();
             info!(peer = %node.0, "peer declared dead; held as unreachable");
         }
         // Mesh transition 3 of 5 (issue #613 item 1.1). A confirmed death removes
@@ -7797,14 +7798,162 @@ impl Hub {
         }
     }
 
-    /// A SHARED obligation names one member on one node (0041-T12). When that node
-    /// is declared dead and the group has a member that can take the delivery now —
-    /// on this node, or on a node with a link — the delivery re-selects at once: the
+    /// A peer's interest snapshot arrived ([`PeerMessage::Interest`]).
+    fn peer_announced_interest(&mut self, node: &NodeId, filters: Vec<String>) {
+        debug!(node = %node.0, filters = filters.len(), "remote interest updated");
+        // The peer's view is AUTHORITATIVE (it never gossips before it
+        // is — 0043-P4 exhibit ②): its link now counts toward
+        // `mesh_settled`, and a scan can settle held publishes against
+        // its (possibly new) interest.
+        let mut synced_now = false;
+        if let Some(peer) = self.peers.get_mut(node) {
+            if !peer.interest_synced {
+                peer.interest_synced = true;
+                synced_now = true;
+                if !self.pending_publishes.is_empty() {
+                    self.takeover_reconcile_ticks = self.takeover_reconcile_ticks.max(2);
+                }
+            }
+        }
+        // Mesh transition 4 of 5 (issue #613 item 1.1): the ONLY place
+        // `interest_synced` turns on, so the only place `mesh_settled`
+        // can improve without a link event. Recomputed outside the
+        // `get_mut` borrow, and only on the flip — a repeat snapshot from
+        // an already-synced peer changes nothing.
+        if synced_now {
+            self.recompute_mesh();
+        }
+        self.interest.replace(node.clone(), filters);
+        // The peer has said what it routes, on a link that is new: every
+        // ordinary forward this node owes it goes out now, oldest publish first,
+        // under the seqs they were given when they were recorded — a publisher
+        // held for a peer that was out of reach is held no longer than the peer
+        // was (ADR 0087 D1). And it is a gate as well as a trigger: nothing was
+        // sent on this link before it ([`register_forward`](Self::register_forward)),
+        // so what was held across the outage reaches the peer ahead of what was
+        // published after the link came back, and its subscribers see one
+        // publisher's messages in the order they were published.
+        if synced_now {
+            self.send_owed_to(node, false);
+        }
+    }
+
+    /// A peer's `$share` membership snapshot arrived
+    /// ([`PeerMessage::SharedInterest`]). It follows the interest snapshot on every
+    /// link, in every build.
+    ///
+    /// The first one on a link is where the `$share` deliveries this node holds are
+    /// planned again (ADR 0087), in this order:
+    ///
+    /// 1. one owed to a member of this peer that the snapshot no longer lists — the
+    ///    consumer disconnected or unsubscribed during the outage, or the peer
+    ///    restarted — is placed with another member of its group, as a first
+    ///    placement is; a peer that predates [`REFUSAL_SHARED_MEMBER_GONE`] would
+    ///    have answered it `Stored`;
+    /// 2. one owed to a member on ANOTHER node that cannot be reached moves to a
+    ///    member here, if the group has one — the same consumer, reconnected
+    ///    through this peer;
+    /// 3. everything now owed to this peer's members goes out, oldest publish
+    ///    first. Nothing was sent to them on this link before.
+    ///
+    /// [`REFUSAL_SHARED_MEMBER_GONE`]: mqtt_cluster::peer::REFUSAL_SHARED_MEMBER_GONE
+    fn peer_announced_shared(&mut self, node: &NodeId, groups: Vec<RemoteSharedGroup>) {
+        debug!(node = %node.0, groups = groups.len(), "remote shared interest updated");
+        let first_on_link = self.peers.get(node).is_some_and(|p| !p.shared_synced);
+        self.remote_shared.insert(node.clone(), groups);
+        self.rebuild_remote_shared_index();
+        if !first_on_link {
+            return;
+        }
+        self.replace_shared_owed_to_absent_members(node);
+        self.move_shared_from_unreachable();
+        if let Some(peer) = self.peers.get_mut(node) {
+            peer.shared_synced = true;
+        }
+        self.send_owed_to(node, true);
+    }
+
+    /// Place again every `$share` delivery owed to a member of `node` that its
+    /// membership snapshot — just received, the first on a new link — does not list.
+    /// The pending table is walked once; the snapshot is indexed only if a delivery
+    /// is owed to the node at all.
+    fn replace_shared_owed_to_absent_members(&mut self, node: &NodeId) {
+        let groups = self.remote_shared.get(node).map_or(&[][..], Vec::as_slice);
+        let mut listed: Option<HashSet<(&str, &str, &ClientId)>> = None;
+        let mut absent: Vec<(u64, u64)> = Vec::new();
+        for (id, p) in self.pending_publishes.iter() {
+            for (seq, o) in &p.awaiting {
+                let ForwardKind::Shared { key, client, .. } = &o.kind else {
+                    continue;
+                };
+                if &o.node != node {
+                    continue;
+                }
+                let listed = listed.get_or_insert_with(|| {
+                    groups
+                        .iter()
+                        .flat_map(|g| {
+                            g.members
+                                .iter()
+                                .map(|m| (g.group.as_str(), g.filter.as_str(), &m.0))
+                        })
+                        .collect()
+                });
+                if !listed.contains(&(key.0.as_str(), key.1.as_str(), client)) {
+                    absent.push((*id, *seq));
+                }
+            }
+        }
+        drop(listed);
+        for (id, seq) in absent {
+            let Some(obligation) = self
+                .pending_publishes
+                .get_mut(id)
+                .and_then(|p| p.awaiting.remove(&seq))
+            else {
+                continue;
+            };
+            self.forward_index.remove(&seq);
+            debug!(publish = id, peer = %node.0, "shared member no longer announced; placing again");
+            self.reselect_shared(id, obligation, Reselect::MemberGone);
+        }
+    }
+
+    /// A SHARED obligation names one member on one node (0041-T12). While that node
+    /// has no link, the delivery moves to a member of its group that can take it
+    /// now — on this node, or on a node with a link — as soon as there is one: the
     /// rebalance a refusal triggers, and what keeps a group spread over several
-    /// nodes from pausing at all. When it has none, the obligation stays where it
-    /// is: the member is unreachable, not gone. Run again at every tick of the
-    /// node's hold, it moves the delivery to such a member that has appeared since.
-    fn reselect_shared_away_from(&mut self, node: &NodeId) {
+    /// nodes from pausing at all. When there is none, the obligation stays where it
+    /// is: the member is unreachable, not gone.
+    ///
+    /// Which deliveries move depends on what the node may already have done with
+    /// them:
+    ///
+    /// - the node is **held dead**: every delivery owed to its members moves, sent
+    ///   or not, as it has since 0041-T12 (at least once, even at `QoS` 2: the
+    ///   member may have been handed it before the node went quiet);
+    /// - the node has merely **lost its link**: only a delivery that was never
+    ///   written to a link moves — one recorded while the node was out of reach.
+    ///   Nobody can have received it, so the move cannot duplicate it, and it is
+    ///   what lets a publish follow a consumer that reconnected through another
+    ///   node (issue #973). One that WAS sent waits for the node to answer for
+    ///   itself when its link returns, as before: it answers a repeat from its
+    ///   window, or says the member is gone;
+    /// - a publish the hub gated itself during the drain has nobody to retry it and
+    ///   a deadline to meet: it does not wait for a member that may not return, and
+    ///   takes its fallback now (ADR 0083).
+    ///
+    /// Run at a verdict, at every sweep tick, and when a peer's first `$share`
+    /// snapshot arrives on a new link. With every known node linked — the steady
+    /// state — it returns before it touches the pending table.
+    fn move_shared_from_unreachable(&mut self) {
+        if !self
+            .remote_shared
+            .keys()
+            .any(|node| !self.peers.contains_key(node))
+        {
+            return;
+        }
         let mut movable: Vec<(u64, u64)> = Vec::new();
         let mut elsewhere_by_group: HashMap<SharedKey, Vec<(Option<NodeId>, ClientId)>> =
             HashMap::new();
@@ -7813,7 +7962,15 @@ impl Hub {
                 let ForwardKind::Shared { key, tried, .. } = &o.kind else {
                     continue;
                 };
-                if &o.node != node {
+                if self.peers.contains_key(&o.node) {
+                    continue;
+                }
+                let drain_gated = self.drain_gated.contains(id);
+                let held_dead = matches!(
+                    self.held_dead.get(&o.node),
+                    Some(VerdictHold::Unreachable { .. })
+                );
+                if o.sent() && !held_dead && !drain_gated {
                     continue;
                 }
                 // The members of each group that can take the delivery NOW — on
@@ -7836,10 +7993,7 @@ impl Hub {
                 let elsewhere = elsewhere_by_group
                     .get(key)
                     .is_some_and(|members| members.iter().any(|member| !tried.contains(member)));
-                // A publish the hub gated itself during the drain has nobody to
-                // retry it and a deadline to meet: it does not wait for a member
-                // that may not return, and takes its fallback now (ADR 0083).
-                if elsewhere || self.drain_gated.contains(id) {
+                if elsewhere || drain_gated {
                     movable.push((*id, *seq));
                 }
             }
@@ -7855,7 +8009,7 @@ impl Hub {
             self.forward_index.remove(&seq);
             // `Failed`, not a refusal: an unreachable node says nothing about what
             // it stored.
-            self.reselect_shared(id, obligation, DurableOutcome::Failed);
+            self.reselect_shared(id, obligation, Reselect::Elsewhere(DurableOutcome::Failed));
         }
     }
 
@@ -7863,33 +8017,26 @@ impl Hub {
     /// run out. Runs before the sweep's own pass over the pending table, so what an
     /// erasure discharges is answered in the same tick.
     ///
-    /// A hold that goes on is also where a `$share` delivery owed to the unreachable
-    /// peer's member finds a member that has since appeared on another node — the
-    /// group's consumers reconnecting elsewhere after their node went — and moves
-    /// to it, instead of waiting out the hold.
+    /// The tick is also where a `$share` delivery owed to a member that cannot be
+    /// reached — its node held dead, or without a link — finds a member that has
+    /// since appeared on another node, the group's consumers reconnecting elsewhere
+    /// after their node went, and moves to it instead of waiting
+    /// ([`move_shared_from_unreachable`](Self::move_shared_from_unreachable)).
     fn sweep_verdict_holds(&mut self) {
-        if self.held_dead.is_empty() {
-            return;
-        }
         let mut expired: Vec<NodeId> = Vec::new();
-        let mut still_held: Vec<NodeId> = Vec::new();
         for (node, hold) in &mut self.held_dead {
             if let VerdictHold::Unreachable { ticks } = hold {
                 *ticks = ticks.saturating_sub(1);
                 if *ticks == 0 {
                     expired.push(node.clone());
-                } else {
-                    still_held.push(node.clone());
                 }
             }
-        }
-        for node in still_held {
-            self.reselect_shared_away_from(&node);
         }
         for node in expired {
             self.erase_peer(&node);
             self.held_dead.insert(node, VerdictHold::Settled);
         }
+        self.move_shared_from_unreachable();
     }
 
     /// Drop all routing state for a node held `Dead` whose hold has run out, and
@@ -7897,14 +8044,20 @@ impl Hub {
     /// ADR 0087 D1 put the hold in between.
     ///
     /// **For 0087-T3:** this is today's resolution, kept so that a node that really
-    /// is dead holds no publisher longer than before: what is still owed to it is
-    /// discharged and its publisher acknowledged with no answer from anyone. D2
-    /// replaces it with a resolution per subscriber kind, counted, at confirmation.
+    /// is dead holds no publisher longer than before: an ordinary forward still
+    /// owed to it is discharged and its publisher acknowledged with no answer from
+    /// anyone. D2 replaces it with a resolution per subscriber kind, counted, at
+    /// confirmation.
+    ///
+    /// A `$share` delivery is not discharged while its group has a member left. The
+    /// erased node's members are gone with it, so the delivery is placed again as a
+    /// first placement is — with a member that can take it now, else with one on
+    /// another node that cannot be reached, where it is owed and held under THAT
+    /// node's hold or lost link. Discharging it here acknowledged a publish that a
+    /// member on a node which then returned was never offered ("b expires, c
+    /// returns" — issue #973). Only a group with nobody left ends as a publish
+    /// nobody subscribes to does: acknowledged.
     fn erase_peer(&mut self, node: &NodeId) {
-        // A `$share` delivery owed to one of the node's members moves to a member
-        // on another node if its group has one, as it would have at any tick of
-        // the hold (0041-T12: the rebalance a refusal triggers).
-        self.reselect_shared_away_from(node);
         // A dead origin retransmits nothing: its forwards died with it, and a
         // successor sends under its own seqs (issue #648).
         self.forward_windows.remove(node);
@@ -7912,40 +8065,41 @@ impl Hub {
         let had_interest = self.interest.remove(node);
         let had_groups = self.remote_shared.remove(node).is_some();
         self.rebuild_remote_shared_index();
-        // What is still owed to the node is discharged: nobody announced the
-        // interest in its place while it was held, and no member of the group is
-        // left anywhere else. It ends as a re-route grace always ended — one last
-        // look for a successor and for a session materialised here, by the sweep
-        // pass that follows this, and then the publisher's acknowledgement.
-        //
-        // That includes a `$share` delivery whose group is now empty: a publish
-        // for a group nobody is in any more is acknowledged, like a publish nobody
-        // subscribes to. (When the verdict erased at once, one in flight at that
-        // instant was withheld from its publisher and one made a moment later was
-        // acknowledged at once; the hold has made them the same case.) And like an
-        // ordinary obligation it is acknowledged only on a whole mesh: while a
-        // member this node holds alive has no link, the last tick of the grace
-        // holds — that peer may have a member of the group this node cannot see.
+        // An ORDINARY forward still owed to the node is discharged: nobody
+        // announced the interest in its place while it was held. It ends as a
+        // re-route grace always ended — one last look for a successor and for a
+        // session materialised here, by the sweep pass that follows this, and then
+        // the publisher's acknowledgement; and only on a whole mesh: while a member
+        // this node holds alive has no link, the last tick of the grace holds.
         let mut gone_seqs: Vec<u64> = Vec::new();
-        for (_, p) in self.pending_publishes.iter_mut() {
+        let mut shared: Vec<(u64, ForwardObligation)> = Vec::new();
+        for (id, p) in self.pending_publishes.iter_mut() {
             let seqs: Vec<u64> = p
                 .awaiting
                 .iter()
                 .filter(|(_, o)| &o.node == node)
                 .map(|(s, _)| *s)
                 .collect();
-            if seqs.is_empty() {
-                continue;
+            for seq in seqs {
+                let Some(obligation) = p.awaiting.remove(&seq) else {
+                    continue;
+                };
+                gone_seqs.push(seq);
+                if matches!(obligation.kind, ForwardKind::Shared { .. }) {
+                    shared.push((*id, obligation));
+                } else {
+                    debug!(peer = %node.0, topic = %p.topic, "hold ran out; forward obligation discharged");
+                    p.reroute_grace = Some(1);
+                }
             }
-            for seq in &seqs {
-                p.awaiting.remove(seq);
-            }
-            gone_seqs.extend(seqs);
-            debug!(peer = %node.0, topic = %p.topic, "hold ran out; forward obligation discharged");
-            p.reroute_grace = Some(1);
         }
         for seq in gone_seqs {
             self.forward_index.remove(&seq);
+        }
+        // The node's members left their groups with the state erased above, so
+        // each delivery is placed among the members that remain.
+        for (id, obligation) in shared {
+            self.reselect_shared(id, obligation, Reselect::MemberGone);
         }
         if had_interest || had_groups {
             info!(peer = %node.0, "peer held dead stayed unreachable; routing state dropped");
@@ -8126,7 +8280,9 @@ fn plain_forward_frame(
     match &obligation.kind {
         // A proto-12 link carries the publish's id and whether this is a re-route
         // (#784), so the receiver can record the one and honour the other.
-        ForwardKind::Ordinary { replay } if proto >= mqtt_cluster::peer::PROTO_PUBLISH_ORIGIN => {
+        ForwardKind::Ordinary { replay, .. }
+            if proto >= mqtt_cluster::peer::PROTO_PUBLISH_ORIGIN =>
+        {
             PeerMessage::PublishAckedTagged {
                 seq,
                 origin: id,
@@ -8473,7 +8629,8 @@ mod tests {
     mod remote_group_index;
     mod scaling_locality;
     mod scaling_mesh;
-    mod settle_gate;
+    pub(super) mod settle_gate;
+    mod share_obligations;
     mod shared_capacity;
     mod truncate_flusher;
     /// A committed retained snapshot entry with no application properties — the

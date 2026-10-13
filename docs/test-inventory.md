@@ -1409,7 +1409,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 770 test(s)
+## `crates/mqttd/src/lib.rs` — 785 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1671,6 +1671,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::zone_fwd_proofs::the_early_return_does_not_change_who_receives_a_publish`
 - `hub::forwarding::zone_fwd_proofs::the_early_return_never_swallows_a_retained_broadcast`
 - `hub::forwarding::zone_fwd_proofs::the_interest_buffer_is_reused_across_publishes`
+- `hub::forwarding::zone_fwd_proofs::without_a_durable_plane_nothing_stands_in_for_what_an_unreachable_peer_is_owed`
 - `hub::mesh::tests::a_moved_membership_invalidates_a_positive_answer`
 - `hub::mesh::tests::an_unstamped_cache_is_never_whole_on_a_cluster`
 - `hub::mesh::tests::standalone_reads_true_from_an_untouched_cache`
@@ -1943,6 +1944,20 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::settle_gate::leaving_the_settle_window_answers_a_restore_shaped_entry`
 - `hub::tests::settle_gate::no_periodic_inherited_scan_runs_without_a_durable_plane`
 - `hub::tests::settle_gate::the_interest_authoritative_backstop_fires_on_its_own_constant`
+- `hub::tests::share_obligations::a_drain_gated_share_delivery_behind_a_lost_link_does_not_hold_the_drain`
+- `hub::tests::share_obligations::a_drain_gated_share_delivery_with_nobody_to_hand_it_to_is_dropped_and_counted`
+- `hub::tests::share_obligations::a_node_whose_view_is_unsettled_does_not_call_a_share_member_gone`
+- `hub::tests::share_obligations::a_peer_that_has_not_announced_within_a_tick_is_sent_what_it_is_owed_oldest_first`
+- `hub::tests::share_obligations::a_publish_made_before_the_peer_announces_on_a_new_link_goes_out_behind_what_was_held`
+- `hub::tests::share_obligations::a_share_delivery_follows_a_consumer_that_reconnected_through_another_node`
+- `hub::tests::share_obligations::a_share_delivery_held_for_a_member_that_left_during_the_outage_is_placed_again`
+- `hub::tests::share_obligations::a_share_delivery_is_withheld_when_the_only_members_left_already_refused_it`
+- `hub::tests::share_obligations::a_share_delivery_made_before_the_peers_membership_arrives_goes_out_behind_what_was_held`
+- `hub::tests::share_obligations::a_share_delivery_moves_to_a_member_on_a_kept_node_when_its_own_nodes_hold_runs_out`
+- `hub::tests::share_obligations::a_share_delivery_refused_because_its_member_is_gone_is_placed_with_another_member`
+- `hub::tests::share_obligations::a_share_delivery_whose_group_has_nobody_left_is_acknowledged`
+- `hub::tests::share_obligations::a_share_delivery_whose_member_is_gone_is_held_for_a_member_out_of_reach`
+- `hub::tests::share_obligations::a_shared_delivery_for_a_member_that_is_not_here_is_refused_not_answered_stored`
 - `hub::tests::shared_capacity::controls::qos0_shared_capacity_includes_application_properties`
 - `hub::tests::shared_capacity::controls::qos0_shared_does_not_escape_into_another_group_or_a_down_link`
 - `hub::tests::shared_capacity::controls::qos0_shared_rechecks_capacity_between_matching_groups`
@@ -2466,11 +2481,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `publish_reaches_matching_subscriber`
 - `qos1_publish_is_acked_and_downgraded`
 
-## `crates/mqttd/tests/false_dead_delivery.rs` — 7 test(s)
+## `crates/mqttd/tests/false_dead_delivery.rs` — 9 test(s)
 
 - `durable_a_follower_evictor_dials_and_a_durable_session_is_served`
 - `durable_a_leader_evictor_dials_the_lease_moves_and_sessions_follow_it`
 - `durable_the_evicted_peer_dials_the_link_returns_and_sessions_follow_the_lease`
+- `plain_a_false_verdict_keeps_publish_order_for_every_subscriber`
+- `plain_a_link_cut_keeps_publish_order_and_holds_every_acknowledgement_until_the_heal`
 - `plain_a_link_cut_with_no_verdict_holds_every_publish_and_delivers_it`
 - `plain_a_verdict_withdrawn_after_two_seconds_finds_the_link_already_back`
 - `plain_the_evicted_peer_dials_the_link_returns_and_nothing_is_lost`
