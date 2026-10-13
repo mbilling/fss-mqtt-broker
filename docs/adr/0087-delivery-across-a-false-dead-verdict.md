@@ -205,7 +205,7 @@ Read with it:
 | `mqttd_rule_actions_total{result="ok"}` | Moves: the lost republishes are counted as successes. |
 | `mqttd_members{state="dead"}` | 1. The verdict is visible; that it is false is not. No shipped alert reads it. |
 | `mqttd_routing_unsettled{reason="takeover"}`, `mqttd_pending_publishes_awaiting_settle` | Up for the settle window. |
-| Log, at WARN | "membership: peer DEAD; dropping link and routing state", later "peer RECOVERED to alive". |
+| Log, at WARN | "membership: peer DEAD; dropping link and routing state", later "peer RECOVERED to alive". (Since 0087-T2 the first line reads "dropping its link and holding it as unreachable".) |
 
 A rule on `$events/message/dropped` would be raised on A with `no_subscribers` for each
 (`hub/events.rs::note_no_subscribers`); that is from reading the code, not from a test.

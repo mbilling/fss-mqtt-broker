@@ -324,7 +324,7 @@ async fn maintain(
                     });
                 }
                 held_dead.insert(ev.id.clone());
-                warn!(peer = %ev.id.0, "membership: peer DEAD; dropping link and routing state");
+                warn!(peer = %ev.id.0, "membership: peer DEAD; dropping its link and holding it as unreachable (what its subscribers are owed waits for it, for a bounded time)");
                 let _ = hub.send(HubCommand::PeerDead { node: ev.id });
             }
         }
@@ -747,7 +747,7 @@ mod tests {
                 .is_ok(),
             "manager wedged after the undialable member"
         );
-        // ...and the undialable member's death still clears routing state.
+        // ...and the undialable member's death is still told to the hub.
         ev_tx.send(ev("b", "", MemberState::Dead)).unwrap();
         match timeout(Duration::from_secs(2), hub_rx.recv())
             .await
