@@ -894,6 +894,15 @@ impl Hub {
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|c| !tried.iter().any(|(n, cl)| *n == c.node && *cl == c.client))
+                // A re-selection moves a delivery to a member that can take it NOW.
+                // A member that cannot be reached — it stays in its group since ADR
+                // 0087 D1 — is where a publish is first placed when its group has
+                // nobody else, never where one is moved to: the member it would
+                // leave is not tried again, so the move could only strand it. With
+                // no member left that can take it, the pass is exhausted and the
+                // publisher hears the last answer, as it did when a lost link
+                // removed the member from the group.
+                .filter(|c| self.shared_member_can_take_it_now(c))
                 .collect();
             let Some(chosen) = self.select_shared(&key, &candidates) else {
                 debug!(
@@ -1013,10 +1022,16 @@ impl Hub {
             .find(|(k, _)| k == key)
             .map(|(_, cs)| cs)
             .unwrap_or_default();
+        // "Still in the group" is not enough since ADR 0087 D1: a member whose node
+        // has no link stays in its group, and there is no link to hand it this on.
         let Some(member) = tried.iter().find_map(|(node, client)| {
-            members
-                .iter()
-                .find(|c| c.node == *node && c.client == *client)
+            members.iter().find(|c| {
+                c.node == *node
+                    && c.client == *client
+                    && c.node
+                        .as_ref()
+                        .is_none_or(|home| self.peers.contains_key(home))
+            })
         }) else {
             return;
         };
@@ -1050,6 +1065,19 @@ impl Hub {
                     &AppendGate::None,
                 );
             }
+        }
+    }
+
+    /// Whether `member` can be handed a delivery now, by the selector's own rules:
+    /// a local member that is online, or persistent (it queues); a remote member
+    /// whose node has a link (it is delivered to, or queues at its home). What is
+    /// left is a member that cannot be reached — on a node whose link is down or
+    /// that membership holds dead — which a publish may be owed to and held for, but
+    /// which nothing is moved to.
+    pub(super) fn shared_member_can_take_it_now(&self, member: &SharedCandidate) -> bool {
+        match &member.node {
+            None => member.online || self.is_persistent(&member.client),
+            Some(home) => self.peers.contains_key(home),
         }
     }
 

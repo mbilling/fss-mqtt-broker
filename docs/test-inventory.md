@@ -1412,6 +1412,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd/src/lib.rs` — 759 test(s)
 ## `crates/mqttd/src/lib.rs` — 761 test(s)
 ## `crates/mqttd/src/lib.rs` — 763 test(s)
+## `crates/mqttd/src/lib.rs` — 765 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1652,6 +1653,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::zone_fwd_proofs::a_qos0_publish_nobody_wants_does_not_walk_the_peer_map`
 - `hub::forwarding::zone_fwd_proofs::a_reached_answer_is_downgraded_for_an_older_peer`
 - `hub::forwarding::zone_fwd_proofs::a_reached_forward_releases_a_held_ack_and_a_stored_one_does_not`
+- `hub::forwarding::zone_fwd_proofs::a_refused_share_delivery_is_not_moved_to_a_member_that_cannot_be_reached`
 - `hub::forwarding::zone_fwd_proofs::a_session_that_materialises_here_discharges_what_the_unreachable_peer_was_owed`
 - `hub::forwarding::zone_fwd_proofs::a_share_delivery_does_not_move_from_one_unreachable_member_to_another`
 - `hub::forwarding::zone_fwd_proofs::a_share_delivery_in_flight_at_a_verdict_moves_to_a_reachable_member_or_stays_owed`
@@ -1707,6 +1709,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_discard_with_an_inflight_append_leaves_no_ghost_queue`
 - `hub::tests::a_discharged_tombstone_is_reaped_after_the_roster_converges`
 - `hub::tests::a_divergent_retained_value_is_detected_and_counted`
+- `hub::tests::a_drain_gated_message_is_not_handed_to_a_member_whose_node_was_declared_dead`
 - `hub::tests::a_dropped_replay_entry_does_not_pin_the_log`
 - `hub::tests::a_failed_durable_append_is_counted_by_reason`
 - `hub::tests::a_failed_local_commit_retries_until_heal_and_keeps_order`

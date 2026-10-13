@@ -300,7 +300,12 @@ protocol, forward window and every obligation toward it. `peer_disconnected` kee
   hold at which one has appeared (the group's consumers reconnecting elsewhere), and
   stays owed until then (it was withheld from the publisher before). It does not move
   to a member on another node that cannot be reached either: the member it left is not
-  tried again, so that move could strand it with a peer that never returns. Two things the sentence "all from code that already exists" above did not
+  tried again, so that move could strand it with a peer that never returns. The same
+  holds for every re-selection — a refusal with only unreachable members left is
+  answered to the publisher, as it was when a lost link removed them from the group —
+  and for the drain's fallback, which hands a message to a member only over a link. An
+  unreachable member is where a publish is first placed, never where one is moved. Two
+  things the sentence "all from code that already exists" above did not
   cover: a `$share` delivery to a member with no link was *not* an obligation — the
   frame is chosen by the link's negotiated protocol, which read as the oldest for a peer
   with no link, i.e. fire-and-forget, dropped, the publisher acknowledged — so the hub

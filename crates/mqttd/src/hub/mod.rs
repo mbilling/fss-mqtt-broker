@@ -7827,11 +7827,7 @@ impl Hub {
                     for (group, members) in self.shared_candidates(&p.topic) {
                         let elsewhere: Vec<(Option<NodeId>, ClientId)> = members
                             .into_iter()
-                            .filter(|c| {
-                                c.node
-                                    .as_ref()
-                                    .is_none_or(|home| self.peers.contains_key(home))
-                            })
+                            .filter(|c| self.shared_member_can_take_it_now(c))
                             .map(|c| (c.node, c.client))
                             .collect();
                         elsewhere_by_group.insert(group, elsewhere);
@@ -19829,6 +19825,56 @@ mod tests {
         tx.send(HubCommand::PeerDead {
             node: NodeId(dying.into()),
         })
+        .unwrap();
+        match next_forward_answer(&mut survivor_link).await {
+            PeerMessage::SharedDeliver { topic, .. } => assert_eq!(topic, "presence/e"),
+            other => panic!("expected a plain shared delivery, got {other:?}"),
+        }
+        assert_eq!(
+            timeout(Duration::from_secs(2), drained(&tx))
+                .await
+                .expect("nothing awaits an answer")
+                .unwrap(),
+            0
+        );
+    }
+
+    /// The same, in the other order: the member chosen FIRST is on the node that
+    /// dies, the delivery moves to the other member at the verdict, and that one
+    /// refuses. The member on the dead node is still in its group — a verdict erases
+    /// nothing (ADR 0087 D1) — but there is no link to hand it the message on, so
+    /// the fallback goes to the member that refused, alive and linked.
+    #[tokio::test]
+    async fn a_drain_gated_message_is_not_handed_to_a_member_whose_node_was_declared_dead() {
+        let tx = start_hub();
+        let mut n2 = connect_peer_at_proto(&tx, "n2", 1, 7);
+        let mut n3 = connect_peer_at_proto(&tx, "n3", 2, 7);
+        remote_shared_interest_qos(&tx, "n2", "g", "presence/#", &[("m2", QoS::AtLeastOnce)]);
+        remote_shared_interest_qos(&tx, "n3", "g", "presence/#", &[("m3", QoS::AtLeastOnce)]);
+        tx.send(HubCommand::Draining).unwrap();
+        tx.send(presence_message("presence/e")).unwrap();
+        let acked = |msg: PeerMessage| match msg {
+            PeerMessage::SharedDeliverAcked { seq, .. } => seq,
+            other => panic!("expected an acked shared delivery, got {other:?}"),
+        };
+        // Whichever member is chosen first, its node dies.
+        let (dying, mut survivor_link, survivor) = tokio::select! {
+            m = next_forward_answer(&mut n2) => { let _ = acked(m); ("n2", n3, "n3") },
+            m = next_forward_answer(&mut n3) => { let _ = acked(m); ("n3", n2, "n2") },
+        };
+        tx.send(HubCommand::PeerDead {
+            node: NodeId(dying.into()),
+        })
+        .unwrap();
+        // The delivery moves to the other member at once, and that member refuses.
+        let moved = acked(next_forward_answer(&mut survivor_link).await);
+        tx.send(ordered(HubCommand::RemotePublishVerdict {
+            node: NodeId(survivor.into()),
+            seq: moved,
+            verdict: ForwardVerdict::Refused {
+                code: PublishRefusal::Brownout.wire_code(),
+            },
+        }))
         .unwrap();
         match next_forward_answer(&mut survivor_link).await {
             PeerMessage::SharedDeliver { topic, .. } => assert_eq!(topic, "presence/e"),

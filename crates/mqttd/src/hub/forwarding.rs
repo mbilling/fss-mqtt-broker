@@ -2961,6 +2961,68 @@ mod zone_fwd_proofs {
         assert!(matches!(rx.try_recv(), Ok(PublishOutcome::Accepted)));
     }
 
+    /// Nor does a refusal move it there. The delivery owed to b's member moves to
+    /// d's, on a node with a link, at b's verdict; d refuses (its node in a
+    /// brownout). The only member not yet tried is c's, and c cannot be reached: the
+    /// pass is exhausted, and the publisher is told of the refusal and retries —
+    /// where holding the delivery for c would have ended, if c's hold ran out, in an
+    /// acknowledgement for a publish nobody received, with b never tried again.
+    #[test]
+    fn a_refused_share_delivery_is_not_moved_to_a_member_that_cannot_be_reached() {
+        let mut h = hub();
+        let group = |member: &str| RemoteSharedGroup {
+            group: "g".into(),
+            filter: "s/#".into(),
+            members: vec![(ClientId(member.into()), QoS::AtLeastOnce, true)],
+        };
+        let b = attach_peer_at(&mut h, "b", PROTO_FORWARD_REACHED, "none");
+        let c = attach_peer_at(&mut h, "c", PROTO_FORWARD_REACHED, "none");
+        let mut d = attach_peer_at(&mut h, "d", PROTO_FORWARD_REACHED, "none");
+        for (link, member) in [(&b, "m-b"), (&c, "m-c"), (&d, "m-d")] {
+            h.remote_shared
+                .insert(link.node.clone(), vec![group(member)]);
+        }
+        h.rebuild_remote_shared_index();
+        let (id, mut rx) = register(&mut h, "s/t");
+        let _ = h.deliver_shared(
+            "s/t",
+            &Bytes::from_static(b"x"),
+            QoS::AtLeastOnce,
+            None,
+            &AppProperties::default(),
+            Some(id),
+            false,
+        );
+        h.pending_local_done(id);
+
+        h.peer_dead(&c.node);
+        h.peer_dead(&b.node);
+        let moved = loop {
+            let frame =
+                d.rx.try_recv()
+                    .expect("moved to d's member, on a linked node");
+            if let PeerMessage::SharedDeliverAcked { seq, client, .. } = frame {
+                assert_eq!(client, "m-d");
+                break seq;
+            }
+        };
+        h.forward_answered(
+            &d.node,
+            moved,
+            ForwardVerdict::Refused {
+                code: PublishRefusal::Brownout.wire_code(),
+            },
+        );
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Ok(PublishOutcome::Refused(PublishRefusal::Brownout))
+            ),
+            "the publisher is told, and nothing is held for the unreachable member"
+        );
+        assert!(h.pending_publishes.is_empty() && h.forward_index.is_empty());
+    }
+
     /// `$share` membership survives a lost link and a verdict (finding 3 of issue
     /// #973: it was dropped by both, so a link flap alone lost `$share` deliveries).
     /// A member on a node with a link is always preferred; when the group has none,
