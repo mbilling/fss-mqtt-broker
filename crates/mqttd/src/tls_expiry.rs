@@ -381,9 +381,8 @@ pub fn describe(kind: Kind, deciding: &Deciding, warn_permille: u16, now: i64) -
     let spent = percent(window.spent(now));
     let threshold = threshold_percent(warn_permille);
     match (status(window, warn_permille, now), kind) {
-        (Status::Healthy, _) => None,
         // A revocation list dated ahead is not refused for it; only a certificate is.
-        (Status::NotYetValid, Kind::Crl) => None,
+        (Status::Healthy, _) | (Status::NotYetValid, Kind::Crl) => None,
         (Status::NotYetValid, _) => Some(format!(
             "{what} is not valid yet: its validity begins in {}",
             span(window.not_before.saturating_sub(now))
