@@ -315,7 +315,8 @@ pub fn read(source: &Source) -> Result<Option<Deciding>, String> {
 /// Where a window stands against the warning threshold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
-    /// The window has not begun: whoever checks it against the clock refuses it.
+    /// The window has not begun. A certificate in this state is refused by whoever checks
+    /// it against the clock and is warned about; a revocation list is not, and is not.
     NotYetValid,
     /// The window runs and less than the threshold is spent.
     Healthy,
@@ -539,8 +540,8 @@ impl TlsExpiry {
         notices
     }
 
-    /// The log lines due at `now`: one for each held role that is not valid yet or past
-    /// the threshold (WARN) or expired (ERROR), the first time it is seen so — at load, or when it
+    /// The log lines due at `now`: one for each held role that is past the threshold, or
+    /// a certificate not valid yet (WARN), or expired (ERROR), the first time it is seen so — at load, or when it
     /// crosses over — and then at most once every [`REPEAT_SECS`] while it stays so.
     /// Nothing for a healthy role.
     pub fn tick(&self, now: SystemTime) -> Vec<Notice> {
@@ -1039,6 +1040,8 @@ mod tests {
         let metrics = Arc::new(Metrics::new("t"));
         let expiry = TlsExpiry::new(667, Some(metrics.clone()));
         expiry.load(&Role::ALL, &[source(Role::PeerCrl, &path)]);
+        // Dated ahead of the clock: a list is not refused for that, and nothing is said.
+        assert!(expiry.tick(at(T0 - DAY)).is_empty());
         assert!(expiry.tick(at(T0 + 3 * DAY)).is_empty());
         let warn = expiry.tick(at(T0 + 5 * DAY));
         assert_eq!(warn[0].level, NoticeLevel::Warn);
