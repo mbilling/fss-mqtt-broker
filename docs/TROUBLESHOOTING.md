@@ -194,7 +194,10 @@ not route traffic.
 `peer DEAD` name a broker that never stopped; `mqttd_members{state="suspect"}` or
 `{state="dead"}` is above zero for a while.
 
-How a node reaches each line (the timings are constants of the release, not settings):
+How a node reaches each line. The timings are constants of the release, not settings,
+and they are those of a healthy node: a node that has itself been suspected lately
+multiplies its own ack timeouts and windows, so it is slower to accuse others
+([ADR 0016](adr/0016-swim-membership-stability.md) §2).
 
 - **`SUSPECT`**: a probe of the member went unanswered for 0.25 s and so did the same
   probe relayed through three other members for another 0.25 s. Routing is not

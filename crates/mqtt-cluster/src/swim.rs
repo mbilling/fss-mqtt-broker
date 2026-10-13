@@ -131,8 +131,10 @@ pub struct Config {
     pub suspicion_scales_with_log_n: bool,
     /// Probe a suspect once more, directly, before declaring it `Dead`. When its
     /// suspicion window lapses the member is sent one `Ping` carrying the suspicion
-    /// itself and is given one ack timeout. Only a member that stays silent is
-    /// declared `Dead`, one ack timeout later than it would have been.
+    /// itself and is given one ack timeout — `ack_timeout_ms` scaled by this node's
+    /// own health, like every ack timeout (ADR 0016 §2), so a node that has lately
+    /// been the slow one waits longer. Only a member that stays silent is declared
+    /// `Dead`, one ack timeout later than it would have been.
     ///
     /// A member that answers is **never** declared dead on that window, whatever its
     /// `Ack` carries: the `Ack` to that probe is proof of life in itself. Usually it
@@ -1226,7 +1228,8 @@ impl Swim {
     }
 
     /// `Config::confirm_before_dead`: send `id` one `Ping` that carries our suspicion
-    /// of it, and give it one ack timeout. If it is alive and hears us, applying that
+    /// of it, and give it one ack timeout (the health-scaled one, as for any probe:
+    /// 250 ms on a healthy node). If it is alive and hears us, applying that
     /// claim makes it bump its incarnation and its `Ack` carries the refutation
     /// first-hand, which clears the suspicion (and this probe) in `apply_update`; if
     /// its `Ack` carries no refutation, [`on_confirm_ack`](Self::on_confirm_ack)
@@ -3071,6 +3074,61 @@ mod tests {
                 assert_eq!(ack.gossip[0].id, "a", "the refutation is first");
             }
         }
+    }
+
+    /// `confirm_before_dead`: a suspect that answers the last probe but whose own claim
+    /// never arrives — its `Ack` carries no refutation and the `Sync` it is asked for is
+    /// lost, window after window — stays `Suspect`, is never declared `Dead` while it
+    /// answers, and costs exactly one `Ping` and one `Join` per window: the restarted
+    /// window is a full one, nothing is sent inside it, and its lapse sends one probe
+    /// more. The first window it does not answer ends in `Dead`.
+    #[test]
+    fn a_suspect_that_answers_without_ever_refuting_is_asked_once_per_window() {
+        let cfg = Config {
+            confirm_before_dead: true,
+            ..fast_cfg()
+        };
+        let mut s = node_with("a", "a:1", cfg.clone());
+        let mut out = Vec::new();
+        s.apply_update(&suspect_from("b", "b:1", 0, "x"), 0, &mut out);
+
+        // `now` is the start of the current window.
+        let mut now = 0;
+        for window in 1..=3 {
+            // Nothing inside the window; one probe when it lapses; none while that
+            // probe is outstanding.
+            out.clear();
+            s.expire_suspects(now + cfg.suspicion_timeout_ms - 1, &mut out);
+            assert!(sends(&out).is_empty(), "window {window}: {out:?}");
+            let lapsed = now + cfg.suspicion_timeout_ms;
+            s.expire_suspects(lapsed, &mut out);
+            s.expire_suspects(lapsed + 1, &mut out);
+            let sent = sends(&out);
+            assert_eq!(sent.len(), 1, "window {window}: one probe: {out:?}");
+            assert_eq!(sent[0].0, "b:1");
+            let seq = ping_seq(&out).expect("the last probe");
+
+            // b answers, saying nothing about itself: kept, and asked once.
+            let asked = s.handle(m("b", "b:1", Kind::Ack { seq }, vec![]), lapsed + 2);
+            let sent = sends(&asked);
+            assert_eq!(sent.len(), 1, "window {window}: one request: {asked:?}");
+            assert!(sent[0].0 == "b:1" && matches!(sent[0].1.kind, Kind::Join));
+            assert_eq!(member_state(&s, "b"), Some(MemberState::Suspect));
+            // The probe's own deadline passing changes nothing: it was answered.
+            out.clear();
+            s.expire_suspects(lapsed + 2 + cfg.ack_timeout_ms, &mut out);
+            assert!(sends(&out).is_empty(), "window {window}: {out:?}");
+            assert_eq!(member_state(&s, "b"), Some(MemberState::Suspect));
+            now = lapsed + 2;
+        }
+
+        // A window it does not answer: one probe, one ack timeout, dead.
+        out.clear();
+        let lapsed = now + cfg.suspicion_timeout_ms;
+        s.expire_suspects(lapsed, &mut out);
+        assert_eq!(sends(&out).len(), 1);
+        s.expire_suspects(lapsed + cfg.ack_timeout_ms, &mut out);
+        assert_eq!(member_state(&s, "b"), Some(MemberState::Dead));
     }
 
     /// The last direct probe is the default (ADR 0016's amendment of 2026-10-13): a

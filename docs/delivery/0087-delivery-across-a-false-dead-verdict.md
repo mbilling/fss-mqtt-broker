@@ -231,7 +231,7 @@ then, once its sub-decision is settled (T3: O1, O4; T5: O2, O5; T6: O3).
   (fewer false verdicts in every cell, not none: 10 of 32 runs at 30 nodes and 10 %
   loss, against 28), a member reachable one way only (declared dead as before — the
   probe needs a round trip), one link lost one way (no suspicion, as before), a member
-  whose datagrams are late. Twelve real brokers, one stopped for 2 s sixty times:
+  whose datagrams are late. Twelve real brokers, one stopped for 2 s 68 times:
   declared dead in none. No operator switch; no wire change. The task is narrowed to
   what was built and the rest of #975 — a relayed `Dead`, the window's scaling — is
   T10b.

@@ -344,7 +344,10 @@ suspicion and waits one ack timeout (250 ms, times the same multiplier):
 - a suspect whose `Ack` carries none (the claim was stale to it, or it is a v1.1.0
   node, which queues its refutation behind other gossip) is kept on the `Ack` alone:
   the window restarts at its full length and the member is sent one `Join`, whose
-  `Sync` states its incarnation.
+  `Sync` states its incarnation. If that `Sync` is lost the member stays `Suspect`
+  and is asked again when the new window lapses: one `Ping` and one `Join` per
+  window for as long as it answers, and `Dead` the first time it does not
+  (`a_suspect_that_answers_without_ever_refuting_is_asked_once_per_window`).
 
 Only the suspect's own `Ack` to that very probe counts, so the probe spares a member
 only on a datagram round trip between the two nodes concerned. §1 (the tombstone), §2,
@@ -540,8 +543,9 @@ a cell worse.
 (`SIGSTOP`) for 2 s and resumed, repeatedly
 (`a_broker_stopped_for_two_seconds_is_declared_dead_by_no_one`, nightly tier: a
 verdict is a matter of deadlines, and a loaded per-PR runner misses them for reasons
-of its own). On a development machine: 60 stops over nine runs, the stopped broker
-suspected by a peer in 42 of them and declared `Dead` in none. With the probe
+of its own). On a development machine: 68 stops over ten runs (three of four stops
+each, then seven of eight), the stopped broker suspected by a peer in 50 of them and
+declared `Dead` in none. With the probe
 switched off, four runs of four stops each produced one `Dead`. That is fewer than the
 simulation's cut would suggest, because a stopped process is not a cut network: the
 kernel queues what arrives, and the broker answers all of it the moment it resumes.

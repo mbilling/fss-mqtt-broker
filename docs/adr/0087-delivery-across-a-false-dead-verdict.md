@@ -812,7 +812,7 @@ same figures) and measured what the table leaves out:
   the prober and the suspect, so a member that hears nothing, or cannot be heard, is
   declared `Dead` as before; one link lost one way raises no suspicion at all, as
   before, and is D1's member without a link;
-- **a stopped process**: one of twelve real brokers stopped for 2 s, sixty times, was
+- **a stopped process**: one of twelve real brokers stopped for 2 s, 68 times, was
   declared `Dead` in none.
 
 Under this record's design a verdict costs latency, not a message; with the probe a

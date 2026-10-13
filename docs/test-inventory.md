@@ -262,7 +262,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 400 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 401 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -577,6 +577,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `swim::tests::a_stale_circulating_dead_claim_cannot_rekill_the_refuted_member`
 - `swim::tests::a_suspect_ahead_of_a_stale_claim_is_saved_by_its_ack_alone`
 - `swim::tests::a_suspect_is_probed_once_more_before_it_is_declared_dead`
+- `swim::tests::a_suspect_that_answers_without_ever_refuting_is_asked_once_per_window`
 - `swim::tests::a_suspect_that_refutes_in_its_ack_is_not_declared_dead`
 - `swim::tests::a_tombstone_fences_the_dead_life_but_not_a_new_one`
 - `swim::tests::a_tombstone_is_pruned_after_its_ttl_and_the_id_can_rejoin`

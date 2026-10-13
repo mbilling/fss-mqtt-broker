@@ -310,7 +310,10 @@ fn signal(pid: u32, sig: &str) {
 /// "<who logged it>: <line>")`.
 fn verdicts(nodes: &[ProcNode], about: usize) -> (usize, Vec<String>) {
     // The id alone: the log is coloured, so `peer=<id>` is not contiguous in it. Ids
-    // are zero-padded, so one is never a prefix of another.
+    // are zero-padded, so one is never a prefix of another. The line names one member
+    // only — the one it is about, never who suspected it (`cluster.rs`) — so a line
+    // with this id in it is a suspicion OF this broker, logged by the broker whose view
+    // changed.
     let subject = nodes[about].id.clone();
     let mut suspected = 0;
     let mut dead = Vec::new();

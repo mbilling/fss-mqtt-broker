@@ -1312,8 +1312,11 @@ mod cert_request_tests {
     ///   (dropped: `identity`);
     /// - a member in good standing can answer with the probe's sequence number, but
     ///   as itself, which is not the suspect's answer;
-    /// - an `Ack` of `b`'s own to some other probe — an old one, replayed — does not
-    ///   carry this probe's sequence number.
+    /// - an `Ack` of `b`'s own to some other probe does not carry this probe's
+    ///   sequence number. (Within one life of `a`: its counter starts over when it
+    ///   restarts, so an `Ack` `b` sent an earlier life of `a` can carry the same
+    ///   number. Without anti-replay that is a replay the ordinary probe is open to
+    ///   as well; ADR 0016's amendment of 2026-10-13 states it.)
     ///
     /// `b` is declared `Dead` when the probe's ack timeout runs out.
     #[test]
