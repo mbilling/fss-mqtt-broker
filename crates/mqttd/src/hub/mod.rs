@@ -7872,11 +7872,14 @@ impl Hub {
         // ordinary forward this node owes it goes out now, oldest publish first,
         // under the seqs they were given when they were recorded — a publisher
         // held for a peer that was out of reach is held no longer than the peer
-        // was (ADR 0087 D1). And it is a gate as well as a trigger: nothing was
-        // sent on this link before it ([`register_forward`](Self::register_forward)),
-        // so what was held across the outage reaches the peer ahead of what was
-        // published after the link came back, and its subscribers see one
-        // publisher's messages in the order they were published.
+        // was (ADR 0087 D1). And it is a gate as well as a trigger: nothing is
+        // sent on a link before it is opened
+        // ([`register_forward`](Self::register_forward)), so what was held across
+        // the outage reaches the peer ahead of what was published after the link
+        // came back, and its subscribers see one publisher's messages in the order
+        // they were published. (If the peer stayed silent for a tick, the sweep
+        // has opened the link already, with the same oldest-first flush, and there
+        // is nothing left to send here.)
         if open_now {
             self.send_owed_to(node, false);
         }
