@@ -346,7 +346,8 @@ suspicion and waits one ack timeout (250 ms, times the same multiplier):
   the window restarts at its full length and the member is sent one `Join`, whose
   `Sync` states its incarnation. If that `Sync` is lost the member stays `Suspect`
   and is asked again when the new window lapses: one `Ping` and one `Join` per
-  window for as long as it answers, and `Dead` the first time it does not
+  window, on top of the ordinary round-robin probes a suspect keeps receiving, for
+  as long as it answers, and `Dead` the first time it does not
   (`a_suspect_that_answers_without_ever_refuting_is_asked_once_per_window`).
 
 Only the suspect's own `Ack` to that very probe counts, so the probe spares a member

@@ -431,10 +431,12 @@ pub struct Swim {
     probe_idx: usize,
     rng: u64,
     bootstrapped: bool,
-    /// Lifeguard local-health awareness (ADR 0016 §2): rises when our *own* probes go
-    /// unanswered or we must refute ourselves (signals we are the slow one), decays on a
-    /// clean probe. Scales our `ack`/`suspicion` timeouts by `(1 + awareness)` so a
-    /// degraded node stops blaming healthy peers. `0` ⇒ today's timeouts.
+    /// Lifeguard local-health awareness (ADR 0016 §2): rises when we must refute a
+    /// suspicion about ourselves (the unambiguous signal that we are the slow one),
+    /// decays on a clean probe. An unanswered probe of ours does NOT raise it — without
+    /// NACKs that is as likely the target's death as our slowness (see `advance_probe`).
+    /// Scales our `ack`/`suspicion` timeouts by `(1 + awareness)` so a degraded node
+    /// stops blaming healthy peers. `0` ⇒ the configured timeouts.
     awareness: u8,
     /// Set once this node begins a voluntary, graceful departure ([`leave`](Self::leave),
     /// ADR 0019 §2). While leaving we stop refuting `Dead` claims about ourselves so the
