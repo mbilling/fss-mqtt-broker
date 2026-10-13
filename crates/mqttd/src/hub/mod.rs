@@ -7645,6 +7645,9 @@ impl Hub {
         // go the way they went when it was declared dead.
         if self.held_dead.contains(node) {
             self.peer_dead(node);
+            // And the takeover window opens, as it does at a verdict: if the node
+            // has now really gone, this is the moment its sessions are inherited.
+            self.takeover_reconcile_ticks = 8;
         }
     }
 

@@ -342,9 +342,12 @@ rule and tested: a node accepts a peer its SWIM view holds `Dead`.
 aborting it, and `peer.rs` (`dial_member`) keeps dialing under the verdict:
 
 - *Pace.* Each attempt that serves no link doubles the delay, from the ordinary 500 ms
-  to 5 s. An attempt is bounded at each step: 5 s for the TCP connect (under a verdict),
-  then 10 s for the TLS handshake and 10 s for the exchange of `Hello`s (for every
-  dialer, verdict or not — see below). A peer that is really gone costs at most 15
+  to 5 s. An attempt is bounded at each step, verdict or not: 5 s for the TCP connect
+  (membership-driven dialers; a connect begun for a member in good standing is the one
+  that sits in SYN retransmissions when a verdict lands), then 10 s for the TLS
+  handshake and 10 s for the exchange of `Hello`s (every dialer — see below). A connect
+  still under way when membership changes its mind about the peer is dropped for a
+  fresh one. A peer that is really gone costs at most 15
   connection attempts in its first minute — one socket at a time, nothing queued — and
   then none; the window is looked at when an attempt ends, so the one under way when it
   closes is finished first. A link served under the verdict resets the delay.
@@ -396,7 +399,14 @@ aborting it, and `peer.rs` (`dial_member`) keeps dialing under the verdict:
   one thing: it stopped this node connecting to an address whose holder it believed
   gone. An address can change hands, so a membership-driven dialer now links only the
   node it was aimed at — whoever else answers there is hung up on — where before it
-  would have linked whichever cluster member answered.
+  would have linked whichever cluster member answered. The pin protects the dialing
+  node only. The node that answered cannot know why it was dialed: it takes the
+  connection for the dialer's link to *it*, registers it in place of the real one, and
+  sees the hang-up afterwards, so each attempt at a stale address flaps the link of the
+  pair that lives there. The dialer therefore stays away from such an address for 60 s,
+  or until membership speaks of the member again. Refusing before the other node
+  registers needs the expected node id in the `Hello` — a wire change, for D8's
+  protocol step.
 - *Measured* (`false_dead_delivery.rs`, three nodes, loopback): in all three "A dials"
   columns of §3 the first publish is acknowledged after 0.76 s and delivered, and the
   two orientations assert the same rows. Left for D1: `$share` with members on B only,

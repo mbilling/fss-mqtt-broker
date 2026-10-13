@@ -155,12 +155,28 @@ const REDIAL_DELAY: Duration = Duration::from_millis(500);
 /// The longest delay between attempts while the peer is held `Dead` (ADR 0087 D5): each
 /// attempt that serves no link doubles the delay from [`REDIAL_DELAY`] up to this.
 const HELD_DEAD_REDIAL_MAX: Duration = Duration::from_secs(5);
-/// How long the TCP connect of one attempt may take while the peer is held `Dead`. A
-/// host that is really gone often answers nothing at all, and the operating system
-/// would keep one such attempt pending for minutes — past the window the dialer has,
-/// and with its retransmissions spaced further apart than a returning host should have
-/// to wait.
-const HELD_DEAD_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the TCP connect of one attempt may take, for a membership-driven dialer
+/// ([`dial_member`]) — whatever membership says of the peer when the attempt starts.
+///
+/// A host that is gone often answers nothing at all, and the operating system keeps
+/// one such attempt pending for minutes, its retransmissions spaced ever further
+/// apart. The attempt that matters most is the one already under way when a verdict
+/// lands: the link dropped while the peer was still in good standing, the redial sits
+/// in those retransmissions, and — since a verdict no longer ends the dialer — it is
+/// that attempt a returning peer would have to wait out.
+const MEMBER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a dialer stays away from an address where a node other than its member
+/// answered ([`LinkOutcome::WrongNode`]), unless membership speaks first.
+///
+/// The dialer hangs up on that node, but the node cannot know why it was dialed: its
+/// accept path takes the connection for this node's link to IT, registers it — in
+/// place of the real one, which it closes — and only then sees the hang-up. So every
+/// attempt at a member's stale address costs the pair that really lives there one
+/// link flap. An `Alive` that names the member elsewhere replaces this dialer, and
+/// any change of standing ends the wait; this is what bounds the flaps when neither
+/// comes. (Refusing before the other node registers needs the expected node id in
+/// the `Hello`, which is a wire change — ADR 0087 T5's protocol step is the place.)
+const WRONG_NODE_REDIAL_DELAY: Duration = Duration::from_mins(1);
 /// How long each half of a dialed link's handshake may take once TCP is connected: the
 /// TLS handshake, and then the exchange of `Hello`s. For every dialer, whatever
 /// membership says of its peer.
@@ -456,10 +472,14 @@ pub async fn dial_forever_with_ingress(
 /// the dialer keeps going, and what the verdict changes is its pace and its end:
 ///
 /// - each attempt that serves no link doubles the delay, from [`REDIAL_DELAY`] to
-///   [`HELD_DEAD_REDIAL_MAX`], and an attempt is bounded at every step — the TCP
-///   connect by [`HELD_DEAD_DIAL_TIMEOUT`], the TLS handshake and the `Hello`
-///   exchange by [`DIAL_HANDSHAKE_TIMEOUT`] each — so a peer that is really gone
-///   costs one connection attempt every five to ten seconds, not two a second;
+///   [`HELD_DEAD_REDIAL_MAX`], so a peer that is really gone costs one connection
+///   attempt every five to ten seconds, not two a second;
+/// - an attempt is bounded at every step, verdict or not — the TCP connect by
+///   [`MEMBER_CONNECT_TIMEOUT`], the TLS handshake and the `Hello` exchange by
+///   [`DIAL_HANDSHAKE_TIMEOUT`] each — and a connect still under way when
+///   membership changes its mind about the peer is dropped for a fresh one;
+/// - an address where another node answers is left alone for
+///   [`WRONG_NODE_REDIAL_DELAY`], or until membership speaks;
 /// - once the peer has been `Dead` with no link for [`DialTarget::held_dead_for`],
 ///   the dialer dials no more. It does not end: it waits for its standing to
 ///   change, and the `Alive` that withdraws the verdict sets it dialing again. (A
@@ -509,6 +529,8 @@ enum Attempt {
     Served,
     /// No link: the connection, the TLS handshake or the peer handshake failed.
     Failed,
+    /// No link: a node other than the member this dialer is aimed at answered.
+    WrongNode,
 }
 
 /// Since when the dialer's target is held `Dead`; `None` for a member in good
@@ -554,13 +576,29 @@ async fn dial(
     // Said once per dialer, not once per attempt.
     let mut wrong_node_logged = false;
     loop {
-        let connecting = TcpStream::connect(&addr);
-        let connected = if held_dead_since(target.as_mut()).is_some() {
-            tokio::time::timeout(HELD_DEAD_DIAL_TIMEOUT, connecting)
-                .await
-                .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
-        } else {
-            connecting.await
+        let connected = match target.as_mut() {
+            // A static peer: as ever, for as long as the operating system tries.
+            None => TcpStream::connect(&addr).await,
+            Some(target) => {
+                // What membership has said up to here is taken as read; what it says
+                // while this connect is under way cuts it short. A connect begun for
+                // a member in good standing can sit in SYN retransmissions when a
+                // verdict lands — and when the verdict is withdrawn again — and the
+                // peer that has just returned must not wait for the next one.
+                target.standing.borrow_and_update();
+                let connecting =
+                    tokio::time::timeout(MEMBER_CONNECT_TIMEOUT, TcpStream::connect(&addr));
+                tokio::pin!(connecting);
+                let timed_out = || Err(std::io::ErrorKind::TimedOut.into());
+                tokio::select! {
+                    connected = &mut connecting => connected.unwrap_or_else(|_| timed_out()),
+                    changed = target.standing.changed() => match changed {
+                        Ok(()) => continue,
+                        // The link manager is gone; it aborts this task as it goes.
+                        Err(_) => connecting.await.unwrap_or_else(|_| timed_out()),
+                    },
+                }
+            }
         };
         let attempt = match connected {
             Ok(stream) => {
@@ -642,10 +680,10 @@ async fn dial(
                                 answered = %answered.0,
                                 "the node answering at a member's routing address is not that \
                                  member; no link (the address has changed hands — the dialer \
-                                 keeps trying until membership says where the member is)"
+                                 stays away until membership speaks of the member again)"
                             );
                         }
-                        Attempt::Failed
+                        Attempt::WrongNode
                     }
                     Err(e) => {
                         debug!(%addr, error = %e, "outbound peer handshake failed");
@@ -658,6 +696,24 @@ async fn dial(
                 Attempt::Failed
             }
         };
+        if attempt == Attempt::WrongNode {
+            // Each attempt here flaps the link of the pair that lives at this
+            // address ([`WRONG_NODE_REDIAL_DELAY`]): stay away until membership has
+            // something new to say about the member, or for a long while.
+            if let Some(standing) = target.as_mut().map(|t| &mut t.standing) {
+                standing.borrow_and_update();
+                tokio::select! {
+                    () = tokio::time::sleep(WRONG_NODE_REDIAL_DELAY) => {}
+                    changed = standing.changed() => {
+                        if changed.is_err() {
+                            return; // the link manager is gone
+                        }
+                    }
+                }
+            }
+            // Then the ordinary pacing below: under a verdict the window still
+            // applies, and a dialer whose window is spent stops here as anywhere.
+        }
         let now = tokio::time::Instant::now();
         match (held_dead_since(target.as_mut()), attempt) {
             // A member in good standing, or a static peer: the fixed pace.
@@ -670,7 +726,7 @@ async fn dial(
                 delay = REDIAL_DELAY;
                 last_served = Some(now);
             }
-            (Some(since), Attempt::Failed) => {
+            (Some(since), Attempt::Failed | Attempt::WrongNode) => {
                 let window = target.as_ref().map_or(Duration::ZERO, |t| t.held_dead_for);
                 let counted_from = last_served.map_or(since, |served| served.max(since));
                 if now.saturating_duration_since(counted_from) >= window {
@@ -2572,11 +2628,14 @@ mod tests {
 
     /// A dialer that outlives a verdict may be dialing an address its member no
     /// longer holds. Whoever else answers there is not linked — the hub hears
-    /// nothing, and the dialer keeps trying — and the member itself is.
+    /// nothing — and is then left alone: the node that answered took the connection
+    /// for its own link to this node and replaced the real one with it, so every
+    /// further attempt would flap that pair. The dialer returns when membership
+    /// speaks of the member again, and the member itself is linked.
     #[tokio::test]
     async fn a_dialer_links_only_the_member_it_was_aimed_at() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let (_standing, target) = dial_target("b", held_dead_now(), Duration::from_mins(10));
+        let (standing, target) = dial_target("b", held_dead_now(), Duration::from_mins(10));
         let (dialer, mut hub) = spawn_dialer(listener.local_addr().unwrap(), target);
 
         // Another node of the cluster answers at b's address.
@@ -2590,8 +2649,16 @@ mod tests {
             hub.try_recv().is_err(),
             "no link to the node that answered instead"
         );
+        // And the address is left alone: longer than any backoff, and no attempt.
+        assert!(
+            tokio::time::timeout(QUIET, listener.accept())
+                .await
+                .is_err(),
+            "the dialer came back to an address another node answers on"
+        );
 
-        // The member itself, at the same address, on the dialer's next attempt.
+        // Membership speaks of the member again; it is there now, at this address.
+        standing.send_replace(DialStanding::Member);
         let (_member, _buf) = accept_as(&listener, "b").await;
         let registered = tokio::time::timeout(Duration::from_secs(20), hub.recv())
             .await

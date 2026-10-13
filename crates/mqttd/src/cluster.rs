@@ -85,7 +85,10 @@ use tracing::{info, warn};
 ///
 /// **For 0087-T3:** when membership raises confirmation as an event of its own, that
 /// event's arm aborts the dialer and removes it from the book, and this window is
-/// what it replaces.
+/// what it replaces. Until then nothing here shrinks for a peer that never returns:
+/// its dialer's task stays, waiting, with the handles it was given, and the peer
+/// stays in the set of verdicts that stand — here and in the hub. One entry per node
+/// id ever declared dead, which is bounded while ids are stable.
 #[must_use]
 pub fn held_dead_dial_window() -> Duration {
     Duration::from_millis(2 * mqtt_cluster::swim::Config::default().dead_ttl_ms)

@@ -728,7 +728,7 @@ async fn a_node_held_dead_is_not_a_node_anyone_may_claim_to_be() {
 /// matches it. The dialer hangs up all the same, because the node that answered is
 /// not the member it dialed. Nothing reaches `node-a`'s hub — no link, so no frame
 /// of `node-c`'s after its `Hello` is ever read — and nothing is routed between the
-/// two, however often the dialer returns.
+/// two; under the verdict as before it.
 #[tokio::test]
 async fn a_dialer_under_a_dead_verdict_refuses_another_nodes_valid_certificate() {
     use mqtt_cluster::swim::MemberState;
@@ -760,10 +760,11 @@ async fn a_dialer_under_a_dead_verdict_refuses_another_nodes_valid_certificate()
         seen.verdicts() == 1
     })
     .await;
-    // Under the verdict the dialer keeps coming, and `node-c` keeps answering.
+    // The verdict brings the dialer back to the address once more — membership has
+    // spoken of the member — and `node-c` answers again.
     let before = at_other.links();
-    until("the dialer has come back twice under the verdict", || {
-        at_other.links() >= before + 2
+    until("the dialer has come back under the verdict", || {
+        at_other.links() > before
     })
     .await;
 
@@ -779,5 +780,72 @@ async fn a_dialer_under_a_dead_verdict_refuses_another_nodes_valid_certificate()
         seen.links(),
         0,
         "the holder never registered a link to the node that answered"
+    );
+}
+
+/// What the dial-side pin cannot do by itself, and what bounds it. The node that
+/// answers at a member's stale address cannot know why it was dialed: its accept
+/// path takes the connection for the dialing node's link to IT, registers it in
+/// place of the real one — closing that — and only then sees the dialer hang up.
+/// So every attempt at such an address costs the pair that really lives there a
+/// link flap, and a dialer that came back twice a second would keep that pair's link
+/// down for good.
+///
+/// Here `node-a` and `node-c` have a real link, and membership also names `node-b`
+/// at `node-c`'s address. `node-c` registers the real link, the stale dialer's
+/// connection, and the real link's redial — and then nothing more: the dialer aimed
+/// at `node-b` stays away from the address, and the a↔c link is up and routing.
+#[tokio::test]
+async fn a_stale_address_does_not_keep_flapping_the_link_of_the_node_that_answers() {
+    use mqtt_cluster::swim::MemberState;
+
+    let pki = ClusterPki::new("stale-address");
+    let mut holder = bind_node(NodeId("node-a".into())).await;
+    let mut other = bind_node(NodeId("node-c".into())).await;
+    let (events, _) = managed_links(&mut holder, pki.peer_tls("node-a"));
+    let (other_hub, at_other) = tapped(other.hub_tx.clone());
+    other.hub_tx = other_hub;
+    holder.serve(Some(pki.peer_tls("node-a")));
+    other.serve(Some(pki.peer_tls("node-c")));
+
+    // The real pair.
+    events
+        .send(membership("node-c", other.peer_addr, MemberState::Alive))
+        .unwrap();
+    let mut sub = Client::connect(other.client_addr, "sub").await;
+    sub.subscribe("stale/+").await;
+    let mut pubr = Client::connect(holder.client_addr, "pub").await;
+    assert!(
+        crosses(&mut sub, &mut pubr, "stale/before", b"before").await,
+        "the a↔c link must route to begin with"
+    );
+
+    // Membership names a third node at the same address.
+    let before = at_other.links();
+    events
+        .send(membership("node-b", other.peer_addr, MemberState::Alive))
+        .unwrap();
+    until("the stale dialer has reached the address", || {
+        at_other.links() > before
+    })
+    .await;
+
+    // SETTLE(stale-dialer-stays-away): a negative. Five seconds is ten of the
+    // intervals at which a member in good standing is redialed, so a dialer that
+    // kept coming would register about ten more links at `node-c` in it; nothing
+    // observable says "the dialer has decided to stay away". A slow machine gives a
+    // wrong dialer fewer attempts, which is why the bound below is two, not ten.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    // The stale attempt, and the real link's redial after the flap it caused. One
+    // more is allowed for a redial that raced the flap; a dialer that had kept
+    // coming would be far past this.
+    let after = at_other.links() - before;
+    assert!(
+        (1..=3).contains(&after),
+        "node-c registered {after} link(s) from node-a since the stale address was named"
+    );
+    assert!(
+        crosses(&mut sub, &mut pubr, "stale/after", b"after").await,
+        "the a↔c link is up and routing again"
     );
 }

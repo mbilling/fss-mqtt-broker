@@ -2511,12 +2511,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `an_empty_password_is_refused_with_exit_2`
 - `spaces_and_punctuation_survive_the_round_trip`
 
-## `crates/mqttd/tests/peer_identity.rs` — 8 test(s)
+## `crates/mqttd/tests/peer_identity.rs` — 9 test(s)
 
 - `a_cluster_crl_reload_tears_down_the_revoked_nodes_link`
 - `a_dialer_under_a_dead_verdict_refuses_another_nodes_valid_certificate`
 - `a_node_accepts_and_serves_a_link_from_a_peer_it_holds_dead`
 - `a_node_held_dead_is_not_a_node_anyone_may_claim_to_be`
+- `a_stale_address_does_not_keep_flapping_the_link_of_the_node_that_answers`
 - `cert_cn_mismatch_with_hello_node_id_is_rejected`
 - `honest_nodes_with_matching_cert_cn_link_and_route`
 - `plaintext_mesh_without_binding_still_routes`
