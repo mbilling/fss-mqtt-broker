@@ -1,0 +1,133 @@
+---
+adr: "0087"
+title: "A QoS ≥ 1 publish is acknowledged only when every node that owns a subscriber has accepted it: no path around the acknowledged forward"
+adr_status: Proposed
+tasks:
+  - id: 0087-T1
+    title: "Characterise and design: what is acknowledged end to end today, what a false Dead verdict loses per subscriber kind, the failure-detection measurements, and this record"
+    status: in-progress
+    issue: 973
+    notes: "crates/mqttd/tests/false_dead_delivery.rs (six episodes over three brokers wired as main wires them, plain and durable, both link orientations, the evictor leading the lease group or not; every lossy row asserted exactly, so each fails when the behaviour changes in either direction), two unit tests in hub/forwarding.rs for the two faces of the gap at the hub, the false_dead_report measurement and two regression tests in swim_formation_sim.rs, two SWIM Config knobs that are off by default (confirm_before_dead, suspicion_scales_with_log_n) with their unit tests. No change to the delivery path."
+  - id: 0087-T2
+    title: "D1, D4, D6: a peer under a Dead verdict stays in the routing tables as unreachable — interest, $share membership (for a link-down peer too), the forward window; obligations in flight are kept; $share prefers a reachable member and holds when there is none"
+    status: planned
+    issue: 973
+    notes: "Size M (3-5 days). hub/mod.rs peer_dead and peer_disconnected, hub/forwarding.rs (the re-route becomes an addition to the kept obligation), hub/delivery.rs shared_candidates and select_shared. First: it is the rule itself. Flips the two unit tests and, with T4, most rows of the episodes."
+  - id: 0087-T3
+    title: "D2: confirmation that a peer is gone, as a membership event (tombstone pruned unanswered, or a new generation), and the resolution of what it was still owed, per subscriber kind"
+    status: planned
+    issue: 973
+    notes: "Size M (4-6 days). swim.rs (an action at the prune and at a generation change), swim_driver.rs, cluster.rs, a hub command; the resolution table of D2. Needs O1 and O4 settled. After T2: without it a held publish for a peer that really died is held until the pending bound."
+  - id: 0087-T4
+    title: "D5: the link manager keeps dialing a peer under a verdict until it is confirmed gone; a link is admitted by its handshake, not by membership, as a stated and tested rule"
+    status: planned
+    issue: 973
+    notes: "Size S (1-2 days). cluster.rs, the Dead arm and a bounded-lifetime dialer. Measured locally on its own: every lost row of the 'A dials' columns but the $share one becomes delivered. With T2, or straight after it."
+  - id: 0087-T5
+    title: "D8: interest that says whether the lease plane owns it (peer protocol 15, additive, per-link), so a durable session's obligation is discharged by its committed owner's verdict and a clean session's only by its node"
+    status: planned
+    issue: 973
+    notes: "Size L (1-2 weeks). mqtt-cluster/src/peer.rs (the frame, PROTO_MAX 15, the pinned-encoding tests), hub interest index, forwarding. Needs O2 and O5 settled. Without it T2+T3 make every durable failover a dead_ttl pause for publishers, so it ships with them or before them; cluster_upgrade.rs is its oracle."
+  - id: 0087-T6
+    title: "D3: bounds and the publisher's experience — the per-peer held count, the behaviour at the pending-table bound (O3), the stall of a connection whose head acknowledgement is held, documented where the guarantee is stated"
+    status: planned
+    issue: 973
+    notes: "Size S-M (2-3 days). hub/forwarding.rs register_pending, conn.rs only if O3 chooses the v5 reason code; CLIENT-GUIDE, SIZING."
+  - id: 0087-T7
+    title: "D9: observability — held-for-unreachable gauge per peer, resolved-undeliverable and peer-unreachable counters, the log lines, the alert, the admin placement column; operator documentation"
+    status: planned
+    issue: 973
+    notes: "Size M (3-4 days). mqtt-observability, hub, admin API and CLI, the chart's PrometheusRule (re-vendor the mqttui bundle), OPERATIONS, TROUBLESHOOTING, GUIDE. Also settles the no-subscriber reason that is documented and never emitted."
+  - id: 0087-T8
+    title: "D11: the tests — flip the characterisation rows, an episode with the peer really dead, false-Dead and partition injections with clean-session and $share subscribers in cluster_stress's ledger, a SIGSTOP nemesis in cluster_proc"
+    status: planned
+    issue: 973
+    notes: "Size L (1-2 weeks), alongside T2-T5 rather than after them: each of those lands with its rows flipped. The stress and out-of-process injections are what makes the claim more than six scripted episodes."
+  - id: 0087-T9
+    title: "D10 and the rig: re-measure the hot path (clean QoS 1 at ten nodes, the durable rung, the $share QoS 1 lane, the dispatch benchmark) and run a membership fault under load with the ledger; then the README's claim"
+    status: planned
+    issue: 973
+    notes: "Size M, plus rig time. Last: it certifies the rest. Until it has run, the README's 'none lost' carries the condition it was measured under (O8)."
+  - id: 0087-T10
+    title: "Failure detection: one last direct probe before Dead on by default, and the same check before adopting a relayed Dead; decide the window's scaling"
+    status: planned
+    issue: 975
+    notes: "Size M (3-5 days). Independent of T2-T9 and may go first. swim.rs (confirm_before_dead exists, off), swim_sim.rs for loss and one-way faults, the formation simulation's bounds. ADR 0016 gets the amendment."
+---
+
+# Delivery 0087 — acknowledged only when the owning node has accepted it
+
+**ADR:** [docs/adr/0087-delivery-across-a-false-dead-verdict.md](../adr/0087-delivery-across-a-false-dead-verdict.md)
+
+The plan, progress, and changelog for ADR 0087. Task status lives in the frontmatter
+above; the table below is generated from it.
+
+The direction was decided on 2026-10-13 (issue #973): a publisher's QoS ≥ 1
+acknowledgement is given only after the node that owns the subscriber has accepted the
+message, with no path that bypasses it, and correctness comes before a release date. The
+ADR is still Proposed because its sub-decisions O1–O8 are open.
+
+**The minimum complete fix is T2, T3, T4, T5, T6, T7 and T8**, certified by T9. That is
+not what fits a date; it is what it takes for the rule to hold without an exception and
+without making durable failover slower: T2 is the rule, T3 is what ends a hold when the
+peer really is gone, T4 makes a false verdict heal in a second in either link
+orientation, T5 keeps a real owner death at today's failover pause, T6 and T7 make the
+hold bounded and visible, and T8 is the evidence. In working days for one person, by the
+sizes above: about five to seven weeks, then the rig. T10 is separate, smaller, and
+reduces how often any of it is exercised.
+
+Tasks T2–T9 are tracked under #973 until the ADR is accepted; each gets its own issue
+then, once its sub-decision is settled (T3: O1, O4; T5: O2, O5; T6: O3).
+
+## Plan
+
+| Task | Acceptance |
+|---|---|
+| **0087-T1** Characterise and design | The tests, measurements and ADR are merged; the issue carries the table. |
+| **0087-T2** Unreachable, not erased (D1, D4, D6) | `a_publish_for_a_peer_declared_dead_owes_it_nothing_where_a_link_down_peer_is_owed` and `a_forward_unanswered_when_its_target_is_declared_dead_is_acked_when_the_grace_runs_out` are flipped: a publish for a peer under a verdict is an obligation, and one in flight stays one. In the episodes no row is `AckedAndLost` or `HeldThenLost` while the verdict stands, `$share` rows included; a QoS 2 forward retransmitted across a verdict is delivered once. |
+| **0087-T3** Confirmed gone (D2) | An episode with B really dead: a publish for its clean-session subscriber is acknowledged at confirmation and counted, not before and not silently; a durable session's is stored by the new owner within the failover pause; a new generation of B confirms the old one gone. A hold never outlives `dead_ttl` plus a sweep tick for non-durable interest. |
+| **0087-T4** Keep dialing (D5) | The "A dials" and "B dials" columns of the episodes are the same. A node accepts and serves a link from a peer its membership holds `Dead`. The dialer for a confirmed-gone peer is stopped. |
+| **0087-T5** Interest kinds (D8) | With every link at proto 15, an owner's death holds a publisher for the failover pause and no longer; a false verdict at the lease leader loses nothing for either kind. `cluster_upgrade.rs` holds in both directions of the roll; a proto-14 link is treated as O5 decides. |
+| **0087-T6** Bounds (D3) | The pending table's behaviour at its bound under a hold is tested and documented; the per-connection stall is stated in the client guide; O3 is implemented as decided. |
+| **0087-T7** Observability (D9) | An operator can see, from metrics alone, that publishes are held for a peer and how each hold ended; the alert fires in the chart's test; OPERATIONS has the runbook. |
+| **0087-T8** Tests (D11) | `cluster_stress` holds acked durability for clean-session, persistent and `$share` subscribers across seeded false verdicts and partitions; `cluster_proc`'s `SIGSTOP` nemesis passes the acked-facts oracle. |
+| **0087-T9** Rig | A ledgered run with a membership fault under load loses nothing; the re-measured rungs are published with the README. |
+| **0087-T10** Failure detection (#975) | `a_short_cut_still_ends_in_a_false_dead_on_the_default_window` is replaced by the bound the new default keeps; no formation regression. |
+
+## Progress
+
+<!-- status-table:0087 -->
+| Task | Status | Issue | When | Evidence / notes |
+|------|--------|-------|------|------------------|
+| 0087-T1 | 🚧 in-progress | [#973](https://github.com/mbilling/fss-mqtt-broker/issues/973) | — | "crates/mqttd/tests/false_dead_delivery.rs (six episodes over three brokers wired as main wires them, plain and durable, both link orientations, the evictor leading the lease group or not; every lossy row asserted exactly, so each fails when the behaviour changes in either direction), two unit tests in hub/forwarding.rs for the two faces of the gap at the hub, the false_dead_report measurement and two regression tests in swim_formation_sim.rs, two SWIM Config knobs that are off by default (confirm_before_dead, suspicion_scales_with_log_n) with their unit tests. No change to the delivery path." |
+| 0087-T2 | ⬜ planned | [#973](https://github.com/mbilling/fss-mqtt-broker/issues/973) | — | "Size M (3-5 days). hub/mod.rs peer_dead and peer_disconnected, hub/forwarding.rs (the re-route becomes an addition to the kept obligation), hub/delivery.rs shared_candidates and select_shared. First: it is the rule itself. Flips the two unit tests and, with T4, most rows of the episodes." |
+| 0087-T3 | ⬜ planned | [#973](https://github.com/mbilling/fss-mqtt-broker/issues/973) | — | "Size M (4-6 days). swim.rs (an action at the prune and at a generation change), swim_driver.rs, cluster.rs, a hub command; the resolution table of D2. Needs O1 and O4 settled. After T2: without it a held publish for a peer that really died is held until the pending bound." |
+| 0087-T4 | ⬜ planned | [#973](https://github.com/mbilling/fss-mqtt-broker/issues/973) | — | "Size S (1-2 days). cluster.rs, the Dead arm and a bounded-lifetime dialer. Measured locally on its own: every lost row of the 'A dials' columns but the $share one becomes delivered. With T2, or straight after it." |
+| 0087-T5 | ⬜ planned | [#973](https://github.com/mbilling/fss-mqtt-broker/issues/973) | — | "Size L (1-2 weeks). mqtt-cluster/src/peer.rs (the frame, PROTO_MAX 15, the pinned-encoding tests), hub interest index, forwarding. Needs O2 and O5 settled. Without it T2+T3 make every durable failover a dead_ttl pause for publishers, so it ships with them or before them; cluster_upgrade.rs is its oracle." |
+| 0087-T6 | ⬜ planned | [#973](https://github.com/mbilling/fss-mqtt-broker/issues/973) | — | "Size S-M (2-3 days). hub/forwarding.rs register_pending, conn.rs only if O3 chooses the v5 reason code; CLIENT-GUIDE, SIZING." |
+| 0087-T7 | ⬜ planned | [#973](https://github.com/mbilling/fss-mqtt-broker/issues/973) | — | "Size M (3-4 days). mqtt-observability, hub, admin API and CLI, the chart's PrometheusRule (re-vendor the mqttui bundle), OPERATIONS, TROUBLESHOOTING, GUIDE. Also settles the no-subscriber reason that is documented and never emitted." |
+| 0087-T8 | ⬜ planned | [#973](https://github.com/mbilling/fss-mqtt-broker/issues/973) | — | "Size L (1-2 weeks), alongside T2-T5 rather than after them: each of those lands with its rows flipped. The stress and out-of-process injections are what makes the claim more than six scripted episodes." |
+| 0087-T9 | ⬜ planned | [#973](https://github.com/mbilling/fss-mqtt-broker/issues/973) | — | "Size M, plus rig time. Last: it certifies the rest. Until it has run, the README's 'none lost' carries the condition it was measured under (O8)." |
+| 0087-T10 | ⬜ planned | [#975](https://github.com/mbilling/fss-mqtt-broker/issues/975) | — | "Size M (3-5 days). Independent of T2-T9 and may go first. swim.rs (confirm_before_dead exists, off), swim_sim.rs for loss and one-way faults, the formation simulation's bounds. ADR 0016 gets the amendment." |
+<!-- /status-table:0087 -->
+
+## Changelog
+
+- 2026-10-13 — Issue #973 characterised. Three brokers wired as production, one told that
+  a live peer is `Dead`: in the link orientation where the node that is wrong dials,
+  every QoS 1 and QoS 2 publish for a subscriber only that peer has is acknowledged and
+  lost — clean session, persistent session connected or offline, `$share` with no member
+  elsewhere, a rule's republish — in plain and in durable mode; no drop counter moves. In
+  the other orientation the link is back in a second and only a `$share` group without
+  another member loses its first publish. A `$share` group on a peer that merely lost
+  its link loses publishes too. A false verdict at the lease leader also moves the
+  session's lease. The acknowledged-forward path was found sound: the gap is that
+  `PeerDead` erases the interest the path is fed from, and discards obligations in
+  flight.
+- 2026-10-13 — Failure detection measured in the formation simulation: a member cut off
+  for 1.5 s is declared dead in 16 of 32 seeds at 14 nodes and 25 of 32 at 30; with one
+  last direct probe before `Dead`, in none at any size (#975). The probe is in the tree
+  as `Config::confirm_before_dead`, off.
+- 2026-10-13 — Direction decided by the maintainer: acknowledge only after the owning
+  node has accepted, no bypass. The ADR was rewritten from options to that design; its
+  sub-decisions O1–O8 are open.

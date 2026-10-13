@@ -63,6 +63,8 @@ fn swim_cfg() -> SwimConfig {
         reprime_after: 3,
         reprime_on_rescued_probe: true,
         greet_pruned: true,
+        suspicion_scales_with_log_n: false,
+        confirm_before_dead: false,
     }
 }
 

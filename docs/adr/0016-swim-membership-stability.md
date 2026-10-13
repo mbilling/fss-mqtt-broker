@@ -293,3 +293,32 @@ the eviction now ends at `DEAD_TTL` (30.1 s), where it ran to 46 s and 63 s at w
 SWIM's own answer is a window that scales with log N, and Lifeguard's is to tell the
 suspect directly; either is a change to failure-detection timing that this amendment
 does not make; it is left for a change of its own.
+
+## Amendment (2026-10-13): the residual is measured, and two candidates are in the tree, off (issues #973, #975)
+
+The paragraph above is now a number. In the formation simulation, cutting one member of a
+formed cluster off for 1.5 s ends with some node declaring it `Dead` in 3 of 32 seeds at
+5 nodes, 7 at 10, 16 at 14 and 25 at 30; the table for 0.5 s to 5 s, four candidate
+detectors and what each costs when the member really died is in
+[ADR 0087](0087-delivery-across-a-false-dead-verdict.md) §7 and issue #975.
+
+Two `Config` switches were added to measure the candidates. **Both are off by default and
+neither is operator configuration**; with both off the state machine is what it was.
+
+- `confirm_before_dead` — Lifeguard's direct refutation path in its smallest form: when a
+  suspect's window lapses it is sent one `Ping` carrying the suspicion and given one ack
+  timeout, and only a silent one is declared `Dead`. A member that answers is kept
+  whatever its `Ack` carries. Usually the `Ack` carries the refutation, first-hand (a
+  node told it is suspected puts its refutation at the head of its gossip). When it does
+  not — the member had already refuted an earlier claim and that refutation's retransmit
+  budget is spent, so our claim is stale to it; or it is an older build — the `Ack` to
+  that probe is itself proof of life: the window restarts and the member is sent one
+  `Join`, whose `Sync` states its incarnation. No new wire element, and nothing asked of
+  the suspect that a v1.1.0 node does not already do. In the simulation no member cut
+  off for up to 1.5 s is declared dead at any size, and a real death is detected
+  0.1–0.5 s later in the median.
+- `suspicion_scales_with_log_n` — the SWIM paper's rule: both ends of the window times
+  `max(1, log10 n)`.
+
+Whether either becomes the default is #975's decision, as a change of its own, as this
+record asks of any change to failure detection.
