@@ -12,12 +12,12 @@ tasks:
     title: "D1, D5: the lifetime is stated at deployment — gen-certs.sh takes it explicitly and prints the renew-by date, gains renew and revoke; the chart and the operator expose lifetime and renewal lead and pass them to cert-manager; decommission ends with revoke, in the procedure and in what mqttd --decommission prints"
     status: planned
     issue: 984
-    notes: "Size M. deploy/systemd/gen-certs.sh and its README, deploy/helm (values, bootstrap.sh, the cert-manager example), mqttd-operator CRD, OPERATIONS, HARDENING. Needs O1. The scale rig mints its PKI with gen-certs.sh: keep it working."
+    notes: "Size M. deploy/systemd/gen-certs.sh and its README, deploy/helm (values, bootstrap.sh, the cert-manager example), mqttd-operator CRD, OPERATIONS, HARDENING. O1 decided: it refuses without a stated lifetime. The scale rig mints its PKI with gen-certs.sh: keep it working."
   - id: 0088-T3
     title: "D3, D4: expiry is enforced on established peer links — a link whose peer's certificate (or this node's own) has passed notAfter is ended within a minute, as a revoked peer's is; no grace; notBefore tolerance per O3; a test that first shows today's link outliving its certificate"
     status: planned
     issue: 984
-    notes: "Size M. mqttd/src/peer.rs (the link already records what the handshake presented for the revocation sweep), reload.rs. Starts with the characterisation test ADR 0088 'Not verified' asks for. Interacts with ADR 0087 (a link ended for expiry is a lost link: the peer is unreachable, not erased). Needs O3; O2 decides whether client sessions join."
+    notes: "Size M. mqttd/src/peer.rs (the link already records what the handshake presented for the revocation sweep), reload.rs. Starts with the characterisation test ADR 0088 'Not verified' asks for. Interacts with ADR 0087 (a link ended for expiry is a lost link: the peer is unreachable, not erased). Needs O3. O2 decided: client sessions join, behind a setting off by default."
   - id: 0088-T4
     title: "D7: the gossip key and the accepted keys are re-read by the file watcher and SIGHUP; a replaced key takes effect on the next datagram; the three-phase procedure becomes three file replacements"
     status: planned
@@ -32,7 +32,7 @@ tasks:
     title: "D9 on Kubernetes: the operator's rotation controller — the keyring Secret written on a schedule and when a pod leaves for good, gated on every pod reporting the new key accepted; node certificates through cert-manager with the configured lifetime; a kind test that rotates both under publish load with no member lost"
     status: planned
     issue: 984
-    notes: "Size L. mqttd-operator (controller, CRD), the chart, the nightly kube-smoke job. Supersedes ADR 0055 T5 (deferred). Needs O5."
+    notes: "Size L. mqttd-operator (controller, CRD), the chart, the nightly kube-smoke job. Supersedes ADR 0055 T5 (deferred). O5 decided: daily."
   - id: 0088-T7
     title: "D9 elsewhere, and the evidence: the documented procedure for a person (certificates and key), the same on the scale rig — a run that renews every node's certificate and replaces the gossip key under load with a ledger, and a node returning with an expired certificate and an evicted key staying out"
     status: planned
@@ -50,8 +50,9 @@ above; the table below is generated from it.
 The direction was decided on 2026-10-13: the deployer sets a certificate lifetime, whoever
 operates the cluster rotates in time, the broker issues nothing and enforces expiry
 strictly; the gossip key is replaced without a restart, with two keys alive only while one
-replaces the other, and old keys are evicted. The ADR is Proposed because its
-sub-decisions O1–O8 are open.
+replaces the other, and old keys are evicted. O1, O2, O5, O7 and the eviction were decided
+the same day; O3, O4, O6's duration and O8 are open, each with a proposal, and the ADR is
+Proposed until it is accepted.
 
 Order: T1 first (it changes no behaviour and is what makes a short lifetime safe to
 adopt), then T2 and T3 (certificates: stated, renewable, revocable, enforced), T4 (the key
@@ -78,16 +79,20 @@ Tasks are tracked under #984 until the ADR is accepted; each gets its own issue 
 | Task | Status | Issue | When | Evidence / notes |
 |------|--------|-------|------|------------------|
 | 0088-T1 | ⬜ planned | [#984](https://github.com/mbilling/fss-mqtt-broker/issues/984) | — | "Size S-M. mqtt-observability, mqttd (tls_check.rs, reload.rs, the periodic tick), the chart's PrometheusRule (re-vendor the mqttui bundle), OPERATIONS. No behaviour change: safe first. Needs O8." |
-| 0088-T2 | ⬜ planned | [#984](https://github.com/mbilling/fss-mqtt-broker/issues/984) | — | "Size M. deploy/systemd/gen-certs.sh and its README, deploy/helm (values, bootstrap.sh, the cert-manager example), mqttd-operator CRD, OPERATIONS, HARDENING. Needs O1. The scale rig mints its PKI with gen-certs.sh: keep it working." |
-| 0088-T3 | ⬜ planned | [#984](https://github.com/mbilling/fss-mqtt-broker/issues/984) | — | "Size M. mqttd/src/peer.rs (the link already records what the handshake presented for the revocation sweep), reload.rs. Starts with the characterisation test ADR 0088 'Not verified' asks for. Interacts with ADR 0087 (a link ended for expiry is a lost link: the peer is unreachable, not erased). Needs O3; O2 decides whether client sessions join." |
+| 0088-T2 | ⬜ planned | [#984](https://github.com/mbilling/fss-mqtt-broker/issues/984) | — | "Size M. deploy/systemd/gen-certs.sh and its README, deploy/helm (values, bootstrap.sh, the cert-manager example), mqttd-operator CRD, OPERATIONS, HARDENING. O1 decided: it refuses without a stated lifetime. The scale rig mints its PKI with gen-certs.sh: keep it working." |
+| 0088-T3 | ⬜ planned | [#984](https://github.com/mbilling/fss-mqtt-broker/issues/984) | — | "Size M. mqttd/src/peer.rs (the link already records what the handshake presented for the revocation sweep), reload.rs. Starts with the characterisation test ADR 0088 'Not verified' asks for. Interacts with ADR 0087 (a link ended for expiry is a lost link: the peer is unreachable, not erased). Needs O3. O2 decided: client sessions join, behind a setting off by default." |
 | 0088-T4 | ⬜ planned | [#984](https://github.com/mbilling/fss-mqtt-broker/issues/984) | — | "Size S-M. mqttd main.rs (watched_policy_paths, the SwimAuth construction), reload.rs, mqtt-cluster swim_auth.rs (swap the keys under the driver), OPERATIONS. Useful by itself and the base of T5." |
 | 0088-T5 | ⬜ planned | [#984](https://github.com/mbilling/fss-mqtt-broker/issues/984) | — | "Size L. mqtt-cluster (swim_auth.rs, swim.rs gossip of accepted identifiers, the datagram form: additive, the v1.1.0 single-key form still spoken; pinned bytes, the fuzz target), mqtt-config, mqttd. The formation simulation (swim_formation_sim.rs) gains a key change under formation, a late node, and a node holding only an evicted key. Needs O4 and O6. Mixed-version rule: a cluster with a v1.1.0 member cannot leave the single-key form." |
-| 0088-T6 | ⬜ planned | [#984](https://github.com/mbilling/fss-mqtt-broker/issues/984) | — | "Size L. mqttd-operator (controller, CRD), the chart, the nightly kube-smoke job. Supersedes ADR 0055 T5 (deferred). Needs O5." |
+| 0088-T6 | ⬜ planned | [#984](https://github.com/mbilling/fss-mqtt-broker/issues/984) | — | "Size L. mqttd-operator (controller, CRD), the chart, the nightly kube-smoke job. Supersedes ADR 0055 T5 (deferred). O5 decided: daily." |
 | 0088-T7 | ⬜ planned | [#984](https://github.com/mbilling/fss-mqtt-broker/issues/984) | — | "Size M, plus rig time. deploy/systemd README, OPERATIONS, HARDENING, THREAT-MODEL rows (a departed node's credentials; a missed rotation), bench/scale (a rotation step between rungs). Last: it certifies the rest." |
 <!-- /status-table:0088 -->
 
 ## Changelog
 
+- **2026-10-13** — Sub-decisions settled by the maintainer: O1 the script refuses without a
+  stated lifetime; O2 a client session ends at its certificate's expiry, behind a setting off
+  by default; O5 the gossip key is replaced daily; O7 a cluster identity on the peer link,
+  as its own record.
 - **2026-10-13** — Record and plan written. Direction decided by the maintainer the same
   day: the operator (Kubernetes or a person) rotates; expiry is strict; two gossip keys are
   alive only during a change and old keys are evicted. No code.
