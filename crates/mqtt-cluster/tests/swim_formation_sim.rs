@@ -33,7 +33,7 @@ use mqtt_cluster::swim_auth::{
     GossipSign, GossipVerify, OpenReject, SwimAuth, VerifiedIdentity, KEY_LEN,
 };
 use mqtt_cluster::swim_driver::{
-    CertRequests, Gossip, MembershipEvent, Output, StallClock, DRAIN_MAX_DATAGRAMS, TICK,
+    CertRequests, Gossip, MembershipEvent, Output, DRAIN_MAX_DATAGRAMS, TICK,
 };
 use mqtt_cluster::NodeId;
 
@@ -281,14 +281,6 @@ impl Endpoint {
             .collect()
     }
 
-    /// The driver found that this node had been stalled. (v1.1.0's driver finds
-    /// nothing: it reads the wall clock.)
-    fn local_stall(&mut self, stalled_ms: u64) {
-        if let Endpoint::Real { gossip, .. } = self {
-            gossip.local_stall(stalled_ms);
-        }
-    }
-
     fn tick(&mut self, now: u64) -> Vec<Emit> {
         match self {
             Endpoint::Real { gossip, .. } => Self::from_outputs(gossip.tick(now)),
@@ -370,17 +362,38 @@ struct Variant {
     /// isolated one, to send a last direct probe stops for this long from the instant
     /// it has sent it. One node, once per run.
     stall_prober_ms: Option<u64>,
+    /// Make every node but the isolated one LATE, from the moment the fault begins.
+    late: Option<Late>,
+    /// The interval between a node's ticks, ms: the broker's ([`TICK_MS`]) unless a run
+    /// asks what another grid would do to the bound.
+    tick_ms: u64,
+}
+
+/// Nodes whose driver loop wakes late: each tick comes `lo..=hi` ms after it was due,
+/// and the next is due a full interval after that (the driver does not make up ticks).
+#[derive(Clone, Copy)]
+struct Late {
+    lo: u64,
+    hi: u64,
+    /// For how long, from the fault's start ([`Late::stalls`] only).
+    for_ms: u64,
+    /// Whether the node runs at all between its late wake-ups. `true`: it does not —
+    /// a runtime that is not scheduling it — and what arrives queues on its socket
+    /// until the next wake-up; this is put on every node but the isolated one, from
+    /// the fault's start. `false`: only the ticks are late and datagrams are handled
+    /// as they come — a loop whose timer is serviced late; this is put on every node
+    /// for the whole run, so that no tick is on anybody's grid.
+    stalls: bool,
 }
 
 /// What a node's driver loop does on the first tick after the node was stalled — its
 /// ticks stopped while datagrams queued on its socket.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Shell {
-    /// This tree's (`swim_driver::run_gossip`): the stalled time is left out of the
-    /// clock and reported to the state machine; then everything queued is read; then
-    /// the tick.
+    /// This tree's (`swim_driver::run_gossip`): everything queued is read, then the
+    /// tick. The clock is the monotonic one.
     Current,
-    /// The loop as it was up to #1000, at its worst: the wall clock, and the tick
+    /// The loop as it was up to #1000, at its worst: the same clock, and the tick
     /// ahead of what is queued. (It picked between the two at random; a simulation
     /// that wants to see the bug takes the order that shows it.) v1.1.0 nodes always
     /// run this one.
@@ -441,6 +454,8 @@ impl Variant {
             tune: |cfg| cfg,
             shell: Shell::Current,
             stall_prober_ms: None,
+            late: None,
+            tick_ms: TICK_MS,
         }
     }
 }
@@ -482,9 +497,6 @@ struct Node {
     started: u64,
     /// The loop this node's driver runs.
     shell: Shell,
-    /// The clock a [`Shell::Current`] driver feeds its state machine: the monotonic
-    /// one less the time the node was stalled. Equal to it in a run with no stall.
-    clock: StallClock,
     /// Datagrams that arrived while the node was stalled, oldest first: its socket's
     /// receive buffer.
     backlog: Vec<(usize, Vec<u8>)>,
@@ -536,6 +548,12 @@ struct Outcome {
     datagrams: u64,
     /// Datagrams the lossy network dropped.
     lost: u64,
+    /// `Dead` transitions that were a node's own declaration (out of its tick), over
+    /// the whole run; and `Dead` transitions a node adopted from a datagram about a
+    /// member that NO node had declared dead before. The second is zero in a cluster
+    /// of honest nodes: a `Dead` has to start somewhere.
+    declared_deads: u64,
+    untraced_deads: u64,
     /// [`Variant::stall_prober_ms`]: a node sent a last probe and was stalled on it,
     /// and what came of that.
     stalled_prober: Option<StalledProber>,
@@ -595,8 +613,30 @@ struct Sim {
     /// `(node, from, until)` in global ms: the prober stalled by
     /// [`Variant::stall_prober_ms`], once it has been.
     prober_stall: Option<(usize, u64, u64)>,
+    /// A tick's own output is being applied: a `Dead` in it is that node's own
+    /// declaration, where a `Dead` out of a datagram is one it was told.
+    declaring: bool,
+    /// The members some node has declared `Dead` on its own account so far.
+    declared: std::collections::BTreeSet<usize>,
+    /// Per node: until when it is not running, between two late wake-ups
+    /// ([`Late::stalls`]), and how many late ticks it has had.
+    late_until: Vec<u64>,
+    late_ticks: Vec<u64>,
     /// The nodes that have declared the cut-off member `Dead` since the cut began.
     buriers: std::collections::BTreeSet<usize>,
+}
+
+/// splitmix64 over four coordinates, chained from `seed`: the simulation's choices that
+/// must not depend on what the nodes do.
+fn mix(seed: u64, words: [u64; 4]) -> u64 {
+    let mut h = seed;
+    for word in words {
+        h = h.wrapping_add(word).wrapping_add(0x9E37_79B9_7F4A_7C15);
+        h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        h ^= h >> 31;
+    }
+    h
 }
 
 fn addr_of(i: usize) -> String {
@@ -632,6 +672,10 @@ impl Sim {
             seed,
             offered: BTreeMap::new(),
             prober_stall: None,
+            declaring: false,
+            declared: std::collections::BTreeSet::new(),
+            late_until: vec![0; n],
+            late_ticks: vec![0; n],
             buriers: std::collections::BTreeSet::new(),
         };
         // Founder first; the rig waits for it to be ready before starting anyone else.
@@ -656,7 +700,12 @@ impl Sim {
         if let Some(iso) = sim.variant.isolate {
             // Cut off a node that is neither the founder nor a seed (node 0 and 1 are
             // every follower's seeds, and unacquainted seeds are re-greeted anyway).
-            let node = 2 + usize::try_from(sim.rng.range(0, (n - 3) as u64)).expect("small");
+            // (A cluster of two has only the one that is not the founder.)
+            let node = if n >= 3 {
+                2 + usize::try_from(sim.rng.range(0, (n - 3) as u64)).expect("small")
+            } else {
+                n - 1
+            };
             let from = t + iso.at_ms;
             sim.cut = Some((node, from, from + iso.for_ms));
             if sim.variant.loss_permille > 0 {
@@ -733,7 +782,6 @@ impl Sim {
             } else {
                 Shell::TickFirst
             },
-            clock: StallClock::new(TICK),
             backlog: Vec::new(),
         });
         if !restarted {
@@ -765,6 +813,9 @@ impl Sim {
         if self.fault_on(i) == Some(Fault::Stall) {
             return self.cut.map(|(_, _, until)| until);
         }
+        if self.late_until[i] > self.now {
+            return Some(self.late_until[i]);
+        }
         self.prober_stall
             .filter(|(node, from, until)| *node == i && self.now >= *from && self.now < *until)
             .map(|(_, _, until)| until)
@@ -781,27 +832,49 @@ impl Sim {
     /// else's. (The fate of each datagram used to be the next draw from the generator
     /// that also supplies latency, so one datagram more or less reshuffled every loss
     /// after it.) A lossless run draws nothing here, as before.
-    fn lost(&mut self, from: usize, to: usize) -> bool {
+    fn lost(&mut self, from: usize, to: usize, nth: u64) -> bool {
         if self.variant.loss_permille == 0 || self.now < self.loss_from {
             return false;
         }
+        let h = mix(
+            self.seed ^ 0x6A09_E667_F3BC_C908,
+            [from as u64, to as u64, self.now, nth],
+        );
+        let lost = h % 1000 < self.variant.loss_permille;
+        self.out.lost += u64::from(lost);
+        lost
+    }
+
+    /// The place of the datagram `from` is sending `to` now among those offered on
+    /// that directed link in this millisecond.
+    fn ordinal(&mut self, from: usize, to: usize) -> u64 {
         let offered = self.offered.entry((from, to)).or_insert((self.now, 0));
         if offered.0 != self.now {
             *offered = (self.now, 0);
         }
-        let nth = offered.1;
         offered.1 += 1;
-        // splitmix64 over the four coordinates, chained.
-        let mut h = self.seed ^ 0x6A09_E667_F3BC_C908;
-        for word in [from as u64, to as u64, self.now, nth] {
-            h = h.wrapping_add(word).wrapping_add(0x9E37_79B9_7F4A_7C15);
-            h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            h ^= h >> 31;
+        offered.1 - 1
+    }
+
+    /// How long the network takes over the datagram `from` is sending `to` now: well
+    /// under a millisecond, sometimes over.
+    ///
+    /// On a LOSSY network this is a function of the same four coordinates as the loss
+    /// ([`Sim::lost`]) and of nothing a node does, for the whole run: with both the
+    /// fate and the delay of a datagram fixed by where and when it is sent, two
+    /// detectors on one seed really are on one network. On a lossless network it is
+    /// the next draw from the run's generator, as it has been since this harness was
+    /// written — every lossless table on record was measured on those schedules, and
+    /// its two arms are the same run only up to the first datagram one of them sends
+    /// and the other does not.
+    fn latency(&mut self, from: usize, to: usize, nth: u64) -> u64 {
+        if self.variant.loss_permille == 0 {
+            return self.rng.range(0, MAX_LATENCY_MS);
         }
-        let lost = h % 1000 < self.variant.loss_permille;
-        self.out.lost += u64::from(lost);
-        lost
+        mix(
+            self.seed ^ 0x3C6E_F372_FE94_F82B,
+            [from as u64, to as u64, self.now, nth],
+        ) % (MAX_LATENCY_MS + 1)
     }
 
     fn counting(&self) -> bool {
@@ -818,11 +891,15 @@ impl Sim {
                     };
                     self.out.max_datagram = self.out.max_datagram.max(bytes.len());
                     self.out.datagrams += 1;
-                    if self.severed(from, j) || self.lost(from, j) {
+                    let nth = if self.variant.loss_permille > 0 {
+                        self.ordinal(from, j)
+                    } else {
+                        0
+                    };
+                    if self.severed(from, j) || self.lost(from, j, nth) {
                         continue;
                     }
-                    // A private network: well under a millisecond, sometimes over.
-                    let mut lat = self.rng.range(0, MAX_LATENCY_MS);
+                    let mut lat = self.latency(from, j, nth);
                     if let Some(Fault::Slow(late)) = self.fault_on(from) {
                         lat += late;
                     }
@@ -839,6 +916,12 @@ impl Sim {
                             }
                         }
                         MemberState::Dead => {
+                            if self.declaring {
+                                self.declared.insert(subject);
+                                self.out.declared_deads += 1;
+                            } else if !self.declared.contains(&subject) {
+                                self.out.untraced_deads += 1;
+                            }
                             if self.counting() {
                                 self.out.deads[from] += 1;
                             }
@@ -885,20 +968,11 @@ impl Sim {
         }
     }
 
-    /// A wake-up of node `i`'s driver loop: the `now` it feeds its state machine. This
-    /// tree's loop leaves stalled time out of it and reports the stall; the loop
-    /// before it read the wall clock.
-    fn wake(&mut self, i: usize) -> u64 {
-        let node = self.nodes[i].as_mut().expect("a node that is up");
-        let real = self.now - node.started;
-        if node.shell == Shell::TickFirst {
-            return real;
-        }
-        let (now, stalled) = node.clock.observe(real);
-        if let Some(stalled_ms) = stalled {
-            node.endpoint.local_stall(stalled_ms);
-        }
-        now
+    /// A wake-up of node `i`'s driver loop: the `now` it feeds its state machine — its
+    /// monotonic clock, however late the wake-up.
+    fn wake(&self, i: usize) -> u64 {
+        let node = self.nodes[i].as_ref().expect("a node that is up");
+        self.now - node.started
     }
 
     /// A datagram reaches node `to`'s socket: handed to its driver, or — while the
@@ -944,11 +1018,18 @@ impl Sim {
         let sent_before = self.last_probes_sent(i);
         let node = self.nodes[i].as_mut().expect("ticking node is up");
         let emitted = node.endpoint.tick(now);
+        self.declaring = true;
         self.apply(i, emitted);
+        self.declaring = false;
         for (from, bytes) in after_tick {
             self.hand_over(i, from, &bytes, now);
         }
-        self.push(self.now + TICK_MS, Ev::Tick(i));
+        let late = self.lateness(i);
+        let next = self.now + self.variant.tick_ms + late.unwrap_or(0);
+        self.push(next, Ev::Tick(i));
+        if late.is_some() && self.variant.late.is_some_and(|l| l.stalls) {
+            self.late_until[i] = next;
+        }
 
         // The adversarial stall: this node has just sent a last probe, and stops.
         if let Some(for_ms) = self.variant.stall_prober_ms {
@@ -958,6 +1039,25 @@ impl Sim {
                 self.out.stalled_prober = Some(StalledProber::default());
             }
         }
+    }
+
+    /// How late node `i`'s next tick will be, if it is one of the late nodes now
+    /// ([`Variant::late`]): a function of the seed, the node and the tick's number.
+    fn lateness(&mut self, i: usize) -> Option<u64> {
+        let late = self.variant.late?;
+        if late.stalls {
+            let (isolated, from, _) = self.cut?;
+            let over = self.now >= from.saturating_add(late.for_ms);
+            if i == isolated || self.now < from || over {
+                return None;
+            }
+        }
+        self.late_ticks[i] += 1;
+        let h = mix(
+            self.seed ^ 0xBB67_AE85_84CA_A73B,
+            [i as u64, self.late_ticks[i], 0, 0],
+        );
+        Some(late.lo + h % (late.hi - late.lo + 1))
     }
 
     /// Last direct probes node `i` has sent so far.
@@ -1541,10 +1641,13 @@ struct CutCell {
     prober_gave_up: usize,
     dead_about_isolated: usize,
     dead_about_prober: usize,
-    /// Runs in which a member was turned `Dead` although no last probe of any node
-    /// ran out unanswered. Under the default there is no such run: a `Dead` is declared
-    /// on a silent last probe and reaches the other nodes from the one that declared it.
-    dead_without_a_silent_probe: usize,
+    /// Over all runs: `Dead` transitions that were a node's own declaration, and
+    /// `Dead` transitions adopted about a member nobody had declared. Under the
+    /// default every declaration is a last probe that ran out in silence (the first
+    /// equals the silent count) and every other `Dead` descends from one, member by
+    /// member (the second is zero).
+    declared_deads: u64,
+    untraced_deads: u64,
     /// Last direct probes over all runs: sent, answered by the suspect, silent.
     last_probes: (u64, u64, u64),
 }
@@ -1587,10 +1690,8 @@ fn cut_cell_of(variant: &Variant, n: usize, seeds: u64) -> CutCell {
             .iter()
             .filter(|o| o.stalled_prober.is_some_and(|p| p.turned_dead))
             .count(),
-        dead_without_a_silent_probe: runs
-            .iter()
-            .filter(|o| o.deads_during_cut + o.total_deads() > 0 && o.last_probes.2 == 0)
-            .count(),
+        declared_deads: runs.iter().map(|o| o.declared_deads).sum(),
+        untraced_deads: runs.iter().map(|o| o.untraced_deads).sum(),
         last_probes: runs.iter().fold((0, 0, 0), |sum, o| {
             (
                 sum.0 + o.last_probes.0,
@@ -1601,9 +1702,22 @@ fn cut_cell_of(variant: &Variant, n: usize, seeds: u64) -> CutCell {
     }
 }
 
-/// The length of the longest clean cut that CANNOT end in a `Dead` under the default
-/// detector on a network that loses nothing, in ms: by arithmetic, for any cluster
-/// size and any schedule. [`BOUND_DERIVATION`] is the argument; this is its last line.
+/// What holds in a broker, whose ticks are on nobody's grid: the length of the longest
+/// clean cut that CANNOT end in a `Dead` under the default detector on a network that
+/// loses nothing, whatever the phase of each node's ticks and however late they come.
+/// A deadline is acted on at the first wake-up at or after it, which may be the
+/// deadline itself: two ack timeouts and the window's floor, less a datagram's latency
+/// each way. 2 s less twice the latency.
+fn last_probe_floor_ms(cfg: &Config) -> u64 {
+    let window = cfg.suspicion_min_timeout_ms.min(cfg.suspicion_timeout_ms);
+    2 * cfg.ack_timeout_ms + window - 2 * MAX_LATENCY_MS
+}
+
+/// The same when every node's ticks land exactly on a grid of [`TICK_MS`], as this
+/// simulation's do unless it is told otherwise ([`Late`]): each ack timeout is then in
+/// effect rounded up to a tick. The SIMULATION's figure — a broker gets the margin
+/// only in the schedules where its ticks happen to fall so.
+/// [`BOUND_DERIVATION`] is the argument; this is its last line.
 fn last_probe_bound_ms(cfg: &Config) -> u64 {
     // A deadline is acted on by the first tick at or after it.
     let on_a_tick = |ms: u64| ms.div_ceil(TICK_MS) * TICK_MS;
@@ -1631,9 +1745,12 @@ answers each, and there is no Dead for anyone to adopt. The cut begins at c.
          start + 2 x roundup(ack timeout, tick) + window floor.
   4. With the defaults: 2 x roundup(250, 100) + 1500 - 2 x 1 = 2098 ms after c.
 
-A cut of up to 2098 ms has therefore ended before the first last probe is sent. The
-margin over a 2000 ms cut is 98 ms, and all of it is the tick: with a 50 ms tick the
-same line gives 2 x 250 + 1500 - 2 = 1998 ms, and a 2 s cut could swallow the probe.
+A cut of up to 2098 ms has therefore ended before the first last probe is sent — ON THE
+SIMULATION'S GRID, where every tick lands exactly 100 ms after the one before. The 98 ms
+over a 2000 ms cut is all the tick, and a broker cannot count on it: a tick that comes
+50 ms late acts on a 250 ms deadline at 250 ms, not 300. Whatever the ticks do, a
+deadline is not acted on before it, so what always holds is
+    2 x 250 + 1500 - 2 x latency = 2 s less twice the latency (1998 ms here).
 (The member's own suspicions of others need no line: it hears nobody, so it is the only
 suspecter, and its window is the full 4 s.)";
 
@@ -1910,7 +2027,7 @@ fn fault_shapes_report() {
 /// #1002): a node that stops and resumes is a silent member AND a prober whose
 /// deadlines all passed while it was away. The second row of each block is the
 /// default's state machine on the driver loop as it was before it read its socket ahead
-/// of a tick and kept stalled time off its clock.
+/// of a tick.
 fn report_stalled_nodes(seeds: u64) {
     let stalled_rows = [
         (DEFAULT.0, DEFAULT, Shell::Current),
@@ -1939,6 +2056,7 @@ fn report_stalled_nodes(seeds: u64) {
         print_grid(&columns, seeds);
     }
     report_stalled_probers(seeds);
+    report_late_nodes(seeds);
 }
 
 /// The stalled PROBER, at the worst moment: per cell, the runs in which a node was
@@ -2015,22 +2133,26 @@ fn burials(detector: Detector, shape: Fault, loss_permille: u64) -> String {
         .join(" | ")
 }
 
-/// What the documents promise: "a member out of reach for up to two seconds is not
-/// declared dead".
+/// The two seconds of the reports' "2 s" column: a cut the simulation's grid spares,
+/// and two milliseconds more than a broker is promised.
 const PROMISED_CUT_MS: u64 = 2000;
-/// Where the bound actually ends with the broker's timings, as the documents state it
-/// (ADR 0016's amendment for issue #1002, the 1.2.0 release notes, OPERATIONS,
-/// TROUBLESHOOTING, ADR 0087 §7).
-const DOCUMENTED_BOUND_MS: u64 = 2098;
+/// Where the bound ends on the simulation's exact tick grid, as the documents give it
+/// (ADR 0016's amendment for issue #1002, ADR 0087 §7).
+const GRID_BOUND_MS: u64 = 2098;
+/// What the documents promise of a broker: two seconds less twice the network's
+/// latency, which at this simulation's latency is this.
+const DOCUMENTED_FLOOR_MS: u64 = 1998;
 
-/// The bound the default detector keeps (ADR 0016's amendments of 2026-10-13 for issues
-/// #975 and #1002, ADR 0087 T10): a member of a formed cluster that is cut off — nothing
-/// in, nothing out — for up to 2 s is declared `Dead` by no node, and not suspected
-/// for long either: every view is whole again within the window.
+/// The bound the default detector keeps ON THE SIMULATION'S TICK GRID (ADR 0016's
+/// amendments of 2026-10-13 for issues #975 and #1002, ADR 0087 T10): a member of a
+/// formed cluster that is cut off — nothing in, nothing out — for up to 2 s is
+/// declared `Dead` by no node, and not suspected for long either: every view is whole
+/// again within the window. What a broker is promised, whose ticks are on no grid, is
+/// the next test's.
 ///
 /// The bound is arithmetic ([`BOUND_DERIVATION`]), so it is tested as arithmetic: the
-/// figure is computed from the broker's own timeouts and tick, must cover the two
-/// seconds the documents promise, and must be the figure they give; and a cut of
+/// figure is computed from the broker's own timeouts and tick, must cover two
+/// seconds, and must be the figure the documents give for the grid; and a cut of
 /// exactly that length — to the millisecond the last one the argument covers — ends
 /// in no `Dead` at 5, 14 and 30 nodes. Change a timeout or the tick and this fails
 /// with the derivation. Past the bound nothing is promised: the report's 2.5 s column
@@ -2051,7 +2173,7 @@ fn a_member_cut_off_for_up_to_two_seconds_is_not_declared_dead() {
         "the last probe no longer covers a {PROMISED_CUT_MS} ms cut.\n{timings}\n\n{BOUND_DERIVATION}"
     );
     assert_eq!(
-        bound, DOCUMENTED_BOUND_MS,
+        bound, GRID_BOUND_MS,
         "the bound has moved; the documents that state it must move with it.\n{timings}\n\n\
          {BOUND_DERIVATION}"
     );
@@ -2085,6 +2207,148 @@ fn a_member_cut_off_for_up_to_two_seconds_is_not_declared_dead() {
         with.1,
         without.1
     );
+}
+
+/// Every node's ticks late by anything up to a whole tick, each time, for the whole
+/// run: no tick is on a grid, and a deadline can be acted on the instant it falls due.
+fn late_ticks(variant: &Variant) -> Variant {
+    Variant {
+        late: Some(Late {
+            lo: 0,
+            hi: TICK_MS - 1,
+            for_ms: FOREVER_MS,
+            stalls: false,
+        }),
+        ..variant.clone()
+    }
+}
+
+/// Every node's ticks on a grid half as fine as the broker's: a tick lands on every
+/// instant a broker's tick up to half a tick late could, a 250 ms deadline included.
+fn half_ticks(variant: &Variant) -> Variant {
+    Variant {
+        tick_ms: TICK_MS / 2,
+        ..variant.clone()
+    }
+}
+
+/// What a BROKER is promised (ADR 0016's amendment for issue #1002): its ticks are on
+/// no grid — the timer fires late, the loop is scheduled late, and a late tick shifts
+/// every one after it — so the tick's rounding is a margin it cannot count on. With
+/// every node's ticks late by a different amount each time, a member cut off for two
+/// seconds less twice the network's latency is declared `Dead` by no node: no
+/// deadline is acted on before it falls due, so no node suspects the member sooner
+/// than two ack timeouts into the cut, nor asks it the last time sooner than the
+/// window's floor after that. Arithmetic again, and pinned as arithmetic.
+///
+/// The same on a 50 ms grid, where a tick lands exactly on each 250 ms deadline — the
+/// schedule the grid's margin does not survive.
+///
+/// Between that and the grid's 2098 ms a verdict needs a schedule in which a
+/// prober's ticks land on its deadlines and two more nodes suspect in step. The
+/// report sweeps both ways of leaving the grid, 32 seeds a cell, and finds none up
+/// to 2.2 s: what is promised is the arithmetic, not the sweep.
+#[test]
+fn with_ticks_on_no_grid_a_cut_of_two_seconds_less_twice_the_latency_ends_in_no_dead() {
+    let cfg = Config::default();
+    let floor = last_probe_floor_ms(&cfg);
+    assert_eq!(
+        floor, DOCUMENTED_FLOOR_MS,
+        "what a broker is promised has moved; the documents that state it must move with \
+         it: two ack timeouts ({} ms each) and the window's floor ({} ms), less twice the \
+         latency ({MAX_LATENCY_MS} ms)",
+        cfg.ack_timeout_ms, cfg.suspicion_min_timeout_ms,
+    );
+    assert!(floor <= PROMISED_CUT_MS && PROMISED_CUT_MS <= last_probe_bound_ms(&cfg));
+    for n in [5, 14] {
+        for for_ms in [1500, floor] {
+            let c = cut_cell_of(&late_ticks(&cut_under(DEFAULT, for_ms)), n, seeds(n));
+            assert_eq!(
+                c.any_dead, 0,
+                "N={n}, cut {for_ms} ms, ticks on no grid: {} of {} runs turned a member DEAD",
+                c.any_dead, c.runs
+            );
+            assert_eq!(c.unsettled, 0, "N={n}, cut {for_ms} ms");
+        }
+    }
+    let c = cut_cell_of(&half_ticks(&cut_under(DEFAULT, floor)), 14, seeds(14));
+    assert_eq!(
+        c.any_dead, 0,
+        "cut {floor} ms, ticks on a 50 ms grid: {} of {} runs turned a member DEAD",
+        c.any_dead, c.runs
+    );
+}
+
+/// Survivors that are all persistently late: from the moment a member dies, every
+/// other node's driver wakes 300 to 500 ms late, every time, for 30 s, and does not
+/// run in between.
+fn all_survivors_late(shell: Shell) -> Variant {
+    Variant {
+        shell,
+        late: Some(Late {
+            lo: 300,
+            hi: 500,
+            for_ms: 30_000,
+            stalls: true,
+        }),
+        ..fault_under(DEFAULT, Fault::Cut, FOREVER_MS, 0)
+    }
+}
+
+/// How long the survivors take to bury a member that really died, under `variant`.
+fn burial_of(variant: &Variant, n: usize, seeds: u64) -> Burial {
+    let runs = sweep(n, seeds, variant, 240_000);
+    let mut times: Vec<u64> = runs.iter().filter_map(|o| o.buried_after).collect();
+    times.sort_unstable();
+    Burial {
+        unburied: runs.len() - times.len(),
+        times,
+    }
+}
+
+/// Detection of a REAL death must not degrade because the nodes doing the detecting
+/// are late (issue #1002's review). A member dies, and from that moment every survivor
+/// wakes 300 to 500 ms late, every time, for 30 s — in a cluster of two the one
+/// survivor has nobody left to probe but the corpse, so nothing can rest on a probe
+/// being answered.
+///
+/// The state machine's clock is the real one, so a late node is late by one wake-up
+/// at each of its five steps to the verdict and by nothing that adds up. The lone
+/// survivor of two holds the member `Dead` within five wake-ups' lateness of when a
+/// node running on time does. In a cluster of fourteen the last survivor's verdict
+/// also waits on gossip passed between late nodes; it comes within twice the time a
+/// cluster on time takes (in the report: 7.5 s in the median against 5.6 s, 10.5 s at
+/// worst against 8.3 s).
+///
+/// (The first version of this change left stalled time out of the clock and raised
+/// the node's awareness on every stall. Under this same lateness the lone survivor
+/// took 64 s to see the death, against 5.7 s, and fourteen and thirty nodes took 38 s:
+/// they saw it only once the lateness was over. The loop before either sees it about
+/// a second sooner than this one at 14 and 30 nodes, and for a bad reason: reading
+/// its socket after the tick, it raises ten times the suspicions — of healthy peers
+/// that are merely late — and the datagrams they cost carry the news.)
+#[test]
+fn a_real_death_is_seen_on_time_by_survivors_that_are_all_late() {
+    for n in [2, 14] {
+        let on_time = burial_ms(DEFAULT, n, seeds(n))
+            .all()
+            .expect("a dead member is buried");
+        let late = burial_of(&all_survivors_late(Shell::Current), n, seeds(n))
+            .all()
+            .unwrap_or_else(|| panic!("N={n}: late survivors did not bury a dead member"));
+        let bound = if n == 2 {
+            on_time.1 + 5 * 500
+        } else {
+            2 * on_time.1
+        };
+        assert!(
+            late.1 <= bound,
+            "N={n}: on time, the last survivor holds a dead member DEAD after {} ms at \
+             worst; every survivor 300-500 ms late: {} ms (bound {bound} ms)",
+            on_time.1,
+            late.1
+        );
+    }
 }
 
 /// The bound holds when the PROBER is the one that stalls (issue #1002). A member is cut
@@ -2275,14 +2539,15 @@ fn one_link_lost_one_way_raises_no_verdict() {
 /// the default is not a guarantee. What holds:
 ///
 /// - a member that really died is still buried by every survivor;
-/// - the probe adds no verdict of its own: in every run, a `Dead` under the default
-///   has a last probe that ran out in silence behind it — a round trip the network
-///   lost — and never comes without one. That is a property of each run;
+/// - the probe adds no verdict of its own. Every `Dead` a node declares is a last
+///   probe of its own that ran out in silence — a round trip the network lost — and
+///   every `Dead` a node adopts is about a member some node had so declared. That is
+///   a property of each member in each run, not a count over seeds;
 /// - and it removes some: over sixteen seeds of a 10-node cluster losing one datagram
 ///   in five, no more runs end in a false `Dead` with the probe than without (in the
 ///   report, 10 of 32 against 25). The two arms of a seed run on the same network —
-///   the same datagrams are lost wherever they send the same ones ([`Sim::lost`]) —
-///   so this compares detectors and not draws; it is still a count over seeds, and at
+///   a datagram's loss and its delay are functions of where and when it is sent
+///   ([`Sim::lost`], [`Sim::latency`]) — so this compares detectors and not draws; it is still a count over seeds, and at
 ///   the report's rates the count going the other way has a chance of under one in a
 ///   thousand.
 #[test]
@@ -2299,8 +2564,12 @@ fn packet_loss_neither_keeps_a_dead_member_nor_adds_false_verdicts() {
         with.last_probes
     );
     assert_eq!(
-        with.dead_without_a_silent_probe, 0,
-        "a member was turned DEAD in a run in which no last probe ran out unanswered"
+        with.declared_deads, with.last_probes.2,
+        "a node declared a member DEAD other than on a last probe that ran out"
+    );
+    assert_eq!(
+        with.untraced_deads, 0,
+        "a node adopted a DEAD about a member that no node had declared"
     );
     assert!(
         with.any_dead <= without.any_dead,
@@ -2308,4 +2577,54 @@ fn packet_loss_neither_keeps_a_dead_member_nor_adds_false_verdicts() {
         with.any_dead,
         without.any_dead
     );
+}
+
+/// The part of [`fault_shapes_report`] about nodes that are LATE (issue #1002's
+/// review): a member that really died while every survivor is persistently late, and
+/// where the two-second bound ends when no tick is on a grid.
+fn report_late_nodes(seeds: u64) {
+    println!(
+        "\na member that really died: ms until the last survivor holds it DEAD, median / \
+         worst of 16 — with every survivor on time, and with every survivor's driver \
+         waking 300-500 ms late and not running in between, for 30 s"
+    );
+    let sizes = [2, 3, 14, 30];
+    let line = |label: &str, burial: &dyn Fn(usize) -> Burial| {
+        let cells: Vec<String> = sizes
+            .into_iter()
+            .map(|n| format!("N={n} {}", burial(n)))
+            .collect();
+        println!("  {label:<44} | {}", cells.join(" | "));
+    };
+    line("on time", &|n| burial_ms(DEFAULT, n, 16));
+    line("late, this tree", &|n| {
+        burial_of(&all_survivors_late(Shell::Current), n, 16)
+    });
+    line("late, the driver loop before this change", &|n| {
+        burial_of(&all_survivors_late(Shell::TickFirst), n, 16)
+    });
+
+    println!(
+        "\nevery node's ticks 0-99 ms late, each time, for the whole run (no tick on a \
+         grid): one member cut off"
+    );
+    let cuts = [1900, 1998, 2000, 2050, 2098, 2200, 2500];
+    let columns = cuts.map(|for_ms| {
+        (
+            format!("{for_ms}ms"),
+            late_ticks(&cut_under(DEFAULT, for_ms)),
+        )
+    });
+    print_grid(&columns, seeds);
+    println!(
+        "\nevery node's ticks on a 50 ms grid (every instant a tick up to 50 ms late can \
+         land on, deadlines included): one member cut off"
+    );
+    let columns = cuts.map(|for_ms| {
+        (
+            format!("{for_ms}ms"),
+            half_ticks(&cut_under(DEFAULT, for_ms)),
+        )
+    });
+    print_grid(&columns, seeds);
 }

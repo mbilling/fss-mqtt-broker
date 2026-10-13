@@ -210,29 +210,42 @@ multiplies its own ack timeouts and windows, so it is slower to accuse others
   not ask. The verdict stands for 30 s; a member that was alive is then greeted and
   comes back.
 
-Three counters say what the lines do not. `mqttd_swim_last_probes_total{outcome="sent"}`
-counts the last probes a node has sent, `{outcome="spared"}` those the suspect
-answered — a `SUSPECT` that ended in `RECOVERED` because the member was asked — and
-`{outcome="silent"}` those that ended in `DEAD`. A node whose `spared` keeps climbing is
-looking at a member, or a path to one, that goes quiet for seconds at a time and comes
-back; the `suspect` gauge shows that only if it is scraped at the right moment.
-`mqttd_swim_stalls_total` counts the times a node found that it had itself not been
-scheduled for more than 0.2 s: it then does not count that time against anyone, and for
-a few rounds waits longer before accusing a peer.
+The metrics say what the lines do not.
+
+- `mqttd_swim_last_probes_total{outcome="sent"}` counts the last probes a node has
+  sent, `{outcome="spared"}` those the suspect answered — a `SUSPECT` that ended in
+  `RECOVERED` because the member was asked — and `{outcome="silent"}` those that ended
+  in `DEAD`. A node whose `spared` keeps climbing is looking at a member, or a path to
+  one, that goes quiet for seconds at a time and comes back; the `suspect` gauge shows
+  that only if it is scraped at the right moment.
+- `mqttd_swim_stalls_total` counts the times a node found that its own membership task
+  had not run for more than 0.2 s, and `mqttd_swim_stalled_milliseconds_total` for how
+  long in all: `rate(...milliseconds_total[5m]) / 1000` is the fraction of time the
+  node was answering nobody, and the second over the first is the length of a stall.
+  A stall does not make the node accuse anyone — it reads what arrived while it was
+  away before it concludes anything — and does not slow its detection beyond the
+  stall itself.
+- `mqttd_swim_awareness` is 0 on a healthy node. Above 0 the node has lately had to
+  deny being dead, and multiplies its own timeouts and windows by one more than this
+  (up to 9×): it is slower to declare a peer dead, by design, until peers answer its
+  probes again.
 
 What a `DEAD` about a live broker points to:
 
-- **An outage of that broker of more than about two seconds that then ended** — a
-  long pause of the process or its host, a network cut. Up to two seconds does not end
-  in a verdict. That bound is arithmetic on the timings above: nobody suspects the
-  member sooner than 0.6 s into the outage (the two 0.25 s timeouts, each acted on at
-  the next 0.1 s tick) and nobody asks it the last time sooner than 1.5 s after that,
-  so the question arrives once the outage is over. It ends at about 2.1 s; at 2.5 s a
-  verdict is rare (one simulated run in thirty at 10 and 14 nodes), at 3 s it is not.
-- **That broker was not being scheduled.** If its own `mqttd_swim_stalls_total` is
-  climbing, the broker itself went quiet — every worker thread busy near saturation, a
-  paused or migrated VM, a stopped process — and while it is quiet it answers no probe.
-  Its peers then see an outage like any other, with the same two seconds.
+- **An outage of that broker of about two seconds or more that then ended** — a long
+  pause of the process or its host, a network cut. Anything shorter than two seconds
+  less twice the network's latency does not end in a verdict, and that is arithmetic
+  on the timings above: nobody suspects the member sooner than 0.5 s into the outage
+  (the two 0.25 s timeouts) and nobody asks it the last time sooner than 1.5 s after
+  that, so the question arrives once the outage is over. In practice the margin is
+  usually a little more, because a node acts on a timeout at its next 0.1 s tick; at
+  2.5 s a verdict is still rare (one simulated run in thirty at 10 and 14 nodes), at
+  3 s it is not.
+- **That broker was not being scheduled.** If its own
+  `mqttd_swim_stalled_milliseconds_total` is climbing, the broker itself went quiet —
+  every worker thread busy near saturation, a paused or migrated VM, a stopped
+  process — and while it is quiet it answers no probe. Its peers then see an outage
+  like any other, with the same two seconds.
 - **Packet loss on the gossip network.** The last probe and its answer are two
   datagrams. Look for many `SUSPECT`/`RECOVERED` pairs about different members on
   every node; larger clusters are affected first.

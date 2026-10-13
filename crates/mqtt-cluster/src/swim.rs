@@ -454,8 +454,7 @@ pub struct Swim {
     rng: u64,
     bootstrapped: bool,
     /// Lifeguard local-health awareness (ADR 0016 §2): rises when we must refute a
-    /// suspicion about ourselves (the unambiguous signal that we are the slow one) and
-    /// when the driver reports that this node was stalled ([`local_stall`](Self::local_stall)),
+    /// suspicion about ourselves (the unambiguous signal that we are the slow one),
     /// decays on a clean probe. An unanswered probe of ours does NOT raise it — without
     /// NACKs that is as likely the target's death as our slowness (see `advance_probe`).
     /// Scales our `ack`/`suspicion` timeouts by `(1 + awareness)` so a degraded node
@@ -541,24 +540,6 @@ impl Swim {
     #[must_use]
     pub fn awareness(&self) -> u8 {
         self.awareness
-    }
-
-    /// The driver found that THIS node was stalled: it was not scheduled for longer
-    /// than its tick, so for that time it neither read its socket nor sent anything.
-    ///
-    /// That is first-hand evidence that this node is the slow one — stronger than the
-    /// evidence awareness already acts on (having to refute a suspicion of itself),
-    /// and available at once, where a suspicion needs a peer to have probed this node
-    /// during the stall and its claim to arrive. So it raises awareness by one, as a
-    /// refutation does (ADR 0016 §2): for the next rounds this node waits longer for
-    /// acks and holds suspects longer, until clean probe rounds lower it again.
-    ///
-    /// It does not touch any deadline. The driver keeps the stalled time out of the
-    /// clock it feeds [`tick`](Self::tick) and [`handle`](Self::handle), which gives
-    /// every timer here — the ack timeout, the indirect timeout, the suspicion window,
-    /// the last probe — the listening time it was promised.
-    pub fn local_stall(&mut self) {
-        self.raise_awareness();
     }
 
     /// The SWIM addresses of members that have started a new life (a restart: a
@@ -683,7 +664,9 @@ impl Swim {
     }
 
     /// Raise awareness (capped at `awareness_max`): a signal that *we* are the slow one
-    /// — having to refute a suspicion about ourselves, or a stall the driver observed.
+    /// — having to refute a suspicion about ourselves. (Not a stall of this node's own
+    /// driver: that was tried and withdrawn, ADR 0016's amendment for issue #1002. It
+    /// only decays on a clean probe round, and a node whose peers have died has none.)
     fn raise_awareness(&mut self) {
         self.awareness = (self.awareness + 1).min(self.cfg.awareness_max);
     }
@@ -1378,8 +1361,9 @@ impl Swim {
     /// supersedes our claim (one that did has already cleared the probe in
     /// `apply_update`): our claim was stale, or the member queued its refutation
     /// behind other gossip. Only the member can state its incarnation, so it is asked:
-    /// one `Join`, answered by a `Sync` that leads with the member's own claim about
-    /// itself, first-hand. Returns whether the `Ack` was that answer.
+    /// one `Join` that carries the suspicion as it is held now, answered by a `Sync`
+    /// that leads with the member's own claim about itself, first-hand. Returns whether
+    /// the `Ack` was that answer.
     ///
     /// `generation` is the life the `Ack` came from (the datagram's `from_generation`)
     /// and must be the life held for the member. An `Ack` from an EARLIER life — the
@@ -1415,8 +1399,29 @@ impl Swim {
         m.suspecters.clear();
         m.unanswered_probes = 0; // it hears us
         let addr = m.addr.clone();
+        // What we still hold against it, as we hold it NOW — which is not always what
+        // the probe carried: a suspicion at a higher incarnation may have arrived
+        // while the probe was out. Told of that one, the member refutes it, and its
+        // `Sync` supersedes; told nothing, it would answer `Alive` at the incarnation
+        // we already suspect, which supersedes nothing, and sit `Suspect` for another
+        // whole window. (A claim that is stale to it is ignored, and its `Sync` then
+        // carries the higher incarnation it is already at.)
+        let held = Update {
+            id: from.0.clone(),
+            addr: m.addr.clone(),
+            peer_addr: m.peer_addr.clone(),
+            incarnation: m.incarnation,
+            generation: m.generation,
+            state: MemberState::Suspect,
+            suspecter: Some(self.local.0.clone()),
+            failure_domain: m.failure_domain.clone(),
+        };
         self.failed_probe_rounds = 0; // and our outbound path works
-        out.push(self.greet(&addr));
+        let mut ask = self.greet(&addr);
+        if let Action::Send { msg, .. } = &mut ask {
+            msg.gossip.push(held);
+        }
+        out.push(ask);
         true
     }
 
@@ -3547,32 +3552,57 @@ mod tests {
         assert_eq!((probes.sent, probes.spared, probes.silent), (2, 0, 1));
     }
 
-    /// A stall of this node, reported by its driver, is local-health evidence like a
-    /// refutation (ADR 0016 §2): awareness goes up by one, so the ack timeout and the
-    /// suspicion window stretch; it is capped like any other rise and decays on a
-    /// clean probe round.
+    /// A suspect spared on its `Ack` to a probe that carried a STALE claim is cleared at
+    /// once, not a window later. The probe went out about incarnation 0; while it was
+    /// out, a suspicion at incarnation 1 arrived (the member had refuted, and was
+    /// suspected again). The member, at 1, ignores the probe's claim and acks with
+    /// nothing about itself. The `Join` it is then sent carries the suspicion as held
+    /// NOW — at 1 — so it refutes that, and its `Sync` says `Alive` at 2. (Asked
+    /// without the claim it answered `Alive` at 1, which does not supersede `Suspect`
+    /// at 1, and stayed suspect for another full window.)
     #[test]
-    fn a_stall_of_this_node_raises_its_awareness() {
-        let cfg = fast_cfg();
-        let mut s = node("a", "a:1", &[]);
+    fn a_suspect_spared_on_a_stale_claim_is_asked_with_the_claim_held_now() {
+        let cfg = Config {
+            confirm_before_dead: true,
+            ..fast_cfg()
+        };
+        let mut prober = node_with("a", "a:1", cfg.clone());
+        let mut suspect = node_with("b", "b:1", cfg.clone());
         let mut out = Vec::new();
-        s.apply_update(&alive_update("b", "b:1", 0), 0, &mut out);
-        assert_eq!(s.awareness(), 0);
-        s.local_stall();
-        assert_eq!(s.awareness(), 1);
-        assert_eq!(s.scaled_ack_timeout(), 2 * cfg.ack_timeout_ms);
+        // b is at incarnation 1 and has nothing left to gossip about itself.
+        suspect.apply_update(&suspect_from("b", "b:1", 0, "x"), 0, &mut out);
+        while !suspect.take_gossip().is_empty() {}
+        suspect.incarnation = 1;
 
-        // A clean probe round takes it back.
-        s.tick(0);
-        let actions = s.tick(100);
-        let seq = ping_seq(&actions).expect("a ping was sent");
-        s.handle(m("b", "b:1", Kind::Ack { seq }, vec![]), 110);
-        assert_eq!(s.awareness(), 0);
+        prober.apply_update(&suspect_from("b", "b:1", 0, "x"), 0, &mut out);
+        let lapsed = cfg.suspicion_timeout_ms;
+        out.clear();
+        prober.expire_suspects(lapsed, &mut out);
+        let ping = sends(&out)[0].1.clone();
+        prober.apply_update(&suspect_from("b", "b:1", 1, "x"), lapsed + 1, &mut out);
 
-        for _ in 0..(u32::from(cfg.awareness_max) + 5) {
-            s.local_stall();
-        }
-        assert_eq!(s.awareness(), cfg.awareness_max);
+        let replies = suspect.handle(ping, lapsed + 2);
+        let ack = sends(&replies)[0].1.clone();
+        assert!(!ack.gossip.iter().any(|u| u.id == "b"), "{:?}", ack.gossip);
+        let asked = prober.handle(ack, lapsed + 3);
+        let join = sends(&asked)[0].1.clone();
+        assert!(matches!(join.kind, Kind::Join));
+        assert!(
+            join.gossip.iter().any(|u| u.id == "b"
+                && u.state == MemberState::Suspect
+                && u.incarnation == 1
+                && u.suspecter.as_deref() == Some("a")),
+            "the request carries the suspicion as held now: {:?}",
+            join.gossip
+        );
+        assert_eq!(member_state(&prober, "b"), Some(MemberState::Suspect));
+
+        let synced = suspect.handle(join, lapsed + 4);
+        let sync = sends(&synced)[0].1.clone();
+        assert!(matches!(sync.kind, Kind::Sync));
+        prober.handle(sync, lapsed + 5);
+        assert_eq!(member_state(&prober, "b"), Some(MemberState::Alive));
+        assert_eq!(current_incarnation(&suspect), 2);
     }
 
     /// `suspicion_scales_with_log_n`: the window is multiplied by `max(1, log10 n)` —

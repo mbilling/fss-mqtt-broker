@@ -2415,8 +2415,11 @@ IGNORE_ALLOWLIST: dict[str, tuple[str, str | None]] = {
         "few seeds, by `a_member_that_cannot_complete_a_round_trip_is_declared_dead_as_before`, "
         "`one_link_lost_one_way_raises_no_verdict`, "
         "`packet_loss_neither_keeps_a_dead_member_nor_adds_false_verdicts`, "
-        "`a_prober_stalled_on_its_last_probe_declares_nobody_dead` and "
-        "`a_node_stopped_for_two_seconds_neither_dies_nor_declares`, which every tier runs",
+        "`a_prober_stalled_on_its_last_probe_declares_nobody_dead`, "
+        "`a_node_stopped_for_two_seconds_neither_dies_nor_declares`, "
+        "`a_real_death_is_seen_on_time_by_survivors_that_are_all_late` and "
+        "`with_ticks_on_no_grid_a_cut_of_two_seconds_less_twice_the_latency_ends_in_no_dead`, "
+        "which every tier runs",
         None,
     ),
     "crates/mqttd/tests/swim_formation_proc.rs::a_broker_stopped_for_two_seconds_is_declared_dead_by_no_one": (

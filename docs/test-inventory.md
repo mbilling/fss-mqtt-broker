@@ -262,7 +262,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 410 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 411 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -576,9 +576,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `swim::tests::a_run_of_unanswered_probe_rounds_marks_the_node_isolated_while_gossip_keeps_the_view_fresh`
 - `swim::tests::a_single_ack_of_our_probe_clears_isolation`
 - `swim::tests::a_stale_circulating_dead_claim_cannot_rekill_the_refuted_member`
-- `swim::tests::a_stall_of_this_node_raises_its_awareness`
 - `swim::tests::a_suspect_ahead_of_a_stale_claim_is_saved_by_its_ack_alone`
 - `swim::tests::a_suspect_is_probed_once_more_before_it_is_declared_dead`
+- `swim::tests::a_suspect_spared_on_a_stale_claim_is_asked_with_the_claim_held_now`
 - `swim::tests::a_suspect_that_answers_without_ever_refuting_is_asked_once_per_window`
 - `swim::tests::a_suspect_that_refutes_in_its_ack_is_not_declared_dead`
 - `swim::tests::a_suspicion_at_a_higher_incarnation_leaves_the_last_probe_standing`
@@ -664,11 +664,12 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `swim_driver::cert_request_tests::only_a_datagram_signed_by_the_suspect_answers_its_last_probe`
 - `swim_driver::cert_request_tests::the_request_limiter_bounds_its_rate_and_its_table`
 - `swim_driver::cert_request_tests::the_suspects_own_signed_ack_answers_its_last_probe`
+- `swim_driver::stall_tests::a_persistently_late_node_declares_a_dead_member_within_five_wake_ups_of_on_time`
 - `swim_driver::stall_tests::a_prober_stalled_past_the_ack_timeout_reads_the_ack_before_it_gives_up`
-- `swim_driver::stall_tests::a_suspect_that_stays_silent_is_declared_dead_after_the_stall`
+- `swim_driver::stall_tests::a_suspect_that_stays_silent_is_declared_dead_when_the_stalled_prober_wakes`
 - `swim_driver::stall_tests::an_ack_already_in_the_socket_beats_the_tick_that_would_give_up_on_it`
 - `swim_driver::stall_tests::the_read_ahead_of_a_tick_is_bounded`
-- `swim_driver::stall_tests::the_stall_clock_leaves_out_the_time_the_loop_did_not_run`
+- `swim_driver::stall_tests::the_stall_watch_reports_a_wake_up_more_than_two_ticks_late`
 - `swim_driver::tests::a_self_claim_contradicting_the_certificate_is_rejected`
 - `swim_driver::tests::a_signed_relay_cannot_assert_a_third_partys_domain`
 - `swim_driver::tests::an_agreeing_self_claim_passes_and_an_unattested_one_is_kept`
@@ -700,7 +701,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `three_nodes_converge_then_detect_failure`
 - `two_nodes_discover_each_other`
 
-## `crates/mqtt-cluster/tests/swim_formation_sim.rs` — 16 test(s)
+## `crates/mqtt-cluster/tests/swim_formation_sim.rs` — 18 test(s)
 
 - `a_cluster_part_way_through_the_upgrade_from_v1_1_forms`
 - `a_formation_run_is_reproducible_from_its_seed`
@@ -709,6 +710,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_member_that_cannot_complete_a_round_trip_is_declared_dead_as_before`
 - `a_node_stopped_for_two_seconds_neither_dies_nor_declares`
 - `a_prober_stalled_on_its_last_probe_declares_nobody_dead`
+- `a_real_death_is_seen_on_time_by_survivors_that_are_all_late`
 - `a_signed_cluster_forms_with_no_false_suspicion_at_any_size`
 - `a_v1_1_node_still_declares_what_the_last_probe_would_have_spared`
 - `false_dead_report` — `#[ignore]`d
@@ -717,6 +719,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `one_link_lost_one_way_raises_no_verdict`
 - `packet_loss_neither_keeps_a_dead_member_nor_adds_false_verdicts`
 - `the_v1_1_rules_reproduce_the_formation_storm_and_preshared_certificates_remove_it`
+- `with_ticks_on_no_grid_a_cut_of_two_seconds_less_twice_the_latency_ends_in_no_dead`
 - `without_the_last_probe_a_short_cut_ends_in_a_false_dead`
 
 ## `crates/mqtt-cluster/tests/swim_sim.rs` — 6 test(s)

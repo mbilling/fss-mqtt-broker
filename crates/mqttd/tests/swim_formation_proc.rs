@@ -493,8 +493,25 @@ fn dead_lines(log: &str) -> Vec<&str> {
         .collect()
 }
 
+/// The ack timeout of a last probe on a healthy node. A node that has lately been
+/// suspected itself waits longer, never less (ADR 0016 §2).
+const LAST_PROBE_ACK_TIMEOUT: Duration = Duration::from_millis(250);
+
 /// One episode of the test below: steps 1 to 4, and what the prober did on waking.
 /// Returns whether the prober was stopped in time — `false` sets the episode aside.
+///
+/// "In time" is decided on what the SWIM task itself did and on this test's own
+/// clock, not on a log line (the membership lines are written by another task, a
+/// moment after the verdict):
+///
+/// - the probe was sent after the last scrape that did not show it began, and its
+///   deadline is at least an ack timeout after it was sent; so if the prober is seen
+///   stopped within an ack timeout of that scrape, it was stopped with the probe out;
+/// - and whatever the clock says, a probe counted `spared` was out when the prober
+///   stopped: the suspect was only resumed afterwards, so its answer was read after.
+///
+/// An episode that is neither is one this test was too slow for: the probe ran out on
+/// a suspect that was still stopped, rightly.
 async fn stop_the_prober_on_its_last_probe(
     nodes: &mut [ProcNode],
     prober: usize,
@@ -504,8 +521,6 @@ async fn stop_the_prober_on_its_last_probe(
     let prober_pid = nodes[prober].pid().expect("the prober is running");
     let suspect_pid = nodes[suspect].pid().expect("the suspect is running");
     let prober_log = nodes[prober].log_path.clone();
-    let read_log = || std::fs::read(&prober_log).unwrap_or_default();
-    let dead_before = dead_lines(&String::from_utf8_lossy(&read_log())).len();
     let sent_before = last_probes(&nodes[prober], "sent").await;
     let spared_before = last_probes(&nodes[prober], "spared").await;
     let silent_before = last_probes(&nodes[prober], "silent").await;
@@ -513,7 +528,13 @@ async fn stop_the_prober_on_its_last_probe(
     // 1. The suspect goes silent, and in time the prober asks it once more.
     signal(suspect_pid, "-STOP");
     let started = Instant::now();
-    while last_probes(&nodes[prober], "sent").await == sent_before {
+    let mut not_sent_at = Instant::now();
+    loop {
+        let scrape_began = Instant::now();
+        if last_probes(&nodes[prober], "sent").await != sent_before {
+            break;
+        }
+        not_sent_at = scrape_began;
         assert!(
             started.elapsed() < STEP_BUDGET,
             "episode {episode}: the prober sent no last probe in {STEP_BUDGET:?}\n{}",
@@ -532,7 +553,8 @@ async fn stop_the_prober_on_its_last_probe(
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    let written_before_the_stop = read_log().len();
+    let stopped_within = not_sent_at.elapsed();
+    let written_before_the_stop = std::fs::read(&prober_log).unwrap_or_default().len();
 
     // 3. The suspect runs again, and answers what queued while it was stopped.
     signal(suspect_pid, "-CONT");
@@ -551,37 +573,35 @@ async fn stop_the_prober_on_its_last_probe(
     signal(prober_pid, "-CONT");
     await_quiet(nodes, &format!("after prober stop {episode}")).await;
 
-    let log = read_log();
-    let (before, after) = log.split_at(written_before_the_stop);
-    let (before, after) = (
-        String::from_utf8_lossy(before),
-        String::from_utf8_lossy(after),
-    );
-    if dead_lines(&before).len() > dead_before {
-        // Too slow: the probe ran out on a suspect that was still stopped.
-        eprintln!("episode {episode}: the prober gave up before it could be stopped; set aside");
+    let spared = last_probes(&nodes[prober], "spared").await > spared_before;
+    let silent = last_probes(&nodes[prober], "silent").await > silent_before;
+    if stopped_within >= LAST_PROBE_ACK_TIMEOUT && !spared {
+        eprintln!(
+            "episode {episode}: the prober was seen stopped {stopped_within:?} after its last \
+             probe may have gone out, and the probe ran out first; set aside"
+        );
         return false;
     }
-    let after = dead_lines(&after);
+    let log = std::fs::read(&prober_log).unwrap_or_default();
+    let after = String::from_utf8_lossy(&log[written_before_the_stop.min(log.len())..]);
     assert!(
-        after.is_empty(),
-        "episode {episode}: stopped for {PROBER_STOP:?} with its last probe out, the prober \
-         woke and declared a suspect that had answered DEAD:\n{}",
-        after.join("\n")
+        !silent && spared,
+        "episode {episode}: stopped for {PROBER_STOP:?} within {stopped_within:?} of sending \
+         its last probe, the prober woke and gave up on a suspect that had answered \
+         (spared: {spared}, silent: {silent}). Its log since the stop:\n{}",
+        dead_lines(&after).join("\n")
     );
-    assert_eq!(
-        last_probes(&nodes[prober], "silent").await,
-        silent_before,
-        "episode {episode}: the probe was counted silent"
-    );
+    let stalled_ms = nodes[prober]
+        .metric("mqttd_swim_stalled_milliseconds_total")
+        .await
+        .unwrap_or(0);
+    // A stall is the gap between two wake-ups less the tick that was due anyway, and
+    // the stop began part-way through a tick: two ticks short of the stop, at most.
+    let nearly_the_stop = u64::try_from(PROBER_STOP.as_millis()).expect("small") - 200;
     assert!(
-        last_probes(&nodes[prober], "spared").await > spared_before,
-        "episode {episode}: the suspect's answer was not counted"
-    );
-    let stalls = nodes[prober].metric("mqttd_swim_stalls_total").await;
-    assert!(
-        stalls.unwrap_or(0) > 0,
-        "episode {episode}: the prober did not notice that it had been stopped"
+        stalled_ms >= nearly_the_stop,
+        "episode {episode}: stopped for {PROBER_STOP:?}, the prober counted {stalled_ms} ms \
+         of stalls"
     );
     true
 }
@@ -599,21 +619,19 @@ async fn stop_the_prober_on_its_last_probe(
 ///
 /// 1. the suspect is stopped; the prober suspects it and, a window later, sends its
 ///    last probe — seen as `mqttd_swim_last_probes_total{outcome="sent"}` going up;
-/// 2. the prober is stopped at once, and the length of its log is noted once `ps`
-///    shows it stopped: from then on it writes nothing;
+/// 2. the prober is stopped at once, and the time is taken once `ps` shows it stopped;
 /// 3. the suspect is resumed, and answers what queued on its socket, the probe included;
 /// 4. the prober stays stopped for [`PROBER_STOP`], is resumed, and the pair settles.
 ///
 /// Step 2 races the probe's 250 ms: if this test is too slow, the prober gives up on a
-/// suspect that really was silent, and rightly declares it DEAD. That shows as a DEAD
-/// line in the prober's log BEFORE the noted length, and such an episode is set aside,
-/// not failed. A DEAD line AFTER it — written once the prober was running again, with
-/// the answer in hand — is the failure, as is a probe counted silent. At least one
+/// suspect that really was silent, and rightly declares it DEAD. Such an episode is
+/// recognised from the prober's own counters and this test's clock
+/// ([`stop_the_prober_on_its_last_probe`]) and set aside, not failed. A probe that was
+/// out when the prober stopped and is counted `silent` is the failure. At least one
 /// episode must have got the prober stopped in time.
 ///
-/// Before the driver read its socket ahead of a tick and kept stalled time off its
-/// clock, the waking prober took the tick or the `Ack` at random: half of such
-/// episodes ended in a DEAD. The driver's own test of this
+/// Before the driver read its socket ahead of a tick, the waking prober took the tick
+/// or the `Ack` at random: half of such episodes ended in a DEAD. The driver's own test of this
 /// (`a_prober_stalled_past_the_ack_timeout_reads_the_ack_before_it_gives_up`, every
 /// tier) decides the order exactly; this is the same thing with a kernel in between.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -17,7 +17,7 @@
 
 //!
 //! The shell also answers for the one thing the state machine cannot know: whether the
-//! clock it is fed is one this node was awake for. See [`StallClock`] and [`run_gossip`].
+//! node it drives is running late. See [`run_gossip`] and [`StallWatch`].
 
 use crate::replay::{ReplayWindow, SeqStore, SequenceAllocator};
 use crate::swim::{Action, Kind, LastProbes, MemberState, Message, Swim};
@@ -31,12 +31,9 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, trace};
 
 /// The interval at which the broker ticks the state machine. It must stay below the ack
-/// timeout (250 ms), so that a probe's deadline is noticed promptly — and the bound the
-/// last direct probe keeps is arithmetic on it (ADR 0016's amendment for issue #1002:
-/// a deadline is acted on at the first tick at or after it, so each timeout is in effect
-/// rounded up to this). One constant for the broker and for the formation simulation
-/// (`tests/swim_formation_sim.rs`), so that what the simulation measures is what the
-/// broker runs.
+/// timeout (250 ms), so that a probe's deadline is noticed promptly. One constant for the
+/// broker and for the formation simulation (`tests/swim_formation_sim.rs`), so that what
+/// the simulation measures is what the broker runs.
 pub const TICK: Duration = Duration::from_millis(100);
 
 /// A wake-up of the driver's loop more than this many ticks after the one before it is
@@ -48,72 +45,68 @@ const STALL_TICKS: u64 = 2;
 /// cluster going about its business the read ends because the socket is empty.
 pub const DRAIN_MAX_DATAGRAMS: usize = 1024;
 
-/// The most time spent reading ahead of one tick, as a fraction of the tick: a quarter.
+/// The datagrams read ahead of a tick whatever the time: the time budget below is
+/// wall time, and a loop that is preempted in the middle of its read must not find
+/// the budget spent with an `Ack` one datagram further on. Twice the largest cluster
+/// the project has formed, so every member's answer fits.
+pub const DRAIN_MIN_DATAGRAMS: usize = 64;
+
+/// The most time spent reading ahead of one tick once [`DRAIN_MIN_DATAGRAMS`] are
+/// read, as a fraction of the tick: a quarter.
 const DRAIN_TICK_FRACTION: u32 = 4;
 
-/// The clock the driver feeds the state machine: time this node was awake for.
+/// Notices that the driver's loop was not scheduled.
 ///
-/// Every timer in [`Swim`] is a wait for something to arrive — an `Ack` inside the ack
-/// timeout, a refutation inside the suspicion window — measured on the `now` it is
-/// given. A node that is not scheduled for a while (a saturated runtime, a stopped
-/// process, a suspended VM) hears nothing and sends nothing for that time, and on a
-/// wall clock comes back to find that all its deadlines "passed": it would conclude
-/// from its own absence that its peers were silent.
+/// The loop wakes at least once a tick. It [`observe`](Self::observe)s the monotonic
+/// clock on every wake-up, and a wake-up more than two ticks after the one before it
+/// is a stall: for that long this node read nothing and sent nothing.
 ///
-/// So the stalled time is left out. The driver's loop wakes at least once a tick; it
-/// [`observe`](Self::observe)s the monotonic clock on every wake-up, and a wake-up
-/// more than two ticks after the one before it is a stall, counted as ONE tick (the
-/// tick that was due) however long it was. Whatever the node does, its clock then
-/// advances by at most two ticks per wake-up — less than one ack timeout — so no
-/// deadline can be set and found expired without the loop having run, and read its
-/// socket, in between.
-///
-/// Slow is safe here and fast is not: every timer only ever runs LONGER in wall time
-/// than configured, including the tombstone's (ADR 0016 §1), which must outlast the
-/// gossip it fences.
+/// It only notices. The state machine is fed the monotonic clock as it is: a stall
+/// is counted and reported ([`Gossip::note_stall`]) and changes no timer. (A first
+/// version of this left the stalled time out of the clock. That lag was never made
+/// up, so a node that was persistently late ran all of its failure detection, the
+/// tombstone included, at a fraction of real time: a real death took it tens of
+/// seconds to see. Reading the socket before a tick is what keeps a late node from
+/// misjudging a peer, and it costs no time.)
 #[derive(Debug)]
-pub struct StallClock {
+pub struct StallWatch {
     tick_ms: u64,
     /// The monotonic reading at the last wake-up.
     last: u64,
-    /// Stalled time left out so far.
-    lost: u64,
 }
 
-impl StallClock {
-    /// A clock for a loop that wakes every `tick`.
+impl StallWatch {
+    /// A watch on a loop that wakes every `tick`.
     #[must_use]
     pub fn new(tick: Duration) -> Self {
         Self {
             tick_ms: u64::try_from(tick.as_millis()).unwrap_or(u64::MAX).max(1),
             last: 0,
-            lost: 0,
         }
     }
 
     /// Record a wake-up at monotonic time `real_ms` (ms since the driver started).
-    /// Returns the state machine's `now`, and how long this node was stalled before
-    /// this wake-up if it was.
-    pub fn observe(&mut self, real_ms: u64) -> (u64, Option<u64>) {
+    /// Returns how long the loop was stalled before this wake-up, if it was: the time
+    /// since the last wake-up, less the tick that was due anyway.
+    pub fn observe(&mut self, real_ms: u64) -> Option<u64> {
         let real_ms = real_ms.max(self.last);
         let gap = real_ms - self.last;
         self.last = real_ms;
-        let stalled = (gap > STALL_TICKS.saturating_mul(self.tick_ms)).then(|| gap - self.tick_ms);
-        self.lost += stalled.unwrap_or(0);
-        (real_ms - self.lost, stalled)
+        (gap > STALL_TICKS.saturating_mul(self.tick_ms)).then(|| gap - self.tick_ms)
     }
 }
 
-/// How much one tick may read off the socket before it runs: a count and a deadline.
+/// How much one tick may read off the socket before it runs: a count it reads
+/// whatever the time, and beyond that a larger count and a deadline.
 struct DrainBudget {
-    datagrams: usize,
+    read: usize,
     until: std::time::Instant,
 }
 
 impl DrainBudget {
     fn for_tick(tick: Duration) -> Self {
         Self {
-            datagrams: DRAIN_MAX_DATAGRAMS,
+            read: 0,
             // Real time, whatever clock the runtime keeps: this bounds work done.
             until: std::time::Instant::now() + tick / DRAIN_TICK_FRACTION,
         }
@@ -121,10 +114,11 @@ impl DrainBudget {
 
     /// Whether one more datagram may be read; a `true` is spent.
     fn take(&mut self) -> bool {
-        if self.datagrams == 0 || std::time::Instant::now() >= self.until {
+        let over_time = || std::time::Instant::now() >= self.until;
+        if self.read >= DRAIN_MAX_DATAGRAMS || (self.read >= DRAIN_MIN_DATAGRAMS && over_time()) {
             return false;
         }
-        self.datagrams -= 1;
+        self.read += 1;
         true
     }
 }
@@ -172,8 +166,12 @@ pub type CertRequestCounter = std::sync::Arc<dyn Fn() + Send + Sync>;
 pub type LastProbeCounter = std::sync::Arc<dyn Fn(&'static str, u64) + Send + Sync>;
 
 /// A sink called once per **stall** of this node that the driver observed
-/// ([`StallClock`]), with how long it lasted in milliseconds.
+/// ([`StallWatch`]), with how long it lasted in milliseconds.
 pub type StallCounter = std::sync::Arc<dyn Fn(u64) + Send + Sync>;
+
+/// A sink for this node's **local-health awareness** (ADR 0016 §2), called with the new
+/// score whenever it changes: `0` for a healthy node, up to `Config::awareness_max`.
+pub type AwarenessGauge = std::sync::Arc<dyn Fn(u8) + Send + Sync>;
 
 /// At most one certificate request per source address in this many milliseconds: the
 /// protocol period, so a peer whose `Sync` reply was lost is asked again on its next
@@ -266,8 +264,11 @@ pub struct Gossip {
     cert_requested: Option<CertRequestCounter>,
     last_probe: Option<LastProbeCounter>,
     stalled: Option<StallCounter>,
-    /// The state machine's last-probe counts as last handed to `last_probe`.
+    awareness: Option<AwarenessGauge>,
+    /// The state machine's last-probe counts as last handed to `last_probe`, and its
+    /// awareness as last handed to `awareness`.
     last_probes_reported: LastProbes,
+    awareness_reported: u8,
     identity: Option<std::sync::Arc<crate::cluster_identity::ClusterIdentity>>,
     /// Per-sender replay windows, keyed by the authenticated sender id (ADR 0023).
     windows: HashMap<String, ReplayWindow>,
@@ -296,7 +297,9 @@ impl Gossip {
             cert_requested: None,
             last_probe: None,
             stalled: None,
+            awareness: None,
             last_probes_reported: LastProbes::default(),
+            awareness_reported: 0,
             identity: None,
             windows: HashMap::new(),
             cert_requests: CertRequests::default(),
@@ -310,27 +313,29 @@ impl Gossip {
         self
     }
 
-    /// Count the stalls of this node the driver observes ([`StallClock`]).
+    /// Count the stalls of this node the driver observes ([`StallWatch`]).
     #[must_use]
     pub fn with_stall_counter(mut self, counter: Option<StallCounter>) -> Self {
         self.stalled = counter;
         self
     }
 
-    /// This node was stalled for `stalled_ms` before the wake-up now being handled
-    /// ([`StallClock::observe`]): count it, and tell the state machine, which takes it
-    /// as evidence about its own health ([`Swim::local_stall`]). Call it before the
-    /// [`tick`](Self::tick) or [`receive`](Self::receive) of that wake-up.
-    pub fn local_stall(&mut self, stalled_ms: u64) {
-        debug!(
-            stalled_ms,
-            "the SWIM driver was not scheduled: the stalled time is left out of its \
-             clock, and awareness is raised"
-        );
+    /// Publish the local-health awareness whenever it changes (ADR 0016 §2).
+    #[must_use]
+    pub fn with_awareness_gauge(mut self, gauge: Option<AwarenessGauge>) -> Self {
+        self.awareness = gauge;
+        self
+    }
+
+    /// This node's loop was not scheduled for `stalled_ms` before the wake-up now
+    /// being handled ([`StallWatch::observe`]): count it. Nothing else follows from it
+    /// — no timer moves and the state machine is not told. What protects a peer from
+    /// a node that was away is that the node reads its socket before it ticks.
+    pub fn note_stall(&mut self, stalled_ms: u64) {
+        debug!(stalled_ms, "the SWIM driver was not scheduled");
         if let Some(c) = &self.stalled {
             c(stalled_ms);
         }
-        self.swim.local_stall();
     }
 
     /// Hand the last-probe counts that changed since the last call to the sink.
@@ -345,6 +350,17 @@ impl Gossip {
         ] {
             if now > was {
                 c(outcome, now - was);
+            }
+        }
+    }
+
+    /// Hand the awareness to its gauge if it has changed.
+    fn report_awareness(&mut self) {
+        let now = self.swim.awareness();
+        if now != self.awareness_reported {
+            self.awareness_reported = now;
+            if let Some(g) = &self.awareness {
+                g(now);
             }
         }
     }
@@ -400,6 +416,7 @@ impl Gossip {
     /// Seal and serialize the state machine's actions.
     fn outputs(&mut self, actions: Vec<Action>) -> Vec<Output> {
         self.report_last_probes();
+        self.report_awareness();
         // A member that restarted lost every certificate it had cached, ours with the
         // rest (issue #971): un-prime it BEFORE sealing, so the first datagram it gets
         // from us — usually among `actions`, the reply to the datagram that showed us
@@ -631,34 +648,44 @@ pub async fn run(
 /// than `run`'s parameters carry (the certificate-request, last-probe and stall
 /// counters).
 ///
-/// # A node that was itself stalled
+/// # A node that was itself late
 ///
 /// This task shares its runtime with whatever else the process runs (in the broker:
 /// the data path), so it can be kept off the CPU for longer than a tick — and a
-/// stopped process or a suspended VM is kept off for as long as it lasts. Three rules
-/// keep a node from turning its own absence into a verdict about a peer:
+/// stopped process or a suspended VM is kept off for as long as it lasts. One rule
+/// keeps such a node from turning its own absence into a verdict about a peer, and
+/// it costs no time:
 ///
-/// 1. **Read before expiring.** A tick first reads everything the socket held when
-///    the tick came due, then advances the state machine. Deadlines are only ever
-///    acted on by a tick, so an `Ack` that arrived in time is never beaten by the tick
-///    that would have given up on it. (What the socket "held" is what the runtime's
-///    reactor had seen arrive when it fired the tick's timer — it polls the socket and
-///    the timers in one turn, socket first. A datagram that arrives between that turn
-///    and this task running arrived after the tick was due.) (`select!` picks at random among ready branches: without
-///    this, a late tick and the `Ack` queued behind it were a coin toss.) The read is
-///    bounded — [`DRAIN_MAX_DATAGRAMS`] datagrams and a quarter of the tick — so a
-///    flood cannot keep the tick from running; a flood that outruns the bound leaves
-///    datagrams unread behind it at that tick, which is the order every tick had
-///    before. Without the gossip key nothing a sender queues gets past
-///    authentication, so all it can do is spend this budget; forging the `Ack`
-///    takes the suspect's own key.
-/// 2. **Stalled time is not time.** [`StallClock`]: the state machine's `now` leaves
-///    out the time this loop was not running.
-/// 3. **A stall is a finding about this node.** [`Gossip::local_stall`] raises the
-///    local-health awareness (ADR 0016 §2) and counts the stall.
+/// **Read before expiring.** A tick first reads what the socket holds, then advances
+/// the state machine. Deadlines are only ever acted on by a tick, so an `Ack` that
+/// arrived is never beaten by the tick that would have given up on it. (`select!`
+/// picks at random among ready branches: without this, a late tick and the `Ack`
+/// queued behind it were a coin toss.)
 ///
-/// Missed ticks are not made up ([`MissedTickBehavior::Delay`]): after a stall the
-/// loop ticks once, and again a full interval later.
+/// The read asks the KERNEL, on a handle of its own ([`direct_handle`]), not the
+/// runtime: tokio's socket reads only once its reactor has seen the socket become
+/// readable, and there is a wake-up on which it has not. A process resumed from a
+/// stop (`SIGCONT`) finds its reactor's poll interrupted — no events — and its timers
+/// due: the tick runs with a socket full of datagrams that the runtime believes
+/// empty. Two real brokers showed exactly that: the stopped prober woke, "read" its
+/// socket through the runtime, found nothing, and declared dead a suspect whose `Ack`
+/// was sitting there.
+///
+/// The read is bounded so that a flood cannot keep the tick from running:
+/// [`DRAIN_MIN_DATAGRAMS`] are read whatever the time, then up to
+/// [`DRAIN_MAX_DATAGRAMS`] within a quarter of the tick. A flood that outruns the
+/// bound leaves datagrams unread behind it at that tick, which is the order every
+/// tick had before. Without the gossip key nothing a sender queues gets past
+/// authentication, so all it can do is spend this budget; forging the `Ack` takes
+/// the suspect's own key.
+///
+/// **The clock is the monotonic clock**, late or not: a node that wakes late acts on
+/// each deadline when it wakes and no later, so its failure detection is slower by
+/// the lateness of a wake-up at each of the four steps to a verdict (ack timeout,
+/// indirect timeout, suspicion window, last probe) and by nothing that accumulates.
+/// A stall is counted ([`Gossip::note_stall`]) and changes nothing else. Missed ticks
+/// are not made up ([`MissedTickBehavior::Delay`]): they would all read the same
+/// clock.
 pub async fn run_gossip(
     socket: UdpSocket,
     mut gossip: Gossip,
@@ -695,8 +722,9 @@ pub async fn run_gossip(
     };
     let mut ticker = tokio::time::interval(tick_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut clock = StallClock::new(tick_interval);
+    let mut watch = StallWatch::new(tick_interval);
     let mut buf = vec![0u8; RECV_BUF];
+    let direct = direct_handle(&socket);
     tokio::pin!(shutdown);
 
     loop {
@@ -709,12 +737,19 @@ pub async fn run_gossip(
                 return;
             }
             _ = ticker.tick() => {
-                let now = wake(&mut clock, &mut gossip, start);
+                let now = wake(&mut watch, &mut gossip, start);
                 // Everything already received, before this tick may expire anything.
                 let mut budget = DrainBudget::for_tick(tick_interval);
                 while budget.take() {
+                    // Straight from the kernel where there is a handle for it. What
+                    // is taken here the runtime's own read then does not find, which
+                    // is all it notices.
+                    let read = match &direct {
+                        Some(direct) => direct.recv_from(&mut buf),
+                        None => socket.try_recv_from(&mut buf),
+                    };
                     // Empty (`WouldBlock`), or an error `recv_from` will meet again.
-                    let Ok((n, src)) = socket.try_recv_from(&mut buf) else { break };
+                    let Ok((n, src)) = read else { break };
                     let outputs = gossip.receive(&buf[..n], &src.to_string(), now);
                     emit(&socket, &events, outputs).await;
                 }
@@ -726,7 +761,7 @@ pub async fn run_gossip(
             }
             recv = socket.recv_from(&mut buf) => {
                 let Ok((n, src)) = recv else { continue };
-                let now = wake(&mut clock, &mut gossip, start);
+                let now = wake(&mut watch, &mut gossip, start);
                 let outputs = gossip.receive(&buf[..n], &src.to_string(), now);
                 emit(&socket, &events, outputs).await;
                 // Acks land in handle() — isolation can only CLEAR here.
@@ -736,13 +771,28 @@ pub async fn run_gossip(
     }
 }
 
-/// One wake-up of the loop: the state machine's `now`, with a stall — if this wake-up
-/// came after one — reported to the endpoint first.
-fn wake(clock: &mut StallClock, gossip: &mut Gossip, start: Instant) -> u64 {
-    let real_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let (now, stalled) = clock.observe(real_ms);
-    if let Some(stalled_ms) = stalled {
-        gossip.local_stall(stalled_ms);
+/// A second handle on the driver's socket — the same socket, non-blocking as tokio made
+/// it — to read with directly, past the runtime's idea of whether there is anything to
+/// read ([`run_gossip`]). `None` where the platform offers no such duplicate or the
+/// duplication fails (out of descriptors); the driver then reads through the runtime.
+#[cfg(unix)]
+fn direct_handle(socket: &UdpSocket) -> Option<std::net::UdpSocket> {
+    use std::os::fd::AsFd;
+    let owned = socket.as_fd().try_clone_to_owned().ok()?;
+    Some(std::net::UdpSocket::from(owned))
+}
+
+#[cfg(not(unix))]
+fn direct_handle(_socket: &UdpSocket) -> Option<std::net::UdpSocket> {
+    None
+}
+
+/// One wake-up of the loop: the state machine's `now` — the monotonic clock — with a
+/// stall, if this wake-up came after one, counted first.
+fn wake(watch: &mut StallWatch, gossip: &mut Gossip, start: Instant) -> u64 {
+    let now = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if let Some(stalled_ms) = watch.observe(now) {
+        gossip.note_stall(stalled_ms);
     }
     now
 }
@@ -1604,8 +1654,8 @@ mod cert_request_tests {
 /// paused clock, so the test decides when the loop runs and what time it finds.
 #[cfg(test)]
 mod stall_tests {
-    use super::{run_gossip, DrainBudget, Gossip, MembershipEvent, StallClock, TICK};
-    use super::{DRAIN_MAX_DATAGRAMS, STALL_TICKS};
+    use super::{run_gossip, DrainBudget, Gossip, MembershipEvent, StallWatch, TICK};
+    use super::{DRAIN_MAX_DATAGRAMS, DRAIN_MIN_DATAGRAMS, STALL_TICKS};
     use crate::swim::{Config, Kind, MemberState, Message, Swim, Update};
     use crate::NodeId;
     use std::collections::HashMap;
@@ -1721,10 +1771,8 @@ mod stall_tests {
         turn().await;
     }
 
-    /// `a` holds `b` suspect, its window has lapsed, and the last direct probe has
-    /// just gone out, on the tick that just ran. Returns the rig and that probe's
-    /// sequence number.
-    async fn a_with_its_last_probe_out() -> (Rig, u64) {
+    /// `a`, running, and `b`, which has introduced itself and will answer no probe.
+    async fn a_knowing_b() -> Rig {
         let a_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         a_socket.set_nonblocking(true).unwrap();
         let socket = tokio::net::UdpSocket::from_std(a_socket.try_clone().unwrap()).unwrap();
@@ -1746,8 +1794,10 @@ mod stall_tests {
             .with_last_probe_counter(Some(Arc::new(move |outcome, n| {
                 *probes.lock().unwrap().entry(outcome).or_default() += n;
             })))
-            .with_stall_counter(Some(Arc::new(move |_| {
-                *stalls.lock().unwrap().entry("stalls").or_default() += 1;
+            .with_stall_counter(Some(Arc::new(move |stalled_ms| {
+                let mut counts = stalls.lock().unwrap();
+                *counts.entry("stalls").or_default() += 1;
+                *counts.entry("stalled_ms").or_default() += stalled_ms;
             })));
         let (tx, events) = mpsc::unbounded_channel();
         let driver = tokio::spawn(run_gossip(
@@ -1758,7 +1808,7 @@ mod stall_tests {
             None,
             std::future::pending(),
         ));
-        let mut rig = Rig {
+        let rig = Rig {
             b,
             a_addr,
             a_socket,
@@ -1767,10 +1817,18 @@ mod stall_tests {
             driver,
         };
 
-        // `b` introduces itself and then answers no probe: probed, suspected (one
-        // suspecter: the full 4 s window), and asked once more when that lapses.
         rig.send(Kind::Sync, Vec::new());
         turn().await;
+        rig
+    }
+
+    /// `a` holds `b` suspect, its window has lapsed, and the last direct probe has
+    /// just gone out, on the tick that just ran. Returns the rig and that probe's
+    /// sequence number.
+    async fn a_with_its_last_probe_out() -> (Rig, u64) {
+        // `b` answers no probe: probed, suspected (one suspecter: the full 4 s
+        // window), and asked once more when that lapses.
+        let mut rig = a_knowing_b().await;
         for _ in 0..200 {
             pass(100).await;
             if rig.count("sent") == 0 {
@@ -1796,9 +1854,9 @@ mod stall_tests {
 
     /// The finding this change closes. `a`'s last probe is out; `b` answers at once;
     /// and `a` does not run again for three seconds — twelve ack timeouts. When it
-    /// does, the tick that is due and the `Ack` in its socket are both ready. `b` is
-    /// not declared dead: the `Ack` is read before the tick, and those three seconds
-    /// are not on `a`'s clock. `a` knows it was stalled, and says so.
+    /// does, the tick that is due and the `Ack` in its socket are both ready, and on
+    /// `a`'s clock, which is the real one, the probe's deadline is long past. `b` is
+    /// not declared dead: the `Ack` is read before the tick. `a` counts the stall.
     #[tokio::test(start_paused = true)]
     async fn a_prober_stalled_past_the_ack_timeout_reads_the_ack_before_it_gives_up() {
         // The loop picks between its ready branches at random: often enough that a
@@ -1835,10 +1893,9 @@ mod stall_tests {
         }
     }
 
-    /// The same race without a stall the clock would catch: the `Ack` arrives inside
-    /// the ack timeout, and the next time `a` runs is the tick at which that timeout
-    /// has passed — two ticks on, which is late but not a stall. Reading before
-    /// expiring is what decides it, on its own.
+    /// The same race at its narrowest: the `Ack` arrives inside the ack timeout, and
+    /// the next time `a` runs is the tick at which that timeout has passed — two ticks
+    /// on, late but not a stall. With the read ahead of the tick taken out, this fails.
     #[tokio::test(start_paused = true)]
     async fn an_ack_already_in_the_socket_beats_the_tick_that_would_give_up_on_it() {
         let ack_timeout = Config::default().ack_timeout_ms;
@@ -1859,86 +1916,108 @@ mod stall_tests {
         }
     }
 
-    /// None of this keeps a member that is not there. The same stall with no `Ack`:
-    /// `b` is not declared dead by the stall itself — those three seconds are not on
-    /// `a`'s clock, and a node that was just stalled holds its suspects for longer
-    /// (ADR 0016 §2), so the verdict is no longer due. When the longer window lapses
-    /// `b` is asked afresh, stays silent, and is declared dead.
+    /// None of this keeps a member that is not there, or keeps it a moment longer.
+    /// The same stall with no `Ack`: when `a` wakes its socket is empty and the probe's
+    /// deadline has passed, so `b` is declared dead on that wake-up.
     #[tokio::test(start_paused = true)]
-    async fn a_suspect_that_stays_silent_is_declared_dead_after_the_stall() {
+    async fn a_suspect_that_stays_silent_is_declared_dead_when_the_stalled_prober_wakes() {
         let (mut rig, _) = a_with_its_last_probe_out().await;
         pass(3000).await;
-        assert!(
-            !rig.declared_dead(),
-            "the stall is not the suspect's silence"
-        );
-        assert_eq!(rig.count("stalls"), 1);
-
-        // The window, doubled, has about four seconds left; then one doubled ack
-        // timeout. Ten seconds of ticks is ample, and each is on time.
-        let mut ticks = 0;
-        while !rig.declared_dead() {
-            ticks += 1;
-            assert!(ticks <= 100, "a never declared a silent suspect dead");
-            pass(100).await;
-        }
-        assert!(ticks > 5, "declared dead {ticks} ticks after the stall");
+        assert!(rig.declared_dead(), "a silent suspect outlived the stall");
         assert_eq!(
             (rig.count("sent"), rig.count("spared"), rig.count("silent")),
-            (2, 0, 1)
+            (1, 0, 1)
         );
-        assert_eq!(rig.count("stalls"), 1);
+        assert_eq!((rig.count("stalls"), rig.count("stalled_ms")), (1, 2900));
     }
 
-    /// The clock: a late wake-up counts as one tick, however late; time only goes
-    /// forward; and no single wake-up moves it a whole ack timeout.
-    #[test]
-    fn the_stall_clock_leaves_out_the_time_the_loop_did_not_run() {
-        let tick = u64::try_from(TICK.as_millis()).unwrap();
-        let mut clock = StallClock::new(TICK);
-        // On time, and late by less than a whole tick: the clock is the wall clock.
-        assert_eq!(clock.observe(0), (0, None));
-        assert_eq!(clock.observe(tick), (tick, None));
-        assert_eq!(clock.observe(tick + 7), (tick + 7, None));
-        assert_eq!(clock.observe(3 * tick), (3 * tick, None));
-        assert_eq!(clock.observe(5 * tick), (5 * tick, None));
-        // More than two ticks since the last wake-up: a stall, worth one tick.
-        assert_eq!(clock.observe(7 * tick + 1), (6 * tick, Some(tick + 1)));
-        assert_eq!(
-            clock.observe(60_000),
-            (7 * tick, Some(60_000 - 8 * tick - 1))
-        );
-        // Afterwards it runs at the wall clock's rate again, from where it was.
-        assert_eq!(clock.observe(60_040), (7 * tick + 40, None));
-        // A monotonic clock does not go back; if a reading did, this would not.
-        assert_eq!(clock.observe(59_000), (7 * tick + 40, None));
-
-        // The property the driver's rules rest on, for the broker's timings: whatever
-        // the gaps, one wake-up advances the clock by less than the ack timeout, so a
-        // deadline set on one wake-up cannot be found expired on the next.
-        let ack_timeout = Config::default().ack_timeout_ms;
-        assert!(
-            STALL_TICKS * tick < ack_timeout,
-            "a wake-up may advance the clock {} ms and the ack timeout is {ack_timeout} ms: \
-             one late tick could expire a probe it had no chance to hear answered",
-            STALL_TICKS * tick
-        );
-        let mut clock = StallClock::new(TICK);
-        let (mut real, mut was) = (0u64, 0u64);
-        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
-        for _ in 0..10_000 {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            real += seed % 1500;
-            let (now, _) = clock.observe(real);
-            assert!(now >= was && now - was <= STALL_TICKS * tick);
-            was = now;
+    /// How long `a`, whose loop wakes every `gap` ms, takes to declare a `b` that
+    /// never answers dead, and how long after that it prunes the tombstone — both in
+    /// real time, counted by the test; and the rig, for its counters.
+    async fn time_to_dead_and_to_prune(gap: u64) -> (u64, u64, Rig) {
+        let mut rig = a_knowing_b().await;
+        let mut elapsed = 0;
+        while !rig.declared_dead() {
+            assert!(elapsed < 60_000, "a never declared a silent member dead");
+            pass(gap).await;
+            elapsed += gap;
+        }
+        let dead_at = elapsed;
+        // Pruned: `a` greets the member once as it forgets it (issue #971). Nothing
+        // else is sent to a member held dead.
+        rig.inbox().await;
+        loop {
+            assert!(elapsed < dead_at + 120_000, "a never pruned the tombstone");
+            pass(gap).await;
+            elapsed += gap;
+            if rig.inbox().await.iter().any(|m| m.kind == Kind::Join) {
+                return (dead_at, elapsed - dead_at, rig);
+            }
         }
     }
 
-    /// The read ahead of a tick is bounded in datagrams and in time, so a flood cannot
-    /// keep the tick from running.
+    /// Detection of a real death does not degrade when the node doing the detecting is
+    /// persistently late: the state machine runs on the real clock. `a`'s only peer
+    /// dies; from then on every wake-up of `a`'s loop comes 400 ms late — each one a
+    /// stall. `a` has nobody else to probe, so nothing here can rest on a probe being
+    /// answered.
+    ///
+    /// The bound: a late node acts on a deadline at its first wake-up at or after it,
+    /// so each of the five steps to the verdict (the probe round begins; ack timeout;
+    /// indirect timeout; suspicion window; last probe) is late by at most one
+    /// wake-up's lateness, and nothing accumulates. The tombstone is not stretched
+    /// either: it is pruned `dead_ttl` after the verdict, give or take one wake-up —
+    /// which is what lets the link manager's window, twice `dead_ttl` on the same
+    /// clock (`held_dead_dial_window`), assume it.
+    #[tokio::test(start_paused = true)]
+    async fn a_persistently_late_node_declares_a_dead_member_within_five_wake_ups_of_on_time() {
+        let cfg = Config::default();
+        let tick = u64::try_from(TICK.as_millis()).unwrap();
+        let (on_time, pruned_after, rig) = time_to_dead_and_to_prune(tick).await;
+        assert_eq!(rig.count("stalls"), 0);
+        assert_eq!(pruned_after, cfg.dead_ttl_ms);
+
+        let late_by = 400;
+        let (late, pruned_after, rig) = time_to_dead_and_to_prune(tick + late_by).await;
+        assert!(rig.count("stalls") > 10, "every wake-up was a stall");
+        assert_eq!(rig.count("silent"), 1);
+        assert!(
+            late <= on_time + 5 * late_by,
+            "on time: dead after {on_time} ms; waking {late_by} ms late: after {late} ms"
+        );
+        assert!(
+            (cfg.dead_ttl_ms..=cfg.dead_ttl_ms + tick + late_by).contains(&pruned_after),
+            "the tombstone lasted {pruned_after} ms on a late node; dead_ttl is {} ms",
+            cfg.dead_ttl_ms
+        );
+    }
+
+    /// The watch: a wake-up more than two ticks after the last is a stall of the gap
+    /// less the tick that was due; anything up to that is not.
+    #[test]
+    fn the_stall_watch_reports_a_wake_up_more_than_two_ticks_late() {
+        let tick = u64::try_from(TICK.as_millis()).unwrap();
+        let mut watch = StallWatch::new(TICK);
+        assert_eq!(watch.observe(0), None);
+        assert_eq!(watch.observe(tick), None);
+        assert_eq!(watch.observe(tick + 7), None);
+        assert_eq!(watch.observe(3 * tick), None);
+        assert_eq!(
+            watch.observe(5 * tick),
+            None,
+            "two ticks: late, not a stall"
+        );
+        assert_eq!(watch.observe(7 * tick + 1), Some(tick + 1));
+        assert_eq!(watch.observe(60_000), Some(60_000 - 8 * tick - 1));
+        assert_eq!(watch.observe(60_040), None);
+        // A monotonic clock does not go back; a reading that did is no stall.
+        assert_eq!(watch.observe(59_000), None);
+        assert_eq!(STALL_TICKS, 2);
+    }
+
+    /// The read ahead of a tick is bounded, so a flood cannot keep the tick from
+    /// running: a minimum that is read whatever the time — a loop preempted in the
+    /// middle of its read must not find its budget gone — and a maximum.
     #[test]
     fn the_read_ahead_of_a_tick_is_bounded() {
         let mut budget = DrainBudget::for_tick(Duration::from_hours(1));
@@ -1947,7 +2026,11 @@ mod stall_tests {
             .count();
         assert_eq!(granted, DRAIN_MAX_DATAGRAMS);
 
+        // No time at all: the minimum, and no more.
         let mut budget = DrainBudget::for_tick(Duration::ZERO);
-        assert!(!budget.take(), "no time, no read");
+        let granted = (0..2 * DRAIN_MAX_DATAGRAMS)
+            .filter(|_| budget.take())
+            .count();
+        assert_eq!(granted, DRAIN_MIN_DATAGRAMS);
     }
 }

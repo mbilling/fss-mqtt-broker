@@ -337,6 +337,8 @@ struct OtelInstruments {
     gossip_cert_requests: OtelCounter<u64>,
     swim_last_probes: OtelCounter<u64>,
     swim_stalls: OtelCounter<u64>,
+    swim_stalled_milliseconds: OtelCounter<u64>,
+    swim_awareness: OtelGauge<i64>,
     security_reloads: OtelCounter<u64>,
     revocation_evictions: OtelCounter<u64>,
     session_rehomes: OtelCounter<u64>,
@@ -494,6 +496,8 @@ impl OtelInstruments {
             gossip_cert_requests: meter.u64_counter("gossip_cert_requests").build(),
             swim_last_probes: meter.u64_counter("swim_last_probes").build(),
             swim_stalls: meter.u64_counter("swim_stalls").build(),
+            swim_stalled_milliseconds: meter.u64_counter("swim_stalled_milliseconds").build(),
+            swim_awareness: meter.i64_gauge("swim_awareness").build(),
             security_reloads: meter.u64_counter("security_reloads").build(),
             revocation_evictions: meter.u64_counter("revocation_evictions").build(),
             session_rehomes: meter.u64_counter("session_rehomes").build(),
@@ -675,10 +679,19 @@ pub struct Metrics {
     /// only if it is read at the right moment.
     swim_last_probes_total: Family<RunOutcomeLabel, Counter>,
     /// Times the SWIM driver found that this node itself had been stalled: its loop,
-    /// which runs every 100 ms, was not scheduled for more than 200 ms. The stalled time
-    /// is left out of the failure detector's clock, so it does not become a verdict
-    /// about a peer; it is still time in which this node answered nobody.
+    /// which runs every 100 ms, was not scheduled for more than 200 ms. A stall moves no
+    /// timer and reaches no verdict about a peer (the driver reads its socket before
+    /// it ticks); it is time in which this node answered nobody.
     swim_stalls_total: Counter,
+    /// The milliseconds those stalls lasted, summed: `rate()` of it over 1000 is the
+    /// fraction of time the membership task was not running, and it over
+    /// `swim_stalls_total` is the length of a stall.
+    swim_stalled_milliseconds_total: Counter,
+    /// This node's local-health awareness (ADR 0016 §2): 0 when healthy, up to 8. Its
+    /// ack timeouts and suspicion windows are (1 + this) times the release's, so a
+    /// node above 0 is slower to declare a peer dead; it rises when the node has to
+    /// refute a suspicion of itself and falls with each probe a peer answers.
+    swim_awareness: Gauge,
     security_reloads_total: Family<OutcomeLabel, Counter>,
     revocation_evictions_total: Family<ReasonLabel, Counter>,
     session_rehomes_total: Family<ReasonLabel, Counter>,
@@ -1282,7 +1295,18 @@ impl Metrics {
             &mut registry,
             "swim_stalls",
             "Times this node's SWIM driver was not scheduled for more than two of its \
-             100 ms ticks; the stalled time is left out of the failure detector's clock",
+             100 ms ticks",
+        );
+        let swim_stalled_milliseconds_total = register_counter(
+            &mut registry,
+            "swim_stalled_milliseconds",
+            "Milliseconds this node's SWIM driver was not scheduled, summed over its stalls",
+        );
+        let swim_awareness = register_gauge(
+            &mut registry,
+            "swim_awareness",
+            "SWIM local-health awareness (0 healthy; ack timeouts and suspicion windows \
+             are multiplied by 1 + this)",
         );
         let security_reloads_total = register_family(
             &mut registry,
@@ -1820,6 +1844,8 @@ impl Metrics {
             gossip_cert_requests_total,
             swim_last_probes_total,
             swim_stalls_total,
+            swim_stalled_milliseconds_total,
+            swim_awareness,
             security_reloads_total,
             revocation_evictions_total,
             session_rehomes_total,
@@ -2559,10 +2585,19 @@ impl Metrics {
             .add(n, &[KeyValue::new("outcome", outcome.to_string())]);
     }
 
-    /// The SWIM driver found that this node had been stalled (ADR 0016).
-    pub fn swim_stalled(&self) {
+    /// The SWIM driver found that this node had not been scheduled for `stalled_ms`
+    /// (ADR 0016).
+    pub fn swim_stalled(&self, stalled_ms: u64) {
         self.swim_stalls_total.inc();
         self.otel.swim_stalls.add(1, &[]);
+        self.swim_stalled_milliseconds_total.inc_by(stalled_ms);
+        self.otel.swim_stalled_milliseconds.add(stalled_ms, &[]);
+    }
+
+    /// This node's SWIM local-health awareness changed (ADR 0016 §2).
+    pub fn set_swim_awareness(&self, awareness: u8) {
+        self.swim_awareness.set(i64::from(awareness));
+        self.otel.swim_awareness.record(i64::from(awareness), &[]);
     }
 
     /// A hot reload of the security policy completed with `outcome` (`"ok"` for an applied
@@ -3700,7 +3735,9 @@ mod tests {
         m.swim_last_probes("sent", 3);
         m.swim_last_probes("spared", 2);
         m.swim_last_probes("silent", 1);
-        m.swim_stalled();
+        m.swim_stalled(300);
+        m.swim_stalled(1200);
+        m.set_swim_awareness(2);
         // Issue #239: the three replication gauges move together, from one setter. The
         // write floor is the alertable one — docs/OPERATIONS.md makes
         // `min_actual < write_floor` the PAGE rule — so its NAME and the fact that it is
@@ -3757,7 +3794,9 @@ mod tests {
             "mqttd_swim_last_probes_total{outcome=\"sent\"} 3",
             "mqttd_swim_last_probes_total{outcome=\"spared\"} 2",
             "mqttd_swim_last_probes_total{outcome=\"silent\"} 1",
-            "mqttd_swim_stalls_total 1",
+            "mqttd_swim_stalls_total 2",
+            "mqttd_swim_stalled_milliseconds_total 1500",
+            "mqttd_swim_awareness 2",
         ] {
             assert!(out.contains(series), "{series}: {out}");
         }

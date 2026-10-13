@@ -804,7 +804,9 @@ same figures) and measured what the table leaves out:
 
 - **the bound**, now a test (`a_member_cut_off_for_up_to_two_seconds_is_not_declared_dead`,
   in place of `a_short_cut_still_ends_in_a_false_dead_on_the_default_window`): a member
-  cut off for up to 2 s is declared `Dead` by no node, at 3 to 30 nodes;
+  cut off for up to 2 s is declared `Dead` by no node, at 3 to 30 nodes (on the
+  simulation's tick grid; what holds in a broker is 2 s less twice the latency — see
+  "As hardened" below);
 - **the price**: a member that really died is held `Dead` by every survivor about
   0.3 s later in the median, up to 0.6 s later at worst;
 - **formation** is untouched (a formation raises no suspicion, so no probe is sent);
@@ -822,18 +824,23 @@ same figures) and measured what the table leaves out:
 found the bound open on one side: a *prober* that was itself not scheduled for longer
 than the ack timeout could wake, find the probe's deadline past and the suspect's `Ack`
 unread, and declare it `Dead`. The driver now reads its socket before a tick may
-expire anything, keeps the time it was stalled off the failure detector's clock, and
-takes the stall as evidence about its own health; the probe's `Ack` must come from the
-generation that is suspected; and the bound is stated as what it is — arithmetic on the
-release's timings: no node suspects a cut-off member sooner than 0.6 s into the cut
-(two 250 ms timeouts, each acted on at the next 100 ms tick) nor asks it the last time
-sooner than the window's floor of 1.5 s after that, so **a cut of up to 2098 ms** has
-ended before the question is put. Two seconds has 98 ms to spare, all of it the tick;
-the table's 2.5 s column is where it stops being zero. The packet-loss cells are
-re-measured with both detectors on the same network: with one datagram in ten lost
-and nobody at fault, a false verdict within 75 s in 11 runs of 32 at 30 nodes against
-24 without the probe, in 1 against 10 at 14 nodes, in none against 2 at 10. ADR 0016's
-amendment of the same day for #1002 has the rest.
+expire anything, and that is all it does about its own lateness: the failure
+detector's clock is real time, so a node that is late sees a real death at most one
+wake-up's lateness later at each of five steps, and no later. (A first version also
+kept stalled time off that clock and raised the node's awareness; a persistently
+late lone survivor then took 64 s to see a death, against 5.7 s. Withdrawn.) The
+probe's `Ack` must come from the generation that is suspected. And the bound is
+stated as what it is — arithmetic on the release's timings: no node suspects a
+cut-off member sooner than two ack timeouts into the cut, nor asks it the last time
+sooner than the window's floor of 1.5 s after that, so **in a broker a cut of up to
+2 s less twice the network's latency** has ended before the question is put. The
+table above reaches 2 s, and 2098 ms, because the simulation's ticks land exactly on
+a 100 ms grid and so round each 250 ms timeout up to 300; a broker's ticks are on no
+grid and cannot count on that. The table's 2.5 s column is where the zeros stop. The
+packet-loss cells are re-measured with both detectors on the same network: with one
+datagram in ten lost and nobody at fault, a false verdict within 75 s in 11 runs of
+32 at 30 nodes against 27 without the probe, in 2 against 10 at 14 nodes, in none
+against 3 at 10. ADR 0016's amendment of the same day for #1002 has the rest.
 
 Under this record's design a verdict costs latency, not a message; with the probe a
 short outage of one member no longer costs that either. What is left of #975 —
