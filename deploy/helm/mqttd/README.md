@@ -137,6 +137,14 @@ Grafana dashboards live in
 [`deploy/observability/grafana/`](../../observability/grafana/) — not only inside
 the experimental `demo/` stack.
 
+The rules are loaded and unit-tested by `promtool` in CI
+(`scripts/k8s/check-alert-rules.sh`; the tests are in [`ci/alerts/`](ci/alerts/)). Among
+them: `MqttdTlsExpiryWarning` and `MqttdTlsExpiryImminent`, over the time to expiry each
+broker exports for every certificate, CA and revocation list it has loaded
+([`docs/OPERATIONS.md`](../../../docs/OPERATIONS.md#certificate-lifetimes-what-the-broker-tells-you-adr-0088)).
+Renew a certificate before two thirds of its lifetime are spent (cert-manager:
+`renewBefore` above a third of `duration`) and neither fires.
+
 ## Related
 
 - Operator / CRD: [`../mqttd-operator/README.md`](../mqttd-operator/README.md)

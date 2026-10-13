@@ -352,6 +352,10 @@ pub struct Reloader {
     /// Set by [`attach_config_source`](Self::attach_config_source) (ADR 0046 T4): the whole
     /// config is re-loaded, validated, and swapped ahead of the policy rebuild.
     config_source: Option<ConfigSource>,
+    /// Set by [`attach_tls_expiry`](Self::attach_tls_expiry) (ADR 0088 D2): run once a
+    /// reload has swapped everything in, to re-read the validity windows of the TLS
+    /// material now loaded.
+    tls_expiry_refresh: Option<Box<dyn Fn() + Send + Sync>>,
     /// Serializes reloads: SIGHUP, the file watcher and the admin API can fire at once,
     /// and the config swap / rollback must not interleave.
     in_progress: std::sync::Mutex<()>,
@@ -408,6 +412,7 @@ impl Reloader {
                 rules_tx: None,
                 rules_build: None,
                 config_source: None,
+                tls_expiry_refresh: None,
                 in_progress: std::sync::Mutex::new(()),
             },
             Handles {
@@ -542,6 +547,15 @@ impl Reloader {
     /// effect on `SIGHUP`/watch, folded into the same atomic validate-before-swap.
     pub fn attach_config_source(&mut self, source: ConfigSource) {
         self.config_source = Some(source);
+    }
+
+    /// Register the refresh of the TLS expiry gauges and warnings (ADR 0088 D2): `refresh`
+    /// runs after every reload that **committed**, once the new acceptors, connectors and
+    /// revocation lists are in place, and re-reads the validity windows of the files they
+    /// were built from. A rejected reload does not run it: the material in force is still
+    /// the old one, and so are its windows. It decides nothing about the reload.
+    pub fn attach_tls_expiry(&mut self, refresh: impl Fn() + Send + Sync + 'static) {
+        self.tls_expiry_refresh = Some(Box::new(refresh));
     }
 
     /// Re-read the sources and swap the policy in place — **validate-before-swap**: build the
@@ -690,6 +704,10 @@ impl Reloader {
                 // The admin listener (ADR 0081 T18): the next admin handshake serves it.
                 if let Some(Ok(commit)) = admin_tls {
                     commit();
+                }
+                // The time to expiry of what was just loaded (ADR 0088 D2).
+                if let Some(refresh) = &self.tls_expiry_refresh {
+                    refresh();
                 }
                 // The rule engine (ADR 0083): the next publish runs the new rules.
                 if let (Some(tx), Some(Ok(set))) = (&self.rules_tx, rules) {
@@ -1095,6 +1113,42 @@ mod tests {
             &mqtt_core::ClientId("c".into()),
             &"t".to_string()
         ));
+    }
+
+    /// ADR 0088 D2: the expiry of what is loaded is re-read after a reload that committed,
+    /// and only then — a rejected reload leaves the old material, and its windows, in force.
+    #[test]
+    fn the_tls_expiry_refresh_runs_after_a_committed_reload_and_not_a_rejected_one() {
+        use std::sync::atomic::AtomicUsize;
+
+        let initial: (Arc<dyn Authorizer>, Arc<dyn Authenticator>) = (
+            Arc::new(AllowAll),
+            Arc::new(mqtt_auth::basic::BasicAuthenticator {
+                allow_anonymous: true,
+            }),
+        );
+        let fail = Arc::new(AtomicBool::new(false));
+        let failing = fail.clone();
+        let (mut reloader, _handles) = Reloader::new(initial, audit(), move || {
+            if failing.load(Ordering::SeqCst) {
+                return Err("acl file: parse error at line 3".to_string());
+            }
+            ok_auth_pair()
+        });
+        let refreshed = Arc::new(AtomicUsize::new(0));
+        let counter = refreshed.clone();
+        reloader.attach_tls_expiry(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+
+        assert!(reloader.reload("watch"));
+        assert_eq!(refreshed.load(Ordering::SeqCst), 1);
+        fail.store(true, Ordering::SeqCst);
+        assert!(!reloader.reload("watch"));
+        assert_eq!(refreshed.load(Ordering::SeqCst), 1, "rejected: not re-read");
+        fail.store(false, Ordering::SeqCst);
+        assert!(reloader.reload("signal"));
+        assert_eq!(refreshed.load(Ordering::SeqCst), 2);
     }
 
     /// Each reload increments `security_reloads_total`, labelled by outcome.

@@ -73,6 +73,12 @@ client_ca = "/etc/mqttd/tls/client-ca.crt"
 # OFF by default, loudly logged while on, an ERROR without allow_tls12. This reopens the
 # triple-handshake surface for exactly those clients; plan its retirement.
 # allow_unsafe_tls12_features = true
+# How much of its lifetime a certificate, CA or revocation list may spend before the broker
+# warns about it, in thousandths (1..=1000; default 667, two thirds). Applies to every TLS
+# material the broker loads, the cluster bus's and the admin listener's included: the log
+# warning, the mqttd_tls_expiry_warn_ratio gauge the shipped alert compares against, and
+# --check-tls / --check-config all use it. Renew earlier than this and nothing is said.
+# expiry_warn_permille = 667
 
 [security]
 # Anonymous access is OFF by default and loudly logged when enabled — do not enable in prod.

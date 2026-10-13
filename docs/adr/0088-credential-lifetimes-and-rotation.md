@@ -270,8 +270,62 @@ Accepted as proposed on 2026-10-13, with the record:
 - Every renewal makes each peer learn a new certificate. ADR 0016's 2026-10-12 amendment
   (the first datagram to each destination carries it) is what makes that uneventful.
 
+## Amendment (2026-10-13): expiry made visible, as built in T1
+
+D2 is built as written. What it left open, and how each was settled:
+
+- **The series and their label.** `mqttd_tls_expiry_seconds{role}` (seconds to the end;
+  negative once expired, so "expired" is `< 0`) and `mqttd_tls_lifetime_spent_ratio{role}`
+  (0 when new and before `notBefore`, 1 at the end, above 1 after it). `role` is the only
+  label and a fixed set of eight: `listener`, `client_ca`, `client_crl` (the `[tls]`
+  files), `peer`, `peer_ca`, `peer_crl` (`[cluster.peer_tls]`), `admin`, `admin_ca`
+  (`[admin]`). D2 named the three certificates; the two client-facing CA bundles and the
+  client CRL fail their listeners the same way and are loaded by the same code, so they
+  are exported too. A role is exported only while something serves it.
+- **A file with several certificates is reported by the one that expires first.** A chain
+  file whose intermediate ends before its leaf is the intermediate's series, and a CA
+  bundle is its oldest CA's. Both numbers of a series come from that one certificate. A
+  separate `…_chain` role was the alternative; it adds series that are almost always
+  redundant, and an operator who watches `peer` would not be watching it.
+- **A CRL without `nextUpdate` has no series.** It has no window to spend. `--check-tls`
+  says so.
+- **The threshold is per mille:** `tls.expiry_warn_permille`, `1..=1000`, default `667`.
+  The config structs derive `Eq`, so a float is not available, and one unit in the file
+  and the environment avoids the trap `cluster.shared_local_bias_permille` documents.
+  O8's two thirds is therefore 66.7%, not 66.67%. It is read at startup, as the rest of
+  `[tls]` is, and applies to every role.
+- **The node exports its threshold** (`mqttd_tls_expiry_warn_ratio`), so the chart's
+  warning compares each series with the node's own setting and holds no copy of it.
+- **The log's rate:** a line when a role is first seen past the threshold or expired (at
+  startup, after the reload that loaded the file, or within a minute of the crossing),
+  then at most once an hour per role. A reload that leaves a file unchanged does not
+  restart the hour.
+- **The page is capped at 30 days.** `MqttdTlsExpiryImminent` needs less than a tenth of
+  the lifetime *and* less than 30 days left (or expired). Without the cap a ten-year CA
+  pages for its last year. The cap does not touch lifetimes under 300 days.
+- **`--check-tls` loses its fixed 30 days** for the same fraction, and gains the `[admin]`
+  set. A certificate that lives a day always had "under 30 days left". Exit statuses are
+  unchanged: an expired certificate fails, a stale CRL warns.
+- **Rule tests.** The chart had none. `promtool test rules` now runs in the helm CI job
+  over the rendered `PrometheusRule`.
+
+Two things T1 found and did not change:
+
+- **A long-lived CA warns for a long time.** Two thirds of ten years leaves more than
+  three years of warning, hourly in the log. D2 asks for "the same for the cluster CA",
+  and that is what is built; whether a CA should have its own threshold is a question
+  for whoever lives with it.
+- **The QUIC listener does not reload its certificate** (ADR 0036). On a node whose only
+  client-facing TLS is QUIC, the `listener` and `client_ca` series stay those of startup
+  after a reload, because that is what QUIC still serves.
+
 ## Not verified
 
+- T1 did not test what the broker does with a **cluster CA** that is past `notAfter`, or
+  with a **CRL** past `nextUpdate`. D2 says they "fail a cluster the same way". The CRL
+  does not: `--check-tls` already documented that a stale list still loads, and no code
+  path reads `nextUpdate` to refuse one. The CA was not checked either way. Their expiry
+  is exported and warned about regardless.
 - That nothing ends an established peer link at its peer's certificate expiry was read
   from `crates/mqttd/src/peer.rs` (admission checks the CRL; no expiry check or timer was
   found), not shown by a test. T3 starts by writing that test.

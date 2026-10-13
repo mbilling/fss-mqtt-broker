@@ -127,8 +127,12 @@ pub struct Listeners {
     pub quic_allow_anonymous: Option<bool>,
 }
 
+/// The default of [`Tls::expiry_warn_permille`]: two thirds of a lifetime (ADR 0088 O8),
+/// rounded up to the next thousandth.
+pub const DEFAULT_TLS_EXPIRY_WARN_PERMILLE: u16 = 667;
+
 /// TLS material for the client listeners. Paths, never inlined key bytes (ADR 0046 T5).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Tls {
     /// Server certificate chain PEM (`MQTTD_TLS_CERT`).
@@ -157,6 +161,30 @@ pub struct Tls {
     /// logged when on, and a configuration ERROR without [`Tls::allow_tls12`] — a
     /// relaxation of something that is off cannot mean anything.
     pub allow_unsafe_tls12_features: bool,
+    /// How much of its lifetime a certificate, CA or revocation list may spend before the
+    /// broker warns about it (`MQTTD_TLS_EXPIRY_WARN_PERMILLE`, ADR 0088 D2), in
+    /// thousandths: `1..=1000`, default `667` (two thirds). It applies to every TLS
+    /// material the broker loads, the cluster bus's and the admin listener's included,
+    /// and is the threshold of the log warning, of `mqttd_tls_expiry_warn_ratio` (which
+    /// the shipped alert compares against) and of `--check-tls` and `--check-config`.
+    /// Per mille and not a fraction because this struct derives `Eq`; `1000` warns only
+    /// at expiry. Read at startup.
+    pub expiry_warn_permille: u16,
+}
+
+impl Default for Tls {
+    fn default() -> Self {
+        Self {
+            cert: None,
+            key: None,
+            client_ca: None,
+            crl: None,
+            session_cache: None,
+            allow_tls12: false,
+            allow_unsafe_tls12_features: false,
+            expiry_warn_permille: DEFAULT_TLS_EXPIRY_WARN_PERMILLE,
+        }
+    }
 }
 
 /// Authentication + authorization policy. Secure by default: no anonymous access, mTLS
@@ -1408,6 +1436,9 @@ impl Config {
         if get("MQTTD_TLS_ALLOW_UNSAFE_TLS12_FEATURES").is_some() {
             self.tls.allow_unsafe_tls12_features = true;
         }
+        on!("MQTTD_TLS_EXPIRY_WARN_PERMILLE", v, {
+            self.tls.expiry_warn_permille = num("MQTTD_TLS_EXPIRY_WARN_PERMILLE", &v)?;
+        });
 
         // -- security -- (MQTTD_ALLOW_ANONYMOUS: presence = on; require_client_cert is derived,
         // has no env var by design)
@@ -1998,6 +2029,17 @@ impl Config {
                  fraction), got {bias}"
             )));
         }
+        // The expiry warning's threshold (ADR 0088 D2) is a fraction of a lifetime in
+        // (0, 1], written per mille. Zero would warn about a certificate the moment it is
+        // issued, and above 1000 never before it has expired: both are mistakes (the
+        // second most likely a value meant for another unit), and neither is clamped.
+        let warn = self.tls.expiry_warn_permille;
+        if !(1..=1000).contains(&warn) {
+            return Err(ConfigError::Invalid(format!(
+                "tls.expiry_warn_permille (MQTTD_TLS_EXPIRY_WARN_PERMILLE) must be \
+                 1..=1000 thousandths of a lifetime (667 = two thirds), got {warn}"
+            )));
+        }
         // Which certificate field is the principal is not a setting to get wrong quietly:
         // an unrecognised value must not degrade to the CN default, or a SAN-keyed ACL
         // would silently start matching against a CA-chosen Common Name (ADR 0004 T11).
@@ -2384,6 +2426,7 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_TLS_SESSION_CACHE",
     "MQTTD_TLS_ALLOW_TLS12",
     "MQTTD_TLS_ALLOW_UNSAFE_TLS12_FEATURES",
+    "MQTTD_TLS_EXPIRY_WARN_PERMILLE",
     // security
     "MQTTD_ALLOW_ANONYMOUS",
     "MQTTD_MTLS_IDENTITY_SOURCE",
@@ -3625,6 +3668,7 @@ mod tests {
             | "MQTTD_OIDC_MAX_STALE"
             | "MQTTD_BACKUP_EVERY"
             | "MQTTD_TLS_SESSION_CACHE"
+            | "MQTTD_TLS_EXPIRY_WARN_PERMILLE"
             | "MQTTD_ADMIN_PEER_PORT"
             | "MQTTD_RULES_SYS_INTERVAL"
             | "MQTTD_RULES_TRACE_RATE"
@@ -3752,6 +3796,43 @@ mod tests {
         }
     }
 
+    /// ADR 0088 D2 (O8): the expiry warning's threshold defaults to two thirds of a
+    /// lifetime and is a fraction in (0, 1], per mille, in the file and the environment.
+    #[test]
+    fn the_tls_expiry_warning_threshold_defaults_to_two_thirds_and_is_bounded() {
+        let flag = "\n[durable]\nallow_ephemeral = true\n";
+        assert_eq!(Config::default().tls.expiry_warn_permille, 667);
+        assert_eq!(
+            Config::from_toml(&format!("[tls]\ncert = \"/x\"{flag}"))
+                .unwrap()
+                .tls
+                .expiry_warn_permille,
+            667,
+            "a [tls] section that does not name it keeps the default"
+        );
+        for good in [1, 500, 1000] {
+            let c = Config::from_toml(&format!("[tls]\nexpiry_warn_permille = {good}{flag}"))
+                .unwrap_or_else(|e| panic!("{good}: {e}"));
+            assert_eq!(c.tls.expiry_warn_permille, good);
+        }
+        for bad in [0, 1001, 6670] {
+            let err = Config::from_toml(&format!("[tls]\nexpiry_warn_permille = {bad}{flag}"))
+                .expect_err("out of range");
+            assert!(
+                err.to_string().contains("tls.expiry_warn_permille"),
+                "{bad}: {err}"
+            );
+        }
+        let mut c = Config::default();
+        c.overlay_from(getter(&[("MQTTD_TLS_EXPIRY_WARN_PERMILLE", "800")]))
+            .unwrap();
+        assert_eq!(c.tls.expiry_warn_permille, 800);
+        let err = Config::default()
+            .overlay_from(getter(&[("MQTTD_TLS_EXPIRY_WARN_PERMILLE", "0.667")]))
+            .expect_err("a fraction is not per mille");
+        assert!(err.to_string().contains("MQTTD_TLS_EXPIRY_WARN_PERMILLE"));
+    }
+
     #[test]
     fn the_env_surface_is_a_deduplicated_curated_list() {
         // Every var appears exactly once — a duplicate would be a copy/paste bug that hides a
@@ -3788,8 +3869,9 @@ mod tests {
             // and MQTTD_RULES_FUNCTIONS_ENV (ADR 0086),
             // plus MQTTD_RULES_STATE_MAX_BYTES and MQTTD_RULES_STATE_EXPIRY_PER_SEC
             // (ADR 0085),
-            // plus MQTTD_RULES_FUNCTION_MAX_MS (ADR 0086, the ceiling on one call).
-            124,
+            // plus MQTTD_RULES_FUNCTION_MAX_MS (ADR 0086, the ceiling on one call),
+            // plus MQTTD_TLS_EXPIRY_WARN_PERMILLE (ADR 0088 D2).
+            125,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never
