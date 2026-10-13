@@ -148,9 +148,10 @@ not run: the re-formed cluster did not reach a full mesh
 hours is not bounded by a repeat, only by the 1-site controls around each ladder. Brokers
 11–14 sit in a second placement group and may share a physical host with another broker.
 With the two campaigns above, 733,316,488 messages ledgered, none lost. These runs inject
-no fault: a broker that wrongly holds a live member dead acknowledges QoS 1 publishes it
-does not deliver ([#973](https://github.com/mbilling/fss-mqtt-broker/issues/973)), and
-nothing here provokes that. Every rung, the
+no fault: a broker that holds a member dead and cannot reach it for eight seconds
+acknowledges QoS 1 publishes it does not deliver
+([#973](https://github.com/mbilling/fss-mqtt-broker/issues/973)), and nothing here
+provokes that. Every rung, the
 rig's verdicts, the cross-node counters and the commands:
 [durable-scaleout-10-12-14.md](bench/scale/durable-scaleout-10-12-14.md).
 

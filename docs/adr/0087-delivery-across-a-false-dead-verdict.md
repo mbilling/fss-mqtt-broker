@@ -253,6 +253,63 @@ which it drops today (gap 3). Consequences, all from code that already exists:
   registered as a `Shared` obligation toward one of them and held.
 - QoS 0 for an unreachable peer is not forwarded, as today, and is now counted (D9).
 
+**As built (0087-T2).** `peer_dead` drops the link and erases nothing; the hub holds the
+peer as *unreachable* (`VerdictHold`) with its interest, `$share` members, negotiated
+protocol, forward window and every obligation toward it. `peer_disconnected` keeps
+`$share` membership as it kept interest.
+
+- *What ends a hold, until D2 exists.* Confirmation that a peer is gone is not built
+  (T3), so the hold is bounded by what the verdict already cost: **8 sweep ticks** (8 s,
+  `REROUTE_GRACE_TICKS`) with no link, counted from the verdict, or from the loss of a
+  link the peer had under the verdict. Then the peer's state is erased and what it was
+  still owed is resolved as `peer_dead` resolved it at the verdict before: the
+  obligation discharged and its publisher acknowledged with no answer from anyone. (A
+  `$share` delivery whose group has nobody left is acknowledged the same way, as D2's
+  table has it. Erasing at the verdict withheld one that was in flight at that instant
+  and acknowledged one made a moment later; held together, they are one case — and
+  withholding every publish made to such a group during the hold would close each of
+  those publishers' connections at once.) A forward
+  in flight at the verdict is answered on the same sweep it was answered on before, and
+  a publish that arrives during the hold with it — so a node that really died holds no
+  publisher longer than it did. A link that returns ends the hold: from then on only
+  the peer's answer discharges what it is owed. T3 replaces the countdown and that
+  resolution with D2's; until it does, a peer that is alive and out of reach for longer
+  than the hold — a real partition — is still acknowledged for, undelivered, after it.
+- *The successor.* A peer that newly announces matching interest is sent the publish as
+  a re-route, and that forward stands in for what the unreachable peer was owed — today's
+  discharge, kept so that a real owner death costs the failover pause and not the hold.
+  It cannot tell a durable session that moved from a clean session that did not (D8), so
+  a clean-session subscriber on a peer falsely held dead still loses a publish for which
+  another node starts announcing the same interest before the peer's link is back. T5.
+- *`$share`.* A member behind a lost link or on a peer under a verdict stays in its
+  group, marked not reachable: the selector takes any member that can receive now, then a
+  local persistent member, then a remote member on a node with a link, and one of these
+  only when the group has no other — and then the publish is owed to it and held. A
+  delivery in flight at a verdict re-selects at once when the group has a member on
+  another node, at any later tick of the hold at which one has appeared (the group's
+  consumers reconnecting elsewhere), and stays owed until then (it was withheld from the
+  publisher before). Two things the sentence "all from code that already exists" above did not
+  cover: a `$share` delivery to a member with no link was *not* an obligation — the
+  frame is chosen by the link's negotiated protocol, which read as the oldest for a peer
+  with no link, i.e. fire-and-forget, dropped, the publisher acknowledged — so the hub
+  now answers with the protocol the peer's last link negotiated; and a delivery owed no
+  answer (QoS 0, a Will, an event-derived message) to a group with no reachable member
+  is counted `publish_dropped{reason="no-shared-member"}`.
+- *When a held forward goes out.* The sweep retransmits only a forward that is overdue,
+  so one recorded less than a tick before the link returned would wait a further tick.
+  What a peer is owed is therefore sent when its first interest snapshot arrives on the
+  new link — not at link-up: a peer that has just restarted answers a forward it cannot
+  place with a failure until its own view is settled, and does not announce before then.
+- *A draining node.* A publish the hub gated itself during the drain has nobody to retry
+  it and a deadline: its `$share` delivery does not wait for an unreachable member and
+  takes its fallback at the verdict, as before.
+- *Measured* (`false_dead_delivery.rs`): with T4, every flow's first publish is
+  acknowledged 0.50 s after the verdict and delivered — one redial delay and a
+  handshake — the `$share` flows included, in both orientations, plain and durable. With
+  the link alone cut and no verdict, every publish is held until the link is back (1.2 s
+  in the test) and then delivered; before, the two `$share` flows were acknowledged at
+  the link's return and lost.
+
 ### D2 — When a peer is confirmed gone, and how what was held is resolved
 
 A held obligation ends in one of four ways.
@@ -320,7 +377,8 @@ The publisher's PUBREC is the gated answer; it is held like a PUBACK. Exactly-on
 the hold rests on the receiver recognising a retransmitted forward, so the forward window
 for a peer under a verdict is **kept** until the peer is confirmed gone (today `peer_dead`
 drops it, and a forward retransmitted across a false verdict is delivered twice with
-DUP = 0). A re-route to a durable session's new owner is covered by the origin id of
+DUP = 0). *(As built, 0087-T2: kept for as long as the peer's routing state is — the
+hold of D1 — and dropped with it; T3 moves that to confirmation.)* A re-route to a durable session's new owner is covered by the origin id of
 proto 12. Observed today and unchanged by this design: in durable mode the first QoS 2
 publish after the verdict can be answered by closing the connection, because the
 publisher's own dedup record has a replica on the node just written off.
@@ -386,10 +444,10 @@ aborting it, and `peer.rs` (`dial_member`) keeps dialing under the verdict:
   to resolve it, holding every matching publish for a node that is not coming back.
   So the hub remembers the verdict until the link manager withdraws it
   (`HubCommand::PeerAlive`, on the `Alive` that follows a `Dead`), and the loss of a
-  link to a peer held `Dead` is handled as the verdict was. (The second case exists
-  without this task, in the orientation where the evicted node dials; it was found
-  while building it.) D1 replaces "as the verdict was" with a hold, and T3 with a
-  confirmation.
+  link to a peer held `Dead` is handled as the verdict is: since 0087-T2, by the hold
+  of D1, started again. (The second case exists without this task, in the orientation
+  where the evicted node dials; it was found while building it.) T3 replaces the hold
+  with a confirmation.
 - *What the verdict was protecting.* On the accept side, nothing: `serve_listener` never
   consulted membership, which is why the other orientation already healed in a second.
   What a link requires is unchanged and is all in the handshake — the cluster CA's
@@ -449,7 +507,9 @@ pause is wrong.)*
 ### D9 — Observability
 
 - `mqttd_publish_held_for_unreachable{peer}` (gauge): obligations held for a peer with
-  no link, and whether the peer is under a verdict.
+  no link, and whether the peer is under a verdict. *(As built, 0087-T2: the node's
+  total, without the label — publishes with a forward owed to a node that has no link.
+  The split by peer and by verdict is T7's.)*
 - `mqttd_publish_resolved_undeliverable_total{reason}`: publishes acknowledged at D2's
   confirmation because their subscriber's node was confirmed gone, by reason
   (`peer-gone`, `no-shared-member`).
@@ -599,8 +659,12 @@ with every node on the rule, 5 with one node left on v1.1.0, 11 with half, 16 wi
 - QoS 0, Wills and event-derived messages were not measured across a verdict; their rows
   in §1 are from the code.
 - The proto-6 rows of §1 are from the code; no supported release speaks proto 6.
-- D5 is built (0087-T4). D1–D4 and D6–D9 are designed against the code and not built;
-  D3's table-fill arithmetic is not a measurement.
+- D5 is built (0087-T4), and D1, D4 and D6 (0087-T2) with the bound D1 states in place
+  of D2. D2, D3, D7–D9 are designed against the code and not built; D3's table-fill
+  arithmetic is not a measurement.
+- With D1 built, the hot path was checked by reading the diff — `forward_to_peers`,
+  `register_forward` and the constant-time `$share` path are untouched — and by the
+  publish-dispatch micro-benchmark (`benches/shared_plan.rs`), not on the rig.
 - A peer that is unreachable by TCP while its host is up but silent (a dropped SYN, not a
   refused one) was not run: the 5 s bound on an attempt under a verdict is from the code.
   A host that accepts the connection and then says nothing is run, on loopback, against

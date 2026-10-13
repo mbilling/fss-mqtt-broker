@@ -436,6 +436,15 @@ and `mqttd_publish_dropped_total{reason="pending-cap"}` counts it. Watch
 counter: a table that keeps growing at a steady offered rate means ack latency is
 growing, which is the thing to go and find. QoS 0 never enters the table.
 
+The same table is where a publish waits for a peer that cannot be reached (ADR 0087):
+one owed to a subscriber on a node whose link is down, or that this node holds dead, is
+held there until the link returns — for a node held dead, for at most eight seconds
+without a link. `mqttd_publish_held_for_unreachable` is that subset. While it is above
+zero the table fills at *offered QoS ≥ 1 rate × the share owed to that node*, with no
+ack latency to drain it — 40,000 msg/s with a tenth owed to the unreachable node reaches
+the entry bound in 16 seconds — and a publisher's connection is held behind its oldest
+unanswered publish, since acknowledgements leave a connection in publish order.
+
 **Measured, not just claimed** (issue #244) — on **five broker processes sharing one
 8-core host**, which is the dominant caveat and is why the numbers are ratios rather than
 capacities: with two of five nodes' peer bus degraded so that one placement group's appends

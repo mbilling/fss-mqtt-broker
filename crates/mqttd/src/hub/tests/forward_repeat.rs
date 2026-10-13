@@ -382,9 +382,72 @@ async fn a_repeated_shared_delivery_is_re_answered_not_delivered_twice() {
     );
 }
 
+/// ADR 0087 D4, D6 — exactly-once across a verdict. The receiver holds the origin
+/// `Dead` (falsely: the origin is alive and still owes it this forward). The origin
+/// retransmits under the same seq when the link is back, and the copy is answered
+/// again, not applied again: one enqueue, at `QoS` 2 as at `QoS` 1. Until the window
+/// survived the verdict, `peer_dead` dropped it and the retransmission was a second
+/// delivery of the same message with `DUP = 0`.
+#[tokio::test]
+async fn a_forward_retransmitted_across_a_dead_verdict_is_applied_once() {
+    for qos in [QoS::AtLeastOnce, QoS::ExactlyOnce] {
+        let mut rig = Rig::new().await;
+        let forward = || HubCommand::RemotePublishAcked {
+            node: origin(),
+            seq: 9,
+            topic: TOPIC.into(),
+            payload: Bytes::from_static(b"once"),
+            qos,
+            retain: false,
+            message_expiry: None,
+            app: AppProperties::default(),
+            origin: None,
+            replay: false,
+        };
+        rig.dispatch(forward()).await;
+        assert_eq!(rig.queued().await, 1);
+
+        // The verdict: the link goes, the window stays.
+        rig.dispatch(HubCommand::PeerDead { node: origin() }).await;
+        assert!(
+            rig.receiver.forward_windows.contains_key(&origin()),
+            "{qos:?}: the window of a peer under a verdict is kept"
+        );
+
+        // The origin's link returns — it was never dead — and it retransmits.
+        let (peer_tx, to_sender): (PeerOutbound, _) = mpsc::unbounded_channel();
+        rig.to_sender = to_sender;
+        rig.dispatch(HubCommand::PeerConnected {
+            node: origin(),
+            conn_id: 2,
+            ctl: peer_tx.clone(),
+            tx: peer_tx,
+            cert_serial: None,
+            proto: mqtt_cluster::peer::PROTO_MAX,
+            depth: Arc::default(),
+        })
+        .await;
+        rig.dispatch(forward()).await;
+        assert_eq!(
+            rig.queued().await,
+            1,
+            "{qos:?}: a forward retransmitted across the verdict was applied twice"
+        );
+        let answers = rig.answers();
+        assert!(
+            matches!(
+                answers[..],
+                [(9, ForwardVerdict::Reached | ForwardVerdict::Stored)]
+            ),
+            "{qos:?}: and it is answered again, once, on the new link: {answers:?}"
+        );
+    }
+}
+
 /// The key cannot swallow a DIFFERENT message: an origin that restarted (an
 /// older build starts its seqs at 1 again) re-uses a remembered seq for new
-/// content, and that is applied. And an origin's window dies with it.
+/// content, and that is applied. And an origin's window goes when the origin does:
+/// not at the verdict (ADR 0087 D6), but when the hold has run out with no link.
 #[tokio::test]
 async fn a_re_used_seq_with_new_content_is_applied_and_a_dead_origin_is_forgotten() {
     let mut rig = Rig::new().await;
@@ -410,6 +473,10 @@ async fn a_re_used_seq_with_new_content_is_applied_and_a_dead_origin_is_forgotte
     );
 
     rig.receiver.peer_dead(&origin());
+    assert!(rig.receiver.forward_windows.contains_key(&origin()));
+    for _ in 0..crate::hub::REROUTE_GRACE_TICKS {
+        rig.receiver.sweep_verdict_holds();
+    }
     assert!(
         !rig.receiver.forward_windows.contains_key(&origin()),
         "a dead origin's window is dropped with the rest of its routing state"

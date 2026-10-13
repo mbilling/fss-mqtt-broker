@@ -10,9 +10,11 @@
 //! - **`Suspect`** — no action; routing continues until failure is confirmed, so
 //!   a transiently slow node loses nothing.
 //! - **`Dead`** — tell the hub, which drops the link (dropping its outbound sender
-//!   closes the link's pump on whichever side holds the socket). The dialer is
-//!   **not** stopped (ADR 0087 D5): it is told the peer is held `Dead` and keeps
-//!   dialing, backing off, for [`held_dead_dial_window`] — see below.
+//!   closes the link's pump on whichever side holds the socket) and holds the peer
+//!   as unreachable: its routing state is kept, and what its subscribers are owed
+//!   waits for it (ADR 0087 D1). The dialer is **not** stopped (D5): it is told
+//!   the peer is held `Dead` and keeps dialing, backing off, for
+//!   [`held_dead_dial_window`] — see below.
 //!
 //! A member that refutes its suspicion comes back as another `Alive` event, which
 //! returns its dialer to the ordinary pace, or starts one; redial-on-drop is the
@@ -36,9 +38,10 @@
 //! The verdict still stands while such a link is up, and it still means something:
 //! membership says `Dead` once, so the hub remembers it, and when the link of a
 //! peer held `Dead` goes, what the link brought back — the peer's interest, the
-//! forwards in flight to it — goes as it did at the verdict. A node that announces
-//! its own departure is the plain case: it is redialed while it drains, serves
-//! that link, and then exits without another word from membership.
+//! forwards in flight to it — is held for as long as it was at the verdict and no
+//! longer. A node that announces its own departure is the plain case: it is
+//! redialed while it drains, serves that link, and then exits without another word
+//! from membership.
 //!
 //! # When a dialer does stop
 //!

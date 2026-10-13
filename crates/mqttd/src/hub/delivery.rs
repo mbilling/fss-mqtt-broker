@@ -26,6 +26,8 @@ trait SharedSelectable {
     fn online(&self) -> bool;
     fn is_local(&self) -> bool;
     fn client(&self) -> &ClientId;
+    /// The member's home node; `None` for a member on this node.
+    fn node(&self) -> Option<&NodeId>;
 }
 
 impl SharedSelectable for SharedCandidate {
@@ -37,6 +39,9 @@ impl SharedSelectable for SharedCandidate {
     }
     fn client(&self) -> &ClientId {
         &self.client
+    }
+    fn node(&self) -> Option<&NodeId> {
+        self.node.as_ref()
     }
 }
 
@@ -70,6 +75,9 @@ impl SharedSelectable for SharedCandidateRef<'_> {
     }
     fn client(&self) -> &ClientId {
         self.client
+    }
+    fn node(&self) -> Option<&NodeId> {
+        self.node
     }
 }
 
@@ -1549,7 +1557,17 @@ impl Hub {
                     candidates[i].is_local() && self.is_persistent(candidates[i].client())
                 })
             })
-            // ...else a remote member (it queues at its home) so the message is not dropped.
+            // ...else a remote member (it queues at its home) so the message is not
+            // dropped — one whose node has a link, if any has: a member behind a lost
+            // link, or on a node membership holds dead, stays in its group (ADR 0087
+            // D1) and is owed the message only when there is nobody else to give it to.
+            .or_else(|| {
+                rotated().find(|&i| {
+                    candidates[i]
+                        .node()
+                        .is_some_and(|node| self.peers.contains_key(node))
+                })
+            })
             .or_else(|| rotated().find(|&i| !candidates[i].is_local()))
     }
 
