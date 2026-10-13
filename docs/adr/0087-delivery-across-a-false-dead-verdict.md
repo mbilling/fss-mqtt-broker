@@ -338,8 +338,10 @@ protocol, forward window and every obligation toward it. `peer_disconnected` kee
     stored). While it cannot yet say who is on it it answers `Failed` instead, as an
     ordinary forward that matched nobody is answered then: a session about to be
     materialised looks the same as one that is gone. That is narrower than "routing
-    unsettled": its own boot scan has not landed, or — with a durable plane only — a
-    takeover window is open or a scan is in flight. A peer it cannot reach says
+    unsettled": its own view is not authoritative yet (no complete boot scan over a
+    whole mesh, and the ten-tick backstop has not fired — so a node that restarts
+    while a peer is out of reach says `Failed` for up to ten ticks), or — with a
+    durable plane only — a takeover window is open or a scan is in flight. A peer it cannot reach says
     nothing about who is on *this* node, so a partial outage does not turn every
     member that left into a withheld acknowledgement.
     The test is of the SESSION, not of the subscription: a member that unsubscribed
@@ -353,7 +355,12 @@ protocol, forward window and every obligation toward it. `peer_disconnected` kee
   - **The origin does not ask before it knows.** A `$share` delivery is not sent on a
     link until the peer's membership snapshot has arrived on it (the frame after its
     interest snapshot, in every build). At the first one, each delivery held for a
-    member the snapshot no longer lists is placed again; then deliveries held for
+    member the snapshot no longer lists is placed again — except one that was already
+    written to a link (in flight when the old link went), when the peer can answer
+    for it: the member may have taken it before leaving, so a proto ≥ 13 peer is
+    sent it again and answers a repeat from its window or "gone"; for a proto-12
+    peer it is placed again all the same, a possible duplicate over a certain loss;
+    then deliveries held for
     members on *other* unreachable nodes may move to this peer's; then what is owed
     goes out, oldest first. This is what covers a v1.1.0 peer, which answers `Stored`
     for anyone.

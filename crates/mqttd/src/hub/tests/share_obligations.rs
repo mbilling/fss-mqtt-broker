@@ -368,14 +368,20 @@ fn a_peer_that_has_not_announced_within_a_tick_is_sent_what_it_is_owed_oldest_fi
             "proto {proto}: the whole backlog is not sent again every tick"
         );
 
-        // The snapshot arrives: the member is still there, and it is sent (again,
-        // under the same seq, for the peer that already has it).
+        // The snapshot arrives, and the member is still there. The peer that was
+        // already sent the delivery is not sent it again (the sweep retransmits it
+        // if it stays unanswered); the one that was made to wait is sent it now.
         h.peer_announced_shared(&back.node, members(&["c"]));
-        assert_eq!(
-            sent(&mut back),
-            vec![(owed(&h, shared)[0].0, Some("c".to_string()))],
-            "proto {proto}"
-        );
+        let at_the_snapshot = sent(&mut back);
+        if proto == PROTO_MAX {
+            assert!(at_the_snapshot.is_empty(), "proto {proto}: sent once");
+        } else {
+            assert_eq!(
+                at_the_snapshot,
+                vec![(owed(&h, shared)[0].0, Some("c".to_string()))],
+                "proto {proto}"
+            );
+        }
     }
 }
 
@@ -697,6 +703,65 @@ fn a_share_delivery_held_for_a_member_that_left_during_the_outage_is_placed_agai
                 );
             }
         }
+    }
+}
+
+/// A delivery the peer was SENT — in flight when the link went, or sent on the new
+/// link by the sweep before the snapshot came — may have been taken by its member
+/// before the member left. When the first snapshot on the new link no longer lists
+/// that member, such a delivery is left for the peer to answer, if the peer can:
+/// it answers a repeat from its window, or says the member is gone, and only then
+/// is the delivery placed with another member. Placing it again at the snapshot
+/// could hand a second member a message the first one got.
+///
+/// A v1.1.0 peer (proto 12) cannot say "gone" — it would answer `Stored` for a
+/// member that never got the message — so for it the delivery is placed again at
+/// the snapshot, sent or not: a possible duplicate, over a certain loss.
+#[test]
+fn a_share_delivery_the_peer_was_sent_is_left_for_it_to_answer_when_it_can() {
+    for proto in [PROTO_MAX, PROTO_V1_1_0] {
+        let mut h = hub();
+        let mut first = peer(&mut h, "p", proto, &["c"]);
+        let mut q = peer(&mut h, "q", proto, &["d"]);
+        let (_, mut rx) = publish_shared(&mut h);
+        let in_flight = sent(&mut first);
+        assert_eq!(in_flight.len(), 1, "proto {proto}: in flight to p's member");
+        let seq = in_flight[0].0;
+        h.peer_disconnected(&first.node, 0);
+
+        // The link is back, and p no longer lists the member.
+        let mut back = link(&mut h, "p", proto);
+        announce(&mut h, &back, &[], &[]);
+        if proto == PROTO_MAX {
+            assert_eq!(
+                sent(&mut back),
+                vec![(seq, Some("c".to_string()))],
+                "proto {proto}: sent again under its seq, for p to answer"
+            );
+            assert!(
+                sent(&mut q).is_empty(),
+                "proto {proto}: not placed again yet"
+            );
+            assert!(unanswered(&mut rx));
+            // p never had it, and says so.
+            h.forward_answered(
+                &back.node,
+                seq,
+                ForwardVerdict::Refused {
+                    code: REFUSAL_SHARED_MEMBER_GONE,
+                },
+            );
+        } else {
+            assert!(
+                sent(&mut back).is_empty(),
+                "proto {proto}: never sent to a member that is not listed"
+            );
+        }
+        let moved = sent(&mut q);
+        assert_eq!(moved.len(), 1, "proto {proto}");
+        assert_eq!(moved[0].1.as_deref(), Some("d"), "proto {proto}");
+        h.forward_answered(&q.node, moved[0].0, ForwardVerdict::Stored);
+        assert!(accepted(&mut rx), "proto {proto}");
     }
 }
 

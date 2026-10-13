@@ -7121,10 +7121,16 @@ impl Hub {
     }
 
     /// Whether a session this node does not have could still be on its way to it:
-    /// its own boot scan has not landed (the sessions it persisted are not loaded
-    /// yet) or, with a durable plane, a takeover may be handing it one — the
-    /// window is open, or a scan is in flight. While true, "nobody of that name is
-    /// here" is not something to tell a peer.
+    /// its own view is not authoritative yet (the sessions it persisted may not be
+    /// loaded: no complete boot scan has landed) or, with a durable plane, a
+    /// takeover may be handing it one — the window is open, or a scan is in
+    /// flight. While true, "nobody of that name is here" is not something to tell
+    /// a peer.
+    ///
+    /// "Authoritative" is the existing bit, and it is a little wider than "the boot
+    /// scan landed": it is set by a complete scan over a WHOLE mesh, or by the
+    /// ten-tick backstop. So a node that restarts while one of its peers is out of
+    /// reach answers `Failed` for up to ten ticks — bounded, and the cautious side.
     ///
     /// Narrower than [`routing_unsettled`](Self::routing_unsettled) on purpose: the
     /// mesh terms there are about interest this node cannot SEE on other nodes, and
@@ -7840,10 +7846,13 @@ impl Hub {
         // `mesh_settled`, and a scan can settle held publishes against
         // its (possibly new) interest.
         let mut synced_now = false;
+        // Whether the link still has to be opened for forwards: not if the sweep
+        // already sent the peer everything it was owed, after a tick of silence.
+        let mut open_now = false;
         if let Some(peer) = self.peers.get_mut(node) {
             if !peer.interest_synced {
                 peer.interest_synced = true;
-                peer.forwards_open = true;
+                open_now = !std::mem::replace(&mut peer.forwards_open, true);
                 synced_now = true;
                 if !self.pending_publishes.is_empty() {
                     self.takeover_reconcile_ticks = self.takeover_reconcile_ticks.max(2);
@@ -7868,7 +7877,7 @@ impl Hub {
         // so what was held across the outage reaches the peer ahead of what was
         // published after the link came back, and its subscribers see one
         // publisher's messages in the order they were published.
-        if synced_now {
+        if open_now {
             self.send_owed_to(node, false);
         }
     }
@@ -7884,12 +7893,15 @@ impl Hub {
     ///    consumer disconnected or unsubscribed during the outage, or the peer
     ///    restarted — is placed with another member of its group, as a first
     ///    placement is; a peer that predates [`REFUSAL_SHARED_MEMBER_GONE`] would
-    ///    have answered it `Stored`;
+    ///    have answered it `Stored`
+    ///    ([`replace_shared_owed_to_absent_members`](Self::replace_shared_owed_to_absent_members)
+    ///    says which deliveries that is);
     /// 2. one owed to a member on ANOTHER node that cannot be reached moves to a
     ///    member here, if the group has one — the same consumer, reconnected
     ///    through this peer;
     /// 3. everything now owed to this peer's members goes out, oldest publish
-    ///    first. Nothing was sent to them on this link before.
+    ///    first — unless the sweep already sent it all, after a tick of silence
+    ///    from a peer that can refuse a delivery for a missing member.
     ///
     /// [`REFUSAL_SHARED_MEMBER_GONE`]: mqtt_cluster::peer::REFUSAL_SHARED_MEMBER_GONE
     fn peer_announced_shared(&mut self, node: &NodeId, groups: Vec<RemoteSharedGroup>) {
@@ -7902,18 +7914,36 @@ impl Hub {
         }
         self.replace_shared_owed_to_absent_members(node);
         self.move_shared_from_unreachable();
+        let mut open_now = false;
         if let Some(peer) = self.peers.get_mut(node) {
             peer.shared_synced = true;
-            peer.shared_open = true;
+            open_now = !std::mem::replace(&mut peer.shared_open, true);
         }
-        self.send_owed_to(node, true);
+        if open_now {
+            self.send_owed_to(node, true);
+        }
     }
 
     /// Place again every `$share` delivery owed to a member of `node` that its
     /// membership snapshot — just received, the first on a new link — does not list.
     /// The pending table is walked once; the snapshot is indexed only if a delivery
     /// is owed to the node at all.
+    ///
+    /// A delivery that was WRITTEN TO A LINK — in flight when the old link went, or
+    /// sent on this one by the sweep before the snapshot came — is left for the peer
+    /// to answer, when the peer can: it may have taken the message before the member
+    /// left, and then it answers the repeat from its window; if it did not, it says
+    /// the member is gone. Placing it again here could hand a second member a
+    /// message the first one got (at `QoS` 2 too), which is what
+    /// [`move_shared_from_unreachable`](Self::move_shared_from_unreachable) avoids
+    /// after a lost link. A peer below proto 13 cannot say "gone" and would answer
+    /// `Stored` for a member that never got it, so for such a peer every delivery
+    /// is placed again, sent or not: a possible duplicate over a certain loss.
     fn replace_shared_owed_to_absent_members(&mut self, node: &NodeId) {
+        let answers_for_itself = self
+            .peers
+            .get(node)
+            .is_some_and(|p| p.proto >= mqtt_cluster::peer::PROTO_SHARED_MEMBER_GONE);
         let groups = self.remote_shared.get(node).map_or(&[][..], Vec::as_slice);
         let mut listed: Option<HashSet<(&str, &str, &ClientId)>> = None;
         let mut absent: Vec<(u64, u64)> = Vec::new();
@@ -7922,7 +7952,7 @@ impl Hub {
                 let ForwardKind::Shared { key, client, .. } = &o.kind else {
                     continue;
                 };
-                if &o.node != node {
+                if &o.node != node || (o.sent() && answers_for_itself) {
                     continue;
                 }
                 let listed = listed.get_or_insert_with(|| {

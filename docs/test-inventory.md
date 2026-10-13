@@ -1409,7 +1409,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 786 test(s)
+## `crates/mqttd/src/lib.rs` — 787 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1955,6 +1955,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::share_obligations::a_share_delivery_made_before_the_peers_membership_arrives_goes_out_behind_what_was_held`
 - `hub::tests::share_obligations::a_share_delivery_moves_to_a_member_on_a_kept_node_when_its_own_nodes_hold_runs_out`
 - `hub::tests::share_obligations::a_share_delivery_refused_because_its_member_is_gone_is_placed_with_another_member`
+- `hub::tests::share_obligations::a_share_delivery_the_peer_was_sent_is_left_for_it_to_answer_when_it_can`
 - `hub::tests::share_obligations::a_share_delivery_whose_group_has_nobody_left_is_acknowledged`
 - `hub::tests::share_obligations::a_share_delivery_whose_member_is_gone_is_held_for_a_member_out_of_reach`
 - `hub::tests::share_obligations::a_shared_delivery_for_a_connected_client_that_is_no_longer_subscribed_is_delivered`

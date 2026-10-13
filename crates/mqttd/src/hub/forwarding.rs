@@ -1146,15 +1146,15 @@ impl Hub {
     /// And only when the link is OPEN for that kind of forward: the peer has
     /// announced on it — its interest snapshot for an ordinary forward, its `$share`
     /// snapshot for a shared delivery — or the sweep has sent it everything it was
-    /// owed after a tick of silence (ADR 0087). A link that has just come back still has everything recorded
-    /// during the outage to carry, and that goes out, oldest first, when the peer
-    /// announces ([`send_owed_to`](Self::send_owed_to)); a forward registered in
-    /// the instant between was sent at once and overtook all of it, so a
-    /// subscriber saw one publisher's `QoS` 1 messages out of publish order. Now
-    /// it is recorded behind them. For a `$share` delivery the snapshot is also
-    /// what says whether the named member is still there. In the steady state
-    /// every linked peer has announced, and this is the one peer lookup it always
-    /// was.
+    /// owed after a tick of silence (ADR 0087). A link that has just come back
+    /// still has everything recorded during the outage to carry, and that goes
+    /// out, oldest first, when the peer announces
+    /// ([`send_owed_to`](Self::send_owed_to)); a forward registered in the instant
+    /// between was sent at once and overtook all of it, so a subscriber saw one
+    /// publisher's `QoS` 1 messages out of publish order. Now it is recorded
+    /// behind them. For a `$share` delivery the snapshot is also what says whether
+    /// the named member is still there. In the steady state every linked peer has
+    /// announced, and this is the one peer lookup it always was.
     pub(super) fn register_forward(&mut self, id: u64, mut obligation: ForwardObligation) {
         self.forward_seq += 1;
         let seq = self.forward_seq;
@@ -1756,11 +1756,13 @@ impl Hub {
                 // it: EVERYTHING of that kind owed to the peer goes, oldest first,
                 // after this pass — once: the link is then open for that kind, what
                 // is registered later is sent as it is registered, and the sweep
-                // retransmits on it as on any other. The exception is a `$share` delivery for a peer
-                // that cannot say "that member is not here" (below proto 13): it
-                // would answer `Stored` for a consumer that left during the
-                // outage, so the delivery waits for its membership snapshot, which
-                // such a peer sends within ten ticks of starting at the latest.
+                // retransmits on it as on any other.
+                //
+                // The exception is a `$share` delivery for a peer that cannot say
+                // "that member is not here" (below proto 13): it would answer
+                // `Stored` for a consumer that left during the outage, so the
+                // delivery waits for its membership snapshot, which such a peer
+                // sends within ten ticks of starting at the latest.
                 let shared = matches!(obligation.kind, ForwardKind::Shared { .. });
                 let open = if shared {
                     peer.shared_open
