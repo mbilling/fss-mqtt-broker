@@ -2091,6 +2091,10 @@ struct Misplaced {
 }
 
 /// A connected peer node's link.
+// Five independent facts about one link — what its far end asked for, what it has
+// said on it, and what may be sent on it. They do not form a state machine: a link
+// can be open for forwards before or after the peer has announced.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 struct Peer {
     conn_id: u64,
@@ -2134,6 +2138,14 @@ struct Peer {
     /// does not know which of the members it remembers are still there, and a
     /// `$share` delivery to one of them is recorded and not sent.
     shared_synced: bool,
+    /// Whether ordinary forwards are being sent on this link: the peer has
+    /// announced on it ([`interest_synced`](Self::interest_synced)), or it stayed
+    /// silent for a tick with a forward overdue and was sent everything it was owed
+    /// ([`Hub::sweep_pending_forwards`]). Either way everything recorded before has
+    /// gone out, oldest first, so what is registered from here on is sent at once.
+    forwards_open: bool,
+    /// The same for `$share` deliveries, and the peer's membership snapshot.
+    shared_open: bool,
 }
 
 /// One subscription a client holds: its filter and everything MQTT 5 attaches to
@@ -3973,7 +3985,7 @@ impl Hub {
                     // takeover window a session it is about to materialise looks
                     // the same as one that is gone, and the answer is the one the
                     // ordinary forward gets then — `Failed`, which claims nothing.
-                    let verdict = if self.routing_unsettled() {
+                    let verdict = if self.cannot_say_who_is_here() {
                         ForwardVerdict::Failed
                     } else {
                         ForwardVerdict::Refused {
@@ -7108,6 +7120,26 @@ impl Hub {
                 || !self.mesh_settled())
     }
 
+    /// Whether a session this node does not have could still be on its way to it:
+    /// its own boot scan has not landed (the sessions it persisted are not loaded
+    /// yet) or, with a durable plane, a takeover may be handing it one — the
+    /// window is open, or a scan is in flight. While true, "nobody of that name is
+    /// here" is not something to tell a peer.
+    ///
+    /// Narrower than [`routing_unsettled`](Self::routing_unsettled) on purpose: the
+    /// mesh terms there are about interest this node cannot SEE on other nodes, and
+    /// say nothing of who is on this one. With them, any one peer out of reach made
+    /// every member that had really left look undecidable — in exactly the partial
+    /// outage a `$share` delivery most needs to be placed again. Without a durable
+    /// plane no session arrives from anywhere but this node's own store.
+    fn cannot_say_who_is_here(&self) -> bool {
+        self.clustered()
+            && (!self.interest_authoritative
+                || !self.last_scan_complete
+                || (self.durable_plane.is_some()
+                    && (self.takeover_reconcile_ticks > 0 || self.inherited_scan_inflight)))
+    }
+
     /// [`mesh_whole`](Self::mesh_whole), strengthened (0043-P4 exhibit ②):
     /// every membership-alive peer has a live link AND has sent an interest
     /// snapshot on it. A freshly-restarted peer suppresses its snapshot until
@@ -7657,6 +7689,8 @@ impl Hub {
                 cert_serial,
                 interest_synced: false,
                 shared_synced: false,
+                forwards_open: false,
+                shared_open: false,
                 proto,
                 wants_origin: false,
             },
@@ -7809,6 +7843,7 @@ impl Hub {
         if let Some(peer) = self.peers.get_mut(node) {
             if !peer.interest_synced {
                 peer.interest_synced = true;
+                peer.forwards_open = true;
                 synced_now = true;
                 if !self.pending_publishes.is_empty() {
                     self.takeover_reconcile_ticks = self.takeover_reconcile_ticks.max(2);
@@ -7869,6 +7904,7 @@ impl Hub {
         self.move_shared_from_unreachable();
         if let Some(peer) = self.peers.get_mut(node) {
             peer.shared_synced = true;
+            peer.shared_open = true;
         }
         self.send_owed_to(node, true);
     }

@@ -931,7 +931,7 @@ impl Hub {
     /// from a member that is GONE (ADR 0087), to any member the group has left — one
     /// that cannot be reached included, where it is owed and held, exactly as a
     /// first placement would be — and with none left, to the publisher's
-    /// acknowledgement ([`shared_group_has_nobody`](Self::shared_group_has_nobody)).
+    /// acknowledgement ([`shared_placement_exhausted`](Self::shared_placement_exhausted)).
     pub(super) fn reselect_shared(
         &mut self,
         id: u64,
@@ -994,7 +994,7 @@ impl Hub {
                 );
                 match last {
                     Some(last) => self.shared_exhausted(id, &key, &tried, last),
-                    None => self.shared_group_has_nobody(id, &key, &tried, others),
+                    None => self.shared_placement_exhausted(id, &key, &tried, others),
                 }
                 return;
             };
@@ -1099,7 +1099,7 @@ impl Hub {
     ///
     /// A publish the hub gated itself during the drain takes its fallback, as in
     /// [`shared_exhausted`](Self::shared_exhausted).
-    fn shared_group_has_nobody(
+    fn shared_placement_exhausted(
         &mut self,
         id: u64,
         key: &SharedKey,

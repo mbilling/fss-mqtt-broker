@@ -335,9 +335,21 @@ protocol, forward window and every obligation toward it. `peer_disconnected` kee
   - **The receiver says so.** A node asked to deliver to a named member that is not on
     it — not connected, and no session of that name to queue for — used to answer
     `Stored`. It answers `Refused` with code 3 ("the named member is gone": nothing was
-    stored). While its own view is unsettled (mid-boot, a takeover window) it answers
-    `Failed` instead, as an ordinary forward that matched nobody is answered then: a
-    session about to be materialised looks the same as one that is gone.
+    stored). While it cannot yet say who is on it it answers `Failed` instead, as an
+    ordinary forward that matched nobody is answered then: a session about to be
+    materialised looks the same as one that is gone. That is narrower than "routing
+    unsettled": its own boot scan has not landed, or — with a durable plane only — a
+    takeover window is open or a scan is in flight. A peer it cannot reach says
+    nothing about who is on *this* node, so a partial outage does not turn every
+    member that left into a withheld acknowledgement.
+    The test is of the SESSION, not of the subscription: a member that unsubscribed
+    from the group and is still connected, or keeps a persistent session, in the
+    instant the delivery arrives is handed it and the answer is `Stored` — the
+    selection was made while it was a member, and a broker may complete a delivery
+    it had started when an UNSUBSCRIBE arrives [MQTT-3.10.4-3]. Checking group
+    membership per delivery would put a lookup on every `$share` message a node
+    receives for that instant; the origin's check below covers an unsubscribe made
+    during an outage.
   - **The origin does not ask before it knows.** A `$share` delivery is not sent on a
     link until the peer's membership snapshot has arrived on it (the frame after its
     interest snapshot, in every build). At the first one, each delivery held for a
@@ -376,7 +388,8 @@ protocol, forward window and every obligation toward it. `peer_disconnected` kee
   of that kind owed to the peer is sent in the order the publishes were accepted (the
   pending table is ordered by publish id). A linked peer that has not announced within
   a tick is still sent what is overdue, as the sweep always did, but all of it, oldest
-  first (a `$share` delivery only if the peer can refuse it for a missing member:
+  first, once — the link is then open, and later forwards are sent as they are
+  registered (a `$share` delivery only if the peer can refuse it for a missing member:
   proto 13 or more). **The guarantee:** the QoS 1 and QoS 2 messages one node forwards
   to another are applied on the receiving node in the order the origin accepted them —
   in the steady state as before (one ordered link, each forward sent as it is

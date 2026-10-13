@@ -151,9 +151,13 @@ capacity-aware bridge pool; see [the measured scope](benchmarks/SHARED-CAPACITY.
 
 **A QoS 1/2 publish is acknowledged when a member took it**
 ([ADR 0087](adr/0087-delivery-across-a-false-dead-verdict.md)). If the chosen member
-is on another node and has gone by the time the message gets there — it
-disconnected with a clean session, or unsubscribed — that node refuses the delivery
-and it is given to another member; if the member's node cannot be reached, the
+is on another node and its session has gone by the time the message gets there — it
+disconnected with a clean session — that node refuses the delivery and it is given
+to another member. (A member that only *unsubscribed* in that instant, and is still
+connected or keeps a session, still gets the message: a broker may complete a
+delivery it had started when the UNSUBSCRIBE arrived [MQTT-3.10.4-3]. A message held
+across an outage is checked against the node's membership when the link returns, so
+there an unsubscribe counts too.) If the member's node cannot be reached, the
 message goes to a member that can be, and only when the group has none is it held
 for the one that cannot (the publisher's acknowledgement waits with it). A publish
 for a group whose last member has left is acknowledged like one nobody subscribes

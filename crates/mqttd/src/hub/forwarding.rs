@@ -1143,9 +1143,10 @@ impl Hub {
     /// which is also how the pre-0041-T12 `send_shared_to_peer` bug (a shared frame
     /// silently dropped on a downed link, with the publisher acked anyway) is closed.
     ///
-    /// And only when the peer has ANNOUNCED on that link — its interest snapshot
-    /// for an ordinary forward, its `$share` snapshot for a shared delivery
-    /// (ADR 0087). A link that has just come back still has everything recorded
+    /// And only when the link is OPEN for that kind of forward: the peer has
+    /// announced on it — its interest snapshot for an ordinary forward, its `$share`
+    /// snapshot for a shared delivery — or the sweep has sent it everything it was
+    /// owed after a tick of silence (ADR 0087). A link that has just come back still has everything recorded
     /// during the outage to carry, and that goes out, oldest first, when the peer
     /// announces ([`send_owed_to`](Self::send_owed_to)); a forward registered in
     /// the instant between was sent at once and overtook all of it, so a
@@ -1162,9 +1163,9 @@ impl Hub {
         };
         let ready = self.peers.get(&obligation.node).filter(|peer| {
             if matches!(obligation.kind, ForwardKind::Shared { .. }) {
-                peer.shared_synced
+                peer.shared_open
             } else {
-                peer.interest_synced
+                peer.forwards_open
             }
         });
         if let Some(peer) = ready {
@@ -1753,18 +1754,20 @@ impl Hub {
                 // failure, and the publisher retries rather than waiting on it —
                 // but never one forward ahead of the older ones recorded beside
                 // it: EVERYTHING of that kind owed to the peer goes, oldest first,
-                // after this pass. The exception is a `$share` delivery for a peer
+                // after this pass — once: the link is then open for that kind, what
+                // is registered later is sent as it is registered, and the sweep
+                // retransmits on it as on any other. The exception is a `$share` delivery for a peer
                 // that cannot say "that member is not here" (below proto 13): it
                 // would answer `Stored` for a consumer that left during the
                 // outage, so the delivery waits for its membership snapshot, which
                 // such a peer sends within ten ticks of starting at the latest.
                 let shared = matches!(obligation.kind, ForwardKind::Shared { .. });
-                let announced = if shared {
-                    peer.shared_synced
+                let open = if shared {
+                    peer.shared_open
                 } else {
-                    peer.interest_synced
+                    peer.forwards_open
                 };
-                if !announced {
+                if !open {
                     let may_go =
                         !shared || peer.proto >= mqtt_cluster::peer::PROTO_SHARED_MEMBER_GONE;
                     let noted = unannounced
@@ -1868,6 +1871,13 @@ impl Hub {
         }
         for (node, shared) in unannounced {
             self.send_owed_to(&node, shared);
+            if let Some(peer) = self.peers.get_mut(&node) {
+                if shared {
+                    peer.shared_open = true;
+                } else {
+                    peer.forwards_open = true;
+                }
+            }
         }
     }
 }
@@ -2372,6 +2382,8 @@ mod zone_fwd_proofs {
         let peer = hub.peers.get_mut(node).expect("the peer is linked");
         peer.interest_synced = true;
         peer.shared_synced = true;
+        peer.forwards_open = true;
+        peer.shared_open = true;
     }
 
     fn fan_out(hub: &mut Hub, topic: &str, qos: QoS, retain: bool, gate: Option<u64>) {

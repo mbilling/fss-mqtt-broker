@@ -1409,7 +1409,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 785 test(s)
+## `crates/mqttd/src/lib.rs` — 786 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1957,6 +1957,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::share_obligations::a_share_delivery_refused_because_its_member_is_gone_is_placed_with_another_member`
 - `hub::tests::share_obligations::a_share_delivery_whose_group_has_nobody_left_is_acknowledged`
 - `hub::tests::share_obligations::a_share_delivery_whose_member_is_gone_is_held_for_a_member_out_of_reach`
+- `hub::tests::share_obligations::a_shared_delivery_for_a_connected_client_that_is_no_longer_subscribed_is_delivered`
 - `hub::tests::share_obligations::a_shared_delivery_for_a_member_that_is_not_here_is_refused_not_answered_stored`
 - `hub::tests::shared_capacity::controls::qos0_shared_capacity_includes_application_properties`
 - `hub::tests::shared_capacity::controls::qos0_shared_does_not_escape_into_another_group_or_a_down_link`

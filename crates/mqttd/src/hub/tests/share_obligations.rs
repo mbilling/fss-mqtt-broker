@@ -357,6 +357,17 @@ fn a_peer_that_has_not_announced_within_a_tick_is_sent_what_it_is_owed_oldest_fi
              only to a peer that can refuse it for a member that is gone"
         );
 
+        // That was the one flush: the link is open for ordinary forwards now, so a
+        // new one is sent as it is registered, and the next tick sends nothing
+        // again that is not overdue.
+        let (_, _d) = publish_ordinary(&mut h, "t/a", QoS::AtLeastOnce);
+        assert_eq!(sent(&mut back).len(), 1, "proto {proto}: sent at once");
+        tick(&mut h);
+        assert!(
+            sent(&mut back).is_empty(),
+            "proto {proto}: the whole backlog is not sent again every tick"
+        );
+
         // The snapshot arrives: the member is still there, and it is sent (again,
         // under the same seq, for the peer that already has it).
         h.peer_announced_shared(&back.node, members(&["c"]));
@@ -456,6 +467,70 @@ async fn a_node_whose_view_is_unsettled_does_not_call_a_share_member_gone() {
     h.dispatch(shared_delivery(7, "not-yet")).await;
     quiesce(&mut h).await;
     assert_eq!(verdicts(&mut origin), vec![(7, ForwardVerdict::Failed)]);
+
+    // "Unsettled" for a reason that says nothing about who is on THIS node — a
+    // window opened by a link event, a peer out of reach — is not that. This node
+    // has loaded its own sessions and, with no durable plane, none can arrive from
+    // anywhere else: the member is gone, and it says so. (With the broader test,
+    // one peer down made every gone member an acknowledgement withheld.)
+    let (mut h, mut origin) = receiver(PROTO_MAX, true);
+    h.interest_authoritative = true;
+    h.last_scan_complete = true;
+    h.takeover_reconcile_ticks = 3;
+    assert!(
+        h.routing_unsettled(),
+        "fixture: the routing view is unsettled"
+    );
+    h.dispatch(shared_delivery(8, "gone")).await;
+    quiesce(&mut h).await;
+    assert_eq!(
+        verdicts(&mut origin),
+        vec![(
+            8,
+            ForwardVerdict::Refused {
+                code: REFUSAL_SHARED_MEMBER_GONE
+            }
+        )]
+    );
+}
+
+/// CHARACTERISATION of what the receiver's test does not cover: it asks whether the
+/// named client has a SESSION here, not whether it is still subscribed. A member
+/// that unsubscribed from the group in the instant the delivery was in flight, and
+/// is still connected, is handed the message and the origin hears `Stored` — the
+/// selection was made while it was a member, and a broker may complete a delivery
+/// it had started when an UNSUBSCRIBE arrives [MQTT-3.10.4-3]. (Across an outage
+/// the origin's own check against the peer's membership snapshot covers it:
+/// `a_share_delivery_held_for_a_member_that_left_during_the_outage_is_placed_again`.)
+#[tokio::test]
+async fn a_shared_delivery_for_a_connected_client_that_is_no_longer_subscribed_is_delivered() {
+    let (mut h, mut origin) = receiver(PROTO_MAX, false);
+    let (otx, mut orx) = mpsc::unbounded_channel::<Box<crate::hub::Outgoing>>();
+    let (outbound, _meter) = Outbound::new(otx);
+    let (reply, wait) = oneshot::channel();
+    h.dispatch(HubCommand::Attach {
+        client: ClientId("still-here".into()),
+        admission: Box::new(admission("still-here")),
+        conn_id: 7,
+        clean_start: true,
+        session_expiry: 0,
+        receive_maximum: u16::MAX,
+        will: None,
+        outbound,
+        reply,
+    })
+    .await;
+    quiesce(&mut h).await;
+    assert!(matches!(wait.await, Ok(AttachOutcome::Present(false))));
+    while orx.try_recv().is_ok() {}
+
+    h.dispatch(shared_delivery(7, "still-here")).await;
+    quiesce(&mut h).await;
+    assert_eq!(verdicts(&mut origin), vec![(7, ForwardVerdict::Stored)]);
+    assert!(
+        orx.try_recv().is_ok(),
+        "and the client was handed the message"
+    );
 }
 
 /// The origin's half of the same answer. The member is gone, nothing was stored:
