@@ -481,7 +481,8 @@ aborting it, and `peer.rs` (`dial_member`) keeps dialing under the verdict:
   connection for the dialer's link to *it*, registers it in place of the real one, and
   sees the hang-up afterwards, so each attempt at a stale address flaps the link of the
   pair that lives there. The dialer therefore stays away from such an address for 60 s,
-  or until membership speaks of the member again. Refusing before the other node
+  or until the member's standing changes (a verdict lands or is withdrawn; a repeated
+  `Alive` at the same address does not end the wait). Refusing before the other node
   registers needs the expected node id in the `Hello` — a wire change, for D8's
   protocol step.
 - *Measured* (`false_dead_delivery.rs`, three nodes, loopback): in all three "A dials"

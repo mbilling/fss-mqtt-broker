@@ -153,7 +153,7 @@ then, once its sub-decision is settled (T3: O1, O4; T5: O2, O5; T6: O3).
   landed had no bound and could not be interrupted (5 s now for every membership-driven
   attempt, and a change of standing starts a fresh one); and a dialer at a stale address
   flapped the answering node's own link to this node on every attempt (it now stays away
-  for 60 s, or until membership speaks of the member).
+  for 60 s, or until the member's standing changes).
 - 2026-10-13 — T2 (D1, D4, D6) built. A `Dead` verdict erases nothing: the peer is held as
   unreachable and a publish for its subscribers is owed to it and held, as for a peer
   whose link is down; `$share` membership survives a lost link and a verdict. With T4 no
