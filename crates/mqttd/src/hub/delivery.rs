@@ -973,11 +973,12 @@ impl Hub {
     /// final answer. A publish the hub gated itself during the drain (ADR 0083) has
     /// nobody to retry it, however the pass ended — members refusing it (their nodes in
     /// a brownout, before any side effect) or their nodes dying: the first one tried
-    /// still in the group gets it unanswered, as the group would have had the drain not
-    /// gated it. A dead member has left the group already. A member whose node died may
-    /// have delivered it first, so this path is at least once, even at `QoS` 2 (as the
-    /// re-selection after a peer's death already is). Anything else answers the
-    /// publisher.
+    /// that is still in the group and can be handed it gets it unanswered, as the group
+    /// would have had the drain not gated it. A member on a node declared dead is still
+    /// in its group (ADR 0087 D1) and has no link, so it is passed over. A member whose
+    /// node died may have delivered it first, so this path is at least once, even at
+    /// `QoS` 2 (as the re-selection after a peer's death already is). Anything else
+    /// answers the publisher.
     fn shared_exhausted(
         &mut self,
         id: u64,
@@ -1024,6 +1025,10 @@ impl Hub {
             .unwrap_or_default();
         // "Still in the group" is not enough since ADR 0087 D1: a member whose node
         // has no link stays in its group, and there is no link to hand it this on.
+        // A local member needs no such test here, unlike in a re-selection
+        // ([`shared_member_can_take_it_now`](Self::shared_member_can_take_it_now)):
+        // this hand-off is ungated, and `deliver_to_client` below already does what
+        // can be done for one that is offline.
         let Some(member) = tried.iter().find_map(|(node, client)| {
             members.iter().find(|c| {
                 c.node == *node
