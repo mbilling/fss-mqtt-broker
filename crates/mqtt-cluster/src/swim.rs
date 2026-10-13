@@ -54,8 +54,8 @@ impl MemberState {
 }
 
 /// Timing and fan-out parameters for the protocol.
-// The bools are four independent rules, each on or off: two that a v1.1.0 node lacks
-// (issue #971) and two measured candidates (issue #973). Not an encodable state.
+// The bools are four independent rules, each on or off: three that a v1.1.0 node lacks
+// (issues #971 and #975) and one measured candidate (issue #973). Not an encodable state.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -146,8 +146,20 @@ pub struct Config {
     ///
     /// No new wire element, and no cooperation needed from the suspect beyond what a
     /// v1.1.0 node already does: answer a `Ping` with an `Ack` and a `Join` with a
-    /// `Sync`. `false` (the default) is the behaviour of every release so far. **A
-    /// measurement knob (issue #973 / ADR 0087), not operator configuration.**
+    /// `Sync`.
+    ///
+    /// The probe saves a suspect only on a round trip between this node and the
+    /// suspect: our `Ping` has to reach it and its `Ack` — authenticated as the
+    /// suspect's exactly as the `Ack` to an ordinary probe is, and matched to this
+    /// probe's sequence number — has to come back. A relay's word does not count, so a
+    /// member this node can reach in one direction only, or not at all, is declared
+    /// `Dead` as it was without the probe.
+    ///
+    /// `true` is the default since ADR 0016's amendment of 2026-10-13 (issue #975,
+    /// ADR 0087 T10). `false` is v1.1.0's rule — the window lapses and the member is
+    /// `Dead` — kept so the formation simulation can run a v1.1.0 node beside a
+    /// current one. **Not operator configuration**: none of the detector's settings
+    /// is.
     pub confirm_before_dead: bool,
 }
 
@@ -169,7 +181,7 @@ impl Default for Config {
             reprime_on_rescued_probe: true,
             greet_pruned: true,
             suspicion_scales_with_log_n: false,
-            confirm_before_dead: false,
+            confirm_before_dead: true,
         }
     }
 }
@@ -1565,6 +1577,11 @@ mod tests {
     use super::{Action, Config, Kind, MemberState, Message, Swim, Update};
     use crate::NodeId;
 
+    /// Brisk timings, and the last direct probe before `Dead` OFF: the tests of the
+    /// window, the tombstone and the generations state exactly when a member becomes
+    /// `Dead`, and the probe (one more ack timeout, one more datagram) has its own
+    /// tests below, which switch it on — as does every simulation and every cluster
+    /// suite, which run the default.
     fn fast_cfg() -> Config {
         Config {
             protocol_period_ms: 100,
@@ -2794,7 +2811,8 @@ mod tests {
         );
     }
 
-    // --- issue #973 / ADR 0087: failure-detection knobs, off by default ---------
+    // --- issues #973, #975 / ADR 0087: the last direct probe (the default) and the
+    // --- window that scales with log n (off) ----------------------------------
 
     fn node_with(id: &str, addr: &str, cfg: Config) -> Swim {
         Swim::new(
@@ -3052,6 +3070,89 @@ mod tests {
             if on {
                 assert_eq!(ack.gossip[0].id, "a", "the refutation is first");
             }
+        }
+    }
+
+    /// The last direct probe is the default (ADR 0016's amendment of 2026-10-13): a
+    /// node built with `Config::default()`, as the broker builds it, does not declare
+    /// a suspect `Dead` when its window lapses but asks it, and declares it one ack
+    /// timeout later. With the switch off — v1.1.0's rule — the window is all there is.
+    #[test]
+    fn by_default_a_suspect_is_asked_before_it_is_declared_dead() {
+        let default = Config::default();
+        assert!(default.confirm_before_dead);
+        for on in [true, false] {
+            let cfg = Config {
+                confirm_before_dead: on,
+                ..Config::default()
+            };
+            let mut s = node_with("a", "a:1", cfg.clone());
+            let mut out = Vec::new();
+            s.apply_update(&suspect_from("b", "b:1", 0, "x"), 0, &mut out);
+            let lapsed = cfg.suspicion_timeout_ms;
+            out.clear();
+            s.expire_suspects(lapsed, &mut out);
+            if on {
+                assert_eq!(member_state(&s, "b"), Some(MemberState::Suspect));
+                assert!(ping_seq(&out).is_some(), "the suspect is asked");
+                s.expire_suspects(lapsed + cfg.ack_timeout_ms, &mut out);
+            } else {
+                assert!(ping_seq(&out).is_none(), "v1.1.0 asks nobody");
+            }
+            assert_eq!(member_state(&s, "b"), Some(MemberState::Dead), "on={on}");
+        }
+    }
+
+    /// What the last probe can cost in datagrams, at worst: one `Ping`, of the usual
+    /// bounded size, per suspect per lapsed window — however many times the clock is
+    /// advanced inside the probe's ack timeout, and however the suspicions arrived.
+    /// Once the members are `Dead` nothing more is sent about them. So a node made
+    /// to suspect every member at once (a partition; a signed member lying) sends at
+    /// most one probe to each, where without the rule it sent none and declared them
+    /// all dead.
+    #[test]
+    fn the_last_probe_is_one_datagram_per_suspect_per_window() {
+        let cfg = Config {
+            confirm_before_dead: true,
+            ..fast_cfg()
+        };
+        let mut s = node_with("a", "a:1", cfg.clone());
+        let mut out = Vec::new();
+        let suspects = 12;
+        for i in 0..suspects {
+            let (id, addr) = (format!("n{i}"), format!("n{i}:1"));
+            // Three suspecters each: the shortest window the detector has.
+            for by in ["x", "y", "z"] {
+                s.apply_update(&suspect_from(&id, &addr, 0, by), 0, &mut out);
+            }
+        }
+        out.clear();
+        let lapsed = cfg.suspicion_min_timeout_ms;
+        for dt in 0..cfg.ack_timeout_ms {
+            s.expire_suspects(lapsed + dt, &mut out);
+        }
+        let sent = sends(&out);
+        assert_eq!(sent.len(), suspects, "one probe per suspect: {out:?}");
+        let mut probed: Vec<&str> = sent.iter().map(|(to, _)| *to).collect();
+        probed.sort_unstable();
+        probed.dedup();
+        assert_eq!(probed.len(), suspects, "each suspect once");
+        for (_, msg) in &sent {
+            assert!(matches!(msg.kind, Kind::Ping { .. }));
+            assert!(
+                msg.gossip.len() <= cfg.gossip_fanout,
+                "{}",
+                msg.gossip.len()
+            );
+        }
+
+        // Silent, all of them: dead one ack timeout on, and nothing more is sent.
+        out.clear();
+        s.expire_suspects(lapsed + cfg.ack_timeout_ms, &mut out);
+        s.expire_suspects(lapsed + 10 * cfg.ack_timeout_ms, &mut out);
+        assert!(sends(&out).is_empty(), "{out:?}");
+        for i in 0..suspects {
+            assert_eq!(member_state(&s, &format!("n{i}")), Some(MemberState::Dead));
         }
     }
 

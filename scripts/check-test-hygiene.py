@@ -2397,13 +2397,35 @@ IGNORE_ALLOWLIST: dict[str, tuple[str, str | None]] = {
     "crates/mqtt-cluster/tests/swim_formation_sim.rs::false_dead_report": (
         "measurement, not a pass/fail: for six ways of deciding a suspect is dead, five "
         "cluster sizes and six outage lengths it prints how many of 32 seeded runs end with "
-        "a healthy member declared DEAD, and what each costs when the member really died "
-        "(issue #973 / #975; eleven minutes, --release). Its figures are recorded in ADR "
-        "0087 and issue #975; today's default and the recommended candidate are asserted by "
-        "`a_short_cut_still_ends_in_a_false_dead_on_the_default_window` and "
-        "`a_last_direct_probe_spares_a_member_cut_off_for_less_than_the_window`, which every "
+        "a healthy member declared DEAD, the same in a cluster part-way through the upgrade "
+        "from v1.1.0, and what each costs when the member really died (issues #973 and "
+        "#975; thirteen minutes, --release). Its figures are recorded in ADR 0016's "
+        "amendment of 2026-10-13 and ADR 0087; the default's bound and the behaviour without "
+        "the last probe are asserted by "
+        "`a_member_cut_off_for_up_to_two_seconds_is_not_declared_dead` and "
+        "`without_the_last_probe_a_short_cut_ends_in_a_false_dead`, which every tier runs",
+        None,
+    ),
+    "crates/mqtt-cluster/tests/swim_formation_sim.rs::fault_shapes_report": (
+        "measurement, not a pass/fail: the default detector and the same detector without "
+        "its last direct probe under packet loss, a member reachable one way only, one link "
+        "lost one way and a member whose datagrams arrive late, 32 seeded runs per cell "
+        "(issue #975; ten minutes, --release). Its figures are recorded in ADR 0016's "
+        "amendment of 2026-10-13; what they show is asserted, on a few seeds, by "
+        "`a_member_that_cannot_complete_a_round_trip_is_declared_dead_as_before`, "
+        "`one_link_lost_one_way_raises_no_verdict` and "
+        "`packet_loss_neither_keeps_a_dead_member_nor_adds_false_verdicts`, which every "
         "tier runs",
         None,
+    ),
+    "crates/mqttd/tests/swim_formation_proc.rs::a_broker_stopped_for_two_seconds_is_declared_dead_by_no_one": (
+        "twelve spawned brokers, one stopped (SIGSTOP) for two seconds eight times, "
+        "asserting that no broker declares it DEAD (issue #975): a verdict is a matter of "
+        "deadlines, so on a loaded per-PR runner a failure would say more about the runner "
+        "than about the detector, and the run takes a minute and a half. The bound itself "
+        "is asserted in virtual time by "
+        "`a_member_cut_off_for_up_to_two_seconds_is_not_declared_dead`, which every tier runs",
+        "nightly",
     ),
     "crates/mqttd/tests/durable_bench.rs::durable_path_floor": (
         "macro-benchmark: minutes long, and only meaningful in --release",

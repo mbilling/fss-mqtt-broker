@@ -444,8 +444,8 @@ tees, so it costs the test job nothing; given no log it runs the suite itself.
 `#[ignore]` is now first-class rather than out of scope. The inventory records it (asked of the
 binary, via `--list --ignored`), and every ignored test must be declared in `IGNORE_ALLOWLIST`
 in the gate with a reason **and the tier that runs it** — where the tier is *verified* against
-`.github/workflows/`, not believed. Two are so declared and so verified (`cluster_upgrade`,
-`cluster_soak`, both nightly). Five are declared with **no tier at all**:
+`.github/workflows/`, not believed. Three binaries are so declared and so verified
+(`cluster_upgrade`, `cluster_soak`, `swim_formation_proc`, all nightly). Five are declared with **no tier at all**:
 
 | `#[ignore]`d, run by no tier | why |
 |---|---|

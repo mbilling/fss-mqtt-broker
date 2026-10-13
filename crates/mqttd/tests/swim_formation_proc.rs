@@ -23,6 +23,11 @@
 //! a certificate.) Run against a binary built without the change it fails on that
 //! counter every time: 10-23 drops on a third of the brokers by the moment the mesh
 //! is first whole.
+//!
+//! The second test here is about a member of that mesh that goes silent for two
+//! seconds and comes back (issue #975): no broker may declare it dead. That one does
+//! depend on the runner keeping time — a verdict is a matter of deadlines — so it is
+//! `#[ignore]`d and runs in the nightly tier, beside the other slow cluster tests.
 
 mod common;
 mod proc_common;
@@ -224,15 +229,12 @@ async fn assert_no_certificate_storm(nodes: &[ProcNode], phase: &str, bound: u64
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn twelve_signed_brokers_form_a_whole_mesh_without_a_certificate_storm() {
-    let disk = tempfile::tempdir().expect("tempdir");
-    let mut nodes = build(disk.path()).await;
-
-    // Founder first, as the rig does; then the followers one after another, each
-    // started once the one before it answers — the stagger of a scripted bring-up,
-    // which is what makes two non-seed nodes meet through gossip rather than at once.
-    for n in &mut nodes {
+/// Start the brokers as the rig does and wait for the mesh: the founder first, then
+/// the followers one after another, each started once the one before it answers — the
+/// stagger of a scripted bring-up, which is what makes two non-seed nodes meet through
+/// gossip rather than at once. Returns how long the mesh took after the last start.
+async fn form(nodes: &mut [ProcNode]) -> Duration {
+    for n in nodes.iter_mut() {
         n.spawn();
         let started = Instant::now();
         while n.readyz().await.is_none() {
@@ -245,7 +247,15 @@ async fn twelve_signed_brokers_form_a_whole_mesh_without_a_certificate_storm() {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
-    let formed = await_whole_mesh(&mut nodes, "formation").await;
+    await_whole_mesh(nodes, "formation").await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn twelve_signed_brokers_form_a_whole_mesh_without_a_certificate_storm() {
+    let disk = tempfile::tempdir().expect("tempdir");
+    let mut nodes = build(disk.path()).await;
+
+    let formed = form(&mut nodes).await;
     assert_no_certificate_storm(&nodes, "formation", FORMATION_CERT_MISS_BOUND).await;
 
     // "Arm" the founder: a graceful stop and a restart WITH seeds — a new process
@@ -266,6 +276,143 @@ async fn twelve_signed_brokers_form_a_whole_mesh_without_a_certificate_storm() {
         "mesh of {NODES} whole {formed:?} after the last start, and {rearmed:?} after the \
          founder's restart; (members, links, cert-miss) per broker: {:?}",
         survey(&nodes).await
+    );
+    for n in &mut nodes {
+        n.kill().await;
+    }
+}
+
+/// How long the member is stopped: longer than it takes to be suspected (a probe and
+/// its indirect round, 0.5 s), longer than the suspicion window's floor (1.5 s, with
+/// three suspecters), shorter than its ceiling (4 s).
+const STOP: Duration = Duration::from_secs(2);
+
+/// How many times it is stopped. One stop is noticed by its peers only if one of them
+/// happens to probe it early enough in those two seconds; the test needs at least one
+/// that was.
+const EPISODES: usize = 8;
+
+/// A verdict about the stopped member, if one is coming, comes within the suspicion
+/// window (4 s) and the last probe's ack timeout (0.25 s) of the last suspicion. The
+/// mesh is "quiet" once no broker has reported a suspect for this long.
+const QUIET: Duration = Duration::from_secs(6);
+
+fn signal(pid: u32, sig: &str) {
+    let ok = std::process::Command::new("kill")
+        .args([sig, &pid.to_string()])
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(ok, "kill {sig} {pid} failed");
+}
+
+/// The membership transitions the brokers have logged so far (WARN, `cluster.rs`):
+/// `(SUSPECT raised about node `about` by any other broker, every DEAD line as
+/// "<who logged it>: <line>")`.
+fn verdicts(nodes: &[ProcNode], about: usize) -> (usize, Vec<String>) {
+    // The id alone: the log is coloured, so `peer=<id>` is not contiguous in it. Ids
+    // are zero-padded, so one is never a prefix of another.
+    let subject = nodes[about].id.clone();
+    let mut suspected = 0;
+    let mut dead = Vec::new();
+    for (i, n) in nodes.iter().enumerate() {
+        let log = std::fs::read_to_string(&n.log_path).unwrap_or_default();
+        for line in log.lines() {
+            if line.contains("membership: peer DEAD") {
+                dead.push(format!("{}: {line}", n.id));
+            }
+            if i != about && line.contains("membership: peer SUSPECT") && line.contains(&subject) {
+                suspected += 1;
+            }
+        }
+    }
+    (suspected, dead)
+}
+
+/// Wait until the mesh is whole and no broker has held any member suspect or dead for
+/// [`QUIET`]: every suspicion raised has by then been refuted or has run its course.
+async fn await_quiet(nodes: &mut [ProcNode], phase: &str) {
+    let started = Instant::now();
+    let mut quiet_since: Option<Instant> = None;
+    loop {
+        await_whole_mesh(nodes, phase).await;
+        let mut calm = true;
+        for n in nodes.iter() {
+            for state in ["suspect", "dead"] {
+                let series = format!("mqttd_members{{state=\"{state}\"}}");
+                calm &= n.metric(&series).await == Some(0);
+            }
+        }
+        if !calm {
+            quiet_since = None;
+        }
+        let since = *quiet_since.get_or_insert_with(Instant::now);
+        if calm && since.elapsed() >= QUIET {
+            return;
+        }
+        assert!(
+            started.elapsed() < SETTLE_BUDGET,
+            "{phase}: some broker still holds a member suspect or dead after {}s\n{:?}",
+            SETTLE_BUDGET.as_secs(),
+            verdicts(nodes, 0).1
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Issue #975, on real processes: one of twelve brokers is stopped (`SIGSTOP`) for
+/// two seconds and resumed. Its peers notice — at least one logs it SUSPECT — and no
+/// broker declares it, or anyone, DEAD: when a suspicion's window runs out the broker
+/// asks the suspect once more, directly, and by then it answers (ADR 0016's amendment
+/// of 2026-10-13). With that last probe off the same stop ends in a DEAD on some
+/// broker in about half the simulated schedules at this size, which then stands for
+/// the tombstone's 30 s.
+///
+/// The simulation holds the bound over seeds, in virtual time
+/// (`a_member_cut_off_for_up_to_two_seconds_is_not_declared_dead`); this is the
+/// counterpart on real sockets, clocks and certificates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "timing-sensitive on a loaded runner: twelve brokers and a verdict that is a \
+            matter of deadlines; runs in the nightly tier"]
+async fn a_broker_stopped_for_two_seconds_is_declared_dead_by_no_one() {
+    let disk = tempfile::tempdir().expect("tempdir");
+    let mut nodes = build(disk.path()).await;
+    form(&mut nodes).await;
+    await_quiet(&mut nodes, "after formation").await;
+
+    // Neither the founder nor a seed: a member the others know through gossip.
+    let victim = NODES / 2;
+    let pid = nodes[victim].pid().expect("the victim is running");
+    let (_, dead_before) = verdicts(&nodes, victim);
+    let mut noticed = 0;
+    for episode in 1..=EPISODES {
+        let (suspected_before, _) = verdicts(&nodes, victim);
+        signal(pid, "-STOP");
+        // SETTLE(swim-stop-two-seconds): the fault IS a duration — the broker stays stopped this
+        // long, and what its peers conclude about a silence of that length is the subject.
+        tokio::time::sleep(STOP).await;
+        signal(pid, "-CONT");
+        await_quiet(&mut nodes, &format!("after stop {episode}")).await;
+
+        let (suspected, dead) = verdicts(&nodes, victim);
+        assert_eq!(
+            dead.len(),
+            dead_before.len(),
+            "stop {episode}: a broker stopped for {STOP:?} was declared DEAD (or declared \
+             someone DEAD):\n{}",
+            dead.join("\n")
+        );
+        if suspected > suspected_before {
+            noticed += 1;
+        }
+    }
+    assert!(
+        noticed > 0,
+        "none of {EPISODES} stops of {STOP:?} was noticed by any broker: the test proved nothing"
+    );
+    eprintln!(
+        "{} stopped {EPISODES} times for {STOP:?}: suspected in {noticed} of them, declared \
+         DEAD in none",
+        nodes[victim].id
     );
     for n in &mut nodes {
         n.kill().await;

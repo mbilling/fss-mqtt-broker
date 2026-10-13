@@ -1269,4 +1269,109 @@ mod cert_request_tests {
         );
         assert_eq!(a.view("b"), Some(MemberState::Alive));
     }
+
+    /// `a`, holding `b` and `c` alive with their certificates, is told by `c` that `b`
+    /// is suspected, and its window lapses: returns `a`, its counters, the wire peers
+    /// `b` and `c`, the sequence number of the last direct probe `a` sent `b`, and the
+    /// moment that probe gives up.
+    fn a_asking_a_suspect() -> (Gossip, Counts, Wire, Wire, u64, u64) {
+        let (mut a, counts) = endpoint("a");
+        let (b, c) = (Wire::new("b"), Wire::new("c"));
+        a.receive(&b.full(Kind::Sync, vec![]), "b:1", 0);
+        a.receive(&c.full(Kind::Sync, vec![]), "c:1", 0);
+        a.receive(
+            &c.fp(Kind::Sync, vec![update("b", MemberState::Suspect)]),
+            "c:1",
+            10,
+        );
+        assert_eq!(state_of(&a, "b"), Some(MemberState::Suspect));
+
+        // The window lapses. `a` does not declare `b` dead: it asks `b`.
+        let lapsed = 10 + cfg().suspicion_timeout_ms;
+        let sent = datagrams(a.tick(lapsed));
+        assert_eq!(state_of(&a, "b"), Some(MemberState::Suspect));
+        let seq = sent
+            .iter()
+            .filter(|(to, _)| to == "b:1")
+            .find_map(|(_, bytes)| match b.read(bytes).kind {
+                Kind::Ping { seq } => Some(seq),
+                _ => None,
+            })
+            .expect("the last direct probe");
+        (a, counts, b, c, seq, lapsed + cfg().ack_timeout_ms)
+    }
+
+    /// The last direct probe before `Dead` is answered only by the suspect (issue
+    /// #975). With signed gossip an `Ack` is the suspect's when it is signed by the
+    /// suspect's certificate — the same check every datagram passes, which is what an
+    /// ordinary probe's `Ack` has always rested on. So a member that really is dead
+    /// cannot be kept by anyone else:
+    ///
+    /// - a holder of the cluster key with no certificate for `b` cannot sign as `b`
+    ///   (dropped: `auth`), and with a certificate of its own cannot claim to be `b`
+    ///   (dropped: `identity`);
+    /// - a member in good standing can answer with the probe's sequence number, but
+    ///   as itself, which is not the suspect's answer;
+    /// - an `Ack` of `b`'s own to some other probe — an old one, replayed — does not
+    ///   carry this probe's sequence number.
+    ///
+    /// `b` is declared `Dead` when the probe's ack timeout runs out.
+    #[test]
+    fn only_a_datagram_signed_by_the_suspect_answers_its_last_probe() {
+        let (mut a, counts, b, c, seq, gives_up) = a_asking_a_suspect();
+        let now = gives_up - 5;
+        let ack = message(
+            "b",
+            Kind::Ack { seq },
+            vec![update("b", MemberState::Alive)],
+        );
+
+        // The cluster key and b's certificate (it is public), but not b's key.
+        let mut b_cert = b"cert:b\0".to_vec();
+        b_cert.resize(CERT_LEN, 0x5A);
+        let no_key = SwimAuth::new(&[7; KEY_LEN]).with_signing(
+            Arc::new(Signer {
+                cn: "mallory".to_string(),
+                cert: b_cert,
+            }),
+            Arc::new(Verifier),
+        );
+        assert!(datagrams(a.receive(&no_key.seal(&ack, true), "b:1", now)).is_empty());
+        assert_eq!(count(&counts, "auth"), 1);
+
+        // The cluster key and a certificate of its own: it is not b.
+        assert!(datagrams(a.receive(&c.auth.seal(&ack, true), "b:1", now)).is_empty());
+        assert_eq!(count(&counts, "identity"), 1);
+
+        // A member answering as itself, with the right sequence number.
+        a.receive(&c.fp(Kind::Ack { seq }, vec![]), "c:1", now);
+        // b's own Ack, to another probe.
+        a.receive(&b.fp(Kind::Ack { seq: seq + 1 }, vec![]), "b:1", now);
+        assert_eq!(state_of(&a, "b"), Some(MemberState::Suspect));
+
+        a.tick(gives_up);
+        assert_eq!(state_of(&a, "b"), Some(MemberState::Dead));
+    }
+
+    /// The other half: the suspect's own signed `Ack` to that probe keeps it, even
+    /// when it says nothing about itself — and then it is asked to, with a `Join`.
+    #[test]
+    fn the_suspects_own_signed_ack_answers_its_last_probe() {
+        let (mut a, _, b, _, seq, gives_up) = a_asking_a_suspect();
+        let sent = datagrams(a.receive(&b.fp(Kind::Ack { seq }, vec![]), "b:1", gives_up - 5));
+        assert!(
+            sent.iter()
+                .any(|(to, bytes)| to == "b:1" && b.read(bytes).kind == Kind::Join),
+            "b is asked for its own claim"
+        );
+        a.tick(gives_up);
+        a.tick(gives_up + 10 * cfg().ack_timeout_ms);
+        assert_eq!(state_of(&a, "b"), Some(MemberState::Suspect));
+
+        // Its Sync says it is alive, first-hand, an incarnation on.
+        let mut alive = update("b", MemberState::Alive);
+        alive.incarnation += 1;
+        a.receive(&b.full(Kind::Sync, vec![alive]), "b:1", gives_up + 300);
+        assert_eq!(state_of(&a, "b"), Some(MemberState::Alive));
+    }
 }

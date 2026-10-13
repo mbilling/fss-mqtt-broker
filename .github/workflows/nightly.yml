@@ -94,6 +94,24 @@ jobs:
       - name: rolling upgrade + rollback (ADR 0044 P3)
         run: cargo test -p mqttd --test cluster_upgrade -- --ignored --nocapture
 
+  swim-stop:
+    name: a stopped broker is not declared dead (12 brokers)
+    runs-on: ubuntu-latest
+    # ADR 0016's amendment of 2026-10-13 (issue #975), on real processes: one of
+    # twelve signed-gossip brokers is stopped for two seconds, eight times, and no
+    # broker may declare it DEAD. Nightly because a verdict is a matter of
+    # deadlines; the bound itself is asserted per-PR in virtual time
+    # (mqtt-cluster/tests/swim_formation_sim.rs).
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master; `with:` selects the toolchain
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: SIGSTOP one of twelve brokers for two seconds
+        run: cargo test -p mqttd --test swim_formation_proc -- --ignored --nocapture
+
   soak:
     name: one-hour soak (drift watermarks)
     runs-on: ubuntu-latest

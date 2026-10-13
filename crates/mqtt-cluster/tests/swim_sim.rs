@@ -304,6 +304,8 @@ impl Sim {
 
 /// SWIM timings for the simulation: brisk, with a comfortable suspicion window so the
 /// partition-heal scenario stays in `Suspect` (refutable) rather than tombstoning.
+/// The rules are the default's, the last direct probe before `Dead` included: every
+/// scenario here — loss, reordering, a crash, a restart, a partition — runs with it.
 fn sim_cfg() -> Config {
     Config {
         protocol_period_ms: 100,
@@ -321,7 +323,7 @@ fn sim_cfg() -> Config {
         reprime_on_rescued_probe: true,
         greet_pruned: true,
         suspicion_scales_with_log_n: false,
-        confirm_before_dead: false,
+        confirm_before_dead: true,
     }
 }
 
