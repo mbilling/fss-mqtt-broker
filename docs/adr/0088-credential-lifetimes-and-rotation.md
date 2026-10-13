@@ -27,7 +27,8 @@
 > 4. Two gossip keys are alive while one replaces the other, and only then: *old gossip
 >    keys should be evicted, so an older compromised node can't use them.*
 >
-> The record stays **Proposed** because the sub-decisions in §4 are open.
+> The record stays **Proposed** until it is accepted; four sub-decisions in §4 are still
+> open, each with a proposal.
 
 ## Context
 
@@ -75,7 +76,7 @@ replacing the key is the second line.
 
 - `gen-certs.sh` takes the leaf lifetime as an explicit choice and prints the expiry of
   what it minted with the date by which it must be renewed. Its silent 365-day default
-  goes (O1: what replaces it).
+  goes, and nothing replaces it: without a stated lifetime it refuses (O1).
 - The Helm chart and the operator expose the node certificate's lifetime and renewal lead
   as values, and pass them to cert-manager where cert-manager issues.
 - The lifetime is not broker configuration. The broker reads it from the certificate.
@@ -104,7 +105,8 @@ Checked on a timer no coarser than a minute; a link is not kept past expiry by t
 of traffic. Without this a short lifetime bounds new links and nothing else.
 
 Client-facing listeners: a client's certificate is checked at its handshake, and a session
-outliving it is the subject of ADR 0040's sweep; whether expiry joins that sweep is O2.
+outliving it is the subject of ADR 0040's sweep; expiry joins that sweep behind a setting
+that is off by default (O2).
 
 ### D4 — Strict
 
@@ -171,8 +173,8 @@ v1.1.0 without changing its configuration.
 ### D9 — Who replaces it, and when
 
 - **On Kubernetes, the operator.** A rotation controller writes the keyring Secret: on a
-  schedule (O5) and when a pod leaves the cluster for good (a scale-down, a replacement).
-  It waits for every pod to report the new key accepted before it retires the old one, by
+  schedule and when a pod leaves the cluster for good (a scale-down, a replacement).
+  The schedule is daily (O5). It waits for every pod to report the new key accepted before it retires the old one, by
   the broker's metrics, not by sleeping: a mounted Secret reaches a pod when the kubelet
   syncs it.
 - **Elsewhere, a person or their automation,** by the same two writes; the documented
@@ -211,27 +213,31 @@ when the sealing key changes. Never the keys.
   (O7).
 - It does not change how a client authenticates.
 
-## 4. Open sub-decisions
+## 4. Sub-decisions
 
-- **O1 — `gen-certs.sh` without a stated lifetime:** refuse, or default to a short one
-  (proposed: default 24 hours for a leaf and say so in the output, since a default nobody
-  chose should be the safe one; the CA keeps a long life).
-- **O2 — Client certificates:** should a client session end when the client's certificate
-  expires, as it does when it is revoked? Proposed: yes, behind a setting that is off by
-  default in 1.x, because devices with long sessions and short certificates exist.
+Decided by the maintainer on 2026-10-13:
+
+- **O1 — `gen-certs.sh` without a stated lifetime: it refuses.** There is no default leaf
+  lifetime; the command names the option and stops. (The CA keeps a long life.)
+- **O2 — Client certificates: a client's session ends when its certificate expires**, as
+  it does when it is revoked, **behind a setting that is off by default**: devices with
+  long sessions and short certificates exist.
+- **O5 — The operator replaces the gossip key daily** when nobody has left, with the
+  certificates, and at once when a member leaves for good.
+- **O6, the eviction itself — old keys are evicted** and are not kept for late nodes; a
+  node holding only an evicted key is re-provisioned (D9).
+- **O7 — A cluster identity on the peer link: yes**, as a separate record; it changes the
+  `Hello` frame.
+
+Still open, each with its proposal:
+
 - **O3 — Clock difference:** proposed 60 s of tolerance on `notBefore`, none on
   `notAfter`.
 - **O4 — D8's keyring with the cluster ordering the change, or three operator-ordered
   phases.** Proposed: the keyring. It costs more broker code and removes the one mistake
   that partitions a cluster.
-- **O5 — How often the operator replaces the gossip key when nobody has left.** Proposed:
-  daily, with the certificates.
-- **O6 — How long the overlap may last once every member seals with the new key.**
-  Proposed: ten minutes, configurable down to zero, never unbounded. Decided already
-  (2026-10-13): old keys are evicted and are not kept for late nodes; a node holding only
-  an evicted key is re-provisioned.
-- **O7 — A cluster identity on the peer link** (a mismatch refused at the handshake).
-  Proposed: yes, as a separate record; it changes the `Hello` frame.
+- **O6, the duration — how long the overlap may last once every member seals with the new
+  key.** Proposed: ten minutes, configurable down to zero, never unbounded.
 - **O8 — The default threshold for D2's warning.** Proposed: two thirds of the lifetime
   spent.
 
