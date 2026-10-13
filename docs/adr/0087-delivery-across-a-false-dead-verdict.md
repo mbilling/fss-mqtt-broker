@@ -338,6 +338,48 @@ of 7–10 s. (The change is not part of this record's change.)
 A link is admitted by its handshake, not by membership — today's behaviour, made a stated
 rule and tested: a node accepts a peer its SWIM view holds `Dead`.
 
+**As built (0087-T4).** `cluster.rs` tells the dialer the peer is held `Dead` instead of
+aborting it, and `peer.rs` (`dial_member`) keeps dialing under the verdict:
+
+- *Pace.* Each attempt that serves no link doubles the delay, from the ordinary 500 ms
+  to 5 s, and one attempt is given 5 s. A peer that is really gone costs at most 15
+  connection attempts in its first minute — one socket at a time, nothing queued — and
+  then none. A link served under the verdict resets the delay.
+- *End.* Confirmation that a peer is gone is not a membership event yet (D2, T3, O1), so
+  the dialer bounds itself on what the link manager can see: it stops when the peer has
+  been `Dead` with no link for **twice `dead_ttl`** (60 s) — the tombstone has been
+  pruned, the parting greeting of #971 sent, and a live peer's answer would have arrived
+  as `Alive` — counted from the verdict or from the end of the last link served under
+  it; and it is replaced when an `Alive` names the peer at a different routing address,
+  the only form in which a new generation reaches the link manager. The next `Alive`
+  starts a dialer again, as before. T3's event replaces the window.
+- *What the verdict still decides.* Membership says `Dead` once. A peer that is linked
+  again under the verdict announces its interest again and is routed to; when *that*
+  link goes, no second verdict follows — a node that announced its own departure is
+  redialed while it drains and then exits; a node falsely declared dead may die for
+  real inside the tombstone's 30 s — and its interest would stay behind with nothing
+  to resolve it, holding every matching publish for a node that is not coming back.
+  So the hub remembers the verdict until the link manager withdraws it
+  (`HubCommand::PeerAlive`, on the `Alive` that follows a `Dead`), and the loss of a
+  link to a peer held `Dead` is handled as the verdict was. (The second case exists
+  without this task, in the orientation where the evicted node dials; it was found
+  while building it.) D1 replaces "as the verdict was" with a hold, and T3 with a
+  confirmation.
+- *What the verdict was protecting.* On the accept side, nothing: `serve_listener` never
+  consulted membership, which is why the other orientation already healed in a second.
+  What a link requires is unchanged and is all in the handshake — the cluster CA's
+  certificate on both ends, the revocation list, the node id the certificate attests, a
+  common protocol version, the tie-break. (The peer link carries no cluster id; that is
+  checked on gossip, which decides whom a node dials.) On the dial side the verdict did
+  one thing: it stopped this node connecting to an address whose holder it believed
+  gone. An address can change hands, so a membership-driven dialer now links only the
+  node it was aimed at — whoever else answers there is hung up on — where before it
+  would have linked whichever cluster member answered.
+- *Measured* (`false_dead_delivery.rs`, three nodes, loopback): in all three "A dials"
+  columns of §3 the first publish is acknowledged after 0.76 s and delivered, and the
+  two orientations assert the same rows. Left for D1: `$share` with members on B only,
+  first publish, in both directions.
+
 ### D6 — The receiver side
 
 B holds A dead; A forwards to B. With a link, B applies the forward and answers it today
@@ -525,6 +567,11 @@ with every node on the rule, 5 with one node left on v1.1.0, 11 with half, 16 wi
 - QoS 0, Wills and event-derived messages were not measured across a verdict; their rows
   in §1 are from the code.
 - The proto-6 rows of §1 are from the code; no supported release speaks proto 6.
-- D5 was measured by making the change locally. D1–D4 and D6–D9 are designed against the
-  code and not built; D3's table-fill arithmetic is not a measurement.
+- D5 is built (0087-T4). D1–D4 and D6–D9 are designed against the code and not built;
+  D3's table-fill arithmetic is not a measurement.
+- A peer that is unreachable by TCP while its host is up but silent (a dropped SYN, not a
+  refused one) was not run: the 5 s bound on an attempt under a verdict is from the code.
+  A host that accepts the connection and then says nothing (a stopped process) holds one
+  dial open until it speaks — the handshake has no deadline, for a peer under a verdict
+  as for a member in good standing — so that dialer does not reach its window.
 - §7 is a simulation of one fault shape; #975 lists what it leaves out.

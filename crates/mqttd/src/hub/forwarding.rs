@@ -2525,6 +2525,56 @@ mod zone_fwd_proofs {
         );
     }
 
+    // ---- ADR 0087 D5: a link under a `Dead` verdict --------------------------
+
+    /// A link is admitted by its handshake, not by membership, so a peer this hub
+    /// was told is dead can be linked again, announce its interest, and be routed
+    /// to — the verdict still standing. What the verdict then decides is what the
+    /// loss of THAT link means. Membership says `Dead` once: no second verdict
+    /// follows when the link goes, so the interest the link brought back goes with
+    /// it — or a node that has finished the graceful stop it announced would be
+    /// owed every matching publish for good. Once membership holds the peer alive
+    /// again, a lost link keeps its interest, as for any member.
+    #[test]
+    fn a_link_under_a_dead_verdict_takes_its_interest_with_it_until_the_verdict_is_withdrawn() {
+        for withdrawn in [false, true] {
+            let mut h = hub();
+            let first = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
+            h.peer_dead(&first.node);
+            assert!(!h.interest.has_node(&first.node), "the verdict erases");
+
+            // Linked again under the verdict, and routed to.
+            let mut again = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
+            let (id, _rx) = register(&mut h, "t/x");
+            fan_out(&mut h, "t/x", QoS::AtLeastOnce, false, Some(id));
+            assert!(
+                std::iter::from_fn(|| again.rx.try_recv().ok()).any(|frame| matches!(
+                    frame,
+                    PeerMessage::PublishAcked { .. } | PeerMessage::PublishAckedTagged { .. }
+                )),
+                "withdrawn={withdrawn}: a peer held dead with a link is forwarded to"
+            );
+
+            if withdrawn {
+                h.peer_alive(&again.node);
+            }
+            h.peer_disconnected(&again.node, 0);
+            assert_eq!(
+                h.interest.has_node(&again.node),
+                withdrawn,
+                "withdrawn={withdrawn}: the interest outlives the link only for a member"
+            );
+            assert_eq!(
+                h.pending_publishes[&id]
+                    .awaiting
+                    .values()
+                    .any(|o| o.node == again.node),
+                withdrawn,
+                "withdrawn={withdrawn}: and so does the forward that was in flight"
+            );
+        }
+    }
+
     /// An entry that has already been answered and survives only for the
     /// replay: `refuse_pending` must not claim `Refused` to a publisher that has
     /// been told `Accepted`, and `drop_pending` must not be read as a withhold —
