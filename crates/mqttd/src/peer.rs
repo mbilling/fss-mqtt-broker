@@ -155,11 +155,26 @@ const REDIAL_DELAY: Duration = Duration::from_millis(500);
 /// The longest delay between attempts while the peer is held `Dead` (ADR 0087 D5): each
 /// attempt that serves no link doubles the delay from [`REDIAL_DELAY`] up to this.
 const HELD_DEAD_REDIAL_MAX: Duration = Duration::from_secs(5);
-/// How long one connection attempt may take while the peer is held `Dead`. A host that
-/// is really gone often answers nothing at all, and the operating system would keep
-/// one such attempt pending for minutes — past the window the dialer has, and with its
-/// retransmissions spaced further apart than a returning host should have to wait.
+/// How long the TCP connect of one attempt may take while the peer is held `Dead`. A
+/// host that is really gone often answers nothing at all, and the operating system
+/// would keep one such attempt pending for minutes — past the window the dialer has,
+/// and with its retransmissions spaced further apart than a returning host should have
+/// to wait.
 const HELD_DEAD_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long each half of a dialed link's handshake may take once TCP is connected: the
+/// TLS handshake, and then the exchange of `Hello`s. For every dialer, whatever
+/// membership says of its peer.
+///
+/// A dialer has exactly one attempt under way and does nothing else until it returns.
+/// A peer whose kernel completed the connection and whose host then stopped — hung, or
+/// hard-reset before it could say so — answers nothing and sends no reset, so without
+/// a deadline that attempt never returns: this node, the only side that may dial the
+/// pair, would not link the peer again until it restarted itself. (While a `Dead`
+/// verdict still stopped the dialer, the `Alive` that followed started a fresh one and
+/// hid this; a static peer's dialer has always been exposed to it.) A link that is
+/// established is another matter and needs no deadline here: this node writes to it,
+/// and a host that has gone or come back answers those writes with a reset.
+const DIAL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What membership says about the peer a dialer is aimed at (ADR 0087 D5). The link
 /// manager ([`crate::cluster`]) writes it; the dialer reads it between attempts.
@@ -169,8 +184,9 @@ pub enum DialStanding {
     Member,
     /// Held `Dead` since this instant. The verdict may be false, and a link is the
     /// only way this node finds out on the data path — so the dialer keeps dialing,
-    /// backing off, and gives up only when the peer has stayed `Dead` and unreachable
-    /// for the whole of [`DialTarget::held_dead_for`].
+    /// backing off, and stops dialing only when the peer has stayed `Dead` and
+    /// unreachable for the whole of [`DialTarget::held_dead_for`]. It then waits for
+    /// this standing to change, and dials again when it does.
     HeldDead {
         /// When the verdict reached the link manager.
         since: tokio::time::Instant,
@@ -189,7 +205,9 @@ pub struct DialTarget {
     pub standing: tokio::sync::watch::Receiver<DialStanding>,
     /// How long the dialer keeps dialing a peer that is held `Dead` and never serves
     /// a link, counted from the verdict or from the end of the last link served
-    /// under it, whichever is later. Then it stops; an `Alive` event starts another.
+    /// under it, whichever is later. Then it dials no more until the standing
+    /// changes. The window is looked at when an attempt has ended, so the attempt
+    /// under way when it closes is finished first.
     pub held_dead_for: Duration,
 }
 
@@ -371,7 +389,7 @@ pub async fn serve_listener_with_ingress(
                         }
                     };
                     if let Err(e) = result {
-                        debug!(error = %e, "inbound peer link ended");
+                        debug!(error = %e, "inbound peer handshake failed");
                     }
                 });
             }
@@ -413,7 +431,18 @@ pub async fn dial_forever_with_ingress(
     ingress: Option<Arc<IngressCredit>>,
     state: Option<Arc<RuleState>>,
 ) {
-    dial(addr, local, hub, tls, plane, ingress, state, None).await;
+    dial(
+        addr,
+        local,
+        hub,
+        tls,
+        plane,
+        ingress,
+        state,
+        None,
+        DIAL_HANDSHAKE_TIMEOUT,
+    )
+    .await;
 }
 
 /// Dial the member `target` at `addr` and keep the link up, as
@@ -427,11 +456,16 @@ pub async fn dial_forever_with_ingress(
 /// the dialer keeps going, and what the verdict changes is its pace and its end:
 ///
 /// - each attempt that serves no link doubles the delay, from [`REDIAL_DELAY`] to
-///   [`HELD_DEAD_REDIAL_MAX`], and one attempt may take at most
-///   [`HELD_DEAD_DIAL_TIMEOUT`] — a peer that is really gone costs one connection
-///   attempt every five to ten seconds, not two a second;
+///   [`HELD_DEAD_REDIAL_MAX`], and an attempt is bounded at every step — the TCP
+///   connect by [`HELD_DEAD_DIAL_TIMEOUT`], the TLS handshake and the `Hello`
+///   exchange by [`DIAL_HANDSHAKE_TIMEOUT`] each — so a peer that is really gone
+///   costs one connection attempt every five to ten seconds, not two a second;
 /// - once the peer has been `Dead` with no link for [`DialTarget::held_dead_for`],
-///   the dialer stops. An `Alive` event starts a new one.
+///   the dialer dials no more. It does not end: it waits for its standing to
+///   change, and the `Alive` that withdraws the verdict sets it dialing again. (A
+///   dialer that ended itself here could do so in the instant the link manager,
+///   seeing it still running, handed it that `Alive` — and the member would be
+///   alive with no dialer and no link.)
 ///
 /// A link served under the verdict is served like any other and resets both.
 #[allow(clippy::too_many_arguments)] // `dial_forever_with_ingress`, plus the target
@@ -445,7 +479,27 @@ pub async fn dial_member(
     state: Option<Arc<RuleState>>,
     target: DialTarget,
 ) {
-    dial(addr, local, hub, tls, plane, ingress, state, Some(target)).await;
+    dial(
+        addr,
+        local,
+        hub,
+        tls,
+        plane,
+        ingress,
+        state,
+        Some(target),
+        DIAL_HANDSHAKE_TIMEOUT,
+    )
+    .await;
+}
+
+/// What a dialed link's handshake is held to ([`handle`]); the accept side has none.
+struct Dialed<'a> {
+    /// The member the dialer was aimed at ([`DialTarget::node`]); `None` for a
+    /// static peer, whose node id is whatever answers.
+    expect: Option<&'a NodeId>,
+    /// How long the exchange of `Hello`s may take ([`DIAL_HANDSHAKE_TIMEOUT`]).
+    hello_within: Duration,
 }
 
 /// How one dial attempt ended, as the pacing of the next one needs it.
@@ -470,7 +524,8 @@ fn held_dead_since(target: Option<&mut DialTarget>) -> Option<tokio::time::Insta
 }
 
 /// The dial loop behind [`dial_forever_with_ingress`] (`target` is `None`: a static
-/// peer, redialed at a fixed pace for ever) and [`dial_member`].
+/// peer, redialed at a fixed pace for ever) and [`dial_member`]. `handshake_within`
+/// is [`DIAL_HANDSHAKE_TIMEOUT`] everywhere but in tests.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)] // one loop: connect, TLS, serve, pace the next attempt
 async fn dial(
@@ -482,6 +537,7 @@ async fn dial(
     ingress: Option<Arc<IngressCredit>>,
     state: Option<Arc<RuleState>>,
     mut target: Option<DialTarget>,
+    handshake_within: Duration,
 ) {
     // An undialable name is permanent; retrying would only spin.
     let server_name = match tls.as_ref().map(|_| tls::server_name(&addr)).transpose() {
@@ -511,11 +567,21 @@ async fn dial(
                 debug!(%addr, "dialed peer");
                 let _ = stream.set_nodelay(true);
                 let expected_node = target.as_ref().map(|t| &t.node);
+                let dialed = || Dialed {
+                    expect: expected_node,
+                    hello_within: handshake_within,
+                };
                 let outcome = match (&tls, &server_name) {
                     (Some(t), Some(name)) => {
                         // Read the CURRENT connector per dial (ADR 0040 T4).
                         let connector = t.connector.borrow().clone();
-                        match connector.connect(name.clone(), stream).await {
+                        let secured = tokio::time::timeout(
+                            handshake_within,
+                            connector.connect(name.clone(), stream),
+                        )
+                        .await
+                        .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()));
+                        match secured {
                             // Revoked (ADR 0040 T4): fail closed, but keep
                             // redialing — an un-revocation (new CRL) heals.
                             Ok(s) => match admit_peer_link(s.get_ref().1, &t.gossip_crl) {
@@ -527,7 +593,7 @@ async fn dial(
                                         hub.clone(),
                                         true,
                                         expected_cn,
-                                        expected_node,
+                                        Some(dialed()),
                                         serial,
                                         None,
                                         plane.clone(),
@@ -551,7 +617,7 @@ async fn dial(
                             hub.clone(),
                             true,
                             None,
-                            expected_node,
+                            Some(dialed()),
                             None,
                             None,
                             plane.clone(),
@@ -610,10 +676,24 @@ async fn dial(
                 if now.saturating_duration_since(counted_from) >= window {
                     info!(
                         %addr, held_dead_for = ?window,
-                        "peer held dead and unreachable for the whole window; the dialer \
-                         stops (an alive event starts another)"
+                        "peer held dead and unreachable for the whole window; dialing \
+                         stops until membership holds it alive again"
                     );
-                    return;
+                    // Not `return`. The link manager hands an `Alive` to a dialer it
+                    // sees running, so a dialer that ended itself here could miss the
+                    // one event that would have started another. It waits instead: the
+                    // standing read above is marked seen, so whatever the link manager
+                    // has written since — a withdrawn verdict, or a new one — wakes it
+                    // at once, and it dials again.
+                    let Some(standing) = target.as_mut().map(|t| &mut t.standing) else {
+                        return;
+                    };
+                    if standing.changed().await.is_err() {
+                        return; // the link manager is gone
+                    }
+                    delay = REDIAL_DELAY;
+                    last_served = None;
+                    continue;
                 }
                 delay = (delay * 2).min(HELD_DEAD_REDIAL_MAX);
             }
@@ -710,7 +790,7 @@ async fn handle<S>(
     hub: mpsc::UnboundedSender<HubCommand>,
     initiated: bool,
     expected_cn: Option<String>,
-    expected_node: Option<&NodeId>,
+    dialed: Option<Dialed<'_>>,
     cert_serial: Option<Vec<u8>>,
     client_policy: Option<Arc<ConnPolicy>>,
     plane: Option<DurablePlane>,
@@ -727,16 +807,28 @@ where
     // detect a session-proxy connection (ADR 0005) before announcing itself —
     // a proxied client expects raw MQTT back, not our peer Hello.
     let (remote, proto) = if initiated {
-        write_frame(
-            &mut wh,
-            &PeerMessage::Hello {
-                node_id: local.0.clone(),
-                proto_min: peer::PROTO_MIN,
-                proto_max: peer::PROTO_MAX,
-            },
-        )
-        .await?;
-        match read_frame(&mut rh, &mut buf).await? {
+        let hellos = async {
+            write_frame(
+                &mut wh,
+                &PeerMessage::Hello {
+                    node_id: local.0.clone(),
+                    proto_min: peer::PROTO_MIN,
+                    proto_max: peer::PROTO_MAX,
+                },
+            )
+            .await?;
+            read_frame(&mut rh, &mut buf).await
+        };
+        // A dialer waits for the peer's `Hello` no longer than its deadline: a peer
+        // that accepted the connection and then went silent must not hold the
+        // pair's only dialer for good ([`DIAL_HANDSHAKE_TIMEOUT`]).
+        let answer = match dialed.as_ref().map(|d| d.hello_within) {
+            Some(within) => tokio::time::timeout(within, hellos)
+                .await
+                .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))?,
+            None => hellos.await?,
+        };
+        match answer {
             Some(PeerMessage::Hello {
                 node_id,
                 proto_min,
@@ -825,7 +917,7 @@ where
     // spoke — is a node this dialer has no business linking: that node's link is
     // another dialer's, and a second one would replace it in the hub, the two then
     // taking turns closing each other.
-    if let Some(expected) = expected_node {
+    if let Some(expected) = dialed.as_ref().and_then(|d| d.expect) {
         if expected != &remote {
             return Ok(LinkOutcome::WrongNode(remote));
         }
@@ -935,10 +1027,14 @@ where
             map.remove(&key);
         }
     }
-    // The link's own end is said here, so that an `Err` out of this function is
-    // always a handshake that never produced a link.
+    // The link's own end is said here, as it was by each caller, so that an `Err`
+    // out of this function is always a handshake that never produced a link.
     if let Err(e) = &result {
-        debug!(peer = %remote.0, error = %e, "peer link ended");
+        if initiated {
+            debug!(peer = %remote.0, error = %e, "outbound peer link ended");
+        } else {
+            debug!(peer = %remote.0, error = %e, "inbound peer link ended");
+        }
     }
     let _ = hub.send(HubCommand::PeerDisconnected {
         node: remote,
@@ -2157,6 +2253,11 @@ mod tests {
     }
 
     // ---- ADR 0087 D5: the dialer of a peer membership holds `Dead` -----------
+    //
+    // These tests run on the real clock against real sockets, so every bound in them
+    // is one-sided or generous: a "no attempt for N seconds" is longer than any wait
+    // the dialer could be in, and an "attempt arrives" has twenty seconds to do so.
+    // A loaded runner makes them slower, not wrong.
 
     /// A dial target and the handle its standing is changed through.
     fn dial_target(
@@ -2187,8 +2288,20 @@ mod tests {
         tokio::task::JoinHandle<()>,
         mpsc::UnboundedReceiver<HubCommand>,
     ) {
+        spawn_dialer_with_handshake(addr, target, DIAL_HANDSHAKE_TIMEOUT)
+    }
+
+    /// [`spawn_dialer`], with the handshake deadline a test wants.
+    fn spawn_dialer_with_handshake(
+        addr: std::net::SocketAddr,
+        target: DialTarget,
+        handshake_within: Duration,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        mpsc::UnboundedReceiver<HubCommand>,
+    ) {
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
-        let dialer = tokio::spawn(dial_member(
+        let dialer = tokio::spawn(dial(
             addr.to_string(),
             NodeId("a".into()),
             hub_tx,
@@ -2196,20 +2309,31 @@ mod tests {
             None,
             None,
             None,
-            target,
+            Some(target),
+            handshake_within,
         ));
         (dialer, hub_rx)
     }
 
-    /// An address nothing listens on: bound, read, and closed again.
-    async fn closed_port() -> std::net::SocketAddr {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        listener.local_addr().unwrap()
+    /// How long a test waits for something that must happen.
+    const MUST: Duration = Duration::from_secs(20);
+    /// Longer than any wait a dialer can be in between two attempts (the backoff's
+    /// ceiling): this long with no attempt, and the dialer has stopped dialing.
+    const QUIET: Duration = Duration::from_secs(6);
+
+    /// The peer's end: the next connection the dialer makes, hung up on at once —
+    /// an attempt that serves no link.
+    async fn hang_up_on_the_next_attempt(listener: &TcpListener) {
+        let (stream, _) = tokio::time::timeout(MUST, listener.accept())
+            .await
+            .expect("the dialer never came")
+            .unwrap();
+        drop(stream);
     }
 
     /// Accept the dialer's next connection and answer its `Hello` as node `id`.
     async fn accept_as(listener: &TcpListener, id: &str) -> (TcpStream, BytesMut) {
-        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(20), listener.accept())
+        let (mut stream, _) = tokio::time::timeout(MUST, listener.accept())
             .await
             .expect("the dialer never came")
             .unwrap();
@@ -2232,37 +2356,87 @@ mod tests {
         (stream, buf)
     }
 
-    /// The acceptance of 0087-T4's last clause: the dialer for a peer that is held
-    /// `Dead` and out of reach stops once the window has passed — and not before it,
-    /// and never for a member in good standing, however long that one is out of
-    /// reach.
+    /// The acceptance of 0087-T4's last clause, and the hand-over that must not be
+    /// missed. The dialer of a peer held `Dead` and out of reach dials for its window
+    /// and then no more — but it does not END: its task stays, and the `Alive` that
+    /// withdraws the verdict sets that same task dialing again.
+    ///
+    /// That is what closes a race the first form of this had. The dialer used to
+    /// return when its window was spent, and the link manager started another on the
+    /// next `Alive` — if it saw the task finished. An `Alive` handled between the
+    /// dialer's decision and its task ending found a running task, handed IT the
+    /// news, and the member was alive with no dialer. Now there is no decision to
+    /// end, so there is nothing to race: every `Alive` reaches a dialer that can act
+    /// on it.
     #[tokio::test]
-    async fn a_dialer_stops_only_for_a_peer_held_dead_and_out_of_reach_for_the_window() {
-        let addr = closed_port().await;
-        let (standing, target) =
-            dial_target("b", DialStanding::Member, Duration::from_millis(1200));
-        let (mut dialer, _hub) = spawn_dialer(addr, target);
+    async fn a_dialer_whose_window_is_spent_stops_dialing_and_is_set_going_again_by_alive() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (standing, target) = dial_target("b", DialStanding::Member, Duration::from_millis(600));
+        let (dialer, _hub) = spawn_dialer(listener.local_addr().unwrap(), target);
 
-        // In good standing: three attempts' worth of refusals and it is still going.
+        // In good standing it is redialed without end: three attempts, for a start.
+        for _ in 0..3 {
+            hang_up_on_the_next_attempt(&listener).await;
+        }
+
+        // Held dead: it goes on dialing for the window, and then no more.
+        standing.send_replace(held_dead_now());
+        let mut under_the_verdict = 0;
+        while let Ok(accepted) = tokio::time::timeout(QUIET, listener.accept()).await {
+            drop(accepted.unwrap());
+            under_the_verdict += 1;
+            assert!(under_the_verdict < 50, "the dialer never stopped dialing");
+        }
         assert!(
-            tokio::time::timeout(Duration::from_millis(1300), &mut dialer)
-                .await
-                .is_err(),
-            "a member in good standing is redialed for ever"
+            under_the_verdict >= 1,
+            "a peer held dead is still dialed while its window is open"
         );
+        assert!(!dialer.is_finished(), "it stopped dialing; it did not end");
 
-        // Held dead: it goes on for the window, then stops by itself.
-        let verdict = tokio::time::Instant::now();
-        standing.send_replace(DialStanding::HeldDead { since: verdict });
-        tokio::time::timeout(Duration::from_secs(20), &mut dialer)
+        // The verdict is withdrawn — at any moment after the window was spent, the
+        // same task hears of it.
+        standing.send_replace(DialStanding::Member);
+        hang_up_on_the_next_attempt(&listener).await;
+        hang_up_on_the_next_attempt(&listener).await;
+        assert!(!dialer.is_finished());
+        dialer.abort();
+    }
+
+    /// The hand-over from the other side: the verdict is withdrawn while the attempt
+    /// that will spend the window is still under way. The peer here holds that
+    /// attempt open while the window runs out and the `Alive` arrives, and only then
+    /// fails it: the dialer finds its standing already `Member`, and dials on.
+    ///
+    /// Between this order and the one above lies the instant neither test can reach
+    /// from outside — the `Alive` landing after the dialer has read its standing and
+    /// before it waits. It is covered by construction: the dialer waits on the same
+    /// `watch` it read, the read marks what it saw, and a value written since then
+    /// ends the wait at once.
+    #[tokio::test]
+    async fn an_alive_that_arrives_during_the_attempt_that_spends_the_window_is_not_lost() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let window = Duration::from_millis(200);
+        let (standing, target) = dial_target("b", held_dead_now(), window);
+        let (dialer, _hub) = spawn_dialer(listener.local_addr().unwrap(), target);
+
+        // The attempt is under way: connected, its `Hello` sent, no answer yet.
+        let (held_open, _) = tokio::time::timeout(MUST, listener.accept())
             .await
-            .expect("the dialer of a peer held dead and out of reach must stop")
+            .expect("a peer held dead is still dialed")
             .unwrap();
-        assert!(
-            verdict.elapsed() >= Duration::from_millis(1200),
-            "and not before the window has passed: {:?}",
-            verdict.elapsed()
-        );
+        // SETTLE(dialer-window-runs-out-mid-attempt): the time IS the stimulus. The
+        // window has to be spent while this attempt is still open, so that the next
+        // thing the dialer does is look at it; nothing observable marks that moment
+        // from outside the dialer, and a longer wait only makes the window more spent.
+        tokio::time::sleep(window * 3).await;
+        standing.send_replace(DialStanding::Member);
+        drop(held_open);
+
+        // Its window is spent, and it dials all the same: the verdict was withdrawn.
+        hang_up_on_the_next_attempt(&listener).await;
+        hang_up_on_the_next_attempt(&listener).await;
+        assert!(!dialer.is_finished());
+        dialer.abort();
     }
 
     /// What a peer that is really gone costs: under a verdict each attempt that
@@ -2275,32 +2449,29 @@ mod tests {
         let (standing, target) = dial_target("b", held_dead_now(), Duration::from_mins(10));
         let (dialer, _hub) = spawn_dialer(listener.local_addr().unwrap(), target);
 
-        // The peer accepts and hangs up: an attempt that serves no link.
+        // The peer accepts and hangs up: an attempt that serves no link. The gaps
+        // between attempts are lower bounds — no load can shorten a wait.
         let mut accepted = Vec::new();
-        for _ in 0..3 {
-            let (stream, _) = tokio::time::timeout(Duration::from_secs(20), listener.accept())
-                .await
-                .expect("a peer held dead is still dialed")
-                .unwrap();
+        for _ in 0..4 {
+            hang_up_on_the_next_attempt(&listener).await;
             accepted.push(tokio::time::Instant::now());
-            drop(stream);
         }
-        let (first_gap, second_gap) = (accepted[1] - accepted[0], accepted[2] - accepted[1]);
+        let gaps: Vec<Duration> = accepted.windows(2).map(|w| w[1] - w[0]).collect();
         assert!(
-            first_gap >= REDIAL_DELAY * 2 && second_gap >= REDIAL_DELAY * 4,
-            "the delay doubles: {first_gap:?}, then {second_gap:?}"
+            gaps[0] >= REDIAL_DELAY * 2
+                && gaps[1] >= REDIAL_DELAY * 4
+                && gaps[2] >= REDIAL_DELAY * 8,
+            "the delay doubles: {gaps:?}"
         );
 
-        // The third failure set a four-second wait. Membership withdraws the verdict:
-        // the dialer is back long before that wait would have ended.
+        // The fourth failure set a five-second wait. Membership withdraws the
+        // verdict, and the dialer is back in less than HALF of that — two and a half
+        // seconds of margin for a starved runner, where it takes no time at all.
         standing.send_replace(DialStanding::Member);
         let withdrawn = tokio::time::Instant::now();
-        let _ = tokio::time::timeout(Duration::from_secs(20), listener.accept())
-            .await
-            .expect("the dialer returns when the verdict is withdrawn")
-            .unwrap();
+        hang_up_on_the_next_attempt(&listener).await;
         assert!(
-            withdrawn.elapsed() < REDIAL_DELAY * 4,
+            withdrawn.elapsed() < HELD_DEAD_REDIAL_MAX / 2,
             "it did not wait out the backoff: {:?}",
             withdrawn.elapsed()
         );
@@ -2309,12 +2480,15 @@ mod tests {
 
     /// A link served under a verdict is evidence, later than the verdict, that the
     /// peer was there: the window is counted again from that link's end. Here the
-    /// verdict is already older than the window when the link is served, and the
-    /// dialer still tries for a whole window after the link has gone.
+    /// verdict is already far older than the window when the link is served, and
+    /// the dialer still tries again and again after the link has gone — where,
+    /// counting from the verdict, its first failed attempt would have been its last.
     #[tokio::test]
     async fn a_link_served_under_the_verdict_restarts_the_dialers_window() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let window = Duration::from_millis(1200);
+        // Attempts after the link ends come 0.5 s, 1.5 s and 3.5 s later; the window
+        // admits the first two with two seconds to spare for a stalled runner.
+        let window = Duration::from_millis(3500);
         let now = tokio::time::Instant::now();
         let long_ago = now.checked_sub(window * 4).unwrap_or(now);
         let (_standing, target) =
@@ -2323,7 +2497,7 @@ mod tests {
 
         // The peer held dead answers: the link is registered with the hub, and served.
         let (stream, _buf) = accept_as(&listener, "b").await;
-        let registered = tokio::time::timeout(Duration::from_secs(20), hub.recv())
+        let registered = tokio::time::timeout(MUST, hub.recv())
             .await
             .expect("the hub is told of the link");
         assert!(
@@ -2332,28 +2506,68 @@ mod tests {
         );
         // The link ends, and from here on the peer hangs up on every attempt.
         drop(stream);
-        let ended = tokio::time::Instant::now();
         let mut attempts_after = 0;
-        let mut dialer = dialer;
-        tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                tokio::select! {
-                    stopped = &mut dialer => break stopped.unwrap(),
-                    accepted = listener.accept() => {
-                        attempts_after += 1;
-                        drop(accepted.unwrap());
-                    }
-                }
-            }
-        })
-        .await
-        .expect("with no link for a whole window the dialer stops");
+        while let Ok(accepted) = tokio::time::timeout(QUIET, listener.accept()).await {
+            drop(accepted.unwrap());
+            attempts_after += 1;
+            assert!(attempts_after < 50, "the dialer never stopped dialing");
+        }
         assert!(
-            attempts_after >= 2 && ended.elapsed() >= window,
-            "the window ran again from the end of the link: {attempts_after} attempt(s) \
-             in {:?}",
-            ended.elapsed()
+            attempts_after >= 2,
+            "the window ran again from the end of the link: {attempts_after} attempt(s)"
         );
+        dialer.abort();
+    }
+
+    /// A peer that completes the TCP connection and then says nothing — its kernel
+    /// answered, its process hung, or its host was reset before it could refuse —
+    /// does not hold the dialer: the wait for its `Hello` has a deadline, and the
+    /// dialer comes again. Without one the attempt never returned, and since this
+    /// node is the only side that may dial the pair, the two never linked again
+    /// until this node restarted. Under a verdict, and for a member in good
+    /// standing alike.
+    #[tokio::test]
+    async fn a_peer_that_accepts_and_never_speaks_does_not_wedge_the_dialer() {
+        for standing in [held_dead_now(), DialStanding::Member] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (_standing, target) = dial_target("b", standing, Duration::from_mins(10));
+            let (dialer, mut hub) = spawn_dialer_with_handshake(
+                listener.local_addr().unwrap(),
+                target,
+                Duration::from_millis(300),
+            );
+
+            // Three connections, each accepted, read from, and never answered. All
+            // three are kept open: only the dialer's own deadline ends an attempt.
+            let mut silent = Vec::new();
+            for attempt in 1..=3 {
+                let (mut stream, _) = tokio::time::timeout(MUST, listener.accept())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "{standing:?}: the dialer is wedged in attempt {}",
+                            attempt - 1
+                        )
+                    })
+                    .unwrap();
+                let mut buf = BytesMut::new();
+                let hello = read_frame(&mut stream, &mut buf).await.unwrap();
+                assert!(matches!(hello, Some(PeerMessage::Hello { .. })));
+                silent.push(stream);
+            }
+            assert!(hub.try_recv().is_err(), "no link was ever registered");
+
+            // The peer comes to: the next attempt is answered, and linked.
+            let (_stream, _buf) = accept_as(&listener, "b").await;
+            let registered = tokio::time::timeout(MUST, hub.recv())
+                .await
+                .expect("the hub is told of the link");
+            assert!(
+                matches!(&registered, Some(HubCommand::PeerConnected { node, .. }) if node.0 == "b"),
+                "{standing:?}: {registered:?}"
+            );
+            dialer.abort();
+        }
     }
 
     /// A dialer that outlives a verdict may be dialing an address its member no

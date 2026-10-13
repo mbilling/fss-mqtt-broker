@@ -52,11 +52,11 @@
 //! - the peer has been held `Dead` for [`held_dead_dial_window`] — twice the
 //!   tombstone's lifetime — and in that time no dial reached it. By then the
 //!   tombstone has been pruned and the parting greeting (issue #971) sent, and a
-//!   live peer's answer to it would have arrived here as `Alive`;
+//!   live peer's answer to it would have arrived here as `Alive`. The dialer then
+//!   dials no more; its task stays, waiting for the next `Alive`, which sets it
+//!   dialing again;
 //! - an `Alive` event names the peer at a **different routing address** (the only
 //!   form in which a new generation is visible here): the old dialer is replaced.
-//!
-//! A dialer that stopped is started again by the next `Alive`, as before.
 
 use crate::hub::HubCommand;
 use crate::peer::{self, DialStanding, DialTarget};
@@ -64,7 +64,7 @@ use mqtt_cluster::placement::Placement;
 use mqtt_cluster::swim::MemberState;
 use mqtt_cluster::swim_driver::MembershipEvent;
 use mqtt_cluster::NodeId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
@@ -186,6 +186,10 @@ async fn maintain(
     // Last-seen SWIM state per peer, for the members-by-state gauge (ADR 0020-T6). A
     // node reuses its stable id across restarts, so a rejoin overwrites its `Dead` entry.
     let mut member_states: HashMap<NodeId, MemberState> = HashMap::new();
+    // The peers a `Dead` verdict stands for: declared dead, and not since alive.
+    // What the hub is told, and when, follows this and not `member_states`, which
+    // only remembers the last event.
+    let mut held_dead: HashSet<NodeId> = HashSet::new();
 
     while let Some(ev) = events.recv().await {
         // Keep the placement ring in step with membership before routing reacts.
@@ -212,9 +216,28 @@ async fn maintain(
                 // owns the link: a peer held `Dead` may have had a link all along
                 // (ADR 0087 D5), and from here on losing it is a member losing a
                 // link, not the end of a node already written off.
-                if previous == Some(MemberState::Dead) {
+                //
+                // Decided by whether a verdict STANDS, not by what the last event
+                // was: SWIM can raise `Suspect` between a `Dead` and the `Alive`
+                // that ends it (a relayed suspicion about a member it has pruned, or
+                // about a new generation of it, re-adds the member as suspect). The
+                // hub would then keep the verdict for the rest of the member's life,
+                // and treat every later loss of its link as the loss of a node
+                // already written off.
+                if held_dead.remove(&ev.id) {
                     let _ = hub.send(HubCommand::PeerAlive {
                         node: ev.id.clone(),
+                    });
+                }
+                // And its dialer, if it has one, is told — before anything below
+                // can find a reason not to start one: an `Alive` that carries no
+                // routing address yet withdraws the verdict all the same, and must
+                // not leave the dialer counting down to the end of its window.
+                if let Some(dialer) = dialers.0.get(&ev.id) {
+                    dialer.standing.send_if_modified(|standing| {
+                        let withdrawn = *standing != DialStanding::Member;
+                        *standing = DialStanding::Member;
+                        withdrawn
                     });
                 }
                 // One link per pair: only the smaller-id node dials (the same
@@ -233,10 +256,9 @@ async fn maintain(
                 if let Some(dialer) = dialers.0.get(&ev.id) {
                     if !dialer.task.is_finished() {
                         if dialer.addr == ev.peer_addr {
-                            // Already dialing, or linked, at this address. If the
-                            // peer was held `Dead` the verdict is withdrawn, and
-                            // the dialer goes back to the ordinary pace at once.
-                            dialer.standing.send_replace(DialStanding::Member);
+                            // Already dialing, or linked, at this address — or
+                            // waiting, its window spent, for the standing it was
+                            // just given above.
                             continue;
                         }
                         // The peer moved: the running dialer is aiming at an address
@@ -295,6 +317,7 @@ async fn maintain(
                         newly
                     });
                 }
+                held_dead.insert(ev.id.clone());
                 warn!(peer = %ev.id.0, "membership: peer DEAD; dropping link and routing state");
                 let _ = hub.send(HubCommand::PeerDead { node: ev.id });
             }
@@ -486,9 +509,9 @@ mod tests {
     }
 
     /// The dialer of a peer that stays `Dead` and out of reach for the whole window
-    /// stops; the `Alive` that follows (a refutation, or the peer's next life)
-    /// starts another. The peer here hangs up on every attempt, so each attempt is
-    /// seen and none serves a link.
+    /// dials no more; the `Alive` that follows (a refutation, or the peer's next
+    /// life) sets it dialing again. The peer here hangs up on every attempt, so each
+    /// attempt is seen and none serves a link.
     #[tokio::test]
     async fn a_dialer_that_gave_up_on_a_dead_peer_is_started_again_by_alive() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -600,6 +623,93 @@ mod tests {
                 .is_err(),
             "the old address is still being dialed"
         );
+    }
+
+    /// The next hub command, which must come.
+    async fn next_command(hub_rx: &mut mpsc::UnboundedReceiver<HubCommand>) -> HubCommand {
+        timeout(Duration::from_secs(20), hub_rx.recv())
+            .await
+            .expect("the link manager told the hub nothing")
+            .expect("the link manager is running")
+    }
+
+    /// SWIM can raise `Suspect` between a `Dead` and the `Alive` that ends it: once
+    /// the tombstone is pruned, a relayed suspicion about the member re-adds it as
+    /// suspect; and a relayed suspicion about a NEW generation of it supersedes the
+    /// tombstone at once (that one usually returns at a new routing address). The
+    /// verdict is withdrawn at the hub all the same — what decides is that a verdict
+    /// stands, not what the last event was. (When it was the last event that
+    /// decided, the hub kept the verdict for the rest of the member's life, and
+    /// every later loss of its link was handled as the loss of a node already
+    /// written off.) For the node that dials the pair and for the one that does not.
+    #[tokio::test]
+    async fn a_suspect_between_dead_and_alive_still_withdraws_the_verdict_at_the_hub() {
+        for local in ["a", "z"] {
+            for returns_at in ["b:7000", "b-reborn:7000"] {
+                let (ev_tx, mut hub_rx) = start(local);
+                ev_tx.send(ev("b", "b:7000", MemberState::Alive)).unwrap();
+                ev_tx.send(ev("b", "b:7000", MemberState::Dead)).unwrap();
+                ev_tx
+                    .send(ev("b", returns_at, MemberState::Suspect))
+                    .unwrap();
+                ev_tx.send(ev("b", returns_at, MemberState::Alive)).unwrap();
+                // A second `Alive` withdraws nothing, and says nothing.
+                ev_tx.send(ev("b", returns_at, MemberState::Alive)).unwrap();
+                // Then a verdict of its own, so the absence above is observable.
+                ev_tx.send(ev("b", returns_at, MemberState::Dead)).unwrap();
+                let mut told = Vec::new();
+                for _ in 0..3 {
+                    told.push(next_command(&mut hub_rx).await);
+                }
+                assert!(
+                    matches!(
+                        &told[..],
+                        [
+                            HubCommand::PeerDead { node: dead },
+                            HubCommand::PeerAlive { node: alive },
+                            HubCommand::PeerDead { node: again },
+                        ] if dead.0 == "b" && alive.0 == "b" && again.0 == "b"
+                    ),
+                    "local={local} returns_at={returns_at}: {told:?}"
+                );
+            }
+        }
+    }
+
+    /// An `Alive` that carries no routing address yet withdraws the verdict all the
+    /// same — for the dialer too. Its window here is far shorter than its first
+    /// backoff, so a dialer left believing the peer `Dead` would stop after one
+    /// attempt; told the truth, it goes on at the ordinary pace.
+    #[tokio::test]
+    async fn alive_without_a_routing_address_still_withdraws_the_verdict_from_the_dialer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (ev_tx, mut hub_rx) = start_with_window("a", Duration::from_millis(100));
+
+        ev_tx.send(ev("b", &addr, MemberState::Alive)).unwrap();
+        let first = timeout(Duration::from_secs(20), listener.accept())
+            .await
+            .expect("first dial")
+            .unwrap();
+        ev_tx.send(ev("b", &addr, MemberState::Dead)).unwrap();
+        ev_tx.send(ev("b", "", MemberState::Alive)).unwrap();
+        assert!(matches!(
+            next_command(&mut hub_rx).await,
+            HubCommand::PeerDead { .. }
+        ));
+        assert!(matches!(
+            next_command(&mut hub_rx).await,
+            HubCommand::PeerAlive { .. }
+        ));
+        drop(first);
+
+        // Every attempt is hung up on, and they keep coming.
+        for attempt in 1..=5 {
+            let accepted = timeout(Duration::from_secs(20), listener.accept())
+                .await
+                .unwrap_or_else(|_| panic!("the dialer stopped after {} attempt(s)", attempt - 1));
+            drop(accepted.unwrap());
+        }
     }
 
     /// One link per pair: the larger node id never dials (the peer owns it).

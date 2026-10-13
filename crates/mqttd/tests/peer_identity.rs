@@ -512,53 +512,106 @@ async fn a_cluster_crl_reload_tears_down_the_revoked_nodes_link() {
 
 // --- ADR 0087 D5: a link is admitted by its handshake, not by membership -------
 
-/// A sender that counts the links registered through it on their way to `hub`.
-fn counting_links(
+/// What passed through a [`tapped`] sender on its way to a hub.
+#[derive(Default)]
+struct Seen {
+    /// Links registered (`PeerConnected`).
+    links: std::sync::atomic::AtomicUsize,
+    /// `Dead` verdicts the link manager handed the hub (`PeerDead`).
+    verdicts: std::sync::atomic::AtomicUsize,
+}
+
+impl Seen {
+    fn links(&self) -> usize {
+        self.links.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn verdicts(&self) -> usize {
+        self.verdicts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// A sender that counts links and verdicts on their way to `hub`. A command is
+/// counted once it has been handed on, so a count read here is of commands the hub
+/// already holds.
+fn tapped(
     hub: tokio::sync::mpsc::UnboundedSender<mqttd::HubCommand>,
 ) -> (
     tokio::sync::mpsc::UnboundedSender<mqttd::HubCommand>,
-    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<Seen>,
 ) {
+    use std::sync::atomic::Ordering::SeqCst;
     let (tap_tx, mut tap_rx) = tokio::sync::mpsc::unbounded_channel();
-    let links = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let counted = links.clone();
+    let seen = std::sync::Arc::new(Seen::default());
+    let counted = seen.clone();
     tokio::spawn(async move {
         while let Some(command) = tap_rx.recv().await {
-            if matches!(command, mqttd::HubCommand::PeerConnected { .. }) {
-                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
+            let (link, verdict) = (
+                matches!(command, mqttd::HubCommand::PeerConnected { .. }),
+                matches!(command, mqttd::HubCommand::PeerDead { .. }),
+            );
             if hub.send(command).is_err() {
                 break;
             }
+            if link {
+                counted.links.fetch_add(1, SeqCst);
+            }
+            if verdict {
+                counted.verdicts.fetch_add(1, SeqCst);
+            }
         }
     });
-    (tap_tx, links)
+    (tap_tx, seen)
 }
 
-/// The membership event a SWIM driver raises about `node`.
+/// The membership event a SWIM driver raises about node `id` at `peer_addr`.
 fn membership(
-    node: &NodeHandles,
+    id: &str,
+    peer_addr: SocketAddr,
     state: mqtt_cluster::swim::MemberState,
 ) -> mqtt_cluster::swim_driver::MembershipEvent {
     mqtt_cluster::swim_driver::MembershipEvent {
-        id: node.node_id.clone(),
+        id: NodeId(id.into()),
         addr: String::new(),
-        peer_addr: node.peer_addr.to_string(),
+        peer_addr: peer_addr.to_string(),
         state,
         domain: None,
     }
 }
 
-/// Wait until `links` links have been registered with the hub behind the counter.
-async fn links_reach(counter: &std::sync::atomic::AtomicUsize, links: usize) {
+/// Wait until `reached` holds, for at most thirty seconds.
+async fn until(what: &str, reached: impl Fn() -> bool) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while counter.load(std::sync::atomic::Ordering::SeqCst) < links {
+    while !reached() {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the hub never registered link number {links}"
+            "timed out waiting until {what}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// Run `node`'s links as production does: from its membership's events, through a
+/// tap. Returns the event feed and what the tap has seen.
+fn managed_links(
+    node: &mut NodeHandles,
+    tls: PeerTls,
+) -> (
+    tokio::sync::mpsc::UnboundedSender<mqtt_cluster::swim_driver::MembershipEvent>,
+    std::sync::Arc<Seen>,
+) {
+    let (hub, seen) = tapped(node.hub_tx.clone());
+    node.hub_tx = hub;
+    let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(mqttd::cluster::maintain_peer_links(
+        events,
+        node.node_id.clone(),
+        node.hub_tx.clone(),
+        Some(tls),
+        None,
+        None,
+        None,
+    ));
+    (events_tx, seen)
 }
 
 /// ADR 0087 D5, both orientations, over mutual TLS: node `holder` is told by its own
@@ -567,44 +620,23 @@ async fn links_reach(counter: &std::sync::atomic::AtomicUsize, links: usize) {
 /// peer reaches a subscriber on the holder. Whoever dials (the smaller node id), the
 /// holder's membership is asked nothing on the way: everything a link needs — the
 /// cluster CA's certificate on both ends, the node id it attests — it still needs,
-/// and the last test of this file shows it is still refused without.
+/// and the tests after this one show it is still refused without.
 async fn a_link_returns_under_a_dead_verdict(holder_id: &str, peer_id: &str) {
     use mqtt_cluster::swim::MemberState;
 
     let pki = ClusterPki::new("held-dead");
     let mut holder = bind_node(NodeId(holder_id.into())).await;
     let mut peer = bind_node(NodeId(peer_id.into())).await;
-    let (holder_hub, links) = counting_links(holder.hub_tx.clone());
-    holder.hub_tx = holder_hub;
+    // Each node's links are its membership's to manage, as in production.
+    let (holder_events, seen) = managed_links(&mut holder, pki.peer_tls(holder_id));
+    let (peer_events, _) = managed_links(&mut peer, pki.peer_tls(peer_id));
     holder.serve(Some(pki.peer_tls(holder_id)));
     peer.serve(Some(pki.peer_tls(peer_id)));
-
-    // Each node's links are its membership's to manage, as in production.
-    let (holder_events, events) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(mqttd::cluster::maintain_peer_links(
-        events,
-        holder.node_id.clone(),
-        holder.hub_tx.clone(),
-        Some(pki.peer_tls(holder_id)),
-        None,
-        None,
-        None,
-    ));
-    let (peer_events, events) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(mqttd::cluster::maintain_peer_links(
-        events,
-        peer.node_id.clone(),
-        peer.hub_tx.clone(),
-        Some(pki.peer_tls(peer_id)),
-        None,
-        None,
-        None,
-    ));
     holder_events
-        .send(membership(&peer, MemberState::Alive))
+        .send(membership(peer_id, peer.peer_addr, MemberState::Alive))
         .unwrap();
     peer_events
-        .send(membership(&holder, MemberState::Alive))
+        .send(membership(holder_id, holder.peer_addr, MemberState::Alive))
         .unwrap();
 
     let mut sub = Client::connect(holder.client_addr, "sub").await;
@@ -614,15 +646,19 @@ async fn a_link_returns_under_a_dead_verdict(holder_id: &str, peer_id: &str) {
         crosses(&mut sub, &mut pubr, "held/before", b"before").await,
         "the mesh must route before the verdict"
     );
-    links_reach(&links, 1).await;
+    until("the first link is registered", || seen.links() >= 1).await;
 
     // The false verdict, at the holder only. The peer is told nothing.
     holder_events
-        .send(membership(&peer, MemberState::Dead))
+        .send(membership(peer_id, peer.peer_addr, MemberState::Dead))
         .unwrap();
+    until("the holder's hub holds the verdict", || {
+        seen.verdicts() == 1
+    })
+    .await;
 
     // The link the verdict dropped is replaced while the verdict stands...
-    links_reach(&links, 2).await;
+    until("a second link is registered", || seen.links() >= 2).await;
     // ...and is served: nothing between the two nodes asks membership.
     assert!(
         crosses(&mut sub, &mut pubr, "held/during", b"during").await,
@@ -642,36 +678,32 @@ async fn a_node_accepts_and_serves_a_link_from_a_peer_it_holds_dead() {
     a_link_returns_under_a_dead_verdict("node-b", "node-a").await;
 }
 
-/// What a `Dead` verdict does NOT do is open a door. A node that holds `node-a`
-/// `Dead` is dialed by something that claims to be `node-a` with a certificate that
-/// attests another name: refused, exactly as it is for a member in good standing
-/// (`cert_cn_mismatch_with_hello_node_id_is_rejected`) — the accept path's checks
-/// are the handshake's, and membership never stood in for any of them.
+/// An INVARIANT, not a change: this test passes before ADR 0087 D5 as after it,
+/// because the accept path has never had membership as an input. It is here so that
+/// "a link is admitted by its handshake, not by membership" is pinned in the
+/// direction that matters for an attacker too — a verdict admits nobody the
+/// handshake would refuse. The node holds `node-a` `Dead` (the verdict is in its hub
+/// before anything dials), and is then dialed by something that claims to be
+/// `node-a` with a certificate that attests another name: refused, exactly as for a
+/// member in good standing (`cert_cn_mismatch_with_hello_node_id_is_rejected`).
 #[tokio::test]
-async fn a_dead_verdict_admits_nobody_the_handshake_would_refuse() {
+async fn a_node_held_dead_is_not_a_node_anyone_may_claim_to_be() {
     use mqtt_cluster::swim::MemberState;
 
     let pki = ClusterPki::new("held-dead-impostor");
     // The impostor: its Hello says "node-a", its certificate says "node-evil".
     let evil = bind_node(NodeId("node-a".into())).await;
     let mut honest = bind_node(NodeId("node-b".into())).await;
-    let (honest_hub, links) = counting_links(honest.hub_tx.clone());
-    honest.hub_tx = honest_hub;
+    let (events, seen) = managed_links(&mut honest, pki.peer_tls("node-b"));
     honest.serve(Some(pki.peer_tls("node-b")));
 
-    let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(mqttd::cluster::maintain_peer_links(
-        events,
-        honest.node_id.clone(),
-        honest.hub_tx.clone(),
-        Some(pki.peer_tls("node-b")),
-        None,
-        None,
-        None,
-    ));
-    events_tx
-        .send(membership(&evil, MemberState::Dead))
+    events
+        .send(membership("node-a", evil.peer_addr, MemberState::Dead))
         .unwrap();
+    until("the honest node's hub holds the verdict", || {
+        seen.verdicts() == 1
+    })
+    .await;
     evil.dial(honest.peer_addr, Some(pki.peer_tls("node-evil")));
 
     let mut sub = Client::connect(honest.client_addr, "sub").await;
@@ -682,8 +714,70 @@ async fn a_dead_verdict_admits_nobody_the_handshake_would_refuse() {
         "a node held dead is not a node anyone may claim to be"
     );
     assert_eq!(
-        links.load(std::sync::atomic::Ordering::SeqCst),
+        seen.links(),
         0,
         "no link was ever registered for the impostor"
+    );
+}
+
+/// The dial side, which D5 did change: a node now goes on dialing the address of a
+/// member it holds `Dead`, and an address can change hands. Here `node-a` holds
+/// `node-b` dead and keeps dialing its address — where `node-c` now answers, with a
+/// certificate the cluster CA issued for `node-c` and a `Hello` that says so. Every
+/// check a link had before D5 passes: the certificate verifies, and the `Hello`
+/// matches it. The dialer hangs up all the same, because the node that answered is
+/// not the member it dialed. Nothing reaches `node-a`'s hub — no link, so no frame
+/// of `node-c`'s after its `Hello` is ever read — and nothing is routed between the
+/// two, however often the dialer returns.
+#[tokio::test]
+async fn a_dialer_under_a_dead_verdict_refuses_another_nodes_valid_certificate() {
+    use mqtt_cluster::swim::MemberState;
+
+    let pki = ClusterPki::new("held-dead-other-node");
+    let mut holder = bind_node(NodeId("node-a".into())).await;
+    let mut other = bind_node(NodeId("node-c".into())).await;
+    let (events, seen) = managed_links(&mut holder, pki.peer_tls("node-a"));
+    // `node-c` accepts whoever the cluster CA vouches for; what it registers is
+    // counted, to see the dialer come back.
+    let (other_hub, at_other) = tapped(other.hub_tx.clone());
+    other.hub_tx = other_hub;
+    holder.serve(Some(pki.peer_tls("node-a")));
+    other.serve(Some(pki.peer_tls("node-c")));
+
+    // Membership names `node-b` at the address `node-c` answers on, then holds
+    // `node-b` dead. No node-b exists.
+    events
+        .send(membership("node-b", other.peer_addr, MemberState::Alive))
+        .unwrap();
+    until("the dialer has reached the address once", || {
+        at_other.links() >= 1
+    })
+    .await;
+    events
+        .send(membership("node-b", other.peer_addr, MemberState::Dead))
+        .unwrap();
+    until("the holder's hub holds the verdict", || {
+        seen.verdicts() == 1
+    })
+    .await;
+    // Under the verdict the dialer keeps coming, and `node-c` keeps answering.
+    let before = at_other.links();
+    until("the dialer has come back twice under the verdict", || {
+        at_other.links() >= before + 2
+    })
+    .await;
+
+    // A subscriber on the holder, a publisher on the node that answered.
+    let mut sub = Client::connect(holder.client_addr, "sub").await;
+    sub.subscribe("other/+").await;
+    let mut pubr = Client::connect(other.client_addr, "pub").await;
+    assert!(
+        never_crosses(&mut sub, &mut pubr, "other/x").await,
+        "nothing is routed over a link the dialer refused"
+    );
+    assert_eq!(
+        seen.links(),
+        0,
+        "the holder never registered a link to the node that answered"
     );
 }

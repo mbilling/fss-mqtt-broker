@@ -2575,6 +2575,95 @@ mod zone_fwd_proofs {
         }
     }
 
+    /// The same, end to end from the membership events: the link manager turns
+    /// `Dead`, `Suspect`, `Alive` into what it tells the hub, and the hub applies
+    /// it. SWIM raises that sequence for one id in two shapes — a relayed suspicion
+    /// re-adding a member whose tombstone was pruned, and one superseding the
+    /// tombstone of a member that has started a new life (here: at a new address).
+    /// After either, the member is a member: its link is lost, and its interest and
+    /// the forward in flight to it are kept. (The link manager used to withdraw the
+    /// verdict only when `Dead` was the event just before `Alive`; with `Suspect`
+    /// in between the hub held the verdict for good, and this flap erased both.)
+    #[tokio::test]
+    async fn after_dead_suspect_alive_a_lost_link_is_a_members_lost_link() {
+        use mqtt_cluster::swim::MemberState;
+        use mqtt_cluster::swim_driver::MembershipEvent;
+        for returns_at in ["p:7000", "p-reborn:7000"] {
+            let (events, event_rx) = mpsc::unbounded_channel();
+            let (to_hub, mut from_link_manager) = mpsc::unbounded_channel();
+            // "z" > "p": this node does not dial the pair, so no socket is involved.
+            let link_manager = tokio::spawn(crate::cluster::maintain_peer_links(
+                event_rx,
+                NodeId("z".into()),
+                to_hub,
+                None,
+                None,
+                None,
+                None,
+            ));
+            let event = |peer_addr: &str, state| MembershipEvent {
+                id: NodeId("p".into()),
+                addr: "p-swim".into(),
+                peer_addr: peer_addr.into(),
+                state,
+                domain: None,
+            };
+
+            let mut h = hub();
+            let first = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
+            events.send(event("p:7000", MemberState::Alive)).unwrap();
+            events.send(event("p:7000", MemberState::Dead)).unwrap();
+            events
+                .send(event(returns_at, MemberState::Suspect))
+                .unwrap();
+            events.send(event(returns_at, MemberState::Alive)).unwrap();
+            // What the hub is told, applied as its own dispatch applies it; the
+            // member's link is back between the verdict and its withdrawal.
+            let mut again = None;
+            for expected in ["dead", "alive"] {
+                let told = tokio::time::timeout(Duration::from_secs(20), from_link_manager.recv())
+                    .await
+                    .unwrap_or_else(|_| panic!("{returns_at}: the hub was never told `{expected}`"))
+                    .expect("the link manager is running");
+                match told {
+                    HubCommand::PeerDead { node } => {
+                        assert_eq!((expected, &node), ("dead", &first.node));
+                        h.peer_dead(&node);
+                        again = Some(attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x"));
+                    }
+                    HubCommand::PeerAlive { node } => {
+                        assert_eq!((expected, &node), ("alive", &first.node));
+                        h.peer_alive(&node);
+                    }
+                    other => panic!("{returns_at}: unexpected {other:?}"),
+                }
+            }
+            let again = again.expect("the verdict was applied");
+            let (id, mut rx) = register(&mut h, "t/x");
+            fan_out(&mut h, "t/x", QoS::AtLeastOnce, false, Some(id));
+            h.pending_local_done(id);
+
+            // An ordinary link flap, some time later.
+            h.peer_disconnected(&again.node, 0);
+            assert!(
+                h.interest.has_node(&again.node),
+                "{returns_at}: a member's lost link keeps its interest"
+            );
+            assert!(
+                h.pending_publishes[&id]
+                    .awaiting
+                    .values()
+                    .any(|o| o.node == again.node),
+                "{returns_at}: and the forward in flight to it"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "{returns_at}: the publisher is held"
+            );
+            link_manager.abort();
+        }
+    }
+
     /// An entry that has already been answered and survives only for the
     /// replay: `refuse_pending` must not claim `Refused` to a publisher that has
     /// been told `Accepted`, and `drop_pending` must not be read as a withhold —

@@ -137,6 +137,10 @@ struct Node {
     raised: Arc<Mutex<Vec<(NodeId, MemberState)>>>,
     metrics: Arc<mqtt_observability::metrics::Metrics>,
     plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
+    /// The hub, to ask it whether it has caught up ([`HubCommand::Flush`]).
+    hub: mpsc::UnboundedSender<HubCommand>,
+    /// How many `Dead` verdicts this node's link manager has handed its hub.
+    verdicts_handed_to_the_hub: Arc<AtomicUsize>,
 }
 
 // The node assembly mirrors production wiring end to end, as `durable_sessions.rs` does.
@@ -291,10 +295,30 @@ async fn start_node(id: &str, seeds: Vec<String>, mode: Mode) -> Node {
         None,
         std::future::pending(),
     ));
+    // The link manager reaches the hub through a tap that counts the verdicts it
+    // has handed on, so a test can wait for the hub to have APPLIED one. (The
+    // members gauge is no such observable: the link manager publishes it before it
+    // tells the hub.)
+    let verdicts_handed_to_the_hub = Arc::new(AtomicUsize::new(0));
+    let (to_hub, mut from_link_manager) = mpsc::unbounded_channel::<HubCommand>();
+    {
+        let (hub, handed) = (hub_tx.clone(), verdicts_handed_to_the_hub.clone());
+        tokio::spawn(async move {
+            while let Some(command) = from_link_manager.recv().await {
+                let verdict = matches!(command, HubCommand::PeerDead { .. });
+                if hub.send(command).is_err() {
+                    break;
+                }
+                if verdict {
+                    handed.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+    }
     tokio::spawn(mqttd::cluster::maintain_peer_links(
         event_rx,
         node_id.clone(),
-        hub_tx,
+        to_hub,
         None,
         Some(placement.clone()),
         Some(metrics.clone()),
@@ -311,6 +335,8 @@ async fn start_node(id: &str, seeds: Vec<String>, mode: Mode) -> Node {
         raised,
         metrics,
         plane,
+        hub: hub_tx,
+        verdicts_handed_to_the_hub,
     }
 }
 
@@ -437,14 +463,21 @@ impl Cluster {
     }
 
     /// A — and only A — is told B is dead: the event A's SWIM driver emits for a `Dead`.
-    /// Returns once A's link manager has applied it (the members gauge shows it). The
-    /// link is then gone for about a second in either orientation — whichever node
-    /// dials it, dials it again (ADR 0087 D5) — so nothing waits here for the hubs to
-    /// have seen it go: the first publishes race the redial, as they would in
-    /// production.
+    /// Returns once A's HUB has applied the verdict — the link to B dropped, and
+    /// whatever else the verdict does to routing done — so that the first publish of
+    /// every flow is made under the verdict and has to cross the redial. Returning
+    /// on the members gauge alone would not do: the link manager publishes it before
+    /// it tells the hub, and a publish made in between travels the old link and
+    /// reads as delivered without having tested anything.
+    ///
+    /// Nothing waits for the link to be seen DOWN, in either orientation: whichever
+    /// node dials it, dials it again within half a second (ADR 0087 D5), and each
+    /// hub publishes its link count once a second.
     async fn falsely_declare_b_dead_on_a(&self) {
         self.raised_at_verdict
             .store(self.a.raised.lock().unwrap().len(), Ordering::SeqCst);
+        let handed = self.a.verdicts_handed_to_the_hub.clone();
+        let before = handed.load(Ordering::SeqCst);
         self.a.events.send(self.event(MemberState::Dead)).unwrap();
         let metrics = self.a.metrics.clone();
         wait_until(
@@ -453,6 +486,19 @@ impl Cluster {
             || metrics.render().contains("mqttd_members{state=\"dead\"} 1"),
         )
         .await;
+        wait_until(
+            "A's link manager has handed the verdict to A's hub",
+            Duration::from_secs(10),
+            || handed.load(Ordering::SeqCst) > before,
+        )
+        .await;
+        // The verdict is in the hub's queue; this barrier is behind it.
+        let (reply, applied) = tokio::sync::oneshot::channel();
+        self.a.hub.send(HubCommand::Flush { reply }).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), applied)
+            .await
+            .expect("A's hub applies the verdict")
+            .expect("A's hub is running");
     }
 
     /// A's membership heals: the `Alive` event a first-hand refutation raises. Only

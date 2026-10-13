@@ -342,17 +342,39 @@ rule and tested: a node accepts a peer its SWIM view holds `Dead`.
 aborting it, and `peer.rs` (`dial_member`) keeps dialing under the verdict:
 
 - *Pace.* Each attempt that serves no link doubles the delay, from the ordinary 500 ms
-  to 5 s, and one attempt is given 5 s. A peer that is really gone costs at most 15
+  to 5 s. An attempt is bounded at each step: 5 s for the TCP connect (under a verdict),
+  then 10 s for the TLS handshake and 10 s for the exchange of `Hello`s (for every
+  dialer, verdict or not — see below). A peer that is really gone costs at most 15
   connection attempts in its first minute — one socket at a time, nothing queued — and
-  then none. A link served under the verdict resets the delay.
+  then none; the window is looked at when an attempt ends, so the one under way when it
+  closes is finished first. A link served under the verdict resets the delay.
+- *A deadline on the handshake.* A dialer does one thing at a time, and it is the only
+  side that may dial its pair. A peer whose kernel completed the connection and whose
+  host then stopped without a reset — hung, or power-cycled — answers nothing, and a
+  dialer waiting for its `Hello` without a deadline waits for good: the pair is not
+  linked again until the dialing node restarts. While a verdict stopped the dialer, the
+  `Alive` that followed started a fresh one and hid this; a dialer that survives the
+  verdict is exposed to it, as a static peer's dialer always was. So the TLS handshake
+  and the `Hello` exchange of every dialed link have a deadline. An established link
+  needs none here: the node writes to it, and a host that has gone or come back
+  answers a write with a reset.
 - *End.* Confirmation that a peer is gone is not a membership event yet (D2, T3, O1), so
   the dialer bounds itself on what the link manager can see: it stops when the peer has
   been `Dead` with no link for **twice `dead_ttl`** (60 s) — the tombstone has been
   pruned, the parting greeting of #971 sent, and a live peer's answer would have arrived
   as `Alive` — counted from the verdict or from the end of the last link served under
   it; and it is replaced when an `Alive` names the peer at a different routing address,
-  the only form in which a new generation reaches the link manager. The next `Alive`
-  starts a dialer again, as before. T3's event replaces the window.
+  the only form in which a new generation reaches the link manager. A dialer whose
+  window is spent dials no more but does not end: its task waits for its standing to
+  change, and the next `Alive` sets it dialing again. (Ending it left an instant in
+  which the link manager, seeing the task still running, handed it the `Alive` it was
+  about to miss — a member alive with no dialer.) T3's event replaces the window.
+- *What counts as a verdict standing.* The link manager keeps its own set of peers
+  held dead, and withdraws the verdict — at the hub and at the dialer — on the first
+  `Alive` for a peer in it, whatever came between. SWIM can raise `Suspect` between a
+  `Dead` and that `Alive` (a relayed suspicion re-adding a pruned member, or superseding
+  the tombstone of one that started a new life), and an `Alive` can arrive without a
+  routing address; neither may leave the verdict in place.
 - *What the verdict still decides.* Membership says `Dead` once. A peer that is linked
   again under the verdict announces its interest again and is routed to; when *that*
   link goes, no second verdict follows — a node that announced its own departure is
@@ -571,7 +593,7 @@ with every node on the rule, 5 with one node left on v1.1.0, 11 with half, 16 wi
   D3's table-fill arithmetic is not a measurement.
 - A peer that is unreachable by TCP while its host is up but silent (a dropped SYN, not a
   refused one) was not run: the 5 s bound on an attempt under a verdict is from the code.
-  A host that accepts the connection and then says nothing (a stopped process) holds one
-  dial open until it speaks — the handshake has no deadline, for a peer under a verdict
-  as for a member in good standing — so that dialer does not reach its window.
+  A host that accepts the connection and then says nothing is run, on loopback, against
+  the handshake's deadline; a host that stops after the link is established is not —
+  that such a link ends at the next write is from TCP, not from a test here.
 - §7 is a simulation of one fault shape; #975 lists what it leaves out.
