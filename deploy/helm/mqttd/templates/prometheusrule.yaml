@@ -253,6 +253,10 @@ spec:
           # is the node's own tls.expiry_warn_permille, which it exports beside the gauge,
           # so the rule holds no copy of it and no lifetime.
           expr: mqttd_tls_lifetime_spent_ratio >= ignoring(role) group_left() mqttd_tls_expiry_warn_ratio
+          # Long enough for a renewal that lands on the threshold itself to reach the node:
+          # cert-manager renews at two thirds of the duration unless renewBefore says
+          # otherwise, which is the default threshold.
+          for: 5m
           labels:
             severity: warn
           annotations:

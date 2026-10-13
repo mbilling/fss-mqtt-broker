@@ -388,9 +388,10 @@ struct OtelInstruments {
     swim_isolated: OtelGauge<i64>,
     peer_proto_min: OtelGauge<i64>,
     peer_proto_max: OtelGauge<i64>,
-    tls_expiry_warn_ratio: OtelGauge<f64>,
     /// Observed at export time from the stored validity windows, so they keep moving
-    /// between reloads. Held so the callbacks stay registered.
+    /// between reloads (and the threshold is in every export, whatever the temporality).
+    /// Held so the callbacks stay registered.
+    _tls_expiry_warn_ratio: opentelemetry::metrics::ObservableGauge<f64>,
     _tls_expiry_seconds: opentelemetry::metrics::ObservableGauge<i64>,
     _tls_lifetime_spent_ratio: opentelemetry::metrics::ObservableGauge<f64>,
 }
@@ -399,10 +400,24 @@ impl OtelInstruments {
     /// Create every instrument from `meter`, naming each to match its Prometheus
     /// counterpart (the `mqttd` prefix is carried by the OTLP resource `service.name`).
     #[allow(clippy::too_many_lines)] // one line per instrument
-    fn new(meter: &Meter, tls_validity: &TlsValidity) -> Self {
+    fn new(
+        meter: &Meter,
+        tls_validity: &TlsValidity,
+        tls_warn_permille: &std::sync::Arc<std::sync::atomic::AtomicU32>,
+    ) -> Self {
         let (for_seconds, for_ratio) = (tls_validity.clone(), tls_validity.clone());
+        let warn = tls_warn_permille.clone();
         Self {
-            tls_expiry_warn_ratio: meter.f64_gauge("tls_expiry_warn_ratio").build(),
+            _tls_expiry_warn_ratio: meter
+                .f64_observable_gauge("tls_expiry_warn_ratio")
+                .with_callback(move |observer| {
+                    // Zero is "not set": the threshold is at least 1.
+                    let permille = warn.load(std::sync::atomic::Ordering::Relaxed);
+                    if permille > 0 {
+                        observer.observe(f64::from(permille) / 1000.0, &[]);
+                    }
+                })
+                .build(),
             _tls_expiry_seconds: meter
                 .i64_observable_gauge("tls_expiry_seconds")
                 .with_callback(move |observer| {
@@ -780,6 +795,8 @@ pub struct Metrics {
     /// The fraction of a lifetime past which this node warns (`tls.expiry_warn_permille`).
     tls_expiry_warn_ratio: Gauge<f64, std::sync::atomic::AtomicU64>,
     tls_validity: TlsValidity,
+    /// `tls.expiry_warn_permille` as set, for the OTLP callback; 0 until it is.
+    tls_warn_permille: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl Metrics {
@@ -1694,6 +1711,7 @@ impl Metrics {
             tls_expiry_warn_ratio.clone(),
         );
         let tls_validity = TlsValidity::default();
+        let tls_warn_permille = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
 
         let build_info = Family::<VersionLabel, Gauge>::default();
         registry.register("build_info", "Build information", build_info.clone());
@@ -1712,7 +1730,7 @@ impl Metrics {
             .set(1);
 
         Self {
-            otel: OtelInstruments::new(meter, &tls_validity),
+            otel: OtelInstruments::new(meter, &tls_validity, &tls_warn_permille),
             provider,
             registry,
             connections_active,
@@ -1841,6 +1859,7 @@ impl Metrics {
             tls_lifetime_spent_ratio,
             tls_expiry_warn_ratio,
             tls_validity,
+            tls_warn_permille,
         }
     }
 
@@ -3234,7 +3253,8 @@ impl Metrics {
     pub fn set_tls_expiry_warn_permille(&self, permille: u16) {
         let ratio = f64::from(permille) / 1000.0;
         self.tls_expiry_warn_ratio.set(ratio);
-        self.otel.tls_expiry_warn_ratio.record(ratio, &[]);
+        self.tls_warn_permille
+            .store(u32::from(permille), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Set the TLS expiry gauges from the stored windows, as of `now`.
@@ -3946,7 +3966,13 @@ mod tests {
             let mut buf = vec![0u8; 8192];
             loop {
                 let text = String::from_utf8_lossy(&got).into_owned();
-                if text.contains("tls_expiry_seconds") && text.contains("tls_lifetime_spent_ratio")
+                if [
+                    "tls_expiry_seconds",
+                    "tls_lifetime_spent_ratio",
+                    "tls_expiry_warn_ratio",
+                ]
+                .iter()
+                .all(|name| text.contains(name))
                 {
                     break;
                 }
@@ -3963,6 +3989,7 @@ mod tests {
 
         let endpoint = format!("http://{addr}");
         let m = Metrics::with_otlp("t", &endpoint, Duration::from_hours(1), "node-test").unwrap();
+        m.set_tls_expiry_warn_permille(667);
         m.set_tls_validity(vec![(
             "peer",
             ValidityWindow {
@@ -3977,7 +4004,12 @@ mod tests {
             .expect("OTLP export never reached the endpoint")
             .expect("the capture ended without a request");
         server.await.unwrap();
-        for name in ["tls_expiry_seconds", "tls_lifetime_spent_ratio", "peer"] {
+        for name in [
+            "tls_expiry_seconds",
+            "tls_lifetime_spent_ratio",
+            "tls_expiry_warn_ratio",
+            "peer",
+        ] {
             assert!(req.contains(name), "OTLP payload missing {name}:\n{req}");
         }
     }

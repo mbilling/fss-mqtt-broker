@@ -315,7 +315,9 @@ pub fn read(source: &Source) -> Result<Option<Deciding>, String> {
 /// Where a window stands against the warning threshold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
-    /// Less than the threshold is spent (or it is not valid yet).
+    /// The window has not begun: whoever checks it against the clock refuses it.
+    NotYetValid,
+    /// The window runs and less than the threshold is spent.
     Healthy,
     /// The threshold is spent and the window still runs.
     Warn,
@@ -326,7 +328,9 @@ pub enum Status {
 /// Where `window` stands at `now` against a threshold of `warn_permille` thousandths.
 #[must_use]
 pub fn status(window: &ValidityWindow, warn_permille: u16, now: i64) -> Status {
-    if window.ended(now) {
+    if window.not_yet_begun(now) {
+        Status::NotYetValid
+    } else if window.ended(now) {
         Status::Expired
     } else if window.past(warn_permille, now) {
         Status::Warn
@@ -364,8 +368,8 @@ pub fn span(secs: i64) -> String {
     }
 }
 
-/// What to say about a window that is past the threshold or over, for `kind`; `None`
-/// while it is healthy. The one wording the log, `--check-tls` and `--check-config` share.
+/// What to say about a window that has not begun, is past the threshold or is over, for
+/// `kind`; `None` while it is healthy. The one wording the log, `--check-tls` and `--check-config` share.
 #[must_use]
 pub fn describe(kind: Kind, deciding: &Deciding, warn_permille: u16, now: i64) -> Option<String> {
     let Deciding {
@@ -378,6 +382,10 @@ pub fn describe(kind: Kind, deciding: &Deciding, warn_permille: u16, now: i64) -
     let threshold = threshold_percent(warn_permille);
     match (status(window, warn_permille, now), kind) {
         (Status::Healthy, _) => None,
+        (Status::NotYetValid, _) => Some(format!(
+            "{what} is not valid yet: its validity begins in {}",
+            span(window.not_before.saturating_sub(now))
+        )),
         (Status::Warn, Kind::Crl) => Some(format!(
             "{what} has spent {spent} of its thisUpdate..nextUpdate window (warning \
              threshold {threshold}): its next update is due in {left}, on {until}"
@@ -530,8 +538,8 @@ impl TlsExpiry {
         notices
     }
 
-    /// The log lines due at `now`: one for each held role that is past the threshold
-    /// (WARN) or expired (ERROR), the first time it is seen so — at load, or when it
+    /// The log lines due at `now`: one for each held role that is not valid yet or past
+    /// the threshold (WARN) or expired (ERROR), the first time it is seen so — at load, or when it
     /// crosses over — and then at most once every [`REPEAT_SECS`] while it stays so.
     /// Nothing for a healthy role.
     pub fn tick(&self, now: SystemTime) -> Vec<Notice> {
@@ -1170,6 +1178,35 @@ mod tests {
         let lines = check_config_lines(&config, at(T0 + 72 * DAY));
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("90.0%"));
+    }
+
+    /// A certificate loaded ahead of its `notBefore` (a pre-dated rotation, a clock that
+    /// is behind) is refused by whoever checks it, and reads as brand new on the gauges:
+    /// the log says so, at the same bounded rate, until its validity begins.
+    #[test]
+    fn a_certificate_that_is_not_valid_yet_is_warned_about_until_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = ca("root", T0 - 365 * DAY, T0 + 3650 * DAY);
+        let (cert, _) = leaf("node-1", T0 + 2 * HOUR, T0 + 26 * HOUR, &root);
+        let path = write(dir.path(), "node.crt", &cert);
+        let expiry = TlsExpiry::new(667, None);
+        expiry.load(&Role::ALL, &[source(Role::Peer, &path)]);
+        let early = expiry.tick(at(T0));
+        assert_eq!(early.len(), 1, "{early:?}");
+        assert_eq!(early[0].level, NoticeLevel::Warn);
+        assert!(
+            early[0]
+                .message
+                .contains("leaf CN=node-1 is not valid yet: its validity begins in 2h 0m"),
+            "{}",
+            early[0].message
+        );
+        assert!(expiry.tick(at(T0 + 1800)).is_empty(), "bounded");
+        assert_eq!(expiry.tick(at(T0 + HOUR)).len(), 1);
+        // Valid: nothing more, until the threshold.
+        assert!(expiry.tick(at(T0 + 2 * HOUR)).is_empty());
+        assert!(expiry.tick(at(T0 + 10 * HOUR)).is_empty());
+        assert_eq!(expiry.tick(at(T0 + 19 * HOUR)).len(), 1);
     }
 
     #[test]

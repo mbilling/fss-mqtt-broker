@@ -296,6 +296,15 @@ D2 is built as written. What it left open, and how each was settled:
   `[tls]` is, and applies to every role.
 - **The node exports its threshold** (`mqttd_tls_expiry_warn_ratio`), so the chart's
   warning compares each series with the node's own setting and holds no copy of it.
+- **The warning alert waits five minutes; the page does not wait.** cert-manager renews
+  at two thirds of `duration` unless `renewBefore` says otherwise, which is the default
+  threshold: a routine renewal crosses the line for as long as the new Secret takes to
+  reach the pod. The alert holds for that; the log does not, and OPERATIONS says to set
+  `renewBefore` above a third.
+- **Material that is not valid yet is warned about** in the log, at the same rate. On
+  the gauges it reads as new (0 spent), and whoever checks it against the clock refuses
+  it.
+- **Over OTLP all three are observable instruments,** read when the export runs.
 - **The log's rate:** a line when a role is first seen past the threshold or expired (at
   startup, after the reload that loaded the file, or within a minute of the crossing),
   then at most once an hour per role. A reload that leaves a file unchanged does not
@@ -318,6 +327,12 @@ Two things T1 found and did not change:
 - **The QUIC listener does not reload its certificate** (ADR 0036). On a node whose only
   client-facing TLS is QUIC, the `listener` and `client_ca` series stay those of startup
   after a reload, because that is what QUIC still serves.
+
+And one imprecision that is accepted: the windows are read from the files just after a
+reload has built its TLS contexts from them, not from the contexts. A file replaced
+between the two reads is described before it is served; the watcher's next reload,
+which that replacement causes, loads it. `--check-tls` also checks `[admin]` whenever its
+certificate is configured, while the running broker loads it only with `admin.bind`.
 
 ## Not verified
 

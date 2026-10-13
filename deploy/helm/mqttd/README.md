@@ -142,8 +142,9 @@ The rules are loaded and unit-tested by `promtool` in CI
 them: `MqttdTlsExpiryWarning` and `MqttdTlsExpiryImminent`, over the time to expiry each
 broker exports for every certificate, CA and revocation list it has loaded
 ([`docs/OPERATIONS.md`](../../../docs/OPERATIONS.md#certificate-lifetimes-what-the-broker-tells-you-adr-0088)).
-Renew a certificate before two thirds of its lifetime are spent (cert-manager:
-`renewBefore` above a third of `duration`) and neither fires.
+Renew a certificate before two thirds of its lifetime are spent and neither fires.
+cert-manager's default renews at exactly two thirds: set `renewBefore` above a third of
+`duration`.
 
 ## Related
 

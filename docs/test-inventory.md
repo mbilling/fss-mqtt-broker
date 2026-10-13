@@ -1416,7 +1416,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 806 test(s)
+## `crates/mqttd/src/lib.rs` — 807 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -2214,6 +2214,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tls_check::tests::the_threshold_is_the_configured_one`
 - `tls_check::tests::valid_material_passes_reports_names_and_states_the_threshold`
 - `tls_expiry::tests::a_ca_bundle_is_decided_by_its_earliest_ca`
+- `tls_expiry::tests::a_certificate_that_is_not_valid_yet_is_warned_about_until_it_is`
 - `tls_expiry::tests::a_chain_is_decided_by_whichever_certificate_expires_first`
 - `tls_expiry::tests::a_leaf_is_read_with_its_own_window_whatever_its_lifetime`
 - `tls_expiry::tests::a_reload_follows_the_new_certificate_and_does_not_repeat_the_old_warning`

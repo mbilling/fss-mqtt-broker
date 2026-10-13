@@ -40,6 +40,11 @@ tests:
       - eval_time: 1h
         alertname: MqttdTlsExpiryImminent
         exp_alerts: []
+      # 2h03m: past two thirds for two minutes. The rule waits five, so that a renewal
+      # landing on the threshold itself has time to reach the node: nothing yet.
+      - eval_time: 2h3m
+        alertname: MqttdTlsExpiryWarning
+        exp_alerts: []
       # 3h: 70% spent, past the node's two thirds. The warning fires for that node's
       # certificate alone: not its CA, not the other node.
       - eval_time: 3h
@@ -105,7 +110,7 @@ tests:
       - series: 'mqttd_tls_expiry_seconds{instance="node-1", role="listener"}'
         values: '7776000x10'
     alert_rule_test:
-      - eval_time: 5m
+      - eval_time: 10m
         alertname: MqttdTlsExpiryWarning
         exp_alerts:
           - exp_labels:
@@ -132,7 +137,7 @@ tests:
       - series: 'mqttd_tls_expiry_seconds{instance="node-0", role="peer_crl"}'
         values: '30240x10'
     alert_rule_test:
-      - eval_time: 5m
+      - eval_time: 10m
         alertname: MqttdTlsExpiryWarning
         exp_alerts:
           - exp_labels:

@@ -213,8 +213,12 @@ or the `MqttdTlsExpiryWarning` / `MqttdTlsExpiryImminent` alert is firing.
   the bundle, is nearer its end than the leaf: renewing the leaf alone will not stop it.
 - **It keeps warning right after a renewal.** The renewed certificate is itself past the
   threshold (its `notBefore` is old), or the renewal runs later than the threshold. Renew
-  earlier than two thirds of the lifetime (cert-manager: `renewBefore` above a third of
-  `duration`), or raise `MQTTD_TLS_EXPIRY_WARN_PERMILLE`.
+  earlier than two thirds of the lifetime, or raise `MQTTD_TLS_EXPIRY_WARN_PERMILLE`.
+  cert-manager without `renewBefore` renews at exactly two thirds, so each renewal can
+  log one warning before the new Secret arrives: set `renewBefore` above a third of
+  `duration`.
+- **`is not valid yet`.** The certificate's `notBefore` is ahead of this node's clock: it
+  was dated ahead, or the clock is behind. Peers and clients refuse it until then.
 - **It warns about a file you replaced, and the reload was rejected.** Look for
   `security reload REJECTED` just before it: the node kept the old material (a key that
   does not match, a file half written), and the warning is about what it still runs.

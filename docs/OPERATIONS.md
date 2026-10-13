@@ -96,12 +96,17 @@ What a series is about:
   window. A list that states no `nextUpdate` has no window and **no series**.
 - A file whose expiry cannot be read (it was replaced by something unparseable between
   the reload and the read) has no series until the next reload, and a warning says so.
+- **Material that is not valid yet** (a certificate dated ahead, a clock that is behind)
+  reads as new on the gauges: `0` spent. Peers refuse it all the same, so the log warns
+  about it (`is not valid yet: its validity begins in …`) and `--check-tls` fails it.
 
 The numbers are computed when `/metrics` is scraped (or OTLP exports), from the validity
 window read at load, so they move between scrapes. They follow a reload: when the watcher
 or `SIGHUP` swaps a renewed certificate in, the series is the new certificate's from that
-moment. A rejected reload leaves the old material in force and its series unchanged. One
-exception: the QUIC listener serves the certificate it loaded at startup (ADR 0036), so on
+moment. A rejected reload leaves the old material in force and its series unchanged. The
+windows are read from the files just after the reload built its TLS contexts from them; a
+file replaced in between is described a tick early, and the watcher's next reload loads
+it. One exception: the QUIC listener serves the certificate it loaded at startup (ADR 0036), so on
 a node whose only client-facing TLS is QUIC the `listener` and `client_ca` series stay
 those of startup until a restart.
 
@@ -122,14 +127,19 @@ repeat its warning. A healthy certificate is never mentioned.
 **The threshold** is `tls.expiry_warn_permille` (`MQTTD_TLS_EXPIRY_WARN_PERMILLE`), in
 thousandths of the lifetime: `1..=1000`, default `667`, two thirds. It applies to every
 role, the cluster bus's and the admin listener's included, and is read at startup like the
-rest of `[tls]`. Renewal should be scheduled before it: with cert-manager, a `renewBefore`
-of more than a third of `duration` keeps a healthy cluster silent. `mqttd --check-tls` and
+rest of `[tls]`. Renewal should be scheduled before it. **cert-manager's default is not
+early enough:** without `renewBefore` it renews at exactly two thirds of `duration`, which
+is the default threshold, so every routine renewal of a short-lived certificate can log
+one warning while the new Secret travels to the pod. Set `renewBefore` above a third of
+`duration` (for a 24-hour certificate, `10h` rather than the default `8h`) and a healthy
+cluster is silent. The alert waits five minutes for the same reason; the log does not. `mqttd --check-tls` and
 `mqttd --check-config` judge against the same value and print it; `--check-config` adds a
 `warning:` line for each file on the host that is past it or expired, and its exit status
 is unchanged (the configuration is valid).
 
 **The alerts** (chart `PrometheusRule`, [runbook](#alert-tls-material-nearing-expiry)):
-`MqttdTlsExpiryWarning` when a series passes the node's threshold, `MqttdTlsExpiryImminent`
+`MqttdTlsExpiryWarning` when a series has been past the node's threshold for five minutes,
+`MqttdTlsExpiryImminent`
 (page) when less than a tenth of the lifetime and less than 30 days are left, or it has
 expired. A deployment without alerting takes the risk of a missed rotation knowingly.
 
@@ -1511,7 +1521,7 @@ the human-readable superset.
 | **Ingress credit saturated** | `mqttd_ingress_credit_bytes{state="in_use"} / ignoring(state) mqttd_ingress_credit_bytes{state="capacity"} > 0.9` for 5m (warn); `histogram_quantile(0.99, rate(mqttd_ingress_paused_seconds_bucket[5m])) > 1` for 10m (warn) | [runbook](#alert-ingress-credit-saturated) |
 | **Publishes shed at ingress** | `rate(mqttd_publish_dropped_total{reason="hub-ingress"}[5m]) > 0` for 5m (warn) | [runbook](#alert-publishes-shed-at-ingress) |
 | **Append lane saturating** | `mqttd_append_lane_jobs` growing sustained (warn); `rate(mqttd_publish_dropped_total{reason="append-backlog-full"}[5m]) > 0` (page) | [runbook](#alert-append-lane-saturating) |
-| **TLS material nearing expiry** | `mqttd_tls_lifetime_spent_ratio >= ignoring(role) group_left() mqttd_tls_expiry_warn_ratio` (warn); `mqttd_tls_lifetime_spent_ratio >= 0.9 and mqttd_tls_expiry_seconds < 2592000` (page) | [runbook](#alert-tls-material-nearing-expiry) |
+| **TLS material nearing expiry** | `mqttd_tls_lifetime_spent_ratio >= ignoring(role) group_left() mqttd_tls_expiry_warn_ratio` for 5m (warn); `mqttd_tls_lifetime_spent_ratio >= 0.9 and mqttd_tls_expiry_seconds < 2592000` (page) | [runbook](#alert-tls-material-nearing-expiry) |
 
 ### Alert: Split brain
 
@@ -1685,7 +1695,7 @@ the human-readable superset.
 
 ### Alert: TLS material nearing expiry
 
-**Rule:** `mqttd_tls_lifetime_spent_ratio >= ignoring(role) group_left() mqttd_tls_expiry_warn_ratio` (warn, `MqttdTlsExpiryWarning`); `mqttd_tls_lifetime_spent_ratio >= 0.9 and mqttd_tls_expiry_seconds < 2592000` (page, `MqttdTlsExpiryImminent`) — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
+**Rule:** `mqttd_tls_lifetime_spent_ratio >= ignoring(role) group_left() mqttd_tls_expiry_warn_ratio` for 5m (warn, `MqttdTlsExpiryWarning`); `mqttd_tls_lifetime_spent_ratio >= 0.9 and mqttd_tls_expiry_seconds < 2592000` (page, `MqttdTlsExpiryImminent`) — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
 
 **When it fires / what to do:**
 - **What it means:** a certificate, CA bundle or revocation list this node has loaded is
