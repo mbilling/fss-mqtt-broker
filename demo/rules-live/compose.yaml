@@ -25,7 +25,7 @@ services:
   # One-shot: a CA, the admin listener's certificate and the CN=rules-ui operator
   # certificate (pki/gen.sh). The CA key stays in `pki-ca`, which nothing else mounts.
   pki:
-    image: python:3.12-slim@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f
+    image: python:3.14-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170
     network_mode: none
     command: ["sh", "/gen.sh"]
     volumes:
@@ -38,7 +38,7 @@ services:
   # through the admin API live in the volume, so they survive `down` (and `down -v` resets
   # them); the tracked demo/rules/rules.toml is never written.
   rules-seed:
-    image: python:3.12-slim@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f
+    image: python:3.14-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170
     network_mode: none
     command:
       - sh
@@ -104,7 +104,7 @@ services:
   # on the wall clock, one simulator per domain. SIM_CLOCK=fixture makes the devices' clocks
   # replay the README's window too, so the time-of-day alerts fire at any hour.
   sim-power:
-    image: python:3.12-slim@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f
+    image: python:3.14-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170
     init: true
     restart: unless-stopped
     command: ["python3", "/opt/rules/live.py"]
@@ -125,7 +125,7 @@ services:
         condition: service_healthy
 
   sim-homes:
-    image: python:3.12-slim@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f
+    image: python:3.14-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170
     init: true
     restart: unless-stopped
     command: ["python3", "/opt/rules/live.py"]
@@ -142,7 +142,7 @@ services:
         condition: service_healthy
 
   sim-cars:
-    image: python:3.12-slim@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f
+    image: python:3.14-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170
     init: true
     restart: unless-stopped
     command: ["python3", "/opt/rules/live.py"]
@@ -162,7 +162,7 @@ services:
   # it over mTLS, and MQTT as server-sent events. It accepts only requests for
   # localhost:<UI_PORT> or 127.0.0.1:<UI_PORT>, so it must know the published port.
   ui:
-    image: python:3.12-slim@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f
+    image: python:3.14-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170
     init: true
     restart: unless-stopped
     command: ["python3", "/opt/ui/server.py"]
