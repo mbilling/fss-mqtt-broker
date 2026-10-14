@@ -465,6 +465,77 @@ shown in the hub's tests and in the two-process test only as "one side or the ot
 it" (whichever side's sweep looks first); a mixed cluster with a peer on v1.1.0, which
 would not end the link from its side, was not run.
 
+## Amendment (2026-10-14): links move to a renewed certificate before the old one ends (issue #1016)
+
+T3's "a renewal ends the links made before it" is replaced. Nodes minted together share a
+`notAfter` (`gen-certs.sh`, a first chart or cert-manager issue), so every link made before
+a renewal ended in the same second and every node redialled all of its peers at once: an
+ADR 0087 forward hold on every node, a consensus blip on every partition, a gap in every
+`$share` group with remote members — daily under O5. Instead:
+
+- **Make-before-break.** A link has one dialing side (the smaller node id; the other side's
+  dial is dropped by the tie-break and never retried). That side makes a second link to
+  the same peer alongside the first, on the certificates it now has, and only if the
+  handshake gives an end later than the link's is it carried past admission into the peer
+  handshake; otherwise the connection is closed before the `Hello` (`peer.rs`
+  `try_renewed_link`). Its registration replaces the old link in the hub, as a peer's
+  redial after a restart always has: the peer entry, the durable plane's lanes and the
+  outbound path move to the new link in one step, and nothing is erased or marked
+  unreachable. A new link that fails its peer handshake leaves the old one the link.
+- **The old link is let go quietly** (`hub` `RetiringLink`). Replacing a link used to drop
+  its lanes, which closed its socket and lost whatever the peer had already written on it.
+  It now stays open for five sweep ticks with nothing new sent on it: a reply to a
+  consensus RPC, a replication ack and a forward's answer that were in flight still
+  arrive, and an answer to a request that arrived on it goes back on it. Forwards owed to
+  the peer are sent again on the new link once the peer has announced on it, under the seqs
+  they were given, and the receiver answers a repeat without applying it twice (#648), so
+  the move loses nothing acknowledged. What the move does cost: the new link starts not
+  yet announced, so a forward registered in the round trip before the peer's snapshot
+  arrives on it is recorded and sent with that snapshot, and a `QoS` 0 publish in flight
+  on the old link may arrive after one sent on the new.
+- **When** (`peer.rs` `MovePlan`). After this node's own reload commits a renewed
+  certificate, at a uniformly random moment within half the time left before the end
+  window's margin, at most five minutes. Otherwise in the end window: a quarter of the
+  link's life, at most five minutes, closing a minute before the end (an eighth of the life
+  for short certificates: the peer ends the link by its own clock, and O3 allows a minute
+  of difference), at a random moment in it and then every tenth of it until the end. The
+  end window is what moves a link whose peer renewed (the dialing side cannot see that
+  without a handshake) and one whose first try came before the peer had renewed. Five
+  minutes is long enough that a node's few links, and a cluster's renewals, are spread
+  over many seconds, and short against any lifetime this ADR recommends.
+- **The end stays strict.** The once-a-second sweep still ends a link at the earlier end of
+  its handshake's certificates, a retired one included, which it closes without counting a
+  lost link; a link that could not be moved ends as T3 built it.
+- **Measured** (`peer_link_expiry.rs`, three spawned nodes minted together with a
+  100-second certificate, all renewed and reloaded together): the three links moved 13
+  and 10 seconds apart, every node's link gauge read two at every poll through the old
+  end, none logged a lost link, a verdict or an expiry end, and 899 `QoS` 1 messages
+  acknowledged on one node all reached a subscriber on another. With the moves disabled
+  the same test fails at the old end. Run again with durable sessions on, the lease
+  group's epoch on every node is the same after the moves as before: no election.
+
+From the same review:
+
+- **A peer leaf whose `notAfter` x509-parser cannot read is refused** at admission, as an
+  expired one is: admitted, it would make a link with no end. A node whose own leaf is
+  such a certificate refuses it at startup, and a reload that would load one is rejected,
+  so the node that has it says so instead of being refused by every peer.
+- **The own end is read from the chain that is served.** `mqtt_net::tls::peer_tls` reads
+  the CA, the chain and the key once and builds both sides of the bus and the leaf from
+  that reading, at startup and at every reload; before, each was read separately.
+- **Client certificate ends are indexed.** With `tls.end_sessions_at_cert_expiry` on, a
+  passed end pops a heap instead of walking every online session twice; entries of
+  sessions that have gone are dropped as they surface, and the heap is rebuilt when they
+  outnumber the online sessions.
+
+Not covered, and left open on issue #1016: **ADR 0005 relay streams.** A session relocated
+to its owning node arrives on the peer listener as a `ProxyHello` connection, passes
+`admit_peer_link`, and is then served as a client session, not registered as a peer. So
+neither the expiry sweep nor ADR 0040's revocation sweep ends it, and it outlives the
+certificates of the connection it runs on. Ending it at that end would disconnect every
+relayed client at each renewal; it needs a move of its own (the landing node re-proxying
+on its renewed certificate), which is not built.
+
 ## Not verified
 
 - T1 did not test what the broker does with a **cluster CA** that is past `notAfter`, or

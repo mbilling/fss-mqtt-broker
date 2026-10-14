@@ -172,11 +172,25 @@ out of the cluster, at once and with no grace period and no setting that keeps i
 
 A certificate dated up to **60 seconds ahead** of a node's clock is accepted, on the link
 and in gossip (O3), so a renewed node whose clock runs a little fast is not refused;
-there is no allowance at the other end. **A renewal ends the links made before it**: a
-TLS session keeps the certificates of its handshake, so a link made with the old
-certificate ends when that certificate does and is made again at once with the new one —
-one short link loss per link per renewal, which the cluster rides as it rides any link
-that drops.
+there is no allowance at the other end. **A renewal moves the links made before it, one
+at a time, before the old certificate ends.** A TLS session keeps the certificates of its
+handshake, so a link made with the old certificate cannot outlive it. The node that dials
+the link makes a new one alongside it on the renewed certificates, the new one takes over,
+and the old one is closed a few seconds later, once what was in flight on it has arrived.
+The peer is linked throughout: no link is lost, nothing is held for it, and its `$share`
+members stay reachable. `INFO moving a peer link to renewed certificates
+(make-before-break)` on the dialing side, then `peer link established` on both.
+
+- **When:** after the dialing node's own reload commits a renewed certificate, at a random
+  moment within half the time left (at most five minutes), so a node's links move one at
+  a time and nodes minted together do not all move in the same second. A link whose peer
+  renewed, or whose first try came before the peer had, moves in a window of a quarter of
+  its life (at most five minutes) that closes a minute before the end (an eighth of the
+  life for short ones), and is tried again every tenth of that window until the end.
+- **A try that gets nothing later** (neither side renewed yet) closes its connection
+  before the peer handshake; the peer sees only a TLS connection that ended.
+- **The end stays strict:** a link that could not be moved still ends at the old
+  certificate's end, as above.
 
 **Client certificates** are checked at the handshake, and a session that outlives its
 certificate is left alone unless `tls.end_sessions_at_cert_expiry`
@@ -234,8 +248,8 @@ mqttd --check-tls                               # the new window, as the broker 
 The node serves the new certificate on its next handshake and signs its next gossip
 datagram with the new key, without a restart. A node on its new certificate and one on its
 old accept each other, so renew one node at a time, in any order. A peer link made before
-the renewal ends when the old certificate does and is made again at once with the new
-one (above). A node that was down past the end of its certificate is
+the renewal moves to the new certificates before the old one ends, without a link loss
+(above). A node that was down past the end of its certificate is
 renewed the same way and stays out until the files are on it.
 
 ### Removing a node for good

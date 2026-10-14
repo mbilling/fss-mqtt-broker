@@ -650,18 +650,7 @@ impl<V: rustls::client::danger::ServerCertVerifier + ?Sized>
 /// [`NetError::Tls`] if any file is missing or unparseable, the key does not match, or
 /// the CA bundle is empty.
 pub fn peer_acceptor(cert_chain: &Path, key: &Path, ca: &Path) -> Result<TlsAcceptor, NetError> {
-    let inner = WebPkiClientVerifier::builder_with_provider(Arc::new(load_roots(ca)?), provider())
-        .build()
-        .map_err(|e| tls_err("client certificate verifier", ca, &e))?;
-    let mut config = ServerConfig::builder_with_provider(provider())
-        .with_protocol_versions(TLS_VERSIONS)
-        .map_err(|e| tls_err("TLS server configuration", cert_chain, &e))?
-        .with_client_cert_verifier(Arc::new(NotBeforeTolerant(inner)))
-        .with_single_cert(load_certs(cert_chain)?, load_key(key)?)
-        .map_err(|e| tls_err("server certificate/key", cert_chain, &e))?;
-    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
-    config.send_tls13_tickets = 0;
-    Ok(TlsAcceptor::from(Arc::new(config)))
+    Ok(peer_tls(ca, cert_chain, key)?.acceptor)
 }
 
 /// The cluster bus's dialing side: verifies the remote against `ca` with the same
@@ -671,21 +660,71 @@ pub fn peer_acceptor(cert_chain: &Path, key: &Path, ca: &Path) -> Result<TlsAcce
 /// # Errors
 /// [`NetError::Tls`] on unreadable/unparseable PEM material or a key mismatch.
 pub fn peer_connector(ca: &Path, cert_chain: &Path, key: &Path) -> Result<TlsConnector, NetError> {
-    let inner = rustls::client::WebPkiServerVerifier::builder_with_provider(
-        Arc::new(load_roots(ca)?),
-        provider(),
-    )
-    .build()
-    .map_err(|e| tls_err("server certificate verifier", ca, &e))?;
-    let mut config = ClientConfig::builder_with_provider(provider())
+    Ok(peer_tls(ca, cert_chain, key)?.connector)
+}
+
+/// Both sides of the cluster bus and the leaf they present, built from one reading of the
+/// files ([`peer_tls`]).
+pub struct PeerTlsMaterial {
+    /// See [`peer_acceptor`].
+    pub acceptor: TlsAcceptor,
+    /// See [`peer_connector`].
+    pub connector: TlsConnector,
+    /// The leaf both present, as DER: what the node's own certificate end is read from, so
+    /// that end is the one of the certificate served (ADR 0088 D4).
+    pub leaf_der: Vec<u8>,
+}
+
+impl std::fmt::Debug for PeerTlsMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerTlsMaterial").finish_non_exhaustive()
+    }
+}
+
+/// [`peer_acceptor`] and [`peer_connector`] from ONE reading of `ca`, `cert_chain` and
+/// `key`, with the leaf they present. Reading each file once per side, and once more for
+/// the leaf, could build the two sides from different certificates — and describe a third
+/// — when the files are replaced while they are read (issue #1016).
+///
+/// # Errors
+/// [`NetError::Tls`] if any file is missing or unparseable, the key does not match, or
+/// the CA bundle is empty.
+pub fn peer_tls(ca: &Path, cert_chain: &Path, key: &Path) -> Result<PeerTlsMaterial, NetError> {
+    let roots = Arc::new(load_roots(ca)?);
+    let certs = load_certs(cert_chain)?;
+    let key_der = load_key(key)?;
+    let leaf_der = certs[0].as_ref().to_vec();
+
+    let client_verifier = WebPkiClientVerifier::builder_with_provider(roots.clone(), provider())
+        .build()
+        .map_err(|e| tls_err("client certificate verifier", ca, &e))?;
+    let mut server = ServerConfig::builder_with_provider(provider())
+        .with_protocol_versions(TLS_VERSIONS)
+        .map_err(|e| tls_err("TLS server configuration", cert_chain, &e))?
+        .with_client_cert_verifier(Arc::new(NotBeforeTolerant(client_verifier)))
+        .with_single_cert(certs.clone(), key_der.clone_key())
+        .map_err(|e| tls_err("server certificate/key", cert_chain, &e))?;
+    server.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    server.send_tls13_tickets = 0;
+
+    let server_verifier =
+        rustls::client::WebPkiServerVerifier::builder_with_provider(roots, provider())
+            .build()
+            .map_err(|e| tls_err("server certificate verifier", ca, &e))?;
+    let mut client = ClientConfig::builder_with_provider(provider())
         .with_protocol_versions(TLS_VERSIONS)
         .map_err(|e| tls_err("TLS client configuration", cert_chain, &e))?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NotBeforeTolerant(inner)))
-        .with_client_auth_cert(load_certs(cert_chain)?, load_key(key)?)
+        .with_custom_certificate_verifier(Arc::new(NotBeforeTolerant(server_verifier)))
+        .with_client_auth_cert(certs, key_der)
         .map_err(|e| tls_err("client certificate/key", cert_chain, &e))?;
-    config.resumption = rustls::client::Resumption::disabled();
-    Ok(TlsConnector::from(Arc::new(config)))
+    client.resumption = rustls::client::Resumption::disabled();
+
+    Ok(PeerTlsMaterial {
+        acceptor: TlsAcceptor::from(Arc::new(server)),
+        connector: TlsConnector::from(Arc::new(client)),
+        leaf_der,
+    })
 }
 
 /// Parse the host part of `addr` (`host:port`, `[v6]:port`, or bare host) into

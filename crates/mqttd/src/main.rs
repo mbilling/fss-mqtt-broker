@@ -3205,26 +3205,38 @@ fn peer_tls_from_config(
             // The cluster bus's own builders (ADR 0088 D4, O3): no session resumption, so
             // every link verifies the certificate it runs on, and a minute of clock
             // difference on `notBefore`.
-            let (acceptor_tx, acceptor) =
-                tokio::sync::watch::channel(tls::peer_acceptor(cert, key, ca)?);
-            let (connector_tx, connector) =
-                tokio::sync::watch::channel(tls::peer_connector(ca, cert, key)?);
-            let cert_der = tls::first_cert_der(cert)?;
+            // One reading of the files for both sides and the own end (issue #1016), so the
+            // end recorded is the one of the certificate served.
+            let material = tls::peer_tls(ca, cert, key)?;
+            let (acceptor_tx, acceptor) = tokio::sync::watch::channel(material.acceptor);
+            let (connector_tx, connector) = tokio::sync::watch::channel(material.connector);
+            let cert_der = material.leaf_der;
+            // A leaf whose end cannot be read is refused by every peer (`admit_peer_link`
+            // fails closed on it), so it is refused here too, loudly, on the node that has
+            // it — at startup, and by a reload, which then keeps what it serves (#1016).
             let own_cert_end = peer::unknown_cert_end();
-            if let Some(end) = mqtt_auth::mtls::not_after_from_cert(&cert_der) {
-                own_cert_end.store(end, std::sync::atomic::Ordering::Relaxed);
-            }
+            let end = mqtt_auth::mtls::not_after_from_cert(&cert_der).ok_or_else(|| {
+                format!(
+                    "MQTTD_PEER_TLS_CERT {}: the certificate's notAfter cannot be read, and \
+                     peers refuse a certificate whose end they cannot read (ADR 0088 D3)",
+                    cert.display()
+                )
+            })?;
+            own_cert_end.store(end, std::sync::atomic::Ordering::Relaxed);
             let build = {
                 let (ca, cert, key) = (ca.to_path_buf(), cert.to_path_buf(), key.to_path_buf());
                 Box::new(move || {
-                    let acceptor =
-                        tls::peer_acceptor(&cert, &key, &ca).map_err(|e| e.to_string())?;
-                    let connector =
-                        tls::peer_connector(&ca, &cert, &key).map_err(|e| e.to_string())?;
-                    let end = tls::first_cert_der(&cert)
-                        .ok()
-                        .and_then(|der| mqtt_auth::mtls::not_after_from_cert(&der));
-                    Ok((acceptor, connector, end))
+                    let material = tls::peer_tls(&ca, &cert, &key).map_err(|e| e.to_string())?;
+                    let end = mqtt_auth::mtls::not_after_from_cert(&material.leaf_der).ok_or_else(
+                        || {
+                            format!(
+                                "peer certificate {}: notAfter cannot be read, and peers \
+                                 refuse a certificate whose end they cannot read",
+                                cert.display()
+                            )
+                        },
+                    )?;
+                    Ok((material.acceptor, material.connector, Some(end)))
                 }) as Box<dyn Fn() -> reload::PeerTlsBuildResult + Send + Sync>
             };
             Ok(Some((

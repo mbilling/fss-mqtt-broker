@@ -280,3 +280,316 @@ async fn an_expired_node_is_out_and_stays_out() {
         dump(&nodes)
     );
 }
+
+// ---- Renewal: the links move before the old end (issue #1016) ----
+
+/// How long the certificates of the renewal test's nodes live from their minting: room
+/// for three debug binaries to start and mesh on a slow runner (they must within half of
+/// it), then for the moves after the renewal and the end window before the old end.
+const MINTED_LIFETIME: Duration = Duration::from_secs(100);
+
+/// Three nodes, `a`, `b` and `c`, minted together — one `notAfter` for all, as
+/// `gen-certs.sh` or a first cert-manager issue gives — and seeded with each other.
+async fn build_minted_together(root: &Path, durable: bool) -> (Vec<ProcNode>, Pki, SystemTime) {
+    let pki = Pki::new(root);
+    let ends = SystemTime::now() + MINTED_LIFETIME;
+    let swim: Vec<String> = (0..3)
+        .map(|_| format!("127.0.0.1:{}", free_udp_port()))
+        .collect();
+    let mut nodes = Vec::new();
+    for (i, name) in ["a", "b", "c"].into_iter().enumerate() {
+        let id = format!(
+            "ren{}{}-{name}",
+            std::process::id(),
+            if durable { "d" } else { "" }
+        );
+        let data_dir = root.join(&id);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let peer_bind = SocketAddr::from(([127, 0, 0, 1], free_tcp_port()));
+        let (relay_addr, relay, relay_abort) = spawn_relay(peer_bind).await;
+        let mut extra_env = pki.env_for(&id, ends);
+        let durable = if durable { "1" } else { "0" };
+        extra_env.push(("MQTTD_DURABLE_SESSIONS".into(), durable.into()));
+        nodes.push(ProcNode {
+            log_path: root.join(format!("{id}.log")),
+            id,
+            child: None,
+            data_dir,
+            client_addr: SocketAddr::from(([127, 0, 0, 1], free_tcp_port())),
+            peer_bind,
+            swim_bind: swim[i].clone(),
+            health_addr: SocketAddr::from(([127, 0, 0, 1], free_tcp_port())),
+            swim_seeds: swim
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, s)| s.clone())
+                .collect::<Vec<_>>()
+                .join(","),
+            relay_addr,
+            relay,
+            relay_abort,
+            file_size_limit_blocks: None,
+            extra_env,
+            binary: PathBuf::from(env!("CARGO_BIN_EXE_mqttd")),
+        });
+    }
+    (nodes, pki, ends)
+}
+
+/// What `node` has logged since byte `from` of its log.
+fn log_since(node: &ProcNode, from: usize) -> String {
+    let log = std::fs::read_to_string(&node.log_path).unwrap_or_default();
+    log.get(from..).unwrap_or_default().to_string()
+}
+
+fn log_len(node: &ProcNode) -> usize {
+    std::fs::metadata(&node.log_path).map_or(0, |m| usize::try_from(m.len()).unwrap_or(0))
+}
+
+/// Issue #1016's acceptance. Three nodes minted together are renewed together. Before,
+/// every link made before the renewal ended in the same second, at the old `notAfter`, and
+/// every node redialled all of its peers. Now each link's dialer moves it to the renewed
+/// certificates before that end — a new link made alongside, which replaces the old one —
+/// so:
+///
+/// - every link has moved (each node registered a link to each peer again) before the old
+///   end, and no link was ended for expiry at it;
+/// - no node was ever without its links: none logged a lost link, a verdict or an expiry
+///   end, and the link gauge read two on every node at every poll;
+/// - a `QoS` 1 stream from `a` to a subscriber on `c`, published throughout, lost nothing
+///   that was acknowledged.
+///
+/// That the moves are spread over a window, not made in one second, is the jitter's, and
+/// is asserted in `peer.rs`'s unit tests; here the moments are printed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn renewed_nodes_move_their_links_before_the_old_end_without_a_gap() {
+    renewal_moves_links(false).await;
+}
+
+/// The same with durable sessions on, so the lease group's consensus and the session-log
+/// replication run over the links while they move: on top of the above, no node's lease
+/// epoch moves — no election followed a move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn renewed_nodes_move_their_links_without_an_election() {
+    renewal_moves_links(true).await;
+}
+
+#[allow(clippy::too_many_lines)] // one scenario: mesh, stream, renew, watch, account
+async fn renewal_moves_links(durable: bool) {
+    use mqtt_codec::{Packet, QoS};
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, Mutex};
+
+    let root = tempfile::tempdir().unwrap();
+    let (mut nodes, pki, old_end) = build_minted_together(root.path(), durable).await;
+    for n in &mut nodes {
+        n.spawn();
+    }
+    loop {
+        for n in &mut nodes {
+            if let Some(status) = n.exited() {
+                panic!("{} exited ({status})\n{}", n.id, log_tail(&n.log_path));
+            }
+        }
+        if survey(&nodes).await.iter().all(|v| *v == Some((3, 2))) {
+            break;
+        }
+        assert!(
+            SystemTime::now() + MINTED_LIFETIME / 2 < old_end,
+            "the three nodes did not mesh within half of MINTED_LIFETIME ({}s)\n{}",
+            MINTED_LIFETIME.as_secs(),
+            dump(&nodes)
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // A subscriber on c, acknowledging what it gets; a publisher on a.
+    let mut sub = common::Client::connect(nodes[2].client_addr, "mv-sub").await;
+    sub.subscribe(1, "mv/#", QoS::AtLeastOnce).await;
+    let received: Arc<Mutex<BTreeSet<Vec<u8>>>> = Arc::default();
+    let reader = {
+        let received = received.clone();
+        tokio::spawn(async move {
+            loop {
+                match sub.recv_bounded(Duration::from_millis(500)).await {
+                    common::Recv::Packet(Packet::Publish(p)) => {
+                        received.lock().unwrap().insert(p.payload.to_vec());
+                        if let Some(pkid) = p.pkid {
+                            sub.puback(pkid).await;
+                        }
+                    }
+                    common::Recv::Closed => return,
+                    _ => {}
+                }
+            }
+        })
+    };
+    let mut publisher = common::Client::connect(nodes[0].client_addr, "mv-pub").await;
+    let mut pkid: u16 = 0;
+    let mut acked: Vec<Vec<u8>> = Vec::new();
+    let mut seq = 0u32;
+    let mut publish_one = async |publisher: &mut common::Client, acked: &mut Vec<Vec<u8>>| {
+        seq += 1;
+        pkid = pkid.wrapping_add(1).max(1);
+        let payload = format!("m{seq}").into_bytes();
+        publisher
+            .publish("mv/t", &payload, QoS::AtLeastOnce, Some(pkid), Vec::new())
+            .await;
+        if let common::Recv::Packet(Packet::PubAck(ack)) =
+            publisher.recv_bounded(Duration::from_secs(10)).await
+        {
+            assert_eq!(ack.pkid, pkid);
+            acked.push(payload);
+        }
+    };
+    // The subscription reaches a before the stream counts.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        publish_one(&mut publisher, &mut acked).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if !received.lock().unwrap().is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "c's subscription never reached a"
+        );
+    }
+
+    // The renewal: every node's certificate and key replaced, then every node reloaded.
+    let marks: Vec<usize> = nodes.iter().map(log_len).collect();
+    let established: Vec<usize> = nodes.iter().map(links_established).collect();
+    for n in &nodes {
+        let _ = pki.env_for(&n.id, SystemTime::now() + Duration::from_hours(24 * 7));
+    }
+    let renewed_at = SystemTime::now();
+    for n in &nodes {
+        let process = n.pid().expect("running").to_string();
+        let sent = std::process::Command::new("kill")
+            .args(["-HUP", &process])
+            .status()
+            .expect("run kill");
+        assert!(sent.success());
+    }
+
+    // The lease group's epoch on each node, before the renewal (durable sessions on).
+    let epochs = |nodes: &[ProcNode]| {
+        let nodes: Vec<_> = nodes.iter().map(|n| n.health_addr).collect();
+        async move {
+            let mut out = Vec::new();
+            for addr in nodes {
+                let body = http_get(addr, "/metrics").await.unwrap_or_default();
+                out.push(
+                    body.lines()
+                        .find(|l| l.starts_with("mqttd_lease_epoch "))
+                        .map(str::to_string),
+                );
+            }
+            out
+        }
+    };
+    let epochs_before = epochs(&nodes).await;
+
+    // Publish and watch the links through the old end and a few seconds past it. A poll a
+    // node's health endpoint did not answer is counted: the no-gap claim rests on the rest.
+    let mut polls = 0;
+    let mut unanswered = 0;
+    while SystemTime::now() < old_end + Duration::from_secs(5) {
+        publish_one(&mut publisher, &mut acked).await;
+        let view = survey(&nodes).await;
+        unanswered += view.iter().filter(|v| v.is_none()).count();
+        assert!(
+            view.iter()
+                .all(|v| v.is_none_or(|(members, links)| members == 3 && links == 2)),
+            "a node was without a link or a member {:?} after the renewal; \
+             (members, links) = {view:?}\n{}",
+            renewed_at.elapsed().unwrap_or_default(),
+            dump(&nodes)
+        );
+        polls += 1;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        unanswered * 20 <= polls,
+        "{unanswered} of {polls} polls went unanswered: too few to say there was no gap"
+    );
+    if durable {
+        let after = epochs(&nodes).await;
+        assert!(
+            epochs_before.iter().all(Option::is_some),
+            "{epochs_before:?}"
+        );
+        assert_eq!(
+            epochs_before,
+            after,
+            "a lease epoch moved across the moves\n{}",
+            dump(&nodes)
+        );
+    }
+
+    // Every link moved, and before the old end.
+    for (i, n) in nodes.iter().enumerate() {
+        assert!(
+            links_established(n) >= established[i] + 2,
+            "{} did not register both of its links again after the renewal\n{}",
+            n.id,
+            dump(&nodes)
+        );
+        let since = log_since(n, marks[i]);
+        for gap in [
+            "peer link lost",
+            "peer declared dead",
+            "peer link ended: a certificate",
+        ] {
+            assert!(
+                !since.contains(gap),
+                "{} logged `{gap}` after the renewal\n{}",
+                n.id,
+                dump(&nodes)
+            );
+        }
+        for reason in ["peer-cert-expired", "own-cert-expired"] {
+            assert_eq!(ended_for(n, reason).await, 0, "{}: {reason}", n.id);
+        }
+        for line in since.lines().filter(|l| l.contains("moving a peer link")) {
+            eprintln!("{}: {line}", n.id);
+        }
+    }
+    let moves: usize = nodes
+        .iter()
+        .zip(&marks)
+        .map(|(n, from)| log_since(n, *from).matches("moving a peer link").count())
+        .sum();
+    assert!(moves >= 3, "three links, {moves} moves\n{}", dump(&nodes));
+
+    // Nothing acknowledged was lost.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let missing: Vec<String> = {
+            let got = received.lock().unwrap();
+            acked
+                .iter()
+                .filter(|m| !got.contains(*m))
+                .map(|m| String::from_utf8_lossy(m).into_owned())
+                .collect()
+        };
+        if missing.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} of {} acknowledged messages never reached the subscriber: {missing:?}\n{}",
+            missing.len(),
+            acked.len(),
+            dump(&nodes)
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    eprintln!(
+        "{moves} moves; {} acknowledged messages delivered; {polls} polls, {unanswered} \
+         unanswered",
+        acked.len()
+    );
+    reader.abort();
+}
