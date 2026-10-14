@@ -164,6 +164,7 @@ async fn remote_group_index_rebuilds_on_replacement_disconnect_and_death() {
         ctl: tx.clone(),
         tx,
         cert_serial: None,
+        cert_ends: crate::hub::LinkCertEnds::default(),
         proto: mqtt_cluster::peer::PROTO_MAX,
         depth: Arc::new(AtomicUsize::new(0)),
     })

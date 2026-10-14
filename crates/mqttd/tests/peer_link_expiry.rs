@@ -6,12 +6,17 @@
 //! lives for days; node B's is minted to end a short while after the mesh has formed.
 //! The broker reads the real clock, so the lifetime is real, not a faked clock.
 //!
-//! CHARACTERISATION (before T3): these assert what the code does today. With gossip
-//! unsigned nothing but the handshake reads a certificate, and the link stays up past
-//! `notAfter` for as long as anyone watches. With gossip signed, b's datagrams are
-//! dropped as `expired` and the failure detector's verdict drops the link — which comes
-//! straight back, because the dialer resumes its TLS session and a resumed handshake does
-//! not verify the certificate again.
+//! Before 0088-T3 the link outlived the certificate. With gossip unsigned nothing but
+//! the handshake read a certificate, and the link stayed up past `notAfter` for as long
+//! as anyone watched. With gossip signed (the default), b's datagrams were dropped as
+//! `expired` and the failure detector's verdict dropped the link — which came straight
+//! back, because the dialer RESUMED its TLS session, and a resumed handshake does not
+//! verify the certificate again. (This file's first commit asserted both.)
+//!
+//! Now the link ends within a minute of `notAfter` — within a second, on each side, by
+//! the hub's sweep — whatever the gossip posture; neither node relinks, since the peer
+//! bus no longer resumes sessions and admission checks both certificates' ends; and an
+//! expired node's gossip stays dropped, so membership holds it out.
 
 mod common;
 mod proc_common;
@@ -165,35 +170,6 @@ async fn form(nodes: &mut [ProcNode], b_ends: SystemTime) {
     }
 }
 
-/// Sleep until wall-clock `at`.
-async fn sleep_until(at: SystemTime) {
-    if let Ok(left) = at.duration_since(SystemTime::now()) {
-        tokio::time::sleep(left).await;
-    }
-}
-
-/// CHARACTERISATION of the code before 0088-T3: with unsigned gossip, nothing but the
-/// handshake reads a peer's certificate, and an established link outlives it. Watched
-/// for a minute past `notAfter` plus a margin — longer than D3 allows.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_peer_link_outlives_its_peers_certificate() {
-    let root = tempfile::tempdir().unwrap();
-    let (mut nodes, b_ends) = build(root.path(), &[("MQTTD_SWIM_SIGNED", "off")]).await;
-    form(&mut nodes, b_ends).await;
-
-    sleep_until(b_ends + WITHIN + Duration::from_secs(5)).await;
-    let started = Instant::now();
-    let view = survey(&nodes).await;
-    assert_eq!(
-        view,
-        vec![Some((2, 1)), Some((2, 1))],
-        "the link was expected to outlive b's certificate on this code; (members, links) \
-         = {view:?} {:?} after the minute\n{}",
-        started.elapsed(),
-        dump(&nodes)
-    );
-}
-
 /// How many times `node` has logged a link established.
 fn links_established(node: &ProcNode) -> usize {
     std::fs::read_to_string(&node.log_path)
@@ -202,33 +178,105 @@ fn links_established(node: &ProcNode) -> usize {
         .count()
 }
 
-/// CHARACTERISATION of the code before 0088-T3, with gossip signed (the default): a's
-/// failure detector stops hearing b at `notAfter` (b's datagrams are dropped as
-/// `expired`) and its verdict drops the link — and the link comes straight back, because
-/// a's dialer RESUMES its TLS session with b, and a resumed handshake does not look at
-/// b's certificate again. Admission checks only the revocation list.
+/// Wait until neither node has a link, at most until a minute past `b_ends`. Returns
+/// when that was seen, relative to `b_ends` (negative: before it).
+async fn await_unlinked(nodes: &mut [ProcNode], b_ends: SystemTime) -> Duration {
+    loop {
+        for n in nodes.iter_mut() {
+            if let Some(status) = n.exited() {
+                panic!("{} exited ({status})\n{}", n.id, log_tail(&n.log_path));
+            }
+        }
+        let view = survey(nodes).await;
+        if view.iter().all(|v| v.is_some_and(|(_, links)| links == 0)) {
+            let at = SystemTime::now();
+            assert!(
+                at >= b_ends,
+                "the link ended {:?} BEFORE b's certificate did\n{}",
+                b_ends.duration_since(at).unwrap_or_default(),
+                dump(nodes)
+            );
+            return at.duration_since(b_ends).unwrap_or_default();
+        }
+        assert!(
+            SystemTime::now() < b_ends + WITHIN,
+            "the link to b outlived b's certificate by more than a minute (ADR 0088 D3); \
+             (members, links) = {view:?}\n{}",
+            dump(nodes)
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// The counter of links or sessions ended for `reason` on `node`.
+async fn ended_for(node: &ProcNode, reason: &str) -> u64 {
+    node.metric(&format!(
+        "mqttd_revocation_evictions_total{{reason=\"{reason}\"}}"
+    ))
+    .await
+    .unwrap_or(0)
+}
+
+/// D3 by itself: with gossip unsigned, nothing but the link's own expiry check can end
+/// it. It is ended within a minute of b's `notAfter`, and not before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_peer_link_to_an_expired_peer_is_re_established() {
+async fn a_peer_link_ends_within_a_minute_of_its_peers_certificate() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut nodes, b_ends) = build(root.path(), &[("MQTTD_SWIM_SIGNED", "off")]).await;
+    form(&mut nodes, b_ends).await;
+
+    let late = await_unlinked(&mut nodes, b_ends).await;
+    eprintln!("the link ended {late:?} after b's notAfter");
+    // Each side's sweep looks once a second; whichever looks first ends the link, and
+    // the other sees it lost. (That each side ends it by itself is the hub's unit tests.)
+    let by_a = ended_for(&nodes[0], "peer-cert-expired").await;
+    let by_b = ended_for(&nodes[1], "own-cert-expired").await;
+    assert!(
+        by_a + by_b >= 1,
+        "the link was ended for expiry — by a on b's certificate or by b on its own \
+         (a: {by_a}, b: {by_b})\n{}",
+        dump(&nodes)
+    );
+}
+
+/// D4: an expired node is out. Its gossip is dropped and counted, the link ends, and it
+/// is not linked again — not by a's dialer, which keeps dialing a peer it holds dead
+/// (ADR 0087 D5) and used to come back on a resumed TLS session, and not by b's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_expired_node_is_out_and_stays_out() {
     let root = tempfile::tempdir().unwrap();
     let (mut nodes, b_ends) = build(root.path(), &[]).await;
     form(&mut nodes, b_ends).await;
-    let before = links_established(&nodes[0]);
 
-    sleep_until(b_ends + WITHIN + Duration::from_secs(5)).await;
-    let expired = nodes[0]
-        .metric("mqttd_gossip_rejected_total{reason=\"expired\"}")
-        .await
-        .unwrap_or(0);
+    await_unlinked(&mut nodes, b_ends).await;
+    let established = links_established(&nodes[0]);
+    // a stops hearing b, and its failure detector says so.
+    let deadline = Instant::now() + Duration::from_mins(1);
+    loop {
+        let expired = nodes[0]
+            .metric("mqttd_gossip_rejected_total{reason=\"expired\"}")
+            .await
+            .unwrap_or(0);
+        let members = nodes[0].metric("mqttd_cluster_members").await;
+        if expired > 0 && members == Some(1) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a still holds b a member (members {members:?}, expired drops {expired})\n{}",
+            dump(&nodes)
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // SETTLE(expired-peer-stays-unlinked): the property is a NEGATIVE — no link forms
+    // again. a redials a peer it holds dead at most every 5 s (HELD_DEAD_REDIAL_MAX) and b
+    // redials too; twelve seconds is two of a's longest waits plus margin.
+    tokio::time::sleep(Duration::from_secs(12)).await;
+    let view = survey(&nodes).await;
     assert!(
-        expired > 0,
-        "a drops b's gossip as expired\n{}",
-        dump(&nodes)
-    );
-    let after = links_established(&nodes[0]);
-    assert!(
-        after > before,
-        "a was expected to link b again after b's certificate ran out (links established: \
-         {before} before, {after} after)\n{}",
+        view.iter().all(|v| v.is_some_and(|(_, links)| links == 0))
+            && links_established(&nodes[0]) == established,
+        "a link to the expired node formed again; (members, links) = {view:?}\n{}",
         dump(&nodes)
     );
 }

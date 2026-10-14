@@ -825,7 +825,12 @@ async fn main() -> Result<(), StartupError> {
     // acceptor/connector are rebuilt in the same validate-before-swap reload, so a
     // rotated cluster cert/key/CA is served on the next peer handshake.
     if let Some(parts) = peer_tls_reload {
-        reloader.attach_peer_tls(parts.acceptor_tx, parts.connector_tx, parts.build);
+        reloader.attach_peer_tls(
+            parts.acceptor_tx,
+            parts.connector_tx,
+            parts.own_cert_end,
+            parts.build,
+        );
     }
 
     // A cluster whose nodes all answer to the same name is broken in ways that
@@ -3134,6 +3139,7 @@ fn wire_hub(
     hub.set_subscriber_limits(subscriber_limits_from_config(config)?);
     // ADR 0072: per-message durability tiers, only under the operator's opt-in.
     hub.set_allow_relaxed_publish(config.durable.allow_relaxed_publish);
+    hub.set_end_sessions_at_cert_expiry(config.tls.end_sessions_at_cert_expiry);
     hub.set_shared_prefer_local(config.cluster.shared_prefer_local);
     // Issue #613 item 3.4: the locality DIAL, not the switch. `effective_...` folds
     // MQTTD_SHARED_PREFER_LOCAL=0 in as bias 0, so the hub holds one number and the
@@ -3152,6 +3158,7 @@ fn wire_hub(
 struct PeerTlsReload {
     acceptor_tx: tokio::sync::watch::Sender<tokio_rustls::TlsAcceptor>,
     connector_tx: tokio::sync::watch::Sender<tokio_rustls::TlsConnector>,
+    own_cert_end: peer::OwnCertEnd,
     build: Box<dyn Fn() -> reload::PeerTlsBuildResult + Send + Sync>,
 }
 
@@ -3195,18 +3202,29 @@ fn peer_tls_from_config(
             // The acceptor/connector live behind `watch` channels (ADR 0040 T4): the
             // senders + rebuild closure go to the reloader once it exists, so a
             // rotated cluster cert is served on the next peer handshake.
+            // The cluster bus's own builders (ADR 0088 D4, O3): no session resumption, so
+            // every link verifies the certificate it runs on, and a minute of clock
+            // difference on `notBefore`.
             let (acceptor_tx, acceptor) =
-                tokio::sync::watch::channel(tls::server_acceptor(cert, key, Some(ca))?);
+                tokio::sync::watch::channel(tls::peer_acceptor(cert, key, ca)?);
             let (connector_tx, connector) =
-                tokio::sync::watch::channel(tls::client_connector(ca, cert, key)?);
+                tokio::sync::watch::channel(tls::peer_connector(ca, cert, key)?);
+            let cert_der = tls::first_cert_der(cert)?;
+            let own_cert_end = peer::unknown_cert_end();
+            if let Some(end) = mqtt_auth::mtls::not_after_from_cert(&cert_der) {
+                own_cert_end.store(end, std::sync::atomic::Ordering::Relaxed);
+            }
             let build = {
                 let (ca, cert, key) = (ca.to_path_buf(), cert.to_path_buf(), key.to_path_buf());
                 Box::new(move || {
                     let acceptor =
-                        tls::server_acceptor(&cert, &key, Some(&ca)).map_err(|e| e.to_string())?;
+                        tls::peer_acceptor(&cert, &key, &ca).map_err(|e| e.to_string())?;
                     let connector =
-                        tls::client_connector(&ca, &cert, &key).map_err(|e| e.to_string())?;
-                    Ok((acceptor, connector))
+                        tls::peer_connector(&ca, &cert, &key).map_err(|e| e.to_string())?;
+                    let end = tls::first_cert_der(&cert)
+                        .ok()
+                        .and_then(|der| mqtt_auth::mtls::not_after_from_cert(&der));
+                    Ok((acceptor, connector, end))
                 }) as Box<dyn Fn() -> reload::PeerTlsBuildResult + Send + Sync>
             };
             Ok(Some((
@@ -3215,15 +3233,17 @@ fn peer_tls_from_config(
                     connector,
                     // Raw DER kept for signed gossip (ADR 0022): the CA verifies inbound
                     // certs, and our leaf + key sign outbound datagrams.
-                    cert_der: tls::first_cert_der(cert)?,
+                    cert_der,
                     key_der: tls::private_key_der(key)?,
                     ca_der,
                     gossip_crl: Arc::new(std::sync::RwLock::new(gossip_crl)),
                     crl_path,
+                    own_cert_end: own_cert_end.clone(),
                 },
                 PeerTlsReload {
                     acceptor_tx,
                     connector_tx,
+                    own_cert_end,
                     build,
                 },
             )))

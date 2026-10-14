@@ -374,6 +374,7 @@ fn node_peer_tls(
         key_der: mqtt_net::tls::private_key_der(&key_path).unwrap(),
         gossip_crl: std::sync::Arc::new(std::sync::RwLock::new(None)),
         crl_path: None,
+        own_cert_end: mqttd::peer::unknown_cert_end(),
     }
 }
 

@@ -189,6 +189,7 @@ async fn start_reloadable_node(
                     identity.map(|identity| mqttd::conn::CertAdmission {
                         identity,
                         serial: None,
+                        not_after: None,
                     }),
                     conn_policy,
                     hub,

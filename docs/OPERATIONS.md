@@ -148,21 +148,48 @@ is years. That is the fraction doing what it says, and a CA change is the one ro
 that is not hot (below), so the warning is not wrong; if it is too early for you, route
 `role=~".*_ca"` to a quieter receiver. The page waits for the last 30 days.
 
-**What happens today when a node's cluster certificate expires.** Three things, and the
-third is the one to know:
+**What happens when a node's cluster certificate expires** (ADR 0088 D3, D4). The node is
+out of the cluster, at once and with no grace period and no setting that keeps it in:
 
 - **Gossip is dropped, per datagram.** Every datagram is checked against its sender's
   certificate, so the node's gossip is refused by each peer from the moment of expiry
-  (`mqttd_gossip_rejected_total{reason="expired"}`).
-- **New peer handshakes fail.** A peer link that has to be opened after the expiry is not
-  opened.
-- **Established peer links are not ended.** A link that completed its handshake before
-  the expiry stays up for as long as the connection lasts. Ending it at `notAfter` is
-  ADR 0088 D3 (delivery task 0088-T3), which is not built yet.
+  (`mqttd_gossip_rejected_total{reason="expired"}`), and the peers' failure detectors
+  declare it dead.
+- **Its established peer links end** within a second of `notAfter` (the hub looks every
+  second; the bound D3 sets is a minute). Each side of a link records, at the handshake,
+  when the peer's certificate and its own end, and ends the link at the earlier of the
+  two: `WARN peer link ended: a certificate it was admitted under has expired` and
+  `mqttd_revocation_evictions_total{reason="peer-cert-expired"}` on the side whose peer
+  ran out, `reason="own-cert-expired"` on the side whose own certificate did. It is ended
+  as a lost link, not as a departure: what the peer announced and what its subscribers
+  are owed are kept, as for any link that drops (ADR 0087), until the failure detector's
+  verdict and the hold that follows it run their course.
+- **No new link forms**, in either direction. The TLS handshake refuses an expired
+  certificate, the cluster bus never resumes a TLS session (a resumed handshake would
+  not look at the certificate again), and admission checks both ends of the link once
+  more: `WARN peer link refused: a cluster-bus certificate has expired`, at most once a
+  minute.
+
+A certificate dated up to **60 seconds ahead** of a node's clock is accepted, on the link
+and in gossip (O3), so a renewed node whose clock runs a little fast is not refused;
+there is no allowance at the other end. **A renewal ends the links made before it**: a
+TLS session keeps the certificates of its handshake, so a link made with the old
+certificate ends when that certificate does and is made again at once with the new one —
+one short link loss per link per renewal, which the cluster rides as it rides any link
+that drops.
+
+**Client certificates** are checked at the handshake, and a session that outlives its
+certificate is left alone unless `tls.end_sessions_at_cert_expiry`
+(`MQTTD_TLS_END_SESSIONS_AT_CERT_EXPIRY`) is on: then the session is ended within a second
+of its certificate's `notAfter`, as a revoked one is (v5 clients get DISCONNECT `0x87`),
+counted as `mqttd_revocation_evictions_total{reason="cert-expired"}`. Off by default
+because devices with long sessions and short certificates exist (O2). A session relayed
+to another node (ADR 0005) is not covered: the node serving it does not hold the TLS
+session.
 
 A revocation list past its `nextUpdate` still loads and is enforced as it is; revocations
-published since are not in it. The gauges, the warning and the alerts change none of this:
-they report, and nothing is refused or ended because of them.
+published since are not in it. The gauges, the warning and the alerts report; expiry
+itself is what ends things.
 
 ## The lifetime is stated; renewing and revoking are commands (ADR 0088)
 
@@ -206,8 +233,9 @@ mqttd --check-tls                               # the new window, as the broker 
 
 The node serves the new certificate on its next handshake and signs its next gossip
 datagram with the new key, without a restart. A node on its new certificate and one on its
-old accept each other, so renew one node at a time, in any order. Established peer links
-are not re-made by a renewal. A node that was down past the end of its certificate is
+old accept each other, so renew one node at a time, in any order. A peer link made before
+the renewal ends when the old certificate does and is made again at once with the new
+one (above). A node that was down past the end of its certificate is
 renewed the same way and stays out until the files are on it.
 
 ### Removing a node for good
@@ -1821,7 +1849,8 @@ the human-readable superset.
     ([rotation](#certificate--acl--crl-rotation--automatic)); the alert clears on the
     scrape after the reload.
   - `role="peer"`: this node's own cluster certificate. Do it before the page: at expiry
-    the node's gossip is dropped and it can open no new peer link
+    the node is out of the cluster — its gossip is dropped, its peer links end within a
+    second and no new one forms, with no grace period
     ([what happens at expiry](#certificate-lifetimes-what-the-broker-tells-you-adr-0088)).
   - `role` ending in `_ca`: a CA in that bundle is near its end, and every certificate it
     issued ends with it. A cluster CA change is not a hot rotation

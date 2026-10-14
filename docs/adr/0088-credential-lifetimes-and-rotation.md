@@ -392,6 +392,79 @@ Left as it was: `deploy/compose/init.sh` mints with a default lifetime (`CERT_DA
 nothing revokes a departed pod's certificate on Kubernetes, where the lifetime is the
 bound.
 
+## Amendment (2026-10-14): expiry enforced, as built in T3
+
+D3 and D4 are built as written, with O3's tolerance; O2's setting is built and off by
+default. What T3 found first, and what had to be decided:
+
+- **The characterisation** (`crates/mqttd/tests/peer_link_expiry.rs`, its first commit):
+  two spawned brokers, one with a certificate that ends forty seconds after it is minted.
+  With gossip unsigned the link stayed up past `notAfter + 65 s` — nothing but the
+  handshake read the certificate. With gossip signed (the default) the expired node's
+  datagrams were dropped as `expired`, the failure detector declared it dead six seconds
+  later and that verdict dropped the link, **and the link was back within half a second**:
+  the dialer keeps dialing a peer it holds dead (ADR 0087 D5), the peer bus resumed TLS
+  sessions, and a resumed TLS 1.3 handshake does not verify the certificate again. It
+  flapped like that for as long as it was watched. The record's "new peer handshakes
+  fail" was therefore not true of a peer this node had linked before.
+- **The peer bus no longer resumes TLS sessions.** `mqtt_net::tls::peer_acceptor` and
+  `peer_connector` replace the general builders for the cluster bus: no session store,
+  no tickets, `Resumption::disabled()`. Peer links are few and long-lived; a full
+  handshake each costs nothing that matters, and every link now verifies the certificate
+  it runs on.
+- **Admission checks both ends** (`peer.rs` `admit_peer_link`, both directions): the
+  peer's leaf `notAfter`, as a backstop to the TLS verifier, and this node's own. A node
+  whose own certificate has run out neither dials nor accepts; the peers refuse it at the
+  handshake anyway, so this matters against a peer on older code. Refusals log a `WARN`
+  at most once a minute.
+- **A link ends at the earlier of the two certificates of its handshake.** Each side
+  records the peer's `notAfter` and its own when the link forms (`LinkCertEnds`, carried
+  on `HubCommand::PeerConnected`); the hub's once-a-second sweep ends the link the first
+  second after the earlier one, by the same path as the CRL's peer sweep: removing the
+  peer entry closes the link's lanes, its pump and its socket. D3 asked for a timer no
+  coarser than a minute; the hub's existing tick is a second, and it looks at nothing
+  until the earliest known end has passed. Measured end to end: 1.7 to 2.7 s after
+  `notAfter`, of which up to a second is the test's own polling.
+- **Own end is the certificate that is served.** It is read at startup and stored again
+  by every reload that commits a new peer certificate; a link keeps the value from its
+  handshake, because a TLS session keeps the certificates it was made with.
+- **So a renewal ends the links made before it**, at the old certificate's end, and the
+  link is made again at once with the new one. TLS 1.3 cannot re-authenticate an
+  established connection, and keeping the link on the strength of gossip signed with the
+  new certificate would mean a link authenticated by something other than its handshake.
+  One short link loss per link per renewal; the cluster rides it as it rides any link that
+  drops (ADR 0087). With renewal at two thirds of the lifetime, the links of a renewed
+  node are a third of a lifetime on the old certificate.
+- **The reason labels** are `mqttd_revocation_evictions_total`'s, which the CRL sweep
+  already uses: `peer-cert-expired` and `own-cert-expired` for links, `cert-expired` for
+  client sessions. The log line is `peer link ended: a certificate it was admitted under
+  has expired (ADR 0088)`. Gossip from an expired signer was already dropped and counted
+  (`mqttd_gossip_rejected_total{reason="expired"}`, ADR 0022 T7); T3 adds nothing there
+  but the tolerance below.
+- **A link ended for expiry is a lost link, not an erasure** (ADR 0087): the hub calls
+  `peer_disconnected`, which keeps the peer's interest, its `$share` members, its
+  negotiated protocol and its standing, and makes no verdict. What follows is
+  membership's: the expired node's gossip is dropped, so the failure detector declares it
+  dead, `peer_dead` holds it as unreachable, and the hold runs out as for any node that
+  does not come back (0087-T2's eight ticks, until 0087-T3 replaces them). That is D4's
+  "out of the cluster", reached by the ordinary path.
+- **O3's tolerance**: a certificate whose `notBefore` is up to 60 s ahead of the clock is
+  accepted, at the peer bus's TLS verifiers (a wrapper that retries a "not valid yet"
+  verdict at `now + 60 s`, so the allowance can never extend `notAfter`) and in signed
+  gossip (`signed_gossip::NOT_BEFORE_TOLERANCE_SECS`). The client listeners keep
+  webpki's strict check: O3 is about cluster credentials. `gen-certs.sh` keeps minting a
+  minute back; the two together cover two minutes of skew for a fresh certificate.
+- **O2**: `tls.end_sessions_at_cert_expiry` (`MQTTD_TLS_END_SESSIONS_AT_CERT_EXPIRY`,
+  `1`/`0`), off by default, read at startup. On, a client session admitted with a
+  certificate is evicted the second after its `notAfter`, as a revoked one is (the
+  identity sweep's `evict`). A session relocated to another node (ADR 0005) carries no
+  certificate there and is not covered; ADR 0040's revocation sweep has the same gap.
+
+Not verified by T3: the end of a link at the expiry of the node's **own** certificate is
+shown in the hub's tests and in the two-process test only as "one side or the other ends
+it" (whichever side's sweep looks first); a mixed cluster with a peer on v1.1.0, which
+would not end the link from its side, was not run.
+
 ## Not verified
 
 - T1 did not test what the broker does with a **cluster CA** that is past `notAfter`, or
@@ -399,9 +472,11 @@ bound.
   does not: `--check-tls` already documented that a stale list still loads, and no code
   path reads `nextUpdate` to refuse one. The CA was not checked either way. Their expiry
   is exported and warned about regardless.
-- That nothing ends an established peer link at its peer's certificate expiry was read
-  from `crates/mqttd/src/peer.rs` (admission checks the CRL; no expiry check or timer was
-  found), not shown by a test. T3 starts by writing that test.
+- ~~That nothing ends an established peer link at its peer's certificate expiry was read
+  from `crates/mqttd/src/peer.rs`, not shown by a test.~~ Shown, and found worse, by T3
+  (amendment of 2026-10-14 below): the link outlived the certificate in both gossip
+  postures, and with signed gossip it was dropped by the failure detector and came straight
+  back on a resumed TLS session.
 - cert-manager's behaviour with lifetimes of hours under the chart's csi-driver layout was
   not run. T2's volume is rendered and compared between the chart and the operator; no
   cert-manager has issued from it. The `fs-group` attribute it sets (the pod's `fsGroup`)
