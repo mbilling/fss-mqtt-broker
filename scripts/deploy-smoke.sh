@@ -260,14 +260,105 @@ MOSQ_TLS=(--cafile "$PKI_CA/ca.pem")
 #     at once — CN=node id (or the Hello is dropped), SAN covers the advertise host (or the
 #     dialer refuses), both EKUs (or rustls rejects the client cert), and an ECDSA key (or the
 #     gossip signer refuses the key and the process never starts, since SIGNED=require here).
+#
+#     The same two nodes then prove the script's other verbs against a RUNNING broker
+#     (ADR 0088 T2): it mints nothing without a stated lifetime, a `renew` is served and
+#     signed with after a reload and no restart, and a `revoke` ends the revoked node's link
+#     and keeps it out.
 # ─────────────────────────────────────────────────────────────────────────────────
 SYSPKI="$WORK/syspki"
-PKI_DIR="$SYSPKI" sh "$GEN_CERTS" ca >"$WORK/gen-certs.log" 2>&1 \
+# Every run of the script here states what it means and inherits nothing: a LEAF_LIFETIME
+# exported in the caller's shell would otherwise turn the refusal below into a mint.
+gen_certs() {
+  env -u LEAF_LIFETIME -u LEAF_DAYS -u CRL_LIFETIME -u RENEW_AT_PERMILLE \
+    PKI_DIR="$SYSPKI" sh "$GEN_CERTS" "$@"
+}
+file_serial() { openssl x509 -in "$1" -noout -serial | sed 's/^serial=//'; }
+gen_certs ca >"$WORK/gen-certs.log" 2>&1 \
   || { cat "$WORK/gen-certs.log"; fail "$GEN_CERTS could not mint the cluster CA"; }
+
+# ADR 0088 D1 / O1: no stated lifetime, no certificate. The refusal must be a refusal — a
+# non-zero status, the option named, and NOTHING on disk.
+if gen_certs node mqttd-a 127.0.0.1 >"$WORK/gen-refuse.log" 2>&1; then
+  cat "$WORK/gen-refuse.log"
+  fail "$GEN_CERTS minted a leaf set with no lifetime stated — the lifetime of a node's \
+certificate is the deployer's decision, and a silent default is nobody's"
+fi
+grep -q -- '--lifetime' "$WORK/gen-refuse.log" \
+  || { cat "$WORK/gen-refuse.log"; fail "$GEN_CERTS refused without a lifetime but did not name --lifetime"; }
+[[ ! -e "$SYSPKI/mqttd-a" && ! -e "$SYSPKI/ca/index.txt" ]] \
+  || fail "$GEN_CERTS refused without a lifetime and still wrote under $SYSPKI"
+pass "$GEN_CERTS mints nothing without a stated lifetime, and says which option states it"
+
 for n in mqttd-a mqttd-b; do
-  PKI_DIR="$SYSPKI" sh "$GEN_CERTS" node "$n" 127.0.0.1 >>"$WORK/gen-certs.log" 2>&1 \
-    || { cat "$WORK/gen-certs.log"; fail "$GEN_CERTS could not mint a leaf set for $n"; }
+  gen_certs node --lifetime 2d "$n" 127.0.0.1 >"$WORK/gen-node-$n.log" 2>&1 \
+    || { cat "$WORK/gen-node-$n.log"; fail "$GEN_CERTS could not mint a leaf set for $n"; }
+  cat "$WORK/gen-node-$n.log" >>"$WORK/gen-certs.log"
+  openssl x509 -in "$SYSPKI/$n/peer.pem" -noout -checkend $((2 * 86400 - 300)) >/dev/null \
+    || fail "$n/peer.pem ends before the two days that were stated"
+  if openssl x509 -in "$SYSPKI/$n/peer.pem" -noout -checkend $((2 * 86400 + 300)) >/dev/null; then
+    fail "$n/peer.pem outlives the two days that were stated"
+  fi
 done
+# The date to act on is printed, and it is the broker's own warning point: two thirds of the
+# lifetime (tls.expiry_warn_permille = 667), which leaves 333 thousandths of these 48 hours.
+python3 - "$WORK/gen-node-mqttd-a.log" <<'RENEWBY' \
+  || fail "$GEN_CERTS did not print a RENEW BY date at two thirds of the stated lifetime"
+import re, sys
+from datetime import datetime
+text = open(sys.argv[1]).read()
+stamp = r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)"
+end = re.search(r"valid until\s+" + stamp, text)
+renew = re.search(r"RENEW BY\s+" + stamp, text)
+if not (end and renew):
+    sys.exit("no 'valid until' / 'RENEW BY' line")
+when = lambda m: datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%SZ")
+left = (when(end) - when(renew)).total_seconds()
+# The window starts a minute before the mint (clock skew between hosts), and the renew-by
+# point is measured over the whole window, as the broker measures the fraction spent.
+want = (2 * 86400 + 60) * (1000 - 667) / 1000
+sys.exit(0 if abs(left - want) <= 2 else f"{left} s between RENEW BY and the end, expected {want}")
+RENEWBY
+
+# A node's every certificate, offline: an identity minted before the CA kept a ledger,
+# renewed twice (once keeping its key), then revoked. All six certificates that ever named
+# it must be on the list — including the two the first renewal overwrote, which existed
+# nowhere but in the node's directory.
+OLDPKI="$WORK/oldpki"
+gen_old() { env -u LEAF_LIFETIME -u LEAF_DAYS -u CRL_LIFETIME PKI_DIR="$OLDPKI" sh "$GEN_CERTS" "$@"; }
+{ gen_old ca && gen_old node --lifetime 1d old-1 10.9.9.9; } >"$WORK/gen-old.log" 2>&1 \
+  || { cat "$WORK/gen-old.log"; fail "$GEN_CERTS could not mint the pre-ledger identity"; }
+rm -rf "$OLDPKI/ca/index.txt" "$OLDPKI/ca/index.txt.attr" "$OLDPKI/ca/crlnumber" "$OLDPKI/ca/issued"
+serials=("$(file_serial "$OLDPKI/old-1/peer.pem")" "$(file_serial "$OLDPKI/old-1/server.pem")")
+gen_old renew --lifetime 2h old-1 >>"$WORK/gen-old.log" 2>&1 \
+  || { cat "$WORK/gen-old.log"; fail "$GEN_CERTS could not renew a pre-ledger identity"; }
+serials+=("$(file_serial "$OLDPKI/old-1/peer.pem")" "$(file_serial "$OLDPKI/old-1/server.pem")")
+key_before="$(openssl pkey -in "$OLDPKI/old-1/peer.key" -pubout)"
+gen_old renew --lifetime 2h --reuse-key old-1 >>"$WORK/gen-old.log" 2>&1 \
+  || { cat "$WORK/gen-old.log"; fail "$GEN_CERTS could not renew with --reuse-key"; }
+[[ "$(openssl pkey -in "$OLDPKI/old-1/peer.key" -pubout)" == "$key_before" ]] \
+  || fail "$GEN_CERTS renew --reuse-key replaced the key"
+serials+=("$(file_serial "$OLDPKI/old-1/peer.pem")" "$(file_serial "$OLDPKI/old-1/server.pem")")
+gen_old revoke old-1 >>"$WORK/gen-old.log" 2>&1 \
+  || { cat "$WORK/gen-old.log"; fail "$GEN_CERTS could not revoke a renewed identity"; }
+old_crl="$(openssl crl -in "$OLDPKI/ca/peer-crl.pem" -noout -text)"
+for s in "${serials[@]}"; do
+  grep -qi "Serial Number: $s" <<<"$old_crl" || { cat "$WORK/gen-old.log"
+    fail "revoking old-1 left serial $s off the list: a certificate that once named the node \
+stays valid until it ends"; }
+done
+[[ "$(sort -u < <(printf '%s\n' "${serials[@]}") | wc -l | tr -d ' ')" == 6 ]] \
+  || fail "the three generations of old-1 did not have six distinct serials"
+pass "$GEN_CERTS revoke lists every certificate a node ever had — the pre-ledger pair the \
+first renewal replaced, both renewals, and a --reuse-key renewal that kept the key"
+
+# The revocation list a deployment starts with: empty, signed by the cluster CA, and already
+# named by MQTTD_PEER_TLS_CRL — which is what makes a later revocation a file replacement.
+# The nodes read an INSTALLED copy, as a host does, never the CA's directory.
+gen_certs crl >>"$WORK/gen-certs.log" 2>&1 \
+  || { cat "$WORK/gen-certs.log"; fail "$GEN_CERTS could not issue the (empty) revocation list"; }
+GEN_CRL="$WORK/gen-installed-peer-crl.pem"
+cp "$SYSPKI/ca/peer-crl.pem" "$GEN_CRL"
 
 # CA KEY CUSTODY, asserted on the artifact: the cluster's trust root must not appear in any
 # per-node directory, because those directories are exactly what gets copied to a broker host
@@ -329,6 +420,7 @@ start_gen_node() { # <node-id> <client_port> <health_port> <peer_port> <swim_por
     MQTTD_PEER_TLS_CA="$SYSPKI/$n/peer-ca.pem" \
     MQTTD_PEER_TLS_CERT="$SYSPKI/$n/peer.pem" \
     MQTTD_PEER_TLS_KEY="$SYSPKI/$n/peer.key" \
+    MQTTD_PEER_TLS_CRL="$GEN_CRL" \
     MQTTD_SWIM_BIND="127.0.0.1:$sport" \
     MQTTD_SWIM_SEEDS="$seeds" \
     MQTTD_SWIM_KEY_FILE="$SYS_SWIM_KEY" \
@@ -386,6 +478,144 @@ grep -q gen-crossed "$GEN_OUT" || { tail -20 "$WORK/gen-mqttd-a/log"; tail -20 "
 rule is broken (CN, SAN, EKU) or the two leaves do not share one CA"; }
 pass "two nodes boot from $GEN_CERTS material, sign gossip per-node, and route across a \
 mutually-authenticated bus (so all four peer-certificate rules hold)"
+
+# ── renew, against the running pair (ADR 0088 D5) ────────────────────────────────────
+# What an operator does before the renew-by date: `renew`, install the four files over the
+# old ones, reload. The node directory IS the installed path here, so the script's own
+# move-into-place is the install. No restart: the same PID must serve the new certificate.
+gen_metric() { # <health_port> <series, labels included> -> its value, or ""
+  curl -fsS --max-time 5 "http://127.0.0.1:$1/metrics" 2>/dev/null \
+    | awk -v s="$2" '$1 == s { print $2; exit }'
+}
+served_serial() { # <port> -> the serial of the certificate that listener serves right now
+  openssl s_client -connect "127.0.0.1:$1" </dev/null 2>/dev/null \
+    | openssl x509 -noout -serial 2>/dev/null | sed 's/^serial=//'
+}
+more_than() { python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) > float(sys.argv[2]) else 1)' "$1" "$2"; }
+
+old_peer_serial="$(file_serial "$SYSPKI/mqttd-a/peer.pem")"
+[[ "$(served_serial "$SA_P")" == "$old_peer_serial" ]] \
+  || fail "mqttd-a's peer listener is not serving the certificate $GEN_CERTS minted for it"
+before="$(gen_metric "$SA_H" 'mqttd_tls_expiry_seconds{role="peer"}')"
+[[ -n "$before" ]] && more_than "$before" 86400 && more_than $((2 * 86400 + 1)) "$before" \
+  || fail "mqttd-a does not report its two-day peer certificate (mqttd_tls_expiry_seconds{role=\"peer\"}=$before)"
+
+if gen_certs renew mqttd-a >"$WORK/gen-refuse.log" 2>&1; then
+  cat "$WORK/gen-refuse.log"; fail "$GEN_CERTS renewed a leaf set with no lifetime stated"
+fi
+[[ "$(file_serial "$SYSPKI/mqttd-a/peer.pem")" == "$old_peer_serial" ]] \
+  || fail "$GEN_CERTS refused to renew without a lifetime and still replaced the certificate"
+gen_certs renew --lifetime 5d mqttd-a >"$WORK/gen-renew.log" 2>&1 \
+  || { cat "$WORK/gen-renew.log"; fail "$GEN_CERTS could not renew mqttd-a"; }
+grep -q 'RENEW BY' "$WORK/gen-renew.log" \
+  || fail "$GEN_CERTS renewed mqttd-a without printing the date to renew by"
+new_peer_serial="$(file_serial "$SYSPKI/mqttd-a/peer.pem")"
+new_server_serial="$(file_serial "$SYSPKI/mqttd-a/server.pem")"
+[[ "$new_peer_serial" != "$old_peer_serial" ]] \
+  || fail "$GEN_CERTS renew left mqttd-a's peer certificate as it was"
+[[ "$(cert_cn "$SYSPKI/mqttd-a/peer.pem")" == "mqttd-a" ]] \
+  || fail "the renewed peer certificate is not CN=mqttd-a"
+openssl x509 -in "$SYSPKI/mqttd-a/peer.pem" -noout -text | grep -q 'IP Address:127.0.0.1' \
+  || fail "the renewed peer certificate lost its SAN — peers could no longer dial mqttd-a"
+openssl verify -CAfile "$SYSPKI/ca/peer-ca.pem" "$SYSPKI/mqttd-a/peer.pem" >/dev/null 2>&1 \
+  || fail "the renewed peer certificate is not issued by the cluster CA"
+
+kill -HUP "$GA"
+renewed=""
+now=""
+for _ in $(seq 1 60); do
+  now="$(gen_metric "$SA_H" 'mqttd_tls_expiry_seconds{role="peer"}')"
+  if [[ -n "$now" ]] && more_than "$now" $((4 * 86400)) \
+     && [[ "$(served_serial "$SA_P")" == "$new_peer_serial" ]] \
+     && [[ "$(served_serial "$SA_C")" == "$new_server_serial" ]]; then
+    renewed=1; break
+  fi
+  sleep 0.5
+done
+[[ -n "$renewed" ]] || { tail -30 "$WORK/gen-mqttd-a/log"
+  fail "mqttd-a did not pick the renewed material up on reload: peer expiry ${now:-?} s (want \
+over 4 d), peer listener serves $(served_serial "$SA_P") (want $new_peer_serial), client \
+listener serves $(served_serial "$SA_C") (want $new_server_serial)"; }
+kill -0 "$GA" 2>/dev/null || fail "mqttd-a did not survive the reload onto its renewed certificate"
+
+# The renewed node is still a member in the OTHER node's eyes: its gossip is now signed with
+# a key mqttd-b has never seen, under a certificate mqttd-b learns from the datagram and
+# checks against the CA. Several probe rounds later both must still count two, and a publish
+# accepted on the node that did not renew must reach a subscriber on the one that did.
+# (A topic of its own: a subscriber on the wide filter used above was handed that earlier
+# message again when it attached to mqttd-a, which would pass or fail this for the wrong reason.)
+sleep 5
+for pair in "$SA_H:mqttd-a" "$SB_H:mqttd-b"; do
+  members="$(gen_metric "${pair%%:*}" mqttd_cluster_members)"
+  [[ "$members" == "2" ]] || { tail -20 "$WORK/gen-mqttd-a/log"; tail -20 "$WORK/gen-mqttd-b/log"
+    fail "${pair##*:} counts ${members:-?} member(s) after mqttd-a renewed, not 2 — a node on its \
+new certificate and one on its old must accept each other"; }
+done
+GEN_OUT2="$WORK/gen-xnode-renewed.out"
+mosquitto_sub -h 127.0.0.1 -p "$SA_C" --cafile "$SYSPKI/ca/peer-ca.pem" \
+  -t 'devices/device-a/up/renewed' -C 1 -W 20 -u backend -P "$BACKEND_PW" -i gen-sub2 > "$GEN_OUT2" 2>/dev/null &
+GEN_SUB=$!
+sleep 2
+mosquitto_pub -h 127.0.0.1 -p "$SB_C" --cafile "$SYSPKI/ca/peer-ca.pem" \
+  -t 'devices/device-a/up/renewed' -m 'gen-renewed' -q 1 \
+  -u device-a -P "$DEVICE_A_PW" -i gen-pub2 >/dev/null 2>&1 \
+  || fail "a publish on mqttd-b was not accepted after mqttd-a renewed"
+wait "$GEN_SUB" 2>/dev/null || true
+grep -q gen-renewed "$GEN_OUT2" || { echo "sub got: $(cat "$GEN_OUT2")"; tail -20 "$WORK/gen-mqttd-a/log"; tail -20 "$WORK/gen-mqttd-b/log"
+  fail "the pair stopped routing after mqttd-a renewed, or mqttd-a no longer serves a TLS \
+client that trusts the cluster CA (its client-facing leaf was renewed with the peer leaf)"; }
+pass "$GEN_CERTS renew: the running node serves and signs with its renewed certificates after a \
+reload, with no restart, and the pair stays a cluster and keeps routing"
+
+# ── revoke, against the running pair (ADR 0088 D5) ───────────────────────────────────
+# The last step of decommissioning a node: every certificate the CA issued to it goes on the
+# list, the list goes to the nodes that REMAIN, and they reload it. mqttd-b plays the node
+# that left without being shut down — the case revocation exists for.
+links="$(gen_metric "$SA_H" mqttd_peer_links)"
+[[ "$links" == "1" ]] \
+  || fail "mqttd-a does not hold exactly one peer link before the revocation (mqttd_peer_links=${links:-?})"
+gen_certs revoke mqttd-b >"$WORK/gen-revoke.log" 2>&1 \
+  || { cat "$WORK/gen-revoke.log"; fail "$GEN_CERTS could not revoke mqttd-b"; }
+openssl crl -in "$SYSPKI/ca/peer-crl.pem" -CAfile "$SYSPKI/ca/peer-ca.pem" -noout 2>&1 \
+  | grep -q 'verify OK' \
+  || fail "the revocation list $GEN_CERTS wrote does not verify against the cluster CA"
+crl_text="$(openssl crl -in "$SYSPKI/ca/peer-crl.pem" -noout -text)"
+grep -qi "Serial Number: $(file_serial "$SYSPKI/mqttd-b/peer.pem")" <<<"$crl_text" \
+  || fail "the revocation list does not name mqttd-b's peer certificate"
+if grep -qi "Serial Number: $new_peer_serial" <<<"$crl_text"; then
+  fail "revoking mqttd-b put mqttd-a's certificate on the list"
+fi
+# Install is a rename, as `install` does it: the broker must never read half a list.
+cp "$SYSPKI/ca/peer-crl.pem" "$GEN_CRL.new" && mv "$GEN_CRL.new" "$GEN_CRL"
+kill -HUP "$GA"
+cut_off=""
+for _ in $(seq 1 60); do
+  if [[ "$(gen_metric "$SA_H" mqttd_peer_links)" == "0" ]]; then cut_off=1; break; fi
+  sleep 0.5
+done
+[[ -n "$cut_off" ]] || { tail -30 "$WORK/gen-mqttd-a/log"
+  fail "mqttd-a still holds a peer link to mqttd-b after reloading a list that revokes it"; }
+# And it STAYS out. mqttd-b is alive, holds a certificate that still verifies against the
+# CA, and keeps dialing; every attempt has to be turned away by the list.
+sleep 6
+links="$(gen_metric "$SA_H" mqttd_peer_links)"
+[[ "$links" == "0" ]] \
+  || fail "mqttd-b got a peer link back while its certificate is on the list mqttd-a enforces (mqttd_peer_links=${links:-?})"
+kill -0 "$GA" 2>/dev/null || fail "mqttd-a did not survive reloading the revocation list"
+GEN_OUT3="$WORK/gen-xnode-revoked.out"
+mosquitto_sub -h 127.0.0.1 -p "$SA_C" --cafile "$SYSPKI/ca/peer-ca.pem" \
+  -t 'devices/device-a/up/revoked' -C 1 -W 6 -u backend -P "$BACKEND_PW" -i gen-sub3 > "$GEN_OUT3" 2>/dev/null &
+GEN_SUB=$!
+sleep 2
+mosquitto_pub -h 127.0.0.1 -p "$SB_C" --cafile "$SYSPKI/ca/peer-ca.pem" \
+  -t 'devices/device-a/up/revoked' -m 'gen-from-revoked' -q 0 \
+  -u device-a -P "$DEVICE_A_PW" -i gen-pub3 >/dev/null 2>&1 || true
+wait "$GEN_SUB" 2>/dev/null || true
+if grep -q gen-from-revoked "$GEN_OUT3"; then
+  fail "a publish accepted by the REVOKED node reached a subscriber on mqttd-a"
+fi
+pass "$GEN_CERTS revoke: the remaining node reloads the list, ends the revoked node's link, \
+keeps refusing it and takes nothing from it — with no restart"
 
 # Down again before the three-node cluster: these hold ports and a gossip mesh of their own.
 kill "$GA" "$GB" 2>/dev/null || true

@@ -63,11 +63,17 @@ tasks:
     issue: 999
     date: 2026-10-13
     evidence: "swim.rs: Config::confirm_before_dead defaults to true; not operator configuration (none of the detector's settings is). The formation simulation gains packet loss, one-way reachability, one link lost one way and a late member, and a second report (fault_shapes_report); the characterisation test is replaced by the bound the default keeps (a cut of up to 2 s ends in no Dead at 5, 14 and 30 nodes), with the old behaviour pinned as what the switch off gives. A driver test that only a datagram signed by the suspect answers the probe. Twelve real brokers with one stopped for 2 s (nightly tier). ADR 0016's amendment of 2026-10-13 carries the tables."
+  - id: 0087-T10a
+    title: "Failure detection: the last probe holds when the prober was stalled; generation-checked; evidence seed-paired"
+    status: done
+    issue: 1002
+    date: 2026-10-14
+    evidence: "The hardening an independent read-through of T10 asked for, reworked after a review of its first version. swim_driver.rs: a tick reads what its socket holds before it may expire anything (64 datagrams whatever the time, then up to 1024 within a quarter of the tick); the state machine's clock is the monotonic clock, late wake-up or not; a stall is counted with its length and changes nothing else; missed ticks are not made up; one TICK constant for the broker and the simulation. (The first version kept stalled time off the clock and raised awareness on a stall: a persistently late lone survivor then took 64 s to see a death. Withdrawn.) swim.rs: the last probe's Ack must come from the generation held; a Suspect at a higher incarnation leaves the probe standing, and the Join that follows a spare carries the suspicion as held; a probe overtaken by a longer window is sent afresh; the probe carries the suspicion only and spends no gossip budget; counters for probes sent, spared and silent. Metrics mqttd_swim_last_probes_total{outcome}, mqttd_swim_stalls_total, mqttd_swim_stalled_milliseconds_total, mqttd_swim_awareness. The simulation can stall a node, make nodes late, take ticks off the grid and run the old loop; under loss a datagram's fate and delay are functions of seed, link and time, so two detectors on a seed share a network; a 2.5 s column; the bound is pinned twice as arithmetic, 2098 ms on the simulation's grid and 2 s less twice the latency for a broker. Driver tests on a paused clock; a nightly scenario that stops a prober with its last probe out, and the job keeps the brokers' logs on failure. ADR 0016's amendment for #1002 carries the derivation and the tables."
   - id: 0087-T10b
-    title: "Failure detection: the same check before adopting a relayed Dead about a member this node can reach; decide whether the suspicion window scales with the cluster's size"
+    title: "Failure detection: the same check before adopting a relayed Dead about a member this node can reach; decide whether the suspicion window scales with the cluster's size; decide whether membership runs on a thread of its own"
     status: planned
     issue: 975
-    notes: "Size M. What T10 leaves of #975: the 3 s cells and the mixed-version rows (a Dead declared by another node, or by a v1.1.0 node, is adopted unchecked) and the packet-loss cells at 14 nodes and more (the window does not grow with the cluster). suspicion_scales_with_log_n exists, off. ADR 0016 gets the amendment."
+    notes: "Size M. What T10 leaves of #975: the 3 s cells and the mixed-version rows (a Dead declared by another node, or by a v1.1.0 node, is adopted unchecked) and the packet-loss cells at 14 nodes and more (the window does not grow with the cluster). suspicion_scales_with_log_n exists, off. ADR 0016 gets the amendment. Added by T10a: the SWIM driver is a task on the data path's runtime, so a broker whose workers are all busy answers no probe; T10a keeps such a node from accusing its peers, not from being accused. Whether to give membership its own thread and runtime (it would then say Alive about a broker that moves no data: ADR 0087's member without a link) is decided here, from mqttd_swim_stalls_total and mqttd_swim_stalled_milliseconds_total on the rig at the rungs where the README's membership flap was seen. Also from T10a: awareness (ADR 0016 §2) falls only when a peer answers a probe, so a node left with only dead members to probe keeps a raised score; whether it should also decay with time."
 ---
 
 # Delivery 0087 — acknowledged only when the owning node has accepted it
@@ -109,7 +115,8 @@ then, once its sub-decision is settled (T3: O1, O4; T5: O2, O5; T6: O3).
 | **0087-T8** Tests (D11) | `cluster_stress` holds acked durability for clean-session, persistent and `$share` subscribers across seeded false verdicts and partitions; `cluster_proc`'s `SIGSTOP` nemesis passes the acked-facts oracle. |
 | **0087-T9** Rig | A ledgered run with a membership fault under load loses nothing; the re-measured rungs are published with the README. |
 | **0087-T10** Failure detection: the last direct probe, on by default (#999) | `a_short_cut_still_ends_in_a_false_dead_on_the_default_window` is replaced by the bound the new default keeps; no formation regression. |
-| **0087-T10b** Failure detection: a relayed `Dead`, and the window's scaling (#975) | A `Dead` relayed about a member the node can reach is checked before it is adopted, or the decision not to is recorded with its measurement; the 3 s cells and the mixed-version rows of ADR 0016's table say what changed. The window's scaling is decided, with the packet-loss cells at 14 and 30 nodes as its measure. |
+| **0087-T10a** Failure detection: the last probe when the prober was stalled (#1002) | A prober stalled past the ack timeout with the suspect's `Ack` in its socket does not declare it `Dead`: at the driver on a paused clock, in the simulation (where the loop as it was does), and on real processes nightly. A node that is persistently late still sees a real death within five wake-ups' lateness of a node on time, with nobody alive to probe; nothing accumulates and the tombstone is not stretched. An `Ack` from an earlier generation does not answer the probe. The bound is stated wherever it appears as what holds in a broker, and its tests fail with the derivation when a timeout or the tick changes. The packet-loss tables are measured with both detectors on one network. No formation regression; no wire change. |
+| **0087-T10b** Failure detection: a relayed `Dead`, the window's scaling, and where membership runs (#975) | A `Dead` relayed about a member the node can reach is checked before it is adopted, or the decision not to is recorded with its measurement; the 3 s cells and the mixed-version rows of ADR 0016's table say what changed. The window's scaling is decided, with the packet-loss cells at 14 and 30 nodes as its measure. Whether membership gets a thread of its own is decided, with `mqttd_swim_stalls_total` on the rig as its measure. |
 
 ## Progress
 
@@ -127,7 +134,8 @@ then, once its sub-decision is settled (T3: O1, O4; T5: O2, O5; T6: O3).
 | 0087-T8 | ⬜ planned | [#973](https://github.com/mbilling/fss-mqtt-broker/issues/973) | — | "Size L (1-2 weeks), alongside T2-T5 rather than after them: each of those lands with its rows flipped. The stress and out-of-process injections are what makes the claim more than six scripted episodes." |
 | 0087-T9 | ⬜ planned | [#973](https://github.com/mbilling/fss-mqtt-broker/issues/973) | — | "Size M, plus rig time. Last: it certifies the rest. Until it has run, the README's 'none lost' carries the condition it was measured under (O8)." |
 | 0087-T10 | ✅ done | [#999](https://github.com/mbilling/fss-mqtt-broker/issues/999) | 2026-10-13 | "swim.rs: Config::confirm_before_dead defaults to true; not operator configuration (none of the detector's settings is). The formation simulation gains packet loss, one-way reachability, one link lost one way and a late member, and a second report (fault_shapes_report); the characterisation test is replaced by the bound the default keeps (a cut of up to 2 s ends in no Dead at 5, 14 and 30 nodes), with the old behaviour pinned as what the switch off gives. A driver test that only a datagram signed by the suspect answers the probe. Twelve real brokers with one stopped for 2 s (nightly tier). ADR 0016's amendment of 2026-10-13 carries the tables." |
-| 0087-T10b | ⬜ planned | [#975](https://github.com/mbilling/fss-mqtt-broker/issues/975) | — | "Size M. What T10 leaves of #975: the 3 s cells and the mixed-version rows (a Dead declared by another node, or by a v1.1.0 node, is adopted unchecked) and the packet-loss cells at 14 nodes and more (the window does not grow with the cluster). suspicion_scales_with_log_n exists, off. ADR 0016 gets the amendment." |
+| 0087-T10a | ✅ done | [#1002](https://github.com/mbilling/fss-mqtt-broker/issues/1002) | 2026-10-14 | "The hardening an independent read-through of T10 asked for, reworked after a review of its first version. swim_driver.rs: a tick reads what its socket holds before it may expire anything (64 datagrams whatever the time, then up to 1024 within a quarter of the tick); the state machine's clock is the monotonic clock, late wake-up or not; a stall is counted with its length and changes nothing else; missed ticks are not made up; one TICK constant for the broker and the simulation. (The first version kept stalled time off the clock and raised awareness on a stall: a persistently late lone survivor then took 64 s to see a death. Withdrawn.) swim.rs: the last probe's Ack must come from the generation held; a Suspect at a higher incarnation leaves the probe standing, and the Join that follows a spare carries the suspicion as held; a probe overtaken by a longer window is sent afresh; the probe carries the suspicion only and spends no gossip budget; counters for probes sent, spared and silent. Metrics mqttd_swim_last_probes_total{outcome}, mqttd_swim_stalls_total, mqttd_swim_stalled_milliseconds_total, mqttd_swim_awareness. The simulation can stall a node, make nodes late, take ticks off the grid and run the old loop; under loss a datagram's fate and delay are functions of seed, link and time, so two detectors on a seed share a network; a 2.5 s column; the bound is pinned twice as arithmetic, 2098 ms on the simulation's grid and 2 s less twice the latency for a broker. Driver tests on a paused clock; a nightly scenario that stops a prober with its last probe out, and the job keeps the brokers' logs on failure. ADR 0016's amendment for #1002 carries the derivation and the tables." |
+| 0087-T10b | ⬜ planned | [#975](https://github.com/mbilling/fss-mqtt-broker/issues/975) | — | "Size M. What T10 leaves of #975: the 3 s cells and the mixed-version rows (a Dead declared by another node, or by a v1.1.0 node, is adopted unchecked) and the packet-loss cells at 14 nodes and more (the window does not grow with the cluster). suspicion_scales_with_log_n exists, off. ADR 0016 gets the amendment. Added by T10a: the SWIM driver is a task on the data path's runtime, so a broker whose workers are all busy answers no probe; T10a keeps such a node from accusing its peers, not from being accused. Whether to give membership its own thread and runtime (it would then say Alive about a broker that moves no data: ADR 0087's member without a link) is decided here, from mqttd_swim_stalls_total and mqttd_swim_stalled_milliseconds_total on the rig at the rungs where the README's membership flap was seen. Also from T10a: awareness (ADR 0016 §2) falls only when a peer answers a probe, so a node left with only dead members to probe keeps a raised score; whether it should also decay with time." |
 <!-- /status-table:0087 -->
 
 ## Changelog
@@ -236,3 +244,66 @@ then, once its sub-decision is settled (T3: O1, O4; T5: O2, O5; T6: O3).
   declared dead in none. No operator switch; no wire change. The task is narrowed to
   what was built and the rest of #975 — a relayed `Dead`, the window's scaling — is
   T10b.
+- 2026-10-13 — T10a opened and built (#1002), from an independent read-through of T10
+  (verdict: merge; nothing in it a regression). The one finding with a consequence: a
+  *prober* that was not scheduled for longer than the 250 ms ack timeout after sending
+  its last probe woke with the tick overdue and the suspect's `Ack` in its socket, and
+  the driver took one or the other at random — half the time `Dead`, with the answer
+  unread. Membership is a task on the data path's runtime, so a saturated broker is
+  that prober. The driver now reads its socket before a tick may expire anything. On a
+  paused clock the stalled prober spares the suspect in 24 repetitions of each of two
+  shapes (with the read taken out, the second fails); in the simulation, of the 64
+  runs at 5 to 30 nodes in which a prober was stopped on its last probe (for 0.3 s,
+  1 s or 2 s alike), it gave up in none — and in all 64 on the loop as it was; on two
+  real brokers, nightly, the prober stopped with its probe out declares nobody dead,
+  and that test fails in its first episode against the old loop. Also: the probe's
+  `Ack` must come from the generation held (a restart with a lower generation used to
+  leave the member `Suspect` for good); one datagram per window is now true; a probe
+  overtaken by a longer window is sent afresh; the probe spends no gossip budget. The
+  simulation's tick and the broker's are one constant, and the table has a 2.5 s
+  column (1 run of 32 at 10 and at 14 nodes). Formation re-run: identical. Not built,
+  and added to T10b: whether membership should run on a thread of its own, so that a
+  broker whose workers are busy still answers.
+- 2026-10-13 — T10a reworked after an independent review of its first version (verdict:
+  fix first; no path to a new false `Dead`, but a real death could go unseen). The
+  first version also kept the time a node was stalled off the state machine's clock
+  and raised the node's awareness on every stall. The lag was never made up and the
+  awareness had nothing to decay on when the probe targets were dead: measured in the
+  simulation with every survivor waking 300 to 500 ms late for 30 s, a lone survivor
+  held its dead peer `Dead` after 64 s (5.7 s on the loop before, 4.9 s on time), and
+  14 and 30 survivors after 38 s — when the lateness ended. Both mechanisms are
+  withdrawn: the read ahead of the tick is what protects a peer from a late node, and
+  it costs no time. As built the clock is real time, a stall is counted (with its
+  length) and changes nothing, and the same lateness costs the lone survivor 0.8 s
+  (5.7 s) and 14 and 30 survivors 1.9 s (7.5 s and 8.8 s; a quarter more than on
+  time). The prober-stalled table is unchanged: gave up in 0 of 64. Taking the stall
+  clock out uncovered what it had been hiding: the read ahead of the tick went through
+  the runtime, and a process resumed from `SIGSTOP` finds its reactor's poll
+  interrupted and its timers due, so the read found nothing and the nightly prober
+  scenario failed in six runs of ten. The read now asks the kernel on a handle of its
+  own. Also from the
+  review: the read has a floor of 64 datagrams that the time budget cannot cut short;
+  the two-second bound is restated as what holds in a broker — 2 s less twice the
+  network's latency; the 2098 ms is the simulation's exact tick grid — and pinned
+  both ways, with ticks randomly late and on a 50 ms grid; under loss a datagram's
+  delay is keyed like its loss, so the paired tables are paired (at 10 % loss: 11 of
+  32 runs at 30 nodes with a false verdict against 27, 2 against 10 at 14), and the
+  "no verdict the probe did not lose" property is checked member by member; a member
+  spared on a stale claim is asked with the claim as held, and cleared at once; the
+  nightly test sets an episode aside on the prober's own counters and the test's
+  clock, not on a log line; new metrics `mqttd_swim_stalled_milliseconds_total` and
+  `mqttd_swim_awareness`.
+- 2026-10-14 — T10a, from a second review (verdict: merge; three small items). A
+  per-PR test now fails if the read ahead of the tick goes back through the runtime
+  (a datagram in the kernel's buffer that tokio's reactor has not seen: tokio's read
+  says "nothing", the driver's returns it); until then only the nightly scenario
+  covered it. The lateness bound is stated as it is — five gaps between wake-ups,
+  the tick plus the lateness, not five latenesses — and tested with a gap that lines
+  up with nothing. And the review's observation that the probe period was counted
+  from each late start, so a late node's rounds before the dead member's turn each
+  added their lateness (in every release), is fixed in the state machine: the period
+  is kept from when a round was due. With every survivor 300 to 500 ms late that
+  takes the last survivor's verdict from 7.5 s to 7.0 s in the median at 14 nodes and
+  from 8.8 s to 8.0 s at 30 (10.5 s to 8.9 s and 11.2 s to 9.6 s at worst); a node on
+  time is unaffected and the other tables did not move. The driver warns at start if
+  it cannot have its second handle on the socket.

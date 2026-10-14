@@ -171,6 +171,9 @@ pub struct CertAdmission {
     /// `None` when no live TLS leaf exists at this hop (a vouched proxied session,
     /// ADR 0005 — the landing node holds the actual TLS session).
     pub serial: Option<Vec<u8>>,
+    /// The leaf's `notAfter` (Unix seconds), under the same conditions as `serial`: what
+    /// ends the session when `tls.end_sessions_at_cert_expiry` is on (ADR 0088 O2).
+    pub not_after: Option<i64>,
 }
 
 /// Extract the mTLS admission (ADR 0004/0040) from an accepted server-side TLS
@@ -195,6 +198,7 @@ pub fn cert_admission(leaf: &[u8], source: IdentitySource) -> Option<CertAdmissi
         Ok(identity) => Some(CertAdmission {
             identity,
             serial: mqtt_auth::mtls::serial_from_cert(leaf),
+            not_after: mqtt_auth::mtls::not_after_from_cert(leaf),
         }),
         Err(e) => {
             // No fallback to another field: a certificate that does not carry the
@@ -1406,6 +1410,7 @@ where
             admission: Box::new(Admission {
                 identity: principal.clone(),
                 method: auth_method,
+                cert_not_after: cert.as_ref().and_then(|c| c.not_after),
                 cert_serial: cert.and_then(|c| c.serial),
                 protocol: connect.protocol,
                 source: peer,
@@ -1727,6 +1732,7 @@ pub async fn serve_proxied<R, W>(
     let cert = identity.map(|identity| CertAdmission {
         identity,
         serial: None,
+        not_after: None,
     });
     // The auth-failure flag is deliberately dropped here: a proxied stream's peer
     // address is the RELAYING NODE (ADR 0005), which must never be penalized for

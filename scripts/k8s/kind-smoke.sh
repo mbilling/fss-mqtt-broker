@@ -121,7 +121,8 @@ kubectl create namespace "$NS"
 # which is exactly how it came to ship a single shared RSA leaf that could not work.
 # REPLICAS must match the chart's replicaCount, or an ordinal comes up with no leaf.
 PKI_DIR="$(mktemp -d)"
-NS="$NS" RELEASE="$RELEASE" REPLICAS=3 PKI_DIR="$PKI_DIR" "$CHART/bootstrap.sh"
+# LEAF_DAYS: the mint refuses without a stated lifetime (ADR 0088 D1); two days outlasts a smoke.
+LEAF_DAYS=2 NS="$NS" RELEASE="$RELEASE" REPLICAS=3 PKI_DIR="$PKI_DIR" "$CHART/bootstrap.sh"
 # The CA private key must never enter the cluster — only ca.crt does. Assert it, because the
 # whole trust model of the bus rests on it: anything holding this key can mint a leaf with
 # any CN, and the bus binds node identity to the CN.

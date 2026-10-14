@@ -288,15 +288,23 @@ protocol, forward window and every obligation toward it. `peer_disconnected` kee
   peer's session, moved to a new owner, from any other subscription that happens to
   match (D8). So a subscriber on a peer falsely held dead still loses a publish when any
   newly matching interest appears before the peer's link is back — on another node (a
-  monitor on `#` reconnecting there) or on this one (a matching session attaching, which
-  the settle pass delivers to and discharges on). The window is the half second the
-  redial takes. T5. *(0087-T2b: only with a durable plane. Without one — `MQTTD_DURABLE=0`
-  — no session moves between nodes, so nothing is discharged: the newcomer is sent the
-  publish and the unreachable peer stays owed it. Two things follow, both stated here
-  rather than hidden. After a REAL peer death in plain mode, a publish whose subscriber
-  has reconnected through another node is delivered to it at once, but its publisher's
-  acknowledgement now waits out the dead peer's hold — up to 8 ticks — where the
-  newcomer's answer used to release it. And a peer that was only falsely held dead and
+  monitor on `#` reconnecting there). On this one, only a session that existed before
+  the publish counts: one the takeover scan inherits, or one its client resumes here
+  (`session_present = 1`), which the settle pass delivers to and discharges on. A
+  session created here after the publish — clean, or new and persistent — is not
+  delivered to and discharges nothing (#1011, amendment of 2026-10-14). The window is
+  the half second the redial takes. T5. *(0087-T2b: only with a durable plane. Without
+  one — `MQTTD_DURABLE=0` — no session moves between nodes, so nothing is discharged:
+  a newcomer on another node is sent the publish as a re-route and the unreachable peer
+  stays owed it. A newcomer on THIS node is not sent it: a session cannot move here in
+  plain mode, so a client of the dead peer reconnecting with `clean_session=0` is
+  answered `session_present = 0` — its session is new — and is owed nothing published
+  before it (#1011). Two things follow, both stated here rather than hidden. After a
+  REAL peer death in plain mode, a publish whose subscriber has reconnected through a
+  third node is delivered to it there at once, and one whose subscriber reconnected to
+  the origin is not delivered to it at all; either way its publisher's acknowledgement
+  waits out the dead peer's hold — up to 8 ticks — where the newcomer's answer used to
+  release it. And a peer that was only falsely held dead and
   still keeps a persistent session under that client id gets its copy too, queued for
   that session: the client then has two sessions on two nodes, each with the message,
   and sees it again if it reconnects to the first node with `clean_session=0`. That is
@@ -426,7 +434,10 @@ protocol, forward window and every obligation toward it. `peer_disconnected` kee
   are sent as they are registered. (If a peer announces only after that, what is
   re-routed to it then goes out behind what was already sent: the one case, a peer
   silent for over a second on a new link, where the order below is not kept for
-  interest it had not announced before.) **The guarantee:** the QoS 1 and QoS 2 messages one node forwards
+  interest it had not announced before.) *(Open: #1014. A re-route matches a peer's interest by
+  topic, not by when the subscriber came into being, so a publish held for the settle
+  pass and re-routed to a peer is handed to a subscriber created there after it; the
+  local re-delivery stopped doing that (#1011), the re-route still does.)* **The guarantee:** the QoS 1 and QoS 2 messages one node forwards
   to another are applied on the receiving node in the order the origin accepted them —
   in the steady state as before (one ordered link, each forward sent as it is
   registered) and now across a lost link or a false verdict between the two as well.
@@ -750,24 +761,27 @@ tracks it. Measured with #971's formation simulation (`swim_formation_sim.rs`,
 for a given time, 32 seeds per cell; a cell is the number of runs in which some node
 turned a healthy member `Dead`.
 
-| Detector | Nodes | 0.5 s | 1 s | 1.5 s | 2 s | 3 s | 5 s |
-|---|---|---|---|---|---|---|---|
-| **before T10**: 4 s, 1.5 s with three suspecters, no last probe | 3 | 0 | 0 | 0 | 0 | 3 | 32 |
-| | 5 | 0 | 0 | 3 | 7 | 18 | 32 |
-| | 10 | 4 | 4 | 7 | 13 | 25 | 32 |
-| | 14 | 6 | 10 | 16 | 21 | 25 | 32 |
-| | 30 | 6 | 20 | 25 | 28 | 31 | 32 |
-| window × `max(1, log10 N)` | 14 | 3 | 6 | 12 | 12 | 22 | 32 |
-| | 30 | 2 | 5 | 5 | 12 | 23 | 32 |
-| window doubled | 14 | 0 | 0 | 2 | 2 | 10 | 32 |
-| | 30 | 0 | 1 | 1 | 6 | 11 | 31 |
-| memberlist's defaults (floor `4·max(1, log10 N)` s, ceiling ×6) | 14 | 0 | 0 | 0 | 0 | 1 | 30 |
-| | 30 | 0 | 0 | 0 | 0 | 0 | 23 |
-| **one last direct probe before `Dead`** (the default since T10) | 3 | 0 | 0 | 0 | 0 | 0 | 32 |
-| | 5 | 0 | 0 | 0 | 0 | 6 | 29 |
-| | 10 | 0 | 0 | 0 | 0 | 3 | 31 |
-| | 14 | 0 | 0 | 0 | 0 | 8 | 30 |
-| | 30 | 0 | 0 | 0 | 0 | 0 | 28 |
+| Detector | Nodes | 0.5 s | 1 s | 1.5 s | 2 s | 2.5 s | 3 s | 5 s |
+|---|---|---|---|---|---|---|---|---|
+| **before T10**: 4 s, 1.5 s with three suspecters, no last probe | 3 | 0 | 0 | 0 | 0 | 0 | 3 | 32 |
+| | 5 | 0 | 0 | 3 | 7 | 14 | 18 | 32 |
+| | 10 | 4 | 4 | 7 | 13 | 24 | 25 | 32 |
+| | 14 | 6 | 10 | 16 | 21 | 23 | 25 | 32 |
+| | 30 | 6 | 20 | 25 | 28 | 30 | 31 | 32 |
+| window × `max(1, log10 N)` | 14 | 3 | 6 | 12 | 12 | 15 | 22 | 32 |
+| | 30 | 2 | 5 | 5 | 12 | 15 | 23 | 32 |
+| window doubled | 14 | 0 | 0 | 2 | 2 | 5 | 10 | 32 |
+| | 30 | 0 | 1 | 1 | 6 | 6 | 11 | 31 |
+| memberlist's defaults (floor `4·max(1, log10 N)` s, ceiling ×6) | 14 | 0 | 0 | 0 | 0 | 0 | 1 | 30 |
+| | 30 | 0 | 0 | 0 | 0 | 0 | 0 | 23 |
+| **one last direct probe before `Dead`** (the default since T10) | 3 | 0 | 0 | 0 | 0 | 0 | 0 | 32 |
+| | 5 | 0 | 0 | 0 | 0 | 0 | 6 | 29 |
+| | 10 | 0 | 0 | 0 | 0 | 1 | 3 | 31 |
+| | 14 | 0 | 0 | 0 | 0 | 1 | 8 | 30 |
+| | 30 | 0 | 0 | 0 | 0 | 0 | 0 | 26 |
+
+(As measured on the tree of 0087-T10a, which added the 2.5 s column; the 30-node, 5 s
+cell of the last row read 28 before it.)
 
 Up to 3 s every one of the verdicts without the probe was reached after the outage had
 ended; each stood for the tombstone's 30 s. What is left with the probe at 3 s is a `Dead` declared *during*
@@ -801,7 +815,9 @@ same figures) and measured what the table leaves out:
 
 - **the bound**, now a test (`a_member_cut_off_for_up_to_two_seconds_is_not_declared_dead`,
   in place of `a_short_cut_still_ends_in_a_false_dead_on_the_default_window`): a member
-  cut off for up to 2 s is declared `Dead` by no node, at 3 to 30 nodes;
+  cut off for up to 2 s is declared `Dead` by no node, at 3 to 30 nodes (on the
+  simulation's tick grid; what holds in a broker is 2 s less twice the latency — see
+  "As hardened" below);
 - **the price**: a member that really died is held `Dead` by every survivor about
   0.3 s later in the median, up to 0.6 s later at worst;
 - **formation** is untouched (a formation raises no suspicion, so no probe is sent);
@@ -815,11 +831,35 @@ same figures) and measured what the table leaves out:
 - **a stopped process**: one of twelve real brokers stopped for 2 s, 68 times, was
   declared `Dead` in none.
 
+**As hardened (0087-T10a, 2026-10-13, #1002).** An independent read-through of T10
+found the bound open on one side: a *prober* that was itself not scheduled for longer
+than the ack timeout could wake, find the probe's deadline past and the suspect's `Ack`
+unread, and declare it `Dead`. The driver now reads its socket before a tick may
+expire anything, and that is all it does about its own lateness: the failure
+detector's clock is real time, so a node that is late sees a real death at most one
+gap between its wake-ups later at each of five steps, and no later. (A first version also
+kept stalled time off that clock and raised the node's awareness; a persistently
+late lone survivor then took 64 s to see a death, against 5.7 s. Withdrawn.) The
+probe's `Ack` must come from the generation that is suspected. And the bound is
+stated as what it is — arithmetic on the release's timings: no node suspects a
+cut-off member sooner than two ack timeouts into the cut, nor asks it the last time
+sooner than the window's floor of 1.5 s after that, so **in a broker a cut of up to
+2 s less twice the network's latency** has ended before the question is put. The
+table above reaches 2 s, and 2098 ms, because the simulation's ticks land exactly on
+a 100 ms grid and so round each 250 ms timeout up to 300; a broker's ticks are on no
+grid and cannot count on that. The table's 2.5 s column is where the zeros stop. The
+packet-loss cells are re-measured with both detectors on the same network: with one
+datagram in ten lost and nobody at fault, a false verdict within 75 s in 11 runs of
+32 at 30 nodes against 27 without the probe, in 2 against 10 at 14 nodes, in none
+against 3 at 10. ADR 0016's amendment of the same day for #1002 has the rest.
+
 Under this record's design a verdict costs latency, not a message; with the probe a
 short outage of one member no longer costs that either. What is left of #975 —
 checking a *relayed* `Dead` about a member this node can still reach, which is what
 the 3 s cells and the mixed-version rows need, and whether the window should grow with
-the cluster, which is what the packet-loss cells need — is 0087-T10b.
+the cluster, which is what the packet-loss cells need — is 0087-T10b, together with a
+question T10a raises and does not answer: whether membership should run on a thread of
+its own, so that a broker whose workers are all busy still answers its probes.
 
 ## Alternatives considered
 
@@ -881,3 +921,22 @@ the cluster, which is what the packet-loss cells need — is 0087-T10b.
   members at fault at once, a fault during formation, and the rig under load are not
   measured. The probe's effect on the membership flap the rig saw near saturation
   (README) has not been run.
+
+## Amendment (2026-10-14): the settle pass re-delivers only to a session that existed before the publish (issues #1011, #1014; PR #1013)
+
+The local re-delivery of a publish held for the settle pass (`redeliver_pending`) used to
+take every matching session that was offline or had attached after the publish. A session
+created after the publish had attached after it, so a brand-new clean subscriber was handed
+a non-retained message from before it existed: on a freshly formed cluster the routing view
+stays unsettled for several seconds after `/readyz`, and a publish acknowledged in that time
+stays in the settle work set (#1011). It now takes an online session only when that
+attach RESUMED a session (`session_present = 1`); offline sessions — the ones the takeover
+scan inherits — are taken as before.
+
+In plain mode (`MQTTD_DURABLE=0`) this changes what a client of a dead or falsely-dead peer
+gets when it reconnects to the origin with `clean_session = 0`: its session is new there
+(`session_present = 0`), so it is no longer handed the held publish, and its attach no longer
+releases the ack early or discharges what the unreachable peer is owed (D1 above). MQTT owes
+a new session nothing published before it. Not covered (#1014): the re-route to a peer, which
+still hands a held publish to a subscriber created there after it, and a persistent session
+born inside the window that reconnects with `session_present = 1`.

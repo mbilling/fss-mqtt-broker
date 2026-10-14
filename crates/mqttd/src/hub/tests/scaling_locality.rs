@@ -196,6 +196,7 @@ impl Rig {
             ctl: peer_tx.clone(),
             tx: peer_tx,
             cert_serial: None,
+            cert_ends: crate::hub::LinkCertEnds::default(),
             depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             proto: mqtt_cluster::peer::PROTO_MAX,
         })

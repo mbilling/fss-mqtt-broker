@@ -33,6 +33,8 @@ diag-simulated-fsync = []
 
 [dev-dependencies]
 tempfile = "3"
+# `test-util`: tokio's paused clock, for the driver's stalled-prober tests.
+tokio = { workspace = true, features = ["test-util"] }
 criterion = { workspace = true }
 
 [[bench]]

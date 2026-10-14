@@ -69,6 +69,7 @@ async fn start_acl_node(policy_toml: &str) -> (SocketAddr, mpsc::UnboundedSender
                     identity.map(|identity| mqttd::conn::CertAdmission {
                         identity,
                         serial: None,
+                        not_after: None,
                     }),
                     conn_policy,
                     hub,

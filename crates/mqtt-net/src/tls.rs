@@ -499,6 +499,195 @@ pub fn client_connector_multi(
     Ok(TlsConnector::from(Arc::new(config)))
 }
 
+/// How far ahead of this node's clock a cluster-bus certificate's `notBefore` may be and
+/// still be accepted ([ADR 0088](../../../docs/adr/0088-credential-lifetimes-and-rotation.md)
+/// O3): a renewed peer is not refused because its clock runs a little ahead. There is
+/// no tolerance on `notAfter`.
+pub const PEER_NOT_BEFORE_TOLERANCE: std::time::Duration = std::time::Duration::from_mins(1);
+
+/// Whether `e` is a verifier's "this certificate is not valid yet".
+fn not_valid_yet(e: &rustls::Error) -> bool {
+    matches!(
+        e,
+        rustls::Error::InvalidCertificate(
+            rustls::CertificateError::NotValidYet
+                | rustls::CertificateError::NotValidYetContext { .. }
+        )
+    )
+}
+
+/// `now` moved forward by [`PEER_NOT_BEFORE_TOLERANCE`].
+fn tolerant_now(now: rustls::pki_types::UnixTime) -> rustls::pki_types::UnixTime {
+    rustls::pki_types::UnixTime::since_unix_epoch(std::time::Duration::from_secs(
+        now.as_secs()
+            .saturating_add(PEER_NOT_BEFORE_TOLERANCE.as_secs()),
+    ))
+}
+
+/// A cluster-bus certificate verifier: the webpki verifier it wraps, with the one
+/// allowance of [`PEER_NOT_BEFORE_TOLERANCE`]. A certificate the inner verifier refuses
+/// as not valid yet is verified once more at `now` plus the tolerance; that second check
+/// still requires `now + tolerance <= notAfter`, so the allowance never extends a
+/// certificate's end. Every other verdict is the inner verifier's.
+#[derive(Debug)]
+struct NotBeforeTolerant<V: ?Sized>(Arc<V>);
+
+impl<V: rustls::server::danger::ClientCertVerifier + ?Sized>
+    rustls::server::danger::ClientCertVerifier for NotBeforeTolerant<V>
+{
+    fn offer_client_auth(&self) -> bool {
+        self.0.offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.0.client_auth_mandatory()
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        self.0.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        match self.0.verify_client_cert(end_entity, intermediates, now) {
+            Err(e) if not_valid_yet(&e) => {
+                self.0
+                    .verify_client_cert(end_entity, intermediates, tolerant_now(now))
+            }
+            verdict => verdict,
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.0.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.0.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.supported_verify_schemes()
+    }
+}
+
+impl<V: rustls::client::danger::ServerCertVerifier + ?Sized>
+    rustls::client::danger::ServerCertVerifier for NotBeforeTolerant<V>
+{
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        match self
+            .0
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+        {
+            Err(e) if not_valid_yet(&e) => self.0.verify_server_cert(
+                end_entity,
+                intermediates,
+                server_name,
+                ocsp_response,
+                tolerant_now(now),
+            ),
+            verdict => verdict,
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.0.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.0.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.supported_verify_schemes()
+    }
+
+    fn root_hint_subjects(&self) -> Option<&[rustls::DistinguishedName]> {
+        self.0.root_hint_subjects()
+    }
+}
+
+/// The cluster bus's accepting side
+/// ([ADR 0088](../../../docs/adr/0088-credential-lifetimes-and-rotation.md) D4): TLS 1.3, a
+/// client certificate from `ca` required, `notBefore` allowed [`PEER_NOT_BEFORE_TOLERANCE`]
+/// of clock difference, and **no session resumption**. A resumed TLS 1.3 handshake does
+/// not verify the certificate again, so a peer could come back on the session of a
+/// certificate that has since expired; a peer link is long-lived and few, and gains
+/// nothing from resumption.
+///
+/// # Errors
+/// [`NetError::Tls`] if any file is missing or unparseable, the key does not match, or
+/// the CA bundle is empty.
+pub fn peer_acceptor(cert_chain: &Path, key: &Path, ca: &Path) -> Result<TlsAcceptor, NetError> {
+    let inner = WebPkiClientVerifier::builder_with_provider(Arc::new(load_roots(ca)?), provider())
+        .build()
+        .map_err(|e| tls_err("client certificate verifier", ca, &e))?;
+    let mut config = ServerConfig::builder_with_provider(provider())
+        .with_protocol_versions(TLS_VERSIONS)
+        .map_err(|e| tls_err("TLS server configuration", cert_chain, &e))?
+        .with_client_cert_verifier(Arc::new(NotBeforeTolerant(inner)))
+        .with_single_cert(load_certs(cert_chain)?, load_key(key)?)
+        .map_err(|e| tls_err("server certificate/key", cert_chain, &e))?;
+    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    config.send_tls13_tickets = 0;
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+/// The cluster bus's dialing side: verifies the remote against `ca` with the same
+/// `notBefore` allowance as [`peer_acceptor`], presents `cert_chain`/`key`, and never
+/// resumes a session (see [`peer_acceptor`]).
+///
+/// # Errors
+/// [`NetError::Tls`] on unreadable/unparseable PEM material or a key mismatch.
+pub fn peer_connector(ca: &Path, cert_chain: &Path, key: &Path) -> Result<TlsConnector, NetError> {
+    let inner = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        Arc::new(load_roots(ca)?),
+        provider(),
+    )
+    .build()
+    .map_err(|e| tls_err("server certificate verifier", ca, &e))?;
+    let mut config = ClientConfig::builder_with_provider(provider())
+        .with_protocol_versions(TLS_VERSIONS)
+        .map_err(|e| tls_err("TLS client configuration", cert_chain, &e))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NotBeforeTolerant(inner)))
+        .with_client_auth_cert(load_certs(cert_chain)?, load_key(key)?)
+        .map_err(|e| tls_err("client certificate/key", cert_chain, &e))?;
+    config.resumption = rustls::client::Resumption::disabled();
+    Ok(TlsConnector::from(Arc::new(config)))
+}
+
 /// Parse the host part of `addr` (`host:port`, `[v6]:port`, or bare host) into
 /// the [`ServerName`] to verify a dialed peer's certificate against.
 ///
@@ -599,7 +788,7 @@ mod tests {
     use std::path::PathBuf;
 
     /// Write a throwaway CA + leaf cert/key as PEM files under a unique dir.
-    fn mint_pki(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+    pub(super) fn mint_pki(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
         let dir = std::env::temp_dir().join(format!("mqtt-net-tls-{}-{tag}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -890,5 +1079,143 @@ mod fips_posture_tests {
         assert!(err.contains("fips build"), "wrong refusal: {err}");
         // And the approved posture builds fine.
         server_config_versions(&cert_path, &key_path, None, None, 0, Tls12::Off).unwrap();
+    }
+}
+
+/// The cluster bus's own verifiers and session posture (ADR 0088 D4, O3).
+#[cfg(test)]
+mod peer_bus_tests {
+    use super::*;
+    use rustls::client::danger::ServerCertVerifier as _;
+    use rustls::pki_types::UnixTime;
+    use rustls::server::danger::ClientCertVerifier as _;
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime};
+
+    const NOW: u64 = 1_900_000_000;
+
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    /// A CA (written to a file in a fresh directory) and a leaf for 127.0.0.1 valid from
+    /// `from` to `to`.
+    fn ca_and_leaf(tag: &str, from: u64, to: u64) -> (PathBuf, CertificateDer<'static>) {
+        let dir = std::env::temp_dir().join(format!("mqtt-net-peer-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.not_before = at(NOW - 86_400).into();
+        ca_params.not_after = at(NOW + 86_400 * 365).into();
+        let ca =
+            rcgen::CertifiedIssuer::self_signed(ca_params, rcgen::KeyPair::generate().unwrap())
+                .unwrap();
+        let ca_path = dir.join("ca.pem");
+        std::fs::write(&ca_path, ca.pem()).unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
+        params.extended_key_usages = vec![
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        params.not_before = at(from).into();
+        params.not_after = at(to).into();
+        let leaf = params
+            .signed_by(&rcgen::KeyPair::generate().unwrap(), &ca)
+            .unwrap();
+        (ca_path, leaf.der().clone())
+    }
+
+    fn client_verdict(ca: &Path, leaf: &CertificateDer<'_>, now: u64) -> Result<(), rustls::Error> {
+        let inner = WebPkiClientVerifier::builder_with_provider(
+            Arc::new(load_roots(ca).unwrap()),
+            provider(),
+        )
+        .build()
+        .unwrap();
+        NotBeforeTolerant(inner)
+            .verify_client_cert(
+                leaf,
+                &[],
+                UnixTime::since_unix_epoch(Duration::from_secs(now)),
+            )
+            .map(|_| ())
+    }
+
+    fn server_verdict(ca: &Path, leaf: &CertificateDer<'_>, now: u64) -> Result<(), rustls::Error> {
+        let inner = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(load_roots(ca).unwrap()),
+            provider(),
+        )
+        .build()
+        .unwrap();
+        NotBeforeTolerant(inner)
+            .verify_server_cert(
+                leaf,
+                &[],
+                &server_name("127.0.0.1:1").unwrap(),
+                &[],
+                UnixTime::since_unix_epoch(Duration::from_secs(now)),
+            )
+            .map(|_| ())
+    }
+
+    #[test]
+    fn a_peer_certificate_up_to_a_minute_ahead_is_accepted_and_no_further() {
+        // Valid from 30 s after this node's clock: accepted on both sides of a link.
+        let (ca, leaf) = ca_and_leaf("ahead-30", NOW + 30, NOW + 3_600);
+        assert!(client_verdict(&ca, &leaf, NOW).is_ok());
+        assert!(server_verdict(&ca, &leaf, NOW).is_ok());
+        // Exactly the tolerance: still accepted.
+        let (ca, leaf) = ca_and_leaf("ahead-60", NOW + 60, NOW + 3_600);
+        assert!(client_verdict(&ca, &leaf, NOW).is_ok());
+        assert!(server_verdict(&ca, &leaf, NOW).is_ok());
+        // Ninety seconds ahead: refused as not valid yet.
+        let (ca, leaf) = ca_and_leaf("ahead-90", NOW + 90, NOW + 3_600);
+        for verdict in [
+            client_verdict(&ca, &leaf, NOW),
+            server_verdict(&ca, &leaf, NOW),
+        ] {
+            let e = verdict.expect_err("90 s ahead is past the tolerance");
+            assert!(not_valid_yet(&e), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn a_peer_certificate_past_not_after_is_refused_with_no_tolerance() {
+        let (ca, leaf) = ca_and_leaf("ended", NOW - 3_600, NOW - 1);
+        for verdict in [
+            client_verdict(&ca, &leaf, NOW),
+            server_verdict(&ca, &leaf, NOW),
+        ] {
+            assert!(
+                matches!(
+                    verdict,
+                    Err(rustls::Error::InvalidCertificate(
+                        rustls::CertificateError::Expired
+                            | rustls::CertificateError::ExpiredContext { .. }
+                    ))
+                ),
+                "{verdict:?}"
+            );
+        }
+        // The allowance for notBefore does not lend a certificate time at its end: one
+        // that starts ahead and ends within the minute is refused.
+        let (ca, leaf) = ca_and_leaf("short", NOW + 30, NOW + 50);
+        assert!(client_verdict(&ca, &leaf, NOW).is_err());
+        assert!(server_verdict(&ca, &leaf, NOW).is_err());
+    }
+
+    #[test]
+    fn the_peer_bus_never_resumes_a_session() {
+        let (ca, cert, key) = super::tests::mint_pki("peer-noresume");
+        let acceptor = peer_acceptor(&cert, &key, &ca).unwrap();
+        let server = acceptor.config();
+        assert!(!server.session_storage.can_cache());
+        assert_eq!(server.send_tls13_tickets, 0);
+        let connector = peer_connector(&ca, &cert, &key).unwrap();
+        assert_eq!(
+            format!("{:?}", connector.config().resumption),
+            format!("{:?}", rustls::client::Resumption::disabled())
+        );
     }
 }

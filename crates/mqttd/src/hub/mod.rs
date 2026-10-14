@@ -631,6 +631,46 @@ pub enum AuthMethod {
     Enhanced,
 }
 
+/// When the certificates a peer link was admitted under end
+/// ([ADR 0088](../../../../docs/adr/0088-credential-lifetimes-and-rotation.md) D3): the
+/// peer's, read from the leaf it presented, and this node's own, as loaded when the link
+/// formed. A TLS session keeps the certificates of its handshake, so the link ends at the
+/// earlier of the two, whatever has been renewed since. `None` on a plaintext mesh.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LinkCertEnds {
+    /// The peer's leaf `notAfter`, Unix seconds.
+    pub peer: Option<i64>,
+    /// This node's own leaf `notAfter`, Unix seconds.
+    pub own: Option<i64>,
+}
+
+impl LinkCertEnds {
+    /// The earlier of the two ends, if either is known.
+    #[must_use]
+    pub fn earliest(self) -> Option<i64> {
+        match (self.peer, self.own) {
+            (Some(p), Some(o)) => Some(p.min(o)),
+            (end, None) | (None, end) => end,
+        }
+    }
+
+    /// Whether a certificate of the link has passed its `notAfter` at `now` (Unix
+    /// seconds; the last second of the window is still in it), and whose: the bounded
+    /// reason label the link is ended under.
+    #[must_use]
+    pub fn expired(self, now: i64) -> Option<&'static str> {
+        let end = self.earliest()?;
+        if now <= end {
+            return None;
+        }
+        Some(if self.own == Some(end) {
+            "own-cert-expired"
+        } else {
+            "peer-cert-expired"
+        })
+    }
+}
+
 /// The server-side revocable facts a connection was admitted under (ADR 0040 T1):
 /// what a policy-reload sweep re-evaluates against the new policy. Recorded at
 /// CONNECT and kept with the online entry — the broker retains *facts about* the
@@ -648,6 +688,10 @@ pub struct Admission {
     /// no-cert listeners, and for proxied sessions (ADR 0005 — the landing node holds
     /// the actual TLS session and its serial).
     pub cert_serial: Option<Vec<u8>>,
+    /// The end of that leaf's validity (`notAfter`, Unix seconds), under the same
+    /// conditions as `cert_serial`: what ends the session when
+    /// `tls.end_sessions_at_cert_expiry` is on (ADR 0088 O2).
+    pub cert_not_after: Option<i64>,
     /// The connection's negotiated MQTT protocol version: an evicted v5 client is
     /// told why (DISCONNECT `0x87`); v3.1.1 has no server DISCONNECT, so it just
     /// gets the close.
@@ -858,6 +902,12 @@ struct Online {
     /// (ADR 0042 T9) skips clients attached BEFORE the publish first fanned
     /// out — they already received it live; re-sending would duplicate.
     attached_at: Instant,
+    /// Whether this attach resumed a session that already existed (the CONNACK's
+    /// `session_present`). A takeover-window re-delivery owes a publish only to a
+    /// session that existed when it was published: one attached since with
+    /// `session_present = 0` — a clean session, or a new persistent one — was
+    /// created after it, subscribed after it, and is owed nothing (issue #1011).
+    resumed: bool,
 }
 
 /// Downstream acknowledgement state of an unacked `QoS` > 0 message.
@@ -1569,6 +1619,8 @@ pub enum HubCommand {
         /// The remote leaf certificate's serial from the mTLS handshake
         /// (ADR 0040 T4); `None` on a plaintext mesh.
         cert_serial: Option<Vec<u8>>,
+        /// When the certificates the link was admitted under end (ADR 0088 D3).
+        cert_ends: LinkCertEnds,
         /// The peer-bus protocol version this link negotiated (ADR 0038), so the hub
         /// can choose per-link between a proto-6 and a proto-7 frame (0041-T12).
         proto: u32,
@@ -2130,6 +2182,9 @@ struct Peer {
     /// mTLS handshake — the fact a cluster-CRL revocation sweep re-checks
     /// (ADR 0040 T4). `None` on a plaintext mesh.
     cert_serial: Option<Vec<u8>>,
+    /// When the certificates of the link's handshake end: the link is ended once
+    /// either has (ADR 0088 D3, [`Hub::end_expired_credentials`]).
+    cert_ends: LinkCertEnds,
     /// Whether this peer has sent an interest snapshot since the link formed
     /// (0043-P4 exhibit ②). A freshly-booted peer SUPPRESSES its snapshot until
     /// its own routing view is authoritative — so until one arrives, this node
@@ -2415,6 +2470,15 @@ pub struct Hub {
     /// operator's `MQTTD_ALLOW_RELAXED_PUBLISH` opt-in. Off = the property is
     /// ignored and every ack keeps its full quorum-durable meaning.
     allow_relaxed_publish: bool,
+    /// `tls.end_sessions_at_cert_expiry` (ADR 0088 O2): a client session admitted with a
+    /// certificate is ended once that certificate passes `notAfter`. Off by default.
+    end_sessions_at_cert_expiry: bool,
+    /// The earliest certificate end (Unix seconds) among the peer links and — with
+    /// [`end_sessions_at_cert_expiry`](Self::end_sessions_at_cert_expiry) — the client
+    /// sessions, or a moment at or before it: the sweep looks at them only once the
+    /// clock has passed this ([`end_expired_credentials`](Self::end_expired_credentials)).
+    /// `i64::MAX` when nothing has an end.
+    next_cert_end: i64,
     /// `MQTTD_SHARED_PREFER_LOCAL`: prefer a local member in shared selection.
     shared_prefer_local: bool,
     /// `MQTTD_SHARED_LOCAL_BIAS`: how often the local preference fires, per mille
@@ -2924,6 +2988,8 @@ impl Hub {
     /// ring (ADR 0005) so the hub can identify which node owns each persistent
     /// session.
     #[must_use]
+    // One field initialiser per line of the hub's state; splitting it would scatter the defaults.
+    #[allow(clippy::too_many_lines)]
     pub fn with_config_and_placement(
         node_id: NodeId,
         store: Arc<dyn SessionStore>,
@@ -2972,6 +3038,8 @@ impl Hub {
                 store,
                 durable_plane: None,
                 allow_relaxed_publish: false,
+                end_sessions_at_cert_expiry: false,
+                next_cert_end: i64::MAX,
                 shared_prefer_local: false,
                 // 1000, not 0: `shared_prefer_local` already defaults to false,
                 // so the bias is unconsulted until something turns prefer-local
@@ -3050,6 +3118,13 @@ impl Hub {
     /// `MQTTD_ALLOW_RELAXED_PUBLISH` opt-in, threaded to the ack gate.
     pub fn set_allow_relaxed_publish(&mut self, on: bool) {
         self.allow_relaxed_publish = on;
+    }
+
+    /// End a client session once the certificate it was admitted with passes
+    /// `notAfter` — `tls.end_sessions_at_cert_expiry` (ADR 0088 O2). Off by default:
+    /// devices with long sessions and short certificates exist.
+    pub fn set_end_sessions_at_cert_expiry(&mut self, on: bool) {
+        self.end_sessions_at_cert_expiry = on;
     }
 
     /// Prefer a local `$share` member over a remote one when both are online
@@ -3372,6 +3447,9 @@ impl Hub {
         // number of ticks (ADR 0087 D1); the ones whose hold ends are erased here,
         // so the pass below answers what that discharges.
         self.sweep_verdict_holds();
+        // A link or session whose certificate has run out ends here (ADR 0088 D3).
+        let now = i64::try_from(self.clock.now_epoch_secs()).unwrap_or(i64::MAX);
+        self.end_expired_credentials(now).await;
         // Retransmit / re-route acked publish forwards (ADR 0042 T9,
         // exhibit ⑤); no-op when none are pending.
         self.sweep_pending_forwards();
@@ -4065,10 +4143,12 @@ impl Hub {
                 tx,
                 ctl,
                 cert_serial,
+                cert_ends,
                 proto,
                 depth,
             } => {
                 self.peer_connected(node.clone(), conn_id, tx, ctl, cert_serial, proto, depth);
+                self.note_link_cert_ends(&node, conn_id, cert_ends);
                 // Offer the new peer our retained topic-set digest (ADR 0014 §3,
                 // 0014-T6): it pulls the (chunked) snapshot only if the sets differ,
                 // so a steady-state link-up or flap costs one small frame, not the
@@ -4950,6 +5030,11 @@ impl Hub {
                 self.publish_will(&client, &w).await;
             }
         }
+        if self.end_sessions_at_cert_expiry {
+            if let Some(end) = admission.cert_not_after {
+                self.next_cert_end = self.next_cert_end.min(end);
+            }
+        }
         self.online.insert(
             client.clone(),
             Online {
@@ -4958,6 +5043,7 @@ impl Hub {
                 will,
                 admission,
                 attached_at: Instant::now(),
+                resumed: session_present,
             },
         );
         // Its groups' online prefixes must include it from here on (ADR 0015).
@@ -5855,6 +5941,61 @@ impl Hub {
             self.peer_disconnected(&node, conn_id);
         }
         torn_down
+    }
+
+    /// The expiry sweep ([ADR 0088](../../../../docs/adr/0088-credential-lifetimes-and-rotation.md)
+    /// D3, D4, O2), run every sweep tick: a peer link either of whose handshake
+    /// certificates has passed `notAfter` at `now` is ended as the revocation sweep ends
+    /// one ([`sweep_peers`](Self::sweep_peers)) — a lost link, so the peer is held as a
+    /// member whose link is down and nothing it announced is erased (ADR 0087) — and,
+    /// with `tls.end_sessions_at_cert_expiry`, so is a client session whose certificate
+    /// has. There is no grace: the last second of the window is the last second served.
+    /// The tick looks at nothing until `now` passes [`next_cert_end`](Self::next_cert_end).
+    async fn end_expired_credentials(&mut self, now: i64) {
+        if now <= self.next_cert_end {
+            return;
+        }
+        let peers: Vec<(NodeId, u64, &'static str)> = self
+            .peers
+            .iter()
+            .filter_map(|(node, peer)| {
+                let reason = peer.cert_ends.expired(now)?;
+                Some((node.clone(), peer.conn_id, reason))
+            })
+            .collect();
+        for (node, conn_id, reason) in peers {
+            warn!(
+                peer = %node.0,
+                reason,
+                "peer link ended: a certificate it was admitted under has expired (ADR 0088)"
+            );
+            if let Some(m) = &self.metrics {
+                m.revocation_eviction(reason);
+            }
+            self.peer_disconnected(&node, conn_id);
+        }
+        if self.end_sessions_at_cert_expiry {
+            let clients: Vec<ClientId> = self
+                .online
+                .iter()
+                .filter(|(_, o)| o.admission.cert_not_after.is_some_and(|end| now > end))
+                .map(|(client, _)| client.clone())
+                .collect();
+            for client in clients {
+                if let Some(m) = &self.metrics {
+                    m.revocation_eviction("cert-expired");
+                }
+                self.evict(&client, "cert-expired").await;
+            }
+        }
+        // What is left: the next moment worth looking.
+        let peer_ends = self.peers.values().filter_map(|p| p.cert_ends.earliest());
+        let client_ends = self
+            .online
+            .values()
+            .filter(|_| self.end_sessions_at_cert_expiry)
+            .filter_map(|o| o.admission.cert_not_after);
+        self.next_cert_end = peer_ends.chain(client_ends).min().unwrap_or(i64::MAX);
     }
 
     /// Terminate a client's live session server-side (ADR 0040 T1). See
@@ -7717,6 +7858,7 @@ impl Hub {
                 ctl,
                 depth,
                 cert_serial,
+                cert_ends: LinkCertEnds::default(),
                 interest_synced: false,
                 shared_synced: false,
                 forwards_open: false,
@@ -7742,6 +7884,17 @@ impl Hub {
         // SETTLED can move either way — recompute both rather than reason about
         // the direction at each site.
         self.recompute_mesh();
+    }
+
+    /// Record when the certificates of link `conn_id` to `node` end (ADR 0088 D3), so
+    /// the expiry sweep ends the link then.
+    fn note_link_cert_ends(&mut self, node: &NodeId, conn_id: u64, ends: LinkCertEnds) {
+        if let Some(peer) = self.peers.get_mut(node).filter(|p| p.conn_id == conn_id) {
+            peer.cert_ends = ends;
+            if let Some(end) = ends.earliest() {
+                self.next_cert_end = self.next_cert_end.min(end);
+            }
+        }
     }
 
     fn peer_disconnected(&mut self, node: &NodeId, conn_id: u64) {
@@ -8764,6 +8917,7 @@ async fn recover_once(
 
 #[cfg(test)]
 mod tests {
+    mod cert_expiry;
     mod forward_repeat;
     mod message_events;
     mod pending_gauges;
@@ -8882,7 +9036,7 @@ mod tests {
     }
 
     /// A password-admitted v3.1.1 [`Admission`] for `subject` — the common test shape.
-    fn admission(subject: &str) -> Admission {
+    pub(super) fn admission(subject: &str) -> Admission {
         Admission {
             identity: mqtt_auth::Identity {
                 subject: subject.to_string(),
@@ -8890,6 +9044,7 @@ mod tests {
             },
             method: AuthMethod::Password,
             cert_serial: None,
+            cert_not_after: None,
             protocol: ProtocolVersion::V311,
             source: None,
         }
@@ -9826,6 +9981,7 @@ mod tests {
             ctl: peer_tx.clone(), // tests observe both lanes through one receiver
             tx: peer_tx,
             cert_serial: None,
+            cert_ends: crate::hub::LinkCertEnds::default(),
             // No pump runs in these in-process tests, so nothing ever writes
             // this; the gauge it feeds is exercised on a real link.
             depth: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -9853,6 +10009,7 @@ mod tests {
             ctl: peer_tx.clone(), // tests observe both lanes through one receiver
             tx: peer_tx,
             cert_serial: None,
+            cert_ends: crate::hub::LinkCertEnds::default(),
             // No pump runs in these in-process tests, so nothing ever writes
             // this; the gauge it feeds is exercised on a real link.
             depth: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -10156,6 +10313,7 @@ mod tests {
                 },
                 method: AuthMethod::Certificate,
                 cert_serial: Some(vec![0x0a, 0x0b]),
+                cert_not_after: None,
                 protocol: ProtocolVersion::V5,
                 source: None,
             }),
@@ -10296,6 +10454,7 @@ mod tests {
             },
             method: AuthMethod::Certificate,
             cert_serial: Some(vec![0x42]),
+            cert_not_after: None,
             protocol: ProtocolVersion::V311,
             source: None,
         };
@@ -10555,6 +10714,7 @@ mod tests {
             ctl: peer_tx.clone(),
             tx: peer_tx,
             cert_serial: None,
+            cert_ends: crate::hub::LinkCertEnds::default(),
             depth,
             proto: mqtt_cluster::peer::PROTO_MAX,
         })
@@ -18180,6 +18340,7 @@ mod tests {
                 },
                 method: AuthMethod::Password,
                 cert_serial: None,
+                cert_not_after: None,
                 protocol: ProtocolVersion::V5,
                 source: None,
             }),

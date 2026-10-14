@@ -11,7 +11,7 @@ Day-2 procedures: [`docs/OPERATIONS.md`](../../../docs/OPERATIONS.md).
 ## Install
 
 ```sh
-NS=mqttd REPLICAS=3 ./deploy/helm/mqttd/bootstrap.sh
+LEAF_DAYS=30 NS=mqttd REPLICAS=3 ./deploy/helm/mqttd/bootstrap.sh
 helm install mqttd deploy/helm/mqttd -n mqttd \
   --set replicaCount=3 \
   --set secrets.tls.secretName=mqttd-tls \
@@ -22,6 +22,29 @@ helm install mqttd deploy/helm/mqttd -n mqttd \
 `bootstrap.sh` mints the gossip key, server TLS, **one cluster-bus certificate
 per node**, and a starter ACL, then prints the `--set` flags. Replace the
 throwaway PKI before production.
+
+`LEAF_DAYS` is how long the certificates it mints live. It has no default: a run that
+would mint one without it refuses and writes nothing
+([ADR 0088](../../../docs/adr/0088-credential-lifetimes-and-rotation.md)). The run prints
+when they end and the date to renew by; renewal is deleting the leaf files and re-running,
+and the pods pick the new Secret up without a restart.
+
+For production, cert-manager's csi-driver issues one certificate per pod, into a volume no
+other pod can read, and renews it in place. The chart renders that volume when an issuer
+is named, and the lifetime and the renewal lead are required with it:
+
+```sh
+helm install mqttd deploy/helm/mqttd -n mqttd \
+  --set secrets.peerTls.certManager.issuerName=mqttd-cluster-ca \
+  --set secrets.peerTls.certManager.duration=24h \
+  --set secrets.peerTls.certManager.renewBefore=10h \
+  --set secrets.gossipKey.secretName=mqttd-gossip
+```
+
+`duration` and `renewBefore` reach cert-manager as the volume's
+`csi.cert-manager.io/duration` and `csi.cert-manager.io/renew-before`. Set `renewBefore`
+above a third of `duration`. This path is rendered and compared with the operator's in CI;
+it is not run against a live cert-manager there.
 
 ## Values reference
 

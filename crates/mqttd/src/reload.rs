@@ -98,9 +98,11 @@ pub type SwimCrlBuildResult = Result<RevocationList, String>;
 pub type ClientCrlBuildResult = Result<RevocationList, String>;
 
 /// What a peer-bus TLS `build` closure returns (ADR 0040 T4): a freshly-built
-/// acceptor + connector from the re-read cluster CA / node cert / key, or an error
-/// string that aborts the swap.
-pub type PeerTlsBuildResult = Result<(TlsAcceptor, tokio_rustls::TlsConnector), String>;
+/// acceptor + connector from the re-read cluster CA / node cert / key, with the node
+/// certificate's `notAfter` in Unix seconds when it could be read (ADR 0088 D4), or an
+/// error string that aborts the swap.
+pub type PeerTlsBuildResult =
+    Result<(TlsAcceptor, tokio_rustls::TlsConnector, Option<i64>), String>;
 
 /// What an admin-TLS build returns (ADR 0081 T18): the rebuilt material, as a commit that
 /// swaps it in once every other build of the same reload has succeeded, or why it could
@@ -334,6 +336,7 @@ pub struct Reloader {
     peer_tls: Option<(
         watch::Sender<TlsAcceptor>,
         watch::Sender<tokio_rustls::TlsConnector>,
+        crate::peer::OwnCertEnd,
     )>,
     peer_tls_build: Option<Box<dyn Fn() -> PeerTlsBuildResult + Send + Sync>>,
     /// Set by [`attach_admin_tls`](Self::attach_admin_tls): rebuilds the admin listener's
@@ -487,14 +490,17 @@ impl Reloader {
     /// ADR 0032 deferred item): `build` re-reads the cluster CA / node cert / key,
     /// and both sides of the bus read the current value per handshake — a rotated
     /// cluster cert is served on the next peer handshake, folded into the same
-    /// atomic validate-before-swap reload as everything else.
+    /// atomic validate-before-swap reload as everything else. `own_cert_end` follows
+    /// the certificate that is served: a committed reload stores the new one's
+    /// `notAfter` (ADR 0088 D4).
     pub fn attach_peer_tls(
         &mut self,
         acceptor_tx: watch::Sender<TlsAcceptor>,
         connector_tx: watch::Sender<tokio_rustls::TlsConnector>,
+        own_cert_end: crate::peer::OwnCertEnd,
         build: Box<dyn Fn() -> PeerTlsBuildResult + Send + Sync>,
     ) {
-        self.peer_tls = Some((acceptor_tx, connector_tx));
+        self.peer_tls = Some((acceptor_tx, connector_tx, own_cert_end));
         self.peer_tls_build = Some(build);
     }
 
@@ -690,11 +696,15 @@ impl Reloader {
                         .write()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(list);
                 }
-                if let (Some((acc_tx, conn_tx)), Some(Ok((acceptor, connector)))) =
+                if let (Some((acc_tx, conn_tx, own_end)), Some(Ok((acceptor, connector, ends)))) =
                     (&self.peer_tls, peer_tls)
                 {
                     let _ = acc_tx.send(acceptor);
                     let _ = conn_tx.send(connector);
+                    own_end.store(
+                        ends.unwrap_or(i64::MAX),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
                 // Gossip signing identity (issue #269): the SWIM driver reads the slot
                 // per datagram, so the rotated leaf is embedded on the next send.
@@ -864,6 +874,7 @@ mod tests {
                         .map_err(|e| e.to_string())?,
                     mqtt_net::tls::client_connector(&cert_path, &cert_path, &key_path)
                         .map_err(|e| e.to_string())?,
+                    Some(1_900_000_000),
                 ))
             }
         };
@@ -877,14 +888,25 @@ mod tests {
         };
 
         // Success: both watch values are replaced.
-        let (initial_acc, initial_conn) = build_tls().unwrap();
+        let (initial_acc, initial_conn, _) = build_tls().unwrap();
         let (acc_tx, mut acc_rx) = watch::channel(initial_acc);
         let (conn_tx, mut conn_rx) = watch::channel(initial_conn);
         acc_rx.mark_unchanged();
         conn_rx.mark_unchanged();
         let (mut reloader, _handles) = Reloader::new(ok_policy().unwrap(), audit(), ok_policy);
-        reloader.attach_peer_tls(acc_tx, conn_tx, Box::new(build_tls.clone()));
+        let own_end = crate::peer::unknown_cert_end();
+        reloader.attach_peer_tls(
+            acc_tx,
+            conn_tx,
+            own_end.clone(),
+            Box::new(build_tls.clone()),
+        );
         assert!(reloader.reload("signal"));
+        assert_eq!(
+            own_end.load(std::sync::atomic::Ordering::Relaxed),
+            1_900_000_000,
+            "the served certificate's end follows the reload (ADR 0088 D4)"
+        );
         assert!(
             acc_rx.has_changed().unwrap(),
             "the peer acceptor must be rebuilt and swapped"
@@ -895,14 +917,16 @@ mod tests {
         );
 
         // Failure: a bad peer-TLS build rejects the WHOLE reload — nothing swaps.
-        let (initial_acc, initial_conn) = build_tls().unwrap();
+        let (initial_acc, initial_conn, _) = build_tls().unwrap();
         let (acc_tx, mut acc_rx) = watch::channel(initial_acc);
         let (conn_tx, _conn_rx) = watch::channel(initial_conn);
         acc_rx.mark_unchanged();
         let (mut reloader, handles) = Reloader::new(ok_policy().unwrap(), audit(), ok_policy);
+        let own_end = crate::peer::unknown_cert_end();
         reloader.attach_peer_tls(
             acc_tx,
             conn_tx,
+            own_end.clone(),
             Box::new(|| Err("peer cert: unreadable".into())),
         );
         assert!(!reloader.reload("signal"), "the reload must be rejected");

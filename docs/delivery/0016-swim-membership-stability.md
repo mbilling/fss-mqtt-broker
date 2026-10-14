@@ -82,6 +82,18 @@ the issue). Self-refutation is the unambiguous "others cannot reach us" signal.
 
 ## Changelog
 
+- **2026-10-13** — The last probe hardened after an independent read-through (the
+  ADR's amendment for issue #1002; delivery task 0087-T10a). The driver, until now a
+  clock and a socket, has a rule of its own: a tick reads what the socket holds before
+  it may expire anything — so a prober that was itself stalled no longer declares a
+  suspect `Dead` with its answer unread. Its clock stays real time: a first version
+  that kept stalled time off the clock and raised awareness (§2) on a stall made a
+  persistently late node blind to a real death, and was withdrawn on review. The
+  probe's `Ack` must come from the generation held. The two-second bound is derived
+  (2 s less twice the network's latency in a broker; 2098 ms on the simulation's tick
+  grid), the tables gain a 2.5 s column, and the packet-loss tables are measured again
+  with both detectors on one network. Whether membership should leave the data path's runtime is recorded as a
+  question for 0087-T10b.
 - **2026-10-13** — The detector changed, as a change of its own with its own evidence
   (the ADR's amendment of that date): a suspect is asked once more, directly, before it
   is declared `Dead`, by default. Built and tracked as delivery task 0087-T10 (issue

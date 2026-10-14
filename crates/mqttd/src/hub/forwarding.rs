@@ -588,7 +588,12 @@ impl Hub {
     /// A takeover-window re-delivery of pending publish `id` (ADR 0042 T9):
     /// deliver the frame ONLY to routing state that could have missed the
     /// original fan-out — offline persistent sessions (materialized since) and
-    /// clients attached after the publish. Clients online since BEFORE the
+    /// clients that RESUMED a session (`session_present = 1`) after the publish.
+    /// A session CREATED after the publish — a clean session, or a new persistent
+    /// one (`session_present = 0`) — subscribed after it and is owed nothing
+    /// (#1011); in plain mode (`MQTTD_DURABLE=0`) that includes a client of a dead
+    /// or falsely-dead peer reconnecting here with `clean_session = 0`, since
+    /// no session moves between nodes there. Clients online since BEFORE the
     /// publish already received it live; re-sending would duplicate (dups are
     /// legal at `QoS` 1, but a boot-window re-send to a steady subscriber is a
     /// gratuitous one — observed as duplicate bridge forwards). A session this
@@ -624,7 +629,17 @@ impl Hub {
             .matching_clients(&topic)
             .into_iter()
             .filter(|c| !reached.contains(c))
-            .filter(|c| self.online.get(c).is_none_or(|o| o.attached_at > since))
+            // Offline (an inherited session the scan materialised), or attached
+            // since the publish by RESUMING a session that existed before it. A
+            // session created since — a clean session, or a new persistent one —
+            // did not exist when this was published and subscribed after it: it
+            // is owed nothing, retained aside, and a copy here is a message from
+            // before its time (issue #1011).
+            .filter(|c| {
+                self.online
+                    .get(c)
+                    .is_none_or(|o| o.resumed && o.attached_at > since)
+            })
             .map(|c| {
                 let granted = self.granted_qos(&c, &topic);
                 (c, granted)
@@ -730,10 +745,14 @@ impl Hub {
                 }
             }
             // The re-delivery reached a session nobody had handed this publish: the
-            // dead target's subscriber has materialized HERE. That is the evidence
-            // the re-route grace waits for, just as a remote re-route is (the sweep
-            // ends the grace there too), so the ack need not wait out the rest of
-            // the grace (#738: about five seconds of every failover pause).
+            // dead target's subscriber has materialized HERE — inherited by the scan
+            // or resumed by its client. That is the evidence the re-route grace
+            // waits for, just as a remote re-route is (the sweep ends the grace
+            // there too), so the ack need not wait out the rest of the grace (#738:
+            // about five seconds of every failover pause). A session CREATED on this
+            // node since the publish is not re-delivered to (#1011), so it is never
+            // this evidence: it releases no ack early and discharges nothing the
+            // unreachable peer is owed.
             if self.reached_count(id) > reached_before {
                 if let Some(p) = self.pending_publishes.get_mut(id) {
                     p.reroute_grace = None;
@@ -1842,7 +1861,9 @@ impl Hub {
             if awaiting_empty && grace <= 1 {
                 // The grace ends with a FINAL local re-delivery: the subscriber
                 // may have materialized HERE in the meantime — via this node's
-                // takeover scan or its own re-attach — after this publish's
+                // takeover scan or its client RESUMING the session here
+                // (`session_present = 1`; a session created here since the
+                // publish is owed nothing, #1011) — after this publish's
                 // original local fan-out ran against a not-yet-materialized
                 // table (exhibit ⑥'s race, both faces). Targeted: only routing
                 // state that could have missed the original fan-out.
@@ -3182,6 +3203,77 @@ mod zone_fwd_proofs {
     /// subscriber on a peer that was never dead.)
     ///
     /// The durable-mode gap is the two characterisation tests above, for 0087-T5.
+    /// 0087-T2b, pinned in the direction #1011 set. In plain mode a client of a
+    /// peer held dead that reconnects HERE with `clean_session = 0` is answered
+    /// `session_present = 0`: no session moves between nodes, so its session here
+    /// is new. A publish held for the unreachable peer is not handed to it — MQTT
+    /// owes a new session nothing published before it — so its attach is no
+    /// evidence either: it releases no ack early and discharges nothing the peer
+    /// is owed, which stays owed until the peer answers for itself.
+    ///
+    /// Before #1013 the settle pass's re-delivery took any session attached after
+    /// the publish, and this client was handed the message.
+    #[tokio::test]
+    async fn without_a_durable_plane_a_client_reconnecting_here_from_the_unreachable_peer_is_not_handed_the_held_publish(
+    ) {
+        let store = Arc::new(MemorySessionStore::new());
+        let (mut h, _) = Hub::with_config(NodeId("fwd-proofs".into()), store.clone());
+        assert!(h.durable_plane.is_none(), "fixture: plain mode");
+        let dead = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
+        h.peer_dead(&dead.node);
+        let (id, mut rx) = published_under_the_verdict(&mut h);
+        let owed = *h.pending_publishes[&id].awaiting.keys().next().unwrap();
+
+        // The peer's subscriber reconnects here, asking for its session back.
+        let (mut client, _meter, present) =
+            crate::hub::tests::settle_gate::attach_watched(&mut h, "from-p", false, 3600, 1, "t/x")
+                .await;
+        assert!(
+            !present,
+            "plain mode: its session is not here, so it is new"
+        );
+
+        // The settle pass runs (it does on every sweep tick).
+        h.settle_pending_publishes();
+        crate::hub::tests::settle_gate::quiesce(&mut h).await;
+
+        assert_eq!(
+            crate::hub::tests::settle_gate::published_topics(&mut client),
+            Vec::<String>::new(),
+            "a session created after the publish was handed it (#1011)"
+        );
+        assert!(
+            store
+                .pending(&ClientId("from-p".into()), 0, 16)
+                .await
+                .unwrap()
+                .is_empty(),
+            "nor queued for it"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "its attach is no evidence: the ack is still held"
+        );
+        assert!(
+            h.pending_publishes[&id]
+                .awaiting
+                .get(&owed)
+                .is_some_and(|o| o.node == dead.node),
+            "and the unreachable peer is still owed the publish, under its seq"
+        );
+
+        // The peer was never dead: its link returns and it answers for itself.
+        let mut back = link_peer_at(&mut h, "p", PROTO_FORWARD_REACHED);
+        h.peer_announced_interest(&back.node, vec!["t/x".to_string()]);
+        assert_eq!(forwards_sent(&mut back), vec![(owed, None)]);
+        h.forward_answered(&back.node, owed, ForwardVerdict::Reached);
+        assert!(matches!(rx.try_recv(), Ok(PublishOutcome::Accepted)));
+        assert!(
+            crate::hub::tests::settle_gate::published_topics(&mut client).is_empty(),
+            "still nothing for the new session"
+        );
+    }
+
     #[tokio::test]
     async fn without_a_durable_plane_nothing_stands_in_for_what_an_unreachable_peer_is_owed() {
         for newcomer_is_local in [false, true] {

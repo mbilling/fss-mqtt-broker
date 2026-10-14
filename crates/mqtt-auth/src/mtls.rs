@@ -177,6 +177,16 @@ pub fn serial_from_cert(der: &[u8]) -> Option<Vec<u8>> {
     Some(cert.raw_serial().to_vec())
 }
 
+/// The end of a DER-encoded X.509 certificate's validity, `notAfter`, in Unix seconds:
+/// the moment a link or session admitted under it must end
+/// ([ADR 0088](../../../docs/adr/0088-credential-lifetimes-and-rotation.md) D3). `None` if
+/// the certificate cannot be parsed.
+#[must_use]
+pub fn not_after_from_cert(der: &[u8]) -> Option<i64> {
+    let (_, cert) = x509_parser::parse_x509_certificate(der).ok()?;
+    Some(cert.validity().not_after.timestamp())
+}
+
 /// The subject of a DER-encoded, already chain-verified X.509 leaf: the full
 /// distinguished name as `x509-parser` prints it (`CN=ops, O=example`), and its first
 /// Common Name. The admin API (ADR 0081) maps these to roles.
@@ -216,6 +226,17 @@ mod tests {
         }
         let cert = params.self_signed(&key).expect("self-sign");
         cert.der().to_vec()
+    }
+
+    #[test]
+    fn a_certificates_end_is_read_in_unix_seconds() {
+        let key = rcgen::KeyPair::generate().expect("key generation");
+        let mut params = rcgen::CertificateParams::default();
+        params.not_after =
+            (std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_900_000_123)).into();
+        let der = params.self_signed(&key).expect("self-sign").der().to_vec();
+        assert_eq!(not_after_from_cert(&der), Some(1_900_000_123));
+        assert_eq!(not_after_from_cert(b"not a certificate"), None);
     }
 
     #[test]

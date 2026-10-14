@@ -220,6 +220,40 @@
                         "nullable": true,
                         "type": "string"
                       },
+                      "peerTlsCertManager": {
+                        "description": "ALTERNATIVE to `peerTls`: one certificate per pod from cert-manager's csi-driver,\nmirroring the chart's `secrets.peerTls.certManager`. The operator renders the csi\nvolume with the attributes the bus needs (CN = the pod name, the pod's headless DNS\nname as SAN, both EKUs, an ECDSA PKCS#8 key) and with the lifetime and renewal lead\nstated here. No Secret holds every node's key. Ignored when `peerTls` is set.",
+                        "nullable": true,
+                        "properties": {
+                          "duration": {
+                            "description": "The certificate's lifetime, as cert-manager's `duration` (a Go duration: `24h`).\nHours to a day is the aim: a certificate is good until it ends whether or not the\npod it names still exists. Expiry is strict.",
+                            "type": "string"
+                          },
+                          "issuerGroup": {
+                            "description": "The issuer's API group; `cert-manager.io` when omitted.",
+                            "nullable": true,
+                            "type": "string"
+                          },
+                          "issuerKind": {
+                            "description": "`Issuer` (the default) or `ClusterIssuer`.",
+                            "nullable": true,
+                            "type": "string"
+                          },
+                          "issuerName": {
+                            "description": "The `Issuer` (or `ClusterIssuer`) that signs with the cluster CA.",
+                            "type": "string"
+                          },
+                          "renewBefore": {
+                            "description": "How long before its end a certificate is renewed, as cert-manager's `renewBefore`.\nSet it above a third of `duration` (`24h` -> `10h`): the broker warns once two\nthirds of a lifetime is spent, which is exactly when cert-manager renews by default.",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "duration",
+                          "issuerName",
+                          "renewBefore"
+                        ],
+                        "type": "object"
+                      },
                       "tls": {
                         "description": "Server TLS keypair (a `kubernetes.io/tls` Secret).",
                         "nullable": true,
