@@ -66,6 +66,7 @@ caller changes this file and the gate fails until it is regenerated and re-read.
 | `crates/mqttd/tests/replication_pause.rs` | `measure` | `pause-suspend` | SUSPEND | helper, 5 call site(s) |
 | `crates/mqttd/tests/replication_pause.rs` | `measure` | `pause-after-crash` | OBSERVE | helper, 5 call site(s) |
 | `crates/mqttd/tests/swim_formation_proc.rs` | `a_broker_stopped_for_two_seconds_is_declared_dead_by_no_one` | `swim-stop-two-seconds` | STOP | in the test itself |
+| `crates/mqttd/tests/swim_formation_proc.rs` | `stop_the_prober_on_its_last_probe` | `swim-prober-stop` | PROBER_STOP | helper, 1 call site(s) |
 | `crates/mqttd/tests/v5_protocol.rs` | `v5_a_will_is_cancelled_by_a_reconnect_inside_the_delay` | `v5-will-delay-cancel-inside-window` | 400ms | in the test itself |
 | `crates/mqttd/tests/v5_protocol.rs` | `v5_session_expires_after_interval` | `v5-session-expiry-wire` | 4s | in the test itself |
 | `crates/mqttd/tests/v5_protocol.rs` | `v5_disconnect_session_expiry_overrides_the_connect_value` | `v5-disconnect-expiry-override` | 4s | in the test itself |

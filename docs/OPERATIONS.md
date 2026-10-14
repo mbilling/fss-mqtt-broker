@@ -518,8 +518,13 @@ load; the client-facing cost scales with the rolled pod's share, not the fleet):
 
 **Failure detection during the roll from 1.1.0.** From 1.2.0 a node asks a suspected
 member once more, directly, before declaring it dead, so a member that is out of
-reach for up to two seconds is not declared dead
-([TROUBLESHOOTING](TROUBLESHOOTING.md#the-log-says-membership-peer-suspect-or-peer-dead-about-a-broker-that-is-running)).
+reach for just under two seconds is not declared dead (two seconds less twice the
+network's latency; it follows from the release's timings.
+[TROUBLESHOOTING](TROUBLESHOOTING.md#the-log-says-membership-peer-suspect-or-peer-dead-about-a-broker-that-is-running)
+has the arithmetic, and the metrics that show the question being asked:
+`mqttd_swim_last_probes_total` by outcome; `mqttd_swim_stalls_total` and
+`mqttd_swim_stalled_milliseconds_total` for a node whose own membership task was not
+scheduled; `mqttd_swim_awareness`).
 A 1.1.0 node answers that question and does not ask it, and a verdict it reaches is
 adopted by the upgraded nodes like any other: while the roll is in progress a short
 outage of one member can still end in a 30 s `DEAD` verdict, less often with each node

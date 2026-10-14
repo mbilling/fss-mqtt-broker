@@ -129,6 +129,7 @@ fn cfg() -> Config {
         greet_pruned: true,
         suspicion_scales_with_log_n: false,
         confirm_before_dead: true,
+        period_from_schedule: true,
     }
 }
 

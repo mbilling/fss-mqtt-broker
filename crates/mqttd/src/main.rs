@@ -223,9 +223,6 @@ use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
-/// SWIM driver tick; must stay below the ack timeout (250ms default config).
-const SWIM_TICK: Duration = Duration::from_millis(100);
-
 /// Why the broker could not start. Rust prints a `main` error with `Debug`, which
 /// would escape a multi-line message (a rules file's parse error points at the line
 /// and column it means) into one unreadable string; this prints the message as written.
@@ -3748,14 +3745,37 @@ async fn start_swim(
         let m = metrics.clone();
         Arc::new(move || m.gossip_cert_requested())
     };
+    // What becomes of the last direct probes this node sends before declaring a suspect
+    // dead (ADR 0016): sent, spared (the suspect answered), silent (declared dead).
+    let last_probe: swim_driver::LastProbeCounter = {
+        let m = metrics.clone();
+        Arc::new(move |outcome: &'static str, n: u64| m.swim_last_probes(outcome, n))
+    };
+    // The times the driver below found that it had not been scheduled, and for how
+    // long; and the node's own local-health score (ADR 0016).
+    let stalled: swim_driver::StallCounter = {
+        let m = metrics.clone();
+        Arc::new(move |stalled_ms: u64| m.swim_stalled(stalled_ms))
+    };
+    let awareness: swim_driver::AwarenessGauge = {
+        let m = metrics.clone();
+        Arc::new(move |awareness: u8| m.set_swim_awareness(awareness))
+    };
     let gossip = swim_driver::Gossip::new(swim, auth, seq_alloc)
         .with_reject_counter(Some(reject))
         .with_cert_request_counter(Some(cert_requested))
+        .with_last_probe_counter(Some(last_probe))
+        .with_stall_counter(Some(stalled))
+        .with_awareness_gauge(Some(awareness))
         .with_identity(Some(cluster_identity));
+    // On the runtime the data path runs on: a saturated broker can keep this task off
+    // the CPU. The driver does not turn that into a verdict about a peer
+    // (`swim_driver::run_gossip`), and counts it (`mqttd_swim_stalls_total`,
+    // `mqttd_swim_stalled_milliseconds_total`).
     tokio::spawn(swim_driver::run_gossip(
         socket,
         gossip,
-        SWIM_TICK,
+        swim_driver::TICK,
         event_tx,
         Some(swim_isolated.clone()),
         shutdown.clone().cancelled_owned(),
