@@ -15,7 +15,7 @@ runs:
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: crates/mqtt-wasm-sandbox/jq-module/jq.wasm
-        key: jq-wasm-${{ hashFiles('crates/mqtt-wasm-sandbox/jq-module/build.sh', 'crates/mqtt-wasm-sandbox/jq-module/fetch-zig.sh', 'crates/mqtt-wasm-sandbox/jq-module/shim.c', 'crates/mqtt-wasm-sandbox/jq-module/compat.c', 'crates/mqtt-wasm-sandbox/jq-module/compat.h', 'crates/mqtt-wasm-sandbox/jq-module/jq.wasm.sha256') }}
+        key: jq-wasm-${{ hashFiles('crates/mqtt-wasm-sandbox/jq-module/build.sh', 'crates/mqtt-wasm-sandbox/jq-module/fetch-zig.sh', 'crates/mqtt-wasm-sandbox/jq-module/shim.c', 'crates/mqtt-wasm-sandbox/jq-module/execute_cancel.c', 'crates/mqtt-wasm-sandbox/jq-module/compat.c', 'crates/mqtt-wasm-sandbox/jq-module/compat.h', 'crates/mqtt-wasm-sandbox/jq-module/jq.wasm.sha256') }}
     - name: Build jq.wasm from pinned sources with the pinned compiler
       if: steps.module.outputs.cache-hit != 'true'
       shell: bash

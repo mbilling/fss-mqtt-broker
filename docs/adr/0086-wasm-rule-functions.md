@@ -441,7 +441,7 @@ mqttd_alloc(len: u32) -> ptr                    memory the host writes arguments
 mqttd_free(ptr)
 mqttd_describe(ret: ptr)                        JSON: module name, version, functions with min and max arity
 mqttd_call(name, name_len, args, args_len, max_out, ret: ptr) -> status
-mqttd_cancel()                                  optional: ask the running call to stop
+mqttd_cancel_slot() -> ptr                      optional: where the running call's stop flag is
 ```
 
 `ret` receives an address and a length; the host copies the bytes and frees them.
@@ -1234,3 +1234,40 @@ The test that showed the ceiling stopping the compiler asserted its timing again
 ceiling of one millisecond, and made its next call under the same millisecond, which a
 one-character program does not always compile in. It failed on a busy CI runner. No
 assertion in it depends on the machine's speed now.
+
+### 2026-10-15 — A call is asked to stop by a flag the host sets, not by a call into the module
+
+wasmtime 49.0.3 (RUSTSEC-2026-0353 to 0364, taken in #1029) refuses a blocking call into
+a module from inside a call that is running on its own stack: "cannot do blocking `call`
+from an async context" (RUSTSEC-2026-0362). Such a call can let an epoch interruption
+suspend the outer call and hand data that must stay on one thread to another, and nests
+stacks without bound. Every call here runs on its own stack (D6), and the deadline
+callback asked a module to stop exactly that way: it called `mqttd_cancel`. With 49.0.3
+that call was refused, the refusal ended the call, and a `jq` program that times out cost
+its instance and its compiled programs instead of ending at its next step. The two tests
+that pin that behaviour failed, which is how it was found.
+
+The ABI's optional `mqttd_cancel()` is replaced by `mqttd_cancel_slot() -> ptr`, asked
+once per instance after `_initialize`. Its answer is the address of a little-endian `u32`
+in the module's memory, the slot, which holds the address of the module's stop flag, or 0.
+At a call's deadline the host reads the slot and, when it holds an address, stores the
+little-endian `i32` 1 there; none of the module's code runs for it. The module looks at
+its flag between steps, as it would at a signal. The grace and its end are unchanged (2 ms,
+then a trap and the instance dropped). A slot, or a flag address in it, that does not lie
+wholly inside the module's memory ends the call at its deadline; a slot holding 0 leaves the
+call its grace. No release has shipped `mqttd_cancel`, so nothing is kept for it.
+
+In the `jq` module the flag is jq's own: `jq_state.canceled`, which `jq_cancel` sets and
+the interpreter checks at every step. The shim stores the running program's flag in the
+slot around `jq_next` and clears it after; `jq_reset_cancel_state` clears the flag before
+each run, as before. jqc's `src/execute.c` is compiled as it is, through
+`jq-module/execute_cancel.c`, which includes it and adds the one function that returns
+that address; the pinned sources and their hashes do not change. The module does
+(`jq.wasm.sha256`), and its build is still byte-reproducible: two clean builds give the
+same file, and the previous revision's build reproduces the hash it recorded.
+
+The §4 row on time, which says `mqttd_cancel`, is of its date. What it measured holds:
+the tests that showed a timed-out program ending at its next step with its instance and
+its compiled programs whole pass again unchanged, and the sandbox's own tests now show
+the flag being set, a slot pointing outside memory ending the call at its deadline, and a
+slot holding 0 keeping the grace.

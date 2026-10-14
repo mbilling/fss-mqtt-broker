@@ -2268,7 +2268,7 @@ linear memory as `memory`, and:
 | `mqttd_free(address)` | Gives back what `mqttd_alloc` returned, and each result once it has been read |
 | `mqttd_describe(ret)` | Called once at load. The module leaves JSON at `ret`: `{"module":"geo","version":"0.1.0","functions":[{"name":"geo_distance","min_args":4,"max_args":4}]}`. Unknown keys are ignored. The arities are what a rule's call is checked against when the rules are loaded |
 | `mqttd_call(name, name_len, args, args_len, max_out, ret) -> status` | One call of the function `name`. Status `0`: the result at `ret` is the value. Any other status fails the rule, with the bytes at `ret` as its message (counted as `module`). A result longer than `max_out` bytes is refused unread (counted as `output`) |
-| `mqttd_cancel()` | Optional. Called at the deadline; a call still running 2 ms later is stopped and its instance dropped |
+| `mqttd_cancel_slot() -> address` | Optional. Called once per instance, after `_initialize`. The answer is the address of the module's cancel slot: a little-endian `u32` holding the address of a stop flag, or 0. At a call's deadline the broker reads the slot and, when it is not 0, stores the little-endian `i32` 1 at the address it holds; none of the module's code runs for it, so the module looks at its flag between steps, as at a signal. A call still running 2 ms later is stopped and its instance dropped. A slot or a flag that does not lie inside the module's memory stops the call at its deadline. Without the export the call is stopped at its deadline |
 
 `ret` is the address of two little-endian `u32`: the module writes there the address and
 the length of the bytes it answers with, and the broker reads them and frees them with

@@ -8,7 +8,7 @@
  *   mqttd_free(ptr)
  *   mqttd_describe(ret)                JSON text: the functions this module provides
  *   mqttd_call(name, name_len, args, args_len, max_out, ret) -> status
- *   mqttd_cancel()                     optional: asks the running call to stop
+ *   mqttd_cancel_slot() -> ptr         optional: where the running call's stop flag is
  *
  * `ret` points at two u32: the address and the length of a buffer the host reads and
  * then frees with mqttd_free. `args` is a frame: u32 count, then per argument one tag
@@ -20,11 +20,12 @@
  * (emqx/jq v0.4.1, c_src/port_nif_common.c): the program and the input are C strings,
  * so both end at the first NUL; the input is read by jq's own parser; every output is
  * printed with jv_dump_string; the error texts and their tags are the NIF's. The
- * timeout is the NIF's too: when the deadline passes the host calls mqttd_cancel,
- * which is jq_cancel on the running program, and the program ends at its next step
- * with the instance and its compiled programs intact. A program that does not get to
- * a next step (inside one long regex match, say — which EMQX cannot stop at all) is
- * stopped by the host, and the instance with it.
+ * timeout is the NIF's too: when the deadline passes the host sets the running
+ * program's cancel flag through the cancel slot, which is jq_cancel on that program,
+ * and the program ends at its next step with the instance and its compiled programs
+ * intact. A program that does not get to a next step (inside one long regex match,
+ * say — which EMQX cannot stop at all) is stopped by the host, and the instance with
+ * it.
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -67,8 +68,11 @@ typedef struct {
 } cached;
 
 static cached cache[PROGRAM_CACHE];
-/* The program inside jq_next, for mqttd_cancel. */
-static jq_state *running;
+/* The cancel slot: the address of the cancel flag of the program inside jq_next, and
+ * 0 when no program is running. The host reads it at a call's deadline and stores 1
+ * where it points (execute_cancel.c), as a signal handler would. */
+volatile int *mqttd_jq_cancel_flag(jq_state *jq);
+static volatile int *volatile cancel_slot;
 static uint64_t clock_tick;
 static uint32_t cache_hits, cache_misses;
 
@@ -111,11 +115,9 @@ EXPORT("mqttd_alloc") void *mqttd_alloc(uint32_t len) { return malloc(len ? len 
 
 EXPORT("mqttd_free") void mqttd_free(void *p) { free(p); }
 
-/* Called by the host while mqttd_call is paused between two slices of fuel. Sets a
- * flag and nothing else, as a signal handler would. */
-EXPORT("mqttd_cancel") void mqttd_cancel(void) {
-  if (running)
-    jq_cancel(running);
+/* Asked once, when the instance is made: where the cancel slot is. */
+EXPORT("mqttd_cancel_slot") uint32_t mqttd_cancel_slot(void) {
+  return (uint32_t)(uintptr_t)&cancel_slot;
 }
 
 static void ret_bytes(uint32_t *ret, char *p, size_t len) {
@@ -245,7 +247,7 @@ static int32_t jq_eval(const char *program, const char *input, uint32_t max_out,
   buf_put(&out, "j[", 2);
   int first = 1, too_large = 0;
   jq_start(jq, value, 0);
-  running = jq;
+  cancel_slot = mqttd_jq_cancel_flag(jq);
   jv result;
   while (jv_is_valid(result = jq_next(jq))) {
     jv text = jv_dump_string(result, DUMPOPTS);
@@ -262,7 +264,7 @@ static int32_t jq_eval(const char *program, const char *input, uint32_t max_out,
     buf_put(&out, s, n);
     jv_free(text);
   }
-  running = NULL;
+  cancel_slot = NULL;
   if (jq_canceled(jq)) {
     if (!too_large)
       jv_free(result);

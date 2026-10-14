@@ -14,6 +14,9 @@
 //! * `i` returns its first argument as it came, tag and bytes;
 //! * `s` counts down from [`Shape::spin`], thirty-two steps to the count, and then
 //!   returns the answer;
+//! * `c` clears the flag at [`CANCEL_FLAG_AT`], waits for it to be set, and then fails
+//!   with status 7 and the message `nope`: a call that ends by itself when it is asked
+//!   to stop ([`Shape::cancel`]);
 //! * anything else returns the answer ([`Shape::answer`]: a tagged value).
 
 use crate::ABI_VERSION;
@@ -78,6 +81,12 @@ const ANSWER_AT: i32 = 32;
 const NOPE: (i32, &[u8]) = (48, b"nope");
 const DESCRIPTION_AT: i32 = 64;
 
+/// Where [`Shape::cancel`]'s slot lies when the module points `mqttd_cancel_slot` at
+/// it, and the flag `c` waits on.
+pub const CANCEL_SLOT_AT: u32 = 8;
+/// The flag `c` clears and then waits on.
+pub const CANCEL_FLAG_AT: u32 = 12;
+
 /// The most bytes of [`Shape::answer`].
 pub const MAX_ANSWER: usize = 16;
 /// The most bytes of [`Shape::description`].
@@ -119,6 +128,10 @@ pub struct Shape {
     /// How far a start function counts down while an instance is made (0: the module
     /// has no start function).
     pub slow_start: u32,
+    /// `Some((slot, value))`: the module exports `mqttd_cancel_slot`, which answers
+    /// `slot`, and holds `value` at [`CANCEL_SLOT_AT`] from the start. A module that
+    /// can be asked properly answers `CANCEL_SLOT_AT` and holds `CANCEL_FLAG_AT`.
+    pub cancel: Option<(u32, u32)>,
 }
 
 impl Default for Shape {
@@ -132,6 +145,7 @@ impl Default for Shape {
             spin: 1,
             slow_alloc: 0,
             slow_start: 0,
+            cancel: None,
         }
     }
 }
@@ -192,6 +206,15 @@ fn call_body(shape: &Shape) -> Vec<u8> {
     ];
     when(b'i', &ident);
     when(b's', &countdown(shape.spin, 7, 8));
+    // flag = 0; loop { br_if (flag == 0) }; fail with 7
+    let flag = CANCEL_FLAG_AT.cast_signed();
+    let mut waiting = Vec::new();
+    konst(flag, &mut waiting);
+    waiting.extend_from_slice(&[0x41, 0, 0x36, 2, 0, 0x03, 0x40]);
+    konst(flag, &mut waiting);
+    waiting.extend_from_slice(&[0x28, 2, 0, 0x45, 0x0d, 0, 0x0b]);
+    waiting.extend_from_slice(&failing(&[0x41, 7]));
+    when(b'c', &waiting);
     set_result(ANSWER_AT, len_of(&shape.answer).cast_signed(), &mut b);
     b.extend_from_slice(&[0x41, 0, 0x0b]);
     b
@@ -231,10 +254,23 @@ pub fn module(shape: &Shape) -> Vec<u8> {
         body.extend_from_slice(&[0, 1]); // a function of type 1
         section(2, &body, &mut out);
     }
-    // Functions: version, alloc, free, describe, call, recurse, and a start function.
-    let mut functions = vec![6 + u8::from(starting), 0, 1, 2, 2, 3, 0];
+    // Functions: version, alloc, free, describe, call, recurse, a start function, and
+    // `mqttd_cancel_slot`.
+    let cancelling = shape.cancel.is_some();
+    let mut functions = vec![
+        6 + u8::from(starting) + u8::from(cancelling),
+        0,
+        1,
+        2,
+        2,
+        3,
+        0,
+    ];
     if starting {
         functions.push(4);
+    }
+    if cancelling {
+        functions.push(0);
     }
     section(3, &functions, &mut out);
     section(5, &[1, 0, 1], &mut out); // one memory, one page, no maximum
@@ -253,6 +289,9 @@ pub fn module(shape: &Shape) -> Vec<u8> {
     export("mqttd_describe", 0, imported + 3);
     if !shape.without_call {
         export("mqttd_call", 0, imported + 4);
+    }
+    if cancelling {
+        export("mqttd_cancel_slot", 0, imported + 6 + u8::from(starting));
     }
     let mut body = vec![count];
     body.extend_from_slice(&exports);
@@ -306,6 +345,12 @@ pub fn module(shape: &Shape) -> Vec<u8> {
         start.push(0x0b);
         bodies.push(start);
     }
+    if let Some((slot, _)) = shape.cancel {
+        let mut answer = vec![0];
+        konst(slot.cast_signed(), &mut answer);
+        answer.push(0x0b);
+        bodies.push(answer);
+    }
     let mut code = vec![u8::try_from(bodies.len()).unwrap_or_default()];
     for function in bodies {
         uleb(len_of(&function), &mut code);
@@ -313,12 +358,17 @@ pub fn module(shape: &Shape) -> Vec<u8> {
     }
     section(10, &code, &mut out);
 
-    let mut data = vec![3];
-    for (at, bytes) in [
+    let held = shape.cancel.map(|(_, value)| value.to_le_bytes());
+    let mut segments = vec![
         (ANSWER_AT, shape.answer.as_slice()),
         NOPE,
         (DESCRIPTION_AT, shape.description.as_slice()),
-    ] {
+    ];
+    if let Some(held) = &held {
+        segments.push((CANCEL_SLOT_AT.cast_signed(), held.as_slice()));
+    }
+    let mut data = vec![u8::try_from(segments.len()).unwrap_or_default()];
+    for (at, bytes) in segments {
         data.push(0);
         konst(at, &mut data);
         data.push(0x0b);
