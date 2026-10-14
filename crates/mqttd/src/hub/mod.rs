@@ -5891,6 +5891,25 @@ impl Hub {
             debug!(origin = %node.0, seq, "owner question deferred until this node's takeover is over");
             return;
         }
+        // A re-route that would match nobody here while a session could still arrive
+        // is not applied yet either (ADR 0087 D8): its "nobody here" is not an answer
+        // this node can give, and applying it on every retransmission would cost a
+        // booting node a fan-out per held publish per sweep. One that matches a
+        // session here is applied and answered at once, below, whatever the takeover
+        // state.
+        if replay
+            && !question
+            && self.cannot_say_who_is_here()
+            && self.table.matching_clients(&topic).is_empty()
+            && self
+                .forward_windows
+                .get(&node)
+                .and_then(|w| w.seen(seq))
+                .is_none()
+        {
+            debug!(origin = %node.0, seq, "re-route matching nobody here deferred until this node can say who is here");
+            return;
+        }
         // A retransmission of a forward already applied here is answered
         // (again) or left to its in-flight append, never applied twice
         // (issue #648).

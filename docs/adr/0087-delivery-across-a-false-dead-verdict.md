@@ -823,8 +823,8 @@ that negotiated 15. *(O2 decided 2026-10-14: in the first cut.)*
   the group once its own view moves on); if it holds them all, it applies the question
   as a re-route (a session already holding the publish skips it, #784) and answers.
   An ordinary re-route that matches a session here is applied and answered at once,
-  whatever the takeover state; one that matches nobody is not answered while a session
-  could still arrive (applied again when retransmitted — it stored nothing), then
+  whatever the takeover state; one that would match nobody is neither applied nor
+  answered while a session could still arrive (the origin sends it again), then
   answered `Stored`, with no `$events/message/dropped`.
 - *The countdown is gone*, in durable mode as in plain: a hold ends when the node
   answers (and no lease of its has moved), the verdict is withdrawn, the holders of its
