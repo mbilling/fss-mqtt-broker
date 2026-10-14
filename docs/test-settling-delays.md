@@ -44,7 +44,6 @@ caller changes this file and the gate fails until it is regenerated and re-read.
 | `crates/mqttd/src/hub/mod.rs` | `an_uncongested_relaxed_forward_is_answered_at_submit` | `early-verdict-uniqueness` | 100ms | in the test itself |
 | `crates/mqttd/src/hub/mod.rs` | `the_durability_property_is_inert_without_the_operator_opt_in` | `inert-property-negative-window` | 300ms | in the test itself |
 | `crates/mqttd/src/peer.rs` | `wait_ns` | `peer-write-wait-hold` | ? | helper, 2 call site(s) |
-| `crates/mqttd/src/peer.rs` | `an_alive_that_arrives_during_the_attempt_that_spends_the_window_is_not_lost` | `dialer-window-runs-out-mid-attempt` | ? | in the test itself |
 | `crates/mqttd/src/reload.rs` | `committed_config_never_returns_a_rejected_candidate` | `committed-config-reader-blocks` | 50ms | in the test itself |
 | `crates/mqttd/tests/backup_restore.rs` | `sigusr2_on_a_node_with_no_backup_dir_is_a_no_op_not_a_death` | `sigusr2-default-disposition-is-death` | 600ms | in the test itself |
 | `crates/mqttd/tests/cluster.rs` | `retained_mqtt5_properties_replay_from_any_nodes_cache` | `cluster-sever-eof-props` | 400ms | in the test itself |
@@ -54,6 +53,7 @@ caller changes this file and the gate fails until it is regenerated and re-read.
 | `crates/mqttd/tests/durable_sessions.rs` | `lease_group_forms_and_is_stable_under_slow_durable_commits` | `lease-term-stability-window` | 5s | in the test itself |
 | `crates/mqttd/tests/false_dead_delivery.rs` | `relay_one_way` | `peer-announcement-held-back` | ANNOUNCEMENT_DELAY | helper, 2 call site(s) |
 | `crates/mqttd/tests/false_dead_delivery.rs` | `episode_under` | `false-dead-verdict-withdrawn-early` | ? | helper, 2 call site(s) |
+| `crates/mqttd/tests/false_dead_delivery.rs` | `plain_a_peer_really_dead_is_answered_at_confirmation_and_counted` | `really-dead-unconfirmed-hold` | UNCONFIRMED_FOR | in the test itself |
 | `crates/mqttd/tests/http_auth.rs` | `stub_hook` | `http-auth-hang-stub` | 60s | helper, 6 call site(s) |
 | `crates/mqttd/tests/keepalive_lwt.rs` | `pinging_client_stays_connected_past_keepalive` | `keepalive-ping-cadence` | 500ms | in the test itself |
 | `crates/mqttd/tests/keepalive_lwt.rs` | `zero_keepalive_is_never_idle_disconnected` | `keepalive-zero-idle-window` | 2500ms | in the test itself |

@@ -451,7 +451,7 @@ async fn a_forward_retransmitted_across_a_dead_verdict_is_applied_once() {
 /// The key cannot swallow a DIFFERENT message: an origin that restarted (an
 /// older build starts its seqs at 1 again) re-uses a remembered seq for new
 /// content, and that is applied. And an origin's window goes when the origin does:
-/// not at the verdict (ADR 0087 D6), but when the hold has run out with no link.
+/// not at the verdict (ADR 0087 D6), but when membership confirms it gone (D4, D2).
 #[tokio::test]
 async fn a_re_used_seq_with_new_content_is_applied_and_a_dead_origin_is_forgotten() {
     let mut rig = Rig::new().await;
@@ -478,9 +478,14 @@ async fn a_re_used_seq_with_new_content_is_applied_and_a_dead_origin_is_forgotte
 
     rig.receiver.peer_dead(&origin());
     assert!(rig.receiver.forward_windows.contains_key(&origin()));
-    for _ in 0..crate::hub::REROUTE_GRACE_TICKS {
+    for _ in 0..crate::hub::REROUTE_GRACE_TICKS * 2 {
         rig.receiver.sweep_verdict_holds();
     }
+    assert!(
+        rig.receiver.forward_windows.contains_key(&origin()),
+        "kept for as long as the verdict stands unconfirmed"
+    );
+    rig.dispatch(HubCommand::PeerGone { node: origin() }).await;
     assert!(
         !rig.receiver.forward_windows.contains_key(&origin()),
         "a dead origin's window is dropped with the rest of its routing state"

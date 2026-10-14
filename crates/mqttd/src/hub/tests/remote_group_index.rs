@@ -220,7 +220,8 @@ async fn remote_group_index_rebuilds_on_replacement_disconnect_and_death() {
         "each group still has its member, marked as not reachable"
     );
     assert_eq!(hub.plan_shared("keep/x").len(), 1);
-    // A verdict erases nothing either, until its hold has run out with no link.
+    // A verdict erases nothing either, until the node is confirmed gone (ADR 0087
+    // D2) with no link.
     hub.dispatch(HubCommand::PeerDead {
         node: NodeId("a".into()),
     })
@@ -229,11 +230,16 @@ async fn remote_group_index_rebuilds_on_replacement_disconnect_and_death() {
     for _ in 0..crate::hub::REROUTE_GRACE_TICKS {
         hub.sweep_verdict_holds();
     }
+    assert_eq!(hub.plan_shared("keep/x").len(), 1, "no clock ends it");
+    hub.dispatch(HubCommand::PeerGone {
+        node: NodeId("a".into()),
+    })
+    .await;
     assert!(hub.plan_shared("keep/x").is_empty());
     assert!(!hub.remote_by_filter.contains_key("keep/+"));
     assert_eq!(
         hub.plan_shared("new/x").len(),
         2,
-        "the hold that ran out was the dead node's, not the unlinked member's"
+        "the node confirmed gone was the dead node, not the unlinked member's"
     );
 }

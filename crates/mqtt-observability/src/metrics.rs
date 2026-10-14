@@ -292,6 +292,7 @@ struct OtelInstruments {
     publish_received: OtelCounter<u64>,
     publish_delivered: OtelCounter<u64>,
     publish_dropped: OtelCounter<u64>,
+    publish_resolved_undeliverable: OtelCounter<u64>,
     publish_forwarded: OtelCounter<u64>,
     deliver_latency: OtelHistogram<f64>,
     hub_dispatch: OtelHistogram<f64>,
@@ -447,6 +448,9 @@ impl OtelInstruments {
             publish_received: meter.u64_counter("publish_received").build(),
             publish_delivered: meter.u64_counter("publish_delivered").build(),
             publish_dropped: meter.u64_counter("publish_dropped").build(),
+            publish_resolved_undeliverable: meter
+                .u64_counter("publish_resolved_undeliverable")
+                .build(),
             publish_forwarded: meter.u64_counter("publish_forwarded").build(),
             deliver_latency: meter.f64_histogram("deliver_latency_seconds").build(),
             hub_dispatch: meter.f64_histogram("hub_dispatch_seconds").build(),
@@ -584,6 +588,7 @@ pub struct Metrics {
     publish_received_total: Family<QosLabel, Counter>,
     publish_delivered_total: Family<QosLabel, Counter>,
     publish_dropped_total: Family<ReasonLabel, Counter>,
+    publish_resolved_undeliverable_total: Family<ReasonLabel, Counter>,
     publish_forwarded_total: Family<ReasonLabel, Counter>,
     deliver_latency_seconds: Histogram,
     hub_dispatch_seconds: Family<CommandLabel, Histogram>,
@@ -906,7 +911,18 @@ impl Metrics {
         let publish_dropped_total = register_family(
             &mut registry,
             "publish_dropped",
-            "Messages dropped, by reason (no-subscriber, queue-overflow, backlog-overflow, outbound-full, outbound-id-write-failed, pending-cap, pending-cap-replay, settle-replay, settle-replay-refused, append-backlog-full, brownout, too-large, retained-replay-client-offline, retained-replay-read-failed, reserved)",
+            "Messages dropped, by reason (no-subscriber, queue-overflow, backlog-overflow, outbound-full, outbound-id-write-failed, pending-cap, pending-cap-replay, settle-replay, settle-replay-refused, append-backlog-full, brownout, too-large, retained-replay-client-offline, retained-replay-read-failed, reserved, peer-unreachable)",
+        );
+        let publish_resolved_undeliverable_total = register_family(
+            &mut registry,
+            "publish_resolved_undeliverable",
+            "QoS >= 1 publishes acknowledged to their publisher although a node that \
+             owned a subscriber never accepted them, because that node is gone \
+             (ADR 0087 D2, D9), by reason: peer-gone (membership confirmed the node \
+             gone: its tombstone pruned unanswered, or a new generation joined), \
+             no-shared-member (a $share group whose last members were on it), \
+             hold-expired (durable mode, until 0087-T5: the node stayed out of reach \
+             for the eight-tick hold)",
         );
 
         // Issue #480: the fraction of publishes that cross a node boundary, which
@@ -1793,6 +1809,7 @@ impl Metrics {
             publish_received_total,
             publish_delivered_total,
             publish_dropped_total,
+            publish_resolved_undeliverable_total,
             publish_forwarded_total,
             deliver_latency_seconds,
             hub_dispatch_seconds,
@@ -2079,6 +2096,23 @@ impl Metrics {
             .inc_by(n);
         self.otel
             .publish_dropped
+            .add(n, &[KeyValue::new("reason", reason.to_string())]);
+    }
+
+    /// Count `n` publishes acknowledged although a node that owned a subscriber never
+    /// accepted them, because that node is gone (ADR 0087 D2, D9). `n == 0` touches
+    /// nothing, so an idle reason never appears as a series.
+    pub fn publish_resolved_undeliverable_by(&self, reason: &str, n: u64) {
+        if n == 0 {
+            return;
+        }
+        self.publish_resolved_undeliverable_total
+            .get_or_create(&ReasonLabel {
+                reason: reason.to_string(),
+            })
+            .inc_by(n);
+        self.otel
+            .publish_resolved_undeliverable
             .add(n, &[KeyValue::new("reason", reason.to_string())]);
     }
 

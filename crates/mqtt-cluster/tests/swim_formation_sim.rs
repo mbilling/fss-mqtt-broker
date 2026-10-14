@@ -255,9 +255,13 @@ impl Endpoint {
     fn from_outputs(outputs: Vec<Output>) -> Vec<Emit> {
         outputs
             .into_iter()
-            .map(|o| match o {
-                Output::Datagram { to, bytes } => Emit::Datagram { to, bytes },
-                Output::Event(MembershipEvent { id, state, .. }) => Emit::State { id: id.0, state },
+            .filter_map(|o| match o {
+                Output::Datagram { to, bytes } => Some(Emit::Datagram { to, bytes }),
+                // Confirmation that a member is gone changes no state in the view.
+                Output::Event(MembershipEvent { gone: true, .. }) => None,
+                Output::Event(MembershipEvent { id, state, .. }) => {
+                    Some(Emit::State { id: id.0, state })
+                }
             })
             .collect()
     }
@@ -267,7 +271,7 @@ impl Endpoint {
     fn model_emit(auth: &SwimAuth, prime_first_contact: bool, actions: Vec<Action>) -> Vec<Emit> {
         actions
             .into_iter()
-            .map(|a| match a {
+            .filter_map(|a| match a {
                 Action::Send { to, msg } => {
                     let prime = matches!(msg.kind, Kind::Join | Kind::Sync);
                     let payload = postcard::to_allocvec(&msg).expect("encodes");
@@ -276,9 +280,10 @@ impl Endpoint {
                     } else {
                         auth.seal(&payload, prime)
                     };
-                    Emit::Datagram { to, bytes }
+                    Some(Emit::Datagram { to, bytes })
                 }
-                Action::StateChange { id, state, .. } => Emit::State { id: id.0, state },
+                Action::StateChange { id, state, .. } => Some(Emit::State { id: id.0, state }),
+                Action::Gone { .. } => None,
             })
             .collect()
     }
