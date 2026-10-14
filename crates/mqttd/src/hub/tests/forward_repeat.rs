@@ -74,6 +74,7 @@ impl Rig {
             ctl: peer_tx.clone(),
             tx: peer_tx,
             cert_serial: None,
+            cert_ends: crate::hub::LinkCertEnds::default(),
             proto: mqtt_cluster::peer::PROTO_MAX,
             depth: Arc::default(),
         })
@@ -425,6 +426,7 @@ async fn a_forward_retransmitted_across_a_dead_verdict_is_applied_once() {
             ctl: peer_tx.clone(),
             tx: peer_tx,
             cert_serial: None,
+            cert_ends: crate::hub::LinkCertEnds::default(),
             proto: mqtt_cluster::peer::PROTO_MAX,
             depth: Arc::default(),
         })

@@ -96,20 +96,103 @@ cd deploy/systemd
 # "SIGNED per-node" and never become ready.
 ./gen-certs.sh ca
 
-# Once per node: <MQTTD_NODE_ID> <MQTTD_PEER_ADVERTISE host> [names your CLIENTS dial]
-./gen-certs.sh node mqttd-1 mqttd-1.internal.example.com mqtt.example.com
-./gen-certs.sh node mqttd-2 mqttd-2.internal.example.com mqtt.example.com
-./gen-certs.sh node mqttd-3 mqttd-3.internal.example.com mqtt.example.com
+# Once per node: --lifetime, then <MQTTD_NODE_ID> <MQTTD_PEER_ADVERTISE host> [names your
+# CLIENTS dial]. The lifetime is yours to state: there is no default (see below).
+./gen-certs.sh node --lifetime 24h mqttd-1 mqttd-1.internal.example.com mqtt.example.com
+./gen-certs.sh node --lifetime 24h mqttd-2 mqttd-2.internal.example.com mqtt.example.com
+./gen-certs.sh node --lifetime 24h mqttd-3 mqttd-3.internal.example.com mqtt.example.com
+
+# The (empty) revocation list, so that putting a node out later is a file replacement.
+./gen-certs.sh crl
 ```
 
-Each `node` run prints the exact `scp` and per-file `install` commands for that host — five
+Each `node` run prints when what it minted ends and the date to renew it by, then the exact
+`scp` and per-file `install` commands for that host — five
 files (`peer-ca.pem`, `peer.pem`/`peer.key`, `server.pem`/`server.key`), each installed with
 its own mode. There is deliberately **no `chmod /etc/mqttd/tls/*.key`** step: a glob hands
 every key in that directory to the `mqttd` group, which is precisely how a CA key ends up
 readable by the service account it must never be readable by.
 
 Then keep `mqttd-pki/ca/peer-ca.key` on the admin machine or move it to offline storage. You
-need it again only to add a node.
+need it again to add a node, to renew one and to revoke one, which with short lifetimes is
+often: plan where it lives accordingly.
+
+### The lifetime is stated, and renewing is yours
+
+`node` and `renew` mint **nothing** without `--lifetime` (`<N>h`, `<N>d` or `<N>m`;
+`LEAF_LIFETIME` in the environment states it too). There is no default: how long a node's
+certificate lives is decided by whoever deploys the cluster
+([ADR 0088](../../docs/adr/0088-credential-lifetimes-and-rotation.md)). Without it the
+script names the option and exits 2.
+
+Each run prints when the certificates end and the date to **renew by**:
+
+```
+  lifetime      24h, as stated (--lifetime 24h) — checked against both certificates
+  valid until   2026-10-15T02:34:41Z   (Oct 15 02:34:41 2026 GMT, read back from peer.pem)
+  RENEW BY      2026-10-14T18:35:09Z   — 667 thousandths of the lifetime, where a broker
+                starts warning about it (tls.expiry_warn_permille). ...
+```
+
+The renew-by date is two thirds of the lifetime, which is where the broker starts warning
+about the file (`tls.expiry_warn_permille`, default `667`; see
+[OPERATIONS](../../docs/OPERATIONS.md#certificate-lifetimes-what-the-broker-tells-you-adr-0088)).
+If your brokers run another threshold, set `RENEW_AT_PERMILLE` to it. Expiry is strict: a
+node whose certificate has ended is out of the cluster until it is given a new one. Short
+is the aim (hours to a day), because a certificate is good until it ends whether or not the
+node it names is still yours; a short lifetime is also a renewal you owe that often, so
+automate it (a timer on the admin machine that runs `renew` and the install below) before
+you choose hours.
+
+The CA and the revocation list are announced instead of asked for: the CA lives `CA_DAYS`
+(3650) and every `ca` run prints its end; the list's `nextUpdate` is 30 days unless
+`--crl-lifetime` says otherwise, printed with its own re-issue-by date.
+
+### Renewing a node
+
+```sh
+./gen-certs.sh renew --lifetime 24h mqttd-1
+```
+
+New certificates and new keys (`--reuse-key` keeps the keys) for a node this PKI directory
+already holds, with the same CN and the same SANs, read back from the certificates being
+replaced. It prints the `scp` and `install` commands for the four leaf files. Install them
+over the old ones and run `sudo systemctl reload mqttd`, or wait for the file watcher if
+`MQTTD_CONFIG_WATCH` is set: the broker serves the new certificate on the next
+handshake and signs its next gossip datagram with the new key, with no restart. A node on
+its new certificate and one on its old accept each other, so renew one node at a time, in
+any order. `mqttd --check-tls` on the node shows the new window.
+
+A node that was down past the end of its certificate is renewed the same way; it stays out
+until the new files are on it.
+
+### Revoking a node, and decommissioning one
+
+`mqttd --decommission` hands a node's data to the others and stops it. It does not make the
+node's certificate stop working: that certificate is good until it ends. So removing a node
+for good has a last step, on the admin machine:
+
+```sh
+./gen-certs.sh revoke mqttd-3
+```
+
+Every certificate this CA issued to that node id goes on the cluster's revocation list,
+`mqttd-pki/ca/peer-crl.pem`, which the script verifies against the CA before writing it.
+Copy it to every **remaining** node as the file `MQTTD_PEER_TLS_CRL` names and reload: each
+node ends the revoked node's established links, refuses its handshakes and drops its
+gossip, with no restart. This is also how a node is put out *before* its certificate ends,
+which is the reason to do it when a host is lost or a key may have leaked.
+
+The reload is live only on a broker that already runs with `MQTTD_PEER_TLS_CRL`: the path
+is configuration, read at startup. Set it when you deploy, pointing at the empty list
+`./gen-certs.sh crl` issues (it is commented out in `mqttd.env.example`). Re-issue the list
+before its `nextUpdate` with `./gen-certs.sh crl` and distribute it the same way; a list
+past it still loads and is enforced as it is, and the broker warns about it.
+
+The CA keeps a ledger for this next to its key (`ca/index.txt`, `ca/issued/`,
+`ca/crlnumber`): which certificates were issued and which are revoked. It holds no key.
+`scripts/deploy-smoke.sh` runs `renew` and `revoke` against two running nodes on every CI
+run.
 
 **Four rules the peer certificate must satisfy**, listed in `mqttd.env.example` at the point
 of use because they carry over to your own CA — three of the four fail at runtime rather than
@@ -125,8 +208,9 @@ at issue time:
    gossip signing key (ADR 0022), and an RSA one gives you a clean TLS handshake followed by
    a hard startup failure reading `unsupported or unparseable gossip signing key`.
 
-This is a **starter PKI**: self-signed, unrevocable, disposable. Replace it before
-production; the four rules are the part that survives.
+This is a **starter PKI**: self-signed, a CA key in a local directory, disposable. Replace
+it before production; the four rules, a stated lifetime and a revocation list every node
+reads are the parts that survive.
 
 **Client mTLS needs a SECOND CA.** `MQTTD_TLS_CLIENT_CA` must not point at `peer-ca.pem`,
 and nothing here mints a client CA — you bring one. The cluster bus trusts every leaf under

@@ -582,7 +582,7 @@ cosign verify ghcr.io/mbilling/fss-mqtt-broker:1.0.18 \
 
 **Kubernetes**
 ```sh
-NS=mqttd REPLICAS=3 ./deploy/helm/mqttd/bootstrap.sh
+LEAF_DAYS=30 NS=mqttd REPLICAS=3 ./deploy/helm/mqttd/bootstrap.sh
 helm install mqttd deploy/helm/mqttd -n mqttd --set replicaCount=3 \
   --set secrets.tls.secretName=mqttd-tls --set secrets.peerTls.secretName=mqttd-peer-tls \
   --set secrets.gossipKey.secretName=mqttd-gossip

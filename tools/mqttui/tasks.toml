@@ -595,6 +595,9 @@ booted from and made to route to each other. So the four peer-certificate rules 
 to get wrong — CN equals the node id, the SAN covers the MQTTD_PEER_ADVERTISE host, both
 serverAuth and clientAuth, an ECDSA key rather than RSA — are exercised rather than merely
 documented, as is the one-CA-per-cluster contract (a per-host CA forms no mesh at all).
+The same two nodes then prove gen-certs.sh's other verbs against a running broker (ADR 0088):
+no lifetime stated, nothing minted; a `renew` is served after a reload with no restart; a
+`revoke` ends the revoked node's link and keeps it out.
 
 Proves anonymous clients are refused, a cleartext client is refused, a generated password
 authenticates, the ACL confines a device to its own subtree, a publish on node 1 reaches a

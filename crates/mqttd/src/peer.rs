@@ -35,7 +35,7 @@ use mqtt_cluster::peer::{self, PeerMessage};
 use mqtt_cluster::stage_timing;
 use mqtt_cluster::NodeId;
 use mqtt_net::tls;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -67,26 +67,85 @@ fn peer_cert_cn(state: &tokio_rustls::rustls::CommonState) -> Option<String> {
     }
 }
 
-/// The remote leaf certificate's serial from an established peer TLS session —
-/// the fact a cluster CRL names, recorded with the link so a revocation sweep can
-/// re-check it (ADR 0040 T4).
-fn peer_cert_serial(state: &tokio_rustls::rustls::CommonState) -> Option<Vec<u8>> {
-    let leaf = state.peer_certificates()?.first()?;
-    mqtt_auth::mtls::serial_from_cert(leaf)
+/// The remote leaf certificate from an established peer TLS session, as DER.
+fn peer_leaf(state: &tokio_rustls::rustls::CommonState) -> Option<&[u8]> {
+    Some(state.peer_certificates()?.first()?.as_ref())
 }
 
-/// Gate a freshly-handshaken peer link on the **live** cluster CRL (ADR 0040 T4):
-/// the same slot the gossip verifier reads per datagram, so a republished CRL
-/// refuses new links immediately — on the ACCEPT side (a revoked node dialing us)
-/// and on the DIAL side (us dialing a node whose cert was revoked; the TLS
-/// verifier alone would still admit it, since the connector checks chain + name,
-/// not revocation). Returns the remote serial for the link's registration, or
-/// `Err(())` when the link must be dropped.
+/// What a peer link was admitted under: the remote leaf's serial — the fact a cluster
+/// CRL names, recorded with the link so a revocation sweep can re-check it (ADR 0040
+/// T4) — and when the certificates of the handshake end, so the link is ended then
+/// (ADR 0088 D3). Empty on a plaintext mesh.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LinkCert {
+    serial: Option<Vec<u8>>,
+    ends: crate::hub::LinkCertEnds,
+}
+
+/// This node's own cluster-bus certificate's `notAfter`, Unix seconds — `i64::MAX` when
+/// unknown. Set at startup and by every reload that commits a new peer certificate
+/// ([`Reloader::attach_peer_tls`](crate::reload::Reloader::attach_peer_tls)); read at each
+/// peer handshake (ADR 0088 D4).
+pub type OwnCertEnd = Arc<std::sync::atomic::AtomicI64>;
+
+/// An [`OwnCertEnd`] that knows of no end: for tests and setups whose own certificate
+/// is not tracked.
+#[must_use]
+pub fn unknown_cert_end() -> OwnCertEnd {
+    Arc::new(std::sync::atomic::AtomicI64::new(i64::MAX))
+}
+
+/// The wall clock in Unix seconds.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// When a refused link was last logged at WARN, Unix seconds — a node whose certificate
+/// expired would otherwise log every redial.
+static LAST_EXPIRY_REFUSAL_LOG: AtomicI64 = AtomicI64::new(i64::MIN);
+
+/// Log a link refused for an expired certificate at WARN at most once a minute, and at
+/// DEBUG otherwise.
+fn log_expiry_refusal(now: i64, whose: &'static str) {
+    let last = LAST_EXPIRY_REFUSAL_LOG.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= 60
+        && LAST_EXPIRY_REFUSAL_LOG
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        warn!(
+            whose,
+            "peer link refused: a cluster-bus certificate has expired; no grace (ADR 0088 D4)"
+        );
+    } else {
+        debug!(
+            whose,
+            "peer link refused: a cluster-bus certificate has expired"
+        );
+    }
+}
+
+/// Gate a freshly-handshaken peer link, on the ACCEPT side (a node dialing us) and on
+/// the DIAL side (us dialing a node), and return what the link is admitted under, or
+/// `Err(())` when it must be dropped:
+///
+/// - on the **live** cluster CRL (ADR 0040 T4): the same slot the gossip verifier reads
+///   per datagram, so a republished CRL refuses new links immediately — the TLS
+///   verifier alone would still admit a revoked node, since it checks chain and name,
+///   not revocation;
+/// - on **expiry** (ADR 0088 D4): the peer's leaf and this node's own certificate must
+///   both be within `notAfter`. The TLS verifier has checked the peer's at a full
+///   handshake already; this holds whatever the handshake was, and a node whose own
+///   certificate has run out neither dials nor accepts.
 fn admit_peer_link(
     state: &tokio_rustls::rustls::CommonState,
     crl: &crate::reload::SwimCrlSlot,
-) -> Result<Option<Vec<u8>>, ()> {
-    let serial = peer_cert_serial(state);
+    own_end: &OwnCertEnd,
+) -> Result<LinkCert, ()> {
+    let leaf = peer_leaf(state);
+    let serial = leaf.and_then(mqtt_auth::mtls::serial_from_cert);
     if let (Some(serial), Some(list)) = (
         &serial,
         crl.read()
@@ -98,7 +157,24 @@ fn admit_peer_link(
             return Err(());
         }
     }
-    Ok(serial)
+    let now = unix_now();
+    let own = Some(own_end.load(Ordering::Relaxed)).filter(|end| *end != i64::MAX);
+    if own.is_some_and(|end| now > end) {
+        log_expiry_refusal(now, "own");
+        return Err(());
+    }
+    let peer = leaf.and_then(mqtt_auth::mtls::not_after_from_cert);
+    if peer.is_some_and(|end| now > end) {
+        log_expiry_refusal(now, "peer");
+        return Err(());
+    }
+    // A plaintext mesh has no certificates, and so no ends.
+    let ends = if leaf.is_some() {
+        crate::hub::LinkCertEnds { peer, own }
+    } else {
+        crate::hub::LinkCertEnds::default()
+    };
+    Ok(LinkCert { serial, ends })
 }
 
 /// The cluster bus mTLS context, built once from the cluster CA + node cert and
@@ -126,6 +202,9 @@ pub struct PeerTls {
     pub gossip_crl: crate::reload::SwimCrlSlot,
     /// The configured CRL path, kept so the reload closure and the file watcher re-read it.
     pub crl_path: Option<std::path::PathBuf>,
+    /// When this node's own certificate ends (ADR 0088 D4): a link is admitted only while
+    /// it has not, and ends when it does. Shared with the reloader.
+    pub own_cert_end: OwnCertEnd,
 }
 
 /// A fixed (never-reloading) acceptor handle — for tests and setups without a
@@ -374,9 +453,11 @@ pub async fn serve_listener_with_ingress(
                     let result = match (&tls, acceptor) {
                         (Some(t), Some(acceptor)) => match acceptor.accept(stream).await {
                             Ok(s) => {
-                                let Ok(serial) = admit_peer_link(s.get_ref().1, &t.gossip_crl)
+                                let Ok(cert) =
+                                    admit_peer_link(s.get_ref().1, &t.gossip_crl, &t.own_cert_end)
                                 else {
-                                    return; // revoked: fail closed (ADR 0040 T4)
+                                    // Revoked or expired: fail closed (ADR 0040 T4, 0088 D4).
+                                    return;
                                 };
                                 let expected_cn = peer_cert_cn(s.get_ref().1);
                                 handle(
@@ -386,7 +467,7 @@ pub async fn serve_listener_with_ingress(
                                     false,
                                     expected_cn,
                                     None,
-                                    serial,
+                                    cert,
                                     policy,
                                     plane,
                                     ingress,
@@ -401,8 +482,17 @@ pub async fn serve_listener_with_ingress(
                         },
                         _ => {
                             handle(
-                                stream, local, hub, false, None, None, None, policy, plane,
-                                ingress, state,
+                                stream,
+                                local,
+                                hub,
+                                false,
+                                None,
+                                None,
+                                LinkCert::default(),
+                                policy,
+                                plane,
+                                ingress,
+                                state,
                             )
                             .await
                         }
@@ -623,28 +713,32 @@ async fn dial(
                         .await
                         .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()));
                         match secured {
-                            // Revoked (ADR 0040 T4): fail closed, but keep
-                            // redialing — an un-revocation (new CRL) heals.
-                            Ok(s) => match admit_peer_link(s.get_ref().1, &t.gossip_crl) {
-                                Ok(serial) => {
-                                    let expected_cn = peer_cert_cn(s.get_ref().1);
-                                    handle(
-                                        s,
-                                        local.clone(),
-                                        hub.clone(),
-                                        true,
-                                        expected_cn,
-                                        Some(dialed()),
-                                        serial,
-                                        None,
-                                        plane.clone(),
-                                        ingress.clone(),
-                                        state.clone(),
-                                    )
-                                    .await
+                            // Revoked or expired (ADR 0040 T4, 0088 D4): fail closed,
+                            // but keep redialing — a new CRL or a renewed certificate
+                            // heals.
+                            Ok(s) => {
+                                match admit_peer_link(s.get_ref().1, &t.gossip_crl, &t.own_cert_end)
+                                {
+                                    Ok(cert) => {
+                                        let expected_cn = peer_cert_cn(s.get_ref().1);
+                                        handle(
+                                            s,
+                                            local.clone(),
+                                            hub.clone(),
+                                            true,
+                                            expected_cn,
+                                            Some(dialed()),
+                                            cert,
+                                            None,
+                                            plane.clone(),
+                                            ingress.clone(),
+                                            state.clone(),
+                                        )
+                                        .await
+                                    }
+                                    Err(()) => Ok(LinkOutcome::Closed),
                                 }
-                                Err(()) => Ok(LinkOutcome::Closed),
-                            },
+                            }
                             Err(e) => {
                                 debug!(%addr, error = %e, "peer mTLS handshake failed; will retry");
                                 Ok(LinkOutcome::Closed)
@@ -659,7 +753,7 @@ async fn dial(
                             true,
                             None,
                             Some(dialed()),
-                            None,
+                            LinkCert::default(),
                             None,
                             plane.clone(),
                             ingress.clone(),
@@ -850,7 +944,7 @@ async fn handle<S>(
     initiated: bool,
     expected_cn: Option<String>,
     dialed: Option<Dialed<'_>>,
-    cert_serial: Option<Vec<u8>>,
+    cert: LinkCert,
     client_policy: Option<Arc<ConnPolicy>>,
     plane: Option<DurablePlane>,
     ingress: Option<Arc<IngressCredit>>,
@@ -1021,7 +1115,8 @@ where
             tx: out_tx,
             ctl: ctl_tx,
             depth: depth.clone(),
-            cert_serial,
+            cert_serial: cert.serial,
+            cert_ends: cert.ends,
             proto,
         })
         .is_err()
@@ -2258,7 +2353,7 @@ mod tests {
                 true,
                 None,
                 None,
-                None,
+                LinkCert::default(),
                 None,
                 None,
                 None,

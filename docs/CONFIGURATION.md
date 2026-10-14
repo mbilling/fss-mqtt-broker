@@ -6,7 +6,7 @@ Source of truth: `mqtt_config::ENV_VARS` and `Config::overlay_from` in `crates/m
 
 The annotated template is [`mqttd.example.toml`](mqttd.example.toml). Capacity arithmetic lives in [SIZING.md](SIZING.md); day-2 procedures in [OPERATIONS.md](OPERATIONS.md). This page is the inventory of knobs, not the runbook.
 
-Documented overlay variables: **125** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) and any experimental side-channel knobs below.
+Documented overlay variables: **126** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) and any experimental side-channel knobs below.
 
 ## Node identity
 
@@ -46,6 +46,7 @@ Documented overlay variables: **125** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) 
 | `MQTTD_TLS_ALLOW_TLS12` | `tls.allow_tls12` | Admit TLS 1.2 clients on the client-facing TLS listener (`MQTTD_TLS_ALLOW_TLS12`). **Off by default and loudly logged when on** — a reduced posture for fleets whose device firmware cannot negotiate 1.3. Never affects the cluster bus or QUIC (1.3 by protocol). Even when on, 1.2 is HARDENED: ECDHE+AEAD suites only, and Extended Master Secret (RFC 7627) required — see `Tls::allow_unsafe_tls12_features`. |
 | `MQTTD_TLS_ALLOW_UNSAFE_TLS12_FEATURES` | `tls.allow_unsafe_tls12_features` | Relax the hardened TLS 1.2 posture (`MQTTD_TLS_ALLOW_UNSAFE_TLS12_FEATURES`): admits legacy clients that cannot do Extended Master Secret, reopening the triple-handshake surface for exactly those clients. **Off by default**, loudly logged when on, and a configuration ERROR without `Tls::allow_tls12` — a relaxation of something that is off cannot mean anything. |
 | `MQTTD_TLS_EXPIRY_WARN_PERMILLE` | `tls.expiry_warn_permille` | How much of its lifetime a certificate, CA or revocation list may spend before the broker warns about it (`MQTTD_TLS_EXPIRY_WARN_PERMILLE`, ADR 0088 D2), in thousandths: `1..=1000`, default `667` (two thirds). It applies to every TLS material the broker loads, the cluster bus's and the admin listener's included, and is the threshold of the log warning, of `mqttd_tls_expiry_warn_ratio` (which the shipped alert compares against) and of `--check-tls` and `--check-config`. Per mille and not a fraction because this struct derives `Eq`; `1000` warns only at expiry. Read at startup. |
+| `MQTTD_TLS_END_SESSIONS_AT_CERT_EXPIRY` | `tls.end_sessions_at_cert_expiry` | End a client session when the certificate it was admitted with passes `notAfter` (`MQTTD_TLS_END_SESSIONS_AT_CERT_EXPIRY`, `1`/`0`; ADR 0088 O2). **Off by default**: devices with long sessions and short certificates exist, and a certificate is otherwise checked at the handshake only. On, the session is ended within a second of its leaf's end as a revoked one is (v5: DISCONNECT `0x87`), counted as `mqttd_revocation_evictions_total{reason="cert-expired"}`, and the client must reconnect with a valid certificate. Applies to the TLS, WSS and QUIC listeners' client certificates; a session relayed to another node (ADR 0005) is not covered. Cluster peer links are always ended at expiry and have no setting. Read at startup. |
 
 ## Authentication and authorization
 

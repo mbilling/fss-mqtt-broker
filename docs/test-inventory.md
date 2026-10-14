@@ -37,7 +37,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/history-check/src/main.rs` — 0 test(s)
 
 
-## `crates/mqtt-auth/src/lib.rs` — 132 test(s)
+## `crates/mqtt-auth/src/lib.rs` — 134 test(s)
 
 - `acl::tests::a_bad_client_id_does_not_disturb_rules_that_never_use_it`
 - `acl::tests::a_bare_percent_is_literal`
@@ -103,6 +103,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `enhanced::tests::method_name_is_advertised`
 - `enhanced::tests::unknown_subject_is_challenged_then_fails`
 - `enhanced::tests::wrong_secret_fails`
+- `mtls::tests::a_certificates_end_is_read_in_unix_seconds`
 - `mtls::tests::a_missing_selected_source_yields_no_identity_and_never_falls_back`
 - `mtls::tests::a_multi_common_name_subject_yields_no_identity`
 - `mtls::tests::a_uri_subject_can_never_be_substituted_into_a_topic_pattern`
@@ -142,6 +143,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `signed_gossip::tests::a_cert_without_the_urn_attests_no_domain`
 - `signed_gossip::tests::a_crl_not_signed_by_the_cluster_ca_is_rejected_at_load`
 - `signed_gossip::tests::a_failure_domain_urn_in_the_san_is_returned`
+- `signed_gossip::tests::a_minute_of_clock_difference_is_allowed_on_not_before_and_none_on_not_after`
 - `signed_gossip::tests::a_not_yet_valid_certificate_is_rejected`
 - `signed_gossip::tests::a_revoked_certificate_is_rejected`
 - `signed_gossip::tests::a_signature_from_another_key_is_rejected`
@@ -262,7 +264,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 401 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 413 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -566,6 +568,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `swim::tests::a_node_told_it_is_suspected_answers_with_its_refutation_first`
 - `swim::tests::a_peer_marks_a_leaving_node_dead_immediately`
 - `swim::tests::a_ping_req_naming_an_unroutable_target_is_relayed_to_our_learned_address`
+- `swim::tests::a_probe_overtaken_by_a_longer_window_is_sent_afresh_when_it_lapses`
 - `swim::tests::a_probe_rescued_only_by_helpers_still_counts_toward_the_regreet`
 - `swim::tests::a_pruned_member_is_greeted_once_as_its_tombstone_goes`
 - `swim::tests::a_receiver_learns_a_peers_gossiped_failure_domain`
@@ -577,11 +580,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `swim::tests::a_stale_circulating_dead_claim_cannot_rekill_the_refuted_member`
 - `swim::tests::a_suspect_ahead_of_a_stale_claim_is_saved_by_its_ack_alone`
 - `swim::tests::a_suspect_is_probed_once_more_before_it_is_declared_dead`
+- `swim::tests::a_suspect_spared_on_a_stale_claim_is_asked_with_the_claim_held_now`
 - `swim::tests::a_suspect_that_answers_without_ever_refuting_is_asked_once_per_window`
 - `swim::tests::a_suspect_that_refutes_in_its_ack_is_not_declared_dead`
+- `swim::tests::a_suspicion_at_a_higher_incarnation_leaves_the_last_probe_standing`
 - `swim::tests::a_tombstone_fences_the_dead_life_but_not_a_new_one`
 - `swim::tests::a_tombstone_is_pruned_after_its_ttl_and_the_id_can_rejoin`
 - `swim::tests::address_change_at_higher_incarnation_is_adopted`
+- `swim::tests::an_ack_from_an_earlier_life_does_not_answer_the_last_probe`
 - `swim::tests::an_unacquainted_seed_is_re_greeted_until_it_answers`
 - `swim::tests::an_unlabelled_relay_does_not_erase_a_known_domain`
 - `swim::tests::an_unroutable_self_claim_cannot_overwrite_a_source_learned_address`
@@ -613,6 +619,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `swim::tests::refutation_resets_accumulated_suspicions`
 - `swim::tests::refutes_suspicion_about_self`
 - `swim::tests::the_last_probe_is_one_datagram_per_suspect_per_window`
+- `swim::tests::the_probe_period_runs_from_when_a_round_was_due_not_from_a_late_tick`
 - `swim::tests::the_suspicion_window_grows_with_log_n_only_when_asked`
 - `swim::tests::with_the_v1_1_rule_a_rescued_probe_resets_the_regreet_count`
 - `swim_auth::first_contact_tests::a_rotated_signer_primes_every_destination_again`
@@ -660,6 +667,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `swim_driver::cert_request_tests::only_a_datagram_signed_by_the_suspect_answers_its_last_probe`
 - `swim_driver::cert_request_tests::the_request_limiter_bounds_its_rate_and_its_table`
 - `swim_driver::cert_request_tests::the_suspects_own_signed_ack_answers_its_last_probe`
+- `swim_driver::stall_tests::a_persistently_late_node_declares_a_dead_member_within_five_wake_ups_of_on_time`
+- `swim_driver::stall_tests::a_prober_stalled_past_the_ack_timeout_reads_the_ack_before_it_gives_up`
+- `swim_driver::stall_tests::a_suspect_that_stays_silent_is_declared_dead_when_the_stalled_prober_wakes`
+- `swim_driver::stall_tests::an_ack_already_in_the_socket_beats_the_tick_that_would_give_up_on_it`
+- `swim_driver::stall_tests::the_read_ahead_of_a_tick_finds_a_datagram_the_runtime_has_not_noticed`
+- `swim_driver::stall_tests::the_read_ahead_of_a_tick_is_bounded`
+- `swim_driver::stall_tests::the_stall_watch_reports_a_wake_up_more_than_two_ticks_late`
 - `swim_driver::tests::a_self_claim_contradicting_the_certificate_is_rejected`
 - `swim_driver::tests::a_signed_relay_cannot_assert_a_third_partys_domain`
 - `swim_driver::tests::an_agreeing_self_claim_passes_and_an_unattested_one_is_kept`
@@ -691,13 +705,16 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `three_nodes_converge_then_detect_failure`
 - `two_nodes_discover_each_other`
 
-## `crates/mqtt-cluster/tests/swim_formation_sim.rs` — 14 test(s)
+## `crates/mqtt-cluster/tests/swim_formation_sim.rs` — 18 test(s)
 
 - `a_cluster_part_way_through_the_upgrade_from_v1_1_forms`
 - `a_formation_run_is_reproducible_from_its_seed`
 - `a_member_cut_off_for_up_to_two_seconds_is_not_declared_dead`
 - `a_member_falsely_declared_dead_is_readmitted_within_the_tombstone_ttl`
 - `a_member_that_cannot_complete_a_round_trip_is_declared_dead_as_before`
+- `a_node_stopped_for_two_seconds_neither_dies_nor_declares`
+- `a_prober_stalled_on_its_last_probe_declares_nobody_dead`
+- `a_real_death_is_seen_on_time_by_survivors_that_are_all_late`
 - `a_signed_cluster_forms_with_no_false_suspicion_at_any_size`
 - `a_v1_1_node_still_declares_what_the_last_probe_would_have_spared`
 - `false_dead_report` — `#[ignore]`d
@@ -706,6 +723,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `one_link_lost_one_way_raises_no_verdict`
 - `packet_loss_neither_keeps_a_dead_member_nor_adds_false_verdicts`
 - `the_v1_1_rules_reproduce_the_formation_storm_and_preshared_certificates_remove_it`
+- `with_ticks_on_no_grid_a_cut_of_two_seconds_less_twice_the_latency_ends_in_no_dead`
 - `without_the_last_probe_a_short_cut_ends_in_a_false_dead`
 
 ## `crates/mqtt-cluster/tests/swim_sim.rs` — 6 test(s)
@@ -786,7 +804,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `publish_codec_round_trip_clears_the_floor`
 
-## `crates/mqtt-config/src/lib.rs` — 50 test(s)
+## `crates/mqtt-config/src/lib.rs` — 51 test(s)
 
 - `tests::a_backup_dir_inside_the_data_dir_is_a_config_error`
 - `tests::a_bad_enum_value_is_rejected`
@@ -806,6 +824,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::defaults_are_secure`
 - `tests::durable_on_without_a_data_dir_refuses_naming_both_remedies`
 - `tests::each_remedy_individually_unblocks_validation`
+- `tests::ending_client_sessions_at_certificate_expiry_is_off_by_default`
 - `tests::env_overlay_wins_over_the_file`
 - `tests::ephemeral_durability_is_exactly_durable_on_without_a_data_dir`
 - `tests::every_env_var_maps_to_a_config_key`
@@ -898,7 +917,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_reserved_tree_is_exactly_sys_and_below`
 - `tests::topic_name_validity_rejects_wildcards_and_emptiness`
 
-## `crates/mqtt-net/src/lib.rs` — 25 test(s)
+## `crates/mqtt-net/src/lib.rs` — 28 test(s)
 
 - `frame::tests::a_drain_grows_the_buffer_once_and_keeps_it`
 - `frame::tests::a_new_reader_takes_the_named_read_buffer`
@@ -913,6 +932,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `quic::tests::topic_slot_is_stable_and_in_range`
 - `quic::tests::topic_slot_spreads_across_the_pool`
 - `tests::only_tls_is_encrypted`
+- `tls::peer_bus_tests::a_peer_certificate_past_not_after_is_refused_with_no_tolerance`
+- `tls::peer_bus_tests::a_peer_certificate_up_to_a_minute_ahead_is_accepted_and_no_further`
+- `tls::peer_bus_tests::the_peer_bus_never_resumes_a_session`
 - `tls::tests::a_crl_without_client_auth_is_rejected`
 - `tls::tests::an_empty_or_missing_crl_file_is_rejected`
 - `tls::tests::builds_mtls_client_connector`
@@ -1384,7 +1406,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/bin/render_sample.rs` — 0 test(s)
 
 
-## `crates/mqttd-operator/src/lib.rs` — 36 test(s)
+## `crates/mqttd-operator/src/lib.rs` — 37 test(s)
 
 - `controller::tests::an_unknown_kind_has_no_gvk`
 - `controller::tests::every_rendered_kind_has_a_gvk`
@@ -1412,6 +1434,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `remediate::tests::fences_the_minority_founder_when_the_evidence_is_clear`
 - `remediate::tests::quantities_parse_format_and_refuse_the_unknown`
 - `remediate::tests::unreachable_pods_that_could_flip_the_verdict_block_the_fence`
+- `render::tests::cert_manager_certificates_carry_the_stated_lifetime_and_renewal_lead`
 - `render::tests::checksum_is_sha256_lowercase_hex`
 - `render::tests::cluster_established_is_rendered_only_once_bootstrapped`
 - `render::tests::preserves_the_operational_contracts`
@@ -1426,7 +1449,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 807 test(s)
+## `crates/mqttd/src/lib.rs` — 815 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1688,6 +1711,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::zone_fwd_proofs::the_early_return_does_not_change_who_receives_a_publish`
 - `hub::forwarding::zone_fwd_proofs::the_early_return_never_swallows_a_retained_broadcast`
 - `hub::forwarding::zone_fwd_proofs::the_interest_buffer_is_reused_across_publishes`
+- `hub::forwarding::zone_fwd_proofs::without_a_durable_plane_a_client_reconnecting_here_from_the_unreachable_peer_is_not_handed_the_held_publish`
 - `hub::forwarding::zone_fwd_proofs::without_a_durable_plane_nothing_stands_in_for_what_an_unreachable_peer_is_owed`
 - `hub::mesh::tests::a_moved_membership_invalidates_a_positive_answer`
 - `hub::mesh::tests::an_unstamped_cache_is_never_whole_on_a_cluster`
@@ -1841,6 +1865,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::brownout_refuses_growth_and_recovery_restores_it`
 - `hub::tests::brownout_refuses_the_ack_and_the_live_send_for_an_online_persistent_subscriber`
 - `hub::tests::brownout_refuses_the_publishers_ack_for_an_offline_persistent_subscriber`
+- `hub::tests::cert_expiry::a_client_session_outlives_its_certificate_unless_the_setting_is_on`
+- `hub::tests::cert_expiry::a_link_ends_at_the_earlier_of_its_two_certificates_and_names_whose`
+- `hub::tests::cert_expiry::a_link_ends_when_this_nodes_own_certificate_does`
+- `hub::tests::cert_expiry::a_link_whose_peer_certificate_ends_is_lost_and_the_peer_is_held_not_erased`
+- `hub::tests::cert_expiry::a_plaintext_link_has_no_end`
 - `hub::tests::clean_session_attach_wipes_prior_persistent_state`
 - `hub::tests::commands_sort_into_the_control_and_data_lanes`
 - `hub::tests::durable_failure_reasons_are_bounded`
@@ -1947,8 +1976,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::session_expiry_zero_discards_at_disconnect`
 - `hub::tests::settle_gate::a_held_ack_retires_on_the_sweep_when_the_window_closes_without_a_scan`
 - `hub::tests::settle_gate::a_held_publish_is_re_delivered_to_a_materialised_session_once_not_per_pass`
+- `hub::tests::settle_gate::a_new_persistent_session_created_after_a_held_publish_is_not_handed_it`
 - `hub::tests::settle_gate::a_proto_11_peer_gets_the_untagged_forward_and_an_untagged_replay_still_delivers`
 - `hub::tests::settle_gate::a_rerouted_forward_skips_a_session_that_already_holds_the_publish`
+- `hub::tests::settle_gate::a_session_created_after_a_held_publish_is_not_handed_it`
 - `hub::tests::settle_gate::a_session_the_original_fan_out_reached_is_not_re_delivered_to`
 - `hub::tests::settle_gate::a_settle_window_replay_skips_a_session_that_already_holds_the_publish`
 - `hub::tests::settle_gate::a_settled_node_with_no_durable_plane_still_skips_the_periodic_scan`
@@ -2591,6 +2622,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `plaintext_mesh_without_binding_still_routes`
 - `the_node_holding_a_peer_dead_keeps_dialing_it_and_serves_the_link`
 
+## `crates/mqttd/tests/peer_link_expiry.rs` — 2 test(s)
+
+- `a_peer_link_ends_within_a_minute_of_its_peers_certificate`
+- `an_expired_node_is_out_and_stays_out`
+
 ## `crates/mqttd/tests/persistence.rs` — 2 test(s)
 
 - `a_clean_session_does_not_survive_a_node_restart`
@@ -2977,9 +3013,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `membership_receipt_oracle_rejects_loss_duplicates_and_stale_bursts`
 - `membership_tcp_fixture_receives_all_data_before_each_socket_fence`
 
-## `crates/mqttd/tests/swim_formation_proc.rs` — 2 test(s)
+## `crates/mqttd/tests/swim_formation_proc.rs` — 3 test(s)
 
 - `a_broker_stopped_for_two_seconds_is_declared_dead_by_no_one` — `#[ignore]`d
+- `a_prober_stopped_with_its_last_probe_out_does_not_declare_the_suspect_dead` — `#[ignore]`d
 - `twelve_signed_brokers_form_a_whole_mesh_without_a_certificate_storm`
 
 ## `crates/mqttd/tests/swim_routing.rs` — 3 test(s)
