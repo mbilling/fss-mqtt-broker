@@ -49,7 +49,7 @@ ca.crt plus <pod>.crt / <pod>.key for EVERY ordinal 0..{{ sub (int .Values.repli
 is SIGNED per-node" in each log; if you instead see "does not match its certificate Common
 Name", a leaf's CN is not its pod name.
   Growing the cluster? Mint the new ordinals' leaves BEFORE raising replicaCount:
-    REPLICAS=<n> ./deploy/helm/mqttd/bootstrap.sh
+    LEAF_DAYS=<days> REPLICAS=<n> ./deploy/helm/mqttd/bootstrap.sh
 {{- if not .Values.secrets.gossipKey.secretName }}
 
 WARNING: secrets.peerTls is set but secrets.gossipKey is EMPTY. The peer links are

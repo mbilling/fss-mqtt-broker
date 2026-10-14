@@ -241,7 +241,9 @@ Compose on one host survives a *process* failure, not a machine failure. The sam
 environment shape moves to three machines two ways:
 
 - **systemd** ([`deploy/systemd/`](../deploy/systemd/)): `gen-certs.sh ca` once on
-  an admin box, `gen-certs.sh node <id> <hostname>` per machine, install the
+  an admin box, `gen-certs.sh node --lifetime <N>h <id> <hostname>` per machine
+  (the lifetime is yours to state; the script prints the date to renew by, and
+  `renew` and `revoke` are its other two verbs), install the
   hardened unit and the annotated env file. Five marked lines to edit per node —
   and they are exactly this tutorial's concepts: node id, the TLS material paths,
   `MQTTD_PEER_ADVERTISE` (an address the *other machines* can dial, never

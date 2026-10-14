@@ -161,7 +161,7 @@ chart.
 ## Quick start
 
 ```sh
-NS=mqttd REPLICAS=3 ./deploy/helm/mqttd/bootstrap.sh
+LEAF_DAYS=30 NS=mqttd REPLICAS=3 ./deploy/helm/mqttd/bootstrap.sh
 helm install mqttd deploy/helm/mqttd -n mqttd \
   --set replicaCount=3 \
   --set secrets.tls.secretName=mqttd-tls \

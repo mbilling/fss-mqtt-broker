@@ -334,6 +334,57 @@ between the two reads is described before it is served; the watcher's next reloa
 which that replacement causes, loads it. `--check-tls` also checks `[admin]` whenever its
 certificate is configured, while the running broker loads it only with `admin.bind`.
 
+## Amendment (2026-10-14): stated, renewable, revocable, as built in T2
+
+D1 and D5 are built as written. What they left open, and how each was settled:
+
+- **How a lifetime is written.** `--lifetime <N>h`, `<N>d` or `<N>m` on `node` and
+  `renew`; `LEAF_LIFETIME` in the environment states it too, and so does a set
+  `LEAF_DAYS`, the variable the script read before. A bare number is refused: it would be
+  days to one reader and hours to the next. The refusal exits 2 and writes nothing.
+- **Hours need `openssl ca`.** `openssl x509 -req` counts in whole days on every OpenSSL
+  before 3.4 and on LibreSSL. Leaves are signed by `openssl ca` with an explicit start and
+  end, and each is checked against the stated lifetime (`-checkend`) before it is
+  installed.
+- **The CA keeps a ledger**, because `openssl ca` writes one and a revocation list is
+  generated from it: `ca/index.txt`, `ca/issued/` (certificates, no keys) and
+  `ca/crlnumber`, next to the CA key. Serials are random.
+- **The renew-by date is the broker's warning point**: `RENEW_AT_PERMILLE` thousandths of
+  the lifetime, `667` unless set, which is `tls.expiry_warn_permille`'s default. The
+  script cannot read a broker's configuration, so a deployment that changed the threshold
+  sets both.
+- **`renew` reads the identity from what it replaces** (CN and SANs out of the node's
+  current certificates) and does not check them against the clock: an expired node is
+  the one that most needs it. A new key by default; `--reuse-key` keeps it.
+- **`revoke` takes a node id and revokes every certificate the CA issued to it**, not one
+  file: after two renewals three certificates name the node, and each is good until it
+  ends. A certificate from before the ledger is revoked from the node's directory. The
+  same id can be renewed afterwards; the new serials are not on the list.
+- **The list's `nextUpdate` is announced, not asked for**: 30 days unless
+  `--crl-lifetime`, printed with its own re-issue-by date, as the CA's end is printed.
+  `crl` issues the empty list and re-issues the current one.
+- **The list is live only where it was configured at startup.** `cluster.peer_tls.crl` is
+  a path read at start; the file behind it is what reloads. So the documented deployment
+  sets it from the first day, pointing at the empty list. The shipped
+  `mqttd.env.example` still has the line commented out: uncommenting it by default would
+  make a list every systemd deployment has to keep re-issuing.
+- **cert-manager issues per pod through its csi-driver, so there is no `Certificate`
+  object.** One `Certificate` has one Common Name, and the bus binds a node to its own.
+  The lifetime and the renewal lead are the volume's `csi.cert-manager.io/duration` and
+  `csi.cert-manager.io/renew-before`. The chart now renders that volume
+  (`secrets.peerTls.certManager`) and the operator does too
+  (`spec.secrets.peerTlsCertManager`); both require the two values. A volume written by
+  hand through `extraVolumes` is not checked.
+- **The chart's `bootstrap.sh` is a deployer too**: `LEAF_DAYS` lost its default. It
+  counts in whole days and has no revoke; it is the starter path.
+- **`mqttd --decommission` prints the step on every completed drain** and says it is for
+  a node leaving for good. The command cannot tell that from a restart: a Kubernetes
+  `preStop` runs it for both.
+
+Left as it was: `deploy/compose/init.sh` mints with a default lifetime (`CERT_DAYS`), and
+nothing revokes a departed pod's certificate on Kubernetes, where the lifetime is the
+bound.
+
 ## Not verified
 
 - T1 did not test what the broker does with a **cluster CA** that is past `notAfter`, or
@@ -345,5 +396,9 @@ certificate is configured, while the running broker loads it only with `admin.bi
   from `crates/mqttd/src/peer.rs` (admission checks the CRL; no expiry check or timer was
   found), not shown by a test. T3 starts by writing that test.
 - cert-manager's behaviour with lifetimes of hours under the chart's csi-driver layout was
-  not run.
+  not run. T2's volume is rendered and compared between the chart and the operator; no
+  cert-manager has issued from it. The `fs-group` attribute it sets (the pod's `fsGroup`)
+  is from the csi-driver's documentation, not from a run.
+- T2's test renews and revokes with SIGHUP as the trigger. The file watcher picking a
+  renewed leaf or a new list up was not run for this material (it shares the reload path).
 - The cost of gossiping accepted-key identifiers was not measured.

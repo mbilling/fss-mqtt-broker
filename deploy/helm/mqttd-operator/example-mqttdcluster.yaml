@@ -23,6 +23,13 @@ spec:
     tls: mqttd-server-tls
     acl: mqttd-acl
     peerTls: mqttd-peer-tls
+    # Instead of peerTls: one certificate per pod from cert-manager's csi-driver. The
+    # lifetime (duration) and the renewal lead (renewBefore) are required, with no default
+    # (ADR 0088); set renewBefore above a third of duration.
+    # peerTlsCertManager:
+    #   issuerName: mqttd-cluster-ca
+    #   duration: 24h
+    #   renewBefore: 10h
     gossipKey: mqttd-gossip-key
   persistence:
     size: 10Gi

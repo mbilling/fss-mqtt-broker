@@ -134,7 +134,8 @@ secrets:
   #      ITSELF once this Secret and gossipKey are both present, so it is not opt-in.
   #
   # SCALING: a new ordinal is a new node id and a new DNS name, so it needs its own leaf.
-  # Mint before you grow — `REPLICAS=<n> ./bootstrap.sh`, then raise replicaCount. A pod
+  # Mint before you grow — `LEAF_DAYS=<days> REPLICAS=<n> ./bootstrap.sh`, then raise
+  # replicaCount (the lifetime of the new leaves is stated; there is no default). A pod
   # whose ordinal has no leaf fails its init container with a message naming that command,
   # rather than crash-looping on a missing file. Scale-down needs nothing.
   #
@@ -151,10 +152,16 @@ secrets:
   # RESIDUAL on the bootstrap.sh path: one Secret holds every node's key, and Kubernetes
   # hands a pod the whole Secret — so every broker can read every other node's peer key.
   # The CN binding stops an outsider, not a compromised pod. For per-pod key isolation use
-  # cert-manager's csi-driver via `dir` below + extraVolumes/extraVolumeMounts (annotated
-  # example at extraVolumes): each pod's leaf is minted into an ephemeral volume no other
-  # pod can read. Note that ONE cert-manager Certificate listing every pod's DNS name does
-  # NOT work: it has a single CN, and rule 1 is per-pod.
+  # cert-manager's csi-driver via `certManager` below: each pod's leaf is minted into an
+  # ephemeral volume no other pod can read. Note that ONE cert-manager Certificate listing
+  # every pod's DNS name does NOT work: it has a single CN, and rule 1 is per-pod.
+  #
+  # LIFETIME (ADR 0088): how long a node's certificate lives is stated by whoever deploys,
+  # in every path, and nothing here defaults it. bootstrap.sh refuses to mint without
+  # LEAF_DAYS and prints the date to renew by; `certManager` below requires `duration` and
+  # `renewBefore`. Expiry is strict — a node whose certificate has ended is out of the
+  # cluster until it has a new one — and the broker warns from two thirds of the lifetime
+  # (tls.expiry_warn_permille; the chart's MqttdTlsExpiry* alerts).
   peerTls:
     secretName: ""
     mountPath: /etc/mqttd/cluster
@@ -165,6 +172,28 @@ secrets:
     # Secret exists at all: per-pod key isolation, which secretName cannot give you
     # (Kubernetes hands a pod the whole Secret). Mutually exclusive with secretName.
     dir: ""
+    # ALTERNATIVE to both: per-pod certificates from cert-manager's csi-driver, with the
+    # volume rendered by the chart. Naming an issuer turns it on; it needs cert-manager and
+    # its csi-driver installed, and an Issuer/ClusterIssuer that signs with the CLUSTER CA.
+    # The chart mounts the volume at `mountPath` above, derives MQTTD_PEER_TLS_{CA,CERT,KEY}
+    # (and the admin API's certificate) from it, and sets the attributes the bus's four
+    # rules need: CN = the pod name, the pod's headless DNS name as SAN, both EKUs, an ECDSA
+    # PKCS#8 key. The driver renews in place and the broker's file watcher picks the new
+    # files up, so a renewal is not a restart.
+    certManager:
+      issuerName: ""
+      issuerKind: Issuer           # or ClusterIssuer
+      issuerGroup: cert-manager.io
+      # The certificate's lifetime, as cert-manager's `duration` (a Go duration: 24h, 12h).
+      # REQUIRED with issuerName, and there is no default: cert-manager's own is 90 days,
+      # which nobody chose. Hours to a day is the aim — a certificate is good until it ends
+      # whether or not the pod it names still exists.
+      duration: ""
+      # How long before its end a certificate is renewed, as cert-manager's `renewBefore`.
+      # REQUIRED with issuerName. Set it ABOVE a third of `duration` (24h -> 10h): the
+      # broker warns once two thirds of a lifetime is spent, and cert-manager's default
+      # renews at exactly that point, so every routine renewal would log a warning.
+      renewBefore: ""
 
   # Gossip key file (Secret with key `swim-key`). The chart sets MQTTD_SWIM_KEY_FILE to
   # <mountPath>/swim-key for you when this is set.
@@ -216,8 +245,11 @@ networkPolicy:
 extraEnv: []
 
 # Extra volumes/mounts for the BROKER container (the bridge has its own pair below).
-# The intended use is cert-manager's csi-driver for per-pod peer-bus keys — mount the
-# ephemeral csi volume here and point secrets.peerTls.dir at its mountPath.
+# Per-pod peer-bus keys from cert-manager's csi-driver need none of this any more: set
+# secrets.peerTls.certManager and the chart renders the volume. Writing the volume by hand
+# (below, with secrets.peerTls.dir at its mountPath) remains for a layout the chart does
+# not assume; then the lifetime and the renewal lead are yours to state here, and leaving
+# them out gets cert-manager's defaults, which nobody chose (ADR 0088).
 extraVolumes: []
 #  - name: peer-tls-csi
 #    csi:
@@ -230,6 +262,9 @@ extraVolumes: []
 #        csi.cert-manager.io/key-usages: "server auth,client auth"
 #        csi.cert-manager.io/key-algorithm: ECDSA
 #        csi.cert-manager.io/key-encoding: PKCS8
+#        csi.cert-manager.io/duration: 24h          # the lifetime: state it
+#        csi.cert-manager.io/renew-before: 10h      # above a third of the lifetime
+#        csi.cert-manager.io/fs-group: "65532"      # podSecurityContext.fsGroup
 extraVolumeMounts: []
 #  - name: peer-tls-csi
 #    mountPath: /etc/mqttd/cluster-csi

@@ -1400,7 +1400,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/bin/render_sample.rs` — 0 test(s)
 
 
-## `crates/mqttd-operator/src/lib.rs` — 36 test(s)
+## `crates/mqttd-operator/src/lib.rs` — 37 test(s)
 
 - `controller::tests::an_unknown_kind_has_no_gvk`
 - `controller::tests::every_rendered_kind_has_a_gvk`
@@ -1428,6 +1428,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `remediate::tests::fences_the_minority_founder_when_the_evidence_is_clear`
 - `remediate::tests::quantities_parse_format_and_refuse_the_unknown`
 - `remediate::tests::unreachable_pods_that_could_flip_the_verdict_block_the_fence`
+- `render::tests::cert_manager_certificates_carry_the_stated_lifetime_and_renewal_lead`
 - `render::tests::checksum_is_sha256_lowercase_hex`
 - `render::tests::cluster_established_is_rendered_only_once_bootstrapped`
 - `render::tests::preserves_the_operational_contracts`

@@ -55,6 +55,11 @@ say "bootstrapping a $N-node cluster (mode: $MODE)"
 # its peer certificate's SAN, and opens :7001 on the cloud firewall to exactly
 # the brokers' own public /32s (the firewall filters only the public side).
 PEER_NET="${PEER_NET:-private}"
+# How long the node certificates of a rig cluster live. gen-certs.sh mints nothing without
+# a stated lifetime (ADR 0088), so the rig states one: seven days outlasts any campaign on
+# a cluster that is destroyed when its run ends, and at two thirds of it (4 d 16 h) the
+# brokers start warning. A run meant to cross an expiry sets RIG_CERT_LIFETIME (<N>h|<N>d).
+CERT_LIFETIME="${RIG_CERT_LIFETIME:-7d}"
 case "$PEER_NET" in private | public) ;; *) die "PEER_NET must be private or public, not '$PEER_NET'" ;; esac
 [ "$PEER_NET" = private ] || [ "${CLOUD:-hcloud}" = hcloud ] || die "PEER_NET=public is only wired for CLOUD=hcloud"
 peer_host() { # peer_host <index> — the address the peer bus advertises
@@ -80,7 +85,7 @@ if [ ! -d "$PKI" ]; then
 		# peer certificate's SAN; the private IP is the address MQTT clients
 		# dial, so it goes in as the extra (client-facing) SAN.
 		(cd "$PKI" && OPENSSL="$OPENSSL_BIN" PKI_DIR="$PKI/cluster" \
-			sh "$REPO_ROOT/deploy/systemd/gen-certs.sh" node \
+			sh "$REPO_ROOT/deploy/systemd/gen-certs.sh" node --lifetime "$CERT_LIFETIME" \
 			"$(broker_node_id "$i")" "$(peer_host "$i")" "$(broker_priv_ip "$i")" \
 			>>"$PKI/gen-certs.log" 2>&1) ||
 			{ cat "$PKI/gen-certs.log" >&2; die "gen-certs.sh node $(broker_node_id "$i") failed"; }
