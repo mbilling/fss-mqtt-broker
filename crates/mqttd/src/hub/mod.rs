@@ -858,6 +858,12 @@ struct Online {
     /// (ADR 0042 T9) skips clients attached BEFORE the publish first fanned
     /// out — they already received it live; re-sending would duplicate.
     attached_at: Instant,
+    /// Whether this attach resumed a session that already existed (the CONNACK's
+    /// `session_present`). A takeover-window re-delivery owes a publish only to a
+    /// session that existed when it was published: one attached since with
+    /// `session_present = 0` — a clean session, or a new persistent one — was
+    /// created after it, subscribed after it, and is owed nothing (issue #1011).
+    resumed: bool,
 }
 
 /// Downstream acknowledgement state of an unacked `QoS` > 0 message.
@@ -4958,6 +4964,7 @@ impl Hub {
                 will,
                 admission,
                 attached_at: Instant::now(),
+                resumed: session_present,
             },
         );
         // Its groups' online prefixes must include it from here on (ADR 0015).
@@ -8882,7 +8889,7 @@ mod tests {
     }
 
     /// A password-admitted v3.1.1 [`Admission`] for `subject` — the common test shape.
-    fn admission(subject: &str) -> Admission {
+    pub(super) fn admission(subject: &str) -> Admission {
         Admission {
             identity: mqtt_auth::Identity {
                 subject: subject.to_string(),
