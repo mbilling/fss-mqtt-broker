@@ -124,7 +124,8 @@ pub const PROTO_MIN: u32 = 6;
 /// cluster without one puts none on the wire and its frames are byte for byte proto
 /// 13's. A proto-13 link is sent none: the node behind it holds no such state.
 ///
-/// Proto 15 (ADR 0087 D8, interest kinds) is additive: one frame.
+/// Proto 15 (ADR 0087 D8, interest kinds) is additive: two frames and one refusal
+/// code.
 /// [`InterestKinds`](PeerMessage::InterestKinds) is an interest snapshot that says which
 /// filters are held only by sessions the lease plane owns — durable sessions, owed to
 /// whichever node is their committed owner — and which by a session that lives and
@@ -132,7 +133,11 @@ pub const PROTO_MIN: u32 = 6;
 /// [`Interest`](PeerMessage::Interest) on a link that negotiated 15; a node without one
 /// has no interest the lease plane owns and keeps sending `Interest`, so a plain
 /// cluster's frames are byte for byte proto 14's. A proto-14 link is sent `Interest`,
-/// which the receiver reads as interest that only its node can answer for.
+/// which the receiver reads as interest whose kinds it does not know.
+/// [`OwnerQuestion`](PeerMessage::OwnerQuestion) asks the node now holding a lease a
+/// dead node held to answer for the dead node's durable sessions in it, at the lease
+/// epoch the asking node knows; [`REFUSAL_NOT_THE_HOLDER`] is its "not me". Sent only
+/// on a link at 15, by a node with a durable plane.
 pub const PROTO_MAX: u32 = 15;
 
 /// The peer-bus proto at which a build computes durable ownership over all admitted
@@ -186,6 +191,13 @@ pub const PROTO_RULE_STATE: u32 = 14;
 /// The peer-bus proto at which a link carries
 /// [`InterestKinds`](PeerMessage::InterestKinds) (ADR 0087 D8).
 pub const PROTO_INTEREST_KINDS: u32 = 15;
+
+/// The [`ForwardVerdict::Refused`] code a node answers an
+/// [`OwnerQuestion`](PeerMessage::OwnerQuestion) with when its applied lease state,
+/// at or past the epoch the question names, gives one of the asked groups to another
+/// node (ADR 0087 D8): nothing was stored; the asker asks again of whoever holds the
+/// group once its own view has moved on. Never said to a publisher. Proto 15.
+pub const REFUSAL_NOT_THE_HOLDER: u16 = 4;
 
 /// The parts a namespace of rule state is summarised in
 /// ([`StateDigest`](PeerMessage::StateDigest)): a key's part is the top bits of a
@@ -1027,6 +1039,36 @@ pub enum PeerMessage {
         node_bound: Vec<String>,
         /// Filters held only by sessions the lease plane owns.
         lease_owned: Vec<String>,
+    },
+    /// A forward asking the receiver, as the node that now holds `groups`' leases,
+    /// to answer for a dead node's durable sessions in them (ADR 0087 D8; proto 15):
+    /// [`PublishAckedTagged`](Self::PublishAckedTagged) with `replay` set, plus the
+    /// groups and, for each, the epoch of the lease the sender knows naming the
+    /// receiver. The receiver answers only once its applied lease state has reached
+    /// every named epoch and its own takeover is over: then, holding every group, it
+    /// applies it as a re-route and answers as for one; holding one no longer, it
+    /// refuses with [`REFUSAL_NOT_THE_HOLDER`]. Answered with
+    /// [`PublishVerdict`](Self::PublishVerdict), retransmitted under its seq like any
+    /// acked forward. Never wrapped in [`OriginPublish`](Self::OriginPublish).
+    OwnerQuestion {
+        /// Correlates the verdict.
+        seq: u64,
+        /// The publish's id on the sending node (as `PublishAckedTagged`'s).
+        origin: u64,
+        /// `(group, lease epoch)` pairs the receiver is asked about.
+        groups: Vec<(u64, u64)>,
+        /// Destination topic (no wildcards).
+        topic: String,
+        /// Application payload.
+        payload: Vec<u8>,
+        /// Publish `QoS` as its 2-bit wire value.
+        qos: u8,
+        /// The retain flag.
+        retain: bool,
+        /// The publisher's Message Expiry Interval (seconds), if any.
+        message_expiry: Option<u32>,
+        /// The publisher's forwardable MQTT 5 application properties.
+        app: WireAppProps,
     },
 }
 
@@ -2237,6 +2279,33 @@ mod tests {
             BytesMut::from(&include_bytes!("../fuzz/seeds/peer_decode/interest_kinds.bin")[..]);
         assert_eq!(decode(&mut buf).unwrap(), Some(kinds));
         assert!(buf.is_empty());
+
+        let question = PeerMessage::OwnerQuestion {
+            seq: 2,
+            origin: 9,
+            groups: vec![(3, 300)],
+            topic: "t".into(),
+            payload: vec![7],
+            qos: 1,
+            retain: false,
+            message_expiry: None,
+            app: WireAppProps::default(),
+        };
+        roundtrip(&question);
+        let mut out = Vec::new();
+        encode(&question, &mut out).unwrap();
+        assert_eq!(out[4], 36, "appended after InterestKinds (35)");
+        assert_eq!(
+            &out[5..13],
+            [2, 9, 1, 3, 0xac, 0x02, 1, b't'],
+            "seq, origin, the (group, epoch) pairs, then the publish as PublishAckedTagged \
+             carries it"
+        );
+        let mut buf =
+            BytesMut::from(&include_bytes!("../fuzz/seeds/peer_decode/owner_question.bin")[..]);
+        assert_eq!(decode(&mut buf).unwrap(), Some(question));
+        assert!(buf.is_empty());
+        assert_eq!(super::REFUSAL_NOT_THE_HOLDER, 4);
 
         assert_eq!(PROTO_INTEREST_KINDS, 15);
         assert_eq!(

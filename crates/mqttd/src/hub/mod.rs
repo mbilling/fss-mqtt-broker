@@ -1868,6 +1868,30 @@ pub enum HubCommand {
         /// A takeover re-route (#784): skip a session already holding the publish.
         replay: bool,
     },
+    /// A peer asks this node, as the holder of `groups`' leases, to answer for a dead
+    /// node's durable sessions in them ([`PeerMessage::OwnerQuestion`], ADR 0087 D8).
+    RemoteOwnerQuestion {
+        /// The peer the question arrived from (where the answer is sent).
+        node: NodeId,
+        /// The sender's forward sequence.
+        seq: u64,
+        /// The publish's id on the sending node.
+        origin: u64,
+        /// `(group, lease epoch)` pairs asked about.
+        groups: Vec<(u64, u64)>,
+        /// Destination topic.
+        topic: String,
+        /// Application payload.
+        payload: Bytes,
+        /// The original publish `QoS`.
+        qos: QoS,
+        /// The retain flag.
+        retain: bool,
+        /// The publisher's Message Expiry Interval (seconds).
+        message_expiry: Option<u32>,
+        /// The publisher's forwardable MQTT 5 application properties.
+        app: AppProperties,
+    },
     /// A peer's durability-gated answer to a forwarded publish (ADR 0042 T9,
     /// exhibit ⑤): resolves the matching obligation on the pending publish that
     /// forwarded it, releasing the publisher's acknowledgement when it was the
@@ -2052,6 +2076,7 @@ impl HubCommand {
             | Self::SysPublish { .. }
             | Self::RemotePublish { .. }
             | Self::RemotePublishAcked { .. }
+            | Self::RemoteOwnerQuestion { .. }
             | Self::RemoteSharedDeliver { .. }
             | Self::RemoteSharedDeliverAcked { .. }
             | Self::Attach { .. }
@@ -3117,26 +3142,58 @@ enum VerdictHold {
 /// gone is counted under (ADR 0087 D2, D9): `mqttd_publish_resolved_undeliverable_total`.
 const PEER_GONE: &str = "peer-gone";
 
+/// An acked forward as [`Hub::remote_publish_acked`] applies it.
+struct RemoteForward {
+    node: NodeId,
+    seq: u64,
+    topic: String,
+    payload: Bytes,
+    qos: QoS,
+    retain: bool,
+    message_expiry: Option<u32>,
+    app: AppProperties,
+    origin: Option<u64>,
+    replay: bool,
+    /// An owner's question ([`HubCommand::RemoteOwnerQuestion`]): never answered
+    /// before this node can say who is on it.
+    question: bool,
+}
+
 /// How many former holders of a group's lease [`Hub::note_lease_moves`] remembers.
 const LEASE_HISTORY: usize = 4;
 
-/// The hub's record of who holds the leases a node held dead held, and what they have
-/// answered for it (ADR 0087 D8).
+/// How long before a node is lost a lease that moved off it still counts as its
+/// (ADR 0087 D8): the lease leader may have moved it before this node's own verdict.
+const RECENT_MOVE: Duration = Duration::from_mins(2);
+
+/// The hub's record of who holds the leases of nodes it lost, and what those holders
+/// have answered for them (ADR 0087 D8).
 #[derive(Debug, Default)]
 struct LeaseHeirs {
-    /// The committed lease map as this node last read it, and for each group the
-    /// nodes that held its lease before (the last [`LEASE_HISTORY`], newest last).
-    /// Updated when the session sweep sees the ownership epoch move
-    /// ([`Hub::note_lease_moves`]). Bounded by the group count.
+    /// Each group's lease holder and the epoch its lease was minted at, as this node
+    /// last read the committed lease map (when the session sweep saw the ownership
+    /// epoch move: [`Hub::note_lease_moves`]). A group whose lease names a holder
+    /// that does not resolve to a node keeps the holder it had and is listed in
+    /// `unresolved`: nobody can be asked for it.
     seen: BTreeMap<u64, NodeId>,
-    former: HashMap<u64, Vec<NodeId>>,
-    /// For a publish owed to a node held dead for its durable sessions: the nodes
-    /// now holding that node's former leases that have answered an owner re-route of
-    /// it ([`ForwardKind::Ordinary`]'s `owner_reroute`).
-    answers: HashMap<u64, Vec<NodeId>>,
-    /// The publishes this node has run a settle pass for as such a holder itself,
-    /// its own takeover done. Both pruned with the pending table.
-    local_pass: HashSet<u64>,
+    epochs: BTreeMap<u64, u64>,
+    unresolved: BTreeSet<u64>,
+    /// For each group, the nodes that held its lease before (the last
+    /// [`LEASE_HISTORY`], newest last) and when it moved off them.
+    former: HashMap<u64, Vec<(NodeId, Instant)>>,
+    /// The groups a node held when this node lost it — its link went, or a verdict
+    /// fell on it — and those moved off it shortly before ([`RECENT_MOVE`]). What it
+    /// is owed for its durable sessions is owed, while any of them has moved, to
+    /// whoever holds them now. Dropped once the node is linked, not held dead, and
+    /// owed nothing.
+    accountable: HashMap<NodeId, BTreeSet<u64>>,
+    /// For a held publish: `(holder, group, epoch)` for each group a holder has
+    /// answered an owner's question about (or this node, as holder, has run a
+    /// settle pass for), at the lease epoch asked.
+    answers: HashMap<u64, Vec<(NodeId, u64, u64)>>,
+    /// For a held publish and a holder: the `(group, epoch)` list it last said "not
+    /// me" to; it is not asked that list again.
+    refused: HashMap<(u64, NodeId), Vec<(u64, u64)>>,
 }
 
 // The bools are independent obligations, not an encodable state machine.
@@ -4107,116 +4164,50 @@ impl Hub {
                 origin,
                 replay,
             } => {
-                // A RE-ROUTE (#784) is how a durable session's new owner is asked
-                // for what was owed to the session's dead owner, and its answer
-                // stands for that owner's (ADR 0087 D8). So it is not applied, nor
-                // answered, while a session could still be on its way here — the
-                // takeover window is open or a scan is in flight: a session taken
-                // over a moment later would not have it, and "stored" would be
-                // said for it all the same. The origin sends it again every sweep
-                // until it is answered; it is applied once this node can say who
-                // is here. (A repeat of one applied already is answered as ever.)
-                if replay
-                    && self.cannot_say_who_is_here()
-                    && self
-                        .forward_windows
-                        .get(&node)
-                        .and_then(|w| w.seen(seq))
-                        .is_none()
-                    && !self
-                        .remote_append_pending
-                        .contains_key(&(node.clone(), seq))
-                {
-                    debug!(origin = %node.0, seq, "re-route deferred until this node's takeover is over");
-                    return;
-                }
-                // A retransmission of a forward already applied here is answered
-                // (again) or left to its in-flight append, never applied twice
-                // (issue #648).
-                if self.forward_is_repeat(
-                    &node,
+                self.remote_publish_acked(RemoteForward {
+                    node,
                     seq,
-                    forwarding::forward_fingerprint(None, &topic, &payload),
-                ) {
+                    topic,
+                    payload,
+                    qos,
+                    retain,
+                    message_expiry,
+                    app,
+                    origin,
+                    replay,
+                    question: false,
+                })
+                .await;
+            }
+            HubCommand::RemoteOwnerQuestion {
+                node,
+                seq,
+                origin,
+                groups,
+                topic,
+                payload,
+                qos,
+                retain,
+                message_expiry,
+                app,
+            } => {
+                if self.owner_question_answered_here(&node, seq, &groups) {
                     return;
                 }
-                // A client's `$SYS/` publish accepted by a node that predates ADR 0084:
-                // delivered nowhere, and answered as stored — as a v3.1.1 publish the ACL
-                // denies is acked — since a retry could never change the answer.
-                if self.peer_reserved_refused(&topic, qos, retain) {
-                    self.finish_peer_verdict(&node, seq, DurableOutcome::Ok, false, false);
-                    return;
-                }
-                // An acked forward (ADR 0042 T9, exhibit ⑤): apply locally like
-                // RemotePublish, then answer with a durability-gated ack — sent only
-                // after the local fan-out, durable offline enqueues included.
-                //
-                // A fan-out that matched NOBODY while this node's routing view is
-                // still settling (mid-boot, a takeover/membership window, a moved
-                // session just released) answers `ok = false` (0043-P4 exhibit ②):
-                // the sender forwarded because interest said someone here is owed
-                // this, and "I found no one" is not yet a claim this node can stand
-                // behind — the refusal makes the publisher retry until it is.
-                //
-                // The answer is a VERDICT at proto ≥ 7 (0041-T12, issue #238), so a
-                // stated-policy REFUSAL on this node reaches the origin as one and its
-                // publisher is told `0x97` instead of being closed on unacked. At proto 6
-                // it collapses to `PublishAck { ok }` — today's behaviour verbatim, the
-                // rolling-upgrade skew residual. The fan-out is `answerable` either way:
-                // a verdict travels back, so a refusal must be effect-free here too.
-                let (durable, matched) = self
-                    .deliver(
-                        &topic,
-                        &payload,
-                        qos,
-                        retain,
-                        message_expiry,
-                        &app,
-                        None,
-                        &AppendGate::Peer {
-                            node: node.clone(),
-                            seq,
-                            origin,
-                            replay,
-                        },
-                    )
-                    .await;
-                // A fan-out that matched NOBODY mid-settle maps to FAILED, never
-                // `Refused`: the message may genuinely be owed and delivered once the
-                // view settles, so "nothing was stored, retry" would be a FALSE refusal
-                // — as much a defect as a false ack.
-                //
-                // A re-route is applied only once this node can say who is here
-                // (above), and that is what the rule needs: no session can still
-                // arrive to want it. Its "nobody here" is an answer — the dead
-                // owner's lease heir that took none of its sessions saying so (ADR
-                // 0087 D8) — not a stale route, so it raises no event either.
-                let sync = if matched == 0 && self.routing_unsettled() && !replay {
-                    DurableOutcome::Failed
-                } else {
-                    // Settled, and nobody here wanted it after all: the route the
-                    // origin forwarded on was stale.
-                    if matched == 0 && matches!(durable, DurableOutcome::Ok) && !replay {
-                        self.note_unrouted_forward(
-                            &topic,
-                            &payload,
-                            qos,
-                            retain,
-                            message_expiry,
-                            &app,
-                        );
-                    }
-                    durable
-                };
-                // Answered now if no lane job was submitted; otherwise folded into
-                // the `(node, seq)` aggregate and answered when the last `AppendDone`
-                // lands — a peer is never told `Stored` before the store actually
-                // stored (issue #242). Exception, by explicit contract: a RELAXED
-                // forward below the congestion threshold answers at
-                // submit-acceptance (issue #399) — `Stored` then means what the
-                // relaxed ack means.
-                let relaxed = self.relaxed_requested(&app);
-                self.finish_peer_verdict(&node, seq, sync, relaxed, matched > 0);
+                self.remote_publish_acked(RemoteForward {
+                    node,
+                    seq,
+                    topic,
+                    payload,
+                    qos,
+                    retain,
+                    message_expiry,
+                    app,
+                    origin: Some(origin),
+                    replay: true,
+                    question: true,
+                })
+                .await;
             }
             HubCommand::RemotePublishAck { node, seq, ok } => {
                 // A proto-6 peer's boolean: `false` means only "not stored, reason
@@ -5824,6 +5815,168 @@ impl Hub {
         let _ = self.persist_subscriptions(client).await;
         self.gossip_interest();
         existed
+    }
+
+    /// The lease checks of an owner's question (ADR 0087 D8): `true` when it has been
+    /// dealt with here — deferred, because this node's applied lease state has not
+    /// reached an epoch it names (the asker sends it again), or refused with
+    /// [`REFUSAL_NOT_THE_HOLDER`](mqtt_cluster::peer::REFUSAL_NOT_THE_HOLDER) because
+    /// that state, at or past the epoch, gives a named group to another node. `false`:
+    /// this node holds every named group, and the question is applied as a re-route.
+    fn owner_question_answered_here(
+        &mut self,
+        node: &NodeId,
+        seq: u64,
+        groups: &[(u64, u64)],
+    ) -> bool {
+        let Some(placement) = &self.placement else {
+            debug!(origin = %node.0, seq, "owner question with no lease state here; deferred");
+            return true;
+        };
+        let (map, epochs) = {
+            let p = placement
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (p.committed_lease_map(), p.committed_lease_epochs())
+        };
+        if groups
+            .iter()
+            .any(|(g, e)| epochs.get(g).copied().unwrap_or(0) < *e)
+        {
+            debug!(origin = %node.0, seq, "owner question names a lease epoch not applied here yet; deferred");
+            return true;
+        }
+        if groups
+            .iter()
+            .any(|(g, _)| map.get(g) != Some(&self.node_id))
+        {
+            debug!(origin = %node.0, seq, "owner question for a group this node does not hold");
+            self.answer_forward(
+                node,
+                seq,
+                ForwardVerdict::Refused {
+                    code: mqtt_cluster::peer::REFUSAL_NOT_THE_HOLDER,
+                },
+            );
+            return true;
+        }
+        false
+    }
+
+    /// An acked forward that arrived from `f.node` (ADR 0042 T9, exhibit ⑤): apply it
+    /// and answer — or, for an owner's question ([`HubCommand::RemoteOwnerQuestion`],
+    /// ADR 0087 D8), apply it as the re-route it is once the lease checks are passed.
+    // One arm's worth of the dispatch table, moved here so the owner's question
+    // shares it.
+    #[allow(clippy::too_many_lines)]
+    async fn remote_publish_acked(&mut self, f: RemoteForward) {
+        let RemoteForward {
+            node,
+            seq,
+            topic,
+            payload,
+            qos,
+            retain,
+            message_expiry,
+            app,
+            origin,
+            replay,
+            question,
+        } = f;
+        // An owner's question (ADR 0087 D8) is answered only by a node that can
+        // say who is on it: its answer stands for a dead node's durable
+        // sessions, and a session taken over a moment later would not have the
+        // publish. Neither applied nor recorded: the origin sends it again.
+        if question && self.cannot_say_who_is_here() {
+            debug!(origin = %node.0, seq, "owner question deferred until this node's takeover is over");
+            return;
+        }
+        // A retransmission of a forward already applied here is answered
+        // (again) or left to its in-flight append, never applied twice
+        // (issue #648).
+        if self.forward_is_repeat(
+            &node,
+            seq,
+            forwarding::forward_fingerprint(None, &topic, &payload),
+        ) {
+            return;
+        }
+        // A client's `$SYS/` publish accepted by a node that predates ADR 0084:
+        // delivered nowhere, and answered as stored — as a v3.1.1 publish the ACL
+        // denies is acked — since a retry could never change the answer.
+        if self.peer_reserved_refused(&topic, qos, retain) {
+            self.finish_peer_verdict(&node, seq, DurableOutcome::Ok, false, false);
+            return;
+        }
+        // An acked forward (ADR 0042 T9, exhibit ⑤): apply locally like
+        // RemotePublish, then answer with a durability-gated ack — sent only
+        // after the local fan-out, durable offline enqueues included.
+        //
+        // A fan-out that matched NOBODY while this node's routing view is
+        // still settling (mid-boot, a takeover/membership window, a moved
+        // session just released) answers `ok = false` (0043-P4 exhibit ②):
+        // the sender forwarded because interest said someone here is owed
+        // this, and "I found no one" is not yet a claim this node can stand
+        // behind — the refusal makes the publisher retry until it is.
+        //
+        // The answer is a VERDICT at proto ≥ 7 (0041-T12, issue #238), so a
+        // stated-policy REFUSAL on this node reaches the origin as one and its
+        // publisher is told `0x97` instead of being closed on unacked. At proto 6
+        // it collapses to `PublishAck { ok }` — today's behaviour verbatim, the
+        // rolling-upgrade skew residual. The fan-out is `answerable` either way:
+        // a verdict travels back, so a refusal must be effect-free here too.
+        let (durable, matched) = self
+            .deliver(
+                &topic,
+                &payload,
+                qos,
+                retain,
+                message_expiry,
+                &app,
+                None,
+                &AppendGate::Peer {
+                    node: node.clone(),
+                    seq,
+                    origin,
+                    replay,
+                },
+            )
+            .await;
+        // A fan-out that matched NOBODY mid-settle maps to FAILED, never
+        // `Refused`: the message may genuinely be owed and delivered once the
+        // view settles, so "nothing was stored, retry" would be a FALSE refusal
+        // — as much a defect as a false ack.
+        //
+        // A RE-ROUTE that matched nobody (ADR 0087 D8) is not answered at all
+        // while a session could still be on its way here (a takeover window,
+        // a scan in flight): the origin sends it again every sweep, and this
+        // node applies it again then — nothing was stored, so that is safe —
+        // and answers once it can say who is here. Its "nobody here" then is an
+        // answer, not a stale route: `Stored`, with no event. One that matched
+        // a session here is answered as any forward, at once.
+        if replay && matched == 0 && self.cannot_say_who_is_here() {
+            debug!(origin = %node.0, seq, "re-route matched nobody while a session may still arrive; answer deferred");
+            return;
+        }
+        let sync = if matched == 0 && self.routing_unsettled() && !replay {
+            DurableOutcome::Failed
+        } else {
+            // Settled, and nobody here wanted it after all: the route the
+            // origin forwarded on was stale.
+            if matched == 0 && matches!(durable, DurableOutcome::Ok) && !replay {
+                self.note_unrouted_forward(&topic, &payload, qos, retain, message_expiry, &app);
+            }
+            durable
+        };
+        // Answered now if no lane job was submitted; otherwise folded into
+        // the `(node, seq)` aggregate and answered when the last `AppendDone`
+        // lands — a peer is never told `Stored` before the store actually
+        // stored (issue #242). Exception, by explicit contract: a RELAXED
+        // forward below the congestion threshold answers at
+        // submit-acceptance (issue #399) — `Stored` then means what the
+        // relaxed ack means.
+        let relaxed = self.relaxed_requested(&app);
+        self.finish_peer_verdict(&node, seq, sync, relaxed, matched > 0);
     }
 
     /// Answer a peer's forward verdict — immediately when its fan-out submitted no
@@ -8183,13 +8336,7 @@ impl Hub {
         // them stays owed to their new owner, and is not sent on this link
         // ([`VerdictHold::Gone`]). If it holds them again, it is their owner again.
         match self.held_dead.get(&node_for_events).copied() {
-            Some(VerdictHold::GoneLinked { .. }) | None => {}
-            Some(VerdictHold::Gone) if self.lease_released(&node_for_events) => {}
-            Some(VerdictHold::Gone) => {
-                self.owe_to_its_node_again(&node_for_events);
-                self.held_dead
-                    .insert(node_for_events.clone(), VerdictHold::Settled);
-            }
+            Some(VerdictHold::GoneLinked { .. } | VerdictHold::Gone) | None => {}
             Some(_) => {
                 self.held_dead
                     .insert(node_for_events.clone(), VerdictHold::Settled);
@@ -8226,6 +8373,7 @@ impl Hub {
         }
         info!(peer = %node.0, "peer link lost");
         self.peers.remove(node);
+        self.note_accountable(node);
         self.recompute_peers_want_origin();
         // The peer's INTEREST is kept (ADR 0042 T9): a link-down peer is not a
         // dead peer, and its subscribers are still owed matching publishes — a
@@ -8282,33 +8430,14 @@ impl Hub {
     /// node is from here on held as it is for any member whose link is down — until
     /// the link returns.
     ///
-    /// Not for a node confirmed gone whose leases the lease plane has moved: what it
-    /// is still owed for its durable sessions is their new owner's to answer
-    /// ([`VerdictHold::Gone`]), whatever membership now says of the node — an
-    /// `Alive` after a confirmation is a new generation, and it holds none of them.
+    /// Not for a node confirmed gone with forwards still owed for its durable
+    /// sessions ([`VerdictHold::Gone`]): an `Alive` after a confirmation is a new
+    /// generation, which answers for none of them.
     fn peer_alive(&mut self, node: &NodeId) {
         if self.held_dead.get(node) == Some(&VerdictHold::Gone) {
-            if self.lease_released(node) {
-                return;
-            }
-            self.owe_to_its_node_again(node);
+            return;
         }
         self.held_dead.remove(node);
-    }
-
-    /// Clear the `for_owner` mark of every forward owed to `node`: it holds the
-    /// leases of the sessions they are for again, so it is their owner, and they go
-    /// out on its link like any other.
-    fn owe_to_its_node_again(&mut self, node: &NodeId) {
-        for (_, p) in self.pending_publishes.iter_mut() {
-            for o in p.awaiting.values_mut() {
-                if &o.node == node {
-                    if let ForwardKind::Ordinary { for_owner, .. } = &mut o.kind {
-                        *for_owner = false;
-                    }
-                }
-            }
-        }
     }
 
     /// The failure detector declared `node` dead (ADR 0087 D1).
@@ -8344,6 +8473,7 @@ impl Hub {
     ///   counted ([`erase_peer`](Self::erase_peer)), but for what its committed
     ///   owner is to answer ([`VerdictHold::Gone`]).
     fn peer_dead(&mut self, node: &NodeId) {
+        self.note_accountable(node);
         let had_link = self.peers.remove(node).is_some();
         self.retiring_links.retain(|link| &link.node != node);
         self.recompute_peers_want_origin();
@@ -8737,46 +8867,44 @@ impl Hub {
             let owed = self
                 .pending_publishes
                 .values()
-                .any(|p| p.awaiting.values().any(|o| o.node == node));
+                .any(|p| p.awaiting.values().any(|o| o.node == node && o.for_owner()));
             if !owed {
                 self.held_dead.remove(&node);
-            } else if self.peers.contains_key(&node) && !self.lease_released(&node) {
-                // Linked, and the lease plane gives it its leases again: the owner.
-                self.held_dead.remove(&node);
-                self.owe_to_its_node_again(&node);
-                if self.peers.get(&node).is_some_and(|p| p.forwards_open) {
-                    self.send_owed_to(&node, false);
-                }
-            } else if self.takeover_of_settled(&node) && self.lease_heirs(&node).is_empty() {
-                // The leases moved, but not while this node watched: nobody here can
-                // be told apart as their owner. (Where it saw them move, the heirs
-                // answer — `discharge_owner_bound` — or the publish stays held.)
+            } else if self.owner_view_settled()
+                && self
+                    .heirs
+                    .accountable
+                    .get(&node)
+                    .is_none_or(BTreeSet::is_empty)
+            {
+                // It held no lease this node knows of when it was lost: nobody can be
+                // asked for its sessions.
                 self.held_dead.remove(&node);
                 self.resolve_owed_to_gone(&node);
             }
         }
+        // A node lost and found again, owed nothing for its durable sessions, is
+        // nobody's to account for any more.
+        if !self.heirs.accountable.is_empty() {
+            let owed: HashSet<NodeId> = self
+                .pending_publishes
+                .values()
+                .flat_map(|p| p.awaiting.values().map(|o| o.node.clone()))
+                .collect();
+            let (peers, held) = (&self.peers, &self.held_dead);
+            self.heirs
+                .accountable
+                .retain(|n, _| !peers.contains_key(n) || held.contains_key(n) || owed.contains(n));
+        }
         self.move_shared_from_unreachable();
     }
 
-    /// Whether the lease plane has moved every group off `node` (ADR 0087 D8): the
-    /// committed lease map this node was last pushed names it nowhere. `false` while
-    /// no map has been pushed, and without a placement — nothing can be said then.
-    fn lease_released(&self, node: &NodeId) -> bool {
-        self.placement.as_ref().is_some_and(|p| {
-            p.read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .holds_a_lease(node)
-                == Some(false)
-        })
-    }
-
-    /// Whether the takeover of `node`'s durable sessions is over, as far as this node
-    /// can tell (ADR 0087 D8): the lease plane has moved every group off `node`, the
-    /// session sweep has seen the map as it is now (and opened the takeover window a
-    /// move opens), and this node's routing view has settled — the window closed,
-    /// its own scan landed, every peer linked and announced.
-    pub(super) fn takeover_of_settled(&self, node: &NodeId) -> bool {
-        self.lease_released(node) && self.ownership_move_observed() && !self.routing_unsettled()
+    /// Whether this node's view of the lease plane can be acted on (ADR 0087 D8): the
+    /// session sweep has seen the committed lease map as it is now (and opened the
+    /// takeover window a move opens), and this node's routing view has settled — the
+    /// window closed, its own scan landed, every peer linked and announced.
+    pub(super) fn owner_view_settled(&self) -> bool {
+        self.ownership_move_observed() && !self.routing_unsettled()
     }
 
     /// The session sweep saw the ownership epoch move to `epoch` (and has armed the
@@ -8786,46 +8914,99 @@ impl Hub {
         self.sweep_epoch_seen = Some(epoch);
     }
 
-    /// Remember who held each group whose committed lease moved since the map was
-    /// last read here (ADR 0087 D8). Called when the session sweep sees the
-    /// ownership epoch move; the first read only records the map.
+    /// Read the committed lease map — holders and epochs — and remember who held
+    /// each group whose holder changed (ADR 0087 D8). A group whose holder does not
+    /// resolve to a node keeps the holder it had, marked unresolved.
     pub(super) fn note_lease_moves(&mut self) {
         let Some(placement) = &self.placement else {
             return;
         };
-        let map = placement
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .committed_lease_map();
-        for (group, holder) in &map {
-            if let Some(before) = self.heirs.seen.get(group).filter(|b| *b != holder) {
-                let former = self.heirs.former.entry(*group).or_default();
-                former.retain(|n| n != before);
-                former.push(before.clone());
-                if former.len() > LEASE_HISTORY {
-                    former.remove(0);
+        let (map, epochs) = {
+            let p = placement
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (p.committed_lease_map(), p.committed_lease_epochs())
+        };
+        let now = Instant::now();
+        let groups: BTreeSet<u64> = map.keys().chain(epochs.keys()).copied().collect();
+        for group in groups {
+            match map.get(&group) {
+                Some(holder) => {
+                    if let Some(before) = self.heirs.seen.get(&group).filter(|b| *b != holder) {
+                        let former = self.heirs.former.entry(group).or_default();
+                        former.retain(|(n, _)| n != before);
+                        former.push((before.clone(), now));
+                        if former.len() > LEASE_HISTORY {
+                            former.remove(0);
+                        }
+                    }
+                    self.heirs.seen.insert(group, holder.clone());
+                    self.heirs.unresolved.remove(&group);
+                }
+                None => {
+                    self.heirs.unresolved.insert(group);
                 }
             }
+            if let Some(epoch) = epochs.get(&group) {
+                self.heirs.epochs.insert(group, *epoch);
+            }
         }
-        self.heirs.seen = map;
     }
 
-    /// The nodes that hold now a lease `node` held before, as far as this node saw
-    /// the leases move: whoever owns `node`'s durable sessions now. Empty when it saw
-    /// none move off `node` (it was not running then, or they have not moved).
-    pub(super) fn lease_heirs(&self, node: &NodeId) -> Vec<NodeId> {
-        let mut heirs: Vec<NodeId> = Vec::new();
+    /// Record the groups `node` holds as this node last read the lease map, and those
+    /// that moved off it within [`RECENT_MOVE`]: what it may owe answers for if its
+    /// leases move while it is lost (ADR 0087 D8). Added to, never narrowed, while
+    /// the record lasts.
+    fn note_accountable(&mut self, node: &NodeId) {
+        if self.durable_plane.is_none() {
+            return;
+        }
+        let recent = Instant::now().checked_sub(RECENT_MOVE);
+        let mut groups: BTreeSet<u64> = self
+            .heirs
+            .seen
+            .iter()
+            .filter(|(_, h)| *h == node)
+            .map(|(g, _)| *g)
+            .collect();
         for (group, former) in &self.heirs.former {
-            if !former.contains(node) {
-                continue;
-            }
-            if let Some(holder) = self.heirs.seen.get(group) {
-                if holder != node && !heirs.contains(holder) {
-                    heirs.push(holder.clone());
-                }
+            if former
+                .iter()
+                .any(|(n, at)| n == node && recent.is_none_or(|r| *at >= r))
+            {
+                groups.insert(*group);
             }
         }
-        heirs
+        if !groups.is_empty() {
+            self.heirs
+                .accountable
+                .entry(node.clone())
+                .or_default()
+                .extend(groups);
+        }
+    }
+
+    /// Whether a group `node` is accountable for is now held by another node, or by
+    /// one this node cannot resolve: its answers for its durable sessions are no
+    /// longer the owner's.
+    pub(super) fn leases_moved_off(&self, node: &NodeId) -> bool {
+        self.heirs.accountable.get(node).is_some_and(|groups| {
+            groups
+                .iter()
+                .any(|g| self.heirs.unresolved.contains(g) || self.heirs.seen.get(g) != Some(node))
+        })
+    }
+
+    /// The holder of `group`'s lease and the epoch it was minted at, as last read;
+    /// `None` when the holder does not resolve or the group has no lease.
+    pub(super) fn lease_holder(&self, group: u64) -> Option<(&NodeId, u64)> {
+        if self.heirs.unresolved.contains(&group) {
+            return None;
+        }
+        Some((
+            self.heirs.seen.get(&group)?,
+            self.heirs.epochs.get(&group).copied().unwrap_or(0),
+        ))
     }
 
     /// Whether the session sweep has seen the committed lease map as it is now — and
@@ -8853,7 +9034,7 @@ impl Hub {
             let seqs: Vec<u64> = p
                 .awaiting
                 .iter()
-                .filter(|(_, o)| &o.node == node)
+                .filter(|(_, o)| &o.node == node && o.for_owner())
                 .map(|(s, _)| *s)
                 .collect();
             for seq in seqs {
@@ -8992,21 +9173,30 @@ impl Hub {
                     .awaiting
                     .get(&seq)
                     .is_some_and(|o| matches!(o.kind, ForwardKind::Shared { .. }));
-                // A peer whose kinds are not known (an older build, O5) may have held
-                // the publish for a durable session as well as a clean one: kept for
-                // the heirs too, who answer for whatever they took over — "no such
-                // session" included — rather than acknowledged here.
+                // Kept for the holders of the node's leases whenever ANY filter of
+                // its matching the topic is lease-owned — a clean monitor beside a
+                // durable session does not make the durable one's publish the node's
+                // to lose — and whenever its kinds are not known (an older build,
+                // O5): it may have been for a durable session. Counted `peer-gone`
+                // when the holders have answered, if part of it was the node's own.
                 if !shared_kind
                     && durable
-                    && (self.interest.owner_bound(node, &p.topic)
+                    && (self.interest.lease_owned_match(node, &p.topic)
                         || !self.interest.kinds_known(node))
                 {
+                    let node_bound_too = !self.interest.owner_bound(node, &p.topic);
                     if let Some(ForwardObligation {
-                        kind: ForwardKind::Ordinary { for_owner, .. },
+                        kind:
+                            ForwardKind::Ordinary {
+                                for_owner,
+                                clean_too,
+                                ..
+                            },
                         ..
                     }) = p.awaiting.get_mut(&seq)
                     {
                         *for_owner = true;
+                        *clean_too = node_bound_too;
                     }
                     kept += 1;
                     continue;
@@ -9258,6 +9448,17 @@ fn plain_forward_frame(
                 app: app_to_wire(p.app()),
             }
         }
+        ForwardKind::Question { groups, .. } => PeerMessage::OwnerQuestion {
+            seq,
+            origin: id,
+            groups: groups.clone(),
+            topic: p.topic.clone(),
+            payload: p.payload.to_vec(),
+            qos: p.qos as u8,
+            retain: p.retain,
+            message_expiry: p.message_expiry,
+            app: app_to_wire(p.app()),
+        },
         ForwardKind::Ordinary { .. } => PeerMessage::PublishAcked {
             seq,
             topic: p.topic.clone(),

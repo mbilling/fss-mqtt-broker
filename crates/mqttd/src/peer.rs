@@ -1878,6 +1878,30 @@ fn forward_inbound(
                 replay,
             });
         }
+        PeerMessage::OwnerQuestion {
+            seq,
+            origin,
+            groups,
+            topic,
+            payload,
+            qos,
+            retain,
+            message_expiry,
+            app,
+        } => {
+            let _ = hub.send(HubCommand::RemoteOwnerQuestion {
+                node: remote.clone(),
+                seq,
+                origin,
+                groups,
+                topic,
+                payload: payload.into(),
+                qos: mqtt_codec::QoS::from_u8(qos).unwrap_or(mqtt_codec::QoS::AtMostOnce),
+                retain,
+                message_expiry,
+                app: app_of(app),
+            });
+        }
         PeerMessage::PublishAck { seq, ok } => {
             let _ = hub.send(HubCommand::RemotePublishAck {
                 node: remote.clone(),
@@ -2571,6 +2595,41 @@ mod tests {
             rx.try_recv(),
             Ok(HubCommand::RemoteInterest { filters, lease_owned, .. })
                 if filters == ["durable/#"] && lease_owned.is_none()
+        ));
+    }
+
+    /// ADR 0087 D8: an owner's question reaches the hub with its groups and epochs.
+    #[test]
+    fn an_owner_question_reaches_the_hub_with_its_groups() {
+        let (hub, mut rx) = mpsc::unbounded_channel();
+        let (ctl, _ctl_rx) = mpsc::unbounded_channel::<PeerMessage>();
+        let (bulk, _bulk_rx) = mpsc::unbounded_channel::<PeerMessage>();
+        let (ctl, bulk) = (ctl.downgrade(), bulk.downgrade());
+        let remote = NodeId("n2".into());
+        forward_inbound(
+            PeerMessage::OwnerQuestion {
+                seq: 4,
+                origin: 9,
+                groups: vec![(3, 300)],
+                topic: "t".into(),
+                payload: vec![1],
+                qos: 1,
+                retain: false,
+                message_expiry: None,
+                app: mqtt_cluster::peer::WireAppProps::default(),
+            },
+            &hub,
+            &remote,
+            7,
+            None,
+            None,
+            &ctl,
+            &bulk,
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(HubCommand::RemoteOwnerQuestion { seq: 4, origin: 9, groups, .. })
+                if groups == [(3, 300)]
         ));
     }
 

@@ -1220,6 +1220,144 @@ async fn a_re_route_waits_until_the_receiver_can_say_who_is_here() {
     assert_eq!(fix.queued("moved").await.len(), 1);
 }
 
+/// The liveness half of the rule above (from the re-review of PR #1025): a re-route
+/// that MATCHES a session present here is applied and answered at once, whether or
+/// not this node can yet say who else is here — a node whose scans never complete
+/// still delivers what it can and answers `Reached`. Only "nobody here" waits.
+#[tokio::test]
+async fn a_re_route_that_matches_a_session_here_is_answered_before_the_scan() {
+    let mut fix = clustered_fixture();
+    let (peer_tx, mut origin) = mpsc::unbounded_channel();
+    fix.hub.peer_connected(
+        NodeId("origin-node".into()),
+        1,
+        peer_tx.clone(),
+        peer_tx,
+        None,
+        mqtt_cluster::peer::PROTO_MAX,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    );
+    let (mut client, _meter, _) = attach_watched(&mut fix.hub, "here", true, 0, 1, "q/#").await;
+    assert!(
+        fix.hub.cannot_say_who_is_here(),
+        "fixture: no scan has landed"
+    );
+    fix.dispatch(HubCommand::RemotePublishAcked {
+        node: NodeId("origin-node".into()),
+        seq: 1,
+        topic: "q/1".into(),
+        payload: Bytes::from_static(b"settle-gate"),
+        qos: QoS::AtLeastOnce,
+        retain: false,
+        message_expiry: None,
+        app: AppProperties::default(),
+        origin: Some(7),
+        replay: true,
+    })
+    .await;
+    quiesce(&mut fix.hub).await;
+    assert_eq!(published_topics(&mut client), ["q/1"]);
+    let answers: Vec<_> = std::iter::from_fn(|| origin.try_recv().ok())
+        .filter_map(|f| match f {
+            PeerMessage::PublishVerdict { seq, verdict } => Some((seq, verdict)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(answers, [(1, ForwardVerdict::Reached)]);
+}
+
+/// ADR 0087 D8, the holder's side of an owner's question. The question names each
+/// group with the epoch of the lease the asker knows. Here: deferred — neither
+/// applied nor answered — while this node's applied lease state is behind that
+/// epoch; refused "not me" when that state gives the group to another node; applied
+/// as a re-route and answered once this node holds the group at that epoch and its
+/// own takeover is over.
+#[tokio::test]
+async fn an_owner_question_is_answered_only_by_the_groups_holder_at_the_epoch_asked() {
+    let mut fix = clustered_fixture();
+    let placement = Arc::new(std::sync::RwLock::new(
+        mqtt_cluster::placement::Placement::new(
+            NodeId("settle-gate".into()),
+            mqtt_cluster::placement::DEFAULT_REPLICAS,
+        ),
+    ));
+    fix.hub.placement = Some(placement.clone());
+    let set = |holder: &str, epoch: u64| {
+        let mut p = placement.write().unwrap();
+        p.set_lease_owners(std::collections::BTreeMap::from([(
+            5,
+            NodeId(holder.into()),
+        )]));
+        p.set_lease_epochs(std::collections::BTreeMap::from([(5, epoch)]));
+    };
+    let (peer_tx, mut origin) = mpsc::unbounded_channel();
+    fix.hub.peer_connected(
+        NodeId("origin-node".into()),
+        1,
+        peer_tx.clone(),
+        peer_tx,
+        None,
+        mqtt_cluster::peer::PROTO_MAX,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    );
+    fix.store_only_session("moved", "q/#").await;
+    fix.scan_lands(&["moved"], true).await;
+    assert!(!fix.hub.cannot_say_who_is_here());
+    let question = |seq: u64| HubCommand::RemoteOwnerQuestion {
+        node: NodeId("origin-node".into()),
+        seq,
+        origin: 7,
+        groups: vec![(5, 10)],
+        topic: "q/1".into(),
+        payload: Bytes::from_static(b"settle-gate"),
+        qos: QoS::AtLeastOnce,
+        retain: false,
+        message_expiry: None,
+        app: AppProperties::default(),
+    };
+    let verdicts = |rx: &mut mpsc::UnboundedReceiver<PeerMessage>| {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|f| match f {
+                PeerMessage::PublishVerdict { seq, verdict } => Some((seq, verdict)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    set("settle-gate", 9);
+    fix.dispatch(question(1)).await;
+    assert_eq!(
+        verdicts(&mut origin),
+        [],
+        "behind the epoch asked: deferred"
+    );
+    assert!(fix.queued("moved").await.is_empty());
+
+    set("elsewhere", 12);
+    fix.dispatch(question(1)).await;
+    assert_eq!(
+        verdicts(&mut origin),
+        [(
+            1,
+            ForwardVerdict::Refused {
+                code: mqtt_cluster::peer::REFUSAL_NOT_THE_HOLDER
+            }
+        )],
+        "past the epoch, and the group is another node's: not me"
+    );
+    assert!(fix.queued("moved").await.is_empty());
+
+    set("settle-gate", 10);
+    fix.dispatch(question(2)).await;
+    quiesce(&mut fix.hub).await;
+    assert_eq!(verdicts(&mut origin), [(2, ForwardVerdict::Reached)]);
+    assert_eq!(
+        fix.queued("moved").await.len(),
+        1,
+        "applied for the session held here"
+    );
+}
+
 /// **#784, mixed versions.** A proto-11 peer cannot carry the publish's identity, so
 /// it is sent the untagged `PublishAcked`, and an untagged forward arriving here is
 /// stored as before — no check, no tag. The upgrade window therefore keeps today's

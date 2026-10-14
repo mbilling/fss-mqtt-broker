@@ -1456,7 +1456,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 836 test(s)
+## `crates/mqttd/src/lib.rs` — 843 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1690,13 +1690,16 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::pending_bounds::the_entry_cap_evicts_only_the_oldest`
 - `hub::forwarding::pending_bounds::the_reached_record_is_charged_and_released_with_its_entry`
 - `hub::forwarding::pending_bounds::the_sweep_retransmits_only_overdue_forwards`
+- `hub::forwarding::zone_fwd_proofs::a_clean_monitor_beside_a_durable_session_does_not_resolve_the_durable_ones_forward`
 - `hub::forwarding::zone_fwd_proofs::a_dead_peer_without_kinds_is_answered_for_by_its_heirs_not_by_its_confirmation`
 - `hub::forwarding::zone_fwd_proofs::a_durable_session_that_materialises_here_discharges_what_its_dead_owner_was_owed`
 - `hub::forwarding::zone_fwd_proofs::a_durable_sessions_forward_outlives_its_owners_confirmation_until_an_heir_answers`
 - `hub::forwarding::zone_fwd_proofs::a_forward_unanswered_when_its_target_is_declared_dead_stays_owed_until_the_peer_answers`
 - `hub::forwarding::zone_fwd_proofs::a_hold_at_the_pending_table_bound_evicts_the_oldest_and_withholds_its_ack`
+- `hub::forwarding::zone_fwd_proofs::a_holder_that_says_not_me_is_not_evidence_and_the_new_holder_is_asked`
 - `hub::forwarding::zone_fwd_proofs::a_link_to_a_peer_confirmed_gone_that_stays_up_is_dropped_after_the_countdown`
 - `hub::forwarding::zone_fwd_proofs::a_link_under_a_dead_verdict_takes_its_interest_with_it_until_the_verdict_is_withdrawn`
+- `hub::forwarding::zone_fwd_proofs::a_lost_node_that_held_no_lease_is_resolved_at_confirmation_and_counted`
 - `hub::forwarding::zone_fwd_proofs::a_peer_confirmed_gone_while_linked_is_resolved_when_that_link_ends`
 - `hub::forwarding::zone_fwd_proofs::a_peer_confirmed_gone_whose_link_stays_up_and_that_is_alive_again_resolves_nothing`
 - `hub::forwarding::zone_fwd_proofs::a_peer_that_stays_dead_is_held_until_confirmed_gone_and_then_resolved_and_counted`
@@ -1705,6 +1708,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::zone_fwd_proofs::a_reached_answer_is_downgraded_for_an_older_peer`
 - `hub::forwarding::zone_fwd_proofs::a_reached_forward_releases_a_held_ack_and_a_stored_one_does_not`
 - `hub::forwarding::zone_fwd_proofs::a_refused_share_delivery_is_not_moved_to_a_member_that_cannot_be_reached`
+- `hub::forwarding::zone_fwd_proofs::a_restarted_owner_does_not_answer_for_sessions_whose_lease_moved`
 - `hub::forwarding::zone_fwd_proofs::a_share_delivery_does_not_move_from_one_unreachable_member_to_another`
 - `hub::forwarding::zone_fwd_proofs::a_share_delivery_in_flight_at_a_verdict_moves_to_a_reachable_member_or_stays_owed`
 - `hub::forwarding::zone_fwd_proofs::a_share_delivery_owed_to_a_dead_node_moves_to_a_new_member_or_ends_with_the_hold`
@@ -1999,6 +2003,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::settle_gate::a_held_publish_is_re_delivered_to_a_materialised_session_once_not_per_pass`
 - `hub::tests::settle_gate::a_new_persistent_session_created_after_a_held_publish_is_not_handed_it`
 - `hub::tests::settle_gate::a_proto_11_peer_gets_the_untagged_forward_and_an_untagged_replay_still_delivers`
+- `hub::tests::settle_gate::a_re_route_that_matches_a_session_here_is_answered_before_the_scan`
 - `hub::tests::settle_gate::a_re_route_waits_until_the_receiver_can_say_who_is_here`
 - `hub::tests::settle_gate::a_rerouted_forward_skips_a_session_that_already_holds_the_publish`
 - `hub::tests::settle_gate::a_session_created_after_a_held_publish_is_not_handed_it`
@@ -2010,6 +2015,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::settle_gate::an_early_acked_publish_still_replays_to_a_session_the_scan_materialises`
 - `hub::tests::settle_gate::an_entry_whose_ack_is_still_held_is_never_retired`
 - `hub::tests::settle_gate::an_incomplete_scan_is_retried_on_a_node_with_no_durable_plane`
+- `hub::tests::settle_gate::an_owner_question_is_answered_only_by_the_groups_holder_at_the_epoch_asked`
 - `hub::tests::settle_gate::an_unsettled_view_releases_the_ack_of_a_publish_that_reached_a_subscriber`
 - `hub::tests::settle_gate::leaving_the_settle_window_answers_a_restore_shaped_entry`
 - `hub::tests::settle_gate::no_periodic_inherited_scan_runs_without_a_durable_plane`
@@ -2106,6 +2112,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `peer::tests::a_peer_that_accepts_and_never_speaks_does_not_wedge_the_dialer`
 - `peer::tests::a_renewal_is_acted_on_within_half_the_room_left_capped`
 - `peer::tests::an_alive_that_arrives_during_an_attempt_after_confirmation_is_not_lost`
+- `peer::tests::an_owner_question_reaches_the_hub_with_its_groups`
 - `peer::tests::control_frames_jump_the_bulk_queue`
 - `peer::tests::interest_reaches_the_hub_with_its_kinds_or_with_none`
 - `peer::tests::peer_qos0_is_shed_when_the_pool_is_full_and_nothing_else_is`

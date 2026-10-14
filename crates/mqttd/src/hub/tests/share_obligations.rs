@@ -178,7 +178,7 @@ fn owed(hub: &Hub, id: u64) -> Vec<(u64, String, Option<String>)> {
                 .map(|(seq, o)| {
                     let member = match &o.kind {
                         ForwardKind::Shared { client, .. } => Some(client.0.to_string()),
-                        ForwardKind::Ordinary { .. } => None,
+                        ForwardKind::Ordinary { .. } | ForwardKind::Question { .. } => None,
                     };
                     (*seq, o.node.0.clone(), member)
                 })

@@ -169,6 +169,12 @@ pub struct Placement {
     /// bootstrap) falls back to the HRW owner, so behaviour is unchanged until the
     /// driver has a committed lease to report.
     lease_owners: BTreeMap<GroupId, NodeId>,
+    /// The epoch each group's committed lease was minted at (its fence token), for
+    /// every group that has a lease — including one whose holder could not be
+    /// resolved to a node, which `lease_owners` leaves out. Pushed beside
+    /// `lease_owners` by the durable driver (ADR 0087 D8: the lease-plane state a
+    /// node's view of a group is compared by across nodes).
+    lease_epochs: BTreeMap<GroupId, u64>,
     /// Each peer's inter-node (peer-link) address, so the owner of a session can
     /// be reached for session relocation (ADR 0005).
     addrs: BTreeMap<NodeId, String>,
@@ -298,6 +304,7 @@ impl Placement {
             eligible,
             voters: BTreeSet::new(),
             lease_owners: BTreeMap::new(),
+            lease_epochs: BTreeMap::new(),
             addrs: BTreeMap::new(),
             local_domain: None,
             domains: BTreeMap::new(),
@@ -705,6 +712,20 @@ impl Placement {
     #[must_use]
     pub fn holds_a_lease(&self, node: &NodeId) -> Option<bool> {
         (!self.lease_owners.is_empty()).then(|| self.lease_owners.values().any(|h| h == node))
+    }
+
+    /// Record the epoch each group's committed lease was minted at (see
+    /// `lease_epochs`). Pushed with [`set_lease_owners`](Self::set_lease_owners).
+    pub fn set_lease_epochs(&mut self, epochs: BTreeMap<GroupId, u64>) {
+        self.lease_epochs = epochs;
+    }
+
+    /// The epoch each group's committed lease was minted at, for every group with a
+    /// lease — whether or not its holder resolved to a node. Bounded by
+    /// [`NUM_GROUPS`].
+    #[must_use]
+    pub fn committed_lease_epochs(&self) -> BTreeMap<GroupId, u64> {
+        self.lease_epochs.clone()
     }
 
     /// The committed lease map as last pushed — `group -> holder`, unfiltered by

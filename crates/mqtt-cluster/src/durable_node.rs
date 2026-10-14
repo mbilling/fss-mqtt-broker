@@ -1143,17 +1143,20 @@ fn push_committed_lease_owners(
         id_map.entry(raft_id(n)).or_insert_with(|| n.clone());
     }
     let mut owners: BTreeMap<GroupId, NodeId> = BTreeMap::new();
+    let mut epochs: BTreeMap<GroupId, u64> = BTreeMap::new();
     for group in 0..NUM_GROUPS {
-        if let Some(holder) = lease_store.current_lease(group).map(|rec| rec.holder) {
-            if let Some(nid) = id_map.get(&holder) {
+        if let Some(rec) = lease_store.current_lease(group) {
+            epochs.insert(group, rec.epoch);
+            if let Some(nid) = id_map.get(&rec.holder) {
                 owners.insert(group, nid.clone());
             }
         }
     }
-    placement
+    let mut p = placement
         .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .set_lease_owners(owners);
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    p.set_lease_owners(owners);
+    p.set_lease_epochs(epochs);
 }
 
 #[cfg(test)]
