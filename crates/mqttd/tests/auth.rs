@@ -62,6 +62,7 @@ async fn start_broker(identity: Option<Identity>, auth: Arc<dyn Authenticator>) 
                 identity.clone().map(|identity| mqttd::conn::CertAdmission {
                     identity,
                     serial: None,
+                    not_after: None,
                 }),
                 policy,
                 hub_tx.clone(),

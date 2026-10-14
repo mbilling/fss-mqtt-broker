@@ -115,16 +115,47 @@ fn seeds_for(i: usize, swim: &[String]) -> String {
         .join(",")
 }
 
-async fn build(root: &Path) -> Vec<ProcNode> {
+/// Where a test's brokers keep their files, logs included: a temporary directory,
+/// removed when the test ends — or, when `MQTTD_SWIM_LOG_DIR` is set, a directory
+/// named for the test under it, which stays. The nightly job sets it and uploads the
+/// `*.log` files when a test fails: a verdict that should not have been reached is
+/// explained by the brokers' own lines around it, and those used to go with the
+/// temporary directory.
+struct Root {
+    path: PathBuf,
+    _temporary: Option<tempfile::TempDir>,
+}
+
+impl Root {
+    fn for_test(name: &str) -> Self {
+        if let Some(kept) = std::env::var_os("MQTTD_SWIM_LOG_DIR") {
+            let path = PathBuf::from(kept).join(name);
+            // A fresh one each run: the brokers append to their logs.
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("the log directory");
+            return Self {
+                path,
+                _temporary: None,
+            };
+        }
+        let temporary = tempfile::tempdir().expect("tempdir");
+        Self {
+            path: temporary.path().to_path_buf(),
+            _temporary: Some(temporary),
+        }
+    }
+}
+
+async fn build(root: &Path, count: usize) -> Vec<ProcNode> {
     let pki = Pki::new(root);
-    let peer_binds: Vec<SocketAddr> = (0..NODES)
+    let peer_binds: Vec<SocketAddr> = (0..count)
         .map(|_| SocketAddr::from(([127, 0, 0, 1], free_tcp_port())))
         .collect();
-    let swim: Vec<String> = (0..NODES)
+    let swim: Vec<String> = (0..count)
         .map(|_| format!("127.0.0.1:{}", free_udp_port()))
         .collect();
     let mut nodes = Vec::new();
-    for i in 0..NODES {
+    for i in 0..count {
         // Zero-padded so the ids sort as the nodes are numbered.
         let id = format!("form{}-{:02}", std::process::id(), i + 1);
         let data_dir = root.join(&id);
@@ -174,11 +205,12 @@ async fn survey(nodes: &[ProcNode]) -> Vec<Option<(u64, u64, u64)>> {
     out
 }
 
-/// Wait until every broker holds all `NODES` members and a link to each of the others.
-/// Fails — with every broker's figures and its warnings — if a broker exits or the
-/// budget runs out.
+/// Wait until every broker holds every broker as a member and a link to each of the
+/// others. Fails — with every broker's figures and its warnings — if a broker exits or
+/// the budget runs out.
 async fn await_whole_mesh(nodes: &mut [ProcNode], phase: &str) -> Duration {
     let started = Instant::now();
+    let count = nodes.len();
     loop {
         for n in nodes.iter_mut() {
             if let Some(status) = n.exited() {
@@ -190,7 +222,7 @@ async fn await_whole_mesh(nodes: &mut [ProcNode], phase: &str) -> Duration {
             }
         }
         let view = survey(nodes).await;
-        let whole = (NODES as u64, NODES as u64 - 1);
+        let whole = (count as u64, count as u64 - 1);
         if view
             .iter()
             .all(|v| v.is_some_and(|(m, l, _)| (m, l) == whole))
@@ -206,10 +238,10 @@ async fn await_whole_mesh(nodes: &mut [ProcNode], phase: &str) -> Duration {
                 );
             }
             panic!(
-                "{phase}: the mesh of {NODES} was not whole within {}s — every broker must \
-                 report {NODES} members and {} peer links (figures and warnings above)",
+                "{phase}: the mesh of {count} was not whole within {}s — every broker must \
+                 report {count} members and {} peer links (figures and warnings above)",
                 SETTLE_BUDGET.as_secs(),
-                NODES - 1
+                count - 1
             );
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -252,8 +284,8 @@ async fn form(nodes: &mut [ProcNode]) -> Duration {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn twelve_signed_brokers_form_a_whole_mesh_without_a_certificate_storm() {
-    let disk = tempfile::tempdir().expect("tempdir");
-    let mut nodes = build(disk.path()).await;
+    let disk = Root::for_test("formation");
+    let mut nodes = build(&disk.path, NODES).await;
 
     let formed = form(&mut nodes).await;
     assert_no_certificate_storm(&nodes, "formation", FORMATION_CERT_MISS_BOUND).await;
@@ -377,8 +409,8 @@ async fn await_quiet(nodes: &mut [ProcNode], phase: &str) {
 #[ignore = "timing-sensitive on a loaded runner: twelve brokers and a verdict that is a \
             matter of deadlines; runs in the nightly tier"]
 async fn a_broker_stopped_for_two_seconds_is_declared_dead_by_no_one() {
-    let disk = tempfile::tempdir().expect("tempdir");
-    let mut nodes = build(disk.path()).await;
+    let disk = Root::for_test("suspect-stopped");
+    let mut nodes = build(&disk.path, NODES).await;
     form(&mut nodes).await;
     await_quiet(&mut nodes, "after formation").await;
 
@@ -416,6 +448,223 @@ async fn a_broker_stopped_for_two_seconds_is_declared_dead_by_no_one() {
         "{} stopped {EPISODES} times for {STOP:?}: suspected in {noticed} of them, declared \
          DEAD in none",
         nodes[victim].id
+    );
+    for n in &mut nodes {
+        n.kill().await;
+    }
+}
+
+/// How long the PROBER is stopped with its last probe out: six ack timeouts, so that a
+/// broker which trusted its clock on waking would find the probe long given up on.
+const PROBER_STOP: Duration = Duration::from_millis(1500);
+
+/// How many times. One is enough to show it; a few, because an episode proves nothing
+/// when this test is too slow to stop the prober inside the probe's 250 ms.
+const PROBER_EPISODES: usize = 4;
+
+/// A step of an episode must be observed within this long: the suspect is suspected a
+/// probe period and two ack timeouts after it stops, and asked once more a window (4 s,
+/// one suspecter) after that.
+const STEP_BUDGET: Duration = Duration::from_secs(30);
+
+/// One of the broker's last-probe counters (`sent`, `spared`, `silent`); an untouched
+/// one is not rendered and is zero.
+async fn last_probes(node: &ProcNode, outcome: &str) -> u64 {
+    node.metric(&format!(
+        "mqttd_swim_last_probes_total{{outcome=\"{outcome}\"}}"
+    ))
+    .await
+    .unwrap_or(0)
+}
+
+/// Whether process `pid` is stopped (`T` in `ps`), which is when it can no longer write
+/// to its log.
+fn is_stopped(pid: u32) -> bool {
+    std::process::Command::new("ps")
+        .args(["-o", "state=", "-p", &pid.to_string()])
+        .output()
+        .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim().starts_with('T'))
+}
+
+/// The `peer DEAD` lines in `log`.
+fn dead_lines(log: &str) -> Vec<&str> {
+    log.lines()
+        .filter(|l| l.contains("membership: peer DEAD"))
+        .collect()
+}
+
+/// The ack timeout of a last probe on a healthy node. A node that has lately been
+/// suspected itself waits longer, never less (ADR 0016 §2).
+const LAST_PROBE_ACK_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// One episode of the test below: steps 1 to 4, and what the prober did on waking.
+/// Returns whether the prober was stopped in time — `false` sets the episode aside.
+///
+/// "In time" is decided on what the SWIM task itself did and on this test's own
+/// clock, not on a log line (the membership lines are written by another task, a
+/// moment after the verdict):
+///
+/// - the probe was sent after the last scrape that did not show it began, and its
+///   deadline is at least an ack timeout after it was sent; so if the prober is seen
+///   stopped within an ack timeout of that scrape, it was stopped with the probe out;
+/// - and whatever the clock says, a probe counted `spared` was out when the prober
+///   stopped: the suspect was only resumed afterwards, so its answer was read after.
+///
+/// An episode that is neither is one this test was too slow for: the probe ran out on
+/// a suspect that was still stopped, rightly.
+async fn stop_the_prober_on_its_last_probe(
+    nodes: &mut [ProcNode],
+    prober: usize,
+    suspect: usize,
+    episode: usize,
+) -> bool {
+    let prober_pid = nodes[prober].pid().expect("the prober is running");
+    let suspect_pid = nodes[suspect].pid().expect("the suspect is running");
+    let prober_log = nodes[prober].log_path.clone();
+    let sent_before = last_probes(&nodes[prober], "sent").await;
+    let spared_before = last_probes(&nodes[prober], "spared").await;
+    let silent_before = last_probes(&nodes[prober], "silent").await;
+
+    // 1. The suspect goes silent, and in time the prober asks it once more.
+    signal(suspect_pid, "-STOP");
+    let started = Instant::now();
+    let mut not_sent_at = Instant::now();
+    loop {
+        let scrape_began = Instant::now();
+        if last_probes(&nodes[prober], "sent").await != sent_before {
+            break;
+        }
+        not_sent_at = scrape_began;
+        assert!(
+            started.elapsed() < STEP_BUDGET,
+            "episode {episode}: the prober sent no last probe in {STEP_BUDGET:?}\n{}",
+            log_notables(&prober_log, 40)
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // 2. The prober is stopped with that probe out, and writes nothing from here.
+    signal(prober_pid, "-STOP");
+    let started = Instant::now();
+    while !is_stopped(prober_pid) {
+        assert!(
+            started.elapsed() < STEP_BUDGET,
+            "episode {episode}: the prober did not stop"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let stopped_within = not_sent_at.elapsed();
+    let written_before_the_stop = std::fs::read(&prober_log).unwrap_or_default().len();
+
+    // 3. The suspect runs again, and answers what queued while it was stopped.
+    signal(suspect_pid, "-CONT");
+    let started = Instant::now();
+    while nodes[suspect].readyz().await.is_none() {
+        assert!(
+            started.elapsed() < STEP_BUDGET,
+            "episode {episode}: the suspect did not answer after it was resumed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // SETTLE(swim-prober-stop): the fault IS a duration — the prober stays stopped for six
+    // ack timeouts with its last probe out, and what it concludes on waking is the subject.
+    tokio::time::sleep(PROBER_STOP).await;
+    signal(prober_pid, "-CONT");
+    await_quiet(nodes, &format!("after prober stop {episode}")).await;
+
+    let spared = last_probes(&nodes[prober], "spared").await > spared_before;
+    let silent = last_probes(&nodes[prober], "silent").await > silent_before;
+    if stopped_within >= LAST_PROBE_ACK_TIMEOUT && !spared {
+        eprintln!(
+            "episode {episode}: the prober was seen stopped {stopped_within:?} after its last \
+             probe may have gone out, and the probe ran out first; set aside"
+        );
+        return false;
+    }
+    let log = std::fs::read(&prober_log).unwrap_or_default();
+    let after = String::from_utf8_lossy(&log[written_before_the_stop.min(log.len())..]);
+    assert!(
+        !silent && spared,
+        "episode {episode}: stopped for {PROBER_STOP:?} within {stopped_within:?} of sending \
+         its last probe, the prober woke and gave up on a suspect that had answered \
+         (spared: {spared}, silent: {silent}). Its log since the stop:\n{}",
+        dead_lines(&after).join("\n")
+    );
+    let stalled_ms = nodes[prober]
+        .metric("mqttd_swim_stalled_milliseconds_total")
+        .await
+        .unwrap_or(0);
+    // A stall is the gap between two wake-ups less the tick that was due anyway, and
+    // the stop began part-way through a tick: two ticks short of the stop, at most.
+    let nearly_the_stop = u64::try_from(PROBER_STOP.as_millis()).expect("small") - 200;
+    assert!(
+        stalled_ms >= nearly_the_stop,
+        "episode {episode}: stopped for {PROBER_STOP:?}, the prober counted {stalled_ms} ms \
+         of stalls"
+    );
+    true
+}
+
+/// The stalled PROBER, on real processes (issue #1002): a broker whose last direct
+/// probe of a suspect is out is stopped (`SIGSTOP`) for six ack timeouts, while the
+/// suspect answers. When it wakes, the tick that would give up on the probe is overdue
+/// and the suspect's `Ack` is in its socket. It must not declare the suspect DEAD.
+///
+/// Two brokers, so that there is one prober and its probe is the only one: with more,
+/// every other broker's own last probe of the stopped suspect would run out too, and
+/// rightly.
+///
+/// Every step waits on something a broker reports, except the stop itself:
+///
+/// 1. the suspect is stopped; the prober suspects it and, a window later, sends its
+///    last probe — seen as `mqttd_swim_last_probes_total{outcome="sent"}` going up;
+/// 2. the prober is stopped at once, and the time is taken once `ps` shows it stopped;
+/// 3. the suspect is resumed, and answers what queued on its socket, the probe included;
+/// 4. the prober stays stopped for [`PROBER_STOP`], is resumed, and the pair settles.
+///
+/// Step 2 races the probe's 250 ms: if this test is too slow, the prober gives up on a
+/// suspect that really was silent, and rightly declares it DEAD. Such an episode is
+/// recognised from the prober's own counters and this test's clock
+/// ([`stop_the_prober_on_its_last_probe`]) and set aside, not failed. A probe that was
+/// out when the prober stopped and is counted `silent` is the failure. At least one
+/// episode must have got the prober stopped in time.
+///
+/// Before the driver read its socket ahead of a tick, the waking prober took the tick
+/// or the `Ack` at random: half of such episodes ended in a DEAD. The driver's own test of this
+/// (`a_prober_stalled_past_the_ack_timeout_reads_the_ack_before_it_gives_up`, every
+/// tier) decides the order exactly; this is the same thing with a kernel in between.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "timing-sensitive on a loaded runner: the prober has to be stopped within its \
+            last probe's 250 ms; runs in the nightly tier"]
+async fn a_prober_stopped_with_its_last_probe_out_does_not_declare_the_suspect_dead() {
+    let disk = Root::for_test("prober-stopped");
+    let mut nodes = build(&disk.path, 2).await;
+    form(&mut nodes).await;
+    await_quiet(&mut nodes, "after formation").await;
+    let (prober, suspect) = (0, 1);
+
+    let mut in_time = 0;
+    for episode in 1..=PROBER_EPISODES {
+        if stop_the_prober_on_its_last_probe(&mut nodes, prober, suspect, episode).await {
+            in_time += 1;
+        }
+    }
+    let suspect_log = std::fs::read_to_string(&nodes[suspect].log_path).unwrap_or_default();
+    assert!(
+        dead_lines(&suspect_log).is_empty(),
+        "the suspect declared the prober DEAD:\n{}",
+        dead_lines(&suspect_log).join("\n")
+    );
+    assert!(
+        in_time > 0,
+        "in none of {PROBER_EPISODES} episodes was the prober stopped inside its last \
+         probe's ack timeout: the test proved nothing"
+    );
+    eprintln!(
+        "{} stopped for {PROBER_STOP:?} with its last probe out, {in_time} times of \
+         {PROBER_EPISODES}: declared DEAD in none",
+        nodes[prober].id
     );
     for n in &mut nodes {
         n.kill().await;

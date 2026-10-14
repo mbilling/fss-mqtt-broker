@@ -109,6 +109,7 @@ fn admission(subject: &str) -> Admission {
         },
         method: AuthMethod::Password,
         cert_serial: None,
+        cert_not_after: None,
         protocol: ProtocolVersion::V311,
         source: None,
     }

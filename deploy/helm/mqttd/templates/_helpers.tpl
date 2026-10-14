@@ -57,6 +57,52 @@ app.kubernetes.io/component: broker
 {{- end -}}
 
 {{/* ---------------------------------------------------------------------- */}}
+{{/* Per-pod cluster-bus certificates from cert-manager's csi-driver          */}}
+{{/* (secrets.peerTls.certManager, ADR 0088 D1). "true" when an issuer is     */}}
+{{/* named, after checking what must come with it: the certificate's          */}}
+{{/* LIFETIME and its RENEWAL LEAD are stated by whoever deploys — the chart  */}}
+{{/* has no default for either, and cert-manager's own (90 days, renewed at   */}}
+{{/* two thirds) is nobody's decision.                                        */}}
+{{/* ---------------------------------------------------------------------- */}}
+{{- define "mqttd.peerTlsCertManager" -}}
+{{- $peer := .Values.secrets.peerTls -}}
+{{- $cm := $peer.certManager | default dict -}}
+{{- if $cm.issuerName -}}
+{{- if or $peer.secretName $peer.dir -}}
+{{- fail "secrets.peerTls.certManager.issuerName is mutually exclusive with secrets.peerTls.secretName and secrets.peerTls.dir: the chart renders the cert-manager csi volume itself and mounts it at secrets.peerTls.mountPath" -}}
+{{- end -}}
+{{- if not $cm.duration -}}
+{{- fail "secrets.peerTls.certManager.duration is required with issuerName: the lifetime of a node's certificate is stated when the cluster is deployed and has no default (ADR 0088), e.g. --set secrets.peerTls.certManager.duration=24h" -}}
+{{- end -}}
+{{- if not $cm.renewBefore -}}
+{{- fail "secrets.peerTls.certManager.renewBefore is required with issuerName: how long before its end a certificate is renewed is stated, not defaulted. Set it ABOVE a third of duration (for duration=24h, renewBefore=10h): the broker starts warning at two thirds of the lifetime, and cert-manager's default renews exactly then" -}}
+{{- end -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/* The csi volume's attributes: the four rules the bus enforces on a peer    */}}
+{{/* certificate (CN = pod name, a SAN for the pod's advertise host, both      */}}
+{{/* EKUs, an ECDSA PKCS#8 key), then the lifetime and the renewal lead.       */}}
+{{/* ${POD_NAME} / ${POD_NAMESPACE} are the csi-driver's own variables.        */}}
+{{- define "mqttd.peerTlsCsiAttributes" -}}
+{{- $cm := .Values.secrets.peerTls.certManager -}}
+csi.cert-manager.io/issuer-name: {{ $cm.issuerName | quote }}
+csi.cert-manager.io/issuer-kind: {{ $cm.issuerKind | default "Issuer" | quote }}
+csi.cert-manager.io/issuer-group: {{ $cm.issuerGroup | default "cert-manager.io" | quote }}
+csi.cert-manager.io/common-name: "${POD_NAME}"
+csi.cert-manager.io/dns-names: {{ printf "${POD_NAME}.%s.${POD_NAMESPACE}.svc.cluster.local" (include "mqttd.headlessName" .) | quote }}
+csi.cert-manager.io/key-usages: "server auth,client auth"
+csi.cert-manager.io/key-algorithm: "ECDSA"
+csi.cert-manager.io/key-encoding: "PKCS8"
+csi.cert-manager.io/duration: {{ $cm.duration | quote }}
+csi.cert-manager.io/renew-before: {{ $cm.renewBefore | quote }}
+{{- with (.Values.podSecurityContext | default dict).fsGroup }}
+csi.cert-manager.io/fs-group: {{ . | quote }}
+{{- end }}
+{{- end -}}
+
+{{/* ---------------------------------------------------------------------- */}}
 {{/* The broker container's environment.                                     */}}
 {{/*                                                                         */}}
 {{/* Secret material is referenced BY PATH (ADR 0046 T5), and this is where   */}}
@@ -91,6 +137,12 @@ app.kubernetes.io/component: broker
 {{- if and $peer.secretName $peer.dir }}
 {{- fail "secrets.peerTls.secretName and secrets.peerTls.dir are mutually exclusive: one shared Secret keyed by pod name, or one per-pod directory (e.g. a cert-manager csi volume) — not both" }}
 {{- end }}
+{{- /* secrets.peerTls.certManager: the chart renders the cert-manager csi volume itself
+       (statefulset.yaml) at peerTls.mountPath, so from here on it is the `dir` layout. */}}
+{{- $dir := $peer.dir -}}
+{{- if eq (include "mqttd.peerTlsCertManager" .) "true" }}
+{{- $dir = $peer.mountPath -}}
+{{- end }}
 {{- if $peer.secretName }}
 - name: POD_NAME
   valueFrom:
@@ -108,21 +160,21 @@ app.kubernetes.io/component: broker
 - name: MQTTD_PEER_TLS_KEY
   value: {{ printf "%s/$(POD_NAME).key" $peer.mountPath | quote }}
 {{- end }}
-{{- else if $peer.dir }}
+{{- else if $dir }}
 {{- /* A per-pod directory (cert-manager csi-driver layout): tls.crt/tls.key/ca.crt.
        No POD_NAME indirection — the volume itself is per-pod, which is the point:
        no shared Secret, so no pod can read another's key. */}}
 {{- if not (hasKey $declared "MQTTD_PEER_TLS_CA") }}
 - name: MQTTD_PEER_TLS_CA
-  value: {{ printf "%s/ca.crt" $peer.dir | quote }}
+  value: {{ printf "%s/ca.crt" $dir | quote }}
 {{- end }}
 {{- if not (hasKey $declared "MQTTD_PEER_TLS_CERT") }}
 - name: MQTTD_PEER_TLS_CERT
-  value: {{ printf "%s/tls.crt" $peer.dir | quote }}
+  value: {{ printf "%s/tls.crt" $dir | quote }}
 {{- end }}
 {{- if not (hasKey $declared "MQTTD_PEER_TLS_KEY") }}
 - name: MQTTD_PEER_TLS_KEY
-  value: {{ printf "%s/tls.key" $peer.dir | quote }}
+  value: {{ printf "%s/tls.key" $dir | quote }}
 {{- end }}
 {{- end }}
 {{- if $gossip.secretName }}
@@ -134,7 +186,7 @@ app.kubernetes.io/component: broker
 {{- /* The admin API (ADR 0081): served with the pod's own cluster-bus certificate. */}}
 {{- $admin := .Values.admin -}}
 {{- if $admin.enabled }}
-{{- if not (or $peer.secretName $peer.dir) }}
+{{- if not (or $peer.secretName $dir) }}
 {{- fail "admin.enabled needs the cluster-bus certificates (secrets.peerTls): each pod serves the admin API with its own cluster certificate" }}
 {{- end }}
 {{- if not $admin.clientCa.secretName }}
@@ -146,9 +198,9 @@ app.kubernetes.io/component: broker
 - name: MQTTD_ADMIN_BIND
   value: "0.0.0.0:9443"
 - name: MQTTD_ADMIN_CERT
-  value: {{ ternary (printf "%s/$(POD_NAME).crt" $peer.mountPath) (printf "%s/tls.crt" $peer.dir) (not (empty $peer.secretName)) | quote }}
+  value: {{ ternary (printf "%s/$(POD_NAME).crt" $peer.mountPath) (printf "%s/tls.crt" $dir) (not (empty $peer.secretName)) | quote }}
 - name: MQTTD_ADMIN_KEY
-  value: {{ ternary (printf "%s/$(POD_NAME).key" $peer.mountPath) (printf "%s/tls.key" $peer.dir) (not (empty $peer.secretName)) | quote }}
+  value: {{ ternary (printf "%s/$(POD_NAME).key" $peer.mountPath) (printf "%s/tls.key" $dir) (not (empty $peer.secretName)) | quote }}
 - name: MQTTD_ADMIN_CLIENT_CA
   value: {{ printf "%s/ca.crt" $admin.clientCa.mountPath | quote }}
 {{- with $admin.viewers }}

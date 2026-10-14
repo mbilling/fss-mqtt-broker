@@ -95,22 +95,41 @@ jobs:
         run: cargo test -p mqttd --test cluster_upgrade -- --ignored --nocapture
 
   swim-stop:
-    name: a stopped broker is not declared dead (12 brokers)
+    name: a stopped broker is not declared dead, and a stopped prober declares nobody
     runs-on: ubuntu-latest
-    # ADR 0016's amendment of 2026-10-13 (issue #975), on real processes: one of
-    # twelve signed-gossip brokers is stopped for two seconds, eight times, and no
-    # broker may declare it DEAD. Nightly because a verdict is a matter of
-    # deadlines; the bound itself is asserted per-PR in virtual time
-    # (mqtt-cluster/tests/swim_formation_sim.rs).
+    # ADR 0016's amendments of 2026-10-13 (issues #975, #1002), on real processes.
+    # One of twelve signed-gossip brokers is stopped for two seconds, eight times, and
+    # no broker may declare it DEAD. And of two brokers, the one whose last direct
+    # probe of the other is out is stopped for six ack timeouts while the other
+    # answers: on waking it may not declare DEAD a suspect whose answer is in its
+    # socket. Nightly because a verdict is a matter of deadlines; the bound and the
+    # stalled prober are asserted per-PR in virtual time
+    # (mqtt-cluster/tests/swim_formation_sim.rs, mqtt-cluster/src/swim_driver.rs).
     timeout-minutes: 45
+    # Nothing here writes to the repository; uploading an artifact needs no scope.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master; `with:` selects the toolchain
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - name: SIGSTOP one of twelve brokers for two seconds
-        run: cargo test -p mqttd --test swim_formation_proc -- --ignored --nocapture
+      # One at a time: each scenario is about deadlines, and fourteen brokers started
+      # by the other would be its noise. The brokers' files go where the next step
+      # can find them.
+      - name: SIGSTOP a suspect for two seconds; SIGSTOP a prober with its last probe out
+        run: MQTTD_SWIM_LOG_DIR=$PWD/target/swim-stop cargo test -p mqttd --test swim_formation_proc -- --ignored --nocapture --test-threads=1
+      # A verdict that should not have been reached is explained by the brokers' own
+      # lines around it. Logs only: the directory also holds each run's throwaway keys.
+      - name: Upload the brokers' logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: swim-stop-broker-logs
+          path: target/swim-stop/**/*.log
+          if-no-files-found: ignore
+          retention-days: 14
 
   soak:
     name: one-hour soak (drift watermarks)

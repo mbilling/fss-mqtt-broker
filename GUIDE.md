@@ -1469,7 +1469,7 @@ are in [`docs/OPERATIONS.md`](docs/OPERATIONS.md):
 # Mints the gossip key, server TLS, a starter ACL and ONE CLUSTER-BUS CERTIFICATE PER NODE
 # into the namespace, then prints the exact --set flags to wire them. Verifies every
 # certificate property it reports before installing it.
-NS=mqttd REPLICAS=3 ./deploy/helm/mqttd/bootstrap.sh
+LEAF_DAYS=30 NS=mqttd REPLICAS=3 ./deploy/helm/mqttd/bootstrap.sh
 
 # mqttd-tls is a kubernetes.io/tls Secret; mqttd-peer-tls carries ca.crt plus
 # <pod>.crt/<pod>.key per pod (the layout bootstrap.sh mints and prints).
@@ -1544,7 +1544,7 @@ cd deploy/compose && ./bootstrap.sh && docker compose up -d   # three nodes, one
 
 ```sh
 deploy/systemd/gen-certs.sh ca                                 # ONCE, on an admin box
-deploy/systemd/gen-certs.sh node mqttd-1 mqttd-1.example.com   # ...then once per node
+deploy/systemd/gen-certs.sh node --lifetime 24h mqttd-1 mqttd-1.example.com   # ...then once per node
 sudo install -m 0644 deploy/systemd/mqttd.service /etc/systemd/system/
 sudo install -m 0640 deploy/systemd/mqttd.env.example /etc/mqttd/mqttd.env
 sudo $EDITOR /etc/mqttd/mqttd.env                              # five marked lines
@@ -1565,7 +1565,9 @@ one command and is TLS on the first run; systemd ships the TLS lines uncommented
 [`gen-certs.sh`](deploy/systemd/gen-certs.sh) that mints the material — one CA for the
 cluster, one leaf set per node, run from an admin machine so the CA private key never
 reaches a broker host — so an unedited install fails closed at startup, naming the setting
-and the path it could not read, rather than serving cleartext. Both are self-signed starter
+and the path it could not read, rather than serving cleartext. It mints no leaf without a
+stated `--lifetime`, prints the date to renew by, and has `renew` and `revoke` for the two
+things an operator then owes ([ADR 0088](docs/adr/0088-credential-lifetimes-and-rotation.md)). Both are self-signed starter
 PKIs to replace before production.
 
 Plaintext is still available and is now an explicit, named opt-in:

@@ -23,7 +23,19 @@ fn main() {
     // `helm template` with secrets.peerTls/gossipKey and admin.* set — the per-pod
     // MQTTD_ADMIN_* wiring, the client-CA mount and the admin ports must agree too.
     let admin_on = std::env::args().any(|a| a == "--admin");
-    let secrets = if admin_on || std::env::args().any(|a| a == "--peer-tls") {
+    // `--peer-tls-cert-manager` renders the per-pod cert-manager csi volume with a stated
+    // lifetime and renewal lead (ADR 0088 D1), matching `helm template --set
+    // secrets.peerTls.certManager.{issuerName,duration,renewBefore}=...`.
+    let secrets = if std::env::args().any(|a| a == "--peer-tls-cert-manager") {
+        serde_json::json!({
+            "peerTlsCertManager": {
+                "issuerName": "mqttd-cluster-ca",
+                "duration": "24h",
+                "renewBefore": "10h",
+            },
+            "gossipKey": "mqttd-gossip",
+        })
+    } else if admin_on || std::env::args().any(|a| a == "--peer-tls") {
         serde_json::json!({ "peerTls": "mqttd-peer-tls", "gossipKey": "mqttd-gossip" })
     } else {
         serde_json::Value::Null

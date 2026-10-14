@@ -148,16 +148,81 @@ const ADMIN_CA_PATH: &str = "/etc/mqttd/admin";
 /// The admin API port (ADR 0081), on the container and the headless Service.
 const ADMIN_PORT: i64 = 9443;
 
-/// The admin API settings when they can be rendered: the CR asks for it AND names the
-/// cluster-bus Secret whose per-pod leaf serves it (the chart `fail`s without one; the
+/// The pod security context's `fsGroup` (the chart's `podSecurityContext.fsGroup`), also
+/// handed to cert-manager's csi-driver so the non-root broker can read its key.
+const FS_GROUP: i64 = 65532;
+
+/// Where a pod's cluster-bus certificate comes from, mirroring the chart's
+/// `secrets.peerTls`: one Secret keyed by pod name, or a per-pod cert-manager csi volume.
+#[derive(Clone, Copy)]
+enum PeerTls<'a> {
+    /// `secrets.peerTls`: `ca.crt` plus `<pod>.crt` / `<pod>.key` per pod.
+    Secret(&'a str),
+    /// `secrets.peerTlsCertManager`: `ca.crt`, `tls.crt`, `tls.key`, this pod's only.
+    CertManager(&'a crate::crd::PeerTlsCertManager),
+}
+
+impl PeerTls<'_> {
+    /// The certificate and key paths the broker (and the admin API) are given.
+    fn leaf_paths(self) -> (String, String) {
+        match self {
+            Self::Secret(_) => (
+                format!("{PEER_TLS_PATH}/$(POD_NAME).crt"),
+                format!("{PEER_TLS_PATH}/$(POD_NAME).key"),
+            ),
+            Self::CertManager(_) => (
+                format!("{PEER_TLS_PATH}/tls.crt"),
+                format!("{PEER_TLS_PATH}/tls.key"),
+            ),
+        }
+    }
+}
+
+/// The CR's cluster-bus certificate source. The Secret wins when both are set (the chart
+/// `fail`s on that; a CR cannot, so the older, explicit field is the one honoured).
+fn peer_tls(cr: &MqttdCluster) -> Option<PeerTls<'_>> {
+    let s = cr.spec.secrets.as_ref()?;
+    match (&s.peer_tls, &s.peer_tls_cert_manager) {
+        (Some(secret), _) => Some(PeerTls::Secret(secret)),
+        (None, Some(cm)) => Some(PeerTls::CertManager(cm)),
+        (None, None) => None,
+    }
+}
+
+/// The cert-manager csi volume for per-pod cluster-bus certificates — the same
+/// attributes as the chart's `mqttd.peerTlsCsiAttributes`: the four rules the bus
+/// enforces, then the lifetime and renewal lead the CR states (ADR 0088 D1).
+/// `${POD_NAME}` / `${POD_NAMESPACE}` are the csi-driver's own variables.
+fn peer_tls_csi_volume(cm: &crate::crd::PeerTlsCertManager, names: &Names) -> Value {
+    json!({
+        "name": "peer-tls",
+        "csi": {
+            "driver": "csi.cert-manager.io",
+            "readOnly": true,
+            "volumeAttributes": {
+                "csi.cert-manager.io/issuer-name": cm.issuer_name,
+                "csi.cert-manager.io/issuer-kind": cm.issuer_kind.as_deref().unwrap_or("Issuer"),
+                "csi.cert-manager.io/issuer-group":
+                    cm.issuer_group.as_deref().unwrap_or("cert-manager.io"),
+                "csi.cert-manager.io/common-name": "${POD_NAME}",
+                "csi.cert-manager.io/dns-names":
+                    format!("${{POD_NAME}}.{}.${{POD_NAMESPACE}}.svc.cluster.local", names.headless),
+                "csi.cert-manager.io/key-usages": "server auth,client auth",
+                "csi.cert-manager.io/key-algorithm": "ECDSA",
+                "csi.cert-manager.io/key-encoding": "PKCS8",
+                "csi.cert-manager.io/duration": cm.duration,
+                "csi.cert-manager.io/renew-before": cm.renew_before,
+                "csi.cert-manager.io/fs-group": FS_GROUP.to_string(),
+            },
+        },
+    })
+}
+
+/// The admin API settings when they can be rendered: the CR asks for it AND has a
+/// cluster-bus certificate per pod to serve it with (the chart `fail`s without one; the
 /// operator renders nothing rather than a broker that cannot start).
 fn admin(cr: &MqttdCluster) -> Option<&crate::crd::AdminSpec> {
-    let peer_tls = cr
-        .spec
-        .secrets
-        .as_ref()
-        .and_then(|s| s.peer_tls.as_ref())
-        .is_some();
+    let peer_tls = peer_tls(cr).is_some();
     cr.spec
         .admin
         .as_ref()
@@ -403,7 +468,7 @@ fn pdb(names: &Names) -> Value {
 
 /// Volume mounts + volumes for whichever secret references the CR sets, mirroring
 /// the chart's `secrets` block (by PATH — the operator never reads the material).
-fn secret_wiring(cr: &MqttdCluster) -> (Vec<Value>, Vec<Value>) {
+fn secret_wiring(cr: &MqttdCluster, names: &Names) -> (Vec<Value>, Vec<Value>) {
     let mut mounts = Vec::new();
     let mut volumes = Vec::new();
     let s = cr.spec.secrets.as_ref();
@@ -425,12 +490,16 @@ fn secret_wiring(cr: &MqttdCluster) -> (Vec<Value>, Vec<Value>) {
             json!({ "name": "acl", "configMap": { "name": acl } }),
         );
     }
-    if let Some(peer) = s.and_then(|s| s.peer_tls.as_ref()) {
-        add(
+    match peer_tls(cr) {
+        Some(PeerTls::Secret(peer)) => add(
             "peer-tls",
             PEER_TLS_PATH,
             json!({ "name": "peer-tls", "secret": { "secretName": peer } }),
-        );
+        ),
+        Some(PeerTls::CertManager(cm)) => {
+            add("peer-tls", PEER_TLS_PATH, peer_tls_csi_volume(cm, names));
+        }
+        None => {}
     }
     if let Some(key) = s.and_then(|s| s.gossip_key.as_ref()) {
         add(
@@ -492,12 +561,7 @@ fn statefulset(cr: &MqttdCluster, names: &Names, observed_pvc_max: Option<u64>) 
     if founding_disarmed(cr) {
         init_env.push(json!({ "name": "CLUSTER_ESTABLISHED", "value": "true" }));
     }
-    let peer_tls = cr
-        .spec
-        .secrets
-        .as_ref()
-        .and_then(|s| s.peer_tls.as_ref())
-        .is_some();
+    let peer_tls = peer_tls(cr);
     let gossip_key = cr
         .spec
         .secrets
@@ -510,7 +574,8 @@ fn statefulset(cr: &MqttdCluster, names: &Names, observed_pvc_max: Option<u64>) 
         json!({ "name": "config-tmpl", "mountPath": "/tmpl" }),
         json!({ "name": "config", "mountPath": "/config" }),
     ];
-    if peer_tls {
+    // The preflight is the Secret layout's: a csi volume is this pod's own by construction.
+    if matches!(peer_tls, Some(PeerTls::Secret(_))) {
         init_env.push(json!({ "name": "PEER_TLS_DIR", "value": PEER_TLS_PATH }));
         init_mounts
             .push(json!({ "name": "peer-tls", "mountPath": PEER_TLS_PATH, "readOnly": true }));
@@ -523,19 +588,20 @@ fn statefulset(cr: &MqttdCluster, names: &Names, observed_pvc_max: Option<u64>) 
     // Kubernetes' dependent-env expansion of $(POD_NAME): a StatefulSet pod template
     // cannot select a Secret per ordinal, but every pod can select a KEY within one.
     let mut broker_env: Vec<Value> = Vec::new();
-    if peer_tls {
-        broker_env.push(
-            json!({ "name": "POD_NAME", "valueFrom": { "fieldRef": { "fieldPath": "metadata.name" } } }),
-        );
+    if let Some(peer) = peer_tls {
+        // POD_NAME must be defined before the entries that expand it; the csi layout
+        // needs no such indirection (the volume itself is per-pod).
+        if matches!(peer, PeerTls::Secret(_)) {
+            broker_env.push(
+                json!({ "name": "POD_NAME", "valueFrom": { "fieldRef": { "fieldPath": "metadata.name" } } }),
+            );
+        }
+        let (cert, key) = peer.leaf_paths();
         broker_env.push(
             json!({ "name": "MQTTD_PEER_TLS_CA", "value": format!("{PEER_TLS_PATH}/ca.crt") }),
         );
-        broker_env.push(
-            json!({ "name": "MQTTD_PEER_TLS_CERT", "value": format!("{PEER_TLS_PATH}/$(POD_NAME).crt") }),
-        );
-        broker_env.push(
-            json!({ "name": "MQTTD_PEER_TLS_KEY", "value": format!("{PEER_TLS_PATH}/$(POD_NAME).key") }),
-        );
+        broker_env.push(json!({ "name": "MQTTD_PEER_TLS_CERT", "value": cert }));
+        broker_env.push(json!({ "name": "MQTTD_PEER_TLS_KEY", "value": key }));
     }
     if gossip_key {
         broker_env.push(
@@ -545,15 +611,12 @@ fn statefulset(cr: &MqttdCluster, names: &Names, observed_pvc_max: Option<u64>) 
     // The admin API (ADR 0081), served with the pod's own cluster-bus leaf — the same
     // variables, values and order as the chart's `mqttd.brokerEnv`.
     let admin = admin(cr);
-    if let Some(a) = admin {
+    if let (Some(a), Some(peer)) = (admin, peer_tls) {
+        let (cert, key) = peer.leaf_paths();
         broker_env
             .push(json!({ "name": "MQTTD_ADMIN_BIND", "value": format!("0.0.0.0:{ADMIN_PORT}") }));
-        broker_env.push(
-            json!({ "name": "MQTTD_ADMIN_CERT", "value": format!("{PEER_TLS_PATH}/$(POD_NAME).crt") }),
-        );
-        broker_env.push(
-            json!({ "name": "MQTTD_ADMIN_KEY", "value": format!("{PEER_TLS_PATH}/$(POD_NAME).key") }),
-        );
+        broker_env.push(json!({ "name": "MQTTD_ADMIN_CERT", "value": cert }));
+        broker_env.push(json!({ "name": "MQTTD_ADMIN_KEY", "value": key }));
         broker_env.push(
             json!({ "name": "MQTTD_ADMIN_CLIENT_CA", "value": format!("{ADMIN_CA_PATH}/ca.crt") }),
         );
@@ -565,7 +628,7 @@ fn statefulset(cr: &MqttdCluster, names: &Names, observed_pvc_max: Option<u64>) 
                 .push(json!({ "name": "MQTTD_ADMIN_OPERATORS", "value": a.operators.join(";") }));
         }
     }
-    let (secret_mounts, secret_volumes) = secret_wiring(cr);
+    let (secret_mounts, secret_volumes) = secret_wiring(cr, names);
     let persistence = cr.spec.persistence.as_ref();
     let size = persistence
         .and_then(|p| p.size.clone())
@@ -800,11 +863,98 @@ mod tests {
         .expect("sample CR")
     }
 
-    /// ADR 0081 T15: `spec.admin` with the cluster-bus Secret renders the admin API —
-    /// the `MQTTD_ADMIN_*` env served with each pod's own leaf, the client-CA mount and the
-    /// admin port on the container and the headless Service (never the client Service).
-    /// Without `peerTls`, or with no subject in either role list, it renders nothing
-    /// rather than a broker that cannot start.
+    /// ADR 0088 D1: `secrets.peerTlsCertManager` renders the cert-manager csi volume with
+    /// the lifetime and renewal lead the CR states, points the broker (and the admin API)
+    /// at the volume's own `tls.crt`/`tls.key`, and arms no Secret-layout preflight. A CR
+    /// that names neither value does not deserialize: there is no default to fall back to.
+    #[test]
+    fn cert_manager_certificates_carry_the_stated_lifetime_and_renewal_lead() {
+        let mut cr = sample();
+        cr.spec.secrets = serde_json::from_value(serde_json::json!({
+            "peerTlsCertManager": {
+                "issuerName": "cluster-ca", "issuerKind": "ClusterIssuer",
+                "duration": "12h", "renewBefore": "5h",
+            },
+        }))
+        .unwrap();
+        cr.spec.admin = serde_json::from_value(
+            serde_json::json!({ "clientCaSecret": "ca", "operators": ["CN=root"] }),
+        )
+        .unwrap();
+        let sts = render(&cr, None).statefulset;
+        let pod = &sts["spec"]["template"]["spec"];
+        let volume = pod["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "peer-tls")
+            .expect("a peer-tls volume");
+        assert_eq!(volume["csi"]["driver"], "csi.cert-manager.io");
+        let attrs = &volume["csi"]["volumeAttributes"];
+        assert_eq!(attrs["csi.cert-manager.io/duration"], "12h");
+        assert_eq!(attrs["csi.cert-manager.io/renew-before"], "5h");
+        assert_eq!(attrs["csi.cert-manager.io/issuer-name"], "cluster-ca");
+        assert_eq!(attrs["csi.cert-manager.io/issuer-kind"], "ClusterIssuer");
+        assert_eq!(attrs["csi.cert-manager.io/issuer-group"], "cert-manager.io");
+        assert_eq!(attrs["csi.cert-manager.io/common-name"], "${POD_NAME}");
+        assert_eq!(attrs["csi.cert-manager.io/key-algorithm"], "ECDSA");
+        assert_eq!(
+            attrs["csi.cert-manager.io/key-usages"],
+            "server auth,client auth"
+        );
+
+        let env = |container: &serde_json::Value| -> std::collections::BTreeMap<String, String> {
+            container["env"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|e| {
+                    Some((
+                        e["name"].as_str()?.to_owned(),
+                        e["value"].as_str()?.to_owned(),
+                    ))
+                })
+                .collect()
+        };
+        let broker = env(&pod["containers"][0]);
+        assert_eq!(broker["MQTTD_PEER_TLS_CERT"], "/etc/mqttd/cluster/tls.crt");
+        assert_eq!(broker["MQTTD_PEER_TLS_KEY"], "/etc/mqttd/cluster/tls.key");
+        assert_eq!(broker["MQTTD_PEER_TLS_CA"], "/etc/mqttd/cluster/ca.crt");
+        assert_eq!(broker["MQTTD_ADMIN_CERT"], "/etc/mqttd/cluster/tls.crt");
+        assert!(
+            !env(&pod["initContainers"][0]).contains_key("PEER_TLS_DIR"),
+            "the per-pod-leaf preflight is the Secret layout's"
+        );
+
+        // No lifetime, no object: neither field has a default.
+        for missing in ["duration", "renewBefore"] {
+            let mut spec = serde_json::json!({
+                "issuerName": "cluster-ca", "duration": "12h", "renewBefore": "5h",
+            });
+            spec.as_object_mut().unwrap().remove(missing);
+            assert!(
+                serde_json::from_value::<crate::crd::PeerTlsCertManager>(spec).is_err(),
+                "a peerTlsCertManager without {missing} must be refused"
+            );
+        }
+
+        // The Secret wins when both are named.
+        cr.spec.secrets = serde_json::from_value(serde_json::json!({
+            "peerTls": "p",
+            "peerTlsCertManager": { "issuerName": "x", "duration": "1h", "renewBefore": "30m" },
+        }))
+        .unwrap();
+        let sts = render(&cr, None).statefulset;
+        let volume = sts["spec"]["template"]["spec"]["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "peer-tls")
+            .unwrap()
+            .clone();
+        assert_eq!(volume["secret"]["secretName"], "p");
+    }
+
     /// Issue #778: `spec.networkPolicy` renders an ingress policy whose pod-mesh rule
     /// admits only the cluster's own pods to the peer bus and gossip (and the admin port
     /// when the admin API is on); the client and health rules pass their peer lists
@@ -883,6 +1033,11 @@ mod tests {
             .contains("\"admin\""));
     }
 
+    /// ADR 0081 T15: `spec.admin` with the cluster-bus Secret renders the admin API —
+    /// the `MQTTD_ADMIN_*` env served with each pod's own leaf, the client-CA mount and the
+    /// admin port on the container and the headless Service (never the client Service).
+    /// Without `peerTls`, or with no subject in either role list, it renders nothing
+    /// rather than a broker that cannot start.
     #[test]
     fn the_admin_api_renders_only_with_the_cluster_bus_and_a_role() {
         let with = |secrets: serde_json::Value, admin: serde_json::Value| {
@@ -1206,6 +1361,7 @@ mod tests {
             tls: Some("mqttd-tls".into()),
             acl: None,
             peer_tls: None,
+            peer_tls_cert_manager: None,
             gossip_key: Some("swim-key".into()),
         });
         let wired = render(&cr, None);

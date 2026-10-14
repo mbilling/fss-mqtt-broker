@@ -170,6 +170,17 @@ pub struct Tls {
     /// Per mille and not a fraction because this struct derives `Eq`; `1000` warns only
     /// at expiry. Read at startup.
     pub expiry_warn_permille: u16,
+    /// End a client session when the certificate it was admitted with passes `notAfter`
+    /// (`MQTTD_TLS_END_SESSIONS_AT_CERT_EXPIRY`, `1`/`0`; ADR 0088 O2). **Off by
+    /// default**: devices with long sessions and short certificates exist, and a
+    /// certificate is otherwise checked at the handshake only. On, the session is ended
+    /// within a second of its leaf's end as a revoked one is (v5: DISCONNECT `0x87`),
+    /// counted as `mqttd_revocation_evictions_total{reason="cert-expired"}`, and the
+    /// client must reconnect with a valid certificate. Applies to the TLS, WSS and QUIC
+    /// listeners' client certificates; a session relayed to another node (ADR 0005) is
+    /// not covered. Cluster peer links are always ended at expiry and have no setting.
+    /// Read at startup.
+    pub end_sessions_at_cert_expiry: bool,
 }
 
 impl Default for Tls {
@@ -183,6 +194,7 @@ impl Default for Tls {
             allow_tls12: false,
             allow_unsafe_tls12_features: false,
             expiry_warn_permille: DEFAULT_TLS_EXPIRY_WARN_PERMILLE,
+            end_sessions_at_cert_expiry: false,
         }
     }
 }
@@ -1439,6 +1451,10 @@ impl Config {
         on!("MQTTD_TLS_EXPIRY_WARN_PERMILLE", v, {
             self.tls.expiry_warn_permille = num("MQTTD_TLS_EXPIRY_WARN_PERMILLE", &v)?;
         });
+        on!("MQTTD_TLS_END_SESSIONS_AT_CERT_EXPIRY", v, {
+            self.tls.end_sessions_at_cert_expiry =
+                on_off("MQTTD_TLS_END_SESSIONS_AT_CERT_EXPIRY", &v)?;
+        });
 
         // -- security -- (MQTTD_ALLOW_ANONYMOUS: presence = on; require_client_cert is derived,
         // has no env var by design)
@@ -2427,6 +2443,7 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_TLS_ALLOW_TLS12",
     "MQTTD_TLS_ALLOW_UNSAFE_TLS12_FEATURES",
     "MQTTD_TLS_EXPIRY_WARN_PERMILLE",
+    "MQTTD_TLS_END_SESSIONS_AT_CERT_EXPIRY",
     // security
     "MQTTD_ALLOW_ANONYMOUS",
     "MQTTD_MTLS_IDENTITY_SOURCE",
@@ -3616,6 +3633,7 @@ mod tests {
             | "MQTTD_TLS_ALLOW_TLS12"
             | "MQTTD_TLS_ALLOW_UNSAFE_TLS12_FEATURES"
             // An explicit on/off (anything else is refused) whose default is off.
+            | "MQTTD_TLS_END_SESSIONS_AT_CERT_EXPIRY"
             | "MQTTD_RULES_TRACE"
             | "MQTTD_RULES_JQ" => "1",
             // Enums: any valid, non-default (default None) member.
@@ -3833,6 +3851,30 @@ mod tests {
         assert!(err.to_string().contains("MQTTD_TLS_EXPIRY_WARN_PERMILLE"));
     }
 
+    /// ADR 0088 O2: ending client sessions at their certificate's expiry is a setting,
+    /// off unless asked for, in the file and the environment.
+    #[test]
+    fn ending_client_sessions_at_certificate_expiry_is_off_by_default() {
+        assert!(!Config::default().tls.end_sessions_at_cert_expiry);
+        let flag = "\n[durable]\nallow_ephemeral = true\n";
+        let c =
+            Config::from_toml(&format!("[tls]\nend_sessions_at_cert_expiry = true{flag}")).unwrap();
+        assert!(c.tls.end_sessions_at_cert_expiry);
+        let mut c = Config::default();
+        c.overlay_from(getter(&[("MQTTD_TLS_END_SESSIONS_AT_CERT_EXPIRY", "on")]))
+            .unwrap();
+        assert!(c.tls.end_sessions_at_cert_expiry);
+        let err = Config::default()
+            .overlay_from(getter(&[(
+                "MQTTD_TLS_END_SESSIONS_AT_CERT_EXPIRY",
+                "maybe",
+            )]))
+            .expect_err("on or off");
+        assert!(err
+            .to_string()
+            .contains("MQTTD_TLS_END_SESSIONS_AT_CERT_EXPIRY"));
+    }
+
     #[test]
     fn the_env_surface_is_a_deduplicated_curated_list() {
         // Every var appears exactly once — a duplicate would be a copy/paste bug that hides a
@@ -3870,8 +3912,9 @@ mod tests {
             // plus MQTTD_RULES_STATE_MAX_BYTES and MQTTD_RULES_STATE_EXPIRY_PER_SEC
             // (ADR 0085),
             // plus MQTTD_RULES_FUNCTION_MAX_MS (ADR 0086, the ceiling on one call),
-            // plus MQTTD_TLS_EXPIRY_WARN_PERMILLE (ADR 0088 D2).
-            125,
+            // plus MQTTD_TLS_EXPIRY_WARN_PERMILLE (ADR 0088 D2),
+            // plus MQTTD_TLS_END_SESSIONS_AT_CERT_EXPIRY (ADR 0088 O2).
+            126,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never
