@@ -481,6 +481,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `placement::tests::a_dead_peer_drops_its_domain`
 - `placement::tests::a_declared_member_count_arms_the_write_floor_before_gossip_or_the_roster`
 - `placement::tests::a_joining_node_moves_only_a_minority`
+- `placement::tests::a_lease_epoch_change_alone_moves_the_ownership_epoch`
 - `placement::tests::a_memo_hit_does_not_recompute_the_hrw_pass`
 - `placement::tests::a_narrower_replica_set_is_a_prefix_of_a_wider_one`
 - `placement::tests::a_new_replication_factor_reshapes_sets_and_keeps_owners`
@@ -497,7 +498,6 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `placement::tests::for_each_member_is_the_same_set_as_members`
 - `placement::tests::group_of_is_deterministic_and_in_range`
 - `placement::tests::group_queries_are_consistent`
-- `placement::tests::holding_a_lease_reads_the_committed_map_whatever_membership_says`
 - `placement::tests::owner_route_is_none_until_the_owner_address_is_known`
 - `placement::tests::owner_route_points_at_a_remote_owner_and_is_none_when_local`
 - `placement::tests::owns_and_is_replica_agree_with_the_ring`
@@ -1456,7 +1456,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 847 test(s)
+## `crates/mqttd/src/lib.rs` — 851 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1690,11 +1690,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::pending_bounds::the_entry_cap_evicts_only_the_oldest`
 - `hub::forwarding::pending_bounds::the_reached_record_is_charged_and_released_with_its_entry`
 - `hub::forwarding::pending_bounds::the_sweep_retransmits_only_overdue_forwards`
+- `hub::forwarding::zone_fwd_proofs::a_blip_with_no_lease_moving_is_answered_by_the_node_itself`
 - `hub::forwarding::zone_fwd_proofs::a_clean_and_a_durable_session_on_the_same_filter_keep_the_forward_for_the_holders`
 - `hub::forwarding::zone_fwd_proofs::a_clean_monitor_beside_a_durable_session_does_not_resolve_the_durable_ones_forward`
 - `hub::forwarding::zone_fwd_proofs::a_dead_peer_without_kinds_is_answered_for_by_its_heirs_not_by_its_confirmation`
 - `hub::forwarding::zone_fwd_proofs::a_durable_session_that_materialises_here_discharges_what_its_dead_owner_was_owed`
 - `hub::forwarding::zone_fwd_proofs::a_durable_sessions_forward_outlives_its_owners_confirmation_until_an_heir_answers`
+- `hub::forwarding::zone_fwd_proofs::a_forward_kept_for_the_lease_holders_stays_kept_through_a_new_generation`
 - `hub::forwarding::zone_fwd_proofs::a_forward_unanswered_when_its_target_is_declared_dead_stays_owed_until_the_peer_answers`
 - `hub::forwarding::zone_fwd_proofs::a_group_moved_to_the_lost_node_just_before_the_loss_is_still_answered_for`
 - `hub::forwarding::zone_fwd_proofs::a_hold_at_the_pending_table_bound_evicts_the_oldest_and_withholds_its_ack`
@@ -1702,6 +1704,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::zone_fwd_proofs::a_link_to_a_peer_confirmed_gone_that_stays_up_is_dropped_after_the_countdown`
 - `hub::forwarding::zone_fwd_proofs::a_link_under_a_dead_verdict_takes_its_interest_with_it_until_the_verdict_is_withdrawn`
 - `hub::forwarding::zone_fwd_proofs::a_lost_node_that_held_no_lease_is_resolved_at_confirmation_and_counted`
+- `hub::forwarding::zone_fwd_proofs::a_lost_nodes_answer_after_its_lease_moved_counts_for_nothing_whatever_it_announces`
 - `hub::forwarding::zone_fwd_proofs::a_peer_confirmed_gone_while_linked_is_resolved_when_that_link_ends`
 - `hub::forwarding::zone_fwd_proofs::a_peer_confirmed_gone_whose_link_stays_up_and_that_is_alive_again_resolves_nothing`
 - `hub::forwarding::zone_fwd_proofs::a_peer_that_stays_dead_is_held_until_confirmed_gone_and_then_resolved_and_counted`
@@ -2020,6 +2023,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::settle_gate::an_entry_whose_ack_is_still_held_is_never_retired`
 - `hub::tests::settle_gate::an_incomplete_scan_is_retried_on_a_node_with_no_durable_plane`
 - `hub::tests::settle_gate::an_owner_question_is_answered_only_by_the_groups_holder_at_the_epoch_asked`
+- `hub::tests::settle_gate::an_owner_question_reaches_only_the_durable_sessions_it_names_and_waits_for_a_recovering_attach`
 - `hub::tests::settle_gate::an_unsettled_view_releases_the_ack_of_a_publish_that_reached_a_subscriber`
 - `hub::tests::settle_gate::leaving_the_settle_window_answers_a_restore_shaped_entry`
 - `hub::tests::settle_gate::no_periodic_inherited_scan_runs_without_a_durable_plane`

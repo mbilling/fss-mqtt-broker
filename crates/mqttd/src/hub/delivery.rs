@@ -427,6 +427,42 @@ impl Hub {
             .collect()
     }
 
+    /// Apply an owner's question (ADR 0087 D8) — a re-route of `topic` for the durable
+    /// sessions of `groups` held here, and only those: the persistent sessions among
+    /// the topic's ordinary recipients whose placement group is one of `groups`. No
+    /// retained write, no `$share` placement. Returns `(durable, matched)` as
+    /// [`deliver`](Self::deliver) does.
+    #[allow(clippy::too_many_arguments)] // the delivery-path fields, plus the groups
+    pub(super) fn deliver_owner_question(
+        &mut self,
+        topic: &str,
+        payload: &Bytes,
+        qos: QoS,
+        message_expiry: Option<u32>,
+        app: &AppProperties,
+        groups: &[u64],
+        gate: &AppendGate,
+    ) -> (DurableOutcome, usize) {
+        let targets: Vec<(ClientId, QoS, bool)> = self
+            .ordinary_targets(topic, None, false)
+            .into_iter()
+            .filter(|(c, _, _)| {
+                self.is_persistent(c) && groups.contains(&mqtt_cluster::placement::group_of(&c.0))
+            })
+            .collect();
+        let matched = targets.len();
+        let owes = targets
+            .iter()
+            .any(|(c, granted, _)| self.owes_durable(c, min_qos(qos, *granted)));
+        if let Some(r) = self.plan_refusal(owes) {
+            self.count_refusal(r);
+            return (DurableOutcome::Refused(r), matched);
+        }
+        let (durable, _) =
+            self.deliver_local(topic, payload, qos, message_expiry, app, targets, gate);
+        (durable, matched)
+    }
+
     /// Whether delivering to `client` at `delivered_qos` OWES a durable append: a
     /// persistent session is promised redelivery of anything unacknowledged (#124),
     /// and at-most-once is promised nothing. Both checks are in-memory.

@@ -3160,9 +3160,10 @@ struct RemoteForward {
     app: AppProperties,
     origin: Option<u64>,
     replay: bool,
-    /// An owner's question ([`HubCommand::RemoteOwnerQuestion`]): never answered
-    /// before this node can say who is on it.
-    question: bool,
+    /// An owner's question ([`HubCommand::RemoteOwnerQuestion`]), with the groups it
+    /// names: never answered before this node can say who is on it, and applied to
+    /// the persistent sessions of those groups only.
+    question: Option<Vec<u64>>,
 }
 
 /// How long before a node is lost a lease that changed hands still counts as one it
@@ -4199,7 +4200,7 @@ impl Hub {
                     app,
                     origin,
                     replay,
-                    question: false,
+                    question: None,
                 })
                 .await;
             }
@@ -4229,7 +4230,7 @@ impl Hub {
                     app,
                     origin: Some(origin),
                     replay: true,
-                    question: true,
+                    question: Some(groups.iter().map(|(g, _)| *g).collect()),
                 })
                 .await;
             }
@@ -5206,6 +5207,7 @@ impl Hub {
             // metadata, and writing a cleared deadline would wrongly materialize one.
             let _ = self.store.set_session_expiry(&client, None).await;
         }
+        self.note_persistence(&client);
         // A resumed session registers filters WITHOUT a SUBSCRIBE, so peers must
         // learn them here (ADR 0042 T9): after a takeover, this advertisement is
         // what re-targets a peer's held acked forward to this node — the client
@@ -5878,6 +5880,16 @@ impl Hub {
             debug!(origin = %node.0, seq, "owner question while this node's sweep has not yet seen the lease map; deferred");
             return true;
         }
+        // A persistent attach of a session in an asked group whose recovery is still
+        // in flight (ADR 0017, up to five seconds): the scan skipped it and still
+        // called itself complete, but the session is not here yet.
+        if self.connecting.keys().any(|c| {
+            let g = mqtt_cluster::placement::group_of(&c.0);
+            groups.iter().any(|(asked, _)| *asked == g)
+        }) {
+            debug!(origin = %node.0, seq, "owner question while a session of an asked group is being recovered; deferred");
+            return true;
+        }
         if groups
             .iter()
             .any(|(g, e)| self.heirs.epochs.get(g).copied().unwrap_or(0) < *e)
@@ -5925,7 +5937,7 @@ impl Hub {
         // say who is on it: its answer stands for a dead node's durable
         // sessions, and a session taken over a moment later would not have the
         // publish. Neither applied nor recorded: the origin sends it again.
-        if question && self.cannot_say_who_is_here() {
+        if question.is_some() && self.cannot_say_who_is_here() {
             debug!(origin = %node.0, seq, "owner question deferred until this node's takeover is over");
             return;
         }
@@ -5936,7 +5948,7 @@ impl Hub {
         // session here is applied and answered at once, below, whatever the takeover
         // state.
         if replay
-            && !question
+            && question.is_none()
             && self.cannot_say_who_is_here()
             && self.table.matching_clients(&topic).is_empty()
             && self
@@ -5982,23 +5994,40 @@ impl Hub {
         // it collapses to `PublishAck { ok }` — today's behaviour verbatim, the
         // rolling-upgrade skew residual. The fan-out is `answerable` either way:
         // a verdict travels back, so a refusal must be effect-free here too.
-        let (durable, matched) = self
-            .deliver(
+        let gate = AppendGate::Peer {
+            node: node.clone(),
+            seq,
+            origin,
+            replay,
+        };
+        let (durable, matched) = match &question {
+            // An owner's question is for the durable sessions of the groups it names,
+            // and nobody else: a clean subscriber here got the publish live already,
+            // if it was owed it at all, and a re-delivery would reach it as a new
+            // message — a duplicate at QoS 2 (the third review of PR #1025).
+            Some(groups) => self.deliver_owner_question(
                 &topic,
                 &payload,
                 qos,
-                retain,
                 message_expiry,
                 &app,
-                None,
-                &AppendGate::Peer {
-                    node: node.clone(),
-                    seq,
-                    origin,
-                    replay,
-                },
-            )
-            .await;
+                groups,
+                &gate,
+            ),
+            None => {
+                self.deliver(
+                    &topic,
+                    &payload,
+                    qos,
+                    retain,
+                    message_expiry,
+                    &app,
+                    None,
+                    &gate,
+                )
+                .await
+            }
+        };
         // A fan-out that matched NOBODY mid-settle maps to FAILED, never
         // `Refused`: the message may genuinely be owed and delivered once the
         // view settles, so "nothing was stored, retry" would be a FALSE refusal
@@ -6569,6 +6598,7 @@ impl Hub {
                     } else {
                         self.session_expiry.insert(client.clone(), secs);
                     }
+                    self.note_persistence(client);
                 }
             }
             self.apply_parked_will(client, conn_id, graceful).await;
@@ -6606,6 +6636,7 @@ impl Hub {
             } else {
                 self.session_expiry.insert(client.clone(), secs);
             }
+            self.note_persistence(client);
         }
         // Any end other than a clean DISCONNECT publishes the will
         // [MQTT-3.14.4-3]; DISCONNECT discards it [MQTT-3.14.4-3].
@@ -6849,6 +6880,23 @@ impl Hub {
         }
     }
 
+    /// Tell the subscription table whether `client`'s session is one the lease plane
+    /// owns (persistent, with a durable plane), after `session_expiry` changed: what
+    /// [`local_interest`](Self::local_interest) splits filters by (ADR 0087 D8), in a
+    /// pass over distinct filters rather than over every subscription.
+    fn note_persistence(&mut self, client: &ClientId) {
+        let persistent = self.session_expiry.contains_key(client);
+        let filters: Vec<FilterKey> = self
+            .subs
+            .get(client)
+            .into_iter()
+            .flat_map(ClientSubs::iter)
+            .map(|e| FilterKey::clone(&e.filter))
+            .collect();
+        self.table
+            .set_kind(client, persistent, filters.iter().map(|f| &**f));
+    }
+
     /// Whether `client` has a retained session (survives disconnect) — its MQTT 5.0
     /// Session Expiry Interval is non-zero (ADR 0009).
     fn is_persistent(&self, client: &ClientId) -> bool {
@@ -6924,6 +6972,7 @@ impl Hub {
         self.drop_subscriptions(client);
         self.inflight.remove(client);
         self.session_expiry.remove(client);
+        self.note_persistence(client);
         self.expiring.remove(client);
         self.retained_windows.remove(client);
         self.forget_qos2_isolation(client);
@@ -7307,6 +7356,7 @@ impl Hub {
             self.session_expiry
                 .entry(client.clone())
                 .or_insert(u32::MAX);
+            self.note_persistence(&client);
             debug!(client = %client.0, "inherited session materialized before re-attach (ADR 0042 T9)");
             registered = true;
         }
@@ -8477,7 +8527,11 @@ impl Hub {
             self.erase_peer(node);
             return;
         }
-        if let Some(hold) = self.held_dead.get_mut(node) {
+        if let Some(hold) = self
+            .held_dead
+            .get_mut(node)
+            .filter(|h| **h != VerdictHold::Gone)
+        {
             *hold = VerdictHold::Unreachable;
             // And the takeover window opens, as it does at a verdict: if the node
             // has now really gone, this is the moment its sessions are inherited.
@@ -8541,6 +8595,10 @@ impl Hub {
             // Already held dead, with no link since: a repeated verdict neither
             // restarts a hold that is running nor revives one that ran out.
             Some(hold) if !had_link => *hold,
+            // A node confirmed gone with forwards kept for its sessions' lease
+            // holders stays so: a verdict on its new generation does not make them
+            // its own again.
+            Some(VerdictHold::Gone) => VerdictHold::Gone,
             _ => VerdictHold::Unreachable,
         };
         self.held_dead.insert(node.clone(), hold);
@@ -8970,6 +9028,15 @@ impl Hub {
             let keep: HashSet<NodeId> = keep.into_iter().cloned().collect();
             self.heirs.accountable.retain(|n, _| keep.contains(n));
         }
+        // A link's starting seq is kept only for a node that is linked, held dead or
+        // accounted for: a node id that has gone for good leaves nothing behind.
+        if self.heirs.link_seq.len() > self.peers.len() {
+            let (peers, held, accountable) =
+                (&self.peers, &self.held_dead, &self.heirs.accountable);
+            self.heirs.link_seq.retain(|n, _| {
+                peers.contains_key(n) || held.contains_key(n) || accountable.contains_key(n)
+            });
+        }
         self.move_shared_from_unreachable();
     }
 
@@ -9045,6 +9112,16 @@ impl Hub {
     fn note_accountable(&mut self, node: &NodeId) {
         if self.durable_plane.is_none() {
             return;
+        }
+        // Every forward owed to it now is classified from its interest as it is at
+        // the loss, once; later snapshots change nothing about them.
+        for (_, p) in self.pending_publishes.iter_mut() {
+            let topic = &p.topic;
+            for o in p.awaiting.values_mut() {
+                if &o.node == node {
+                    forwarding::freeze(&self.interest, o, topic);
+                }
+            }
         }
         let now = Instant::now();
         let recent = now.checked_sub(RECENT_MOVE);
@@ -9283,28 +9360,26 @@ impl Hub {
                 // to lose — and whenever its kinds are not known (an older build,
                 // O5): it may have been for a durable session. Counted `peer-gone`
                 // when the holders have answered, if part of it was the node's own.
-                if !shared_kind
-                    && durable
-                    && (self.interest.lease_owned_match(node, &p.topic)
-                        || !self.interest.kinds_known(node))
-                {
-                    let node_bound_too = self.interest.node_bound_match(node, &p.topic)
-                        || !self.interest.kinds_known(node);
-                    if let Some(ForwardObligation {
-                        kind:
-                            ForwardKind::Ordinary {
-                                for_owner,
-                                clean_too,
-                                ..
-                            },
+                if !shared_kind && durable {
+                    let Some(o) = p.awaiting.get_mut(&seq) else {
+                        continue;
+                    };
+                    // Classified when the node was lost (or now, if it never was
+                    // while this node watched), and never again: a forward already
+                    // kept for the lease holders stays kept.
+                    forwarding::freeze(&self.interest, o, &p.topic);
+                    if let ForwardKind::Ordinary {
+                        for_owner,
+                        durable_part,
                         ..
-                    }) = p.awaiting.get_mut(&seq)
+                    } = &mut o.kind
                     {
-                        *for_owner = true;
-                        *clean_too = node_bound_too;
+                        if *for_owner || *durable_part {
+                            *for_owner = true;
+                            kept += 1;
+                            continue;
+                        }
                     }
-                    kept += 1;
-                    continue;
                 }
                 let Some(obligation) = p.awaiting.remove(&seq) else {
                     continue;
@@ -9399,7 +9474,7 @@ impl Hub {
         if self.durable_plane.is_none() {
             return LocalInterest::Plain(self.table.filters());
         }
-        let (node_bound, lease_owned) = self.table.filters_by_kind(|c| self.is_persistent(c));
+        let (node_bound, lease_owned) = self.table.filters_by_kind();
         LocalInterest::Kinds {
             node_bound,
             lease_owned,

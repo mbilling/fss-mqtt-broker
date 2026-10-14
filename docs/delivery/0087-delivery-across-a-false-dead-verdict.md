@@ -397,3 +397,19 @@ then, once its sub-decision is settled (T3: O1, O4; T5: O2, O5; T6: O3).
   holder is asked at most every four sweeps, a question is never written on a link
   below 15, and a malformed one is answered `Failed`. New episode: a clean and a
   durable session on one filter.
+- 2026-10-14 — T5, after a fourth independent review (one blocker; the maintainer
+  adopted the reviewer's simplification). A forward's kind is now frozen when its node
+  is lost, and nothing later reads the node's interest for it: a node that came back
+  announcing no interest at all — restarted, or having released a session whose lease
+  moved during a long outage with no verdict — answered `Stored` and the publish was
+  acknowledged. Once a lease it may have held has moved, nothing durable sent to it
+  before its current link is discharged by its own answer; with no lease moved its
+  answer counts, so a blip costs nothing (tested both ways). `Gone` is no longer
+  demoted by a new generation's link or loss. An owner's question reaches only the
+  persistent sessions of the groups it names (a clean QoS 2 subscriber on the holder
+  got a second copy) and waits for a persistent attach of those groups still being
+  recovered. A lease re-minted to the same holder moves the ownership epoch. A healthy
+  cluster no longer looks for kept forwards on every tick, the interest split is a
+  pass over distinct filters (counted per filter), a deferring holder's question is
+  re-sent every four sweeps measured from when it was last sent, and a departed node's
+  link record is dropped.

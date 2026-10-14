@@ -1307,13 +1307,15 @@ async fn an_owner_question_is_answered_only_by_the_groups_holder_at_the_epoch_as
     .await;
     driver.abort();
     fix.hub.attach_durable_plane(plane);
+    // The group of the session the question is about.
+    let g = mqtt_cluster::placement::group_of("moved");
     let set = |holder: &str, epoch: u64| {
         let mut p = placement.write().unwrap();
         p.set_lease_owners(std::collections::BTreeMap::from([(
-            5,
+            g,
             NodeId(holder.into()),
         )]));
-        p.set_lease_epochs(std::collections::BTreeMap::from([(5, epoch)]));
+        p.set_lease_epochs(std::collections::BTreeMap::from([(g, epoch)]));
     };
     let (peer_tx, mut origin) = mpsc::unbounded_channel();
     fix.hub.peer_connected(
@@ -1361,7 +1363,7 @@ async fn an_owner_question_is_answered_only_by_the_groups_holder_at_the_epoch_as
 
     // The probe: the driver names this node; the sweep has not seen it.
     set("settle-gate", 10);
-    fix.dispatch(question(1, 5)).await;
+    fix.dispatch(question(1, g)).await;
     quiesce(&mut fix.hub).await;
     assert_eq!(
         verdicts(&mut origin),
@@ -1376,7 +1378,7 @@ async fn an_owner_question_is_answered_only_by_the_groups_holder_at_the_epoch_as
         fix.hub.cannot_say_who_is_here(),
         "the window the move opened"
     );
-    fix.dispatch(question(1, 5)).await;
+    fix.dispatch(question(1, g)).await;
     assert_eq!(
         verdicts(&mut origin),
         [],
@@ -1392,7 +1394,7 @@ async fn an_owner_question_is_answered_only_by_the_groups_holder_at_the_epoch_as
         quiesce(&mut fix.hub).await;
     }
     assert!(!fix.hub.cannot_say_who_is_here(), "the window closed");
-    fix.dispatch(question(1, 5)).await;
+    fix.dispatch(question(1, g)).await;
     quiesce(&mut fix.hub).await;
     assert_eq!(verdicts(&mut origin), [(1, ForwardVerdict::Reached)]);
     assert_eq!(
@@ -1404,7 +1406,7 @@ async fn an_owner_question_is_answered_only_by_the_groups_holder_at_the_epoch_as
     // The group moves on; the sweep sees it: "not me" to a question at 10.
     set("elsewhere", 12);
     fix.hub.run_sweep().await;
-    fix.dispatch(question(2, 5)).await;
+    fix.dispatch(question(2, g)).await;
     assert_eq!(
         verdicts(&mut origin),
         [(
@@ -1419,6 +1421,98 @@ async fn an_owner_question_is_answered_only_by_the_groups_holder_at_the_epoch_as
     fix.dispatch(question(3, mqtt_cluster::placement::NUM_GROUPS))
         .await;
     assert_eq!(verdicts(&mut origin), [(3, ForwardVerdict::Failed)]);
+}
+
+/// Fourth review, M2 and M3, the holder's side: an owner's question is applied to
+/// the persistent sessions of the groups it names and to nobody else — a clean
+/// subscriber here, which may have had the publish live already, is not handed it
+/// again (at `QoS` 2 that would be a second delivery) — and while a persistent attach
+/// of an asked group is still being recovered, the question is deferred.
+#[tokio::test]
+async fn an_owner_question_reaches_only_the_durable_sessions_it_names_and_waits_for_a_recovering_attach(
+) {
+    let mut fix = clustered_fixture();
+    let placement = Arc::new(std::sync::RwLock::new(
+        mqtt_cluster::placement::Placement::new(
+            NodeId("settle-gate".into()),
+            mqtt_cluster::placement::DEFAULT_REPLICAS,
+        ),
+    ));
+    fix.hub.placement = Some(placement.clone());
+    let g = mqtt_cluster::placement::group_of("moved");
+    {
+        let mut p = placement.write().unwrap();
+        p.set_lease_owners(std::collections::BTreeMap::from([(
+            g,
+            NodeId("settle-gate".into()),
+        )]));
+        p.set_lease_epochs(std::collections::BTreeMap::from([(g, 10)]));
+    }
+    let (peer_tx, mut origin) = mpsc::unbounded_channel();
+    fix.hub.peer_connected(
+        NodeId("origin-node".into()),
+        1,
+        peer_tx.clone(),
+        peer_tx,
+        None,
+        mqtt_cluster::peer::PROTO_MAX,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    );
+    fix.store_only_session("moved", "q/#").await;
+    fix.scan_lands(&["moved"], true).await;
+    let (mut clean, _meter, _) = attach_watched(&mut fix.hub, "clean", true, 0, 7, "q/#").await;
+    fix.hub.run_sweep().await;
+    for _ in 0..30 {
+        if !fix.hub.cannot_say_who_is_here() && fix.hub.ownership_move_observed() {
+            break;
+        }
+        fix.hub.run_sweep().await;
+        quiesce(&mut fix.hub).await;
+    }
+    let question = |seq: u64| HubCommand::RemoteOwnerQuestion {
+        node: NodeId("origin-node".into()),
+        seq,
+        origin: 7,
+        groups: vec![(g, 10)],
+        topic: "q/1".into(),
+        payload: Bytes::from_static(b"settle-gate"),
+        qos: QoS::AtLeastOnce,
+        retain: false,
+        message_expiry: None,
+        app: AppProperties::default(),
+    };
+    let verdicts = |rx: &mut mpsc::UnboundedReceiver<PeerMessage>| {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|f| match f {
+                PeerMessage::PublishVerdict { seq, verdict } => Some((seq, verdict)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // A persistent attach of a session in the asked group is being recovered.
+    fix.hub.connecting.insert(ClientId("moved".into()), 99);
+    fix.dispatch(question(1)).await;
+    assert_eq!(
+        verdicts(&mut origin),
+        [],
+        "deferred while the attach recovers"
+    );
+    fix.hub.connecting.clear();
+
+    fix.dispatch(question(1)).await;
+    quiesce(&mut fix.hub).await;
+    assert_eq!(verdicts(&mut origin), [(1, ForwardVerdict::Reached)]);
+    assert_eq!(
+        fix.queued("moved").await.len(),
+        1,
+        "the durable session has it"
+    );
+    assert_eq!(
+        published_topics(&mut clean),
+        Vec::<String>::new(),
+        "the clean subscriber is not handed it again"
+    );
 }
 
 /// **#784, mixed versions.** A proto-11 peer cannot carry the publish's identity, so

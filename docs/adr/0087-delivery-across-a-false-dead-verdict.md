@@ -800,18 +800,29 @@ that negotiated 15. *(O2 decided 2026-10-14: in the first cut.)*
   closed once the node is linked, not held dead, and owed nothing kept for its
   sessions' owners nor anything sent before its link: a link blip leaves nothing that
   a later, ordinary rebalance could turn into questions.
-- *Which forwards wait for those holders* (`waits_for_holders`): one kept for them —
-  at confirmation, whenever ANY filter of the lost node's matching the topic is
-  lease-owned, or its kinds are not known (a clean monitor beside a durable session
-  does not make the durable one's publish the node's to lose); or one the lost node
-  answered after a group it held had moved: its answer covers the sessions it has,
-  not one whose lease moved, so the forward is kept rather than discharged — whether
-  the node answering is the old process, a restarted one, or one that has some groups
-  back (`answered_for_lost_owner`). And, before confirmation, one owed to a node held
-  dead with no link, all its matching filters lease-owned, and a group of its moved.
-  Such a forward is never sent to the lost node again. Only forwards sent before the
-  node's current link are taken from it this way: one sent on its new link is answered
-  by it as any linked node's is.
+- *The rule: a forward's kind is frozen when its node is lost.* When this node loses a
+  node, every ordinary forward owed to it is classified once, from the node's interest
+  as it is at that moment (`freeze`): whether a durable session's filter matched
+  (`durable_part`), and whether a clean session's did (`clean_too`) — kinds not known
+  count as both; a forward registered while the node stays lost is classified from the
+  same, still-held interest. Nothing later reads the node's interest again for it: a
+  node that links again — a restarted process, or the same one after it released a
+  session whose lease moved — announces what it has NOW, and that says nothing about
+  what it was sent before (the fourth review of PR #1025: a node announcing no
+  interest at all answered `Stored`, and the publish was acknowledged). Then:
+  - once a lease the node may have held has moved, nothing with `durable_part` that
+    was sent to it before its current link is discharged by its own answer — the
+    answer is kept as covering the node's own (clean) part, and the forward is kept
+    for the lease holders (`for_owner`), never sent to the node again
+    (`answered_for_lost_owner`); with no lease moved, the node's answer counts as it
+    always did, so a blip costs nothing;
+  - before confirmation, a forward to a node held dead with no link that is
+    `durable_part` and not `clean_too`, a lease of which has moved, waits for the
+    holders too (`waits_for_holders`);
+  - at confirmation, a `durable_part` forward is kept for the holders, counted
+    `peer-gone` once they answer if it was `clean_too`; a forward already kept stays
+    kept, and `Gone` is never demoted by a later link, loss or verdict of a new
+    generation.
 - *What discharges them* (`discharge_owner_bound`): once this node's view of the lease
   plane can be acted on (the sweep has seen the map as it is now and opened the
   takeover window a move opens; the routing view has settled), EVERY group the lost
@@ -838,7 +849,16 @@ that negotiated 15. *(O2 decided 2026-10-14: in the first cut.)*
   neither applied nor answered; the asker asks again, no more than every four sweeps —
   until the sweep has seen the map as it is now and that view has reached every epoch
   the question names, and until the receiver can say who is on it (its first complete
-  scan landed; with a durable plane no takeover window open and no scan in flight). Then, if that state gives a named group to another node, it says
+  scan landed; with a durable plane no takeover window open and no scan in flight),
+  and no persistent attach of a session in an asked group is still being recovered
+  (ADR 0017's off-loop recovery, up to five seconds, which the scan skips). It is
+  applied to the PERSISTENT sessions of the groups it names and to nobody else: a
+  clean subscriber here had the publish live if it was owed it, and a second copy
+  would be a new message — a duplicate at QoS 2. A lease re-minted to the same holder
+  (ADR 0080's live replication-factor change) moves the ownership epoch, so a holder's
+  sweep sees the new epoch and does not defer for ever. (An ordinary re-route still
+  shares the recovering-attach gap: one arriving then that matches nobody is answered
+  once the scan is complete, the attach not yet done.) Then, if that state gives a named group to another node, it says
   "not me" (the asker does not ask that holder the same again, and asks whoever holds
   the group once its own view moves on); if it holds them all, it applies the question
   as a re-route (a session already holding the publish skips it, #784) and answers.
@@ -1233,6 +1253,8 @@ What is left, stated rather than hidden:
   that failed and is retried) misses the publish. That is the takeover path's own
   definition of done (exhibit ⑥), not a new one.
 - *Unbounded holds*, listed under D8 "How long": the pending table is the bound.
+- *`$share` with durable members* across a lost node is not covered by this record's
+  owner questions: issue #1028.
 - *During a roll* a durable owner's death behind a link below 15 holds its publishers
   until confirmation and then until the holders of its leases answer; a holder that is
   itself an older build is never asked, and its publishers are held to the table's

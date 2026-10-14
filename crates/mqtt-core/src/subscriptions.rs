@@ -36,6 +36,12 @@ pub struct SubscriptionTable {
     /// the local and remote `$share` populations can share one walk rather than
     /// each scanning their filters per publish.
     index: FilterIndex,
+    /// The clients marked of the kind [`set_kind`](Self::set_kind) names (for the
+    /// broker: sessions the lease plane owns), and per filter how many of its
+    /// subscribers are — so [`filters_by_kind`](Self::filters_by_kind) is a pass over
+    /// distinct filters, never over subscriptions.
+    of_kind: HashSet<ClientId>,
+    kind_count: HashMap<FilterKey, usize>,
 }
 
 impl SubscriptionTable {
@@ -51,33 +57,55 @@ impl SubscriptionTable {
     /// table, the trie terminal and the caller's own per-client bookkeeping all
     /// share one allocation.
     pub fn subscribe(&mut self, client: ClientId, filter: FilterKey) {
-        match self.by_filter.entry(filter) {
+        let of_kind = self.of_kind.contains(&client);
+        let key = filter.clone();
+        let added = match self.by_filter.entry(filter) {
             Entry::Vacant(v) => {
                 self.index.insert(v.key());
                 v.insert(HashSet::from([client]));
+                true
             }
-            Entry::Occupied(mut o) => {
-                o.get_mut().insert(client);
+            Entry::Occupied(mut o) => o.get_mut().insert(client),
+        };
+        if added && of_kind {
+            *self.kind_count.entry(key).or_default() += 1;
+        }
+    }
+
+    /// One fewer subscriber of the kind holds `filter`.
+    fn kind_left(&mut self, filter: &str) {
+        if let Some(n) = self.kind_count.get_mut(filter) {
+            *n -= 1;
+            if *n == 0 {
+                self.kind_count.remove(filter);
             }
         }
     }
 
     /// Remove `client`'s subscription to `filter`, if present.
     pub fn unsubscribe(&mut self, client: &ClientId, filter: &str) {
+        let mut removed = false;
         if let Some(clients) = self.by_filter.get_mut(filter) {
-            clients.remove(client);
+            removed = clients.remove(client);
             if clients.is_empty() {
                 self.by_filter.remove(filter);
                 self.index.remove(filter);
             }
+        }
+        if removed && self.of_kind.contains(client) {
+            self.kind_left(filter);
         }
     }
 
     /// Remove all of `client`'s subscriptions (called on disconnect).
     pub fn remove_client(&mut self, client: &ClientId) {
         let mut emptied: Vec<FilterKey> = Vec::new();
+        let mut left: Vec<FilterKey> = Vec::new();
+        let of_kind = self.of_kind.contains(client);
         self.by_filter.retain(|filter, clients| {
-            clients.remove(client);
+            if clients.remove(client) && of_kind {
+                left.push(filter.clone());
+            }
             if clients.is_empty() {
                 emptied.push(filter.clone());
                 false
@@ -87,6 +115,42 @@ impl SubscriptionTable {
         });
         for filter in emptied {
             self.index.remove(&filter);
+        }
+        for filter in left {
+            self.kind_left(&filter);
+        }
+    }
+
+    /// Mark `client` as of the kind [`filters_by_kind`](Self::filters_by_kind)
+    /// counts, or not. `filters` are its subscriptions (the caller's own record of
+    /// them; ones the table does not hold for it are ignored). A client's kind
+    /// outlives its subscriptions: one that subscribes later is counted as marked.
+    pub fn set_kind<'a>(
+        &mut self,
+        client: &ClientId,
+        of_kind: bool,
+        filters: impl IntoIterator<Item = &'a str>,
+    ) {
+        if self.of_kind.contains(client) == of_kind {
+            return;
+        }
+        if of_kind {
+            self.of_kind.insert(client.clone());
+        } else {
+            self.of_kind.remove(client);
+        }
+        for f in filters {
+            let Some((key, clients)) = self.by_filter.get_key_value(f) else {
+                continue;
+            };
+            if !clients.contains(client) {
+                continue;
+            }
+            if of_kind {
+                *self.kind_count.entry(FilterKey::clone(key)).or_default() += 1;
+            } else {
+                self.kind_left(f);
+            }
         }
     }
 
@@ -161,22 +225,20 @@ impl SubscriptionTable {
     }
 
     /// Every distinct topic filter with at least one subscriber, by its holders'
-    /// kinds, in one pass: `(any_other, any_kind)` — the filters at least one
-    /// subscriber of which does NOT satisfy `kind`, and those at least one of which
-    /// does. A filter held by both kinds of subscriber is in both; together they are
-    /// [`filters`](Self::filters).
+    /// kinds ([`set_kind`](Self::set_kind)), in one pass over the distinct filters:
+    /// `(any_other, any_kind)` — the filters at least one subscriber of which is NOT
+    /// of the kind, and those at least one of which is. A filter held by both kinds
+    /// of subscriber is in both; together they are [`filters`](Self::filters).
     #[must_use]
-    pub fn filters_by_kind(
-        &self,
-        kind: impl Fn(&ClientId) -> bool,
-    ) -> (Vec<TopicFilter>, Vec<TopicFilter>) {
+    pub fn filters_by_kind(&self) -> (Vec<TopicFilter>, Vec<TopicFilter>) {
         let mut other = Vec::new();
         let mut of_kind = Vec::new();
         for (filter, clients) in &self.by_filter {
-            if clients.iter().any(|c| !kind(c)) {
+            let n = self.kind_count.get(filter).copied().unwrap_or(0);
+            if clients.len() > n {
                 other.push(String::from(&**filter));
             }
-            if clients.iter().any(&kind) {
+            if n > 0 {
                 of_kind.push(String::from(&**filter));
             }
         }
@@ -247,7 +309,10 @@ mod tests {
         assert_eq!(t.matching_filter_count_of(&cid("c"), "x/1"), 0);
         assert_eq!(t.matching_filter_count_of(&cid("c"), "y"), 1);
 
-        let (mut other, mut of_kind) = t.filters_by_kind(|c| c.as_str() != "c");
+        for c in ["a", "b"] {
+            t.set_kind(&cid(c), true, ["x/#", "x/+", "y"]);
+        }
+        let (mut other, mut of_kind) = t.filters_by_kind();
         other.sort();
         of_kind.sort();
         assert_eq!(
@@ -256,6 +321,28 @@ mod tests {
             "b holds y: at least one of the kind"
         );
         assert_eq!(other, vec!["y".to_string()], "c holds y too: in both");
+
+        // The counts follow every change, never a scan.
+        t.unsubscribe(&cid("b"), "y");
+        assert_eq!(
+            t.filters_by_kind().1.len(),
+            2,
+            "y lost its last subscriber of the kind"
+        );
+        t.subscribe(cid("b"), FilterKey::from("y"));
+        t.set_kind(&cid("c"), true, ["y"]);
+        assert_eq!(
+            t.filters_by_kind().0,
+            Vec::<String>::new(),
+            "no subscriber of another kind left"
+        );
+        t.remove_client(&cid("a"));
+        t.set_kind(&cid("b"), false, ["x/#", "y"]);
+        let (mut other, mut of_kind) = t.filters_by_kind();
+        other.sort();
+        of_kind.sort();
+        assert_eq!(other, vec!["x/#".to_string(), "y".to_string()]);
+        assert_eq!(of_kind, vec!["y".to_string()]);
     }
 
     #[test]
