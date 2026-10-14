@@ -534,6 +534,21 @@ cut recorded in the amendment of 2026-10-14 below.
   member, and a later lost link is a member's. (From the review of PR #1021: without
   the mark, a stale link outliving the confirmation left the peer's interest held
   under the lost-link policy with nothing to end it.)
+- *What bounds a link to a node confirmed gone: the hold's own countdown, in both
+  modes.* Nothing else ends a half-open peer link in a bounded time. The peer link
+  has no keepalive frame, no read deadline and no TCP keepalive on the socket
+  (checked in `peer.rs` and `mqtt-cluster`'s `peer.rs` on the tree of this change).
+  A host that has restarted answers the next write with a reset, so a link to a
+  restarted node ends at the next frame sent on it; a host that is gone without one
+  leaves writes to be retransmitted until the kernel gives up (on Linux's defaults,
+  about fifteen minutes). In plain mode an idle link is not written to at all, so
+  nothing ends it; in durable mode the lease group's heartbeats write every 500 ms,
+  which bounds it by that retransmission timeout and no better. So the
+  `GoneLinked` mark counts `REROUTE_GRACE_TICKS` (8) sweep ticks: a live peer's
+  `Alive` — its answer to the parting greeting, or its new life — arrives well
+  inside them; when they pass with the link still up and no `Alive`, the hub drops
+  the link and resolves the node, `peer-gone`. A link to a node confirmed gone thus
+  holds its publishers no more than 8 s past the confirmation.
 - *The resolution* (`erase_peer`): an ordinary forward still owed to the peer — a clean
   session; a persistent one in non-durable mode (O4) — is discharged and its publisher
   acknowledged on the next sweep tick (one last look for a successor), and counted
@@ -971,6 +986,11 @@ its own, so that a broker whose workers are all busy still answers its probes.
   generation is tested on the state machine (`swim.rs`), not on a running cluster. The
   episodes hold B "really dead" by cutting the A–B link with B's process running; a
   killed process was not run.
+- The link manager remembers each node confirmed gone (`confirmed_gone` in
+  `cluster.rs`) until that id's next `Alive` or `Dead`: one entry per node id that
+  departs and never returns under its name, for the life of the process — as its set
+  of verdicts did before 0087-T3. Stable ids keep it small; ephemeral ids grow it.
+  Not pruned when SWIM forgets the member.
 - With D1 built, the hot path was checked by reading the diff — `forward_to_peers`,
   `register_forward` and the constant-time `$share` path are untouched — and by the
   publish-dispatch micro-benchmark (`benches/shared_plan.rs`), not on the rig.

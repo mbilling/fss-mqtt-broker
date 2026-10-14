@@ -3039,7 +3039,21 @@ enum VerdictHold {
     /// ([`peer_disconnected`](Hub::peer_disconnected)); a later link, if one forms,
     /// does not clear this. Only an `Alive` does ([`HubCommand::PeerAlive`]): the
     /// node is a member again, and its lost link is a member's.
-    GoneLinked,
+    ///
+    /// **Bounded by its own countdown**, in both modes: nothing else ends a
+    /// half-open peer link in a bounded time. The link has no keepalive frame, no
+    /// read deadline and no TCP keepalive; a write to a host that is gone without a
+    /// reset is retransmitted until the kernel gives up (on Linux's defaults, about
+    /// fifteen minutes), and an idle link — nothing owed in either direction, no
+    /// lease group riding it in plain mode — is never written to at all. So when
+    /// [`REROUTE_GRACE_TICKS`] sweeps pass with the link still up and no `Alive` —
+    /// a live peer answers the parting greeting, or its new life is reported, well
+    /// inside that — the link is dropped and the node resolved as at a
+    /// confirmation with no link.
+    GoneLinked {
+        /// Sweep ticks left before the link is dropped and the node resolved.
+        ticks: u8,
+    },
 }
 
 /// Why the hold for a node held dead ended with its state erased (ADR 0087 D2, D9):
@@ -8064,7 +8078,7 @@ impl Hub {
         // (ADR 0087 D5), and there is nothing left to count down. (One confirmed
         // gone stays so: only an `Alive` makes it a member again.)
         if let Some(hold) = self.held_dead.get_mut(&node_for_events) {
-            if *hold != VerdictHold::GoneLinked {
+            if !matches!(hold, VerdictHold::GoneLinked { .. }) {
                 *hold = VerdictHold::Settled;
             }
         }
@@ -8130,9 +8144,15 @@ impl Hub {
         // A node membership has since confirmed GONE is not coming back under this
         // verdict: its dialer has stopped, and no confirmation will follow the one
         // that came. What it is owed is resolved now (ADR 0087 D2).
-        if self.held_dead.get(node) == Some(&VerdictHold::GoneLinked) {
+        if matches!(
+            self.held_dead.get(node),
+            Some(VerdictHold::GoneLinked { .. })
+        ) {
             self.held_dead.remove(node);
             info!(peer = %node.0, "the link of a peer confirmed gone ended; resolving what it was owed");
+            // The takeover window opens as at a verdict's lost link: if a session of
+            // the node is still to be inherited, this is when.
+            self.takeover_reconcile_ticks = 8;
             self.erase_peer(node, Resolution::PeerGone);
             return;
         }
@@ -8544,6 +8564,24 @@ impl Hub {
             self.erase_peer(&node, Resolution::HoldExpired);
             self.held_dead.insert(node, VerdictHold::Settled);
         }
+        // A link to a node confirmed gone is given its countdown in both modes
+        // ([`VerdictHold::GoneLinked`]): then it is dropped, and the node resolved.
+        let mut gone: Vec<NodeId> = Vec::new();
+        for (node, hold) in &mut self.held_dead {
+            if let VerdictHold::GoneLinked { ticks } = hold {
+                *ticks = ticks.saturating_sub(1);
+                if *ticks == 0 {
+                    gone.push(node.clone());
+                }
+            }
+        }
+        for node in gone {
+            self.held_dead.remove(&node);
+            warn!(peer = %node.0, "the link of a peer confirmed gone outlived its countdown with no Alive; dropping it and resolving what the peer was owed");
+            self.drop_link_of_gone(&node);
+            self.takeover_reconcile_ticks = 8;
+            self.erase_peer(&node, Resolution::PeerGone);
+        }
         self.move_shared_from_unreachable();
     }
 
@@ -8554,8 +8592,9 @@ impl Hub {
     /// linked — and nothing it is owed is resolved yet: the obligations are on that
     /// link. It is marked [`VerdictHold::GoneLinked`], so that if the link ends
     /// before membership holds the node alive again, what it is owed is resolved
-    /// then: its dialer has stopped and no further confirmation comes. Otherwise what it was still owed is resolved per subscriber kind (D2's
-    /// table), and counted: an ordinary forward — a clean session, or a persistent
+    /// then: its dialer has stopped and no further confirmation comes. Otherwise
+    /// what it was still owed is resolved per subscriber kind (D2's table), and
+    /// counted: an ordinary forward — a clean session, or a persistent
     /// one in non-durable mode (O4 as decided: acknowledged and counted at
     /// confirmation, not held longer) — is discharged, and its publisher answered
     /// after one last look for a successor; a `$share` delivery is placed with a
@@ -8569,12 +8608,36 @@ impl Hub {
         };
         if self.peers.contains_key(node) {
             info!(peer = %node.0, "peer confirmed gone while linked; the link answers for it until it ends");
-            self.held_dead.insert(node.clone(), VerdictHold::GoneLinked);
+            self.held_dead.insert(
+                node.clone(),
+                VerdictHold::GoneLinked {
+                    ticks: REROUTE_GRACE_TICKS,
+                },
+            );
             return;
         }
         if matches!(hold, VerdictHold::Unreachable { .. }) {
             self.erase_peer(node, Resolution::PeerGone);
         }
+    }
+
+    /// Drop the link of a node confirmed gone whose link outlived its countdown
+    /// ([`VerdictHold::GoneLinked`]): as [`peer_dead`](Self::peer_dead) drops a link
+    /// — removing the peer entry drops its outbound sender, which closes the link's
+    /// pump — and as [`peer_disconnected`](Self::peer_disconnected) tells the rest of
+    /// the node that it went.
+    fn drop_link_of_gone(&mut self, node: &NodeId) {
+        if self.peers.remove(node).is_none() {
+            return;
+        }
+        self.retiring_links.retain(|link| &link.node != node);
+        self.recompute_peers_want_origin();
+        self.mark_shared_unreachable(node);
+        if let Some(plane) = &self.durable_plane {
+            plane.fail(node);
+        }
+        self.drop_retained_handoff_state(node);
+        self.recompute_mesh();
     }
 
     /// Drop all routing state for a node held `Dead` whose hold has ended — it was

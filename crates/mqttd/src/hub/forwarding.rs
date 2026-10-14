@@ -3106,6 +3106,69 @@ mod zone_fwd_proofs {
         assert!(h.pending_publishes.is_empty());
     }
 
+    /// The bound on that link, from the re-review of #1021: nothing ends a
+    /// half-open peer link in a bounded time — no keepalive frame, no read deadline,
+    /// no TCP keepalive, and in plain mode no raft traffic either — so a link to a
+    /// node confirmed gone that stays up with no `Alive` is given the hold's
+    /// countdown and no more. Then it is dropped, and what the node was owed is
+    /// resolved and counted `peer-gone`. Without a durable plane and with one alike.
+    #[tokio::test]
+    async fn a_link_to_a_peer_confirmed_gone_that_stays_up_is_dropped_after_the_countdown() {
+        for durable in [false, true] {
+            let mut h = if durable {
+                durable_hub().await.0
+            } else {
+                hub()
+            };
+            let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("glc"));
+            h.attach_metrics(metrics.clone());
+            let first = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
+            h.peer_dead(&first.node);
+            let mut zombie = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
+            let (id, mut rx) = register(&mut h, "t/x");
+            fan_out(&mut h, "t/x", QoS::AtLeastOnce, false, Some(id));
+            h.pending_local_done(id);
+            assert!(was_sent_a_forward(&mut zombie), "durable={durable}");
+            h.peer_gone(&zombie.node);
+
+            for tick in 1..REROUTE_GRACE_TICKS {
+                sweep_tick(&mut h);
+                assert!(
+                    rx.try_recv().is_err() && h.peers.contains_key(&zombie.node),
+                    "durable={durable}: the link still answers for the peer at sweep {tick}"
+                );
+            }
+            sweep_tick(&mut h);
+            assert!(
+                !h.peers.contains_key(&zombie.node),
+                "durable={durable}: the link is dropped at the end of the countdown"
+            );
+            sweep_tick(&mut h);
+            assert!(
+                matches!(rx.try_recv(), Ok(PublishOutcome::Accepted)),
+                "durable={durable}: the publisher is answered"
+            );
+            assert!(!h.interest.has_node(&zombie.node), "durable={durable}");
+            assert!(
+                metrics
+                    .render()
+                    .contains("mqttd_publish_resolved_undeliverable_total{reason=\"peer-gone\"} 1"),
+                "durable={durable}: counted: {}",
+                metrics.render()
+            );
+            assert!(!h.held_dead.contains_key(&zombie.node), "durable={durable}");
+            // The pump's sender is gone with the peer entry: the link closes.
+            while let Ok(_frame) = zombie.rx.try_recv() {}
+            assert!(
+                matches!(
+                    zombie.rx.try_recv(),
+                    Err(mpsc::error::TryRecvError::Disconnected)
+                ),
+                "durable={durable}: the link's sender is dropped"
+            );
+        }
+    }
+
     /// The other side of it: a peer confirmed gone whose link stays up — it was
     /// alive after all — and that membership then holds alive again is a member.
     /// Nothing is resolved while the link lasts, the `Alive` clears the mark, and a
@@ -3124,12 +3187,21 @@ mod zone_fwd_proofs {
         fan_out(&mut h, "t/x", QoS::AtLeastOnce, false, Some(id));
         h.pending_local_done(id);
         assert!(was_sent_a_forward(&mut again), "the live link is routed to");
-        for _ in 0..REROUTE_GRACE_TICKS * 2 {
+        // Inside the countdown a live peer's `Alive` arrives (it answers the parting
+        // greeting in a round trip).
+        for _ in 1..REROUTE_GRACE_TICKS {
             sweep_tick(&mut h);
         }
         assert!(rx.try_recv().is_err(), "held for the peer's answer");
 
         h.peer_alive(&again.node);
+        for _ in 0..REROUTE_GRACE_TICKS * 2 {
+            sweep_tick(&mut h);
+        }
+        assert!(
+            h.peers.contains_key(&again.node),
+            "after the Alive, no countdown drops the live link"
+        );
         h.peer_disconnected(&again.node, 0);
         for _ in 0..REROUTE_GRACE_TICKS * 2 {
             sweep_tick(&mut h);
