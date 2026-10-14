@@ -1317,7 +1317,9 @@ impl Metrics {
             &mut registry,
             "revocation_evictions",
             "Live state revoked by a policy-reload sweep (ADR 0040), by kind \
-             (cert-revoked, user-removed, connect-denied, grant-revoked, peer-revoked)",
+             (cert-revoked, user-removed, connect-denied, grant-revoked, peer-revoked), or \
+             ended at a certificate's expiry (ADR 0088: peer-cert-expired, own-cert-expired, \
+             cert-expired)",
         );
         let session_rehomes_total = register_family(
             &mut registry,

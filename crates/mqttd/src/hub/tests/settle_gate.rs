@@ -498,6 +498,7 @@ async fn an_early_acked_publish_still_re_routes_to_a_peer_that_advertises_intere
         ctl: peer_tx.clone(),
         tx: peer_tx,
         cert_serial: None,
+        cert_ends: crate::hub::LinkCertEnds::default(),
         proto: mqtt_cluster::peer::PROTO_MAX,
         depth: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     })
@@ -1170,6 +1171,7 @@ async fn a_proto_11_peer_gets_the_untagged_forward_and_an_untagged_replay_still_
         ctl: peer_tx.clone(),
         tx: peer_tx,
         cert_serial: None,
+        cert_ends: crate::hub::LinkCertEnds::default(),
         proto: mqtt_cluster::peer::PROTO_FORWARD_REACHED,
         depth: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     })

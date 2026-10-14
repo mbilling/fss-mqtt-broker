@@ -37,7 +37,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/history-check/src/main.rs` — 0 test(s)
 
 
-## `crates/mqtt-auth/src/lib.rs` — 132 test(s)
+## `crates/mqtt-auth/src/lib.rs` — 134 test(s)
 
 - `acl::tests::a_bad_client_id_does_not_disturb_rules_that_never_use_it`
 - `acl::tests::a_bare_percent_is_literal`
@@ -103,6 +103,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `enhanced::tests::method_name_is_advertised`
 - `enhanced::tests::unknown_subject_is_challenged_then_fails`
 - `enhanced::tests::wrong_secret_fails`
+- `mtls::tests::a_certificates_end_is_read_in_unix_seconds`
 - `mtls::tests::a_missing_selected_source_yields_no_identity_and_never_falls_back`
 - `mtls::tests::a_multi_common_name_subject_yields_no_identity`
 - `mtls::tests::a_uri_subject_can_never_be_substituted_into_a_topic_pattern`
@@ -142,6 +143,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `signed_gossip::tests::a_cert_without_the_urn_attests_no_domain`
 - `signed_gossip::tests::a_crl_not_signed_by_the_cluster_ca_is_rejected_at_load`
 - `signed_gossip::tests::a_failure_domain_urn_in_the_san_is_returned`
+- `signed_gossip::tests::a_minute_of_clock_difference_is_allowed_on_not_before_and_none_on_not_after`
 - `signed_gossip::tests::a_not_yet_valid_certificate_is_rejected`
 - `signed_gossip::tests::a_revoked_certificate_is_rejected`
 - `signed_gossip::tests::a_signature_from_another_key_is_rejected`
@@ -802,7 +804,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `publish_codec_round_trip_clears_the_floor`
 
-## `crates/mqtt-config/src/lib.rs` — 50 test(s)
+## `crates/mqtt-config/src/lib.rs` — 51 test(s)
 
 - `tests::a_backup_dir_inside_the_data_dir_is_a_config_error`
 - `tests::a_bad_enum_value_is_rejected`
@@ -822,6 +824,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::defaults_are_secure`
 - `tests::durable_on_without_a_data_dir_refuses_naming_both_remedies`
 - `tests::each_remedy_individually_unblocks_validation`
+- `tests::ending_client_sessions_at_certificate_expiry_is_off_by_default`
 - `tests::env_overlay_wins_over_the_file`
 - `tests::ephemeral_durability_is_exactly_durable_on_without_a_data_dir`
 - `tests::every_env_var_maps_to_a_config_key`
@@ -914,7 +917,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_reserved_tree_is_exactly_sys_and_below`
 - `tests::topic_name_validity_rejects_wildcards_and_emptiness`
 
-## `crates/mqtt-net/src/lib.rs` — 25 test(s)
+## `crates/mqtt-net/src/lib.rs` — 28 test(s)
 
 - `frame::tests::a_drain_grows_the_buffer_once_and_keeps_it`
 - `frame::tests::a_new_reader_takes_the_named_read_buffer`
@@ -929,6 +932,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `quic::tests::topic_slot_is_stable_and_in_range`
 - `quic::tests::topic_slot_spreads_across_the_pool`
 - `tests::only_tls_is_encrypted`
+- `tls::peer_bus_tests::a_peer_certificate_past_not_after_is_refused_with_no_tolerance`
+- `tls::peer_bus_tests::a_peer_certificate_up_to_a_minute_ahead_is_accepted_and_no_further`
+- `tls::peer_bus_tests::the_peer_bus_never_resumes_a_session`
 - `tls::tests::a_crl_without_client_auth_is_rejected`
 - `tls::tests::an_empty_or_missing_crl_file_is_rejected`
 - `tls::tests::builds_mtls_client_connector`
@@ -1443,7 +1449,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 810 test(s)
+## `crates/mqttd/src/lib.rs` — 815 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1859,6 +1865,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::brownout_refuses_growth_and_recovery_restores_it`
 - `hub::tests::brownout_refuses_the_ack_and_the_live_send_for_an_online_persistent_subscriber`
 - `hub::tests::brownout_refuses_the_publishers_ack_for_an_offline_persistent_subscriber`
+- `hub::tests::cert_expiry::a_client_session_outlives_its_certificate_unless_the_setting_is_on`
+- `hub::tests::cert_expiry::a_link_ends_at_the_earlier_of_its_two_certificates_and_names_whose`
+- `hub::tests::cert_expiry::a_link_ends_when_this_nodes_own_certificate_does`
+- `hub::tests::cert_expiry::a_link_whose_peer_certificate_ends_is_lost_and_the_peer_is_held_not_erased`
+- `hub::tests::cert_expiry::a_plaintext_link_has_no_end`
 - `hub::tests::clean_session_attach_wipes_prior_persistent_state`
 - `hub::tests::commands_sort_into_the_control_and_data_lanes`
 - `hub::tests::durable_failure_reasons_are_bounded`
@@ -2610,6 +2621,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `honest_nodes_with_matching_cert_cn_link_and_route`
 - `plaintext_mesh_without_binding_still_routes`
 - `the_node_holding_a_peer_dead_keeps_dialing_it_and_serves_the_link`
+
+## `crates/mqttd/tests/peer_link_expiry.rs` — 2 test(s)
+
+- `a_peer_link_ends_within_a_minute_of_its_peers_certificate`
+- `an_expired_node_is_out_and_stays_out`
 
 ## `crates/mqttd/tests/persistence.rs` — 2 test(s)
 

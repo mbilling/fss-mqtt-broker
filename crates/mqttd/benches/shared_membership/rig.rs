@@ -222,6 +222,7 @@ impl Rig {
                         ctl: tx.clone(),
                         tx,
                         cert_serial: None,
+                        cert_ends: mqttd::hub::LinkCertEnds::default(),
                         proto: mqtt_cluster::peer::PROTO_MAX,
                         depth: Arc::new(AtomicUsize::new(0)),
                     })
@@ -328,6 +329,7 @@ impl Rig {
                     },
                     method: AuthMethod::Password,
                     cert_serial: None,
+                    cert_not_after: None,
                     protocol: ProtocolVersion::V311,
                     source: None,
                 }),
