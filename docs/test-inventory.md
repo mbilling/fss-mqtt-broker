@@ -888,7 +888,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `subscriptions::tests::a_distinct_filter_is_allocated_once_however_many_subscribers`
 - `subscriptions::tests::a_fully_removed_filter_can_be_resubscribed`
 - `subscriptions::tests::client_with_overlapping_filters_appears_once`
-- `subscriptions::tests::counts_one_clients_matching_filters_and_splits_filters_by_their_subscribers`
+- `subscriptions::tests::counts_one_clients_matching_filters_and_lists_filters_by_their_holders_kinds`
 - `subscriptions::tests::deep_filter_teardown_stays_iterative`
 - `subscriptions::tests::dollar_topics_are_hidden_from_leading_wildcards_only`
 - `subscriptions::tests::empty_levels_and_literal_wildcard_spellings`
@@ -1456,7 +1456,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 843 test(s)
+## `crates/mqttd/src/lib.rs` — 847 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1690,11 +1690,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::pending_bounds::the_entry_cap_evicts_only_the_oldest`
 - `hub::forwarding::pending_bounds::the_reached_record_is_charged_and_released_with_its_entry`
 - `hub::forwarding::pending_bounds::the_sweep_retransmits_only_overdue_forwards`
+- `hub::forwarding::zone_fwd_proofs::a_clean_and_a_durable_session_on_the_same_filter_keep_the_forward_for_the_holders`
 - `hub::forwarding::zone_fwd_proofs::a_clean_monitor_beside_a_durable_session_does_not_resolve_the_durable_ones_forward`
 - `hub::forwarding::zone_fwd_proofs::a_dead_peer_without_kinds_is_answered_for_by_its_heirs_not_by_its_confirmation`
 - `hub::forwarding::zone_fwd_proofs::a_durable_session_that_materialises_here_discharges_what_its_dead_owner_was_owed`
 - `hub::forwarding::zone_fwd_proofs::a_durable_sessions_forward_outlives_its_owners_confirmation_until_an_heir_answers`
 - `hub::forwarding::zone_fwd_proofs::a_forward_unanswered_when_its_target_is_declared_dead_stays_owed_until_the_peer_answers`
+- `hub::forwarding::zone_fwd_proofs::a_group_moved_to_the_lost_node_just_before_the_loss_is_still_answered_for`
 - `hub::forwarding::zone_fwd_proofs::a_hold_at_the_pending_table_bound_evicts_the_oldest_and_withholds_its_ack`
 - `hub::forwarding::zone_fwd_proofs::a_holder_that_says_not_me_is_not_evidence_and_the_new_holder_is_asked`
 - `hub::forwarding::zone_fwd_proofs::a_link_to_a_peer_confirmed_gone_that_stays_up_is_dropped_after_the_countdown`
@@ -1715,9 +1717,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::zone_fwd_proofs::a_share_group_keeps_its_members_across_a_lost_link_and_a_verdict`
 - `hub::forwarding::zone_fwd_proofs::a_takeover_redelivery_that_reaches_a_session_ends_the_grace_and_the_hold`
 - `hub::forwarding::zone_fwd_proofs::a_takeover_reroute_ends_the_grace`
+- `hub::forwarding::zone_fwd_proofs::after_a_link_blip_and_a_rebalance_a_nodes_own_answer_acknowledges`
 - `hub::forwarding::zone_fwd_proofs::after_dead_suspect_alive_a_lost_link_is_a_members_lost_link`
 - `hub::forwarding::zone_fwd_proofs::an_already_acknowledged_entry_is_never_refused_or_withheld`
 - `hub::forwarding::zone_fwd_proofs::an_already_answered_victim_is_not_counted_as_a_withheld_ack`
+- `hub::forwarding::zone_fwd_proofs::an_owner_question_is_not_sent_on_a_link_that_relinked_below_15`
 - `hub::forwarding::zone_fwd_proofs::closing_the_window_clears_both_holds_and_acks`
 - `hub::forwarding::zone_fwd_proofs::every_exit_from_the_fan_out_restores_the_buffer`
 - `hub::forwarding::zone_fwd_proofs::every_heir_must_answer_after_the_move_and_a_fan_out_answer_is_not_one`
@@ -2586,8 +2590,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `publish_reaches_matching_subscriber`
 - `qos1_publish_is_acked_and_downgraded`
 
-## `crates/mqttd/tests/false_dead_delivery.rs` — 12 test(s)
+## `crates/mqttd/tests/false_dead_delivery.rs` — 13 test(s)
 
+- `durable_a_clean_and_a_durable_session_on_one_filter_are_each_answered_for`
 - `durable_a_follower_evictor_dials_and_a_durable_session_is_served`
 - `durable_a_leader_evictor_dials_the_lease_moves_and_sessions_follow_it`
 - `durable_a_peer_out_of_reach_holds_a_clean_session_to_confirmation_and_a_durable_one_past_it`

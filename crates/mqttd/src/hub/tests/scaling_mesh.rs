@@ -146,7 +146,7 @@ impl Mesh {
                 node: node.clone(),
                 conn_id: None,
                 filters: filters.iter().map(|f| (*f).to_string()).collect(),
-                lease_owned: None,
+                kinds: None,
             })
             .await;
             peers.push((node, prx));

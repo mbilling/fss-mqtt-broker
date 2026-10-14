@@ -1779,20 +1779,21 @@ fn forward_inbound(
                 node: remote.clone(),
                 conn_id: Some(conn_id),
                 filters,
-                lease_owned: None,
+                kinds: None,
             });
         }
         PeerMessage::InterestKinds {
-            mut node_bound,
+            node_bound,
             lease_owned,
         } => {
-            node_bound.extend(lease_owned.iter().cloned());
-            let lease_owned = Some(lease_owned);
+            let mut filters: Vec<String> = node_bound.iter().chain(&lease_owned).cloned().collect();
+            filters.sort_unstable();
+            filters.dedup();
             let _ = hub.send(HubCommand::RemoteInterest {
                 node: remote.clone(),
                 conn_id: Some(conn_id),
-                filters: node_bound,
-                lease_owned,
+                filters,
+                kinds: Some(Box::new((node_bound, lease_owned))),
             });
         }
         PeerMessage::MessageEvents { wanted } => {
@@ -2560,8 +2561,8 @@ mod tests {
     }
 
     /// ADR 0087 D8: an interest snapshot with kinds reaches the hub as the whole
-    /// interest plus the filters the lease plane owns; one without kinds as the
-    /// whole interest with none — every filter bound to the sender.
+    /// interest plus both kinds — a filter both kinds hold once in the whole and in
+    /// both lists; one without kinds as the whole interest, kinds unknown.
     #[test]
     fn interest_reaches_the_hub_with_its_kinds_or_with_none() {
         let (hub, mut rx) = mpsc::unbounded_channel();
@@ -2572,29 +2573,31 @@ mod tests {
         let forward = |msg| forward_inbound(msg, &hub, &remote, 7, None, None, &ctl, &bulk);
 
         forward(PeerMessage::InterestKinds {
-            node_bound: vec!["clean/#".into()],
-            lease_owned: vec!["durable/#".into()],
+            node_bound: vec!["both/#".into(), "clean/#".into()],
+            lease_owned: vec!["both/#".into(), "durable/#".into()],
         });
         let Ok(HubCommand::RemoteInterest {
             node,
             conn_id,
             filters,
-            lease_owned,
+            kinds,
         }) = rx.try_recv()
         else {
             panic!("an interest command");
         };
         assert_eq!((node, conn_id), (remote.clone(), Some(7)));
-        assert_eq!(filters, ["clean/#", "durable/#"]);
-        assert_eq!(lease_owned.as_deref(), Some(&["durable/#".to_string()][..]));
+        assert_eq!(filters, ["both/#", "clean/#", "durable/#"]);
+        let (bound, owned) = *kinds.expect("kinds");
+        assert_eq!(bound, ["both/#", "clean/#"]);
+        assert_eq!(owned, ["both/#", "durable/#"]);
 
         forward(PeerMessage::Interest {
             filters: vec!["durable/#".into()],
         });
         assert!(matches!(
             rx.try_recv(),
-            Ok(HubCommand::RemoteInterest { filters, lease_owned, .. })
-                if filters == ["durable/#"] && lease_owned.is_none()
+            Ok(HubCommand::RemoteInterest { filters, kinds, .. })
+                if filters == ["durable/#"] && kinds.is_none()
         ));
     }
 

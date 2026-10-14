@@ -1020,24 +1020,24 @@ pub enum PeerMessage {
     /// A full snapshot of the sending node's local subscription interest, as
     /// [`Interest`](Self::Interest) is, with each filter's KIND (ADR 0087 D8).
     ///
-    /// `lease_owned` holds the filters every subscriber of which on the sender is a
-    /// session the lease plane owns: a durable session, owed to whichever node is its
-    /// committed owner, so when the lease moves it the new owner's answer stands for
-    /// the sender's. `node_bound` holds every other filter — one at least one session
-    /// that lives and dies with the sender holds (a clean session; any session
-    /// without a durable plane): only the sender can answer for it, or the
-    /// confirmation that it is gone. The two are disjoint, and their union is what
-    /// `Interest` would carry; a receiver takes a filter found in both as
-    /// lease-owned, and ignores the kinds of one that arrives on a link below 15.
+    /// `lease_owned` holds the filters at least one session the lease plane owns holds
+    /// on the sender: a durable session, owed to whichever node is its committed
+    /// owner, so when the lease moves it the new owner's answer stands for the
+    /// sender's. `node_bound` holds the filters at least one session that lives and
+    /// dies with the sender holds (a clean session; any session without a durable
+    /// plane): only the sender can answer for that one, or the confirmation that it is
+    /// gone. A filter both kinds hold is in BOTH lists — what a publish matching it is
+    /// owed to depends on each — and their union is what `Interest` would carry. A
+    /// receiver ignores the kinds of one that arrives on a link below 15.
     ///
     /// Sent instead of `Interest`, on the same triggers, by a node with a durable
     /// plane on a link that negotiated proto ≥ 15. `Interest` itself means every
     /// filter is node-bound — what a node without a durable plane, and a peer behind
     /// an older link, is read as.
     InterestKinds {
-        /// Filters a session bound to the sender holds.
+        /// Filters at least one session bound to the sender holds.
         node_bound: Vec<String>,
-        /// Filters held only by sessions the lease plane owns.
+        /// Filters at least one session the lease plane owns holds.
         lease_owned: Vec<String>,
     },
     /// A forward asking the receiver, as the node that now holds `groups`' leases,
@@ -2256,9 +2256,10 @@ mod tests {
     /// neither is sent it.
     #[test]
     fn interest_kinds_is_appended_and_announced_at_proto_15() {
+        // `a/#` held by a clean session and a durable one: in both lists.
         let kinds = PeerMessage::InterestKinds {
             node_bound: vec!["a/#".into()],
-            lease_owned: vec!["b".into(), "c/+".into()],
+            lease_owned: vec!["a/#".into(), "b".into()],
         };
         roundtrip(&kinds);
         roundtrip(&PeerMessage::InterestKinds {
@@ -2270,7 +2271,7 @@ mod tests {
         assert_eq!(out[4], 35, "appended after StateExpiry (34)");
         assert_eq!(
             &out[5..],
-            [1, 3, b'a', b'/', b'#', 2, 1, b'b', 3, b'c', b'/', b'+'],
+            [1, 3, b'a', b'/', b'#', 2, 3, b'a', b'/', b'#', 1, b'b'],
             "two length-prefixed lists of length-prefixed filters: node-bound, then \
              lease-owned"
         );

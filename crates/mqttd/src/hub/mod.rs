@@ -1685,11 +1685,13 @@ pub enum HubCommand {
         conn_id: Option<u64>,
         /// Every topic filter with subscribers on that node.
         filters: Vec<String>,
-        /// The filters among `filters` that only sessions the lease plane owns hold
-        /// there (ADR 0087 D8, [`PeerMessage::InterestKinds`]): owed to their committed
-        /// owner, wherever it is. `None` for a plain [`PeerMessage::Interest`] — the
-        /// kinds are not known, and no filter is taken for lease-owned.
-        lease_owned: Option<Vec<String>>,
+        /// The kinds of `filters` (ADR 0087 D8, [`PeerMessage::InterestKinds`]):
+        /// `(node_bound, lease_owned)` — those at least one session bound to the node
+        /// holds, and those at least one session the lease plane owns holds; a filter
+        /// both hold is in both. `None` for a plain [`PeerMessage::Interest`]: the
+        /// kinds are not known.
+        /// Boxed: rarely carried, and it would size every hub command.
+        kinds: Option<Box<(Vec<String>, Vec<String>)>>,
     },
     /// A peer's shared-subscription membership snapshot (ADR 0015 §2), used to select
     /// one member per group across the cluster.
@@ -3059,9 +3061,13 @@ impl LocalInterest {
             Self::Kinds {
                 node_bound,
                 lease_owned,
-            } => PeerMessage::Interest {
-                filters: node_bound.iter().chain(lease_owned).cloned().collect(),
-            },
+            } => {
+                let mut filters: Vec<String> =
+                    node_bound.iter().chain(lease_owned).cloned().collect();
+                filters.sort_unstable();
+                filters.dedup();
+                PeerMessage::Interest { filters }
+            }
         }
     }
 }
@@ -3159,12 +3165,23 @@ struct RemoteForward {
     question: bool,
 }
 
-/// How many former holders of a group's lease [`Hub::note_lease_moves`] remembers.
-const LEASE_HISTORY: usize = 4;
-
-/// How long before a node is lost a lease that moved off it still counts as its
-/// (ADR 0087 D8): the lease leader may have moved it before this node's own verdict.
+/// How long before a node is lost a lease that changed hands still counts as one it
+/// may have held (ADR 0087 D8): the lease leader may have moved it before this
+/// node's own verdict, through holders this node never saw between two reads.
 const RECENT_MOVE: Duration = Duration::from_mins(2);
+
+/// What a lost node may owe answers for (ADR 0087 D8; `LeaseHeirs::accountable`).
+#[derive(Debug)]
+struct Account {
+    /// Every group it may have held: those it held as last read when it was lost,
+    /// every group whose lease changed within [`RECENT_MOVE`] before, every group
+    /// whose holder did not resolve, and every group whose lease has changed since.
+    groups: BTreeSet<u64>,
+    /// The groups it held as last read when it was lost.
+    held: BTreeSet<u64>,
+    /// When it was (first) lost.
+    lost_at: Instant,
+}
 
 /// The hub's record of who holds the leases of nodes it lost, and what those holders
 /// have answered for them (ADR 0087 D8).
@@ -3178,19 +3195,26 @@ struct LeaseHeirs {
     seen: BTreeMap<u64, NodeId>,
     epochs: BTreeMap<u64, u64>,
     unresolved: BTreeSet<u64>,
-    /// For each group, the nodes that held its lease before (the last
-    /// [`LEASE_HISTORY`], newest last) and when it moved off them.
-    former: HashMap<u64, Vec<(NodeId, Instant)>>,
-    /// The groups a node held when this node lost it — its link went, or a verdict
-    /// fell on it — and those moved off it shortly before ([`RECENT_MOVE`]). What it
-    /// is owed for its durable sessions is owed, while any of them has moved, to
-    /// whoever holds them now. Dropped once the node is linked, not held dead, and
-    /// owed nothing.
-    accountable: HashMap<NodeId, BTreeSet<u64>>,
-    /// For a held publish: `(holder, group, epoch)` for each group a holder has
-    /// answered an owner's question about (or this node, as holder, has run a
-    /// settle pass for), at the lease epoch asked.
-    answers: HashMap<u64, Vec<(NodeId, u64, u64)>>,
+    /// When each group's lease last changed — holder, epoch, or resolvability — as
+    /// this node read it.
+    changed_at: HashMap<u64, Instant>,
+    /// The groups a node may have held when this node lost it — its link went, or a
+    /// verdict fell on it: those it held as last read, every group whose lease
+    /// changed within [`RECENT_MOVE`] before (a holder between two reads is not
+    /// seen, so any recent change may have passed through it), every group whose
+    /// holder does not resolve, and every group whose lease changes while the
+    /// record lasts. What it is owed for its durable sessions is owed, while any of
+    /// them is held elsewhere, to whoever holds them now. Dropped once the node is
+    /// linked, not held dead, and owed nothing kept for its sessions' owners nor
+    /// anything sent before its link.
+    accountable: HashMap<NodeId, Account>,
+    /// The forward seq this node had reached when each node's current link formed:
+    /// a forward at or below it was registered before the link.
+    link_seq: HashMap<NodeId, u64>,
+    /// For a held publish, by group: the holder that answered an owner's question
+    /// about it (or this node, as holder, by a settle pass) and the lease epoch it
+    /// answered at.
+    answers: HashMap<u64, HashMap<u64, (NodeId, u64)>>,
     /// For a held publish and a holder: the `(group, epoch)` list it last said "not
     /// me" to; it is not asked that list again.
     refused: HashMap<(u64, NodeId), Vec<(u64, u64)>>,
@@ -4404,10 +4428,11 @@ impl Hub {
                 node,
                 conn_id,
                 filters,
-                lease_owned,
+                kinds,
             } => {
                 if !self.arrived_on_a_replaced_link(&node, conn_id) {
-                    self.peer_announced_interest_kinds(&node, filters, lease_owned.as_deref());
+                    let kinds = kinds.as_deref().map(|(b, o)| (b.as_slice(), o.as_slice()));
+                    self.peer_announced_interest_kinds(&node, filters, kinds);
                 }
             }
             HubCommand::RemoteSharedInterest {
@@ -5818,38 +5843,51 @@ impl Hub {
     }
 
     /// The lease checks of an owner's question (ADR 0087 D8): `true` when it has been
-    /// dealt with here — deferred, because this node's applied lease state has not
-    /// reached an epoch it names (the asker sends it again), or refused with
-    /// [`REFUSAL_NOT_THE_HOLDER`](mqtt_cluster::peer::REFUSAL_NOT_THE_HOLDER) because
-    /// that state, at or past the epoch, gives a named group to another node. `false`:
-    /// this node holds every named group, and the question is applied as a re-route.
+    /// dealt with here, `false` when this node holds every named group and the
+    /// question is to be applied as a re-route.
+    ///
+    /// Judged against the lease map as THIS NODE'S SESSION SWEEP last observed it —
+    /// never the placement the durable driver writes from its own thread. The sweep is
+    /// what opens the takeover window and starts the inherited-session scan for a
+    /// move; between the driver's push and that sweep, the live map already names
+    /// this node while the sessions it is taking over are not loaded, and a question
+    /// answered then would say "nobody here" for a session about to arrive. So:
+    ///
+    /// - malformed (more groups than there are, or a group out of range): `Failed`;
+    /// - the live map has moved past what the sweep observed, or the observed lease
+    ///   epoch of a named group is below the one asked: deferred — neither applied
+    ///   nor answered; the asker sends it again;
+    /// - the observed map gives a named group to another node, at or past the epoch
+    ///   asked: refused [`REFUSAL_NOT_THE_HOLDER`](mqtt_cluster::peer::REFUSAL_NOT_THE_HOLDER).
     fn owner_question_answered_here(
         &mut self,
         node: &NodeId,
         seq: u64,
         groups: &[(u64, u64)],
     ) -> bool {
-        let Some(placement) = &self.placement else {
-            debug!(origin = %node.0, seq, "owner question with no lease state here; deferred");
-            return true;
-        };
-        let (map, epochs) = {
-            let p = placement
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (p.committed_lease_map(), p.committed_lease_epochs())
-        };
-        if groups
-            .iter()
-            .any(|(g, e)| epochs.get(g).copied().unwrap_or(0) < *e)
+        let num_groups = mqtt_cluster::placement::NUM_GROUPS;
+        if groups.is_empty()
+            || groups.len() > usize::try_from(num_groups).unwrap_or(usize::MAX)
+            || groups.iter().any(|(g, _)| *g >= num_groups)
         {
-            debug!(origin = %node.0, seq, "owner question names a lease epoch not applied here yet; deferred");
+            warn!(origin = %node.0, seq, groups = groups.len(), "malformed owner question; answered as a failure");
+            self.answer_forward(node, seq, ForwardVerdict::Failed);
+            return true;
+        }
+        if !self.ownership_move_observed() {
+            debug!(origin = %node.0, seq, "owner question while this node's sweep has not yet seen the lease map; deferred");
             return true;
         }
         if groups
             .iter()
-            .any(|(g, _)| map.get(g) != Some(&self.node_id))
+            .any(|(g, e)| self.heirs.epochs.get(g).copied().unwrap_or(0) < *e)
         {
+            debug!(origin = %node.0, seq, "owner question names a lease epoch not observed here yet; deferred");
+            return true;
+        }
+        if groups.iter().any(|(g, _)| {
+            self.heirs.unresolved.contains(g) || self.heirs.seen.get(g) != Some(&self.node_id)
+        }) {
             debug!(origin = %node.0, seq, "owner question for a group this node does not hold");
             self.answer_forward(
                 node,
@@ -8314,6 +8352,8 @@ impl Hub {
         // ADR 0073: remember the negotiated proto across link flaps (removed only
         // on confirmed death) — the ownership-domain capability check reads this.
         self.known_peer_protos.insert(node.clone(), proto);
+        // ADR 0087 D8: forwards up to here were registered before this link.
+        self.heirs.link_seq.insert(node.clone(), self.forward_seq);
         let node_for_events = node.clone();
         let replaced = self.peers.insert(
             node,
@@ -8350,10 +8390,11 @@ impl Hub {
         // (ADR 0087 D5), and there is nothing left to count down. (One confirmed
         // gone stays so: only an `Alive` makes it a member again.)
         //
-        // A node confirmed gone whose leases the lease plane has moved is not the
-        // owner of the durable sessions it is still owed for: what it is owed for
-        // them stays owed to their new owner, and is not sent on this link
-        // ([`VerdictHold::Gone`]). If it holds them again, it is their owner again.
+        // A node confirmed gone with forwards still kept for its durable sessions
+        // stays `Gone` whatever links: those forwards are never sent on this link;
+        // the current holder of each lease it held answers for them — this node
+        // among them, asked like any other, for the leases it holds again
+        // ([`VerdictHold::Gone`], ADR 0087 D8).
         match self.held_dead.get(&node_for_events).copied() {
             Some(VerdictHold::GoneLinked { .. } | VerdictHold::Gone) | None => {}
             Some(_) => {
@@ -8548,19 +8589,19 @@ impl Hub {
     }
 
     /// A peer's interest snapshot arrived ([`PeerMessage::Interest`], or
-    /// [`PeerMessage::InterestKinds`] with the filters only sessions the lease plane
-    /// owns hold there as `lease_owned` — ADR 0087 D8).
+    /// [`PeerMessage::InterestKinds`] with its `(node_bound, lease_owned)` kinds —
+    /// ADR 0087 D8).
     fn peer_announced_interest_kinds(
         &mut self,
         node: &NodeId,
         filters: Vec<String>,
-        lease_owned: Option<&[String]>,
+        kinds: Option<(&[String], &[String])>,
     ) {
         debug!(node = %node.0, filters = filters.len(), "remote interest updated");
         // Kinds are a proto-15 statement (ADR 0087 D8): from a link below it — a
-        // peer that cannot have meant them — every filter is node-bound (O5).
-        let lease_owned = lease_owned
-            .filter(|_| self.peer_proto(node) >= mqtt_cluster::peer::PROTO_INTEREST_KINDS);
+        // peer that cannot have meant them — the kinds are not known (O5).
+        let kinds =
+            kinds.filter(|_| self.peer_proto(node) >= mqtt_cluster::peer::PROTO_INTEREST_KINDS);
         // The peer's view is AUTHORITATIVE (it never gossips before it
         // is — 0043-P4 exhibit ②): its link now counts toward
         // `mesh_settled`, and a scan can settle held publishes against
@@ -8583,8 +8624,7 @@ impl Hub {
         if synced_now {
             self.recompute_mesh();
         }
-        self.interest
-            .replace_kinds(node.clone(), filters, lease_owned);
+        self.interest.replace_kinds(node.clone(), filters, kinds);
         // The peer has said what it routes, on a link that is new: every
         // ordinary forward this node owes it goes out now, oldest publish first,
         // under the seqs they were given when they were recorded — a publisher
@@ -8894,7 +8934,7 @@ impl Hub {
                     .heirs
                     .accountable
                     .get(&node)
-                    .is_none_or(BTreeSet::is_empty)
+                    .is_none_or(|a| a.groups.is_empty())
             {
                 // It held no lease this node knows of when it was lost: nobody can be
                 // asked for its sessions.
@@ -8902,18 +8942,33 @@ impl Hub {
                 self.resolve_owed_to_gone(&node);
             }
         }
-        // A node lost and found again, owed nothing for its durable sessions, is
-        // nobody's to account for any more.
+        // A node lost and found again is nobody's to account for once it is linked,
+        // not held dead, and owed nothing kept for its sessions' owners nor anything
+        // sent before its link: its answers from then on are its own, as any linked
+        // node's are. One pass over the pending table, only while a record exists.
         if !self.heirs.accountable.is_empty() {
-            let owed: HashSet<NodeId> = self
-                .pending_publishes
-                .values()
-                .flat_map(|p| p.awaiting.values().map(|o| o.node.clone()))
-                .collect();
-            let (peers, held) = (&self.peers, &self.held_dead);
-            self.heirs
-                .accountable
-                .retain(|n, _| !peers.contains_key(n) || held.contains_key(n) || owed.contains(n));
+            let mut keep: HashSet<&NodeId> = HashSet::new();
+            for node in self.heirs.accountable.keys() {
+                if !self.peers.contains_key(node) || self.held_dead.contains_key(node) {
+                    keep.insert(node);
+                }
+            }
+            for p in self.pending_publishes.values() {
+                for (seq, o) in &p.awaiting {
+                    if self.heirs.accountable.contains_key(&o.node)
+                        && (o.for_owner()
+                            || self
+                                .heirs
+                                .link_seq
+                                .get(&o.node)
+                                .is_none_or(|linked| seq <= linked))
+                    {
+                        keep.insert(&o.node);
+                    }
+                }
+            }
+            let keep: HashSet<NodeId> = keep.into_iter().cloned().collect();
+            self.heirs.accountable.retain(|n, _| keep.contains(n));
         }
         self.move_shared_from_unreachable();
     }
@@ -8933,9 +8988,10 @@ impl Hub {
         self.sweep_epoch_seen = Some(epoch);
     }
 
-    /// Read the committed lease map — holders and epochs — and remember who held
-    /// each group whose holder changed (ADR 0087 D8). A group whose holder does not
-    /// resolve to a node keeps the holder it had, marked unresolved.
+    /// Read the committed lease map — holders and epochs — and remember when each
+    /// group's lease changed (ADR 0087 D8). A group whose holder does not resolve to
+    /// a node keeps the holder it had, marked unresolved. Every node this node is
+    /// accounting for takes every group that changed.
     pub(super) fn note_lease_moves(&mut self) {
         let Some(placement) = &self.placement else {
             return;
@@ -8948,17 +9004,15 @@ impl Hub {
         };
         let now = Instant::now();
         let groups: BTreeSet<u64> = map.keys().chain(epochs.keys()).copied().collect();
+        let mut changed: Vec<u64> = Vec::new();
         for group in groups {
+            let before = (
+                self.heirs.seen.get(&group).cloned(),
+                self.heirs.epochs.get(&group).copied(),
+                self.heirs.unresolved.contains(&group),
+            );
             match map.get(&group) {
                 Some(holder) => {
-                    if let Some(before) = self.heirs.seen.get(&group).filter(|b| *b != holder) {
-                        let former = self.heirs.former.entry(group).or_default();
-                        former.retain(|(n, _)| n != before);
-                        former.push((before.clone(), now));
-                        if former.len() > LEASE_HISTORY {
-                            former.remove(0);
-                        }
-                    }
                     self.heirs.seen.insert(group, holder.clone());
                     self.heirs.unresolved.remove(&group);
                 }
@@ -8969,50 +9023,81 @@ impl Hub {
             if let Some(epoch) = epochs.get(&group) {
                 self.heirs.epochs.insert(group, *epoch);
             }
+            let after = (
+                self.heirs.seen.get(&group).cloned(),
+                self.heirs.epochs.get(&group).copied(),
+                self.heirs.unresolved.contains(&group),
+            );
+            if before != after {
+                self.heirs.changed_at.insert(group, now);
+                changed.push(group);
+            }
+        }
+        if !changed.is_empty() {
+            for account in self.heirs.accountable.values_mut() {
+                account.groups.extend(changed.iter().copied());
+            }
         }
     }
 
-    /// Record the groups `node` holds as this node last read the lease map, and those
-    /// that moved off it within [`RECENT_MOVE`]: what it may owe answers for if its
-    /// leases move while it is lost (ADR 0087 D8). Added to, never narrowed, while
-    /// the record lasts.
+    /// Start (or widen) the account of what `node` may owe answers for, now that
+    /// this node has lost it (ADR 0087 D8; see `LeaseHeirs::accountable`).
     fn note_accountable(&mut self, node: &NodeId) {
         if self.durable_plane.is_none() {
             return;
         }
-        let recent = Instant::now().checked_sub(RECENT_MOVE);
-        let mut groups: BTreeSet<u64> = self
+        let now = Instant::now();
+        let recent = now.checked_sub(RECENT_MOVE);
+        let held: BTreeSet<u64> = self
             .heirs
             .seen
             .iter()
             .filter(|(_, h)| *h == node)
             .map(|(g, _)| *g)
             .collect();
-        for (group, former) in &self.heirs.former {
-            if former
-                .iter()
-                .any(|(n, at)| n == node && recent.is_none_or(|r| *at >= r))
-            {
-                groups.insert(*group);
-            }
-        }
-        if !groups.is_empty() {
+        let mut groups = held.clone();
+        groups.extend(self.heirs.unresolved.iter().copied());
+        groups.extend(
             self.heirs
-                .accountable
-                .entry(node.clone())
-                .or_default()
-                .extend(groups);
-        }
+                .changed_at
+                .iter()
+                .filter(|(_, at)| recent.is_none_or(|r| **at >= r))
+                .map(|(g, _)| *g),
+        );
+        // Recorded even when empty: a group that changes while the record lasts may
+        // have passed through the node unseen, and joins it then.
+        let account = self
+            .heirs
+            .accountable
+            .entry(node.clone())
+            .or_insert_with(|| Account {
+                groups: BTreeSet::new(),
+                held: BTreeSet::new(),
+                lost_at: now,
+            });
+        account.groups.extend(groups);
+        account.held.extend(held);
     }
 
-    /// Whether a group `node` is accountable for is now held by another node, or by
-    /// one this node cannot resolve: its answers for its durable sessions are no
-    /// longer the owner's.
+    /// Whether a lease `node` may have held has gone elsewhere since it was lost: one
+    /// it held then is now another node's (or nobody's this node can resolve), or
+    /// one it may have held changed after it was lost and is not its. Then its
+    /// answers for its durable sessions are no longer the owner's. Groups that
+    /// changed hands among other nodes before it was lost, and stayed put since,
+    /// do not count: a false verdict on a node with no lease moving costs nothing.
     pub(super) fn leases_moved_off(&self, node: &NodeId) -> bool {
-        self.heirs.accountable.get(node).is_some_and(|groups| {
-            groups
-                .iter()
-                .any(|g| self.heirs.unresolved.contains(g) || self.heirs.seen.get(g) != Some(node))
+        self.heirs.accountable.get(node).is_some_and(|account| {
+            account.groups.iter().any(|g| {
+                let elsewhere =
+                    self.heirs.unresolved.contains(g) || self.heirs.seen.get(g) != Some(node);
+                elsewhere
+                    && (account.held.contains(g)
+                        || self
+                            .heirs
+                            .changed_at
+                            .get(g)
+                            .is_some_and(|at| *at > account.lost_at))
+            })
         })
     }
 
@@ -9203,7 +9288,8 @@ impl Hub {
                     && (self.interest.lease_owned_match(node, &p.topic)
                         || !self.interest.kinds_known(node))
                 {
-                    let node_bound_too = !self.interest.owner_bound(node, &p.topic);
+                    let node_bound_too = self.interest.node_bound_match(node, &p.topic)
+                        || !self.interest.kinds_known(node);
                     if let Some(ForwardObligation {
                         kind:
                             ForwardKind::Ordinary {
@@ -9313,7 +9399,7 @@ impl Hub {
         if self.durable_plane.is_none() {
             return LocalInterest::Plain(self.table.filters());
         }
-        let (node_bound, lease_owned) = self.table.filters_split(|c| self.is_persistent(c));
+        let (node_bound, lease_owned) = self.table.filters_by_kind(|c| self.is_persistent(c));
         LocalInterest::Kinds {
             node_bound,
             lease_owned,
@@ -10912,7 +10998,7 @@ mod tests {
             node: NodeId(node.into()),
             conn_id: None,
             filters: filters.iter().map(|f| (*f).to_string()).collect(),
-            lease_owned: None,
+            kinds: None,
         })
         .unwrap();
     }
@@ -19128,7 +19214,7 @@ mod tests {
             node: node.clone(),
             conn_id: None,
             filters: filters.iter().map(|f| (*f).to_string()).collect(),
-            lease_owned: None,
+            kinds: None,
         })
         .unwrap();
     }

@@ -2970,3 +2970,122 @@ async fn durable_an_owner_that_dies_holds_its_publishers_for_the_failover_not_fo
         "the new owner stored the publish for the session: received {received:?}"
     );
 }
+
+/// The third review of PR #1025, B2, end to end: on B a durable session (offline) and
+/// a clean session (connected) hold the IDENTICAL filter. A, the lease leader, holds
+/// B dead and cannot reach it, and moves B's groups. B's interest names the filter
+/// in both of its kinds, so a publish for it is owed to B for the clean session —
+/// held until B is confirmed gone — AND to the durable session's new owner, which
+/// must have it before the publisher is acknowledged. Then: acknowledged after the
+/// confirmation, counted `peer-gone` (the clean session's part), and the durable
+/// session, resumed on its new owner, receives the publish.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn durable_a_clean_and_a_durable_session_on_one_filter_are_each_answered_for() {
+    let cluster = Cluster::start(Mode::Durable, Link::EvictorDials, Founder::Evictor).await;
+    let q1 = QoS::AtLeastOnce;
+    let mut mixed = Flow::new(
+        &cluster,
+        "mixed",
+        On::A,
+        "fd/mix",
+        q1,
+        vec![
+            Sub::connect(&cluster, On::B, "sub-mix-d", false, "fd/mix/#", q1).await,
+            Sub::connect(&cluster, On::B, "sub-mix-c", true, "fd/mix/#", q1).await,
+        ],
+    )
+    .await;
+    mixed.warm().await;
+    let session = mixed.subs[0].id.clone();
+    mixed.subs[0]
+        .client
+        .take()
+        .expect("connected")
+        .disconnect()
+        .await;
+    b_dies_as_a_sees_it(&cluster).await;
+    let before = series(&cluster.a);
+
+    let confirm = async {
+        // SETTLE(mixed-filter-confirmation): not a wait for a state — the time IS the
+        // stimulus: the clean session's part is held until B is confirmed gone.
+        tokio::time::sleep(UNCONFIRMED_FOR).await;
+        cluster.confirm_b_gone_on_a().await
+    };
+    let (answer, gone_at) = tokio::join!(mixed.publish("first", ACK_BOUND), confirm);
+    let acked_at = mixed.publisher.last_acked_at;
+    let moved_on_a = moved(&before, &series(&cluster.a));
+    let owner = cluster
+        .a
+        .placement
+        .read()
+        .unwrap()
+        .committed_session_owner(&session);
+    println!(
+        "  mixed: {answer:?}, {:?} after the confirmation; the session's owner now {owner:?}; \
+         moved on A: {moved_on_a:?}",
+        acked_at.and_then(|at| at.checked_duration_since(gone_at))
+    );
+    assert!(answer.acked_ok(), "acknowledged: {answer:?}");
+    assert!(
+        acked_at.expect("acknowledged") >= gone_at,
+        "not before B was confirmed gone: the clean session's part was B's"
+    );
+    assert!(
+        (moved_on_a
+            .get("mqttd_publish_resolved_undeliverable_total{reason=\"peer-gone\"}")
+            .copied()
+            .unwrap_or(0.0)
+            - 1.0)
+            .abs()
+            < f64::EPSILON,
+        "counted once, for the clean session: {moved_on_a:?}"
+    );
+    let owner = owner.expect("the leader committed a new owner");
+    assert_ne!(owner, cluster.b.id, "the lease moved off the dead owner");
+    let node = cluster
+        .nodes()
+        .into_iter()
+        .find(|n| n.id == owner)
+        .expect("the owner is one of the three");
+    let mut received = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while received.is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the session never resumed on {owner:?}"
+        );
+        let Ok((mut client, present)) = Client::connect_v311_explained(
+            node.client_addr,
+            &session,
+            false,
+            Duration::from_secs(4),
+        )
+        .await
+        else {
+            continue;
+        };
+        assert!(present, "the session moved with its lease");
+        let until = Instant::now() + QUIET;
+        while let Some(left) = until.checked_duration_since(Instant::now()) {
+            match client.recv_bounded(left).await {
+                Recv::Packet(Packet::Publish(p)) => {
+                    if let Some(pkid) = p.pkid {
+                        client.puback(pkid).await;
+                    }
+                    received.push(p.topic);
+                }
+                Recv::Packet(_) => {}
+                Recv::Quiet | Recv::Closed => break,
+            }
+        }
+        if received.is_empty() {
+            break;
+        }
+    }
+    assert!(
+        received.iter().any(|t| t == "fd/mix/first"),
+        "the durable session's new owner had the publish: received {received:?}"
+    );
+}

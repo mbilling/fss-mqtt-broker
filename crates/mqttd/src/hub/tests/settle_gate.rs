@@ -508,7 +508,7 @@ async fn an_early_acked_publish_still_re_routes_to_a_peer_that_advertises_intere
         node: NodeId("successor".into()),
         conn_id: Some(1),
         filters: Vec::new(),
-        lease_owned: None,
+        kinds: None,
     })
     .await;
 
@@ -526,7 +526,7 @@ async fn an_early_acked_publish_still_re_routes_to_a_peer_that_advertises_intere
         node: NodeId("successor".into()),
         conn_id: None,
         filters: vec!["settle/r".into()],
-        lease_owned: None,
+        kinds: None,
     })
     .await;
     assert!(
@@ -1266,12 +1266,22 @@ async fn a_re_route_that_matches_a_session_here_is_answered_before_the_scan() {
     assert_eq!(answers, [(1, ForwardVerdict::Reached)]);
 }
 
-/// ADR 0087 D8, the holder's side of an owner's question. The question names each
-/// group with the epoch of the lease the asker knows. Here: deferred — neither
-/// applied nor answered — while this node's applied lease state is behind that
-/// epoch; refused "not me" when that state gives the group to another node; applied
-/// as a re-route and answered once this node holds the group at that epoch and its
-/// own takeover is over.
+/// ADR 0087 D8, the holder's side of an owner's question, driven by the hub's own
+/// sweep. The question names each group with the epoch of the lease the asker knows.
+///
+/// - The durable driver has pushed a map naming this node at that epoch, but this
+///   node's sweep has not seen it yet — the session to take over is in the store,
+///   not loaded (the third review's probe of PR #1025, which answered `Stored`
+///   here): deferred, neither applied nor answered.
+/// - The sweep has seen it, and the takeover window it opened is still open:
+///   deferred.
+/// - Once the window has closed and the scan has loaded the session: applied as a
+///   re-route and answered `Reached`, the session holding the publish.
+/// - A map, as the sweep saw it, giving the group to another node at or past the
+///   epoch asked: "not me".
+/// - A question naming a group out of range: `Failed`.
+// One linear timeline: the push, the sweep, the window, the move on.
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn an_owner_question_is_answered_only_by_the_groups_holder_at_the_epoch_asked() {
     let mut fix = clustered_fixture();
@@ -1282,6 +1292,21 @@ async fn an_owner_question_is_answered_only_by_the_groups_holder_at_the_epoch_as
         ),
     ));
     fix.hub.placement = Some(placement.clone());
+    let (_store, _retained, plane, driver) = mqtt_cluster::durable_node::build_durable_node(
+        NodeId("settle-gate".into()),
+        placement.clone(),
+        false,
+        5,
+        &std::collections::BTreeMap::new(),
+        None,
+        None,
+        false,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
+    )
+    .await;
+    driver.abort();
+    fix.hub.attach_durable_plane(plane);
     let set = |holder: &str, epoch: u64| {
         let mut p = placement.write().unwrap();
         p.set_lease_owners(std::collections::BTreeMap::from([(
@@ -1300,14 +1325,24 @@ async fn an_owner_question_is_answered_only_by_the_groups_holder_at_the_epoch_as
         mqtt_cluster::peer::PROTO_MAX,
         Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     );
+    set("elsewhere", 9);
+    fix.hub.run_sweep().await;
+    fix.scan_lands(&[], true).await;
+    for _ in 0..30 {
+        if !fix.hub.cannot_say_who_is_here() {
+            break;
+        }
+        fix.hub.run_sweep().await;
+        quiesce(&mut fix.hub).await;
+    }
+    assert!(!fix.hub.cannot_say_who_is_here(), "fixture: a settled node");
+    // The session it is about to take over: in the store, not loaded.
     fix.store_only_session("moved", "q/#").await;
-    fix.scan_lands(&["moved"], true).await;
-    assert!(!fix.hub.cannot_say_who_is_here());
-    let question = |seq: u64| HubCommand::RemoteOwnerQuestion {
+    let question = |seq: u64, group: u64| HubCommand::RemoteOwnerQuestion {
         node: NodeId("origin-node".into()),
         seq,
         origin: 7,
-        groups: vec![(5, 10)],
+        groups: vec![(group, 10)],
         topic: "q/1".into(),
         payload: Bytes::from_static(b"settle-gate"),
         qos: QoS::AtLeastOnce,
@@ -1324,38 +1359,66 @@ async fn an_owner_question_is_answered_only_by_the_groups_holder_at_the_epoch_as
             .collect::<Vec<_>>()
     };
 
-    set("settle-gate", 9);
-    fix.dispatch(question(1)).await;
+    // The probe: the driver names this node; the sweep has not seen it.
+    set("settle-gate", 10);
+    fix.dispatch(question(1, 5)).await;
+    quiesce(&mut fix.hub).await;
     assert_eq!(
         verdicts(&mut origin),
         [],
-        "behind the epoch asked: deferred"
+        "the placement is ahead of this node's sweep: deferred, not `Stored`"
     );
     assert!(fix.queued("moved").await.is_empty());
 
+    // The sweep sees it and opens the takeover window: still deferred.
+    fix.hub.run_sweep().await;
+    assert!(
+        fix.hub.cannot_say_who_is_here(),
+        "the window the move opened"
+    );
+    fix.dispatch(question(1, 5)).await;
+    assert_eq!(
+        verdicts(&mut origin),
+        [],
+        "deferred while the window is open"
+    );
+
+    // The window closes, the scan has loaded the session: answered for it.
+    for _ in 0..30 {
+        if !fix.hub.cannot_say_who_is_here() {
+            break;
+        }
+        fix.hub.run_sweep().await;
+        quiesce(&mut fix.hub).await;
+    }
+    assert!(!fix.hub.cannot_say_who_is_here(), "the window closed");
+    fix.dispatch(question(1, 5)).await;
+    quiesce(&mut fix.hub).await;
+    assert_eq!(verdicts(&mut origin), [(1, ForwardVerdict::Reached)]);
+    assert_eq!(
+        fix.queued("moved").await.len(),
+        1,
+        "applied for the session taken over"
+    );
+
+    // The group moves on; the sweep sees it: "not me" to a question at 10.
     set("elsewhere", 12);
-    fix.dispatch(question(1)).await;
+    fix.hub.run_sweep().await;
+    fix.dispatch(question(2, 5)).await;
     assert_eq!(
         verdicts(&mut origin),
         [(
-            1,
+            2,
             ForwardVerdict::Refused {
                 code: mqtt_cluster::peer::REFUSAL_NOT_THE_HOLDER
             }
         )],
-        "past the epoch, and the group is another node's: not me"
     );
-    assert!(fix.queued("moved").await.is_empty());
 
-    set("settle-gate", 10);
-    fix.dispatch(question(2)).await;
-    quiesce(&mut fix.hub).await;
-    assert_eq!(verdicts(&mut origin), [(2, ForwardVerdict::Reached)]);
-    assert_eq!(
-        fix.queued("moved").await.len(),
-        1,
-        "applied for the session held here"
-    );
+    // Out of range: a failure, never applied.
+    fix.dispatch(question(3, mqtt_cluster::placement::NUM_GROUPS))
+        .await;
+    assert_eq!(verdicts(&mut origin), [(3, ForwardVerdict::Failed)]);
 }
 
 /// **#784, mixed versions.** A proto-11 peer cannot carry the publish's identity, so
@@ -1382,7 +1445,7 @@ async fn a_proto_11_peer_gets_the_untagged_forward_and_an_untagged_replay_still_
         node: NodeId("old-peer".into()),
         conn_id: None,
         filters: vec!["q/#".into()],
-        lease_owned: None,
+        kinds: None,
     })
     .await;
     let _ack = fix.publish_gated("q/1").await;

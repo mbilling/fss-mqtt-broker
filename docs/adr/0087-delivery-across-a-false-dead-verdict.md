@@ -757,20 +757,24 @@ that negotiated 15. *(O2 decided 2026-10-14: in the first cut.)*
 
 - *The frame.* `PeerMessage::InterestKinds { node_bound, lease_owned }`, appended at tag
   35, `PROTO_MAX` 15 (`PROTO_INTEREST_KINDS`); the pinned body of
-  `{ ["a/#"], ["b", "c/+"] }` is `23 01 03 'a/#' 02 01 'b' 03 'c/+'`, and it is a seed of
+  `{ ["a/#"], ["a/#", "b"] }` is `23 01 03 'a/#' 02 03 'a/#' 01 'b'`, and it is a seed of
   the `peer_decode` fuzz target. It is a whole interest snapshot, sent instead of
-  `Interest` on the same triggers: `lease_owned` holds the filters EVERY subscriber of
-  which on the sender is a persistent session (a session the lease plane owns),
-  `node_bound` every other. A node with a durable plane sends it on a link that
-  negotiated 15; a node without one has no lease-owned interest and keeps sending
-  `Interest`, so a plain cluster's frames are byte for byte proto 14's. `Interest` is
-  read as interest whose kinds are not known: no filter is lease-owned. A filter found
-  in both lists is taken as lease-owned (no build sends that: the lists are disjoint
-  by construction). A node re-announces when a session's kind changes without its
-  filters changing (a persistent session resumed with expiry 0, or the reverse).
-- *Where the kind is kept.* The interest index keeps each node's lease-owned filters in
-  a second table beside the first. The publish path walks the first, as before; the
-  second is asked only about a publish owed to a node that cannot be reached.
+  `Interest` on the same triggers: `lease_owned` holds the filters AT LEAST ONE
+  persistent session (a session the lease plane owns) on the sender holds,
+  `node_bound` those at least one session bound to the sender holds. A filter both
+  kinds hold is in BOTH lists: a publish matching it is owed to the sender for the
+  one and to the lease holders for the other. (The first cut put such a filter in
+  `node_bound` only, and a durable session sharing a filter with a clean monitor lost
+  its publish at confirmation — the third review of PR #1025.) A node with a durable
+  plane sends it on a link that negotiated 15; a node without one has no lease-owned
+  interest and keeps sending `Interest`, so a plain cluster's frames are byte for byte
+  proto 14's. `Interest` is read as interest whose kinds are not known. A node
+  re-announces when a session's kind changes without its filters changing (a
+  persistent session resumed with expiry 0, or the reverse).
+- *Where the kind is kept.* The interest index keeps each node's lease-owned and
+  node-bound filters in two tables beside the first. The publish path walks the
+  first, as before; the others are asked only about a publish owed to a node that
+  cannot be reached.
 - *The owner's question* (proto 15). `PeerMessage::OwnerQuestion { seq, origin, groups,
   … }`, appended at tag 36: `PublishAckedTagged` with `replay` set, plus `(group, lease
   epoch)` pairs — the groups it is asked about and, for each, the epoch of the lease the
@@ -782,12 +786,20 @@ that negotiated 15. *(O2 decided 2026-10-14: in the first cut.)*
   `REFUSAL_NOT_THE_HOLDER` (4): "this group is not mine at that epoch". Sent only on a
   link at 15.
 - *Who a lost node's durable sessions belong to now.* When a node is lost — its link
-  goes, or a verdict falls on it — this node records the groups it held, from the
-  lease map last read, and those that moved off it in the two minutes before
-  (`note_accountable`; the lease leader may move them before this node's own
-  verdict). Each group's holder and lease epoch is re-read whenever the session sweep
-  sees the ownership epoch move (`note_lease_moves`); a group whose holder does not
-  resolve to a node keeps the holder it had and is marked unresolved.
+  goes, or a verdict falls on it — this node opens an account of the groups it may
+  have held (`note_accountable`): those it held as the lease map was last read; every
+  group whose lease changed hands in the two minutes before (between two of this
+  node's reads a lease can pass through a node unseen, so any recent change may have
+  been the lost node's); every group whose holder does not resolve; and every group
+  whose lease changes while the account is open. Each group's holder and lease epoch
+  is re-read whenever the session sweep sees the ownership epoch move
+  (`note_lease_moves`); a group whose holder does not resolve keeps the holder it had
+  and is marked unresolved. The node's answers stop counting for its durable sessions
+  only once a group it held then, or one that changed after it was lost, is held
+  elsewhere — so a false verdict with no lease moving costs nothing. The account is
+  closed once the node is linked, not held dead, and owed nothing kept for its
+  sessions' owners nor anything sent before its link: a link blip leaves nothing that
+  a later, ordinary rebalance could turn into questions.
 - *Which forwards wait for those holders* (`waits_for_holders`): one kept for them —
   at confirmation, whenever ANY filter of the lost node's matching the topic is
   lease-owned, or its kinds are not known (a clean monitor beside a durable session
@@ -797,7 +809,9 @@ that negotiated 15. *(O2 decided 2026-10-14: in the first cut.)*
   the node answering is the old process, a restarted one, or one that has some groups
   back (`answered_for_lost_owner`). And, before confirmation, one owed to a node held
   dead with no link, all its matching filters lease-owned, and a group of its moved.
-  Such a forward is never sent to the lost node again.
+  Such a forward is never sent to the lost node again. Only forwards sent before the
+  node's current link are taken from it this way: one sent on its new link is answered
+  by it as any linked node's is.
 - *What discharges them* (`discharge_owner_bound`): once this node's view of the lease
   plane can be acted on (the sweep has seen the map as it is now and opened the
   takeover window a move opens; the routing view has settled), EVERY group the lost
@@ -814,11 +828,17 @@ that negotiated 15. *(O2 decided 2026-10-14: in the first cut.)*
   when it is discharged. Without the evidence the publish stays held: a group whose
   holder does not resolve, a holder behind a link below 15 (it cannot read a
   question), a holder that does not answer.
-- *The holder's side.* A question is answered only when the receiver's applied lease
-  state has reached every epoch it names — deferred, neither applied nor answered,
-  before; the asker sends it again every sweep — and the receiver can say who is on it
-  (its first complete scan landed; with a durable plane no takeover window open and no
-  scan in flight). Then, if that state gives a named group to another node, it says
+- *The holder's side.* A question naming more groups than there are, or a group out
+  of range, is answered `Failed`. Otherwise it is answered only against the lease map
+  as the receiver's OWN SESSION SWEEP last observed it — never the placement the
+  durable driver writes from its own thread: the sweep is what opens the takeover
+  window and starts the scan for a move, and between the driver's push and that sweep
+  the live map already names the receiver while the sessions it is taking over are
+  not loaded (the third review's probe: answered `Stored` there). So it is deferred —
+  neither applied nor answered; the asker asks again, no more than every four sweeps —
+  until the sweep has seen the map as it is now and that view has reached every epoch
+  the question names, and until the receiver can say who is on it (its first complete
+  scan landed; with a durable plane no takeover window open and no scan in flight). Then, if that state gives a named group to another node, it says
   "not me" (the asker does not ask that holder the same again, and asks whoever holds
   the group once its own view moves on); if it holds them all, it applies the question
   as a re-route (a session already holding the publish skips it, #784) and answers.
@@ -849,8 +869,11 @@ that negotiated 15. *(O2 decided 2026-10-14: in the first cut.)*
   its kinds are not known: what it is owed waits for it or for confirmation, and is
   then kept for the holders of its leases and counted `peer-gone` when they have
   answered (it may have been for a clean session). A holder behind such a link is never
-  asked: a durable session whose lease moved to an older node is held until the pending
-  table's bound, during the roll only.
+  asked, and an owner's question is never written on a link below 15 (an older build
+  would read tag 36 as an unknown frame and drop the link) — retransmissions included,
+  so a holder that relinks below 15 is held for: a durable session whose lease moved to
+  an older node is held until that node is upgraded, or the pending table's bound,
+  during the roll only.
 - *Measured* (`false_dead_delivery.rs`, three nodes, loopback). A follower holds B dead
   with the link cut: a clean session's publish is held through 12 s — past the old
   countdown — and answered 1.0 s after the confirmation, counted `peer-gone` (it was
@@ -1191,12 +1214,12 @@ countdown that ended every kind of hold alike.
 
 What is left, stated rather than hidden:
 
-- *What a lost node is accountable for is what this node saw.* The groups it held when
-  this node last read the lease map, and those that moved off it in the two minutes
-  before it was lost. Each group remembers its last four holders, so a group that
-  moved four times or more in those two minutes is not traced back to it; a lease
-  that moved off it before that window, or while this node was not running, is not
-  either. A node with no such group has nobody to answer for it.
+- *What a lost node is accountable for is what this node saw, widened.* The groups it
+  held as last read, every group that changed hands in the two minutes before it was
+  lost, every unresolved group, and every group that changes while its account is
+  open. A lease that passed through it and away again more than two minutes before it
+  was lost is not traced; that is the ordinary rebalance, which #294's machinery
+  covers. A node that held no group in that account has nobody to answer for it.
 - *A node this node never lost.* What is owed to a peer whose link never went and on
   which no verdict fell is answered by the peer, as always; if its leases moved in the
   meantime (a resize), its answer is taken as it was before this work (#294's own

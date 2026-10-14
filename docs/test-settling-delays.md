@@ -56,6 +56,7 @@ caller changes this file and the gate fails until it is regenerated and re-read.
 | `crates/mqttd/tests/false_dead_delivery.rs` | `plain_a_peer_really_dead_is_answered_at_confirmation_and_counted` | `really-dead-unconfirmed-hold` | UNCONFIRMED_FOR | in the test itself |
 | `crates/mqttd/tests/false_dead_delivery.rs` | `durable_a_peer_out_of_reach_holds_a_clean_session_to_confirmation_and_a_durable_one_past_it` | `durable-unconfirmed-hold` | UNCONFIRMED_FOR | in the test itself |
 | `crates/mqttd/tests/false_dead_delivery.rs` | `durable_an_owner_that_dies_holds_its_publishers_for_the_failover_not_for_confirmation` | `failover-then-confirmation` | FAILOVER_UNCONFIRMED_FOR | in the test itself |
+| `crates/mqttd/tests/false_dead_delivery.rs` | `durable_a_clean_and_a_durable_session_on_one_filter_are_each_answered_for` | `mixed-filter-confirmation` | UNCONFIRMED_FOR | in the test itself |
 | `crates/mqttd/tests/http_auth.rs` | `stub_hook` | `http-auth-hang-stub` | 60s | helper, 6 call site(s) |
 | `crates/mqttd/tests/keepalive_lwt.rs` | `pinging_client_stays_connected_past_keepalive` | `keepalive-ping-cadence` | 500ms | in the test itself |
 | `crates/mqttd/tests/keepalive_lwt.rs` | `zero_keepalive_is_never_idle_disconnected` | `keepalive-zero-idle-window` | 2500ms | in the test itself |

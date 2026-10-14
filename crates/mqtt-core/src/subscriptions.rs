@@ -160,24 +160,27 @@ impl SubscriptionTable {
         count
     }
 
-    /// Every distinct topic filter with at least one subscriber, split in two: the
-    /// filters EVERY subscriber of which satisfies `all`, and the rest — as
-    /// `(rest, all)`. One pass; together they are [`filters`](Self::filters).
+    /// Every distinct topic filter with at least one subscriber, by its holders'
+    /// kinds, in one pass: `(any_other, any_kind)` — the filters at least one
+    /// subscriber of which does NOT satisfy `kind`, and those at least one of which
+    /// does. A filter held by both kinds of subscriber is in both; together they are
+    /// [`filters`](Self::filters).
     #[must_use]
-    pub fn filters_split(
+    pub fn filters_by_kind(
         &self,
-        all: impl Fn(&ClientId) -> bool,
+        kind: impl Fn(&ClientId) -> bool,
     ) -> (Vec<TopicFilter>, Vec<TopicFilter>) {
-        let mut rest = Vec::new();
-        let mut every = Vec::new();
+        let mut other = Vec::new();
+        let mut of_kind = Vec::new();
         for (filter, clients) in &self.by_filter {
-            if clients.iter().all(&all) {
-                every.push(String::from(&**filter));
-            } else {
-                rest.push(String::from(&**filter));
+            if clients.iter().any(|c| !kind(c)) {
+                other.push(String::from(&**filter));
+            }
+            if clients.iter().any(&kind) {
+                of_kind.push(String::from(&**filter));
             }
         }
-        (rest, every)
+        (other, of_kind)
     }
 
     /// Number of distinct topic filters currently registered.
@@ -228,7 +231,7 @@ mod tests {
     }
 
     #[test]
-    fn counts_one_clients_matching_filters_and_splits_filters_by_their_subscribers() {
+    fn counts_one_clients_matching_filters_and_lists_filters_by_their_holders_kinds() {
         let mut t = SubscriptionTable::new();
         for (c, f) in [
             ("a", "x/#"),
@@ -244,15 +247,15 @@ mod tests {
         assert_eq!(t.matching_filter_count_of(&cid("c"), "x/1"), 0);
         assert_eq!(t.matching_filter_count_of(&cid("c"), "y"), 1);
 
-        let (mut rest, mut every) = t.filters_split(|c| c.as_str() != "c");
-        rest.sort();
-        every.sort();
-        assert_eq!(every, vec!["x/#".to_string(), "x/+".to_string()]);
+        let (mut other, mut of_kind) = t.filters_by_kind(|c| c.as_str() != "c");
+        other.sort();
+        of_kind.sort();
         assert_eq!(
-            rest,
-            vec!["y".to_string()],
-            "one subscriber that fails puts it here"
+            of_kind,
+            vec!["x/#".to_string(), "x/+".to_string(), "y".to_string()],
+            "b holds y: at least one of the kind"
         );
+        assert_eq!(other, vec!["y".to_string()], "c holds y too: in both");
     }
 
     #[test]

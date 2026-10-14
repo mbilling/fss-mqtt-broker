@@ -496,7 +496,7 @@ async fn a_snapshot_from_a_replaced_link_does_not_open_the_new_one() {
         node: node.clone(),
         conn_id: Some(conn_id),
         filters: vec!["t/#".to_string()],
-        lease_owned: None,
+        kinds: None,
     };
     let membership = |conn_id| HubCommand::RemoteSharedInterest {
         node: node.clone(),

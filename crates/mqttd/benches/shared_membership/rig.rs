@@ -232,7 +232,7 @@ impl Rig {
                         node: node.clone(),
                         conn_id: None,
                         filters: vec![],
-                        lease_owned: None,
+                        kinds: None,
                     })
                     .unwrap();
             }
