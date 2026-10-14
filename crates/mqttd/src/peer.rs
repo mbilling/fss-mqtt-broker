@@ -1779,7 +1779,7 @@ fn forward_inbound(
                 node: remote.clone(),
                 conn_id: Some(conn_id),
                 filters,
-                lease_owned: Vec::new(),
+                lease_owned: None,
             });
         }
         PeerMessage::InterestKinds {
@@ -1787,6 +1787,7 @@ fn forward_inbound(
             lease_owned,
         } => {
             node_bound.extend(lease_owned.iter().cloned());
+            let lease_owned = Some(lease_owned);
             let _ = hub.send(HubCommand::RemoteInterest {
                 node: remote.clone(),
                 conn_id: Some(conn_id),
@@ -2561,7 +2562,7 @@ mod tests {
         };
         assert_eq!((node, conn_id), (remote.clone(), Some(7)));
         assert_eq!(filters, ["clean/#", "durable/#"]);
-        assert_eq!(lease_owned, ["durable/#"]);
+        assert_eq!(lease_owned.as_deref(), Some(&["durable/#".to_string()][..]));
 
         forward(PeerMessage::Interest {
             filters: vec!["durable/#".into()],
@@ -2569,7 +2570,7 @@ mod tests {
         assert!(matches!(
             rx.try_recv(),
             Ok(HubCommand::RemoteInterest { filters, lease_owned, .. })
-                if filters == ["durable/#"] && lease_owned.is_empty()
+                if filters == ["durable/#"] && lease_owned.is_none()
         ));
     }
 

@@ -1015,7 +1015,8 @@ pub enum PeerMessage {
     /// that lives and dies with the sender holds (a clean session; any session
     /// without a durable plane): only the sender can answer for it, or the
     /// confirmation that it is gone. The two are disjoint, and their union is what
-    /// `Interest` would carry.
+    /// `Interest` would carry; a receiver takes a filter found in both as
+    /// lease-owned, and ignores the kinds of one that arrives on a link below 15.
     ///
     /// Sent instead of `Interest`, on the same triggers, by a node with a durable
     /// plane on a link that negotiated proto ≥ 15. `Interest` itself means every

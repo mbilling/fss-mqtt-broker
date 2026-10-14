@@ -764,46 +764,85 @@ that negotiated 15. *(O2 decided 2026-10-14: in the first cut.)*
   `node_bound` every other. A node with a durable plane sends it on a link that
   negotiated 15; a node without one has no lease-owned interest and keeps sending
   `Interest`, so a plain cluster's frames are byte for byte proto 14's. `Interest` is
-  read as every filter node-bound.
+  read as interest whose kinds are not known: no filter is lease-owned. A filter found
+  in both lists is taken as lease-owned (no build sends that: the lists are disjoint
+  by construction). A node re-announces when a session's kind changes without its
+  filters changing (a persistent session resumed with expiry 0, or the reverse).
 - *Where the kind is kept.* The interest index keeps each node's lease-owned filters in
   a second table beside the first. The publish path walks the first, as before; the
   second is asked only about a publish owed to a node that cannot be reached.
-- *What discharges a forward owed to a node held dead* (`discharge_owner_bound`), all
-  of: every filter of the node's that matches the topic is lease-owned; the committed
-  lease map this node was last pushed names the node for no group — the lease plane has
-  moved its sessions (read unfiltered by liveness: a node held dead still owns what the
-  plane has not moved, so a false verdict at a node that does not lead the lease group,
-  or a partition the plane did not act on, discharges nothing); and another node that
-  announces lease-owned interest for the topic has answered the publish, or the publish
-  was handed to a persistent session on this node (this node took the session over).
-  Whoever was sent what: the new owner's answer counts whether the publish reached it
-  in the fan-out or as a re-route when it announced the session. The re-route itself
-  no longer discharges anything (it did, on the topic alone, since before this record).
+- *What discharges a forward owed to a node held dead* (`discharge_owner_bound`) — only
+  evidence that the owner of the session that MOVED has the publish. All of:
+  - every filter of the dead node's that matches the topic is lease-owned (a node
+    confirmed gone is owed nothing else, below);
+  - the takeover of its groups is over as this node can see it: the committed lease
+    map this node was last pushed names the dead node for no group (read unfiltered by
+    liveness: a node held dead still owns what the plane has not moved, so a false
+    verdict at a node that does not lead the lease group, or a partition the plane did
+    not act on, discharges nothing), the session sweep has seen that map and opened
+    the takeover window a move opens, and this node's routing view has settled;
+  - EVERY node that now holds a lease the dead node held — its *heirs*, from the moves
+    this node saw (`lease_heirs`: the last four holders of each group) — has answered a
+    re-route of the publish sent to it AFTER that, as the owner's question
+    (`ask_the_heirs`; flagged as a re-route, so a session already holding it skips it,
+    #784): sent whether or not the heir was sent the publish before and whether or not
+    it announces the topic. If this node is an heir, it has run a settle pass for the
+    publish since its own takeover was over. One heir took the session over and has
+    the publish; the others say they have no such session.
+  An answer to the original fan-out is not evidence: an heir with a durable session
+  of its own on an overlapping filter answers it at once, before it has taken the
+  dead node's session over (the review of PR #1025, which found the first cut of this
+  task discharging on exactly that). Without evidence the publish stays held.
+- *The heir's side.* A node does not apply, or answer, a re-route while it cannot say
+  who is on it — before its first complete scan, or with a durable plane while a
+  takeover window is open or a scan is in flight (`cannot_say_who_is_here`): a session
+  taken over a moment later would not have it. The origin sends it again every sweep,
+  and it is applied once the node can say. A re-route that then matches nobody is
+  answered `Stored` ("no such session here") rather than `Failed`, and raises no
+  `$events/message/dropped`. This is local behaviour, no wire change; an older build
+  answers at once, which is why its answer is not taken before confirmation (below).
 - *The countdown is gone*, in durable mode as in plain: a hold ends when the node
-  answers, the verdict is withdrawn, the committed owner answers (above), or the node
-  is confirmed gone.
-- *At confirmation* (D2's durable row) a forward for lease-owned interest is not
-  resolved: the node's routing state is erased and the forward stays owed
-  (`VerdictHold::Gone`), to be discharged by the new owner's answer, or — once the
-  lease plane has moved the node's groups, the session sweep has seen the move and
-  opened its takeover window, and this node's routing view has settled with nobody
-  announcing the interest — resolved and counted `peer-gone`. While the lease plane
-  still names the node (no quorum moved it) it stays held.
+  answers, the verdict is withdrawn, its heirs answer (above), or the node is
+  confirmed gone.
+- *At confirmation* (D2's durable row) a forward for lease-owned interest — or for any
+  interest of a node whose kinds are not known (O5, below) — is not resolved: the
+  node's routing state is erased and the forward stays owed (`VerdictHold::Gone`) to
+  the heirs, discharged by their answers as above. It is never sent to the node again
+  once the lease plane has moved its groups: a new generation of the node, linked and
+  `Alive`, is not the owner of sessions whose leases moved, and its `Stored` would say
+  nothing about them; if the lease plane gives it its leases back, it is their owner
+  again and the forward goes out on its link. When the leases moved where this node
+  did not see them move (it started since), no heir can be told apart, and the
+  forward is resolved and counted `peer-gone` once the view has settled. While the
+  lease plane still names the node (no quorum moved it) it stays held.
+- *How long a durable session's publisher is held.* For the failover pause when the
+  owner really died: the lease move, then the heirs' and this node's takeover windows
+  (eight sweep ticks each, armed by the same move), then one answer. **Unbounded but
+  for the pending table (D3)** while the lease plane cannot move the dead node's
+  groups, while an heir is itself out of reach, or while this node's routing view
+  stays unsettled (`routing_unsettled()`: a member without a link keeps it so); the
+  heir's side likewise defers for as long as it cannot say who is on it. The cost of
+  the rule is a longer hold, never an acknowledgement without delivery.
 - *Mixed versions (O5).* A peer behind a link below 15 — a 1.2.0-era build (14) or
-  v1.1.0 (12) — sends `Interest`, so its interest is node-bound: what it is owed waits
-  for it or for confirmation, and its answer is never taken for a durable session's
-  owner's. A durable failover of such a node therefore holds its publishers until
-  confirmation (30 s) instead of the failover pause, during the roll only; nothing
-  acknowledged is lost on a mixed link that was not lost between two proto-15 nodes.
+  v1.1.0 (12) — sends `Interest` (kinds a link below 15 might carry are ignored), so
+  its kinds are not known: what it is owed waits for it or for confirmation, and is
+  then kept for its heirs as above, not acknowledged. An heir behind such a link is
+  not asked, and its answer not taken, before the dead node is confirmed gone; after
+  it, it is — it has had `dead_ttl` to take its sessions over. A durable failover
+  involving an older node therefore holds its publishers until confirmation (30 s)
+  instead of the failover pause, during the roll only.
 - *Measured* (`false_dead_delivery.rs`, three nodes, loopback). A follower holds B dead
   with the link cut: a clean session's publish is held through 12 s — past the old
-  countdown — and answered 0.9 s after the confirmation, counted `peer-gone` (it was
+  countdown — and answered 1.0 s after the confirmation, counted `peer-gone` (it was
   acknowledged at 8 s, undelivered, `hold-expired`); a durable session's beside it is
   held past the confirmation and, B being alive, delivered and acknowledged when its
-  link returns. The leader holds B dead and moves its groups: the durable session's
-  publish is stored by the new owner and acknowledged 4.0 s after the verdict, the
-  clean session's beside it 1.0 s after the confirmation, and only the clean one is
-  counted.
+  link returns. The leader holds B dead and moves its groups to C, which also has a
+  durable session of its own on an overlapping filter and answers the fan-out at
+  once: the durable session's publish is acknowledged 11.0 s after the verdict, when
+  C has answered as the heir after its takeover, and is received when the session
+  resumes on C; the clean session's beside it is answered after the confirmation, and
+  only it is counted. (The first cut of this task acknowledged the durable one at
+  4.0 s, on an answer that did not show C had it.)
 
 ### D9 — Observability
 
@@ -1125,26 +1164,27 @@ partition longer than eight sweep ticks acknowledged undelivered — is closed: 
 publish is held until confirmation and then counted `peer-gone`
 (`durable_a_peer_out_of_reach_holds_a_clean_session_to_confirmation_and_a_durable_one_past_it`
 replaces `durable_a_peer_out_of_reach_is_answered_at_the_countdown_and_counted`). A
-durable failover still holds its publishers for the failover pause, now by the new
-owner's answer for interest the lease plane owns rather than by a countdown that ended
-every kind of hold alike.
+durable failover still holds its publishers for the failover pause — longer than before
+(11 s against 4 s in the episode): until every node that took over one of the dead
+owner's leases has answered for the publish after its own takeover, rather than until a
+countdown that ended every kind of hold alike.
 
 What is left, stated rather than hidden:
 
-- *The answer is matched on the topic and the kind, not on the session.* A node that
-  announces lease-owned interest for the topic and answers the publish discharges what
-  the dead owner was owed once the lease plane has moved the dead owner's groups —
-  whether or not it is the owner of THAT session. When the dead owner's session moved
-  to a node that has not yet taken it over, while another node with a durable session
-  on the same filter has already answered, the moved session misses the publish unless
-  this node's takeover window re-routes it there (the re-route of exhibit ⑥, flagged so
-  a session already holding it skips it) — the race §3's leader column showed before
-  this record, now narrowed to durable interest after the lease has moved. A clean
-  session is never discharged this way.
+- *The heirs are the nodes this node saw take the dead node's leases.* A move it did not
+  see (it restarted since) leaves no heirs to ask, and the publish is then resolved at
+  confirmation once the view has settled, and counted `peer-gone`. Each group remembers
+  its last four holders, so a lease that moved five times while a publish was held is
+  not traced.
+- *"Over" is each node's own takeover window.* An heir answers once its window is
+  closed and its scan has landed; a session its scan did not materialise by then (a
+  store read that failed and is retried) misses the publish. That is the takeover
+  path's own definition of done (exhibit ⑥), not a new one.
 - *A node confirmed gone whose groups the lease plane cannot move* keeps its durable
   sessions' publishers held for as long as that lasts: a write without a quorum is not
-  acknowledged (D2's durable row). The pending table is the bound (D3).
+  acknowledged (D2's durable row). So does an heir that never answers. The pending
+  table is the bound (D3).
 - *During a roll* a durable owner's death behind a link below 15 holds its publishers
-  until confirmation (O5).
+  until confirmation and then until its heirs answer (O5).
 - *The hot path* is unchanged by inspection (the publish walks one table, as before);
   D10's re-measurement is T9's.

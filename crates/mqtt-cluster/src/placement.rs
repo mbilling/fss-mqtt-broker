@@ -707,6 +707,14 @@ impl Placement {
         (!self.lease_owners.is_empty()).then(|| self.lease_owners.values().any(|h| h == node))
     }
 
+    /// The committed lease map as last pushed — `group -> holder`, unfiltered by
+    /// liveness (see [`holds_a_lease`](Self::holds_a_lease)). Bounded by
+    /// [`NUM_GROUPS`].
+    #[must_use]
+    pub fn committed_lease_map(&self) -> BTreeMap<GroupId, NodeId> {
+        self.lease_owners.clone()
+    }
+
     /// The current lease voter set as seen by this ring (ADR 0049) — empty until
     /// the durable driver has pushed it. Exposed so ownership convergence can be
     /// observed (tests, diagnostics).

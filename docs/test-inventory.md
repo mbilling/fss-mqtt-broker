@@ -1456,7 +1456,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 833 test(s)
+## `crates/mqttd/src/lib.rs` — 836 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1690,8 +1690,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::pending_bounds::the_entry_cap_evicts_only_the_oldest`
 - `hub::forwarding::pending_bounds::the_reached_record_is_charged_and_released_with_its_entry`
 - `hub::forwarding::pending_bounds::the_sweep_retransmits_only_overdue_forwards`
+- `hub::forwarding::zone_fwd_proofs::a_dead_peer_without_kinds_is_answered_for_by_its_heirs_not_by_its_confirmation`
 - `hub::forwarding::zone_fwd_proofs::a_durable_session_that_materialises_here_discharges_what_its_dead_owner_was_owed`
-- `hub::forwarding::zone_fwd_proofs::a_durable_sessions_forward_outlives_its_owners_confirmation_until_an_owner_answers`
+- `hub::forwarding::zone_fwd_proofs::a_durable_sessions_forward_outlives_its_owners_confirmation_until_an_heir_answers`
 - `hub::forwarding::zone_fwd_proofs::a_forward_unanswered_when_its_target_is_declared_dead_stays_owed_until_the_peer_answers`
 - `hub::forwarding::zone_fwd_proofs::a_hold_at_the_pending_table_bound_evicts_the_oldest_and_withholds_its_ack`
 - `hub::forwarding::zone_fwd_proofs::a_link_to_a_peer_confirmed_gone_that_stays_up_is_dropped_after_the_countdown`
@@ -1715,12 +1716,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::zone_fwd_proofs::an_already_answered_victim_is_not_counted_as_a_withheld_ack`
 - `hub::forwarding::zone_fwd_proofs::closing_the_window_clears_both_holds_and_acks`
 - `hub::forwarding::zone_fwd_proofs::every_exit_from_the_fan_out_restores_the_buffer`
+- `hub::forwarding::zone_fwd_proofs::every_heir_must_answer_after_the_move_and_a_fan_out_answer_is_not_one`
 - `hub::forwarding::zone_fwd_proofs::interest_carries_its_kinds_on_a_proto_15_link_and_only_there`
+- `hub::forwarding::zone_fwd_proofs::only_the_lease_heirs_answer_after_the_move_discharges_a_dead_owners_forward`
 - `hub::forwarding::zone_fwd_proofs::qos0_for_a_peer_with_no_link_is_counted_peer_unreachable`
 - `hub::forwarding::zone_fwd_proofs::releasing_the_ack_hold_does_not_shrink_the_settle_work_set`
 - `hub::forwarding::zone_fwd_proofs::the_ack_hold_clear_is_one_way_and_narrow`
 - `hub::forwarding::zone_fwd_proofs::the_answer_is_at_most_once`
-- `hub::forwarding::zone_fwd_proofs::the_committed_owners_answer_discharges_only_what_the_lease_plane_owns`
 - `hub::forwarding::zone_fwd_proofs::the_drain_barrier_reports_the_drain_gated_publishes_the_bound_evicted`
 - `hub::forwarding::zone_fwd_proofs::the_early_return_does_not_change_who_receives_a_publish`
 - `hub::forwarding::zone_fwd_proofs::the_early_return_never_swallows_a_retained_broadcast`
@@ -1997,6 +1999,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::settle_gate::a_held_publish_is_re_delivered_to_a_materialised_session_once_not_per_pass`
 - `hub::tests::settle_gate::a_new_persistent_session_created_after_a_held_publish_is_not_handed_it`
 - `hub::tests::settle_gate::a_proto_11_peer_gets_the_untagged_forward_and_an_untagged_replay_still_delivers`
+- `hub::tests::settle_gate::a_re_route_waits_until_the_receiver_can_say_who_is_here`
 - `hub::tests::settle_gate::a_rerouted_forward_skips_a_session_that_already_holds_the_publish`
 - `hub::tests::settle_gate::a_session_created_after_a_held_publish_is_not_handed_it`
 - `hub::tests::settle_gate::a_session_the_original_fan_out_reached_is_not_re_delivered_to`

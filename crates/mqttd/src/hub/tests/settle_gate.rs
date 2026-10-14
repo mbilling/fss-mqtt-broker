@@ -508,7 +508,7 @@ async fn an_early_acked_publish_still_re_routes_to_a_peer_that_advertises_intere
         node: NodeId("successor".into()),
         conn_id: Some(1),
         filters: Vec::new(),
-        lease_owned: Vec::new(),
+        lease_owned: None,
     })
     .await;
 
@@ -526,7 +526,7 @@ async fn an_early_acked_publish_still_re_routes_to_a_peer_that_advertises_intere
         node: NodeId("successor".into()),
         conn_id: None,
         filters: vec!["settle/r".into()],
-        lease_owned: Vec::new(),
+        lease_owned: None,
     })
     .await;
     assert!(
@@ -1114,7 +1114,9 @@ async fn a_settle_window_replay_skips_a_session_that_already_holds_the_publish()
 async fn a_rerouted_forward_skips_a_session_that_already_holds_the_publish() {
     let mut fix = clustered_fixture();
     fix.store_only_session("keeper", "q/#").await;
-    fix.scan_lands(&["keeper"], false).await;
+    // A COMPLETE scan: a node that cannot yet say who is on it defers a re-route
+    // (ADR 0087 D8 — see `a_re_route_waits_until_the_receiver_can_say_who_is_here`).
+    fix.scan_lands(&["keeper"], true).await;
     plant_held_copy(&fix, "keeper", "q/1", "origin-node", 41).await;
 
     let forward =
@@ -1158,6 +1160,66 @@ async fn a_rerouted_forward_skips_a_session_that_already_holds_the_publish() {
     assert_eq!(fix.queued("keeper").await.len(), 3);
 }
 
+/// ADR 0087 D8: a re-route is how a durable session's new owner is asked for what
+/// its dead owner was owed, and its answer stands for that owner's. So a node that
+/// cannot yet say who is on it — here, before its first complete scan — neither
+/// applies nor answers one (the origin sends it again every sweep), and applies and
+/// answers it once it can: the session taken over in between has it. A FIRST
+/// delivery is applied as ever.
+#[tokio::test]
+async fn a_re_route_waits_until_the_receiver_can_say_who_is_here() {
+    let mut fix = clustered_fixture();
+    let (peer_tx, mut origin) = mpsc::unbounded_channel();
+    fix.hub.peer_connected(
+        NodeId("origin-node".into()),
+        1,
+        peer_tx.clone(),
+        peer_tx,
+        None,
+        mqtt_cluster::peer::PROTO_MAX,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    );
+    fix.store_only_session("moved", "q/#").await;
+    let forward = |seq: u64, replay: bool| HubCommand::RemotePublishAcked {
+        node: NodeId("origin-node".into()),
+        seq,
+        topic: "q/1".into(),
+        payload: Bytes::from_static(b"settle-gate"),
+        qos: QoS::AtLeastOnce,
+        retain: false,
+        message_expiry: None,
+        app: AppProperties::default(),
+        origin: Some(7),
+        replay,
+    };
+    let verdicts = |rx: &mut mpsc::UnboundedReceiver<PeerMessage>| {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|f| match f {
+                PeerMessage::PublishVerdict { seq, verdict } => Some((seq, verdict)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        fix.hub.cannot_say_who_is_here(),
+        "fixture: before the first scan"
+    );
+    fix.dispatch(forward(1, true)).await;
+    assert_eq!(verdicts(&mut origin), [], "deferred: neither answered");
+    assert!(fix.queued("moved").await.is_empty(), "nor applied");
+
+    fix.scan_lands(&["moved"], true).await;
+    assert!(!fix.hub.cannot_say_who_is_here());
+    fix.dispatch(forward(1, true)).await;
+    quiesce(&mut fix.hub).await;
+    assert_eq!(
+        verdicts(&mut origin),
+        [(1, ForwardVerdict::Reached)],
+        "the origin's retransmission is applied, and answered for the session taken over"
+    );
+    assert_eq!(fix.queued("moved").await.len(), 1);
+}
+
 /// **#784, mixed versions.** A proto-11 peer cannot carry the publish's identity, so
 /// it is sent the untagged `PublishAcked`, and an untagged forward arriving here is
 /// stored as before — no check, no tag. The upgrade window therefore keeps today's
@@ -1182,7 +1244,7 @@ async fn a_proto_11_peer_gets_the_untagged_forward_and_an_untagged_replay_still_
         node: NodeId("old-peer".into()),
         conn_id: None,
         filters: vec!["q/#".into()],
-        lease_owned: Vec::new(),
+        lease_owned: None,
     })
     .await;
     let _ack = fix.publish_gated("q/1").await;

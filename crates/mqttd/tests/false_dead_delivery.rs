@@ -2787,15 +2787,24 @@ async fn durable_a_peer_out_of_reach_holds_a_clean_session_to_confirmation_and_a
     );
 }
 
+/// When the failover episode confirms B gone: past the failover pause — the lease
+/// moved, the new owner's takeover window and this node's both closed, and the new
+/// owner asked — with room, so that the durable publish is answered without it.
+const FAILOVER_UNCONFIRMED_FOR: Duration = Duration::from_secs(20);
+
 /// 0087-T5's acceptance (ADR 0087 D8), and the regression guard for the failover
 /// pause. A, the lease group's leader, holds B dead and cannot reach it — as when B
 /// has really died — so A reassigns B's groups and the session's new owner takes it
 /// over. Two publishes are made at the verdict, both owed to B and held:
 ///
 /// - `offline`, for B's (offline) durable session: when the new owner announces the
-///   session's filter — as interest the lease plane owns — it is re-routed there and
-///   stored, and that answer acknowledges the publisher, within the failover pause
-///   and long before B is confirmed gone; nothing is counted undeliverable;
+///   session's filter it is re-routed there; once the move is over as A sees it,
+///   C — the heir of B's leases — is asked as such and answers after its own
+///   takeover window, and that answer acknowledges the publisher, within the
+///   failover pause and before B is confirmed gone; nothing is counted
+///   undeliverable. C also has a durable session of its own on an overlapping
+///   filter, so it answered the publish at once in the fan-out — before it had B's
+///   session — and that answer alone acknowledges nothing (the review of PR #1025);
 /// - `clean`, for a clean session on B: no new owner answers for it, so it is held
 ///   until membership confirms B gone, then acknowledged and counted `peer-gone`.
 ///
@@ -2812,7 +2821,14 @@ async fn durable_an_owner_that_dies_holds_its_publishers_for_the_failover_not_fo
         On::A,
         "fd/off",
         q1,
-        vec![Sub::connect(&cluster, On::B, "sub-off", false, "fd/off/#", q1).await],
+        vec![
+            Sub::connect(&cluster, On::B, "sub-off", false, "fd/off/#", q1).await,
+            // A durable session of the bystander's own on an overlapping filter: C
+            // answers every publish for `fd/off/...` at once, before it has taken
+            // B's session over — and that answer must not stand for B's session
+            // (the review of PR #1025).
+            Sub::connect(&cluster, On::C, "sub-off-c", false, "fd/off/+", q1).await,
+        ],
     )
     .await;
     let mut clean = Flow::new(
@@ -2841,7 +2857,7 @@ async fn durable_an_owner_that_dies_holds_its_publishers_for_the_failover_not_fo
         // SETTLE(failover-then-confirmation): not a wait for a state — the time IS the
         // stimulus: the durable publish must be answered without it, the clean one
         // only with it.
-        tokio::time::sleep(UNCONFIRMED_FOR).await;
+        tokio::time::sleep(FAILOVER_UNCONFIRMED_FOR).await;
         cluster.confirm_b_gone_on_a().await
     };
     let (answer, clean_answer, gone_at) = tokio::join!(
@@ -2869,7 +2885,7 @@ async fn durable_an_owner_that_dies_holds_its_publishers_for_the_failover_not_fo
     assert!(answer.acked_ok(), "acknowledged: {answer:?}");
     let held = held.expect("acknowledged");
     assert!(
-        held < Duration::from_secs(20) && acked_at.expect("acknowledged") < gone_at,
+        held < FAILOVER_UNCONFIRMED_FOR && acked_at.expect("acknowledged") < gone_at,
         "a durable failover holds a publisher for the failover pause, not until the \
          owner is confirmed gone: held {held:?}"
     );
