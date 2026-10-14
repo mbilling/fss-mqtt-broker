@@ -103,9 +103,22 @@ free_port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0)
 # ─────────────────────────────────────────────────────────────────────────────────
 echo "── 1. the shipped mint runs, and self-verifies ──"
 PKI="$WORK/pki"
-RELEASE="$RELEASE" NS="$NS" REPLICAS="$REPLICAS" PKI_DIR="$PKI" \
+# ADR 0088 D1: the lifetime of what is minted is stated by whoever deploys, and there is no
+# default. Without it the mint must refuse, name the variable, and leave NOTHING behind.
+if env -u LEAF_DAYS RELEASE="$RELEASE" NS="$NS" REPLICAS="$REPLICAS" PKI_DIR="$PKI" \
+     bash "$BOOTSTRAP" --mint-only >"$WORK/refuse.log" 2>&1; then
+  cat "$WORK/refuse.log"; fail "$BOOTSTRAP minted certificates with no lifetime stated"
+fi
+grep -q 'LEAF_DAYS' "$WORK/refuse.log" \
+  || { cat "$WORK/refuse.log"; fail "$BOOTSTRAP refused without a lifetime but did not name LEAF_DAYS"; }
+[ ! -e "$PKI" ] || fail "$BOOTSTRAP refused without a lifetime and still wrote $PKI"
+pass "the shipped mint refuses without a stated lifetime, and writes nothing"
+
+LEAF_DAYS=2 RELEASE="$RELEASE" NS="$NS" REPLICAS="$REPLICAS" PKI_DIR="$PKI" \
   bash "$BOOTSTRAP" --mint-only >"$WORK/mint.log" 2>&1 \
   || { cat "$WORK/mint.log"; fail "$BOOTSTRAP could not mint a conforming PKI"; }
+grep -q 'RENEW BY' "$WORK/mint.log" \
+  || { cat "$WORK/mint.log"; fail "$BOOTSTRAP minted leaves without printing the date to renew by"; }
 pass "$REPLICAS per-node leaves + a CA minted and read back (see $WORK/mint.log)"
 
 # The CA private key must never be among the files that go into the cluster. The mint keeps
@@ -120,10 +133,11 @@ done
 pass "the CA private key stays in $PKI/ca and is not part of any node's material"
 
 # Re-running must RE-VERIFY and keep, never silently re-mint: a second CA is a second trust
-# root, and a rotated gossip key partitions a running cluster.
+# root, and a rotated gossip key partitions a running cluster. No LEAF_DAYS here on purpose:
+# a run that mints nothing has no lifetime to state.
 KEY_BEFORE="$(cat "$PKI/gossip/swim-key")"
 CA_BEFORE="$(openssl x509 -in "$PKI/ca/cluster-ca.pem" -noout -serial)"
-RELEASE="$RELEASE" NS="$NS" REPLICAS="$REPLICAS" PKI_DIR="$PKI" \
+env -u LEAF_DAYS RELEASE="$RELEASE" NS="$NS" REPLICAS="$REPLICAS" PKI_DIR="$PKI" \
   bash "$BOOTSTRAP" --mint-only >"$WORK/mint2.log" 2>&1 \
   || { cat "$WORK/mint2.log"; fail "a second mint run failed against its own output"; }
 [ "$KEY_BEFORE" = "$(cat "$PKI/gossip/swim-key")" ] \
@@ -358,7 +372,7 @@ for ((i = 0; i < REPLICAS; i++)); do
   cp "$BADPKI/shared.key" "$BADPKI/nodes/$STS_NAME-$i.key"
 done
 # (a) the mint's verifier must refuse to bless it on a re-run, and say why.
-if RELEASE="$RELEASE" NS="$NS" REPLICAS="$REPLICAS" PKI_DIR="$BADPKI" \
+if LEAF_DAYS=2 RELEASE="$RELEASE" NS="$NS" REPLICAS="$REPLICAS" PKI_DIR="$BADPKI" \
      bash "$BOOTSTRAP" --mint-only >"$WORK/bad-mint.log" 2>&1; then
   fail "the mint BLESSED the #262 certificate on a re-run — a rejected artifact must never be reused"
 fi

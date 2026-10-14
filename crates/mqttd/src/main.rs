@@ -5389,11 +5389,32 @@ fn hash_password_cli() -> ! {
     }
 }
 
+/// What `--decommission` prints once the drain is complete (ADR 0088 D5). The drain hands
+/// the node's data over; it does not end the node's credentials, and nothing else in the
+/// procedure does unless the operator is told. Printed on every completed drain, because
+/// this command cannot tell a node leaving for good from one being rolled (a Kubernetes
+/// `preStop` runs it for both) — so it says which case the step belongs to.
+#[cfg(unix)]
+const DECOMMISSION_LAST_STEP: [&str; 9] = [
+    "decommission: LAST STEP, if this node is leaving the cluster for good — revoke its certificate.",
+    "decommission:   The drain moved its data. Its cluster certificate is still valid until it",
+    "decommission:   expires, and whoever holds its key can still open a peer link with it.",
+    "decommission:   On the machine that holds the cluster CA:",
+    "decommission:     deploy/systemd/gen-certs.sh revoke <this node's id>",
+    "decommission:   (or your own CA's equivalent), then put the revocation list on every REMAINING",
+    "decommission:   node as cluster.peer_tls.crl (MQTTD_PEER_TLS_CRL). They reload it without a",
+    "decommission:   restart and refuse the node from then on. See docs/OPERATIONS.md,",
+    "decommission:   \"Removing a node for good\". A node that is only restarting needs none of this.",
+];
+
 /// `mqttd --decommission [--pid <n>] [--timeout <secs>]` (ADR 0047 T4): send `SIGUSR1` to the
 /// running broker to begin the ADR 0043 decommission drain (hand every held key to its
 /// post-departure replica set, verify, then leave gracefully), and **block until that process
 /// exits** so a Kubernetes `preStop` holds the pod open for the whole drain. The broker image is
 /// distroless (no shell, no `kill`), so this is how the `preStop` hook reaches it.
+///
+/// On a completed drain it ends by printing the step that is the operator's:
+/// revoking the departed node's certificate ([`DECOMMISSION_LAST_STEP`]).
 ///
 /// Target defaults to **PID 1** — the broker is the container entrypoint. Exit `0` when the
 /// broker exits (drain complete), `1` on timeout (`preStop` then yields to the grace period /
@@ -5422,6 +5443,9 @@ fn run_decommission() -> ! {
     loop {
         if broker_exited(raw_pid) {
             outln!("decommission: pid {raw_pid} exited — drain complete");
+            for line in DECOMMISSION_LAST_STEP {
+                outln!("{line}");
+            }
             std::process::exit(0);
         }
         if std::time::Instant::now() >= deadline {

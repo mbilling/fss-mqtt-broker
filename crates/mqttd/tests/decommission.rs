@@ -67,6 +67,21 @@ fn it_signals_the_target_and_waits_for_it_to_exit() {
         "decommission should exit 0 once the target drains; stdout was: {stdout}"
     );
     assert!(stdout.contains("drain complete"), "stdout was: {stdout}");
+    // ADR 0088 D5: the drain hands the data over and leaves the certificate valid, so the
+    // command ends by naming the step that is the operator's — after "drain complete",
+    // with the command and the setting the list goes under.
+    let (_, after) = stdout.split_once("drain complete").unwrap();
+    for needle in [
+        "LAST STEP",
+        "revoke its certificate",
+        "gen-certs.sh revoke",
+        "MQTTD_PEER_TLS_CRL",
+    ] {
+        assert!(
+            after.contains(needle),
+            "after a completed drain --decommission must end with the revoke step ({needle:?}); stdout was: {stdout}"
+        );
+    }
     // The target really did exit (reaped); nothing left running.
     let _ = target.wait();
 }

@@ -152,10 +152,41 @@ pub struct SecretRefs {
     /// key signs gossip). A new ordinal needs its own leaf before it can start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_tls: Option<String>,
+    /// ALTERNATIVE to `peerTls`: one certificate per pod from cert-manager's csi-driver,
+    /// mirroring the chart's `secrets.peerTls.certManager`. The operator renders the csi
+    /// volume with the attributes the bus needs (CN = the pod name, the pod's headless DNS
+    /// name as SAN, both EKUs, an ECDSA PKCS#8 key) and with the lifetime and renewal lead
+    /// stated here. No Secret holds every node's key. Ignored when `peerTls` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_tls_cert_manager: Option<PeerTlsCertManager>,
     /// Gossip key file (Secret with key `swim-key`). Setting this together with `peerTls`
     /// arms signed per-node gossip (ADR 0022).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gossip_key: Option<String>,
+}
+
+/// Per-pod cluster-bus certificates from cert-manager's csi-driver (ADR 0088 D1). The
+/// lifetime and the renewal lead are REQUIRED: how long a node's certificate lives is
+/// stated by whoever deploys the cluster, and neither has a default here.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerTlsCertManager {
+    /// The `Issuer` (or `ClusterIssuer`) that signs with the cluster CA.
+    pub issuer_name: String,
+    /// `Issuer` (the default) or `ClusterIssuer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer_kind: Option<String>,
+    /// The issuer's API group; `cert-manager.io` when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer_group: Option<String>,
+    /// The certificate's lifetime, as cert-manager's `duration` (a Go duration: `24h`).
+    /// Hours to a day is the aim: a certificate is good until it ends whether or not the
+    /// pod it names still exists. Expiry is strict.
+    pub duration: String,
+    /// How long before its end a certificate is renewed, as cert-manager's `renewBefore`.
+    /// Set it above a third of `duration` (`24h` -> `10h`): the broker warns once two
+    /// thirds of a lifetime is spent, which is exactly when cert-manager renews by default.
+    pub renew_before: String,
 }
 
 /// Per-pod persistent volume settings.

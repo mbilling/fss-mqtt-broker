@@ -67,10 +67,13 @@ Single-node deployments: verify none of the cluster binds are set and skip to §
 | H-4.3 | L1 | SWIM gossip keyed | `MQTTD_SWIM_KEY`/`MQTTD_SWIM_KEY_FILE`; unkeyed = `INSECURE` log | `grep "SWIM gossip is UNAUTHENTICATED" <log>` returns nothing |
 | H-4.4 | L2 | Signed gossip posture (per-node certs) | `MQTTD_SWIM_SIGNED` | `/statusz` shows the signed posture; a V1 datagram from a test sender is dropped (counted `auth`) |
 | H-4.5 | L2 | Anti-replay posture (signed **and** sequenced) | `MQTTD_SWIM_REPLAY` | `/statusz` posture; replayed datagram dropped (counted `replay`) |
-| H-4.6 | L2 | Peer-bus CRL configured and hot | `MQTTD_PEER_TLS_CRL` | revoke a node's cert, SIGHUP: its links drop without a broker restart |
+| H-4.6 | L2 | Peer-bus CRL configured **from deployment** (the path is read at startup; only the file is reloaded) and hot | `MQTTD_PEER_TLS_CRL`; `gen-certs.sh crl` issues the empty list | revoke a node's cert (`gen-certs.sh revoke <node>`), install the list, SIGHUP: its links drop without a broker restart |
 | H-4.7 | L2 | Kubernetes: per-pod peer keys (cert-manager csi-driver), not the starter one-Secret-for-all | deployment choice | `kubectl get secret` — no single secret holding every node's key |
 | H-4.8 | L2 | Refound guard on (split-brain containment) | `MQTTD_REFOUND_GUARD` (default on) | absent from config (default) or explicitly `true`; never `false` in production |
 | H-4.9 | L2 | Kubernetes: the cluster ports (7001, 7946, 9443) reachable only pod to pod, under an enforcing CNI | chart `networkPolicy.enabled` / CR `spec.networkPolicy` (default off) | `kubectl get networkpolicy`; a probe pod outside the release cannot connect to a pod's 7001 (the kind smoke does exactly this) |
+| H-4.10 | L1 | Node certificate lifetime **stated** at deployment, and renewal scheduled before two thirds of it; no path defaults it ([OPERATIONS](OPERATIONS.md#the-lifetime-is-stated-renewing-and-revoking-are-commands-adr-0088)) | `gen-certs.sh --lifetime`, `bootstrap.sh` `LEAF_DAYS`, chart `secrets.peerTls.certManager.duration`/`renewBefore`, CR `spec.secrets.peerTlsCertManager` | `mqttd --check-tls` on a node: the peer certificate's window is the one you stated, and under the threshold |
+| H-4.11 | L2 | Node certificates short-lived (hours to a day), renewed without a person | the lifetime above; cert-manager's csi-driver, or a timer running `gen-certs.sh renew` | `mqttd_tls_expiry_seconds{role="peer"}` never exceeds the stated lifetime and resets before the warning threshold |
+| H-4.12 | L1 | Decommissioning a node ends with revoking its certificate | `gen-certs.sh revoke <node>` after `mqttd --decommission` (which prints the step) | the departed node's serials are in the list every remaining node loads: `openssl crl -in <peer-crl.pem> -noout -text` |
 
 ## 5. Resource governance
 

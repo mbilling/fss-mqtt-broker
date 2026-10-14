@@ -164,6 +164,91 @@ A revocation list past its `nextUpdate` still loads and is enforced as it is; re
 published since are not in it. The gauges, the warning and the alerts change none of this:
 they report, and nothing is refused or ended because of them.
 
+## The lifetime is stated; renewing and revoking are commands (ADR 0088)
+
+How long a node's certificate lives is decided when the cluster is deployed, by whoever
+deploys it, and whoever operates the cluster renews before that ends. The broker issues
+nothing and has no setting for it; it reads the lifetime from the certificate. No path
+this repository ships has a default any more:
+
+| Path | Where the lifetime is stated | Without it | Renewal |
+|---|---|---|---|
+| systemd, bare metal (`deploy/systemd/gen-certs.sh`) | `--lifetime <N>h\|<N>d` on `node` and `renew` (`LEAF_LIFETIME`) | refuses, exit 2, nothing written | `gen-certs.sh renew`, a person or a timer |
+| Chart, starter PKI (`deploy/helm/mqttd/bootstrap.sh`) | `LEAF_DAYS=<days>` | refuses, exit 2, nothing written (a run that mints nothing needs none) | delete the leaf files, re-run |
+| Chart, cert-manager (`secrets.peerTls.certManager`) | `duration` and `renewBefore` | `helm` refuses to render | cert-manager's csi-driver, in place |
+| Operator (`spec.secrets.peerTlsCertManager`) | `duration` and `renewBefore`, required by the CRD | the API server rejects the object | cert-manager's csi-driver, in place |
+
+The compose packaging's one-shot (`deploy/compose/init.sh`, `CERT_DAYS`) is not in this
+table: it still mints with a default, for a cluster that lives on one host.
+
+Both scripts print, for what they minted, when it ends and the date to **renew by**: two
+thirds of the lifetime, which is the default of `tls.expiry_warn_permille` and so the
+moment the broker starts warning about the file (above). Set `RENEW_AT_PERMILLE` for the
+script if you changed the broker's threshold. The chart and the operator pass `duration`
+and `renewBefore` to cert-manager's csi-driver as `csi.cert-manager.io/duration` and
+`csi.cert-manager.io/renew-before`; set `renewBefore` above a third of `duration`, for the
+reason given above.
+
+**Short is the aim: hours to a day.** A certificate is good until it ends whether or not
+the node it names is still yours, and a short lifetime is what bounds that without anyone
+acting. It is also a renewal owed that often. Automate the renewal before choosing hours,
+and alert on the expiry gauges: expiry is strict, there is no grace period, and a missed
+renewal is a node (or a cluster) that is out until it is renewed.
+
+**Renewing** (systemd; on the admin machine that holds the CA key):
+
+```sh
+./gen-certs.sh renew --lifetime 24h mqttd-1     # same CN, same SANs, new keys
+# install the four leaf files it names over the old ones on mqttd-1, then:
+sudo systemctl reload mqttd                     # or the file watcher, if it is on
+mqttd --check-tls                               # the new window, as the broker reads it
+```
+
+The node serves the new certificate on its next handshake and signs its next gossip
+datagram with the new key, without a restart. A node on its new certificate and one on its
+old accept each other, so renew one node at a time, in any order. Established peer links
+are not re-made by a renewal. A node that was down past the end of its certificate is
+renewed the same way and stays out until the files are on it.
+
+### Removing a node for good
+
+1. **Drain it:** `mqttd --decommission` on the node (the chart's `preStop` runs it on a
+   scale-down). It hands the node's data to the others and stops the broker.
+2. **Update the others' seed lists** if they name it ([below](#seed-lists-automatic-on-kubernetes-yours-everywhere-else)).
+3. **Revoke its certificate.** The drain does not end the node's credentials: its
+   certificate is valid until it expires, and whoever holds its key can open a peer link
+   with it. `mqttd --decommission` prints this step when the drain completes.
+
+   ```sh
+   ./gen-certs.sh revoke mqttd-3      # on the admin machine; writes mqttd-pki/ca/peer-crl.pem
+   ```
+
+   Every certificate the CA issued to that node id goes on the cluster's revocation list.
+   Put the list on every **remaining** node as the file `cluster.peer_tls.crl`
+   (`MQTTD_PEER_TLS_CRL`) names and reload (`systemctl reload mqttd`, or the watcher). Each
+   node then ends the revoked node's established links, refuses its handshakes and drops
+   its gossip (`mqttd_gossip_rejected_total{reason="revoked"}`), without a restart.
+
+**Have the list configured before you need it.** `cluster.peer_tls.crl` is read at startup;
+only the file behind it is reloaded. A cluster deployed without it needs the setting and
+one rolling restart before its first revocation takes effect. `gen-certs.sh crl` issues the
+empty list to deploy with, and re-issues the current one with a fresh `nextUpdate` (30 days
+unless `--crl-lifetime` says otherwise; `mqttd_tls_expiry_seconds{role="peer_crl"}` and the
+script's own re-issue-by date tell you when).
+
+Revocation is also the only way to put a node out *before* its certificate ends: a lost
+host, a key that may have leaked. With lifetimes of hours it matters less, and it remains
+the last step.
+
+**On Kubernetes** nothing in this repository revokes a departed pod's certificate.
+cert-manager does not publish revocation lists, and the starter `bootstrap.sh` PKI has no
+revoke command. A scaled-down pod's certificate is bounded by its lifetime, which is the
+reason to state a short one there; a list from your own CA can be mounted and named with
+`MQTTD_PEER_TLS_CRL` through `extraEnv` and `extraVolumes`.
+
+`scripts/deploy-smoke.sh` runs the refusal, a renewal and a revocation against two running
+nodes on every CI run.
+
 ## Cluster-bus certificates — one per node, and why that is not negotiable
 
 The inter-node bus (`secrets.peerTls`) is **mutually authenticated per node**, so its
@@ -189,12 +274,15 @@ three of which fail at runtime rather than at issue time:
 `deploy/helm/mqttd/bootstrap.sh` mints all of this and **verifies every property it
 prints** before installing anything; the CA private key stays on your workstation and never
 enters the cluster. For production, cert-manager's csi-driver is the better path — it is the
-only option that also keeps each pod to its own key, and the chart supports it directly:
-mount the csi ephemeral volume via `extraVolumes`/`extraVolumeMounts` and set
-`secrets.peerTls.dir` to its mountPath (the chart then derives `MQTTD_PEER_TLS_*` from the
-csi layout `tls.crt`/`tls.key`/`ca.crt`; the annotated example is in `values.yaml`). The
-attributes that satisfy the bus's rules: `common-name: "${POD_NAME}"`,
-`key-algorithm: ECDSA`, `key-encoding: PKCS8`, `key-usages: "server auth,client auth"`.
+only option that also keeps each pod to its own key, and the chart renders it: set
+`secrets.peerTls.certManager.issuerName` with `duration` and `renewBefore` (both required;
+the operator's `spec.secrets.peerTlsCertManager` is the same three fields). The chart
+mounts the csi volume, derives `MQTTD_PEER_TLS_*` from its layout
+(`tls.crt`/`tls.key`/`ca.crt`) and sets the attributes that satisfy the bus's rules:
+`common-name: "${POD_NAME}"`, the pod's headless DNS name, `key-algorithm: ECDSA`,
+`key-encoding: PKCS8`, `key-usages: "server auth,client auth"`. A hand-written csi volume
+through `extraVolumes` with `secrets.peerTls.dir` still works; then `duration` and
+`renew-before` are yours to write.
 
 **Symptoms.** Pods running but never Ready, with `does not match its certificate Common
 Name` in the logs → a leaf's CN is not its pod name. A startup failure naming the *gossip
@@ -247,7 +335,8 @@ alertable equivalent).
 
 - **Up — mint the new nodes' certificates FIRST if the cluster bus is on.** A new ordinal is
   a new node id and a new DNS name, so it needs its own leaf (see *Cluster-bus certificates*
-  above). Run `REPLICAS=<n> ./deploy/helm/mqttd/bootstrap.sh` before raising the count: it
+  above). Run `LEAF_DAYS=<days> REPLICAS=<n> ./deploy/helm/mqttd/bootstrap.sh` before raising the count
+  (the lifetime of the new leaves is stated, there is no default): it
   re-verifies and keeps the existing CA, leaves and gossip key, mints only the new ordinals,
   and re-applies the Secret. A pod whose ordinal has no leaf fails its **init container**
   with a message naming that command, so the rollout stalls visibly at that ordinal instead
@@ -262,7 +351,8 @@ alertable equivalent).
   (`preStop` → SIGUSR1): the departing node hands every held key to the surviving
   replica set and verifies before exiting. Watch `/readyz` and the drain logs; then
   take the next step. Never drop below a durable quorum
-  (`lease_voters`, default 5 → keep ≥ 3 running).
+  (`lease_voters`, default 5 → keep ≥ 3 running). The drain does not end the departed
+  pod's certificate: see [Removing a node for good](#removing-a-node-for-good).
 - **Down and the write floor:** a *consented* decommission shrinks the quorum-committed
   durable roster, so the derived `durable.min_replicas` floor follows it down by itself —
   the common 3→2 and 5→3 shrinks need no action, and neither does 3→1 once the drain has
@@ -966,7 +1056,8 @@ Everything below runs from the `mqttd` binary itself, so it works in the distrol
 | More logging for 15 minutes | `mqttd --admin log-override 'mqttd::hub=debug' --ttl 900` |
 | What are the rules doing, and is the file on disk the one running? | `mqttd --admin rules` (`--json`: `digest`, `file_digest`) |
 | Change the rules on this node (a listed writer) | `mqttd --admin rules-apply rules.toml --if_match <digest>` |
-| Remove a node for good | `mqttd --decommission` |
+| Remove a node for good | `mqttd --decommission`, then revoke its certificate ([procedure](#removing-a-node-for-good)) |
+| Renew a node's certificate (systemd) | `gen-certs.sh renew --lifetime <N>h <node>`, install, `systemctl reload mqttd` |
 
 ## The admin API (ADR 0081)
 
@@ -1782,8 +1873,9 @@ OpenSSL-based brokers tolerated, so a migrating fleet otherwise discovers it by 
 
 Same procedures, different transport: rotation = replace the files (the watcher path
 is identical) or `kill -HUP`; decommission = `mqttd --decommission --timeout <secs>`
-or `kill -USR1` + wait for exit; the founder rule applies to whichever node you
-bootstrap with empty seeds.
+or `kill -USR1` + wait for exit, and it ends with `gen-certs.sh revoke <node>`
+([Removing a node for good](#removing-a-node-for-good)); the founder rule applies to
+whichever node you bootstrap with empty seeds.
 
 Standing a secured cluster up *outside* Kubernetes in the first place — three nodes
 with client TLS, the mutually-authenticated bus, a gossip key, deny-by-default ACLs
