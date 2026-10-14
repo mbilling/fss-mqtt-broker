@@ -120,8 +120,12 @@ mkdir -p obj
 
 for f in builtin bytecode compile execute jv jv_alloc jv_aux jv_dtoa jv_file jv_parse \
          jv_print jv_unicode linker locfile util jv_dtoa_tsd lexer parser; do
+  src="jqc/src/$f.c"
+  # The interpreter as it is, plus where a program's cancel flag lies (the host sets
+  # it at a deadline: execute_cancel.c).
+  [ "$f" = execute ] && src="$here/execute_cancel.c"
   # shellcheck disable=SC2086
-  cc "jq_$f" "jqc/src/$f.c" $defs -Igen -Igen/src -Ijqc -Ijqc/src -Ijqc/vendor -Ionig/src \
+  cc "jq_$f" "$src" $defs -Igen -Igen/src -Ijqc -Ijqc/src -Ijqc/vendor -Ionig/src \
      -include "$here/compat.h"
 done
 for f in decContext decNumber; do

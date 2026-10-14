@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::jq::{Pool, PoolStats, Tag};
-use crate::test_module::{module, Shape};
+use crate::test_module::{module, Shape, CANCEL_FLAG_AT, CANCEL_SLOT_AT};
 use crate::{
     Arg, CallError, Execution, Grants, HandOff, Limits, LoadError, Reply, Sandbox, ABI_VERSION,
 };
@@ -90,6 +90,146 @@ fn an_endless_loop_stops_at_the_deadline_and_poisons_only_its_instance() {
         next.call("t", &[], soon()),
         Ok(Reply::Json(b"true".to_vec()))
     );
+}
+
+/// The test module with its cancel slot as `cancel` says, under a grace no machine
+/// outlasts unless the host waits it out.
+fn cancellable(cancel: Option<(u32, u32)>, grace: Duration, execution: Execution) -> Sandbox {
+    let shape = Shape {
+        cancel,
+        ..Shape::default()
+    };
+    let limits = Limits {
+        cancel_grace: grace,
+        ..Limits::default()
+    };
+    Sandbox::load_as(&module(&shape), execution, limits, Grants::default())
+        .expect("the test module loads")
+}
+
+const ASKABLE: Option<(u32, u32)> = Some((CANCEL_SLOT_AT, CANCEL_FLAG_AT));
+
+/// What the deadline does is set a flag in the module's memory, where its slot says:
+/// no code of the module runs from the deadline (the runtime refuses that, inside a
+/// call), and a call that looks at the flag ends by itself with its own answer, its
+/// instance whole.
+#[test]
+fn a_call_asked_to_stop_ends_by_itself_and_keeps_its_instance() {
+    for execution in [Execution::Compiled, Execution::Interpreted] {
+        let sandbox = cancellable(ASKABLE, Duration::from_secs(30), execution);
+        let mut instance = sandbox.instantiate().unwrap();
+        for round in 0..3 {
+            let started = Instant::now();
+            let outcome = instance.call(
+                "cancellable",
+                &[],
+                Some(started + Duration::from_millis(20)),
+            );
+            let took = started.elapsed();
+            assert_eq!(
+                outcome,
+                Err(CallError::Module {
+                    status: 7,
+                    message: b"nope".to_vec()
+                }),
+                "{execution:?}, round {round}"
+            );
+            assert!(
+                took >= Duration::from_millis(20),
+                "{execution:?}: asked early, after {took:?}"
+            );
+            assert!(
+                took < Duration::from_secs(5),
+                "{execution:?}: the grace was waited out, {took:?}"
+            );
+            assert!(!instance.is_poisoned(), "{execution:?}");
+        }
+        assert_eq!(
+            instance.call("t", &[], soon()),
+            Ok(Reply::Json(b"true".to_vec()))
+        );
+    }
+}
+
+/// Without the slot there is nobody to ask: the call ends at its deadline, whatever
+/// the grace.
+#[test]
+fn a_module_without_a_cancel_slot_ends_at_its_deadline_whatever_the_grace() {
+    let mut instance = cancellable(None, Duration::from_secs(30), Execution::Compiled)
+        .instantiate()
+        .unwrap();
+    let started = Instant::now();
+    let outcome = instance.call(
+        "cancellable",
+        &[],
+        Some(started + Duration::from_millis(20)),
+    );
+    let took = started.elapsed();
+    assert_eq!(outcome, Err(CallError::Timeout));
+    assert!(
+        took < Duration::from_secs(5),
+        "the grace was given, {took:?}"
+    );
+    assert!(instance.is_poisoned());
+}
+
+/// A slot, or a flag address in it, that does not lie wholly inside the module's
+/// memory is the module's mistake or its malice: nothing is written, nothing panics,
+/// and the call ends at its deadline as if it could not be asked.
+#[test]
+fn a_cancel_slot_that_points_outside_memory_ends_the_call_at_its_deadline() {
+    let page = 65_536;
+    for cancel in [
+        (CANCEL_SLOT_AT, u32::MAX),
+        (CANCEL_SLOT_AT, u32::MAX - 3),
+        (CANCEL_SLOT_AT, page - 2),
+        (CANCEL_SLOT_AT, page),
+        (u32::MAX, CANCEL_FLAG_AT),
+        (page - 1, CANCEL_FLAG_AT),
+    ] {
+        let mut instance = cancellable(Some(cancel), Duration::from_secs(30), Execution::Compiled)
+            .instantiate()
+            .unwrap();
+        let before = instance.memory_bytes();
+        let started = Instant::now();
+        let outcome = instance.call(
+            "cancellable",
+            &[],
+            Some(started + Duration::from_millis(20)),
+        );
+        let took = started.elapsed();
+        assert_eq!(outcome, Err(CallError::Timeout), "{cancel:?}");
+        assert!(
+            took < Duration::from_secs(5),
+            "{cancel:?}: the grace was given, {took:?}"
+        );
+        assert!(instance.is_poisoned(), "{cancel:?}");
+        assert_eq!(instance.memory_bytes(), before, "{cancel:?}");
+    }
+}
+
+/// A slot holding 0 says there is nothing to ask right now: the call keeps its grace
+/// (it may yet reach a step that looks), and is ended when the grace is over.
+#[test]
+fn an_empty_cancel_slot_still_leaves_the_call_its_grace() {
+    let grace = Duration::from_millis(150);
+    let mut instance = cancellable(Some((CANCEL_SLOT_AT, 0)), grace, Execution::Compiled)
+        .instantiate()
+        .unwrap();
+    let started = Instant::now();
+    let deadline = Duration::from_millis(20);
+    let outcome = instance.call("cancellable", &[], Some(started + deadline));
+    let took = started.elapsed();
+    assert_eq!(outcome, Err(CallError::Timeout));
+    assert!(
+        took >= deadline + grace,
+        "the grace was cut short, {took:?}"
+    );
+    assert!(
+        took < Duration::from_secs(5),
+        "stopped late, after {took:?}"
+    );
+    assert!(instance.is_poisoned());
 }
 
 #[test]

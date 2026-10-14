@@ -66,12 +66,14 @@ fn name(text: &str, out: &mut Vec<u8>) {
 /// Functions 0 to 6 are imports: `clock_time_get`, `environ_sizes_get`,
 /// `environ_get`, `fd_fdstat_get`, `fd_read`, `fd_write`, `proc_exit`. Function 11 is
 /// `mqttd_call` itself. Memory holds `{}` at 16 and `jtrue` at 32; global 0 is the
-/// allocator's next address.
+/// allocator's next address. The cancel slot (function 12, `mqttd_cancel_slot`) is at
+/// address 0, which the body may fill with anything: the host follows whatever it
+/// holds at a deadline, and must stay inside the module's memory doing it.
 fn around(body: &[u8]) -> Vec<u8> {
     const I32: u8 = 0x7f;
     const I64: u8 = 0x7e;
     let mut out = b"\0asm\x01\0\0\0".to_vec();
-    let types: [(&[u8], &[u8]); 8] = [
+    let types: [(&[u8], &[u8]); 7] = [
         (&[], &[I32]),
         (&[I32], &[I32]),
         (&[I32], &[]),
@@ -79,7 +81,6 @@ fn around(body: &[u8]) -> Vec<u8> {
         (&[I32, I64, I32], &[I32]),
         (&[I32, I32], &[I32]),
         (&[I32; 4], &[I32]),
-        (&[], &[]),
     ];
     let mut s = vec![types.len() as u8];
     for (params, results) in types {
@@ -108,8 +109,8 @@ fn around(body: &[u8]) -> Vec<u8> {
     }
     section(2, &s, &mut out);
 
-    // version, alloc, free, describe, call, cancel
-    section(3, &[6, 0, 1, 2, 2, 3, 7], &mut out);
+    // version, alloc, free, describe, call, cancel slot
+    section(3, &[6, 0, 1, 2, 2, 3, 0], &mut out);
     section(5, &[1, 0, 1], &mut out); // one memory, one page, no maximum
     section(6, &[1, I32, 1, 0x41, 0x80, 0x08, 0x0b], &mut out); // global 0: mut i32 = 1024
 
@@ -120,7 +121,7 @@ fn around(body: &[u8]) -> Vec<u8> {
         ("mqttd_free", 0, 9),
         ("mqttd_describe", 0, 10),
         ("mqttd_call", 0, 11),
-        ("mqttd_cancel", 0, 12),
+        ("mqttd_cancel_slot", 0, 12),
     ];
     let mut s = vec![exports.len() as u8];
     for (export, kind, index) in exports {
@@ -142,7 +143,7 @@ fn around(body: &[u8]) -> Vec<u8> {
             0, 0x20, 0, 0x41, 16, 0x36, 2, 0, 0x20, 0, 0x41, 2, 0x36, 2, 4, 0x0b,
         ],
         &call,
-        &[0, 0x0b],
+        &[0, 0x41, 0, 0x0b], // the cancel slot: address 0
     ];
     let mut s = vec![functions.len() as u8];
     for function in functions {

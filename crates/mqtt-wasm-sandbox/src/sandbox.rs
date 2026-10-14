@@ -66,7 +66,8 @@ pub struct Limits {
     /// runs what is quick, as in EMQX.
     pub min_run: Duration,
     /// How long a call may still run after its deadline when the module can be asked
-    /// to stop (`mqttd_cancel`): the time it has to end by itself and stay usable.
+    /// to stop (it exports `mqttd_cancel_slot`): the time it has to end by itself and
+    /// stay usable.
     pub cancel_grace: Duration,
     /// The deadline of instantiation (data segments, constructors) and of the calls
     /// that read a module's description.
@@ -306,8 +307,9 @@ pub(crate) struct Host {
     /// The timer's registration for the running call: of `yield_at` while that is
     /// ahead, of `deadline` after.
     armed: Option<crate::timer::Armed>,
-    /// `mqttd_cancel`, when the module has it and has not been asked yet in this call.
-    cancel: Option<TypedFunc<(), ()>>,
+    /// The instance's memory and its cancel slot (`mqttd_cancel_slot`), when the module
+    /// has one and has not been asked yet in this call.
+    cancel: Option<(Memory, u32)>,
     cancel_grace: Duration,
 }
 
@@ -570,7 +572,12 @@ impl Sandbox {
         let call = instance
             .get_typed_func(&mut store, "mqttd_call")
             .map_err(export)?;
-        let cancel = instance.get_typed_func(&mut store, "mqttd_cancel").ok();
+        // Optional; when it is there it has to be the ABI's.
+        let cancel_slot = instance
+            .get_func(&mut store, "mqttd_cancel_slot")
+            .map(|func| func.typed::<(), u32>(&store))
+            .transpose()
+            .map_err(export)?;
         // A reactor's constructors (libc start-up), when it has them.
         let initialize = instance
             .get_typed_func::<(), ()>(&mut store, "_initialize")
@@ -581,7 +588,7 @@ impl Sandbox {
             free,
             describe,
             call,
-            cancel,
+            cancel_slot: None,
             memory,
             module: instance,
             store,
@@ -593,6 +600,14 @@ impl Sandbox {
         if let Some(initialize) = initialize {
             made.run(initialize, (), Some(within))
                 .map_err(LoadError::Start)?;
+        }
+        // Asked once, after the constructors and outside any other call: where the
+        // module keeps the address of the flag that asks its running call to stop.
+        if let Some(cancel_slot) = cancel_slot {
+            made.cancel_slot = Some(
+                made.run(cancel_slot, (), Some(within))
+                    .map_err(LoadError::Start)?,
+            );
         }
         Ok(made)
     }
@@ -665,6 +680,12 @@ fn classify(error: &wasmtime::Error) -> CallError {
 /// instance's deadline) is passed over. At this call's deadline a module that can be
 /// asked to stop is asked, once, and given the grace; after that the call is ended.
 ///
+/// Asking runs none of the module's code: this callback runs on the call's own stack,
+/// in the middle of the call, where the runtime refuses a call into the module (a
+/// blocking call from inside an asynchronous one, RUSTSEC-2026-0362). The module said
+/// where its flag is when the instance was made ([`ask_to_stop`]); the host sets it,
+/// as a signal handler would, and the module's code sees it at its next step.
+///
 /// Before that, a call with a [`HandOff`] is suspended once, when its first slice is
 /// used up: the runtime returns to whoever polls the call, which is [`on_fiber`].
 fn at_epoch(mut store: wasmtime::StoreContextMut<'_, Host>) -> wasmtime::Result<UpdateDeadline> {
@@ -688,26 +709,58 @@ fn at_epoch(mut store: wasmtime::StoreContextMut<'_, Host>) -> wasmtime::Result<
     if now < deadline {
         return Ok(UpdateDeadline::Continue(1));
     }
-    let Some(cancel) = host.cancel.take() else {
+    let Some((memory, slot)) = host.cancel.take() else {
         return Err(Stop::Timeout.into());
     };
     // The timer keeps ticking while this call is overdue: the first tick after the
     // grace ends it.
     host.deadline = Some(now + host.cancel_grace);
-    // `mqttd_cancel` is a call into the module like any other and would meet this
-    // same expired epoch at its first instruction: it gets its own, far away.
-    store.set_epoch_deadline(u64::MAX / 2);
-    cancel.call(&mut store, ()).map_err(|_| Stop::Timeout)?;
+    if !ask_to_stop(memory.data_mut(&mut store), slot) {
+        return Err(Stop::Timeout.into());
+    }
     Ok(UpdateDeadline::Continue(1))
 }
 
-/// Sets a store up for one call: its deadline with the timer, its `mqttd_cancel`, its
+/// Asks the running call to stop through the module's cancel slot: `slot` is the
+/// address of a little-endian u32 that holds the address of the flag (0: nothing to
+/// ask right now, which still leaves the call its grace), and the flag is set by
+/// storing the i32 1 there. Read at the deadline, never earlier: the module moves the
+/// flag as it goes. Whatever the module put there, nothing outside its memory is
+/// touched: an address that does not lie wholly inside it (`false`) ends the call
+/// now, as for a module that cannot be asked.
+fn ask_to_stop(memory: &mut [u8], slot: u32) -> bool {
+    let Some(flag) = word(memory, slot) else {
+        return false;
+    };
+    if flag == 0 {
+        return true;
+    }
+    let Some(cell) = cell(memory, flag) else {
+        return false;
+    };
+    cell.copy_from_slice(&1i32.to_le_bytes());
+    true
+}
+
+/// The four bytes at `at`, when they lie wholly inside `memory`.
+fn cell(memory: &mut [u8], at: u32) -> Option<&mut [u8]> {
+    let at = usize::try_from(at).ok()?;
+    memory.get_mut(at..at.checked_add(4)?)
+}
+
+/// The little-endian u32 at `at`, when it lies wholly inside `memory`.
+fn word(memory: &mut [u8], at: u32) -> Option<u32> {
+    let bytes = cell(memory, at)?;
+    Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+/// Sets a store up for one call: its deadline with the timer, its cancel slot, its
 /// fuel, and with `hand_off` the end of its first slice. [`disarm`] takes the call off
 /// the timer again.
 fn arm(
     store: &mut Store<Host>,
     deadline: Option<Instant>,
-    cancel: Option<&TypedFunc<(), ()>>,
+    cancel: Option<(Memory, u32)>,
     limits: &Limits,
     hand_off: bool,
 ) -> wasmtime::Result<()> {
@@ -722,7 +775,7 @@ fn arm(
     let host = store.data_mut();
     host.deadline = deadline;
     host.yield_at = yield_at;
-    host.cancel = cancel.cloned();
+    host.cancel = cancel;
     host.armed = Some(host.timer.arm(yield_at.or(deadline)));
     if let Some(fuel) = limits.max_fuel {
         store.set_fuel(fuel)?;
@@ -747,8 +800,8 @@ pub struct Instance {
     free: TypedFunc<u32, ()>,
     describe: TypedFunc<u32, ()>,
     call: TypedFunc<(u32, u32, u32, u32, u32, u32), i32>,
-    /// `mqttd_cancel`, when the module has it.
-    cancel: Option<TypedFunc<(), ()>>,
+    /// What `mqttd_cancel_slot` answered, when the module has it.
+    cancel_slot: Option<u32>,
     limits: Limits,
     hand_off: Option<HandOff>,
     poisoned: bool,
@@ -831,7 +884,7 @@ impl Instance {
         arm(
             &mut self.store,
             deadline,
-            self.cancel.as_ref(),
+            self.cancel_slot.map(|slot| (self.memory, slot)),
             &self.limits,
             self.hand_off.is_some(),
         )
