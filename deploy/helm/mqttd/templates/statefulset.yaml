@@ -249,7 +249,7 @@ spec:
               mountPath: {{ .Values.secrets.acl.mountPath }}
               readOnly: true
             {{- end }}
-            {{- if .Values.secrets.peerTls.secretName }}
+            {{- if or .Values.secrets.peerTls.secretName (eq (include "mqttd.peerTlsCertManager" .) "true") }}
             - name: peer-tls
               mountPath: {{ .Values.secrets.peerTls.mountPath }}
               readOnly: true
@@ -290,6 +290,16 @@ spec:
         - name: peer-tls
           secret:
             secretName: {{ .Values.secrets.peerTls.secretName }}
+        {{- else if eq (include "mqttd.peerTlsCertManager" .) "true" }}
+        # One certificate PER POD, minted by cert-manager's csi-driver into a volume no other
+        # pod can read, with the lifetime and renewal lead this release states (ADR 0088 D1).
+        # The driver renews in place and the broker's file watcher reloads it: no restart.
+        - name: peer-tls
+          csi:
+            driver: csi.cert-manager.io
+            readOnly: true
+            volumeAttributes:
+              {{- include "mqttd.peerTlsCsiAttributes" . | nindent 14 }}
         {{- end }}
         {{- if .Values.secrets.gossipKey.secretName }}
         - name: gossip-key

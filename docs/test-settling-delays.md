@@ -59,6 +59,7 @@ caller changes this file and the gate fails until it is regenerated and re-read.
 | `crates/mqttd/tests/keepalive_lwt.rs` | `zero_keepalive_is_never_idle_disconnected` | `keepalive-zero-idle-window` | 2500ms | in the test itself |
 | `crates/mqttd/tests/peer_identity.rs` | `a_cluster_crl_reload_tears_down_the_revoked_nodes_link` | `crl-redial-attempt-window` | 2s | in the test itself |
 | `crates/mqttd/tests/peer_identity.rs` | `a_stale_address_does_not_keep_flapping_the_link_of_the_node_that_answers` | `stale-dialer-stays-away` | 5s | in the test itself |
+| `crates/mqttd/tests/peer_link_expiry.rs` | `an_expired_node_is_out_and_stays_out` | `expired-peer-stays-unlinked` | 12s | in the test itself |
 | `crates/mqttd/tests/proc_common/mod.rs` | `pump` | `relay-slow-link-fault` | ? | helper, 7 call site(s) |
 | `crates/mqttd/tests/proc_common/mod.rs` | `kill_step` | `nemesis-kill-offset` | ? | helper, 2 call site(s) |
 | `crates/mqttd/tests/reload_acl.rs` | `an_offline_sessions_revoked_grant_does_not_replay_its_queue_on_resume` | `acl-detach-offline` | 100ms | in the test itself |
@@ -66,6 +67,7 @@ caller changes this file and the gate fails until it is regenerated and re-read.
 | `crates/mqttd/tests/replication_pause.rs` | `measure` | `pause-suspend` | SUSPEND | helper, 5 call site(s) |
 | `crates/mqttd/tests/replication_pause.rs` | `measure` | `pause-after-crash` | OBSERVE | helper, 5 call site(s) |
 | `crates/mqttd/tests/swim_formation_proc.rs` | `a_broker_stopped_for_two_seconds_is_declared_dead_by_no_one` | `swim-stop-two-seconds` | STOP | in the test itself |
+| `crates/mqttd/tests/swim_formation_proc.rs` | `stop_the_prober_on_its_last_probe` | `swim-prober-stop` | PROBER_STOP | helper, 1 call site(s) |
 | `crates/mqttd/tests/v5_protocol.rs` | `v5_a_will_is_cancelled_by_a_reconnect_inside_the_delay` | `v5-will-delay-cancel-inside-window` | 400ms | in the test itself |
 | `crates/mqttd/tests/v5_protocol.rs` | `v5_session_expires_after_interval` | `v5-session-expiry-wire` | 4s | in the test itself |
 | `crates/mqttd/tests/v5_protocol.rs` | `v5_disconnect_session_expiry_overrides_the_connect_value` | `v5-disconnect-expiry-override` | 4s | in the test itself |

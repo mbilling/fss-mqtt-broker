@@ -334,6 +334,137 @@ between the two reads is described before it is served; the watcher's next reloa
 which that replacement causes, loads it. `--check-tls` also checks `[admin]` whenever its
 certificate is configured, while the running broker loads it only with `admin.bind`.
 
+## Amendment (2026-10-14): stated, renewable, revocable, as built in T2
+
+D1 and D5 are built as written. What they left open, and how each was settled:
+
+- **How a lifetime is written.** `--lifetime <N>h`, `<N>d` or `<N>m` on `node` and
+  `renew`; `LEAF_LIFETIME` in the environment states it too, and so does a set
+  `LEAF_DAYS`, the variable the script read before. A bare number is refused: it would be
+  days to one reader and hours to the next. The refusal exits 2 and writes nothing.
+- **Hours need `openssl ca`.** `openssl x509 -req` counts in whole days on every OpenSSL
+  before 3.4 and on LibreSSL. Leaves are signed by `openssl ca` with an explicit start and
+  end, and each is checked against the stated lifetime (`-checkend`) before it is
+  installed.
+- **The CA keeps a ledger**, because `openssl ca` writes one and a revocation list is
+  generated from it: `ca/index.txt`, `ca/issued/` (certificates, no keys) and
+  `ca/crlnumber`, next to the CA key. Serials are random.
+- **The renew-by date is the broker's warning point**: `RENEW_AT_PERMILLE` thousandths of
+  the lifetime, `667` unless set, which is `tls.expiry_warn_permille`'s default. The
+  script cannot read a broker's configuration, so a deployment that changed the threshold
+  sets both.
+- **`renew` reads the identity from what it replaces** (CN and SANs out of the node's
+  current certificates) and does not check them against the clock: an expired node is
+  the one that most needs it. A new key by default; `--reuse-key` keeps it.
+- **`revoke` takes a node id and revokes every certificate the CA issued to it**, not one
+  file: after two renewals three certificates name the node, and each is good until it
+  ends. A certificate from before the ledger is revoked from the node's directory, and
+  `renew` or `node` copies the certificates it replaces into `ca/issued/` first, so the
+  first renewal of a node minted by the old script does not lose the only copy of a
+  certificate that is still valid. The same id can be renewed afterwards; the new serials
+  are not on the list.
+- **`notBefore` is a minute before the mint.** Until T3's tolerance exists, a peer whose
+  clock is a few seconds behind would refuse a freshly renewed node. The end is the
+  stated lifetime from the moment of minting, and the renew-by point is measured over
+  the whole window, as the broker measures the fraction spent.
+- **The list's `nextUpdate` is announced, not asked for**: 30 days unless
+  `--crl-lifetime`, printed with its own re-issue-by date, as the CA's end is printed.
+  `crl` issues the empty list and re-issues the current one.
+- **The list is live only where it was configured at startup.** `cluster.peer_tls.crl` is
+  a path read at start; the file behind it is what reloads. So the documented deployment
+  sets it from the first day, pointing at the empty list. The shipped
+  `mqttd.env.example` still has the line commented out: uncommenting it by default would
+  make a list every systemd deployment has to keep re-issuing.
+- **cert-manager issues per pod through its csi-driver, so there is no `Certificate`
+  object.** One `Certificate` has one Common Name, and the bus binds a node to its own.
+  The lifetime and the renewal lead are the volume's `csi.cert-manager.io/duration` and
+  `csi.cert-manager.io/renew-before`. The chart now renders that volume
+  (`secrets.peerTls.certManager`) and the operator does too
+  (`spec.secrets.peerTlsCertManager`); both require the two values. A volume written by
+  hand through `extraVolumes` is not checked.
+- **The chart's `bootstrap.sh` is a deployer too**: `LEAF_DAYS` lost its default. It
+  counts in whole days and has no revoke; it is the starter path.
+- **`mqttd --decommission` prints the step on every completed drain** and says it is for
+  a node leaving for good. The command cannot tell that from a restart: a Kubernetes
+  `preStop` runs it for both.
+
+Left as it was: `deploy/compose/init.sh` mints with a default lifetime (`CERT_DAYS`), and
+nothing revokes a departed pod's certificate on Kubernetes, where the lifetime is the
+bound.
+
+## Amendment (2026-10-14): expiry enforced, as built in T3
+
+D3 and D4 are built as written, with O3's tolerance; O2's setting is built and off by
+default. What T3 found first, and what had to be decided:
+
+- **The characterisation** (`crates/mqttd/tests/peer_link_expiry.rs`, its first commit):
+  two spawned brokers, one with a certificate that ends forty seconds after it is minted.
+  With gossip unsigned the link stayed up past `notAfter + 65 s` — nothing but the
+  handshake read the certificate. With gossip signed (the default) the expired node's
+  datagrams were dropped as `expired`, the failure detector declared it dead six seconds
+  later and that verdict dropped the link, **and the link was back within half a second**:
+  the dialer keeps dialing a peer it holds dead (ADR 0087 D5), the peer bus resumed TLS
+  sessions, and a resumed TLS 1.3 handshake does not verify the certificate again. It
+  flapped like that for as long as it was watched. The record's "new peer handshakes
+  fail" was therefore not true of a peer this node had linked before.
+- **The peer bus no longer resumes TLS sessions.** `mqtt_net::tls::peer_acceptor` and
+  `peer_connector` replace the general builders for the cluster bus: no session store,
+  no tickets, `Resumption::disabled()`. Peer links are few and long-lived; a full
+  handshake each costs nothing that matters, and every link now verifies the certificate
+  it runs on.
+- **Admission checks both ends** (`peer.rs` `admit_peer_link`, both directions): the
+  peer's leaf `notAfter`, as a backstop to the TLS verifier, and this node's own. A node
+  whose own certificate has run out neither dials nor accepts; the peers refuse it at the
+  handshake anyway, so this matters against a peer on older code. Refusals log a `WARN`
+  at most once a minute.
+- **A link ends at the earlier of the two certificates of its handshake.** Each side
+  records the peer's `notAfter` and its own when the link forms (`LinkCertEnds`, carried
+  on `HubCommand::PeerConnected`); the hub's once-a-second sweep ends the link the first
+  second after the earlier one, by the same path as the CRL's peer sweep: removing the
+  peer entry closes the link's lanes, its pump and its socket. D3 asked for a timer no
+  coarser than a minute; the hub's existing tick is a second, and it looks at nothing
+  until the earliest known end has passed. Measured end to end: 1.7 to 2.7 s after
+  `notAfter`, of which up to a second is the test's own polling.
+- **Own end is the certificate that is served.** It is read at startup and stored again
+  by every reload that commits a new peer certificate; a link keeps the value from its
+  handshake, because a TLS session keeps the certificates it was made with.
+- **So a renewal ends the links made before it**, at the old certificate's end, and the
+  link is made again at once with the new one. TLS 1.3 cannot re-authenticate an
+  established connection, and keeping the link on the strength of gossip signed with the
+  new certificate would mean a link authenticated by something other than its handshake.
+  One short link loss per link per renewal; the cluster rides it as it rides any link that
+  drops (ADR 0087). With renewal at two thirds of the lifetime, the links of a renewed
+  node are a third of a lifetime on the old certificate.
+- **The reason labels** are `mqttd_revocation_evictions_total`'s, which the CRL sweep
+  already uses: `peer-cert-expired` and `own-cert-expired` for links, `cert-expired` for
+  client sessions. The log line is `peer link ended: a certificate it was admitted under
+  has expired (ADR 0088)`. Gossip from an expired signer was already dropped and counted
+  (`mqttd_gossip_rejected_total{reason="expired"}`, ADR 0022 T7); T3 adds nothing there
+  but the tolerance below.
+- **A link ended for expiry is a lost link, not an erasure** (ADR 0087): the hub calls
+  `peer_disconnected`, which keeps the peer's interest, its `$share` members, its
+  negotiated protocol and its standing, and makes no verdict. What follows is
+  membership's: the expired node's gossip is dropped, so the failure detector declares it
+  dead, `peer_dead` holds it as unreachable, and the hold runs out as for any node that
+  does not come back (0087-T2's eight ticks, until 0087-T3 replaces them). That is D4's
+  "out of the cluster", reached by the ordinary path.
+- **O3's tolerance**: a certificate whose `notBefore` is up to 60 s ahead of the clock is
+  accepted, at the peer bus's TLS verifiers (a wrapper that retries a "not valid yet"
+  verdict at `now + 60 s`, so the allowance can never extend `notAfter`) and in signed
+  gossip (`signed_gossip::NOT_BEFORE_TOLERANCE_SECS`). The client listeners keep
+  webpki's strict check: O3 is about cluster credentials. `gen-certs.sh` keeps minting a
+  minute back; the two together cover two minutes of skew for a fresh certificate.
+- **O2**: `tls.end_sessions_at_cert_expiry` (`MQTTD_TLS_END_SESSIONS_AT_CERT_EXPIRY`,
+  `1`/`0`), off by default, read at startup. On, a client session admitted with a
+  certificate is evicted the second after its `notAfter`, as a revoked one is (the
+  identity sweep's `evict`). A session relocated to another node (ADR 0005) carries no
+  certificate there and is not covered; ADR 0040's revocation sweep has the same gap.
+
+Not verified by T3: the end of a link at the expiry of the node's **own** certificate is
+shown in the hub's tests and in the two-process test only as "one side or the other ends
+it" (whichever side's sweep looks first); a mixed cluster with a peer on v1.1.0, which
+would not end the link from its side, was not run.
+
 ## Not verified
 
 - T1 did not test what the broker does with a **cluster CA** that is past `notAfter`, or
@@ -341,9 +472,15 @@ certificate is configured, while the running broker loads it only with `admin.bi
   does not: `--check-tls` already documented that a stale list still loads, and no code
   path reads `nextUpdate` to refuse one. The CA was not checked either way. Their expiry
   is exported and warned about regardless.
-- That nothing ends an established peer link at its peer's certificate expiry was read
-  from `crates/mqttd/src/peer.rs` (admission checks the CRL; no expiry check or timer was
-  found), not shown by a test. T3 starts by writing that test.
+- ~~That nothing ends an established peer link at its peer's certificate expiry was read
+  from `crates/mqttd/src/peer.rs`, not shown by a test.~~ Shown, and found worse, by T3
+  (amendment of 2026-10-14 below): the link outlived the certificate in both gossip
+  postures, and with signed gossip it was dropped by the failure detector and came straight
+  back on a resumed TLS session.
 - cert-manager's behaviour with lifetimes of hours under the chart's csi-driver layout was
-  not run.
+  not run. T2's volume is rendered and compared between the chart and the operator; no
+  cert-manager has issued from it. The `fs-group` attribute it sets (the pod's `fsGroup`)
+  is from the csi-driver's documentation, not from a run.
+- T2's test renews and revokes with SIGHUP as the trigger. The file watcher picking a
+  renewed leaf or a new list up was not run for this material (it shares the reload path).
 - The cost of gossiping accepted-key identifiers was not measured.

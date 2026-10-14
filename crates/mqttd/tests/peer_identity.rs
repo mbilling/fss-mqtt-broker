@@ -146,6 +146,7 @@ impl ClusterPki {
             key_der: mqtt_net::tls::private_key_der(&key).unwrap(),
             gossip_crl: std::sync::Arc::new(std::sync::RwLock::new(None)),
             crl_path: None,
+            own_cert_end: mqttd::peer::unknown_cert_end(),
         }
     }
 
@@ -164,6 +165,7 @@ impl ClusterPki {
             key_der: mqtt_net::tls::private_key_der(&key).unwrap(),
             gossip_crl: std::sync::Arc::new(std::sync::RwLock::new(None)),
             crl_path: None,
+            own_cert_end: mqttd::peer::unknown_cert_end(),
         }
     }
 }

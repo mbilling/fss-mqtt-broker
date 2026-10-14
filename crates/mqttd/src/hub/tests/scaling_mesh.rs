@@ -135,6 +135,7 @@ impl Mesh {
                 tx: ptx,
                 ctl,
                 cert_serial: None,
+                cert_ends: crate::hub::LinkCertEnds::default(),
                 proto: crate::hub::PROTO_FORWARD_VERDICT,
                 depth: Arc::new(AtomicUsize::new(0)),
             })
@@ -344,6 +345,7 @@ async fn a_settled_gated_publish_does_not_re_enumerate_cluster_members() {
             tx: ptx,
             ctl,
             cert_serial: None,
+            cert_ends: crate::hub::LinkCertEnds::default(),
             proto: crate::hub::PROTO_FORWARD_VERDICT,
             depth: Arc::new(AtomicUsize::new(0)),
         })

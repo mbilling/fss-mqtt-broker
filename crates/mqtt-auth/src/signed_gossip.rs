@@ -296,6 +296,13 @@ impl GossipSigner {
     }
 }
 
+/// How many seconds ahead of the receiver's clock a sender certificate's `notBefore` may
+/// be ([ADR 0088](../../../docs/adr/0088-credential-lifetimes-and-rotation.md) O3): a
+/// freshly renewed node whose clock runs a little ahead is not refused. `notAfter` has no
+/// tolerance. The cluster bus's TLS verifiers allow the same
+/// (`mqtt_net::tls::PEER_NOT_BEFORE_TOLERANCE`).
+pub const NOT_BEFORE_TOLERANCE_SECS: i64 = 60;
+
 /// Verify a signed gossip datagram: the `cert_der` leaf must chain to `ca_der`, be inside
 /// its validity window at `now_unix`, not be revoked by `crl` (when one is loaded), and
 /// `sig` must be a valid signature over `msg` under the leaf's public key. On success,
@@ -328,10 +335,15 @@ pub fn verify(
     )
     .map_err(|()| VerifyError::Chain)?;
 
-    // 2. The leaf is inside its validity window (ADR 0022 T7). An unrepresentable clock
-    //    fails closed as Expired rather than skipping the check.
+    // 2. The leaf is inside its validity window (ADR 0022 T7), with
+    //    [`NOT_BEFORE_TOLERANCE_SECS`] of clock difference on its start and none on its end
+    //    (ADR 0088 O3). An unrepresentable clock fails closed as Expired rather than
+    //    skipping the check.
     let now = ASN1Time::from_timestamp(now_unix).map_err(|_| VerifyError::Expired)?;
-    if !leaf.validity().is_valid_at(now) {
+    let ahead = ASN1Time::from_timestamp(now_unix.saturating_add(NOT_BEFORE_TOLERANCE_SECS))
+        .map_err(|_| VerifyError::Expired)?;
+    let validity = leaf.validity();
+    if validity.not_before > ahead || now > validity.not_after {
         return Err(VerifyError::Expired);
     }
 
@@ -584,6 +596,29 @@ mod tests {
             verify(ca.issuer.der(), &cert, b"msg", &sig, NOW, None),
             Err(VerifyError::Expired)
         );
+    }
+
+    /// ADR 0088 O3: a minute of clock difference on `notBefore`, none on `notAfter`.
+    #[test]
+    fn a_minute_of_clock_difference_is_allowed_on_not_before_and_none_on_not_after() {
+        let ca = new_ca();
+        let window = |from: i64, to: i64| {
+            let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+            let at = |secs: i64| {
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs.unsigned_abs())
+            };
+            params.not_before = at(from).into();
+            params.not_after = at(to).into();
+            let (cert, signer) = leaf_from(&ca, params, "node-a", &rcgen::PKCS_ECDSA_P256_SHA256);
+            let sig = signer.sign(b"msg");
+            verify(ca.issuer.der(), &cert, b"msg", &sig, NOW, None).map(|v| v.cn)
+        };
+        assert_eq!(window(NOW + 30, NOW + 3_600), Ok("node-a".to_string()));
+        assert_eq!(window(NOW + 60, NOW + 3_600), Ok("node-a".to_string()));
+        assert_eq!(window(NOW + 61, NOW + 3_600), Err(VerifyError::Expired));
+        // The last second of the window is in it; the next is not.
+        assert_eq!(window(NOW - 3_600, NOW), Ok("node-a".to_string()));
+        assert_eq!(window(NOW - 3_600, NOW - 1), Err(VerifyError::Expired));
     }
 
     // --- revocation (ADR 0022 T7) ---

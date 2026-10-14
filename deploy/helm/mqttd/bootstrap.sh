@@ -5,11 +5,17 @@
 # mounts that do not exist, which is the "missing middle" the compose path had a
 # bootstrap.sh for and Kubernetes did not.
 #
-#   ./bootstrap.sh                        # namespace "mqttd", 3 nodes, NO password users
-#   ./bootstrap.sh alice bob              # ...same, plus an Argon2id passwd Secret for these users
-#   NS=iot ./bootstrap.sh sensor-1 sensor-2
-#   REPLICAS=5 ./bootstrap.sh             # after a scale-up — see SCALING below
-#   ./bootstrap.sh --mint-only            # mint + verify the PKI, touch no cluster
+#   LEAF_DAYS=30 ./bootstrap.sh           # namespace "mqttd", 3 nodes, NO password users
+#   LEAF_DAYS=30 ./bootstrap.sh alice bob # ...same, plus an Argon2id passwd Secret for these users
+#   LEAF_DAYS=30 NS=iot ./bootstrap.sh sensor-1 sensor-2
+#   LEAF_DAYS=30 REPLICAS=5 ./bootstrap.sh   # after a scale-up — see SCALING below
+#   LEAF_DAYS=30 ./bootstrap.sh --mint-only  # mint + verify the PKI, touch no cluster
+#
+# LEAF_DAYS is how long the certificates this run MINTS live, and it has NO DEFAULT (ADR
+# 0088): how long a node's certificate lives is decided by whoever deploys the cluster, so
+# a run that would have to mint one without it refuses, naming the variable, and writes
+# nothing. A run that mints nothing (everything on disk still verifies) does not need it.
+# What is minted is printed with its end and with the date to renew by — see RENEWAL.
 #
 # Creates, in $NS:
 #   Secret mqttd-tls        server TLS keypair          (kubernetes.io/tls: tls.crt/tls.key)
@@ -18,8 +24,8 @@
 #   Secret mqttd-passwd     Argon2id password file       (key: passwd)   [if users given]
 #   ConfigMap mqttd-acl     a starter deny-by-default ACL (key: acl.toml)
 #
-# THROWAWAY STARTER PKI. Self-signed, no revocation, a 10-year CA in a local directory. It
-# exists so the chart's cluster bus has a recipe that RUNS. Replace it before production
+# THROWAWAY STARTER PKI. Self-signed, no revocation, a 10-year CA in a local directory, leaf
+# lifetimes in whole days. It exists so the chart's cluster bus has a recipe that RUNS. Replace it before production
 # (cert-manager — see CERT-MANAGER below); the four rules below are what carries over.
 #
 # ── ONE LEAF PER NODE, NOT ONE FOR THE CLUSTER ────────────────────────────────────────
@@ -91,17 +97,29 @@
 # needs a per-pod issuer; see CERT-MANAGER below.
 #
 # ── RENEWAL ───────────────────────────────────────────────────────────────────────────
-# Leaves live LEAF_DAYS (365 by default) and a re-run KEEPS whatever verifies, so renewal
-# is an explicit act: delete the leaf files, re-run, roll the pods (rotation is NOT hot —
-# the gossip signer reads the key once at startup; see docs/OPERATIONS.md).
+# Leaves live the LEAF_DAYS you state and a re-run KEEPS whatever verifies, so renewal is
+# an explicit act, and yours: the run prints each certificate's end and the date to RENEW
+# BY (two thirds of the lifetime, which is where a broker starts warning about it:
+# tls.expiry_warn_permille, default 667). Delete the leaf files and re-run:
 #
 #   rm mqttd-pki/nodes/<release>-*.pem mqttd-pki/nodes/<release>-*.key
-#   REPLICAS=<n> ./bootstrap.sh           # mints fresh leaves under the SAME CA
-#   kubectl -n <ns> rollout restart statefulset/<release>
+#   LEAF_DAYS=<days> REPLICAS=<n> ./bootstrap.sh   # fresh leaves under the SAME CA, Secret re-applied
+#
+# No rollout is needed: the kubelet syncs the updated Secret into the running pods and the
+# broker's file watcher (runtime.config_watch_secs, 30 s in the chart) reloads it — served
+# on the next peer handshake, signing the next gossip datagram (docs/OPERATIONS.md,
+# "Rotation is hot"). A rolling restart still works, and is the recovery path. The server
+# keypair (server/server.pem) is renewed the same way: delete it and re-run.
 #
 # An EXPIRED leaf fails re-verification ("does not verify"), which is this same procedure,
-# not an openssl problem. The CA lives CA_DAYS (3650); renewing IT invalidates every leaf,
-# so delete the whole $PKI_DIR and re-run, then roll.
+# not an openssl problem; a node whose certificate has ended is out of the cluster until it
+# is renewed. The CA lives CA_DAYS (3650); renewing IT invalidates every leaf, so delete
+# the whole $PKI_DIR and re-run, then roll.
+#
+# Whole days only, and no revocation: this is the starter path. Lifetimes of hours, renewal
+# without a person, and per-pod keys are what cert-manager is for — see CERT-MANAGER below
+# and secrets.peerTls.certManager in values.yaml, which takes the lifetime and the renewal
+# lead as values.
 #
 # ── SCALING ───────────────────────────────────────────────────────────────────────────
 # A new ordinal is a new node id and a new DNS name, so it needs its OWN leaf: re-run with
@@ -119,10 +137,11 @@
 # ── CERT-MANAGER (the production path) ────────────────────────────────────────────────
 # Nothing here is required — the chart needs EITHER a Secret with ca.crt plus <pod>.crt /
 # <pod>.key per pod (this script's output), OR a per-pod directory via secrets.peerTls.dir
-# + extraVolumes (the cert-manager csi-driver path — wired in values.yaml, see the
-# annotated extraVolumes example there). csi is the one option that satisfies all four
-# rules AND keeps each pod to its own key (minted into an ephemeral volume, never a
-# shared Secret):
+# + extraVolumes (the cert-manager csi-driver path). The chart renders that volume itself
+# from secrets.peerTls.certManager — an issuer, and the lifetime (`duration`) and renewal
+# lead (`renewBefore`), which have no default there either. csi is the one option that
+# satisfies all four rules AND keeps each pod to its own key (minted into an ephemeral
+# volume, never a shared Secret). The attributes that satisfy the rules:
 #   csi.cert-manager.io/common-name: "${POD_NAME}"        # rule 1
 #   csi.cert-manager.io/dns-names: "${POD_NAME}.<headless>.${POD_NAMESPACE}.svc.cluster.local"
 #   csi.cert-manager.io/key-usages: "server auth,client auth"   # rule 3
@@ -140,7 +159,10 @@ REPLICAS="${REPLICAS:-3}"
 IMAGE="${MQTTD_IMAGE:-ghcr.io/mbilling/fss-mqtt-broker:latest}"
 PKI_DIR="${PKI_DIR:-./mqttd-pki}"
 CA_DAYS="${CA_DAYS:-3650}"
-LEAF_DAYS="${LEAF_DAYS:-365}"
+LEAF_DAYS="${LEAF_DAYS:-}"       # NO default: stated by whoever deploys (ADR 0088)
+# Where a broker starts warning about a certificate, in thousandths of its lifetime (the
+# default of tls.expiry_warn_permille). The renew-by date printed below is this point.
+RENEW_AT_PERMILLE="${RENEW_AT_PERMILLE:-667}"
 CURVE=prime256v1                 # NIST P-256; see rule 4
 OPENSSL="${OPENSSL:-openssl}"    # override to point at a conforming build; see above
 
@@ -188,6 +210,50 @@ CA_DIR="$PKI_DIR/ca"
 NODES_DIR="$PKI_DIR/nodes"
 SERVER_DIR="$PKI_DIR/server"
 GOSSIP_DIR="$PKI_DIR/gossip"
+
+# ADR 0088 D1: no stated lifetime, no certificate — decided BEFORE anything is written, so a
+# refusal leaves nothing behind (not even a CA). A run that would mint no leaf needs none.
+[[ "$RENEW_AT_PERMILLE" =~ ^[1-9][0-9]*$ ]] && (( RENEW_AT_PERMILLE <= 1000 )) \
+  || { echo "FATAL: RENEW_AT_PERMILLE must be 1..1000 (got '$RENEW_AT_PERMILLE')" >&2; exit 2; }
+WOULD_MINT=()
+for ((i = 0; i < REPLICAS; i++)); do
+  [[ -s "$NODES_DIR/$FULLNAME-$i.pem" || -s "$NODES_DIR/$FULLNAME-$i.key" ]] || WOULD_MINT+=("$FULLNAME-$i")
+done
+[[ -s "$SERVER_DIR/server.pem" || -s "$SERVER_DIR/server.key" ]] || WOULD_MINT+=("the server keypair")
+if (( ${#WOULD_MINT[@]} )); then
+  if [[ -z "$LEAF_DAYS" ]]; then
+    {
+      echo "FATAL: no certificate lifetime was stated, so nothing was minted."
+      echo "       This run would mint: ${WOULD_MINT[*]}"
+      echo "       There is no default. How long a node's certificate lives is decided when"
+      echo "       the cluster is deployed, and whoever operates it renews before that ends"
+      echo "       (ADR 0088). State it, in whole days, and re-run:"
+      echo "         LEAF_DAYS=30 $0 $INVOCATION"
+      echo "       The run prints the date to renew by. For lifetimes of hours and renewal"
+      echo "       without a person, use cert-manager (secrets.peerTls.certManager)."
+    } >&2
+    exit 2
+  fi
+  [[ "$LEAF_DAYS" =~ ^[1-9][0-9]*$ ]] \
+    || { echo "FATAL: LEAF_DAYS must be a whole number of days, 1 or more (got '$LEAF_DAYS')" >&2; exit 2; }
+fi
+
+# GNU and busybox date take `-d @<epoch>`, BSD (macOS) takes `-r <epoch>`.
+iso() { date -u -d "@$1" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -r "$1" '+%Y-%m-%dT%H:%M:%SZ'; }
+cert_not_after() { "$OPENSSL" x509 -in "$1" -noout -enddate 2>/dev/null | sed 's/^notAfter=//'; }
+# Printed once, after a run that minted something: the end of what it minted and the date
+# to act on. Kept certificates are listed with their own end, which an earlier run chose.
+MINT_AT=''
+window_report() {
+  [[ -n "$MINT_AT" ]] || return 0
+  local secs=$((LEAF_DAYS * 86400))
+  echo "  LIFETIME of what THIS run minted: $LEAF_DAYS day(s), as stated (LEAF_DAYS=$LEAF_DAYS)"
+  echo "    valid until  $(iso $((MINT_AT + secs)))"
+  echo "    RENEW BY     $(iso $((MINT_AT + secs * RENEW_AT_PERMILLE / 1000)))   — $RENEW_AT_PERMILLE thousandths of the lifetime, where a"
+  echo "                 broker starts warning (tls.expiry_warn_permille). See RENEWAL at the top"
+  echo "                 of this script: delete the leaf files, re-run with LEAF_DAYS. At the end"
+  echo "                 date a node is OUT of the cluster until it is renewed: no grace period."
+}
 
 # Everything is minted here first and moved into place only after it verifies.
 STAGE=''
@@ -401,6 +467,7 @@ mint_leaf() { # <out-basename> <CN> <EKU list> <SAN list>
   printf 'subjectAltName=%s\nextendedKeyUsage=%s\nbasicConstraints=critical,CA:FALSE\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n' \
     "$sans" "$eku" > "$STAGE/leaf.ext"
   printf '[req]\ndistinguished_name=dn\nprompt=no\n[dn]\nCN=%s\n' "$cn" > "$STAGE/leaf.cnf"
+  [[ -n "$MINT_AT" ]] || MINT_AT="$(date -u +%s)"
   mint_key "$leaf.key"
   # -sha256 explicitly: LibreSSL's default signing digest here is SHA-1.
   ssl req -new -key "$leaf.key" -sha256 -config "$STAGE/leaf.cnf" \
@@ -515,6 +582,7 @@ echo "  peer leaves for $REPLICAS node(s) — every property below read back fro
 for ((i = 0; i < REPLICAS; i++)); do
   node="$FULLNAME-$i"
   echo "    $node.crt/.key  $(cert_summary "$NODES_DIR/$node.pem")"
+  echo "                    ends $(cert_not_after "$NODES_DIR/$node.pem")"
 done
 [[ ${#KEPT[@]} -eq 0 ]] || echo "    (kept + re-verified: ${KEPT[*]})"
 [[ ${#MINTED[@]} -eq 0 ]] || echo "    (newly minted: ${MINTED[*]})"
@@ -541,6 +609,7 @@ else
   echo "  server keypair: minted"
 fi
 echo "    $(cert_summary "$SERVER_DIR/server.pem")"
+echo "    ends $(cert_not_after "$SERVER_DIR/server.pem")"
 
 # --- gossip key (ADR 0003) — persisted, never silently rotated ---------------------------
 mkdir -p "$GOSSIP_DIR"
@@ -558,6 +627,7 @@ else
 fi
 
 rm -rf "$STAGE"; STAGE=''
+window_report
 
 # --- a starter deny-by-default ACL ------------------------------------------------------
 cat > "$WORK/acl.toml" <<'ACL'
@@ -640,7 +710,8 @@ arms automatically — expect "SWIM gossip is SIGNED per-node" in every pod's lo
 no "does not match its certificate Common Name".
 
 replicaCount MUST NOT exceed $REPLICAS here: ordinals above that have no leaf, and
-their init container will say so. To grow, mint first — REPLICAS=<n> $0 — then upgrade.
+their init container will say so. To grow, mint first — LEAF_DAYS=<days> REPLICAS=<n> $0 —
+then upgrade.
 
 First install only: leave clusterEstablished=false (the default). Turn it on once the
 cluster has formed:  helm upgrade $RELEASE deploy/helm/mqttd --reuse-values --set clusterEstablished=true
