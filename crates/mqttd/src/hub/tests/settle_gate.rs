@@ -1221,3 +1221,125 @@ async fn a_proto_11_peer_gets_the_untagged_forward_and_an_untagged_replay_still_
     );
     assert_eq!(queued[1].origin, None);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #1011 — the settle-window re-delivery is owed to sessions that existed
+// when the publish was made, not to one created since.
+// ---------------------------------------------------------------------------
+
+/// Attach `client` and keep its outbound receiver, so the test can read what
+/// the hub actually wrote to it. Returns the receiver and `session_present`.
+async fn attach_watched(
+    fix: &mut Fix,
+    client: &str,
+    clean_start: bool,
+    session_expiry: u32,
+    conn_id: u64,
+) -> (mpsc::UnboundedReceiver<Box<crate::hub::Outgoing>>, bool) {
+    let (otx, orx) = mpsc::unbounded_channel::<Box<crate::hub::Outgoing>>();
+    let (outbound, meter) = Outbound::new(otx);
+    fix.meters.push(meter);
+    let (reply, wait) = oneshot::channel();
+    fix.dispatch(HubCommand::Attach {
+        client: ClientId(client.into()),
+        admission: Box::new(admission(client)),
+        conn_id,
+        clean_start,
+        session_expiry,
+        receive_maximum: u16::MAX,
+        will: None,
+        outbound,
+        reply,
+    })
+    .await;
+    let Ok(AttachOutcome::Present(present)) = wait.await else {
+        panic!("{client} must attach");
+    };
+    (orx, present)
+}
+
+/// The PUBLISH topics written to one connection so far.
+fn published_topics(orx: &mut mpsc::UnboundedReceiver<Box<crate::hub::Outgoing>>) -> Vec<String> {
+    let mut topics = Vec::new();
+    while let Ok(out) = orx.try_recv() {
+        if let Some(Packet::Publish(p)) = out.packet() {
+            topics.push(p.topic.clone());
+        }
+    }
+    topics
+}
+
+/// A clean session that connects and subscribes AFTER a publish is not handed
+/// that publish by the settle window's re-delivery; a session that RESUMES in
+/// the same window still is.
+///
+/// The production shape (#1011): on a freshly formed two-node cluster the
+/// routing view stays unsettled for several seconds after `/readyz` (the
+/// membership change arms the takeover window), so a `QoS` 1 publish made then
+/// stays in the settle work set after its subscriber on the other node has
+/// it. A brand-new clean `mosquitto_sub` on the publishing node, a few seconds
+/// later, was delivered that old non-retained message.
+///
+/// Fails before the fix: the re-delivery's filter was "offline, or attached
+/// after the publish", and a session created after the publish is attached
+/// after it.
+#[tokio::test]
+async fn a_session_created_after_a_held_publish_is_not_handed_it() {
+    let mut fix = clustered_fixture();
+    // The positive control: a persistent session that existed before the publish
+    // (in the store, subscribed, not attached anywhere on this node).
+    fix.store_only_session("returning", "settle/early").await;
+    assert!(
+        fix.hub.routing_unsettled(),
+        "fixture invariant: the takeover window must be open"
+    );
+
+    let _ack = fix.publish_gated("settle/early").await;
+    let id = fix.only_pending();
+    assert!(
+        fix.hub.pending_publishes[&id].awaiting_settle,
+        "fixture invariant: the publish is in the settle work set"
+    );
+
+    // A brand-new clean session, created after the publish, subscribes to it.
+    let (mut fresh, present) = attach_watched(&mut fix, "fresh", true, 0, 1).await;
+    assert!(!present, "fixture invariant: a clean start resumes nothing");
+    let (reply, wait) = oneshot::channel();
+    fix.dispatch(HubCommand::Subscribe {
+        client: ClientId("fresh".into()),
+        filters: vec![("settle/#".into(), QoS::AtLeastOnce)],
+        no_local_filters: Vec::new(),
+        sub_id: None,
+        rap_filters: Vec::new(),
+        retain_handling: vec![0],
+        reply: Some(reply),
+    })
+    .await;
+    assert_eq!(wait.await.unwrap(), vec![true]);
+
+    // The session that existed before the publish comes back in the same window.
+    let (mut returning, present) = attach_watched(&mut fix, "returning", false, 3600, 2).await;
+    assert!(present, "fixture invariant: the stored session is resumed");
+
+    // A settle pass, with the window still open.
+    fix.scan_lands(&[], false).await;
+
+    assert_eq!(
+        published_topics(&mut fresh),
+        Vec::<String>::new(),
+        "a clean session created AFTER the publish was handed it by the settle \
+         window's re-delivery: a non-retained message from before it existed \
+         (#1011)"
+    );
+    let reached = fix.hub.pending_publishes[&id]
+        .reached
+        .as_deref()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        reached.contains(&ClientId("returning".into())),
+        "the session that existed before the publish and resumed in the window \
+         is still owed it (ADR 0042 T9 exhibit ⑥); reached: {reached:?}"
+    );
+    let _ = published_topics(&mut returning);
+}

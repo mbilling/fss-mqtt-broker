@@ -624,7 +624,17 @@ impl Hub {
             .matching_clients(&topic)
             .into_iter()
             .filter(|c| !reached.contains(c))
-            .filter(|c| self.online.get(c).is_none_or(|o| o.attached_at > since))
+            // Offline (an inherited session the scan materialised), or attached
+            // since the publish by RESUMING a session that existed before it. A
+            // session created since — a clean session, or a new persistent one —
+            // did not exist when this was published and subscribed after it: it
+            // is owed nothing, retained aside, and a copy here is a message from
+            // before its time (issue #1011).
+            .filter(|c| {
+                self.online
+                    .get(c)
+                    .is_none_or(|o| o.resumed && o.attached_at > since)
+            })
             .map(|c| {
                 let granted = self.granted_qos(&c, &topic);
                 (c, granted)

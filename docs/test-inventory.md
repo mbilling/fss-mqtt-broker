@@ -1443,7 +1443,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 807 test(s)
+## `crates/mqttd/src/lib.rs` — 808 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1966,6 +1966,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::settle_gate::a_held_publish_is_re_delivered_to_a_materialised_session_once_not_per_pass`
 - `hub::tests::settle_gate::a_proto_11_peer_gets_the_untagged_forward_and_an_untagged_replay_still_delivers`
 - `hub::tests::settle_gate::a_rerouted_forward_skips_a_session_that_already_holds_the_publish`
+- `hub::tests::settle_gate::a_session_created_after_a_held_publish_is_not_handed_it`
 - `hub::tests::settle_gate::a_session_the_original_fan_out_reached_is_not_re_delivered_to`
 - `hub::tests::settle_gate::a_settle_window_replay_skips_a_session_that_already_holds_the_publish`
 - `hub::tests::settle_gate::a_settled_node_with_no_durable_plane_still_skips_the_periodic_scan`
