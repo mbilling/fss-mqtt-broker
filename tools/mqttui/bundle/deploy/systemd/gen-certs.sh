@@ -530,6 +530,17 @@ run_ca() {
   }
 }
 
+# Was <cert> issued to <node id> by THIS CA, and is it still worth keeping? Only such a
+# certificate goes into issued/: anything else there (a leaf from a replaced CA, a
+# directory copied from another cluster) would be picked up by every later `revoke` and
+# fail it. An openssl without -no_check_time cannot vouch for an ended certificate; an
+# ended one needs no revoking, so it is not kept either.
+issued_here() { # <cert> <node id>
+  [ "$(cert_cn "$1")" = "$2" ] || return 1
+  "$OPENSSL" verify -CAfile "$CA_DIR/peer-ca.pem" -no_check_time "$1" >/dev/null 2>&1 \
+    || "$OPENSSL" verify -CAfile "$CA_DIR/peer-ca.pem" "$1" >/dev/null 2>&1
+}
+
 ledger_serials() { # <status V|R> <node id> -> the serials the ledger holds for that CN
   awk -F'\t' -v st="$1" -v subj="/CN=$2" '$1 == st && $6 == subj { print $4 }' \
     "$STAGE/db/index.txt"
@@ -736,7 +747,8 @@ mint_node_set() {
     [ -s "$_old" ] || continue
     _ser="$(cert_serial "$_old")"
     [ -n "$_ser" ] || continue
-    if ! ledger_has V "$_ser" && ! ledger_has R "$_ser" && [ ! -e "$CA_DIR/issued/$_ser.pem" ]; then
+    if ! ledger_has V "$_ser" && ! ledger_has R "$_ser" && [ ! -e "$CA_DIR/issued/$_ser.pem" ] \
+       && issued_here "$_old" "$node_id"; then
       cp "$_old" "$STAGE/db/issued/$_ser.pem"
     fi
   done
@@ -963,11 +975,14 @@ cmd_revoke() {
   done
   # ... and what issued/ holds for that CN without a ledger line: certificates from before
   # the ledger, kept there by the `renew` or `node` run that replaced them.
+  # The file name is the serial, so the (many) files the ledger already accounts for cost
+  # no openssl call; only the few pre-ledger ones are read.
   for _crt in "$CA_DIR"/issued/*.pem; do
     [ -s "$_crt" ] || continue
+    _ser="$(basename "$_crt" .pem)"
+    if ledger_has V "$_ser" || ledger_has R "$_ser"; then continue; fi
     [ "$(cert_cn "$_crt")" = "$node_id" ] || continue
-    _ser="$(cert_serial "$_crt")"
-    ledger_has V "$_ser" || ledger_has R "$_ser" || echo "$_crt" >> "$STAGE/to-revoke"
+    echo "$_crt" >> "$STAGE/to-revoke"
   done
   for f in peer.pem server.pem; do
     [ ! -s "$PKI_DIR/$node_id/$f" ] || echo "$PKI_DIR/$node_id/$f" >> "$STAGE/to-revoke"
