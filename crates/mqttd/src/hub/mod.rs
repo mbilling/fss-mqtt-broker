@@ -8889,7 +8889,7 @@ mod tests {
     }
 
     /// A password-admitted v3.1.1 [`Admission`] for `subject` — the common test shape.
-    fn admission(subject: &str) -> Admission {
+    pub(super) fn admission(subject: &str) -> Admission {
         Admission {
             identity: mqtt_auth::Identity {
                 subject: subject.to_string(),

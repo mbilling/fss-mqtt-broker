@@ -1443,7 +1443,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 808 test(s)
+## `crates/mqttd/src/lib.rs` — 810 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1705,6 +1705,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::zone_fwd_proofs::the_early_return_does_not_change_who_receives_a_publish`
 - `hub::forwarding::zone_fwd_proofs::the_early_return_never_swallows_a_retained_broadcast`
 - `hub::forwarding::zone_fwd_proofs::the_interest_buffer_is_reused_across_publishes`
+- `hub::forwarding::zone_fwd_proofs::without_a_durable_plane_a_client_reconnecting_here_from_the_unreachable_peer_is_not_handed_the_held_publish`
 - `hub::forwarding::zone_fwd_proofs::without_a_durable_plane_nothing_stands_in_for_what_an_unreachable_peer_is_owed`
 - `hub::mesh::tests::a_moved_membership_invalidates_a_positive_answer`
 - `hub::mesh::tests::an_unstamped_cache_is_never_whole_on_a_cluster`
@@ -1964,6 +1965,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::session_expiry_zero_discards_at_disconnect`
 - `hub::tests::settle_gate::a_held_ack_retires_on_the_sweep_when_the_window_closes_without_a_scan`
 - `hub::tests::settle_gate::a_held_publish_is_re_delivered_to_a_materialised_session_once_not_per_pass`
+- `hub::tests::settle_gate::a_new_persistent_session_created_after_a_held_publish_is_not_handed_it`
 - `hub::tests::settle_gate::a_proto_11_peer_gets_the_untagged_forward_and_an_untagged_replay_still_delivers`
 - `hub::tests::settle_gate::a_rerouted_forward_skips_a_session_that_already_holds_the_publish`
 - `hub::tests::settle_gate::a_session_created_after_a_held_publish_is_not_handed_it`

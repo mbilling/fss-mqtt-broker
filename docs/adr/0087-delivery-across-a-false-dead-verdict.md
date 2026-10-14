@@ -288,15 +288,23 @@ protocol, forward window and every obligation toward it. `peer_disconnected` kee
   peer's session, moved to a new owner, from any other subscription that happens to
   match (D8). So a subscriber on a peer falsely held dead still loses a publish when any
   newly matching interest appears before the peer's link is back — on another node (a
-  monitor on `#` reconnecting there) or on this one (a matching session attaching, which
-  the settle pass delivers to and discharges on). The window is the half second the
-  redial takes. T5. *(0087-T2b: only with a durable plane. Without one — `MQTTD_DURABLE=0`
-  — no session moves between nodes, so nothing is discharged: the newcomer is sent the
-  publish and the unreachable peer stays owed it. Two things follow, both stated here
-  rather than hidden. After a REAL peer death in plain mode, a publish whose subscriber
-  has reconnected through another node is delivered to it at once, but its publisher's
-  acknowledgement now waits out the dead peer's hold — up to 8 ticks — where the
-  newcomer's answer used to release it. And a peer that was only falsely held dead and
+  monitor on `#` reconnecting there). On this one, only a session that existed before
+  the publish counts: one the takeover scan inherits, or one its client resumes here
+  (`session_present = 1`), which the settle pass delivers to and discharges on. A
+  session created here after the publish — clean, or new and persistent — is not
+  delivered to and discharges nothing (#1011, amendment of 2026-10-14). The window is
+  the half second the redial takes. T5. *(0087-T2b: only with a durable plane. Without
+  one — `MQTTD_DURABLE=0` — no session moves between nodes, so nothing is discharged:
+  a newcomer on another node is sent the publish as a re-route and the unreachable peer
+  stays owed it. A newcomer on THIS node is not sent it: a session cannot move here in
+  plain mode, so a client of the dead peer reconnecting with `clean_session=0` is
+  answered `session_present = 0` — its session is new — and is owed nothing published
+  before it (#1011). Two things follow, both stated here rather than hidden. After a
+  REAL peer death in plain mode, a publish whose subscriber has reconnected through a
+  third node is delivered to it there at once, and one whose subscriber reconnected to
+  the origin is not delivered to it at all; either way its publisher's acknowledgement
+  waits out the dead peer's hold — up to 8 ticks — where the newcomer's answer used to
+  release it. And a peer that was only falsely held dead and
   still keeps a persistent session under that client id gets its copy too, queued for
   that session: the client then has two sessions on two nodes, each with the message,
   and sees it again if it reconnects to the first node with `clean_session=0`. That is
@@ -426,7 +434,10 @@ protocol, forward window and every obligation toward it. `peer_disconnected` kee
   are sent as they are registered. (If a peer announces only after that, what is
   re-routed to it then goes out behind what was already sent: the one case, a peer
   silent for over a second on a new link, where the order below is not kept for
-  interest it had not announced before.) **The guarantee:** the QoS 1 and QoS 2 messages one node forwards
+  interest it had not announced before.) *(Open: #1014. A re-route matches a peer's interest by
+  topic, not by when the subscriber came into being, so a publish held for the settle
+  pass and re-routed to a peer is handed to a subscriber created there after it; the
+  local re-delivery stopped doing that (#1011), the re-route still does.)* **The guarantee:** the QoS 1 and QoS 2 messages one node forwards
   to another are applied on the receiving node in the order the origin accepted them —
   in the steady state as before (one ordered link, each forward sent as it is
   registered) and now across a lost link or a false verdict between the two as well.
@@ -910,3 +921,22 @@ its own, so that a broker whose workers are all busy still answers its probes.
   members at fault at once, a fault during formation, and the rig under load are not
   measured. The probe's effect on the membership flap the rig saw near saturation
   (README) has not been run.
+
+## Amendment (2026-10-14): the settle pass re-delivers only to a session that existed before the publish (issues #1011, #1014; PR #1013)
+
+The local re-delivery of a publish held for the settle pass (`redeliver_pending`) used to
+take every matching session that was offline or had attached after the publish. A session
+created after the publish had attached after it, so a brand-new clean subscriber was handed
+a non-retained message from before it existed: on a freshly formed cluster the routing view
+stays unsettled for several seconds after `/readyz`, and a publish acknowledged in that time
+stays in the settle work set (#1011). It now takes an online session only when that
+attach RESUMED a session (`session_present = 1`); offline sessions — the ones the takeover
+scan inherits — are taken as before.
+
+In plain mode (`MQTTD_DURABLE=0`) this changes what a client of a dead or falsely-dead peer
+gets when it reconnects to the origin with `clean_session = 0`: its session is new there
+(`session_present = 0`), so it is no longer handed the held publish, and its attach no longer
+releases the ack early or discharges what the unreachable peer is owed (D1 above). MQTT owes
+a new session nothing published before it. Not covered (#1014): the re-route to a peer, which
+still hands a held publish to a subscriber created there after it, and a persistent session
+born inside the window that reconnects with `session_present = 1`.

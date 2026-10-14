@@ -1227,20 +1227,25 @@ async fn a_proto_11_peer_gets_the_untagged_forward_and_an_untagged_replay_still_
 // when the publish was made, not to one created since.
 // ---------------------------------------------------------------------------
 
-/// Attach `client` and keep its outbound receiver, so the test can read what
-/// the hub actually wrote to it. Returns the receiver and `session_present`.
-async fn attach_watched(
-    fix: &mut Fix,
+/// The hub's outbound receiver for one watched connection.
+pub(in crate::hub) type Watched = mpsc::UnboundedReceiver<Box<crate::hub::Outgoing>>;
+
+/// Attach `client` to `hub` and subscribe it to `filter`, keeping its outbound
+/// receiver so a test can read what the hub actually wrote to it. Returns the
+/// receiver, the meter (hold it: dropping it reports the connection gone) and
+/// `session_present`.
+pub(in crate::hub) async fn attach_watched(
+    hub: &mut Hub,
     client: &str,
     clean_start: bool,
     session_expiry: u32,
     conn_id: u64,
-) -> (mpsc::UnboundedReceiver<Box<crate::hub::Outgoing>>, bool) {
+    filter: &str,
+) -> (Watched, crate::hub::OutboundMeter, bool) {
     let (otx, orx) = mpsc::unbounded_channel::<Box<crate::hub::Outgoing>>();
     let (outbound, meter) = Outbound::new(otx);
-    fix.meters.push(meter);
     let (reply, wait) = oneshot::channel();
-    fix.dispatch(HubCommand::Attach {
+    hub.dispatch(HubCommand::Attach {
         client: ClientId(client.into()),
         admission: Box::new(admission(client)),
         conn_id,
@@ -1252,14 +1257,28 @@ async fn attach_watched(
         reply,
     })
     .await;
+    quiesce(hub).await;
     let Ok(AttachOutcome::Present(present)) = wait.await else {
         panic!("{client} must attach");
     };
-    (orx, present)
+    let (reply, wait) = oneshot::channel();
+    hub.dispatch(HubCommand::Subscribe {
+        client: ClientId(client.into()),
+        filters: vec![(filter.into(), QoS::AtLeastOnce)],
+        no_local_filters: Vec::new(),
+        sub_id: None,
+        rap_filters: Vec::new(),
+        retain_handling: vec![0],
+        reply: Some(reply),
+    })
+    .await;
+    quiesce(hub).await;
+    assert_eq!(wait.await.unwrap(), vec![true], "the subscribe must grant");
+    (orx, meter, present)
 }
 
 /// The PUBLISH topics written to one connection so far.
-fn published_topics(orx: &mut mpsc::UnboundedReceiver<Box<crate::hub::Outgoing>>) -> Vec<String> {
+pub(in crate::hub) fn published_topics(orx: &mut Watched) -> Vec<String> {
     let mut topics = Vec::new();
     while let Ok(out) = orx.try_recv() {
         if let Some(Packet::Publish(p)) = out.packet() {
@@ -1302,24 +1321,15 @@ async fn a_session_created_after_a_held_publish_is_not_handed_it() {
     );
 
     // A brand-new clean session, created after the publish, subscribes to it.
-    let (mut fresh, present) = attach_watched(&mut fix, "fresh", true, 0, 1).await;
+    let (mut fresh, m1, present) =
+        attach_watched(&mut fix.hub, "fresh", true, 0, 1, "settle/#").await;
     assert!(!present, "fixture invariant: a clean start resumes nothing");
-    let (reply, wait) = oneshot::channel();
-    fix.dispatch(HubCommand::Subscribe {
-        client: ClientId("fresh".into()),
-        filters: vec![("settle/#".into(), QoS::AtLeastOnce)],
-        no_local_filters: Vec::new(),
-        sub_id: None,
-        rap_filters: Vec::new(),
-        retain_handling: vec![0],
-        reply: Some(reply),
-    })
-    .await;
-    assert_eq!(wait.await.unwrap(), vec![true]);
-
-    // The session that existed before the publish comes back in the same window.
-    let (mut returning, present) = attach_watched(&mut fix, "returning", false, 3600, 2).await;
+    // The session that existed before the publish comes back in the same window
+    // (its stored subscription is restored; the extra one changes nothing).
+    let (mut returning, m2, present) =
+        attach_watched(&mut fix.hub, "returning", false, 3600, 2, "settle/early").await;
     assert!(present, "fixture invariant: the stored session is resumed");
+    fix.meters.extend([m1, m2]);
 
     // A settle pass, with the window still open.
     fix.scan_lands(&[], false).await;
@@ -1345,5 +1355,38 @@ async fn a_session_created_after_a_held_publish_is_not_handed_it() {
         published_topics(&mut returning),
         vec!["settle/early".to_string()],
         "the resumed session must be written the re-delivered PUBLISH"
+    );
+}
+
+/// The same for a NEW PERSISTENT session: `clean_session = 0` with nothing
+/// stored under that id is answered `session_present = 0`. It was created after
+/// the publish, subscribed after it, and is owed nothing published before it —
+/// the persistence it asked for begins at its CONNECT (#1011).
+#[tokio::test]
+async fn a_new_persistent_session_created_after_a_held_publish_is_not_handed_it() {
+    let mut fix = clustered_fixture();
+    let _ack = fix.publish_gated("settle/early").await;
+    let id = fix.only_pending();
+    assert!(fix.hub.pending_publishes[&id].awaiting_settle);
+
+    let (mut fresh, meter, present) =
+        attach_watched(&mut fix.hub, "fresh-persistent", false, 3600, 1, "settle/#").await;
+    fix.meters.push(meter);
+    assert!(
+        !present,
+        "fixture invariant: nothing is stored under this id, so the session is new"
+    );
+
+    fix.scan_lands(&[], false).await;
+
+    assert_eq!(
+        published_topics(&mut fresh),
+        Vec::<String>::new(),
+        "a NEW persistent session created after the publish was handed it by the \
+         settle window's re-delivery (#1011)"
+    );
+    assert!(
+        fix.queued("fresh-persistent").await.is_empty(),
+        "nor was it queued for that session"
     );
 }
