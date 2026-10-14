@@ -1341,5 +1341,9 @@ async fn a_session_created_after_a_held_publish_is_not_handed_it() {
         "the session that existed before the publish and resumed in the window \
          is still owed it (ADR 0042 T9 exhibit ⑥); reached: {reached:?}"
     );
-    let _ = published_topics(&mut returning);
+    assert_eq!(
+        published_topics(&mut returning),
+        vec!["settle/early".to_string()],
+        "the resumed session must be written the re-delivered PUBLISH"
+    );
 }
