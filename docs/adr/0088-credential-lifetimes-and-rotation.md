@@ -511,12 +511,15 @@ ADR 0087 forward hold on every node, a consensus blip on every partition, a gap 
   and 10 seconds apart, every node's link gauge read two at every poll through the old
   end, none logged a lost link, a verdict or an expiry end, and 899 `QoS` 1 messages
   acknowledged on one node all reached a subscriber on another. With the moves disabled
-  the same test fails at the old end.
+  the same test fails at the old end. Run again with durable sessions on, the lease
+  group's epoch on every node is the same after the moves as before: no election.
 
 From the same review:
 
 - **A peer leaf whose `notAfter` x509-parser cannot read is refused** at admission, as an
-  expired one is: admitted, it would make a link with no end.
+  expired one is: admitted, it would make a link with no end. A node whose own leaf is
+  such a certificate refuses it at startup, and a reload that would load one is rejected,
+  so the node that has it says so instead of being refused by every peer.
 - **The own end is read from the chain that is served.** `mqtt_net::tls::peer_tls` reads
   the CA, the chain and the key once and builds both sides of the bus and the leaf from
   that reading, at startup and at every reload; before, each was read separately.

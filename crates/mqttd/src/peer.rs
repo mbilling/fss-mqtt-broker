@@ -110,23 +110,29 @@ static LAST_EXPIRY_REFUSAL_LOG: AtomicI64 = AtomicI64::new(i64::MIN);
 /// DEBUG otherwise.
 fn log_expiry_refusal(now: i64, whose: &'static str) {
     let last = LAST_EXPIRY_REFUSAL_LOG.load(Ordering::Relaxed);
-    if now.saturating_sub(last) >= 60
+    let warn_now = now.saturating_sub(last) >= 60
         && LAST_EXPIRY_REFUSAL_LOG
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-    {
-        warn!(
+            .is_ok();
+    match (warn_now, whose == UNREADABLE_END) {
+        (true, false) => warn!(
             whose,
-            "peer link refused: a cluster-bus certificate has expired, or its end cannot be \
-             read; no grace (ADR 0088 D4)"
-        );
-    } else {
-        debug!(
+            "peer link refused: a cluster-bus certificate has expired; no grace (ADR 0088 D4)"
+        ),
+        (true, true) => warn!(
+            "peer link refused: the peer's certificate end (notAfter) cannot be read \
+             (ADR 0088 D3)"
+        ),
+        (false, false) => debug!(
             whose,
-            "peer link refused: a cluster-bus certificate has expired, or its end cannot be read"
-        );
+            "peer link refused: a cluster-bus certificate has expired"
+        ),
+        (false, true) => debug!("peer link refused: the peer's certificate end cannot be read"),
     }
 }
+
+/// [`log_expiry_refusal`]'s `whose` for a peer leaf whose `notAfter` cannot be read.
+const UNREADABLE_END: &str = "peer-end-unreadable";
 
 /// Gate a freshly-handshaken peer link, on the ACCEPT side (a node dialing us) and on
 /// the DIAL side (us dialing a node), and return what the link is admitted under, or
@@ -169,7 +175,7 @@ fn admit_peer_link(
     // expiry: refused, as an expired one is (issue #1016). The TLS verifier parsed the same
     // certificate, so this is a certificate x509-parser reads differently, not a normal one.
     if leaf.is_some() && peer.is_none() {
-        log_expiry_refusal(now, "peer-end-unreadable");
+        log_expiry_refusal(now, UNREADABLE_END);
         return Err(());
     }
     if peer.is_some_and(|end| now > end) {
@@ -941,7 +947,9 @@ async fn serve_dialed_tls<'a>(
             }, if retiring.is_some() => {
                 retiring = None;
             }
-            (s, cert) = mover.next_link(addr, name, t, handshake_within) => {
+            // One move at a time: a link whose replacement's own window opens while the
+            // old one is still retiring (only with certificates of seconds) waits for it.
+            (s, cert) = mover.next_link(addr, name, t, handshake_within), if retiring.is_none() => {
                 info!(
                     %addr,
                     old_end = ?mover.ends.earliest(),

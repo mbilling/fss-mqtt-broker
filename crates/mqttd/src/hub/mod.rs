@@ -2221,7 +2221,8 @@ struct Peer {
 /// request that arrived on it — a consensus RPC (500 ms heartbeat deadline), a
 /// replication ack (an fsync), a forward's answer — and the durable plane's own bound on
 /// such a request is five seconds. Five ticks covers all of that and holds a socket nobody
-/// writes to for no longer.
+/// writes to for no longer. (The first tick can land just after the replacement, so the
+/// time kept is between four and five seconds.)
 const RETIRE_TICKS: u8 = 5;
 
 /// A peer link that a newer link to the same peer has replaced (issue #1016).
@@ -2236,7 +2237,7 @@ const RETIRE_TICKS: u8 = 5;
 /// re-registered on the new lanes), but its lanes stay open, so its pump keeps reading,
 /// and a reply produced for a request that arrived on it still goes back on it.
 ///
-/// It is closed after [`RETIRE_TICKS`], or at once when a certificate it was admitted
+/// It is closed after up to [`RETIRE_TICKS`] sweep ticks, or at once when a certificate it was admitted
 /// under expires or is revoked, or when the peer is declared dead — what ends a link ends
 /// this one too, without counting as a link loss: the peer has a link.
 #[derive(Debug)]

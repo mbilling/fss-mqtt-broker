@@ -290,7 +290,7 @@ const MINTED_LIFETIME: Duration = Duration::from_secs(100);
 
 /// Three nodes, `a`, `b` and `c`, minted together — one `notAfter` for all, as
 /// `gen-certs.sh` or a first cert-manager issue gives — and seeded with each other.
-async fn build_minted_together(root: &Path) -> (Vec<ProcNode>, Pki, SystemTime) {
+async fn build_minted_together(root: &Path, durable: bool) -> (Vec<ProcNode>, Pki, SystemTime) {
     let pki = Pki::new(root);
     let ends = SystemTime::now() + MINTED_LIFETIME;
     let swim: Vec<String> = (0..3)
@@ -298,13 +298,18 @@ async fn build_minted_together(root: &Path) -> (Vec<ProcNode>, Pki, SystemTime) 
         .collect();
     let mut nodes = Vec::new();
     for (i, name) in ["a", "b", "c"].into_iter().enumerate() {
-        let id = format!("ren{}-{name}", std::process::id());
+        let id = format!(
+            "ren{}{}-{name}",
+            std::process::id(),
+            if durable { "d" } else { "" }
+        );
         let data_dir = root.join(&id);
         std::fs::create_dir_all(&data_dir).unwrap();
         let peer_bind = SocketAddr::from(([127, 0, 0, 1], free_tcp_port()));
         let (relay_addr, relay, relay_abort) = spawn_relay(peer_bind).await;
         let mut extra_env = pki.env_for(&id, ends);
-        extra_env.push(("MQTTD_DURABLE_SESSIONS".into(), "0".into()));
+        let durable = if durable { "1" } else { "0" };
+        extra_env.push(("MQTTD_DURABLE_SESSIONS".into(), durable.into()));
         nodes.push(ProcNode {
             log_path: root.join(format!("{id}.log")),
             id,
@@ -358,14 +363,26 @@ fn log_len(node: &ProcNode) -> usize {
 /// That the moves are spread over a window, not made in one second, is the jitter's, and
 /// is asserted in `peer.rs`'s unit tests; here the moments are printed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(clippy::too_many_lines)] // one scenario: mesh, stream, renew, watch, account
 async fn renewed_nodes_move_their_links_before_the_old_end_without_a_gap() {
+    renewal_moves_links(false).await;
+}
+
+/// The same with durable sessions on, so the lease group's consensus and the session-log
+/// replication run over the links while they move: on top of the above, no node's lease
+/// epoch moves — no election followed a move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn renewed_nodes_move_their_links_without_an_election() {
+    renewal_moves_links(true).await;
+}
+
+#[allow(clippy::too_many_lines)] // one scenario: mesh, stream, renew, watch, account
+async fn renewal_moves_links(durable: bool) {
     use mqtt_codec::{Packet, QoS};
     use std::collections::BTreeSet;
     use std::sync::{Arc, Mutex};
 
     let root = tempfile::tempdir().unwrap();
-    let (mut nodes, pki, old_end) = build_minted_together(root.path()).await;
+    let (mut nodes, pki, old_end) = build_minted_together(root.path(), durable).await;
     for n in &mut nodes {
         n.spawn();
     }
@@ -456,11 +473,32 @@ async fn renewed_nodes_move_their_links_before_the_old_end_without_a_gap() {
         assert!(sent.success());
     }
 
-    // Publish and watch the links through the old end and a few seconds past it.
+    // The lease group's epoch on each node, before the renewal (durable sessions on).
+    let epochs = |nodes: &[ProcNode]| {
+        let nodes: Vec<_> = nodes.iter().map(|n| n.health_addr).collect();
+        async move {
+            let mut out = Vec::new();
+            for addr in nodes {
+                let body = http_get(addr, "/metrics").await.unwrap_or_default();
+                out.push(
+                    body.lines()
+                        .find(|l| l.starts_with("mqttd_lease_epoch "))
+                        .map(str::to_string),
+                );
+            }
+            out
+        }
+    };
+    let epochs_before = epochs(&nodes).await;
+
+    // Publish and watch the links through the old end and a few seconds past it. A poll a
+    // node's health endpoint did not answer is counted: the no-gap claim rests on the rest.
     let mut polls = 0;
+    let mut unanswered = 0;
     while SystemTime::now() < old_end + Duration::from_secs(5) {
         publish_one(&mut publisher, &mut acked).await;
         let view = survey(&nodes).await;
+        unanswered += view.iter().filter(|v| v.is_none()).count();
         assert!(
             view.iter()
                 .all(|v| v.is_none_or(|(members, links)| members == 3 && links == 2)),
@@ -471,6 +509,23 @@ async fn renewed_nodes_move_their_links_before_the_old_end_without_a_gap() {
         );
         polls += 1;
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        unanswered * 20 <= polls,
+        "{unanswered} of {polls} polls went unanswered: too few to say there was no gap"
+    );
+    if durable {
+        let after = epochs(&nodes).await;
+        assert!(
+            epochs_before.iter().all(Option::is_some),
+            "{epochs_before:?}"
+        );
+        assert_eq!(
+            epochs_before,
+            after,
+            "a lease epoch moved across the moves\n{}",
+            dump(&nodes)
+        );
     }
 
     // Every link moved, and before the old end.
@@ -532,7 +587,8 @@ async fn renewed_nodes_move_their_links_before_the_old_end_without_a_gap() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     eprintln!(
-        "{moves} moves; {} acknowledged messages delivered; {polls} polls",
+        "{moves} moves; {} acknowledged messages delivered; {polls} polls, {unanswered} \
+         unanswered",
         acked.len()
     );
     reader.abort();
