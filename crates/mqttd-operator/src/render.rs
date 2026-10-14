@@ -863,11 +863,6 @@ mod tests {
         .expect("sample CR")
     }
 
-    /// ADR 0081 T15: `spec.admin` with the cluster-bus Secret renders the admin API —
-    /// the `MQTTD_ADMIN_*` env served with each pod's own leaf, the client-CA mount and the
-    /// admin port on the container and the headless Service (never the client Service).
-    /// Without `peerTls`, or with no subject in either role list, it renders nothing
-    /// rather than a broker that cannot start.
     /// ADR 0088 D1: `secrets.peerTlsCertManager` renders the cert-manager csi volume with
     /// the lifetime and renewal lead the CR states, points the broker (and the admin API)
     /// at the volume's own `tls.crt`/`tls.key`, and arms no Secret-layout preflight. A CR
@@ -1038,6 +1033,11 @@ mod tests {
             .contains("\"admin\""));
     }
 
+    /// ADR 0081 T15: `spec.admin` with the cluster-bus Secret renders the admin API —
+    /// the `MQTTD_ADMIN_*` env served with each pod's own leaf, the client-CA mount and the
+    /// admin port on the container and the headless Service (never the client Service).
+    /// Without `peerTls`, or with no subject in either role list, it renders nothing
+    /// rather than a broker that cannot start.
     #[test]
     fn the_admin_api_renders_only_with_the_cluster_bus_and_a_role() {
         let with = |secrets: serde_json::Value, admin: serde_json::Value| {

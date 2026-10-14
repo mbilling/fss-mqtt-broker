@@ -273,6 +273,7 @@ gen_certs() {
   env -u LEAF_LIFETIME -u LEAF_DAYS -u CRL_LIFETIME -u RENEW_AT_PERMILLE \
     PKI_DIR="$SYSPKI" sh "$GEN_CERTS" "$@"
 }
+file_serial() { openssl x509 -in "$1" -noout -serial | sed 's/^serial=//'; }
 gen_certs ca >"$WORK/gen-certs.log" 2>&1 \
   || { cat "$WORK/gen-certs.log"; fail "$GEN_CERTS could not mint the cluster CA"; }
 
@@ -313,9 +314,43 @@ if not (end and renew):
     sys.exit("no 'valid until' / 'RENEW BY' line")
 when = lambda m: datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%SZ")
 left = (when(end) - when(renew)).total_seconds()
-want = 2 * 86400 * (1000 - 667) / 1000
+# The window starts a minute before the mint (clock skew between hosts), and the renew-by
+# point is measured over the whole window, as the broker measures the fraction spent.
+want = (2 * 86400 + 60) * (1000 - 667) / 1000
 sys.exit(0 if abs(left - want) <= 2 else f"{left} s between RENEW BY and the end, expected {want}")
 RENEWBY
+
+# A node's every certificate, offline: an identity minted before the CA kept a ledger,
+# renewed twice (once keeping its key), then revoked. All six certificates that ever named
+# it must be on the list — including the two the first renewal overwrote, which existed
+# nowhere but in the node's directory.
+OLDPKI="$WORK/oldpki"
+gen_old() { env -u LEAF_LIFETIME -u LEAF_DAYS -u CRL_LIFETIME PKI_DIR="$OLDPKI" sh "$GEN_CERTS" "$@"; }
+{ gen_old ca && gen_old node --lifetime 1d old-1 10.9.9.9; } >"$WORK/gen-old.log" 2>&1 \
+  || { cat "$WORK/gen-old.log"; fail "$GEN_CERTS could not mint the pre-ledger identity"; }
+rm -rf "$OLDPKI/ca/index.txt" "$OLDPKI/ca/index.txt.attr" "$OLDPKI/ca/crlnumber" "$OLDPKI/ca/issued"
+serials=("$(file_serial "$OLDPKI/old-1/peer.pem")" "$(file_serial "$OLDPKI/old-1/server.pem")")
+gen_old renew --lifetime 2h old-1 >>"$WORK/gen-old.log" 2>&1 \
+  || { cat "$WORK/gen-old.log"; fail "$GEN_CERTS could not renew a pre-ledger identity"; }
+serials+=("$(file_serial "$OLDPKI/old-1/peer.pem")" "$(file_serial "$OLDPKI/old-1/server.pem")")
+key_before="$(openssl pkey -in "$OLDPKI/old-1/peer.key" -pubout)"
+gen_old renew --lifetime 2h --reuse-key old-1 >>"$WORK/gen-old.log" 2>&1 \
+  || { cat "$WORK/gen-old.log"; fail "$GEN_CERTS could not renew with --reuse-key"; }
+[[ "$(openssl pkey -in "$OLDPKI/old-1/peer.key" -pubout)" == "$key_before" ]] \
+  || fail "$GEN_CERTS renew --reuse-key replaced the key"
+serials+=("$(file_serial "$OLDPKI/old-1/peer.pem")" "$(file_serial "$OLDPKI/old-1/server.pem")")
+gen_old revoke old-1 >>"$WORK/gen-old.log" 2>&1 \
+  || { cat "$WORK/gen-old.log"; fail "$GEN_CERTS could not revoke a renewed identity"; }
+old_crl="$(openssl crl -in "$OLDPKI/ca/peer-crl.pem" -noout -text)"
+for s in "${serials[@]}"; do
+  grep -qi "Serial Number: $s" <<<"$old_crl" || { cat "$WORK/gen-old.log"
+    fail "revoking old-1 left serial $s off the list: a certificate that once named the node \
+stays valid until it ends"; }
+done
+[[ "$(sort -u < <(printf '%s\n' "${serials[@]}") | wc -l | tr -d ' ')" == 6 ]] \
+  || fail "the three generations of old-1 did not have six distinct serials"
+pass "$GEN_CERTS revoke lists every certificate a node ever had — the pre-ledger pair the \
+first renewal replaced, both renewals, and a --reuse-key renewal that kept the key"
 
 # The revocation list a deployment starts with: empty, signed by the cluster CA, and already
 # named by MQTTD_PEER_TLS_CRL — which is what makes a later revocation a file replacement.
@@ -456,7 +491,6 @@ served_serial() { # <port> -> the serial of the certificate that listener serves
   openssl s_client -connect "127.0.0.1:$1" </dev/null 2>/dev/null \
     | openssl x509 -noout -serial 2>/dev/null | sed 's/^serial=//'
 }
-file_serial() { openssl x509 -in "$1" -noout -serial | sed 's/^serial=//'; }
 more_than() { python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) > float(sys.argv[2]) else 1)' "$1" "$2"; }
 
 old_peer_serial="$(file_serial "$SYSPKI/mqttd-a/peer.pem")"

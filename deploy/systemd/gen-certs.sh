@@ -226,7 +226,7 @@ esac
 }
 
 # D1 / O1 of ADR 0088: no lifetime, no certificate. Sets LEAF_SECS.
-require_leaf_lifetime() { # <subcommand, for the remedy line>
+require_leaf_lifetime() { # <subcommand> <its positional args>, for the remedy line
   if [ -z "$LIFETIME" ] && [ -n "${LEAF_LIFETIME:-}" ]; then
     LIFETIME="$LEAF_LIFETIME"; LIFETIME_FROM="LEAF_LIFETIME=$LEAF_LIFETIME"
   elif [ -z "$LIFETIME" ] && [ -n "${LEAF_DAYS:-}" ]; then
@@ -239,7 +239,9 @@ require_leaf_lifetime() { # <subcommand, for the remedy line>
       echo "       There is no default. How long a node's certificate lives is decided when"
       echo "       the cluster is deployed, and whoever operates it renews before that ends"
       echo "       (ADR 0088). State it and re-run:"
-      echo "         $0 $1 --lifetime 24h ${INVOCATION#"$1"}"
+      _sub="$1"; shift
+      _keep=''; [ "$REUSE_KEY" = 0 ] || _keep=' --reuse-key'
+      echo "         $0 $_sub --lifetime 24h$_keep $*"
       echo "       <N>h, <N>d or <N>m; LEAF_LIFETIME=24h in the environment states it too."
       echo "       Hours to a day is the aim: a certificate stays good until it ends, whether"
       echo "       or not the node it names is still yours. The run prints the date to renew"
@@ -252,9 +254,13 @@ require_leaf_lifetime() { # <subcommand, for the remedy line>
     echo "       e.g. --lifetime 24h or --lifetime 90d. Nothing was minted." >&2
     exit 2
   }
-  NOT_BEFORE="$NOW"
+  # notBefore a minute in the past: a peer whose clock is a few seconds behind this machine
+  # would otherwise refuse a freshly renewed node until it caught up. The END is the
+  # stated lifetime from now; the renew-by point is measured over the whole window, as
+  # the broker measures the fraction spent (notBefore..notAfter).
+  NOT_BEFORE=$((NOW - 60))
   NOT_AFTER=$((NOW + LEAF_SECS))
-  RENEW_BY=$((NOW + LEAF_SECS * RENEW_AT_PERMILLE / 1000))
+  RENEW_BY=$((NOT_BEFORE + (NOT_AFTER - NOT_BEFORE) * RENEW_AT_PERMILLE / 1000))
 }
 
 # The revocation list's nextUpdate. Announced, not asked for: 30 days unless stated.
@@ -723,6 +729,18 @@ mint_node_set() {
   node_id="$1"; peer_sans="$2"; client_sans="$3"; keep_peer="$4"; keep_server="$5"
   out="$PKI_DIR/$node_id"
 
+  # What this replaces is kept in the ledger's issued/ first. A node minted before the
+  # ledger existed has its only copy here, and once it is overwritten `revoke` could not
+  # find it, while it stays valid until it ends.
+  for _old in "$out/peer.pem" "$out/server.pem"; do
+    [ -s "$_old" ] || continue
+    _ser="$(cert_serial "$_old")"
+    [ -n "$_ser" ] || continue
+    if ! ledger_has V "$_ser" && ! ledger_has R "$_ser" && [ ! -e "$CA_DIR/issued/$_ser.pem" ]; then
+      cp "$_old" "$STAGE/db/issued/$_ser.pem"
+    fi
+  done
+
   # Rule 1: CN is the node id. Rule 2: the SAN covers the advertise host. Rule 3: both EKUs.
   mint_leaf "$STAGE/peer" "$node_id" 'serverAuth,clientAuth' "$peer_sans" "$keep_peer"
   # The client-facing leaf: the names YOUR clients dial, which are usually not the name
@@ -748,7 +766,8 @@ mint_node_set() {
 # What was minted, when it ends, and when to act. Printed by `node` and `renew`.
 window_report() { # <node id>
   cat <<EOF
-  lifetime      $LIFETIME, as stated ($LIFETIME_FROM) — checked against both certificates
+  lifetime      $LIFETIME from now, as stated ($LIFETIME_FROM) — checked against both
+                certificates, which are valid from a minute before they were minted
   valid until   $(iso "$NOT_AFTER")   ($(cert_not_after "$PKI_DIR/$1/peer.pem"), read back from peer.pem)
   RENEW BY      $(iso "$RENEW_BY")   — $RENEW_AT_PERMILLE thousandths of the lifetime, where a broker
                 starts warning about it (tls.expiry_warn_permille). The command is
@@ -760,7 +779,7 @@ EOF
 
 cmd_node() {
   [ $# -ge 2 ] || usage
-  require_leaf_lifetime node
+  require_leaf_lifetime node "$@"
   node_id="$1"; peer_host="$2"; shift 2
   require_ca "no leaf was minted for $node_id"
 
@@ -804,7 +823,7 @@ EOF
 
 cmd_renew() {
   [ $# -eq 1 ] || usage
-  require_leaf_lifetime renew
+  require_leaf_lifetime renew "$@"
   node_id="$1"
   out="$PKI_DIR/$node_id"
   for f in peer.pem peer.key server.pem server.key; do
@@ -941,6 +960,14 @@ cmd_revoke() {
   : > "$STAGE/to-revoke"
   for _ser in $(ledger_serials V "$node_id"); do
     echo "$CA_DIR/issued/$_ser.pem" >> "$STAGE/to-revoke"
+  done
+  # ... and what issued/ holds for that CN without a ledger line: certificates from before
+  # the ledger, kept there by the `renew` or `node` run that replaced them.
+  for _crt in "$CA_DIR"/issued/*.pem; do
+    [ -s "$_crt" ] || continue
+    [ "$(cert_cn "$_crt")" = "$node_id" ] || continue
+    _ser="$(cert_serial "$_crt")"
+    ledger_has V "$_ser" || ledger_has R "$_ser" || echo "$_crt" >> "$STAGE/to-revoke"
   done
   for f in peer.pem server.pem; do
     [ ! -s "$PKI_DIR/$node_id/$f" ] || echo "$PKI_DIR/$node_id/$f" >> "$STAGE/to-revoke"

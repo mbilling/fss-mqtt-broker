@@ -358,8 +358,15 @@ D1 and D5 are built as written. What they left open, and how each was settled:
   the one that most needs it. A new key by default; `--reuse-key` keeps it.
 - **`revoke` takes a node id and revokes every certificate the CA issued to it**, not one
   file: after two renewals three certificates name the node, and each is good until it
-  ends. A certificate from before the ledger is revoked from the node's directory. The
-  same id can be renewed afterwards; the new serials are not on the list.
+  ends. A certificate from before the ledger is revoked from the node's directory, and
+  `renew` or `node` copies the certificates it replaces into `ca/issued/` first, so the
+  first renewal of a node minted by the old script does not lose the only copy of a
+  certificate that is still valid. The same id can be renewed afterwards; the new serials
+  are not on the list.
+- **`notBefore` is a minute before the mint.** Until T3's tolerance exists, a peer whose
+  clock is a few seconds behind would refuse a freshly renewed node. The end is the
+  stated lifetime from the moment of minting, and the renew-by point is measured over
+  the whole window, as the broker measures the fraction spent.
 - **The list's `nextUpdate` is announced, not asked for**: 30 days unless
   `--crl-lifetime`, printed with its own re-issue-by date, as the CA's end is printed.
   `crl` issues the empty list and re-issues the current one.
