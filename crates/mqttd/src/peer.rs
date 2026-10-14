@@ -117,12 +117,13 @@ fn log_expiry_refusal(now: i64, whose: &'static str) {
     {
         warn!(
             whose,
-            "peer link refused: a cluster-bus certificate has expired; no grace (ADR 0088 D4)"
+            "peer link refused: a cluster-bus certificate has expired, or its end cannot be \
+             read; no grace (ADR 0088 D4)"
         );
     } else {
         debug!(
             whose,
-            "peer link refused: a cluster-bus certificate has expired"
+            "peer link refused: a cluster-bus certificate has expired, or its end cannot be read"
         );
     }
 }
@@ -164,6 +165,13 @@ fn admit_peer_link(
         return Err(());
     }
     let peer = leaf.and_then(mqtt_auth::mtls::not_after_from_cert);
+    // A leaf whose end cannot be read would give a link that never ends at the peer's
+    // expiry: refused, as an expired one is (issue #1016). The TLS verifier parsed the same
+    // certificate, so this is a certificate x509-parser reads differently, not a normal one.
+    if leaf.is_some() && peer.is_none() {
+        log_expiry_refusal(now, "peer-end-unreadable");
+        return Err(());
+    }
     if peer.is_some_and(|end| now > end) {
         log_expiry_refusal(now, "peer");
         return Err(());
@@ -638,6 +646,316 @@ fn held_dead_since(target: Option<&mut DialTarget>) -> Option<tokio::time::Insta
     }
 }
 
+/// The most the moves of one renewal's links are spread over (issue #1016).
+const MOVE_SPREAD_MAX_MS: i64 = 5 * 60 * 1000;
+/// The most a link's last planned move keeps clear of its end: O3's minute of clock
+/// difference, since the peer ends the link by its own clock.
+const MOVE_MARGIN_MAX_MS: i64 = 60 * 1000;
+
+/// When a link's move to later-ending certificates is tried (issue #1016).
+///
+/// A TLS session keeps the certificates of its handshake, so a link ends at the earlier of
+/// the two it was made with (ADR 0088 D3), whatever has been renewed since. Nodes minted
+/// together share a `notAfter`, so without a move every link made before a renewal would
+/// end in the same second and every node would redial all of its peers at once. Instead the
+/// node that dials the link (the smaller id; the other side never dials it) makes a second
+/// link alongside it, and that link replaces the old one in the hub
+/// ([`HubCommand::PeerConnected`]) while the old one is let go quietly. A move is tried:
+///
+/// - **after this node's own renewal** — a committed reload stores a later own end than
+///   the link was made with: at a uniformly random moment within half the time left
+///   before the end window's margin, at most [`MOVE_SPREAD_MAX_MS`], so one node's links
+///   move one at a time and not in the same second;
+/// - **in the end window** — the last quarter of the link's life, at most
+///   [`MOVE_SPREAD_MAX_MS`], ending [`MOVE_MARGIN_MAX_MS`] (at most an eighth of the life)
+///   before the end: at a uniformly random moment in it, and again every tenth of it
+///   until the end. This is what moves a link whose *peer* renewed (this node cannot see
+///   that without a handshake) and a link whose first try came before the peer had
+///   renewed.
+///
+/// A try that does not get certificates ending later than the link's is closed before
+/// the peer handshake, and nothing changes. The hard end of ADR 0088 D3 stays the backstop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MovePlan {
+    /// The earliest end of the link's certificates, Unix milliseconds.
+    end_ms: i64,
+    /// When the link was made, Unix milliseconds.
+    made_ms: i64,
+}
+
+impl MovePlan {
+    /// The end window's length and the margin it keeps before the end.
+    fn window(self) -> (i64, i64) {
+        let life = (self.end_ms - self.made_ms).max(0);
+        (
+            MOVE_SPREAD_MAX_MS.min(life / 4),
+            MOVE_MARGIN_MAX_MS.min(life / 8),
+        )
+    }
+
+    /// When the end window opens.
+    fn window_opens(self) -> i64 {
+        let (spread, margin) = self.window();
+        self.end_ms - margin - spread
+    }
+
+    /// The first try in the end window, `jitter` in `[0, 1)` placing it.
+    fn in_end_window(self, jitter: f64) -> i64 {
+        let (spread, _) = self.window();
+        self.window_opens() + scale(spread, jitter)
+    }
+
+    /// The try after a renewal of this node's certificate seen at `now`.
+    fn after_renewal(self, now: i64, jitter: f64) -> i64 {
+        let (_, margin) = self.window();
+        let room = self.end_ms - margin - now;
+        if room <= 0 {
+            return now;
+        }
+        now + scale(MOVE_SPREAD_MAX_MS.min(room / 2), jitter)
+    }
+
+    /// The next try after one at `now` that moved nothing.
+    fn retry(self, now: i64, jitter: f64) -> i64 {
+        let opens = self.window_opens();
+        if now < opens {
+            return self.in_end_window(jitter);
+        }
+        let (spread, _) = self.window();
+        now + (spread / 10).max(1000)
+    }
+}
+
+/// `span` scaled by `jitter` in `[0, 1)`.
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)] // ms, < 2^53
+fn scale(span: i64, jitter: f64) -> i64 {
+    (span as f64 * jitter.clamp(0.0, 1.0)) as i64
+}
+
+/// A uniformly random number in `[0, 1)`, from the process's hasher keys.
+#[allow(clippy::cast_precision_loss)] // 53 bits, exactly
+fn jitter() -> f64 {
+    use std::hash::BuildHasher;
+    static DRAWS: AtomicU64 = AtomicU64::new(0);
+    let bits = std::hash::RandomState::new().hash_one(DRAWS.fetch_add(1, Ordering::Relaxed));
+    (bits >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// The wall clock in Unix milliseconds.
+fn unix_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// One dialed link's moves to renewed certificates ([`MovePlan`]): what the link holds,
+/// what renewal of this node's own certificate has been acted on, and the next try.
+struct Mover {
+    /// The ends of the link being served.
+    ends: crate::hub::LinkCertEnds,
+    made_ms: i64,
+    /// This node's own end that a try has already been planned for.
+    own_seen: Option<i64>,
+    /// The next try, Unix milliseconds; `None` until planned.
+    next_ms: Option<i64>,
+}
+
+impl Mover {
+    fn new(ends: crate::hub::LinkCertEnds) -> Self {
+        Self {
+            ends,
+            made_ms: unix_now_ms(),
+            own_seen: ends.own,
+            next_ms: None,
+        }
+    }
+
+    fn plan(&self) -> Option<MovePlan> {
+        Some(MovePlan {
+            end_ms: self.ends.earliest()?.saturating_mul(1000),
+            made_ms: self.made_ms,
+        })
+    }
+
+    /// When the next try is due, at `now`, with this node's own end now `own` — or
+    /// `None` when the link has nothing to move to (no end, or past it: the hard end's).
+    fn due(&mut self, now: i64, own: Option<i64>) -> Option<i64> {
+        let plan = self.plan()?;
+        if now > plan.end_ms {
+            return None;
+        }
+        // This node's certificate was renewed since the link formed: a move can be had
+        // now, if the peer's is not what holds the end.
+        if own.is_some_and(|own| Some(own) > self.own_seen) {
+            self.own_seen = own;
+            let at = plan.after_renewal(now, jitter());
+            self.next_ms = Some(self.next_ms.map_or(at, |next| next.min(at)));
+        }
+        Some(
+            *self
+                .next_ms
+                .get_or_insert_with(|| plan.in_end_window(jitter())),
+        )
+    }
+
+    /// A try at `now` got nothing that ends later.
+    fn missed(&mut self, now: i64) {
+        self.next_ms = self.plan().map(|plan| plan.retry(now, jitter()));
+    }
+
+    /// Wait for the next try and make it: a connection to `addr` with certificates that end
+    /// later than the link's, past the TLS handshake and admission, not yet a link. Never
+    /// returns while the link has nothing to move to.
+    async fn next_link(
+        &mut self,
+        addr: &str,
+        name: &tokio_rustls::rustls::pki_types::ServerName<'static>,
+        t: &PeerTls,
+        handshake_within: Duration,
+    ) -> (tokio_rustls::client::TlsStream<TcpStream>, LinkCert) {
+        loop {
+            let own = Some(t.own_cert_end.load(Ordering::Relaxed)).filter(|e| *e != i64::MAX);
+            let now = unix_now_ms();
+            let Some(due) = self.due(now, own) else {
+                // Nothing to move to: wait for a renewal of this node's own certificate,
+                // which `due` re-reads.
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            };
+            if now < due {
+                // Looked at again each second: a renewal can move the try earlier.
+                let wait = u64::try_from((due - now).min(1000)).unwrap_or(1000);
+                tokio::time::sleep(Duration::from_millis(wait)).await;
+                continue;
+            }
+            match try_renewed_link(addr, name, t, handshake_within, self.ends).await {
+                Some(found) => return found,
+                None => self.missed(unix_now_ms()),
+            }
+        }
+    }
+}
+
+/// One try at a link whose certificates end later than `ends`: connect, handshake,
+/// admit, compare. `None` when any of it fails or nothing ends later; the connection is
+/// then closed before the peer handshake, which the peer reads as an ended connection.
+async fn try_renewed_link(
+    addr: &str,
+    name: &tokio_rustls::rustls::pki_types::ServerName<'static>,
+    t: &PeerTls,
+    handshake_within: Duration,
+    ends: crate::hub::LinkCertEnds,
+) -> Option<(tokio_rustls::client::TlsStream<TcpStream>, LinkCert)> {
+    let stream = tokio::time::timeout(MEMBER_CONNECT_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .ok()?
+        .ok()?;
+    let _ = stream.set_nodelay(true);
+    let connector = t.connector.borrow().clone();
+    let secured = tokio::time::timeout(handshake_within, connector.connect(name.clone(), stream))
+        .await
+        .ok()?
+        .ok()?;
+    let cert = admit_peer_link(secured.get_ref().1, &t.gossip_crl, &t.own_cert_end).ok()?;
+    let later = cert.ends.earliest() > ends.earliest();
+    debug!(
+        %addr,
+        old_end = ?ends.earliest(),
+        new_end = ?cert.ends.earliest(),
+        later,
+        "tried a peer link on renewed certificates"
+    );
+    later.then_some((secured, cert))
+}
+
+/// A dialed link's future, boxed so a link and the one replacing it can be held side by
+/// side ([`serve_dialed_tls`]).
+type LinkFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<LinkOutcome, std::io::Error>> + Send + 'a>,
+>;
+
+/// Serve a dialed mTLS link, and move it to renewed certificates before its end
+/// ([`MovePlan`], issue #1016): make-before-break. The new link is made alongside, its
+/// registration replaces the old one in the hub — which keeps the old one open a few
+/// seconds for what was in flight on it and then closes it — and from then on the new
+/// one is the link served here. A new link that never registers (its peer handshake
+/// failed) leaves the old one the link. Returns how the link served last ended.
+#[allow(clippy::too_many_arguments)] // `dial`'s handles, passed through
+async fn serve_dialed_tls<'a>(
+    first: tokio_rustls::client::TlsStream<TcpStream>,
+    cert: LinkCert,
+    addr: &str,
+    name: &tokio_rustls::rustls::pki_types::ServerName<'static>,
+    t: &PeerTls,
+    local: &'a NodeId,
+    hub: &'a mpsc::UnboundedSender<HubCommand>,
+    plane: Option<&'a DurablePlane>,
+    ingress: Option<&'a Arc<IngressCredit>>,
+    state: Option<&'a Arc<RuleState>>,
+    expect: Option<&'a NodeId>,
+    handshake_within: Duration,
+) -> Result<LinkOutcome, std::io::Error> {
+    let serve = |s: tokio_rustls::client::TlsStream<TcpStream>, cert: LinkCert| -> LinkFuture<'a> {
+        let expected_cn = peer_cert_cn(s.get_ref().1);
+        Box::pin(handle(
+            s,
+            local.clone(),
+            hub.clone(),
+            true,
+            expected_cn,
+            Some(Dialed {
+                expect,
+                hello_within: handshake_within,
+            }),
+            cert,
+            None,
+            plane.cloned(),
+            ingress.cloned(),
+            state.cloned(),
+        ))
+    };
+    let mut mover = Mover::new(cert.ends);
+    let mut current = serve(first, cert);
+    // The link being replaced, with what the mover held for it, until it has closed.
+    let mut retiring: Option<(LinkFuture<'a>, Mover)> = None;
+    loop {
+        tokio::select! {
+            outcome = &mut current => {
+                // A replacement whose peer handshake failed never became the link: the old
+                // one still is, and a later try may do better.
+                if !matches!(outcome, Ok(LinkOutcome::Served)) {
+                    if let Some((old, mut was)) = retiring.take() {
+                        debug!(%addr, "a renewed peer link did not form; keeping the old one");
+                        was.missed(unix_now_ms());
+                        current = old;
+                        mover = was;
+                        continue;
+                    }
+                }
+                return outcome;
+            }
+            () = async {
+                if let Some((old, _)) = retiring.as_mut() {
+                    let _ = old.await;
+                }
+            }, if retiring.is_some() => {
+                retiring = None;
+            }
+            (s, cert) = mover.next_link(addr, name, t, handshake_within) => {
+                info!(
+                    %addr,
+                    old_end = ?mover.ends.earliest(),
+                    new_end = ?cert.ends.earliest(),
+                    "moving a peer link to renewed certificates (make-before-break)"
+                );
+                let was = std::mem::replace(&mut mover, Mover::new(cert.ends));
+                let old = std::mem::replace(&mut current, serve(s, cert));
+                retiring = Some((old, was));
+            }
+        }
+    }
+}
+
 /// The dial loop behind [`dial_forever_with_ingress`] (`target` is `None`: a static
 /// peer, redialed at a fixed pace for ever) and [`dial_member`]. `handshake_within`
 /// is [`DIAL_HANDSHAKE_TIMEOUT`] everywhere but in tests.
@@ -716,23 +1034,24 @@ async fn dial(
                             // Revoked or expired (ADR 0040 T4, 0088 D4): fail closed,
                             // but keep redialing — a new CRL or a renewed certificate
                             // heals.
+                            // Served with its moves to renewed certificates (#1016).
                             Ok(s) => {
                                 match admit_peer_link(s.get_ref().1, &t.gossip_crl, &t.own_cert_end)
                                 {
                                     Ok(cert) => {
-                                        let expected_cn = peer_cert_cn(s.get_ref().1);
-                                        handle(
+                                        serve_dialed_tls(
                                             s,
-                                            local.clone(),
-                                            hub.clone(),
-                                            true,
-                                            expected_cn,
-                                            Some(dialed()),
                                             cert,
-                                            None,
-                                            plane.clone(),
-                                            ingress.clone(),
-                                            state.clone(),
+                                            &addr,
+                                            name,
+                                            t,
+                                            &local,
+                                            &hub,
+                                            plane.as_ref(),
+                                            ingress.as_ref(),
+                                            state.as_ref(),
+                                            expected_node,
+                                            handshake_within,
                                         )
                                         .await
                                     }
@@ -2776,5 +3095,150 @@ mod tests {
             "{registered:?}"
         );
         dialer.abort();
+    }
+
+    // ---- Moving a link to renewed certificates (issue #1016) ----
+
+    const HOUR_MS: i64 = 3_600_000;
+
+    /// A day-long certificate: the end window is the cap, five minutes, a minute clear of
+    /// the end; a two-minute one (the binary test's) scales both down.
+    #[test]
+    fn the_end_window_is_a_quarter_of_the_life_capped_at_five_minutes() {
+        let day = MovePlan {
+            end_ms: 24 * HOUR_MS,
+            made_ms: 0,
+        };
+        assert_eq!(day.window(), (5 * 60_000, 60_000));
+        assert_eq!(day.window_opens(), 24 * HOUR_MS - 6 * 60_000);
+        assert_eq!(day.in_end_window(0.0), 24 * HOUR_MS - 6 * 60_000);
+        assert!(day.in_end_window(0.999_999) < 24 * HOUR_MS - 60_000);
+
+        let short = MovePlan {
+            end_ms: 120_000,
+            made_ms: 0,
+        };
+        assert_eq!(short.window(), (30_000, 15_000));
+        assert_eq!(short.in_end_window(0.5), 120_000 - 15_000 - 15_000);
+    }
+
+    /// After a renewal the try lands within half the room left before the margin, at
+    /// most five minutes away; with no room left it is at once.
+    #[test]
+    fn a_renewal_is_acted_on_within_half_the_room_left_capped() {
+        let day = MovePlan {
+            end_ms: 24 * HOUR_MS,
+            made_ms: 0,
+        };
+        let renewed_at = 16 * HOUR_MS;
+        assert_eq!(day.after_renewal(renewed_at, 0.0), renewed_at);
+        let latest = day.after_renewal(renewed_at, 0.999_999);
+        assert!(latest > renewed_at && latest < renewed_at + 5 * 60_000);
+
+        let short = MovePlan {
+            end_ms: 120_000,
+            made_ms: 0,
+        };
+        // 120 s life, renewed at 30 s: 75 s of room before the 15 s margin, so 37.5 s.
+        assert_eq!(short.after_renewal(30_000, 0.5), 30_000 + 18_750);
+        assert_eq!(
+            short.after_renewal(110_000, 0.5),
+            110_000,
+            "no room: at once"
+        );
+    }
+
+    /// A try that moved nothing is tried again in the end window — at its jittered moment
+    /// when that is still ahead, and a tenth of the window later (at least a second) once
+    /// in it — and never planned past the end.
+    #[test]
+    fn a_missed_try_is_retried_in_the_end_window() {
+        let day = MovePlan {
+            end_ms: 24 * HOUR_MS,
+            made_ms: 0,
+        };
+        let opens = day.window_opens();
+        assert_eq!(day.retry(16 * HOUR_MS, 0.0), opens);
+        assert_eq!(day.retry(opens + 1, 0.0), opens + 1 + 30_000);
+        let short = MovePlan {
+            end_ms: 8_000,
+            made_ms: 0,
+        };
+        assert_eq!(short.retry(7_000, 0.0), 8_000, "at least a second apart");
+    }
+
+    fn ends(peer: i64, own: i64) -> crate::hub::LinkCertEnds {
+        crate::hub::LinkCertEnds {
+            peer: Some(peer),
+            own: Some(own),
+        }
+    }
+
+    /// A link's mover plans its first try in the end window; a renewal of this node's own
+    /// certificate brings it forward, once per renewal; past the end there is nothing to
+    /// move to (the hard end is the backstop); a plaintext link never moves.
+    #[test]
+    fn a_mover_plans_from_the_link_and_from_its_own_renewals() {
+        let now = 1_000_000_000_i64;
+        let end = now / 1000 + 24 * 3600; // seconds
+        let mut mover = Mover {
+            ends: ends(end, end),
+            made_ms: now,
+            own_seen: Some(end),
+            next_ms: None,
+        };
+        let first = mover.due(now, Some(end)).unwrap();
+        let plan = mover.plan().unwrap();
+        assert!(first >= plan.window_opens() && first < end * 1000);
+        assert_eq!(mover.due(now + 1, Some(end)), Some(first), "planned once");
+
+        let renewed = end + 24 * 3600;
+        let after = mover.due(now + 2, Some(renewed)).unwrap();
+        assert!(after >= now + 2 && after <= now + 2 + MOVE_SPREAD_MAX_MS);
+        assert_eq!(
+            mover.due(now + 3, Some(renewed)),
+            Some(after),
+            "once per renewal"
+        );
+
+        mover.missed(after);
+        let retried = mover.due(after, Some(renewed)).unwrap();
+        assert!(
+            retried >= plan.window_opens(),
+            "a miss waits for the end window"
+        );
+
+        assert_eq!(mover.due(end * 1000 + 1, Some(renewed)), None);
+        let mut plaintext = Mover::new(crate::hub::LinkCertEnds::default());
+        assert_eq!(plaintext.due(now, None), None);
+    }
+
+    /// The point of the jitter: the links of nodes minted together, renewed together, move
+    /// at different moments spread over the window — not in the same second.
+    #[test]
+    fn the_moves_of_one_renewal_are_spread() {
+        let now = 1_000_000_000_i64;
+        let end = now / 1000 + 8 * 3600;
+        let renewed = end + 24 * 3600;
+        let tries: Vec<i64> = (0..32)
+            .map(|_| {
+                let mut mover = Mover {
+                    ends: ends(end, end),
+                    made_ms: now - 16 * HOUR_MS,
+                    own_seen: Some(end),
+                    next_ms: None,
+                };
+                mover.due(now, Some(renewed)).unwrap()
+            })
+            .collect();
+        let earliest = *tries.iter().min().unwrap();
+        let latest = *tries.iter().max().unwrap();
+        assert!(earliest >= now && latest <= now + MOVE_SPREAD_MAX_MS);
+        // 32 uniform draws over five minutes span well over a minute but for a chance
+        // far below one in a billion.
+        assert!(latest - earliest > 60_000, "{tries:?}");
+        let mut seconds: Vec<i64> = tries.iter().map(|t| t / 1000).collect();
+        seconds.dedup();
+        assert!(seconds.len() > 1);
     }
 }

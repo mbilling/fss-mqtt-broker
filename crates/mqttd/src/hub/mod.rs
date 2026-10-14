@@ -2215,6 +2215,41 @@ struct Peer {
     linked_at: Instant,
 }
 
+/// How many sweep ticks (one a second) a replaced peer link is kept open for what was in
+/// flight on it ([`RetiringLink`]). Both nodes switch to the new link within a round trip
+/// and their hubs' queues; what is still owed on the old one after that is an answer to a
+/// request that arrived on it — a consensus RPC (500 ms heartbeat deadline), a
+/// replication ack (an fsync), a forward's answer — and the durable plane's own bound on
+/// such a request is five seconds. Five ticks covers all of that and holds a socket nobody
+/// writes to for no longer.
+const RETIRE_TICKS: u8 = 5;
+
+/// A peer link that a newer link to the same peer has replaced (issue #1016).
+///
+/// Replacing a link used to drop its lanes at once, which closed its socket: whatever the
+/// peer had already written on it — the reply to a consensus RPC this node sent a moment
+/// before, a replication ack, the answer to a forward — was lost with it, and recovered
+/// only by timeouts and retransmission. A renewed certificate is moved to by a new link
+/// made alongside the old one (make-before-break, `peer.rs`), and that is only lossless
+/// if the old link is let go quietly: nothing this node sends goes on it any more (the
+/// hub reaches a peer only through [`Hub::peers`], and the durable plane has been
+/// re-registered on the new lanes), but its lanes stay open, so its pump keeps reading,
+/// and a reply produced for a request that arrived on it still goes back on it.
+///
+/// It is closed after [`RETIRE_TICKS`], or at once when a certificate it was admitted
+/// under expires or is revoked, or when the peer is declared dead — what ends a link ends
+/// this one too, without counting as a link loss: the peer has a link.
+#[derive(Debug)]
+struct RetiringLink {
+    node: NodeId,
+    /// Held only to keep the link's lanes open; dropping them ends its pump.
+    _tx: PeerOutbound,
+    _ctl: PeerOutbound,
+    cert_serial: Option<Vec<u8>>,
+    cert_ends: LinkCertEnds,
+    ticks: u8,
+}
+
 /// One subscription a client holds: its filter and everything MQTT 5 attaches to
 /// that filter, in one record.
 ///
@@ -2479,6 +2514,18 @@ pub struct Hub {
     /// clock has passed this ([`end_expired_credentials`](Self::end_expired_credentials)).
     /// `i64::MAX` when nothing has an end.
     next_cert_end: i64,
+    /// The client sessions' certificate ends, earliest first, with the connection each
+    /// belongs to (`tls.end_sessions_at_cert_expiry` only): the sweep pops what has passed
+    /// instead of walking every online session. An entry whose session has gone or been
+    /// replaced is dropped when it surfaces; the heap is rebuilt from the online table
+    /// when such entries outnumber the live ones (issue #1016).
+    client_cert_ends: std::collections::BinaryHeap<std::cmp::Reverse<(i64, ClientId, u64)>>,
+    /// Links to a peer that a newer link to the same peer has replaced (issue #1016): no
+    /// longer used for anything this node sends, but kept open for
+    /// [`RETIRE_TICKS`] so what was already in flight on them arrives — a reply to a
+    /// consensus RPC, a replication ack, a forward's answer — rather than being lost
+    /// with the socket. See [`RetiringLink`].
+    retiring_links: Vec<RetiringLink>,
     /// `MQTTD_SHARED_PREFER_LOCAL`: prefer a local member in shared selection.
     shared_prefer_local: bool,
     /// `MQTTD_SHARED_LOCAL_BIAS`: how often the local preference fires, per mille
@@ -3040,6 +3087,8 @@ impl Hub {
                 allow_relaxed_publish: false,
                 end_sessions_at_cert_expiry: false,
                 next_cert_end: i64::MAX,
+                client_cert_ends: std::collections::BinaryHeap::new(),
+                retiring_links: Vec::new(),
                 shared_prefer_local: false,
                 // 1000, not 0: `shared_prefer_local` already defaults to false,
                 // so the bias is unconsulted until something turns prefer-local
@@ -3450,6 +3499,8 @@ impl Hub {
         // A link or session whose certificate has run out ends here (ADR 0088 D3).
         let now = i64::try_from(self.clock.now_epoch_secs()).unwrap_or(i64::MAX);
         self.end_expired_credentials(now).await;
+        // A replaced link has had its time for what was in flight on it (issue #1016).
+        self.close_retired_links();
         // Retransmit / re-route acked publish forwards (ADR 0042 T9,
         // exhibit ⑤); no-op when none are pending.
         self.sweep_pending_forwards();
@@ -5030,11 +5081,9 @@ impl Hub {
                 self.publish_will(&client, &w).await;
             }
         }
-        if self.end_sessions_at_cert_expiry {
-            if let Some(end) = admission.cert_not_after {
-                self.next_cert_end = self.next_cert_end.min(end);
-            }
-        }
+        let cert_end = admission
+            .cert_not_after
+            .filter(|_| self.end_sessions_at_cert_expiry);
         self.online.insert(
             client.clone(),
             Online {
@@ -5046,6 +5095,12 @@ impl Hub {
                 resumed: session_present,
             },
         );
+        if let Some(end) = cert_end {
+            self.next_cert_end = self.next_cert_end.min(end);
+            self.client_cert_ends
+                .push(std::cmp::Reverse((end, client.clone(), conn_id)));
+            self.compact_client_cert_ends();
+        }
         // Its groups' online prefixes must include it from here on (ADR 0015).
         self.shared.set_client_online(&client, true);
         info!(client = %client.0, persistent = session_expiry != 0, session_present, "client attached");
@@ -5940,6 +5995,14 @@ impl Hub {
             let conn_id = self.peers[&node].conn_id;
             self.peer_disconnected(&node, conn_id);
         }
+        // A replaced link still open for its last frames goes with it: it was admitted
+        // under the same kind of certificate, and a revoked one is served by nothing.
+        self.retiring_links.retain(|link| {
+            !link
+                .cert_serial
+                .as_ref()
+                .is_some_and(|serial| policy.peer_revoked.contains(serial))
+        });
         torn_down
     }
 
@@ -5974,14 +6037,12 @@ impl Hub {
             }
             self.peer_disconnected(&node, conn_id);
         }
+        // A replaced link kept open for its last frames is held to the same end: it is
+        // closed, quietly — it carries nothing this node sends any more.
+        self.retiring_links
+            .retain(|link| link.cert_ends.expired(now).is_none());
         if self.end_sessions_at_cert_expiry {
-            let clients: Vec<ClientId> = self
-                .online
-                .iter()
-                .filter(|(_, o)| o.admission.cert_not_after.is_some_and(|end| now > end))
-                .map(|(client, _)| client.clone())
-                .collect();
-            for client in clients {
+            for client in self.pop_expired_client_certs(now) {
                 if let Some(m) = &self.metrics {
                     m.revocation_eviction("cert-expired");
                 }
@@ -5990,12 +6051,73 @@ impl Hub {
         }
         // What is left: the next moment worth looking.
         let peer_ends = self.peers.values().filter_map(|p| p.cert_ends.earliest());
-        let client_ends = self
+        let retiring_ends = self
+            .retiring_links
+            .iter()
+            .filter_map(|l| l.cert_ends.earliest());
+        let client_end = self
+            .client_cert_ends
+            .peek()
+            .map(|std::cmp::Reverse((end, _, _))| *end);
+        self.next_cert_end = peer_ends
+            .chain(retiring_ends)
+            .chain(client_end)
+            .min()
+            .unwrap_or(i64::MAX);
+    }
+
+    /// Count down the replaced links kept open for their last frames ([`RetiringLink`]),
+    /// and close the ones whose [`RETIRE_TICKS`] are spent.
+    fn close_retired_links(&mut self) {
+        self.retiring_links.retain_mut(|link| {
+            link.ticks = link.ticks.saturating_sub(1);
+            link.ticks > 0
+        });
+    }
+
+    /// The client sessions whose certificate has passed `notAfter` at `now`, taken off
+    /// [`client_cert_ends`](Self::client_cert_ends): each still online on the connection
+    /// that was admitted with that end. Entries left by sessions that have gone or been
+    /// replaced are dropped as they surface, and when they outnumber the online sessions
+    /// the heap is rebuilt, so it stays proportional to what is online.
+    fn pop_expired_client_certs(&mut self, now: i64) -> Vec<ClientId> {
+        let mut expired = Vec::new();
+        while let Some(std::cmp::Reverse((end, _, _))) = self.client_cert_ends.peek() {
+            if *end >= now {
+                break;
+            }
+            let Some(std::cmp::Reverse((end, client, conn_id))) = self.client_cert_ends.pop()
+            else {
+                break;
+            };
+            let live = self
+                .online
+                .get(&client)
+                .is_some_and(|o| o.conn_id == conn_id && o.admission.cert_not_after == Some(end));
+            if live {
+                expired.push(client);
+            }
+        }
+        self.compact_client_cert_ends();
+        expired
+    }
+
+    /// Rebuild [`client_cert_ends`](Self::client_cert_ends) from the online table once
+    /// entries of sessions that have gone outnumber it — a device fleet that reconnects
+    /// often would otherwise leave one entry per connection until each certificate's end.
+    /// The rebuild is linear and happens at most once per that many attaches.
+    fn compact_client_cert_ends(&mut self) {
+        if self.client_cert_ends.len() <= 2 * self.online.len() + 1024 {
+            return;
+        }
+        self.client_cert_ends = self
             .online
-            .values()
-            .filter(|_| self.end_sessions_at_cert_expiry)
-            .filter_map(|o| o.admission.cert_not_after);
-        self.next_cert_end = peer_ends.chain(client_ends).min().unwrap_or(i64::MAX);
+            .iter()
+            .filter_map(|(client, o)| {
+                let end = o.admission.cert_not_after?;
+                Some(std::cmp::Reverse((end, client.clone(), o.conn_id)))
+            })
+            .collect();
     }
 
     /// Terminate a client's live session server-side (ADR 0040 T1). See
@@ -7850,7 +7972,7 @@ impl Hub {
         // on confirmed death) — the ownership-domain capability check reads this.
         self.known_peer_protos.insert(node.clone(), proto);
         let node_for_events = node.clone();
-        self.peers.insert(
+        let replaced = self.peers.insert(
             node,
             Peer {
                 conn_id,
@@ -7867,6 +7989,19 @@ impl Hub {
                 wants_origin: false,
             },
         );
+        // The link this one replaces is let go quietly ([`RetiringLink`]): nothing is
+        // sent on it from here on, and what was in flight on it still arrives.
+        if let Some(old) = replaced {
+            debug!(peer = %node_for_events.0, "peer link replaced; the old one is retired");
+            self.retiring_links.push(RetiringLink {
+                node: node_for_events.clone(),
+                _tx: old.tx,
+                _ctl: old.ctl,
+                cert_serial: old.cert_serial,
+                cert_ends: old.cert_ends,
+                ticks: RETIRE_TICKS,
+            });
+        }
         self.tell_message_events(Some(&node_for_events));
         // A node held `Dead` is linked: it is reachable, whatever membership says
         // (ADR 0087 D5), and there is nothing left to count down.
@@ -7978,6 +8113,7 @@ impl Hub {
     ///   erased as it used to be at the verdict ([`erase_peer`](Self::erase_peer)).
     fn peer_dead(&mut self, node: &NodeId) {
         let had_link = self.peers.remove(node).is_some();
+        self.retiring_links.retain(|link| &link.node != node);
         self.recompute_peers_want_origin();
         let hold = match self.held_dead.get(node) {
             // Already held dead, with no link since: a repeated verdict neither

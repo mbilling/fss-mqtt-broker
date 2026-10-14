@@ -1449,7 +1449,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 815 test(s)
+## `crates/mqttd/src/lib.rs` — 824 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1866,10 +1866,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::brownout_refuses_the_ack_and_the_live_send_for_an_online_persistent_subscriber`
 - `hub::tests::brownout_refuses_the_publishers_ack_for_an_offline_persistent_subscriber`
 - `hub::tests::cert_expiry::a_client_session_outlives_its_certificate_unless_the_setting_is_on`
+- `hub::tests::cert_expiry::a_dead_verdict_closes_a_retired_link_too`
 - `hub::tests::cert_expiry::a_link_ends_at_the_earlier_of_its_two_certificates_and_names_whose`
 - `hub::tests::cert_expiry::a_link_ends_when_this_nodes_own_certificate_does`
 - `hub::tests::cert_expiry::a_link_whose_peer_certificate_ends_is_lost_and_the_peer_is_held_not_erased`
 - `hub::tests::cert_expiry::a_plaintext_link_has_no_end`
+- `hub::tests::cert_expiry::a_replaced_link_is_retired_quietly_not_lost`
+- `hub::tests::cert_expiry::a_replaced_sessions_certificate_end_does_not_end_its_successor`
+- `hub::tests::cert_expiry::a_retired_link_still_ends_at_its_certificates_end`
 - `hub::tests::clean_session_attach_wipes_prior_persistent_state`
 - `hub::tests::commands_sort_into_the_control_and_data_lanes`
 - `hub::tests::durable_failure_reasons_are_bounded`
@@ -2078,12 +2082,17 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `peer::tests::a_frame_produced_during_the_yield_joins_the_same_write`
 - `peer::tests::a_link_served_under_the_verdict_restarts_the_dialers_window`
 - `peer::tests::a_link_that_negotiated_13_carries_no_rule_state`
+- `peer::tests::a_missed_try_is_retried_in_the_end_window`
+- `peer::tests::a_mover_plans_from_the_link_and_from_its_own_renewals`
 - `peer::tests::a_peer_held_dead_is_redialed_with_a_growing_delay_until_the_verdict_is_withdrawn`
 - `peer::tests::a_peer_that_accepts_and_never_speaks_does_not_wedge_the_dialer`
+- `peer::tests::a_renewal_is_acted_on_within_half_the_room_left_capped`
 - `peer::tests::an_alive_that_arrives_during_the_attempt_that_spends_the_window_is_not_lost`
 - `peer::tests::control_frames_jump_the_bulk_queue`
 - `peer::tests::peer_qos0_is_shed_when_the_pool_is_full_and_nothing_else_is`
 - `peer::tests::rule_state_is_applied_by_the_link_and_enters_no_hub_lane`
+- `peer::tests::the_end_window_is_a_quarter_of_the_life_capped_at_five_minutes`
+- `peer::tests::the_moves_of_one_renewal_are_spread`
 - `peer::tests::write_wait_counts_pushback_and_not_a_prompt_write`
 - `reload::tests::a_bad_gossip_crl_rejects_the_whole_reload`
 - `reload::tests::a_config_reload_swaps_live_and_keeps_it_on_any_failure`
@@ -2622,10 +2631,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `plaintext_mesh_without_binding_still_routes`
 - `the_node_holding_a_peer_dead_keeps_dialing_it_and_serves_the_link`
 
-## `crates/mqttd/tests/peer_link_expiry.rs` — 2 test(s)
+## `crates/mqttd/tests/peer_link_expiry.rs` — 3 test(s)
 
 - `a_peer_link_ends_within_a_minute_of_its_peers_certificate`
 - `an_expired_node_is_out_and_stays_out`
+- `renewed_nodes_move_their_links_before_the_old_end_without_a_gap`
 
 ## `crates/mqttd/tests/persistence.rs` — 2 test(s)
 

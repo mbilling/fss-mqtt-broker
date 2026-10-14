@@ -90,6 +90,13 @@ Each task has its own issue; #984 tracks the record as a whole.
 
 ## Changelog
 
+- **2026-10-14** — T3 follow-up (issue #1016): a renewal no longer ends every link made
+  before it in the same second. The dialing side of each link makes a new link on the
+  renewed certificates alongside the old one and lets the old one go quietly, at a
+  jittered moment after its own reload or in a window before the old end; the hard end
+  stays as the backstop. A peer leaf whose end cannot be read is refused; the own end is
+  read from the chain that is served; client certificate ends are indexed. ADR 0005
+  relay streams are not covered (ADR amendment of the same date).
 - **2026-10-14** — T3 (D3, D4) built: a peer link ends within a second of the
   `notAfter` of either certificate of its handshake, as a lost link (ADR 0087), and no
   new link forms with expired material on either side. The characterisation test showed
