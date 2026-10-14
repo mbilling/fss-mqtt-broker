@@ -162,6 +162,10 @@ async fn maintain(
     // What the hub is told, and when, follows this and not `member_states`, which
     // only remembers the last event.
     let mut held_dead: HashSet<NodeId> = HashSet::new();
+    // The peers confirmed gone while a verdict stood, and not since alive. The hub
+    // may still hold one of them — confirmed while linked, it is resolved when that
+    // link ends — so the `Alive` that follows is told to the hub too.
+    let mut confirmed_gone: HashSet<NodeId> = HashSet::new();
 
     while let Some(ev) = events.recv().await {
         // Confirmation that a peer is gone (ADR 0087 D2) is not a change of state:
@@ -170,6 +174,7 @@ async fn maintain(
         // peer, and the dialer dials no more until the next `Alive`.
         if ev.gone {
             if held_dead.remove(&ev.id) {
+                confirmed_gone.insert(ev.id.clone());
                 warn!(peer = %ev.id.0, "membership: peer CONFIRMED GONE (tombstone pruned unanswered, or a new generation joined); resolving what was held for it");
                 if let Some(dialer) = dialers.0.get(&ev.id) {
                     dialer.standing.send_replace(DialStanding::Gone);
@@ -210,7 +215,8 @@ async fn maintain(
                 // hub would then keep the verdict for the rest of the member's life,
                 // and treat every later loss of its link as the loss of a node
                 // already written off.
-                if held_dead.remove(&ev.id) {
+                // (`|`, not `||`: both sets forget the peer.)
+                if held_dead.remove(&ev.id) | confirmed_gone.remove(&ev.id) {
                     let _ = hub.send(HubCommand::PeerAlive {
                         node: ev.id.clone(),
                     });
@@ -300,6 +306,7 @@ async fn maintain(
                     });
                 }
                 held_dead.insert(ev.id.clone());
+                confirmed_gone.remove(&ev.id);
                 warn!(peer = %ev.id.0, "membership: peer DEAD; dropping its link and holding it as unreachable (what its subscribers are owed waits for it, until it answers or is confirmed gone)");
                 let _ = hub.send(HubCommand::PeerDead { node: ev.id });
             }
@@ -523,18 +530,18 @@ mod tests {
         ev_tx.send(ev("b", &addr, MemberState::Alive)).unwrap();
         let again = timeout(Duration::from_secs(2), listener.accept()).await;
         assert!(again.is_ok(), "the member's next life was not dialed");
-        // The verdict ended with the confirmation: the `Alive` withdraws nothing.
-        assert!(
-            timeout(Duration::from_millis(500), hub_rx.recv())
-                .await
-                .is_err(),
-            "nothing more for the hub"
-        );
+        // The hub is told the member is alive: it may still hold a peer confirmed
+        // gone while linked (`VerdictHold::GoneLinked`).
+        assert!(matches!(
+            next_command(&mut hub_rx).await,
+            HubCommand::PeerAlive { .. }
+        ));
     }
 
     /// The confirmation reaches the hub only while a verdict stands, and once: a new
     /// generation of a member never held `Dead` (a restart nobody noticed) is not
-    /// the end of anything the hub holds.
+    /// the end of anything the hub holds. The `Alive` after a confirmation is told
+    /// to the hub, once.
     #[tokio::test]
     async fn gone_is_told_to_the_hub_once_and_only_while_a_verdict_stands() {
         let (ev_tx, mut hub_rx) = start("z");
@@ -543,11 +550,13 @@ mod tests {
         ev_tx.send(ev("b", "b:7000", MemberState::Dead)).unwrap();
         ev_tx.send(gone("b", "b:7000")).unwrap();
         ev_tx.send(gone("b", "b:7000")).unwrap();
-        // Then a verdict of its own, so the absences above are observable.
+        // The next `Alive` is told (the hub may hold the peer confirmed gone while
+        // linked), once; then a verdict of its own, so the absences are observable.
+        ev_tx.send(ev("b", "b:7000", MemberState::Alive)).unwrap();
         ev_tx.send(ev("b", "b:7000", MemberState::Alive)).unwrap();
         ev_tx.send(ev("b", "b:7000", MemberState::Dead)).unwrap();
         let mut told = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..4 {
             told.push(next_command(&mut hub_rx).await);
         }
         assert!(
@@ -556,8 +565,9 @@ mod tests {
                 [
                     HubCommand::PeerDead { node: dead },
                     HubCommand::PeerGone { node: gone },
+                    HubCommand::PeerAlive { node: alive },
                     HubCommand::PeerDead { node: again },
-                ] if dead.0 == "b" && gone.0 == "b" && again.0 == "b"
+                ] if dead.0 == "b" && gone.0 == "b" && alive.0 == "b" && again.0 == "b"
             ),
             "{told:?}"
         );

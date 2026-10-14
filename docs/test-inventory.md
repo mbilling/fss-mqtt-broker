@@ -1453,7 +1453,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 827 test(s)
+## `crates/mqttd/src/lib.rs` — 829 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1690,6 +1690,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::zone_fwd_proofs::a_forward_unanswered_when_its_target_is_declared_dead_stays_owed_until_the_peer_answers`
 - `hub::forwarding::zone_fwd_proofs::a_hold_at_the_pending_table_bound_evicts_the_oldest_and_withholds_its_ack`
 - `hub::forwarding::zone_fwd_proofs::a_link_under_a_dead_verdict_takes_its_interest_with_it_until_the_verdict_is_withdrawn`
+- `hub::forwarding::zone_fwd_proofs::a_peer_confirmed_gone_while_linked_is_resolved_when_that_link_ends`
+- `hub::forwarding::zone_fwd_proofs::a_peer_confirmed_gone_whose_link_stays_up_and_that_is_alive_again_resolves_nothing`
 - `hub::forwarding::zone_fwd_proofs::a_peer_that_stays_dead_is_held_until_confirmed_gone_and_then_resolved_and_counted`
 - `hub::forwarding::zone_fwd_proofs::a_publish_for_a_peer_declared_dead_is_owed_to_it_as_it_is_to_a_link_down_peer`
 - `hub::forwarding::zone_fwd_proofs::a_qos0_publish_nobody_wants_does_not_walk_the_peer_map`

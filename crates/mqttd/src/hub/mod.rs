@@ -3031,6 +3031,15 @@ enum VerdictHold {
     /// Nothing is held on the verdict's account: the node is linked — and served
     /// like any other — or the hold ran out and its routing state was erased.
     Settled,
+    /// Membership confirmed the node gone ([`HubCommand::PeerGone`]) while it had a
+    /// link. The link answers for it for as long as it lasts, but it is the link of
+    /// a node membership has written off — a connection not yet torn down, or the
+    /// last of a process that is going — and its dialer has stopped. So when it
+    /// ends, what the node is owed is resolved as at a confirmation with no link
+    /// ([`peer_disconnected`](Hub::peer_disconnected)); a later link, if one forms,
+    /// does not clear this. Only an `Alive` does ([`HubCommand::PeerAlive`]): the
+    /// node is a member again, and its lost link is a member's.
+    GoneLinked,
 }
 
 /// Why the hold for a node held dead ended with its state erased (ADR 0087 D2, D9):
@@ -8052,9 +8061,12 @@ impl Hub {
         }
         self.tell_message_events(Some(&node_for_events));
         // A node held `Dead` is linked: it is reachable, whatever membership says
-        // (ADR 0087 D5), and there is nothing left to count down.
+        // (ADR 0087 D5), and there is nothing left to count down. (One confirmed
+        // gone stays so: only an `Alive` makes it a member again.)
         if let Some(hold) = self.held_dead.get_mut(&node_for_events) {
-            *hold = VerdictHold::Settled;
+            if *hold != VerdictHold::GoneLinked {
+                *hold = VerdictHold::Settled;
+            }
         }
         // A link (re)forming while gated publishes are held: schedule a scan so
         // the settle pass re-runs against the now-visible peer state (its
@@ -8114,6 +8126,16 @@ impl Hub {
         // handshake (ADR 0087 D5) — and that link is now gone. No second verdict
         // will follow, so the one that stands starts its hold again: what the link
         // brought back is kept while the node may still return, and no longer.
+        //
+        // A node membership has since confirmed GONE is not coming back under this
+        // verdict: its dialer has stopped, and no confirmation will follow the one
+        // that came. What it is owed is resolved now (ADR 0087 D2).
+        if self.held_dead.get(node) == Some(&VerdictHold::GoneLinked) {
+            self.held_dead.remove(node);
+            info!(peer = %node.0, "the link of a peer confirmed gone ended; resolving what it was owed");
+            self.erase_peer(node, Resolution::PeerGone);
+            return;
+        }
         if let Some(hold) = self.held_dead.get_mut(node) {
             *hold = VerdictHold::Unreachable {
                 ticks: REROUTE_GRACE_TICKS,
@@ -8529,8 +8551,10 @@ impl Hub {
     ///
     /// The verdict ends here. If the node has a link it is answering for itself —
     /// a pruned member that was alive after all, or the new generation already
-    /// linked — and nothing it is owed is resolved: the obligations are on that
-    /// link. Otherwise what it was still owed is resolved per subscriber kind (D2's
+    /// linked — and nothing it is owed is resolved yet: the obligations are on that
+    /// link. It is marked [`VerdictHold::GoneLinked`], so that if the link ends
+    /// before membership holds the node alive again, what it is owed is resolved
+    /// then: its dialer has stopped and no further confirmation comes. Otherwise what it was still owed is resolved per subscriber kind (D2's
     /// table), and counted: an ordinary forward — a clean session, or a persistent
     /// one in non-durable mode (O4 as decided: acknowledged and counted at
     /// confirmation, not held longer) — is discharged, and its publisher answered
@@ -8544,7 +8568,8 @@ impl Hub {
             return; // no verdict stands
         };
         if self.peers.contains_key(node) {
-            info!(peer = %node.0, "peer confirmed gone while linked; the link answers for it");
+            info!(peer = %node.0, "peer confirmed gone while linked; the link answers for it until it ends");
+            self.held_dead.insert(node.clone(), VerdictHold::GoneLinked);
             return;
         }
         if matches!(hold, VerdictHold::Unreachable { .. }) {

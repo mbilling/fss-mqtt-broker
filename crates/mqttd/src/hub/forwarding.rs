@@ -3058,6 +3058,104 @@ mod zone_fwd_proofs {
         assert!(matches!(after.try_recv(), Ok(PublishOutcome::Accepted)));
     }
 
+    /// ADR 0087 D2, from review of #1021: a confirmation that lands while the peer
+    /// still has a link — a connection not yet torn down — leaves the link to answer
+    /// for it, but not for ever. Membership has written the node off and its dialer
+    /// has stopped, so when that link ends no hold starts and no confirmation
+    /// follows: what the node was owed is resolved there and then — its interest
+    /// erased, its publishers answered on the next sweep, counted `peer-gone`.
+    #[test]
+    fn a_peer_confirmed_gone_while_linked_is_resolved_when_that_link_ends() {
+        let mut h = hub();
+        let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("gl"));
+        h.attach_metrics(metrics.clone());
+        let first = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
+        h.peer_dead(&first.node);
+        // Linked again under the verdict, and owed a publish over that link.
+        let mut again = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
+        let (id, mut rx) = register(&mut h, "t/x");
+        fan_out(&mut h, "t/x", QoS::AtLeastOnce, false, Some(id));
+        h.pending_local_done(id);
+        assert!(was_sent_a_forward(&mut again));
+
+        h.peer_gone(&again.node);
+        sweep_tick(&mut h);
+        assert!(
+            rx.try_recv().is_err() && h.interest.has_node(&again.node),
+            "while the link lasts it answers for the peer; nothing is resolved"
+        );
+
+        h.peer_disconnected(&again.node, 0);
+        sweep_tick(&mut h);
+        assert!(!h.interest.has_node(&again.node), "the interest is gone");
+        assert!(
+            matches!(rx.try_recv(), Ok(PublishOutcome::Accepted)),
+            "the publisher is answered"
+        );
+        assert!(
+            metrics
+                .render()
+                .contains("mqttd_publish_resolved_undeliverable_total{reason=\"peer-gone\"} 1"),
+            "and counted: {}",
+            metrics.render()
+        );
+        assert!(
+            !h.held_dead.contains_key(&again.node),
+            "and the verdict is over"
+        );
+        assert!(h.pending_publishes.is_empty());
+    }
+
+    /// The other side of it: a peer confirmed gone whose link stays up — it was
+    /// alive after all — and that membership then holds alive again is a member.
+    /// Nothing is resolved while the link lasts, the `Alive` clears the mark, and a
+    /// later loss of its link is a member's lost link: interest and what it is owed
+    /// are kept, and nothing is counted.
+    #[test]
+    fn a_peer_confirmed_gone_whose_link_stays_up_and_that_is_alive_again_resolves_nothing() {
+        let mut h = hub();
+        let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("gla"));
+        h.attach_metrics(metrics.clone());
+        let first = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
+        h.peer_dead(&first.node);
+        let mut again = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
+        h.peer_gone(&again.node);
+        let (id, mut rx) = register(&mut h, "t/x");
+        fan_out(&mut h, "t/x", QoS::AtLeastOnce, false, Some(id));
+        h.pending_local_done(id);
+        assert!(was_sent_a_forward(&mut again), "the live link is routed to");
+        for _ in 0..REROUTE_GRACE_TICKS * 2 {
+            sweep_tick(&mut h);
+        }
+        assert!(rx.try_recv().is_err(), "held for the peer's answer");
+
+        h.peer_alive(&again.node);
+        h.peer_disconnected(&again.node, 0);
+        for _ in 0..REROUTE_GRACE_TICKS * 2 {
+            sweep_tick(&mut h);
+        }
+        assert!(
+            h.interest.has_node(&again.node),
+            "a member's lost link keeps its interest"
+        );
+        assert!(
+            h.pending_publishes[&id]
+                .awaiting
+                .values()
+                .any(|o| o.node == again.node),
+            "and what it is owed"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the publisher is held, not answered"
+        );
+        assert!(
+            !metrics.render().contains("resolved_undeliverable_total{"),
+            "nothing is counted: {}",
+            metrics.render()
+        );
+    }
+
     /// ADR 0087 D9: a forward nobody answers — here `QoS` 0 — is not held for a peer
     /// with matching interest and no link, and since 0087-T3 that is counted,
     /// `publish_dropped{reason="peer-unreachable"}`, once per such peer. A linked

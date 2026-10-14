@@ -525,8 +525,15 @@ cut recorded in the amendment of 2026-10-14 below.
   nobody had noticed ends nothing the hub holds — and tells the dialer, which then
   dials no more (`DialStanding::Gone`); a link it is serving is served to its end, and
   the next `Alive` sets it dialing again. That replaces D5's 60 s dial window.
-- *"And no link".* The hub (`peer_gone`) ends the verdict either way; if the peer has a
-  link at that moment it is answering for itself, and nothing is resolved.
+- *"And no link".* If the peer has a link when the confirmation lands, the link answers
+  for it and nothing is resolved yet; the hub marks it confirmed gone
+  (`VerdictHold::GoneLinked`). Its dialer has stopped and no second confirmation comes,
+  so if that link then ends before membership holds the peer alive again, what it is
+  owed is resolved at once, as at a confirmation with no link. An `Alive` after the
+  confirmation — told to the hub by the link manager — clears the mark: the peer is a
+  member, and a later lost link is a member's. (From the review of PR #1021: without
+  the mark, a stale link outliving the confirmation left the peer's interest held
+  under the lost-link policy with nothing to end it.)
 - *The resolution* (`erase_peer`): an ordinary forward still owed to the peer — a clean
   session; a persistent one in non-durable mode (O4) — is discharged and its publisher
   acknowledged on the next sweep tick (one last look for a successor), and counted
