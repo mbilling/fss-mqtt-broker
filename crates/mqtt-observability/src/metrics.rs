@@ -919,10 +919,10 @@ impl Metrics {
             "QoS >= 1 publishes acknowledged to their publisher although a node that \
              owned a subscriber never accepted them, because that node is gone \
              (ADR 0087 D2, D9), by reason: peer-gone (membership confirmed the node \
-             gone: its tombstone pruned unanswered, or a new generation joined), \
-             no-shared-member (a $share group whose last members were on it), \
-             hold-expired (durable mode, until 0087-T5: the node stayed out of reach \
-             for the eight-tick hold)",
+             gone: its tombstone pruned unanswered, or a new generation joined; for \
+             a durable session, once the lease plane moved its groups and no owner \
+             announced it), no-shared-member (a $share group whose last members were \
+             on it)",
         );
 
         // Issue #480: the fraction of publishes that cross a node boundary, which

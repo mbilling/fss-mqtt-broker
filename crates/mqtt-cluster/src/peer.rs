@@ -123,7 +123,17 @@ pub const PROTO_MIN: u32 = 6;
 /// file declares `eventual` (the fourth only while its rules select the event), so a
 /// cluster without one puts none on the wire and its frames are byte for byte proto
 /// 13's. A proto-13 link is sent none: the node behind it holds no such state.
-pub const PROTO_MAX: u32 = 14;
+///
+/// Proto 15 (ADR 0087 D8, interest kinds) is additive: one frame.
+/// [`InterestKinds`](PeerMessage::InterestKinds) is an interest snapshot that says which
+/// filters are held only by sessions the lease plane owns — durable sessions, owed to
+/// whichever node is their committed owner — and which by a session that lives and
+/// dies with the sender. A node with a durable plane sends it instead of
+/// [`Interest`](PeerMessage::Interest) on a link that negotiated 15; a node without one
+/// has no interest the lease plane owns and keeps sending `Interest`, so a plain
+/// cluster's frames are byte for byte proto 14's. A proto-14 link is sent `Interest`,
+/// which the receiver reads as interest that only its node can answer for.
+pub const PROTO_MAX: u32 = 15;
 
 /// The peer-bus proto at which a build computes durable ownership over all admitted
 /// members (ADR 0073). Purely a capability marker — see [`PROTO_MAX`].
@@ -172,6 +182,10 @@ pub const REFUSAL_SHARED_MEMBER_GONE: u16 = 3;
 /// [`StateWant`](PeerMessage::StateWant) and
 /// [`StateExpiry`](PeerMessage::StateExpiry) (ADR 0085).
 pub const PROTO_RULE_STATE: u32 = 14;
+
+/// The peer-bus proto at which a link carries
+/// [`InterestKinds`](PeerMessage::InterestKinds) (ADR 0087 D8).
+pub const PROTO_INTEREST_KINDS: u32 = 15;
 
 /// The parts a namespace of rule state is summarised in
 /// ([`StateDigest`](PeerMessage::StateDigest)): a key's part is the top bits of a
@@ -988,6 +1002,31 @@ pub enum PeerMessage {
         /// second or before has had it raised.
         swept: u64,
     },
+    // ---------------------------------------------------------------------
+    // Proto 15 (ADR 0087 D8, interest kinds). Appended.
+    // ---------------------------------------------------------------------
+    /// A full snapshot of the sending node's local subscription interest, as
+    /// [`Interest`](Self::Interest) is, with each filter's KIND (ADR 0087 D8).
+    ///
+    /// `lease_owned` holds the filters every subscriber of which on the sender is a
+    /// session the lease plane owns: a durable session, owed to whichever node is its
+    /// committed owner, so when the lease moves it the new owner's answer stands for
+    /// the sender's. `node_bound` holds every other filter — one at least one session
+    /// that lives and dies with the sender holds (a clean session; any session
+    /// without a durable plane): only the sender can answer for it, or the
+    /// confirmation that it is gone. The two are disjoint, and their union is what
+    /// `Interest` would carry.
+    ///
+    /// Sent instead of `Interest`, on the same triggers, by a node with a durable
+    /// plane on a link that negotiated proto ≥ 15. `Interest` itself means every
+    /// filter is node-bound — what a node without a durable plane, and a peer behind
+    /// an older link, is read as.
+    InterestKinds {
+        /// Filters a session bound to the sender holds.
+        node_bound: Vec<String>,
+        /// Filters held only by sessions the lease plane owns.
+        lease_owned: Vec<String>,
+    },
 }
 
 impl PeerMessage {
@@ -1500,8 +1539,8 @@ mod tests {
     use super::{
         decode, encode, encode_legacy, negotiate_proto, ForwardVerdict, PeerCodecError,
         PeerMessage, ReplicaEntryWire, RetainedWireEntry, SharedGroupWire, SharedMemberWire,
-        WireAppProps, WireOrigin, MAX_FRAME, PROTO_FORWARD_REACHED, PROTO_MAX,
-        PROTO_MESSAGE_ORIGIN, PROTO_MIN, PROTO_OWNERSHIP_DOMAIN, PROTO_PUBLISH_ORIGIN,
+        WireAppProps, WireOrigin, MAX_FRAME, PROTO_FORWARD_REACHED, PROTO_INTEREST_KINDS,
+        PROTO_MAX, PROTO_MESSAGE_ORIGIN, PROTO_MIN, PROTO_OWNERSHIP_DOMAIN, PROTO_PUBLISH_ORIGIN,
         PROTO_REPLICATION_FACTOR, PROTO_REPLICA_READ_PAGED, PROTO_RULE_STATE, STATE_PARTS,
     };
     use bytes::BytesMut;
@@ -2157,14 +2196,62 @@ mod tests {
 
         assert_eq!(PROTO_RULE_STATE, 14);
         assert_eq!(
-            negotiate_proto((PROTO_MIN, PROTO_MAX), (PROTO_MIN, PROTO_MAX)),
+            negotiate_proto((PROTO_MIN, PROTO_MAX), (PROTO_MIN, PROTO_RULE_STATE)),
             Some(PROTO_RULE_STATE),
-            "this build must announce the proto-14 rule-state frames"
+            "this build must still speak the proto-14 rule-state frames"
         );
         assert_eq!(
             negotiate_proto((PROTO_MIN, PROTO_MAX), (PROTO_MIN, PROTO_MESSAGE_ORIGIN)),
             Some(PROTO_MESSAGE_ORIGIN),
             "a proto-13 peer keeps negotiating 13"
+        );
+    }
+
+    /// Proto 15 (ADR 0087 D8): `InterestKinds` round-trips, is APPENDED after every
+    /// earlier frame with its bytes pinned, and this build announces 15 — while a
+    /// proto-14 peer (a 1.2.0-era build) still negotiates 14 and a v1.1.0 peer 12, and
+    /// neither is sent it.
+    #[test]
+    fn interest_kinds_is_appended_and_announced_at_proto_15() {
+        let kinds = PeerMessage::InterestKinds {
+            node_bound: vec!["a/#".into()],
+            lease_owned: vec!["b".into(), "c/+".into()],
+        };
+        roundtrip(&kinds);
+        roundtrip(&PeerMessage::InterestKinds {
+            node_bound: Vec::new(),
+            lease_owned: Vec::new(),
+        });
+        let mut out = Vec::new();
+        encode(&kinds, &mut out).unwrap();
+        assert_eq!(out[4], 35, "appended after StateExpiry (34)");
+        assert_eq!(
+            &out[5..],
+            [1, 3, b'a', b'/', b'#', 2, 1, b'b', 3, b'c', b'/', b'+'],
+            "two length-prefixed lists of length-prefixed filters: node-bound, then \
+             lease-owned"
+        );
+        // The fuzz target starts from this frame too.
+        let mut buf =
+            BytesMut::from(&include_bytes!("../fuzz/seeds/peer_decode/interest_kinds.bin")[..]);
+        assert_eq!(decode(&mut buf).unwrap(), Some(kinds));
+        assert!(buf.is_empty());
+
+        assert_eq!(PROTO_INTEREST_KINDS, 15);
+        assert_eq!(
+            negotiate_proto((PROTO_MIN, PROTO_MAX), (PROTO_MIN, PROTO_MAX)),
+            Some(PROTO_INTEREST_KINDS),
+            "this build must announce interest kinds"
+        );
+        assert_eq!(
+            negotiate_proto((PROTO_MIN, PROTO_MAX), (PROTO_MIN, PROTO_RULE_STATE)),
+            Some(PROTO_RULE_STATE),
+            "a proto-14 peer keeps negotiating 14"
+        );
+        assert_eq!(
+            negotiate_proto((PROTO_MIN, PROTO_MAX), (PROTO_MIN, PROTO_PUBLISH_ORIGIN)),
+            Some(PROTO_PUBLISH_ORIGIN),
+            "a v1.1.0 peer keeps negotiating 12"
         );
     }
 

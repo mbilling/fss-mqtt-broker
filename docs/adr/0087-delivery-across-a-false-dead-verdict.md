@@ -9,7 +9,8 @@
   outage still ends in), [#971](https://github.com/mbilling/fss-mqtt-broker/issues/971)
   (closed: formation, and re-admission after a false verdict),
   [#1020](https://github.com/mbilling/fss-mqtt-broker/issues/1020) (0087-T3: confirmation
-  and its resolution)
+  and its resolution), [#1024](https://github.com/mbilling/fss-mqtt-broker/issues/1024)
+  (0087-T5: interest kinds)
 - **Related:** [ADR 0016](0016-swim-membership-stability.md) (membership stability, and its
   2026-10-12 amendment), [ADR 0042](0042-durable-plane-stress-harness.md) (T9: "acked means
   durable, cluster-wide" — where the acknowledged forward comes from),
@@ -562,9 +563,9 @@ cut recorded in the amendment of 2026-10-14 below.
   SWIM's verdict, plus SWIM's own tick at the prune, the 250 ms the greeting is given,
   and the sweep tick the answer waits for — not "`dead_ttl` plus a sweep tick" exactly,
   as the plan row put it: the greeting's quarter second is O1's "unanswered".
-- *Durable mode.* The hold ends at the earlier of confirmation and the eight-tick
-  countdown of 0087-T2, and what the countdown ends is counted
-  `reason="hold-expired"`. Until D8 (T5) a publish made after a durable session's
+- *Durable mode (until 0087-T5; see D8 "As built").* The hold ends at the earlier of
+  confirmation and the eight-tick countdown of 0087-T2, and what the countdown ends is
+  counted `reason="hold-expired"`. Until D8 (T5) a publish made after a durable session's
   takeover is owed to the dead node and to the new owner alike, and the re-route
   discharge of (2) does not see it (the new owner is not a re-route candidate for a
   publish it was sent anyway), so holding to confirmation would make every durable
@@ -719,8 +720,7 @@ publish that enters at a v1.1.0 node is treated as today until that node is upgr
 v1.1.0 receiver drops its forward window on its own verdict (a duplicate, not a loss).
 D8 is the one wire addition, additive at proto 15 with per-link gating; over an older link
 the peer's interest is treated as not durable, i.e. held until the peer answers or is
-confirmed gone. *(Open: O5 — or today's re-route discharge for such links, during the
-upgrade only.)*
+confirmed gone. *(O5 decided 2026-10-14: so. Built in 0087-T5 — D8 "As built".)*
 
 **As built (0087-T2b): one refusal code, no frame.** "The named `$share` member is gone"
 is code 3 of `ForwardVerdict::Refused`, a field every proto ≥ 7 build decodes; a build
@@ -751,9 +751,59 @@ clean-session subscriber on a peer that was not dead), or hold it until the peer
 or is confirmed gone (and turn every durable failover into a 30 s publisher pause). So
 the interest snapshot says which filters belong to sessions the lease plane owns; D2's
 discharge (2) applies to those and only those. A node sends the new form only on a link
-that negotiated 15. *(Open: O2 — whether this is in the first cut. The view here: it is
-part of the minimum complete fix, because without it either the loss or the failover
-pause is wrong.)*
+that negotiated 15. *(O2 decided 2026-10-14: in the first cut.)*
+
+**As built (0087-T5, issue #1024).**
+
+- *The frame.* `PeerMessage::InterestKinds { node_bound, lease_owned }`, appended at tag
+  35, `PROTO_MAX` 15 (`PROTO_INTEREST_KINDS`); the pinned body of
+  `{ ["a/#"], ["b", "c/+"] }` is `23 01 03 'a/#' 02 01 'b' 03 'c/+'`, and it is a seed of
+  the `peer_decode` fuzz target. It is a whole interest snapshot, sent instead of
+  `Interest` on the same triggers: `lease_owned` holds the filters EVERY subscriber of
+  which on the sender is a persistent session (a session the lease plane owns),
+  `node_bound` every other. A node with a durable plane sends it on a link that
+  negotiated 15; a node without one has no lease-owned interest and keeps sending
+  `Interest`, so a plain cluster's frames are byte for byte proto 14's. `Interest` is
+  read as every filter node-bound.
+- *Where the kind is kept.* The interest index keeps each node's lease-owned filters in
+  a second table beside the first. The publish path walks the first, as before; the
+  second is asked only about a publish owed to a node that cannot be reached.
+- *What discharges a forward owed to a node held dead* (`discharge_owner_bound`), all
+  of: every filter of the node's that matches the topic is lease-owned; the committed
+  lease map this node was last pushed names the node for no group — the lease plane has
+  moved its sessions (read unfiltered by liveness: a node held dead still owns what the
+  plane has not moved, so a false verdict at a node that does not lead the lease group,
+  or a partition the plane did not act on, discharges nothing); and another node that
+  announces lease-owned interest for the topic has answered the publish, or the publish
+  was handed to a persistent session on this node (this node took the session over).
+  Whoever was sent what: the new owner's answer counts whether the publish reached it
+  in the fan-out or as a re-route when it announced the session. The re-route itself
+  no longer discharges anything (it did, on the topic alone, since before this record).
+- *The countdown is gone*, in durable mode as in plain: a hold ends when the node
+  answers, the verdict is withdrawn, the committed owner answers (above), or the node
+  is confirmed gone.
+- *At confirmation* (D2's durable row) a forward for lease-owned interest is not
+  resolved: the node's routing state is erased and the forward stays owed
+  (`VerdictHold::Gone`), to be discharged by the new owner's answer, or — once the
+  lease plane has moved the node's groups, the session sweep has seen the move and
+  opened its takeover window, and this node's routing view has settled with nobody
+  announcing the interest — resolved and counted `peer-gone`. While the lease plane
+  still names the node (no quorum moved it) it stays held.
+- *Mixed versions (O5).* A peer behind a link below 15 — a 1.2.0-era build (14) or
+  v1.1.0 (12) — sends `Interest`, so its interest is node-bound: what it is owed waits
+  for it or for confirmation, and its answer is never taken for a durable session's
+  owner's. A durable failover of such a node therefore holds its publishers until
+  confirmation (30 s) instead of the failover pause, during the roll only; nothing
+  acknowledged is lost on a mixed link that was not lost between two proto-15 nodes.
+- *Measured* (`false_dead_delivery.rs`, three nodes, loopback). A follower holds B dead
+  with the link cut: a clean session's publish is held through 12 s — past the old
+  countdown — and answered 0.9 s after the confirmation, counted `peer-gone` (it was
+  acknowledged at 8 s, undelivered, `hold-expired`); a durable session's beside it is
+  held past the confirmation and, B being alive, delivered and acknowledged when its
+  link returns. The leader holds B dead and moves its groups: the durable session's
+  publish is stored by the new owner and acknowledged 4.0 s after the verdict, the
+  clean session's beside it 1.0 s after the confirmation, and only the clean one is
+  counted.
 
 ### D9 — Observability
 
@@ -764,7 +814,7 @@ pause is wrong.)*
 - `mqttd_publish_resolved_undeliverable_total{reason}`: publishes acknowledged at D2's
   confirmation because their subscriber's node was confirmed gone, by reason
   (`peer-gone`, `no-shared-member`). *(As built, 0087-T3, with a third reason for the
-  durable-mode countdown until T5: `hold-expired`.)*
+  durable-mode countdown until T5: `hold-expired`, no longer emitted since 0087-T5.)*
 - `mqttd_publish_dropped_total{reason="peer-unreachable"}`: QoS 0 not forwarded to a peer
   with matching interest and no link. The `no-subscriber` reason is either emitted or
   taken out of the help text. *(As built, 0087-T3: counted once per such peer, for
@@ -809,15 +859,18 @@ clean-session QoS 1 rung at ten nodes, the durable rung, and the `$share` QoS 1 
   after the verdict — or a new generation of the id. A publisher may wait that long for
   an acknowledgement ("yes 30 seconds is fine"). Not chosen: a separate, shorter bound
   for routing than for membership. Built in 0087-T3 (D2 "As built").
-- **O2 — D8 in the first cut?** Proposed: yes (see D8).
+- **O2 — D8 in the first cut? Decided 2026-10-14 (the maintainer):** yes. Built in
+  0087-T5 (D8 "As built").
 - **O3 — At the pending-table bound:** withhold (today) or answer a v5 publisher `0x97`
   when the message is stored nowhere.
 - **O4 — Persistent sessions in non-durable mode on a node confirmed gone. Decided
   2026-10-14 (the maintainer), the proposed default:** acknowledge and count at
   confirmation (resolved-undeliverable); do not hold longer for a node that may restart
   with its disk. Built in 0087-T3.
-- **O5 — Links below proto 15 during an upgrade:** hold conservatively (proposed), or
-  keep today's discharge-on-re-route for them.
+- **O5 — Links below proto 15 during an upgrade. Decided 2026-10-14 (the maintainer),
+  the proposed default:** held conservatively — a peer behind such a link has no
+  interest the lease plane owns. A mixed link must never lose an acknowledged message;
+  slower is acceptable. Built in 0087-T5.
 - **O6 — A pair that cannot reach each other while both reach a third node.** SWIM does
   not call either dead (indirect probes succeed), so today and under this design the
   publish is held until the pair's link returns. Relaying through the third node is not
@@ -961,8 +1014,8 @@ its own, so that a broker whose workers are all busy still answers its probes.
   partition, for every subscriber kind, up to the pending table's bound.
 - After a real node death, publishers to that node's non-durable subscribers wait for
   confirmation — up to 30 s where it is 8 s today. Durable failover is unchanged, given D8.
-  *(As built, 0087-T3: so in plain mode; with a durable plane the 8 s countdown stays
-  an upper bound until D8 — the amendment of 2026-10-14.)*
+  *(As built, 0087-T3: so in plain mode; with a durable plane the 8 s countdown stayed
+  an upper bound until D8. As built, 0087-T5: so in both modes.)*
 - A node's interest outlives a verdict about it by up to `dead_ttl`; the memory is the
   interest snapshot it already held.
 - Operators get series and a log line for what is held and what was resolved
@@ -978,9 +1031,10 @@ its own, so that a broker whose workers are all busy still answers its probes.
   in §1 are from the code.
 - The proto-6 rows of §1 are from the code; no supported release speaks proto 6.
 - D5 is built (0087-T4), D1, D4 and D6 (0087-T2), and D2 with the counters of D9
-  (0087-T3) — in durable mode with the countdown of D1 as an upper bound until D8.
-  D3, D7, D8 and the rest of D9 are designed against the code and not built; D3's
-  table-fill arithmetic is not a measurement.
+  (0087-T3) — in durable mode with the countdown of D1 as an upper bound until D8 —
+  and D8 with D7's protocol step (0087-T5), which removed that countdown. D3 and the
+  rest of D9 are designed against the code and not built; D3's table-fill arithmetic
+  is not a measurement.
 - 0087-T3's confirmation is injected in the episodes as the event the link manager
   reads; that SWIM raises it at the prune, after an unanswered greeting, and at a new
   generation is tested on the state machine (`swim.rs`), not on a running cluster. The
@@ -1061,3 +1115,36 @@ So:
   was before T3; it is now counted (`hold-expired`) where it was silent. An episode
   pins it (`durable_a_peer_out_of_reach_is_answered_at_the_countdown_and_counted`), and
   T5 flips it. T3's acceptance in durable mode is T5's.
+
+## Amendment (2026-10-14): 0087-T5 — interest kinds; the durable-mode countdown is gone (issue #1024)
+
+O2 and O5 decided by the maintainer the same day (§6). D8 is built as its "As built"
+says, and the cut of the previous amendment is lifted: with a durable plane a hold has no
+countdown either. The known gap that amendment recorded — a clean session behind a
+partition longer than eight sweep ticks acknowledged undelivered — is closed: such a
+publish is held until confirmation and then counted `peer-gone`
+(`durable_a_peer_out_of_reach_holds_a_clean_session_to_confirmation_and_a_durable_one_past_it`
+replaces `durable_a_peer_out_of_reach_is_answered_at_the_countdown_and_counted`). A
+durable failover still holds its publishers for the failover pause, now by the new
+owner's answer for interest the lease plane owns rather than by a countdown that ended
+every kind of hold alike.
+
+What is left, stated rather than hidden:
+
+- *The answer is matched on the topic and the kind, not on the session.* A node that
+  announces lease-owned interest for the topic and answers the publish discharges what
+  the dead owner was owed once the lease plane has moved the dead owner's groups —
+  whether or not it is the owner of THAT session. When the dead owner's session moved
+  to a node that has not yet taken it over, while another node with a durable session
+  on the same filter has already answered, the moved session misses the publish unless
+  this node's takeover window re-routes it there (the re-route of exhibit ⑥, flagged so
+  a session already holding it skips it) — the race §3's leader column showed before
+  this record, now narrowed to durable interest after the lease has moved. A clean
+  session is never discharged this way.
+- *A node confirmed gone whose groups the lease plane cannot move* keeps its durable
+  sessions' publishers held for as long as that lasts: a write without a quorum is not
+  acknowledged (D2's durable row). The pending table is the bound (D3).
+- *During a roll* a durable owner's death behind a link below 15 holds its publishers
+  until confirmation (O5).
+- *The hot path* is unchanged by inspection (the publish walks one table, as before);
+  D10's re-measurement is T9's.

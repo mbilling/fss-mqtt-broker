@@ -696,6 +696,17 @@ impl Placement {
         self.lease_owners.get(&group).cloned()
     }
 
+    /// Whether `node` holds the committed lease of any group, as the replicated lease
+    /// map last pushed here says — unfiltered by liveness, unlike
+    /// [`committed_group_owner`](Self::committed_group_owner): a node membership holds
+    /// `Dead` still owns what the lease plane has not yet moved (ADR 0087 D8). `None`
+    /// while no lease map has been pushed (bootstrap, non-durable), when nothing can
+    /// be said.
+    #[must_use]
+    pub fn holds_a_lease(&self, node: &NodeId) -> Option<bool> {
+        (!self.lease_owners.is_empty()).then(|| self.lease_owners.values().any(|h| h == node))
+    }
+
     /// The current lease voter set as seen by this ring (ADR 0049) — empty until
     /// the durable driver has pushed it. Exposed so ownership convergence can be
     /// observed (tests, diagnostics).
@@ -1095,6 +1106,35 @@ mod tests {
             );
         }
         p
+    }
+
+    /// ADR 0087 D8: whether a node holds a committed lease reads the lease map as
+    /// pushed, a node membership holds `Dead` included — the lease plane has not moved
+    /// its groups until the map says so — and says nothing before a map is pushed.
+    #[test]
+    fn holding_a_lease_reads_the_committed_map_whatever_membership_says() {
+        use std::collections::BTreeMap;
+        let mut p = ring("a", &["b", "c"]);
+        assert_eq!(p.holds_a_lease(&node("b")), None, "no map pushed yet");
+        p.set_lease_owners(BTreeMap::from([(1, node("b")), (2, node("c"))]));
+        p.observe(&node("b"), MemberState::Dead, "b:7000", None);
+        assert_eq!(
+            p.holds_a_lease(&node("b")),
+            Some(true),
+            "held dead, still the owner"
+        );
+        assert_eq!(
+            p.committed_group_owner(1),
+            None,
+            "where the data path stops routing"
+        );
+        p.set_lease_owners(BTreeMap::from([(1, node("c")), (2, node("c"))]));
+        assert_eq!(
+            p.holds_a_lease(&node("b")),
+            Some(false),
+            "the lease plane moved it"
+        );
+        assert_eq!(p.holds_a_lease(&node("c")), Some(true));
     }
 
     // --- 2026-07-20 post-mortem: the data path follows the committed lease ---

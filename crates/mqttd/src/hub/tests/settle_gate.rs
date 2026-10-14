@@ -508,6 +508,7 @@ async fn an_early_acked_publish_still_re_routes_to_a_peer_that_advertises_intere
         node: NodeId("successor".into()),
         conn_id: Some(1),
         filters: Vec::new(),
+        lease_owned: Vec::new(),
     })
     .await;
 
@@ -525,6 +526,7 @@ async fn an_early_acked_publish_still_re_routes_to_a_peer_that_advertises_intere
         node: NodeId("successor".into()),
         conn_id: None,
         filters: vec!["settle/r".into()],
+        lease_owned: Vec::new(),
     })
     .await;
     assert!(
@@ -1180,6 +1182,7 @@ async fn a_proto_11_peer_gets_the_untagged_forward_and_an_untagged_replay_still_
         node: NodeId("old-peer".into()),
         conn_id: None,
         filters: vec!["q/#".into()],
+        lease_owned: Vec::new(),
     })
     .await;
     let _ack = fix.publish_gated("q/1").await;

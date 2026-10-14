@@ -264,7 +264,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 417 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 419 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -461,6 +461,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `peer::tests::a_frozen_frame_with_a_lying_inner_length_is_rejected`
 - `peer::tests::an_origin_without_a_username_or_an_address_round_trips`
 - `peer::tests::an_oversized_frame_is_rejected_at_encode`
+- `peer::tests::interest_kinds_is_appended_and_announced_at_proto_15`
 - `peer::tests::paged_replica_read_frames_roundtrip_at_appended_indices`
 - `peer::tests::partial_frame_returns_none`
 - `peer::tests::proto_negotiation_picks_the_newest_common_version_or_rejects`
@@ -496,6 +497,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `placement::tests::for_each_member_is_the_same_set_as_members`
 - `placement::tests::group_of_is_deterministic_and_in_range`
 - `placement::tests::group_queries_are_consistent`
+- `placement::tests::holding_a_lease_reads_the_committed_map_whatever_membership_says`
 - `placement::tests::owner_route_is_none_until_the_owner_address_is_known`
 - `placement::tests::owner_route_points_at_a_remote_owner_and_is_none_when_local`
 - `placement::tests::owns_and_is_replica_agree_with_the_ring`
@@ -862,7 +864,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_whole_env_surface_overlays_without_collision`
 - `tests::warn_mode_boots_a_newer_config_and_reports_the_ignored_keys`
 
-## `crates/mqtt-core/src/lib.rs` — 56 test(s)
+## `crates/mqtt-core/src/lib.rs` — 57 test(s)
 
 - `retry::tests::delays_ramp_within_jitter_bounds_and_cap`
 - `retry::tests::reset_returns_to_base`
@@ -886,6 +888,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `subscriptions::tests::a_distinct_filter_is_allocated_once_however_many_subscribers`
 - `subscriptions::tests::a_fully_removed_filter_can_be_resubscribed`
 - `subscriptions::tests::client_with_overlapping_filters_appears_once`
+- `subscriptions::tests::counts_one_clients_matching_filters_and_splits_filters_by_their_subscribers`
 - `subscriptions::tests::deep_filter_teardown_stays_iterative`
 - `subscriptions::tests::dollar_topics_are_hidden_from_leading_wildcards_only`
 - `subscriptions::tests::empty_levels_and_literal_wildcard_spellings`
@@ -1453,7 +1456,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 830 test(s)
+## `crates/mqttd/src/lib.rs` — 833 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1687,6 +1690,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::pending_bounds::the_entry_cap_evicts_only_the_oldest`
 - `hub::forwarding::pending_bounds::the_reached_record_is_charged_and_released_with_its_entry`
 - `hub::forwarding::pending_bounds::the_sweep_retransmits_only_overdue_forwards`
+- `hub::forwarding::zone_fwd_proofs::a_durable_session_that_materialises_here_discharges_what_its_dead_owner_was_owed`
+- `hub::forwarding::zone_fwd_proofs::a_durable_sessions_forward_outlives_its_owners_confirmation_until_an_owner_answers`
 - `hub::forwarding::zone_fwd_proofs::a_forward_unanswered_when_its_target_is_declared_dead_stays_owed_until_the_peer_answers`
 - `hub::forwarding::zone_fwd_proofs::a_hold_at_the_pending_table_bound_evicts_the_oldest_and_withholds_its_ack`
 - `hub::forwarding::zone_fwd_proofs::a_link_to_a_peer_confirmed_gone_that_stays_up_is_dropped_after_the_countdown`
@@ -1699,12 +1704,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::zone_fwd_proofs::a_reached_answer_is_downgraded_for_an_older_peer`
 - `hub::forwarding::zone_fwd_proofs::a_reached_forward_releases_a_held_ack_and_a_stored_one_does_not`
 - `hub::forwarding::zone_fwd_proofs::a_refused_share_delivery_is_not_moved_to_a_member_that_cannot_be_reached`
-- `hub::forwarding::zone_fwd_proofs::a_session_that_materialises_here_discharges_what_the_unreachable_peer_was_owed`
 - `hub::forwarding::zone_fwd_proofs::a_share_delivery_does_not_move_from_one_unreachable_member_to_another`
 - `hub::forwarding::zone_fwd_proofs::a_share_delivery_in_flight_at_a_verdict_moves_to_a_reachable_member_or_stays_owed`
 - `hub::forwarding::zone_fwd_proofs::a_share_delivery_owed_to_a_dead_node_moves_to_a_new_member_or_ends_with_the_hold`
 - `hub::forwarding::zone_fwd_proofs::a_share_group_keeps_its_members_across_a_lost_link_and_a_verdict`
-- `hub::forwarding::zone_fwd_proofs::a_successor_that_announces_the_interest_discharges_what_the_unreachable_peer_was_owed`
 - `hub::forwarding::zone_fwd_proofs::a_takeover_redelivery_that_reaches_a_session_ends_the_grace_and_the_hold`
 - `hub::forwarding::zone_fwd_proofs::a_takeover_reroute_ends_the_grace`
 - `hub::forwarding::zone_fwd_proofs::after_dead_suspect_alive_a_lost_link_is_a_members_lost_link`
@@ -1712,15 +1715,17 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::zone_fwd_proofs::an_already_answered_victim_is_not_counted_as_a_withheld_ack`
 - `hub::forwarding::zone_fwd_proofs::closing_the_window_clears_both_holds_and_acks`
 - `hub::forwarding::zone_fwd_proofs::every_exit_from_the_fan_out_restores_the_buffer`
+- `hub::forwarding::zone_fwd_proofs::interest_carries_its_kinds_on_a_proto_15_link_and_only_there`
 - `hub::forwarding::zone_fwd_proofs::qos0_for_a_peer_with_no_link_is_counted_peer_unreachable`
 - `hub::forwarding::zone_fwd_proofs::releasing_the_ack_hold_does_not_shrink_the_settle_work_set`
 - `hub::forwarding::zone_fwd_proofs::the_ack_hold_clear_is_one_way_and_narrow`
 - `hub::forwarding::zone_fwd_proofs::the_answer_is_at_most_once`
+- `hub::forwarding::zone_fwd_proofs::the_committed_owners_answer_discharges_only_what_the_lease_plane_owns`
 - `hub::forwarding::zone_fwd_proofs::the_drain_barrier_reports_the_drain_gated_publishes_the_bound_evicted`
 - `hub::forwarding::zone_fwd_proofs::the_early_return_does_not_change_who_receives_a_publish`
 - `hub::forwarding::zone_fwd_proofs::the_early_return_never_swallows_a_retained_broadcast`
 - `hub::forwarding::zone_fwd_proofs::the_interest_buffer_is_reused_across_publishes`
-- `hub::forwarding::zone_fwd_proofs::with_a_durable_plane_the_hold_ends_at_the_countdown_and_is_counted`
+- `hub::forwarding::zone_fwd_proofs::with_a_durable_plane_a_clean_sessions_hold_ends_at_confirmation_not_a_countdown`
 - `hub::forwarding::zone_fwd_proofs::without_a_durable_plane_a_client_reconnecting_here_from_the_unreachable_peer_is_not_handed_the_held_publish`
 - `hub::forwarding::zone_fwd_proofs::without_a_durable_plane_nothing_stands_in_for_what_an_unreachable_peer_is_owed`
 - `hub::mesh::tests::a_moved_membership_invalidates_a_positive_answer`
@@ -2099,6 +2104,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `peer::tests::a_renewal_is_acted_on_within_half_the_room_left_capped`
 - `peer::tests::an_alive_that_arrives_during_an_attempt_after_confirmation_is_not_lost`
 - `peer::tests::control_frames_jump_the_bulk_queue`
+- `peer::tests::interest_reaches_the_hub_with_its_kinds_or_with_none`
 - `peer::tests::peer_qos0_is_shed_when_the_pool_is_full_and_nothing_else_is`
 - `peer::tests::rule_state_is_applied_by_the_link_and_enters_no_hub_lane`
 - `peer::tests::the_end_window_is_a_quarter_of_the_life_capped_at_five_minutes`
@@ -2574,7 +2580,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `durable_a_follower_evictor_dials_and_a_durable_session_is_served`
 - `durable_a_leader_evictor_dials_the_lease_moves_and_sessions_follow_it`
-- `durable_a_peer_out_of_reach_is_answered_at_the_countdown_and_counted`
+- `durable_a_peer_out_of_reach_holds_a_clean_session_to_confirmation_and_a_durable_one_past_it`
 - `durable_an_owner_that_dies_holds_its_publishers_for_the_failover_not_for_confirmation`
 - `durable_the_evicted_peer_dials_the_link_returns_and_sessions_follow_the_lease`
 - `plain_a_false_verdict_keeps_publish_order_for_every_subscriber`

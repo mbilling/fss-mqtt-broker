@@ -143,6 +143,43 @@ impl SubscriptionTable {
         out
     }
 
+    /// How many of `client`'s filters match `topic`, in one walk. Off the message
+    /// path: what a caller asks of one subscriber, not of the population.
+    #[must_use]
+    pub fn matching_filter_count_of(&self, client: &ClientId, topic: &str) -> usize {
+        let by_filter = &self.by_filter;
+        let mut count = 0;
+        self.for_each_matching_filter(topic, |filter| {
+            if by_filter
+                .get(filter)
+                .is_some_and(|clients| clients.contains(client))
+            {
+                count += 1;
+            }
+        });
+        count
+    }
+
+    /// Every distinct topic filter with at least one subscriber, split in two: the
+    /// filters EVERY subscriber of which satisfies `all`, and the rest — as
+    /// `(rest, all)`. One pass; together they are [`filters`](Self::filters).
+    #[must_use]
+    pub fn filters_split(
+        &self,
+        all: impl Fn(&ClientId) -> bool,
+    ) -> (Vec<TopicFilter>, Vec<TopicFilter>) {
+        let mut rest = Vec::new();
+        let mut every = Vec::new();
+        for (filter, clients) in &self.by_filter {
+            if clients.iter().all(&all) {
+                every.push(String::from(&**filter));
+            } else {
+                rest.push(String::from(&**filter));
+            }
+        }
+        (rest, every)
+    }
+
     /// Number of distinct topic filters currently registered.
     #[must_use]
     pub fn filter_count(&self) -> usize {
@@ -188,6 +225,34 @@ mod tests {
 
     fn cid(s: &str) -> ClientId {
         ClientId(s.into())
+    }
+
+    #[test]
+    fn counts_one_clients_matching_filters_and_splits_filters_by_their_subscribers() {
+        let mut t = SubscriptionTable::new();
+        for (c, f) in [
+            ("a", "x/#"),
+            ("a", "x/+"),
+            ("b", "x/#"),
+            ("b", "y"),
+            ("c", "y"),
+        ] {
+            t.subscribe(cid(c), FilterKey::from(f));
+        }
+        assert_eq!(t.matching_filter_count_of(&cid("a"), "x/1"), 2);
+        assert_eq!(t.matching_filter_count_of(&cid("b"), "x/1"), 1);
+        assert_eq!(t.matching_filter_count_of(&cid("c"), "x/1"), 0);
+        assert_eq!(t.matching_filter_count_of(&cid("c"), "y"), 1);
+
+        let (mut rest, mut every) = t.filters_split(|c| c.as_str() != "c");
+        rest.sort();
+        every.sort();
+        assert_eq!(every, vec!["x/#".to_string(), "x/+".to_string()]);
+        assert_eq!(
+            rest,
+            vec!["y".to_string()],
+            "one subscriber that fails puts it here"
+        );
     }
 
     #[test]

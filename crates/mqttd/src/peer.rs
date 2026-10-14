@@ -1771,11 +1771,27 @@ fn forward_inbound(
                 });
             }
         }
+        // Interest with no kinds is interest only the sender can answer for: what a
+        // node without a durable plane sends, and what a peer behind a link below
+        // proto 15 is read as (ADR 0087 D8, O5).
         PeerMessage::Interest { filters } => {
             let _ = hub.send(HubCommand::RemoteInterest {
                 node: remote.clone(),
                 conn_id: Some(conn_id),
                 filters,
+                lease_owned: Vec::new(),
+            });
+        }
+        PeerMessage::InterestKinds {
+            mut node_bound,
+            lease_owned,
+        } => {
+            node_bound.extend(lease_owned.iter().cloned());
+            let _ = hub.send(HubCommand::RemoteInterest {
+                node: remote.clone(),
+                conn_id: Some(conn_id),
+                filters: node_bound,
+                lease_owned,
             });
         }
         PeerMessage::MessageEvents { wanted } => {
@@ -2515,6 +2531,45 @@ mod tests {
         assert!(matches!(
             rx.try_recv(),
             Ok(HubCommand::RemotePublish { credit: None, .. })
+        ));
+    }
+
+    /// ADR 0087 D8: an interest snapshot with kinds reaches the hub as the whole
+    /// interest plus the filters the lease plane owns; one without kinds as the
+    /// whole interest with none — every filter bound to the sender.
+    #[test]
+    fn interest_reaches_the_hub_with_its_kinds_or_with_none() {
+        let (hub, mut rx) = mpsc::unbounded_channel();
+        let (ctl, _ctl_rx) = mpsc::unbounded_channel::<PeerMessage>();
+        let (bulk, _bulk_rx) = mpsc::unbounded_channel::<PeerMessage>();
+        let (ctl, bulk) = (ctl.downgrade(), bulk.downgrade());
+        let remote = NodeId("n2".into());
+        let forward = |msg| forward_inbound(msg, &hub, &remote, 7, None, None, &ctl, &bulk);
+
+        forward(PeerMessage::InterestKinds {
+            node_bound: vec!["clean/#".into()],
+            lease_owned: vec!["durable/#".into()],
+        });
+        let Ok(HubCommand::RemoteInterest {
+            node,
+            conn_id,
+            filters,
+            lease_owned,
+        }) = rx.try_recv()
+        else {
+            panic!("an interest command");
+        };
+        assert_eq!((node, conn_id), (remote.clone(), Some(7)));
+        assert_eq!(filters, ["clean/#", "durable/#"]);
+        assert_eq!(lease_owned, ["durable/#"]);
+
+        forward(PeerMessage::Interest {
+            filters: vec!["durable/#".into()],
+        });
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(HubCommand::RemoteInterest { filters, lease_owned, .. })
+                if filters == ["durable/#"] && lease_owned.is_empty()
         ));
     }
 

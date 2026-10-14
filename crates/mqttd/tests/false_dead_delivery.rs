@@ -31,16 +31,19 @@
 //!   the link cut for good — and assert what ends the hold: in plain mode only
 //!   membership's confirmation that B is gone, after which every publish owed to B is
 //!   acknowledged within a sweep tick and counted by reason
-//!   (`mqttd_publish_resolved_undeliverable_total`); in durable mode, until T5, the
-//!   eight-tick countdown too — both the gap that leaves (a clean session behind a
-//!   long partition, acknowledged undelivered, now counted) and the failover pause it
-//!   keeps (a durable session's publish stored by the lease's new owner and
-//!   acknowledged in seconds).
+//!   (`mqttd_publish_resolved_undeliverable_total`).
+//! - **T5 (D8), interest kinds.** In durable mode too a hold has no countdown: a clean
+//!   session's publish waits for the confirmation (it waited eight sweep ticks under
+//!   T3, then was acknowledged undelivered), a durable session's waits past it while
+//!   the lease plane still names B — and is delivered when B turns out to be alive —
+//!   and when the lease plane moves B's groups the new owner's answer acknowledges it
+//!   within the failover pause.
 //!
 //! What these episodes still show and the design has not reached: in durable mode
 //! the first `QoS` 2 publish after the verdict can be answered by closing the
 //! connection (ADR 0087 D4 records it as unchanged), and a false verdict at the lease
-//! leader moves the session's lease (T5, D8). Nothing here is `#[ignore]`d.
+//! leader moves the session's lease (an availability cost, ADR 0087 §4). Nothing here
+//! is `#[ignore]`d.
 
 mod common;
 
@@ -2656,16 +2659,23 @@ async fn plain_a_peer_really_dead_is_answered_at_confirmation_and_counted() {
     );
 }
 
-/// 0087-T3 in durable mode, until 0087-T5: the hold ends at the earlier of the
-/// confirmation and the eight-tick countdown, so that a durable failover holds a
-/// publisher no longer than it did (ADR 0087 §6 amendment of 2026-10-14). The known
-/// gap this leaves, pinned here so that T5 flips it: B is out of reach from A — a
-/// node that is NOT the lease leader, so no lease moves — and nobody confirms it
-/// gone. A publish for B's clean-session subscriber is acknowledged when the
-/// countdown runs out, eight sweep ticks after the verdict, and delivered to nobody;
-/// what changed is that it is COUNTED (`reason="hold-expired"`) where it was silent.
+/// 0087-T5 (ADR 0087 D8) flips what 0087-T3 left in durable mode. B is out of reach
+/// from A — a node that is NOT the lease leader, so no lease moves — for longer than
+/// the eight-tick countdown that used to end the hold, and then A is told B is gone
+/// while B is in fact alive, its clients connected:
+///
+/// | flow | owed to | before T5 | now |
+/// |---|---|---|---|
+/// | `clean` | a clean session on B | acknowledged at the countdown, undelivered, `hold-expired` | held until the confirmation; then acknowledged within a sweep and counted `peer-gone` |
+/// | `durable` | a persistent session on B, which the lease plane owns | the same | held past the confirmation — the lease plane still names B, so nobody else can answer for the session — and delivered and acknowledged when B's link is back |
+///
+/// The second row is "a false verdict loses nothing" for a durable session at a node
+/// that does not lead the lease group, through a confirmation too.
+// One linear timeline: two flows, the cut, the hold, the confirmation, the heal.
+#[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn durable_a_peer_out_of_reach_is_answered_at_the_countdown_and_counted() {
+async fn durable_a_peer_out_of_reach_holds_a_clean_session_to_confirmation_and_a_durable_one_past_it(
+) {
     let cluster = Cluster::start(Mode::Durable, Link::EvictorDials, Founder::Bystander).await;
     let q1 = QoS::AtLeastOnce;
     let mut clean = Flow::new(
@@ -2677,55 +2687,121 @@ async fn durable_a_peer_out_of_reach_is_answered_at_the_countdown_and_counted() 
         vec![Sub::connect(&cluster, On::B, "sub-clean", true, "fd/clean/#", q1).await],
     )
     .await;
+    let mut durable = Flow::new(
+        &cluster,
+        "durable",
+        On::A,
+        "fd/pers",
+        q1,
+        vec![Sub::connect(&cluster, On::B, "sub-pers", false, "fd/pers/#", q1).await],
+    )
+    .await;
     clean.warm().await;
+    durable.warm().await;
     b_dies_as_a_sees_it(&cluster).await;
     let verdict = Instant::now();
     let before = series(&cluster.a);
 
-    let answer = clean.publish("first", ACK_BOUND).await;
-    let acked_at = clean.publisher.last_acked_at;
+    let confirm = async {
+        // SETTLE(durable-unconfirmed-hold): not a wait for a state — the time IS the
+        // stimulus. The countdown that used to end the hold was eight sweep ticks;
+        // this outlasts it, so that nothing but the confirmation can end it.
+        tokio::time::sleep(UNCONFIRMED_FOR).await;
+        cluster.confirm_b_gone_on_a().await
+    };
+    let (clean_answer, durable_answer, gone_at) = tokio::join!(
+        clean.publish("first", ACK_BOUND),
+        durable.publish("first", UNCONFIRMED_FOR + 3 * ANSWERED_WITHIN),
+        confirm
+    );
+    clean.first = clean_answer;
+    durable.first = durable_answer;
+    durable.pkids[0] = durable.publisher.last_pkid;
+    let clean_acked_at = clean.publisher.last_acked_at;
     clean.drain(QUIET, true).await;
+    durable.drain(QUIET, true).await;
     let moved_on_a = moved(&before, &series(&cluster.a));
-    cluster.membership_moved_only_as_injected();
     println!(
-        "  clean: {answer:?}, {:?} after the verdict; moved on A: {moved_on_a:?}",
-        acked_at.map(|at| at.duration_since(verdict))
+        "  clean: {clean_answer:?}, {:?} after the verdict, {:?} after the confirmation; \
+         durable: {durable_answer:?}; moved on A: {moved_on_a:?}",
+        clean_acked_at.map(|at| at.duration_since(verdict)),
+        clean_acked_at.and_then(|at| at.checked_duration_since(gone_at)),
     );
 
-    assert!(answer.acked_ok(), "acknowledged: {answer:?}");
-    let held = acked_at.expect("acknowledged").duration_since(verdict);
     assert!(
-        held >= Duration::from_secs(6) && held < Duration::from_secs(20),
-        "held for the countdown — eight one-second sweep ticks from the verdict — and no \
-         longer: {held:?}"
+        clean_answer.acked_ok(),
+        "`clean`: acknowledged: {clean_answer:?}"
+    );
+    let acked_at = clean_acked_at.expect("acknowledged");
+    assert!(
+        acked_at >= gone_at,
+        "`clean`: acknowledged {:?} BEFORE B was confirmed gone — {:?} after the verdict",
+        gone_at.duration_since(acked_at),
+        acked_at.duration_since(verdict)
+    );
+    assert!(
+        acked_at.duration_since(gone_at) < ANSWERED_WITHIN,
+        "`clean`: answered within a sweep tick of the confirmation, not {:?} later",
+        acked_at.duration_since(gone_at)
     );
     assert!(
         clean.seen().during.is_empty(),
-        "delivered to nobody: the T5 gap"
+        "`clean`: B was confirmed gone, and nobody received it: {:?}",
+        clean.seen().during
     );
     assert!(
-        (moved_on_a
-            .get("mqttd_publish_resolved_undeliverable_total{reason=\"hold-expired\"}")
-            .copied()
-            .unwrap_or(0.0)
-            - 1.0)
-            .abs()
+        !durable_answer.acked_ok() && durable.seen().during.is_empty(),
+        "`durable`: still held after the confirmation: {durable_answer:?}, {:?}",
+        durable.seen()
+    );
+    let count = |name: &str| moved_on_a.get(name).copied().unwrap_or(0.0);
+    assert!(
+        (count("mqttd_publish_resolved_undeliverable_total{reason=\"peer-gone\"}") - 1.0).abs()
             < f64::EPSILON,
-        "and counted, where it was silent: {moved_on_a:?}"
+        "the clean session's publish, and only it, counted at the confirmation: {moved_on_a:?}"
+    );
+    assert!(
+        moved_on_a
+            .keys()
+            .all(|n| !n.contains("hold-expired") && !n.starts_with("mqttd_publish_dropped_total")),
+        "no countdown, nothing dropped: {moved_on_a:?}"
+    );
+    assert!(
+        series(&cluster.a)
+            .get("mqttd_publish_held_for_unreachable")
+            .is_some_and(|held| *held >= 1.0),
+        "A reports the durable session's publish held"
+    );
+
+    // B was alive all along: its link comes back, and its membership with it.
+    cluster.link_between_a_and_b().send_replace(true);
+    cluster.heal();
+    durable.heal(&cluster).await;
+    cluster.membership_moved_only_as_injected();
+    println!("  durable after the heal: {:?}", durable.seen());
+    assert_eq!(
+        durable.seen().fate("first"),
+        Fate::HeldUntilHeal,
+        "`durable`: delivered to the session on B, and only then acknowledged: {:?}",
+        durable.seen()
     );
 }
 
-/// 0087-T3's acceptance for a durable session, and the regression guard for the
-/// failover pause. A, the lease group's leader, holds the session's owner B dead and
-/// cannot reach it — as when B has really died — so A reassigns B's groups and the
-/// session's new owner takes it over. A publish for the (offline) session made at
-/// the verdict is owed to B and held; when the new owner announces the session's
-/// filter it is re-routed there, stored, and that answer acknowledges the publisher
-/// — within the failover pause, long before B could be confirmed gone. Nobody
-/// confirms B gone in this test: had the hold been left to last until confirmation
-/// in durable mode (`dead_ttl`, 30 s), the publisher would be waiting still.
+/// 0087-T5's acceptance (ADR 0087 D8), and the regression guard for the failover
+/// pause. A, the lease group's leader, holds B dead and cannot reach it — as when B
+/// has really died — so A reassigns B's groups and the session's new owner takes it
+/// over. Two publishes are made at the verdict, both owed to B and held:
+///
+/// - `offline`, for B's (offline) durable session: when the new owner announces the
+///   session's filter — as interest the lease plane owns — it is re-routed there and
+///   stored, and that answer acknowledges the publisher, within the failover pause
+///   and long before B is confirmed gone; nothing is counted undeliverable;
+/// - `clean`, for a clean session on B: no new owner answers for it, so it is held
+///   until membership confirms B gone, then acknowledged and counted `peer-gone`.
 ///
 /// The session's client then resumes on its new owner and receives the message.
+// One linear timeline: the death, two holds of two kinds, the resume.
+#[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn durable_an_owner_that_dies_holds_its_publishers_for_the_failover_not_for_confirmation() {
     let cluster = Cluster::start(Mode::Durable, Link::EvictorDials, Founder::Evictor).await;
@@ -2739,7 +2815,17 @@ async fn durable_an_owner_that_dies_holds_its_publishers_for_the_failover_not_fo
         vec![Sub::connect(&cluster, On::B, "sub-off", false, "fd/off/#", q1).await],
     )
     .await;
+    let mut clean = Flow::new(
+        &cluster,
+        "clean",
+        On::A,
+        "fd/clean",
+        q1,
+        vec![Sub::connect(&cluster, On::B, "sub-clean", true, "fd/clean/#", q1).await],
+    )
+    .await;
     offline.warm().await;
+    clean.warm().await;
     let session = offline.subs[0].id.clone();
     offline.subs[0]
         .client
@@ -2751,9 +2837,22 @@ async fn durable_an_owner_that_dies_holds_its_publishers_for_the_failover_not_fo
     let verdict = Instant::now();
     let before = series(&cluster.a);
 
-    let answer = offline.publish("first", ACK_BOUND).await;
+    let confirm = async {
+        // SETTLE(failover-then-confirmation): not a wait for a state — the time IS the
+        // stimulus: the durable publish must be answered without it, the clean one
+        // only with it.
+        tokio::time::sleep(UNCONFIRMED_FOR).await;
+        cluster.confirm_b_gone_on_a().await
+    };
+    let (answer, clean_answer, gone_at) = tokio::join!(
+        offline.publish("first", ACK_BOUND),
+        clean.publish("first", ACK_BOUND),
+        confirm
+    );
     let acked_at = offline.publisher.last_acked_at;
     let held = acked_at.map(|at| at.duration_since(verdict));
+    let clean_acked_at = clean.publisher.last_acked_at;
+    clean.drain(QUIET, true).await;
     let moved_on_a = moved(&before, &series(&cluster.a));
     let owner = cluster
         .a
@@ -2761,17 +2860,53 @@ async fn durable_an_owner_that_dies_holds_its_publishers_for_the_failover_not_fo
         .read()
         .unwrap()
         .committed_session_owner(&session);
-    println!("  offline: {answer:?}, {held:?} after the verdict; the session's owner now {owner:?}; moved on A: {moved_on_a:?}");
+    println!(
+        "  offline: {answer:?}, {held:?} after the verdict; the session's owner now {owner:?}; \
+         clean: {clean_answer:?}, {:?} after the confirmation; moved on A: {moved_on_a:?}",
+        clean_acked_at.and_then(|at| at.checked_duration_since(gone_at))
+    );
 
     assert!(answer.acked_ok(), "acknowledged: {answer:?}");
     let held = held.expect("acknowledged");
     assert!(
-        held < Duration::from_secs(20),
+        held < Duration::from_secs(20) && acked_at.expect("acknowledged") < gone_at,
         "a durable failover holds a publisher for the failover pause, not until the \
-         owner is confirmed gone (`dead_ttl`, 30 s): held {held:?}"
+         owner is confirmed gone: held {held:?}"
     );
     let owner = owner.expect("the leader committed a new owner");
     assert_ne!(owner, cluster.b.id, "the lease moved off the dead owner");
+
+    assert!(
+        clean_answer.acked_ok(),
+        "`clean`: acknowledged: {clean_answer:?}"
+    );
+    let clean_acked_at = clean_acked_at.expect("acknowledged");
+    assert!(
+        clean_acked_at >= gone_at && clean_acked_at.duration_since(gone_at) < ANSWERED_WITHIN,
+        "`clean`: held until the confirmation and answered within a sweep tick of it: \
+         {:?} after the verdict",
+        clean_acked_at.duration_since(verdict)
+    );
+    assert!(
+        clean.seen().during.is_empty(),
+        "`clean`: nobody received it — B is gone: {:?}",
+        clean.seen().during
+    );
+    assert!(
+        (moved_on_a
+            .get("mqttd_publish_resolved_undeliverable_total{reason=\"peer-gone\"}")
+            .copied()
+            .unwrap_or(0.0)
+            - 1.0)
+            .abs()
+            < f64::EPSILON,
+        "the clean session's publish, and only it, counted undeliverable: the durable one \
+         was answered by its new owner: {moved_on_a:?}"
+    );
+    assert!(
+        moved_on_a.keys().all(|n| !n.contains("hold-expired")),
+        "no countdown: {moved_on_a:?}"
+    );
 
     // The new owner stored it: the session resumes there and receives it.
     let node = cluster
@@ -2817,10 +2952,5 @@ async fn durable_an_owner_that_dies_holds_its_publishers_for_the_failover_not_fo
     assert!(
         received.iter().any(|t| t == "fd/off/first"),
         "the new owner stored the publish for the session: received {received:?}"
-    );
-    assert!(
-        !moved_on_a
-            .contains_key("mqttd_publish_resolved_undeliverable_total{reason=\"hold-expired\"}"),
-        "the publish was answered by the new owner, not resolved undeliverable: {moved_on_a:?}"
     );
 }

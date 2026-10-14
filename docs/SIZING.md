@@ -438,8 +438,10 @@ growing, which is the thing to go and find. QoS 0 never enters the table.
 
 The same table is where a publish waits for a peer that cannot be reached (ADR 0087):
 one owed to a subscriber on a node whose link is down, or that this node holds dead, is
-held there until the link returns — for a node held dead, for at most eight seconds
-without a link. `mqttd_publish_held_for_unreachable` is that subset. While it is above
+held there until the link returns — for a node held dead, until membership confirms it
+gone (`dead_ttl`, 30 s after the verdict), or, for a durable session whose lease the
+lease plane has moved, until its new owner answers (the failover pause).
+`mqttd_publish_held_for_unreachable` is that subset. While it is above
 zero the table fills at *offered QoS ≥ 1 rate × the share owed to that node*, with no
 ack latency to drain it — 40,000 msg/s with a tenth owed to the unreachable node reaches
 the entry bound in 16 seconds — and a publisher's connection is held behind its oldest
