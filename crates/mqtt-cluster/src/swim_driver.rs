@@ -680,10 +680,13 @@ pub async fn run(
 /// the suspect's own key.
 ///
 /// **The clock is the monotonic clock**, late or not: a node that wakes late acts on
-/// each deadline when it wakes and no later, so its failure detection is slower by
-/// the lateness of a wake-up at each of the four steps to a verdict (ack timeout,
-/// indirect timeout, suspicion window, last probe) and by nothing that accumulates.
-/// A stall is counted ([`Gossip::note_stall`]) and changes nothing else. Missed ticks
+/// each deadline at its first wake-up at or after it, so each of the five steps to a
+/// verdict (the probe round begins, ack timeout, indirect timeout, suspicion window,
+/// last probe) comes at most one gap between wake-ups — the tick plus the lateness —
+/// after it was due, and each step's deadline is set from when the step before was
+/// taken: five gaps at most, and no lag that builds up beyond them. (Probe rounds
+/// are kept to their schedule by the state machine, so the rounds before a member's
+/// turn do not add their own.) A stall is counted ([`Gossip::note_stall`]) and changes nothing else. Missed ticks
 /// are not made up ([`MissedTickBehavior::Delay`]): they would all read the same
 /// clock.
 pub async fn run_gossip(
@@ -725,6 +728,15 @@ pub async fn run_gossip(
     let mut watch = StallWatch::new(tick_interval);
     let mut buf = vec![0u8; RECV_BUF];
     let direct = direct_handle(&socket);
+    if direct.is_none() {
+        // Once, at start: this is not a state the node recovers from by itself.
+        tracing::warn!(
+            "SWIM: no second handle on the gossip socket (out of file descriptors?): \
+             the read ahead of each tick goes through the runtime, which after this \
+             process has been stopped or starved can report an empty socket that is \
+             not — a peer whose answer was waiting may then be declared DEAD"
+        );
+    }
     tokio::pin!(shutdown);
 
     loop {
@@ -741,15 +753,10 @@ pub async fn run_gossip(
                 // Everything already received, before this tick may expire anything.
                 let mut budget = DrainBudget::for_tick(tick_interval);
                 while budget.take() {
-                    // Straight from the kernel where there is a handle for it. What
-                    // is taken here the runtime's own read then does not find, which
-                    // is all it notices.
-                    let read = match &direct {
-                        Some(direct) => direct.recv_from(&mut buf),
-                        None => socket.try_recv_from(&mut buf),
-                    };
                     // Empty (`WouldBlock`), or an error `recv_from` will meet again.
-                    let Ok((n, src)) = read else { break };
+                    let Ok((n, src)) = read_now(&socket, direct.as_ref(), &mut buf) else {
+                        break;
+                    };
                     let outputs = gossip.receive(&buf[..n], &src.to_string(), now);
                     emit(&socket, &events, outputs).await;
                 }
@@ -768,6 +775,23 @@ pub async fn run_gossip(
                 publish_isolation(gossip.swim(), &mut was_isolated);
             }
         }
+    }
+}
+
+/// One datagram off the socket if the KERNEL holds one, without waiting: the read
+/// ahead of a tick ([`run_gossip`]). Through `direct` where there is one — straight to
+/// the kernel, whatever the runtime believes about the socket — and through the
+/// runtime's own non-waiting read otherwise, which answers "nothing" until its reactor
+/// has seen the socket become readable. What is taken here the runtime's read then
+/// does not find, which is all it notices.
+fn read_now(
+    socket: &UdpSocket,
+    direct: Option<&std::net::UdpSocket>,
+    buf: &mut [u8],
+) -> std::io::Result<(usize, std::net::SocketAddr)> {
+    match direct {
+        Some(direct) => direct.recv_from(buf),
+        None => socket.try_recv_from(buf),
     }
 }
 
@@ -1654,6 +1678,7 @@ mod cert_request_tests {
 /// paused clock, so the test decides when the loop runs and what time it finds.
 #[cfg(test)]
 mod stall_tests {
+    use super::{direct_handle, read_now};
     use super::{run_gossip, DrainBudget, Gossip, MembershipEvent, StallWatch, TICK};
     use super::{DRAIN_MAX_DATAGRAMS, DRAIN_MIN_DATAGRAMS, STALL_TICKS};
     use crate::swim::{Config, Kind, MemberState, Message, Swim, Update};
@@ -1958,14 +1983,16 @@ mod stall_tests {
 
     /// Detection of a real death does not degrade when the node doing the detecting is
     /// persistently late: the state machine runs on the real clock. `a`'s only peer
-    /// dies; from then on every wake-up of `a`'s loop comes 400 ms late — each one a
+    /// dies; from then on every wake-up of `a`'s loop comes 370 ms late — each one a
     /// stall. `a` has nobody else to probe, so nothing here can rest on a probe being
     /// answered.
     ///
     /// The bound: a late node acts on a deadline at its first wake-up at or after it,
     /// so each of the five steps to the verdict (the probe round begins; ack timeout;
-    /// indirect timeout; suspicion window; last probe) is late by at most one
-    /// wake-up's lateness, and nothing accumulates. The tombstone is not stretched
+    /// indirect timeout; suspicion window; last probe) comes at most one gap between
+    /// wake-ups — the tick plus the lateness — after it was due, and nothing builds up
+    /// beyond those five. The lateness here is chosen so that the gaps line up with
+    /// nothing: not with the probe period, not with a timeout. The tombstone is not stretched
     /// either: it is pruned `dead_ttl` after the verdict, give or take one wake-up —
     /// which is what lets the link manager's window, twice `dead_ttl` on the same
     /// clock (`held_dead_dial_window`), assume it.
@@ -1977,19 +2004,66 @@ mod stall_tests {
         assert_eq!(rig.count("stalls"), 0);
         assert_eq!(pruned_after, cfg.dead_ttl_ms);
 
-        let late_by = 400;
-        let (late, pruned_after, rig) = time_to_dead_and_to_prune(tick + late_by).await;
+        let late_by = 370;
+        let gap = tick + late_by;
+        let (late, pruned_after, rig) = time_to_dead_and_to_prune(gap).await;
         assert!(rig.count("stalls") > 10, "every wake-up was a stall");
         assert_eq!(rig.count("silent"), 1);
         assert!(
-            late <= on_time + 5 * late_by,
-            "on time: dead after {on_time} ms; waking {late_by} ms late: after {late} ms"
+            late <= on_time + 5 * gap,
+            "on time: dead after {on_time} ms; waking every {gap} ms: after {late} ms"
+        );
+        eprintln!(
+            "a dead peer: declared after {on_time} ms on time, {late} ms waking every {gap} ms"
         );
         assert!(
             (cfg.dead_ttl_ms..=cfg.dead_ttl_ms + tick + late_by).contains(&pruned_after),
             "the tombstone lasted {pruned_after} ms on a late node; dead_ttl is {} ms",
             cfg.dead_ttl_ms
         );
+    }
+
+    /// The read ahead of a tick finds a datagram the RUNTIME has not noticed. This is
+    /// the state a process is in when it resumes from a stop with its tick overdue:
+    /// the datagram is in the kernel's buffer and tokio's reactor has not turned since
+    /// it arrived, so tokio's own non-waiting read says the socket is empty. The
+    /// driver's read ([`read_now`], on its direct handle) must return it all the same.
+    ///
+    /// Nothing is awaited between the datagram's arrival and the two reads, so the
+    /// reactor cannot have turned. With `read_now` switched to the runtime's read this
+    /// fails; so it does where a second handle cannot be had — which is why the driver
+    /// warns when it cannot have one.
+    #[tokio::test]
+    async fn the_read_ahead_of_a_tick_finds_a_datagram_the_runtime_has_not_noticed() {
+        let ours = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        ours.set_nonblocking(true).unwrap();
+        let addr = ours.local_addr().unwrap();
+        let socket = tokio::net::UdpSocket::from_std(ours.try_clone().unwrap()).unwrap();
+        let direct = direct_handle(&socket).expect("a second handle on the socket");
+
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.send_to(b"an ack that arrived in time", addr).unwrap();
+        until("the datagram never reached the socket", || {
+            ours.peek_from(&mut [0u8; 1]).is_ok()
+        });
+
+        let mut buf = [0u8; 64];
+        let through_the_runtime = socket.try_recv_from(&mut buf);
+        assert!(
+            matches!(&through_the_runtime, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "the premise of this test: tokio reports nothing until its reactor has \
+             turned, and here it has not: {through_the_runtime:?}"
+        );
+        let (n, from) = read_now(&socket, Some(&direct), &mut buf)
+            .expect("the driver's read finds what the kernel holds");
+        assert_eq!(&buf[..n], b"an ack that arrived in time");
+        assert_eq!(from, peer.local_addr().unwrap());
+        // And without the handle the driver's read is the runtime's: nothing.
+        peer.send_to(b"another", addr).unwrap();
+        until("the second datagram never reached the socket", || {
+            ours.peek_from(&mut [0u8; 1]).is_ok()
+        });
+        assert!(read_now(&socket, None, &mut buf).is_err());
     }
 
     /// The watch: a wake-up more than two ticks after the last is a stall of the gap

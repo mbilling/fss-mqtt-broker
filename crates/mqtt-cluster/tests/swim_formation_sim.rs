@@ -164,12 +164,14 @@ enum Fix {
 const OTHER_REJECT: u64 = 1 << 32;
 
 /// v1.1.0's state-machine rules: what has been added since is off — the two rules of
-/// issue #971, and the last direct probe before `Dead` (issue #975).
+/// issue #971, the last direct probe before `Dead` (issue #975), and the probe period
+/// kept to its schedule (issue #1002).
 fn v1_1_cfg() -> Config {
     Config {
         reprime_on_rescued_probe: false,
         greet_pruned: false,
         confirm_before_dead: false,
+        period_from_schedule: false,
         ..Config::default()
     }
 }
@@ -2312,13 +2314,15 @@ fn burial_of(variant: &Variant, n: usize, seeds: u64) -> Burial {
 /// survivor has nobody left to probe but the corpse, so nothing can rest on a probe
 /// being answered.
 ///
-/// The state machine's clock is the real one, so a late node is late by one wake-up
-/// at each of its five steps to the verdict and by nothing that adds up. The lone
-/// survivor of two holds the member `Dead` within five wake-ups' lateness of when a
-/// node running on time does. In a cluster of fourteen the last survivor's verdict
-/// also waits on gossip passed between late nodes; it comes within twice the time a
-/// cluster on time takes (in the report: 7.5 s in the median against 5.6 s, 10.5 s at
-/// worst against 8.3 s).
+/// The state machine's clock is the real one, so a late node takes each of its five
+/// steps to the verdict at most one gap between wake-ups (the tick plus the lateness)
+/// after it was due, and nothing builds up beyond those. The lone survivor of two
+/// holds the member `Dead` within five such gaps of when a node running on time
+/// does. In a cluster of fourteen the last survivor's verdict also waits on the
+/// rounds it spends on other members first (each at most a gap late: the probe
+/// period is kept to its schedule) and on gossip passed between late nodes; it comes
+/// within twice the time a cluster on time takes (in the report: 7.0 s in the median
+/// against 5.6 s, 8.9 s at worst against 8.3 s).
 ///
 /// (The first version of this change left stalled time out of the clock and raised
 /// the node's awareness on every stall. Under this same lateness the lone survivor
@@ -2337,7 +2341,7 @@ fn a_real_death_is_seen_on_time_by_survivors_that_are_all_late() {
             .all()
             .unwrap_or_else(|| panic!("N={n}: late survivors did not bury a dead member"));
         let bound = if n == 2 {
-            on_time.1 + 5 * 500
+            on_time.1 + 5 * (TICK_MS + 500)
         } else {
             2 * on_time.1
         };

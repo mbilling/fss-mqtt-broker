@@ -665,14 +665,24 @@ busy does keep the driver off the CPU.
 - **P2. The state machine's clock is real time.** It is the monotonic clock, late
   wake-up or not. A late node acts on each deadline at its first wake-up at or after
   it, so each of the five steps to a verdict — the probe round begins, the ack
-  timeout, the indirect timeout, the suspicion window, the last probe — is late by
-  at most one wake-up's lateness, and nothing accumulates: **a node whose every
-  wake-up is *d* late holds a member that really died `Dead` at most 5 × *d* later
-  than a node running on time.** At 400 ms late that is under 2 s on a nominal 5.9 s
-  (measured at the driver: 6.5 s). The protocol period, the certificate-request rate
-  limit and the tombstone are on the same clock and are not stretched: a tombstone
-  is pruned `dead_ttl` after the verdict give or take one wake-up, which is what the
-  link manager's `held_dead_dial_window` (twice `dead_ttl`, on that clock) assumes.
+  timeout, the indirect timeout, the suspicion window, the last probe — comes at
+  most one gap between wake-ups after it was due, and each step's deadline is set
+  from when the step before was taken: **a node whose wake-ups are *g* apart (the
+  tick plus its lateness) holds a member that really died `Dead` at most 5 × *g*
+  later than a node running on time**, counted from the round in which it probes
+  that member, and no lag builds up beyond those five gaps. Waking 370 ms late
+  (*g* = 470 ms, lined up with no timeout and not with the period) that is 2.35 s on
+  a nominal 5.9 s; measured at the driver, 7.05 s. The rounds *before* the member's
+  turn need their own sentence. The probe period used to be counted from the
+  moment a round started, so a late node started each round one lateness later
+  than the last and a member whose turn was several rounds off waited that many
+  latenesses — in every release, not from this change. The period is now kept
+  from when a round was due (a node a whole period or more behind starts again
+  from now and makes up no rounds), so those rounds are each at most one gap late
+  and their lateness does not add up. The certificate-request rate limit and the
+  tombstone are on the same clock and are not stretched: a tombstone is pruned
+  `dead_ttl` after the verdict give or take one gap, which is what the link
+  manager's `held_dead_dial_window` (twice `dead_ttl`, on that clock) assumes.
 - **P3. A stall does not touch awareness.** The local-health score of §2 rises when a
   node has to refute a suspicion of itself and falls with each probe a peer answers.
   It is not raised by a stall of the node's own driver. A node whose every probe
@@ -736,6 +746,17 @@ there to be read, and the node gives up on that probe on waking. A node away tha
 has been declared dead by everyone else, and what it holds about anyone is stale; no
 allowance is made for it.
 
+A narrower case is left open as well. After a stall of several seconds in a large
+cluster with signed gossip, more than 64 datagrams can be waiting, each costing a
+signature check to read; the `Ack` can then sit past the 64-datagram floor while the
+25 ms budget is spent on verification, and the tick runs with it unread. That is a
+much narrower false `Dead` than the one this amendment closes — it needs the stall,
+the backlog and the `Ack` behind it at once — and it is not zero.
+
+Where the second handle on the socket cannot be had (the process is out of file
+descriptors when the driver starts), the read goes through the runtime and P1 does
+not hold after a stop; the driver says so once, at WARN, when it starts.
+
 **Should membership have a thread of its own?** P1 stops a late node from blaming a
 peer that answered. Nothing here makes a late node answer: a broker whose runtime
 does not schedule the SWIM task for a second answers no probe for a second, and
@@ -778,7 +799,7 @@ member is declared `Dead` and, a tombstone later, the cluster learns the process
 is left as what it is. Ordinary acks and the address refresh remain blind to the
 generation; that is the 2026-08-05 amendment's residual and not changed here.
 
-### Four details of the state machine
+### Five details of the state machine
 
 - **One datagram per window is now true.** A relayed `Suspect` at a higher incarnation
   dropped the probe that was out while the window kept running: the `Ack` in flight
@@ -800,6 +821,14 @@ generation; that is the 2026-08-05 amendment's residual and not changed here.
   `Join` now carries the suspicion as it is held at that moment; the member refutes
   it and its `Sync` clears it
   (`a_suspect_spared_on_a_stale_claim_is_asked_with_the_claim_held_now`).
+- **The probe period is kept from when a round was due.** It was counted from when the
+  round started, so a node that woke late pushed every later round back by its
+  lateness (P2). Late by less than a period, the next round is now due one period
+  after the last was; a whole period or more behind, the node starts again from now.
+  A node on time is unaffected. It is a rule a v1.1.0 node lacks, so like the others
+  it is a `Config` field (`period_from_schedule`, on; not operator configuration)
+  that the simulation's v1.1.0 model switches off
+  (`the_probe_period_runs_from_when_a_round_was_due_not_from_a_late_tick`).
 - **The last probe spends no gossip.** It was built like any datagram and so drew up
   to six updates from the gossip queue, each of which has a bounded number of
   retransmissions; a node whose windows for many suspects lapsed on one tick spent
@@ -963,8 +992,9 @@ been running for 30 s before the member died.
 
 **One-way reachability, one link lost one way, a late member.** The earlier tables
 stand: the deaf and mute rows are identical (for good: within a millisecond), one link
-lost one way still raises nothing, and of the late member's table one cell moved by
-one run (10 nodes, 600 ms late: 4, from 5).
+lost one way still raises nothing, and of the late member's table two cells moved by
+one run each (10 nodes: 4 with the probe at 600 ms late, from 5; 29 without it at 1 s
+late, from 30).
 
 **A node that stops and resumes** — a stopped process, a suspended VM: its ticks stop
 and what is sent to it queues on its socket. It is a silent member and, on waking, a
@@ -974,8 +1004,8 @@ prober whose deadlines all passed. Runs of 32 with a `Dead`, with the probe / wi
 |---|---|---|---|---|---|
 | 3 | 0 / 0 | 0 / 0 | 0 / 0 | 32 / 32 | 32 / 32 |
 | 5 | 0 / 0 | 0 / 0 | 1 / 7 | 25 / 26 | 32 / 32 |
-| 10 | 0 / 2 | 0 / 6 | 2 / 8 | 28 / 30 | 32 / 32 |
-| 14 | 0 / 4 | 0 / 8 | 6 / 16 | 24 / 28 | 32 / 32 |
+| 10 | 0 / 1 | 0 / 6 | 2 / 8 | 28 / 30 | 32 / 32 |
+| 14 | 0 / 5 | 0 / 8 | 6 / 16 | 24 / 28 | 32 / 32 |
 | 30 | 0 / 6 | 0 / 12 | 0 / 15 | 17 / 29 | 32 / 32 |
 
 Up to 2 s nobody is declared dead, as for a cut, and at 3 s fewer are than for a cut:
@@ -1020,25 +1050,29 @@ survivor has nobody to probe but the corpse.
 | every survivor on time | 4934 / 4994 | 4089 / 4996 | 5613 / 8337 | 7005 / 8347 |
 | late, the loop before this change (#1000) | 5716 / 6055 | 5407 / 5853 | 6455 / 8554 | 7229 / 8930 |
 | late, the first version (stall clock, awareness on a stall) | 63805 / 64003 | 47193 / 49097 | 38167 / 40504 | 38421 / 39357 |
-| late, as built | 5716 / 6055 | 5685 / 6088 | 7482 / 10498 | 8787 / 11176 |
+| late, as built but with the period counted from each late start | 5716 / 6055 | 5685 / 6088 | 7482 / 10498 | 8787 / 11176 |
+| late, as built | 5716 / 6055 | 5681 / 6088 | 6993 / 8859 | 8024 / 9556 |
 
 The first version saw nothing until the lateness was over. As built, the lone survivor
-is 0.8 s late in the median and 1.1 s at worst, inside P2's five wake-ups; at 14 and 30
-nodes the last survivor's verdict also waits on gossip handed from one late node to
-another and comes 1.9 s later in the median, 2.2 s and 2.8 s at worst — a quarter to a
-third more than on time. The loop before this change is about a second quicker there,
-and for a bad reason: reading its socket after the tick, it raised ten times the
-suspicions over those runs (247 `Suspect` transitions a run at 14 nodes against 25) —
-of healthy peers that were merely late — and the third more datagrams that cost
-carried the news.
+is 0.8 s late in the median and 1.1 s at worst, inside P2's five gaps. At 14 and 30
+nodes two more things add to it: the rounds a survivor spends on other members before
+the dead one's turn, and gossip handed from one late node to another. The first was
+compounding — the fourth row is the same code with the probe period counted from each
+late start, as every release has counted it — and keeping the period to its schedule
+takes 0.5 s and 0.8 s off the median and 1.6 s off the worst case. What is left is
+1.4 s and 1.0 s in the median and 0.5 s and 1.2 s at worst over a cluster on time: a
+quarter more at most. The loop before this change is still quicker there (with the
+same period rule it gives 6185 / 7778 at 14 nodes and 7025 / 8274 at 30), and for a
+bad reason: reading its socket after the tick, it raised ten times the suspicions
+over those runs (247 `Suspect` transitions a run at 14 nodes against 25) — of healthy
+peers that were merely late — and the third more datagrams that cost carried the news.
 
 **Where the bound ends off the grid.** One member cut off, 32 seeds a cell, with every
 node's ticks 0 to 99 ms late each time for the whole run, and again with every node's
 ticks on a 50 ms grid (every instant a tick up to 50 ms late can land on, the 250 ms
 deadlines included): no run with a `Dead` at 1.9 s, 1.998 s, 2 s, 2.05 s, 2.098 s or
-2.2 s, at any size from 3 to 30, either way; nor at 2.5 s with the randomly late
-ticks, where the grid shows one run in 32 (late ticks put the questions later on
-average). The sweep does not find the worst schedule — it needs a prober's ticks on
+2.2 s, at any size from 3 to 30, either way; at 2.5 s, one or two runs in 32 at 10
+nodes and up, as on the grid. The sweep does not find the worst schedule — it needs a prober's ticks on
 its deadlines and two more suspecters in step — so what is promised is the arithmetic,
 2 s less twice the latency, and not the sweep.
 
@@ -1081,12 +1115,18 @@ it by this amendment:
   `an_ack_already_in_the_socket_beats_the_tick_that_would_give_up_on_it` (the race at
   its narrowest, no stall: with the read taken out this fails);
   `the_read_ahead_of_a_tick_is_bounded` (the minimum read whatever the time, and the
-  maximum).
+  maximum). Those two run on a paused clock, where the runtime's reactor has always
+  turned before the tick, so they pin the ORDER (read, then tick) and would pass with
+  the read going through the runtime. That the read goes past the runtime is pinned
+  by `the_read_ahead_of_a_tick_finds_a_datagram_the_runtime_has_not_noticed`: a
+  datagram in the kernel's buffer, no turn of the reactor since, tokio's own read
+  says "nothing" and the driver's returns it — switched back to the runtime's read
+  it fails — and, with a kernel and a real stop in between, by the nightly scenario.
 - **P2 and P3**, at the driver:
   `a_persistently_late_node_declares_a_dead_member_within_five_wake_ups_of_on_time`
-  — a node whose only peer is dead and whose every wake-up is 400 ms late declares it
-  within the bound (6.5 s against 5.9 s on time), and prunes the tombstone `dead_ttl`
-  later give or take one wake-up; `the_stall_watch_reports_a_wake_up_more_than_two_ticks_late`.
+  — a node whose only peer is dead and whose every wake-up is 370 ms late declares it
+  within the bound (7.05 s against 5.9 s on time), and prunes the tombstone `dead_ttl`
+  later give or take one gap; `the_stall_watch_reports_a_wake_up_more_than_two_ticks_late`.
   In the simulation: `a_real_death_is_seen_on_time_by_survivors_that_are_all_late`, at
   2 and 14 nodes.
 - **P4**: `a_suspect_that_stays_silent_is_declared_dead_when_the_stalled_prober_wakes`

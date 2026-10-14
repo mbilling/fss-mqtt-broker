@@ -262,7 +262,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 411 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 413 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -617,6 +617,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `swim::tests::refutation_resets_accumulated_suspicions`
 - `swim::tests::refutes_suspicion_about_self`
 - `swim::tests::the_last_probe_is_one_datagram_per_suspect_per_window`
+- `swim::tests::the_probe_period_runs_from_when_a_round_was_due_not_from_a_late_tick`
 - `swim::tests::the_suspicion_window_grows_with_log_n_only_when_asked`
 - `swim::tests::with_the_v1_1_rule_a_rescued_probe_resets_the_regreet_count`
 - `swim_auth::first_contact_tests::a_rotated_signer_primes_every_destination_again`
@@ -668,6 +669,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `swim_driver::stall_tests::a_prober_stalled_past_the_ack_timeout_reads_the_ack_before_it_gives_up`
 - `swim_driver::stall_tests::a_suspect_that_stays_silent_is_declared_dead_when_the_stalled_prober_wakes`
 - `swim_driver::stall_tests::an_ack_already_in_the_socket_beats_the_tick_that_would_give_up_on_it`
+- `swim_driver::stall_tests::the_read_ahead_of_a_tick_finds_a_datagram_the_runtime_has_not_noticed`
 - `swim_driver::stall_tests::the_read_ahead_of_a_tick_is_bounded`
 - `swim_driver::stall_tests::the_stall_watch_reports_a_wake_up_more_than_two_ticks_late`
 - `swim_driver::tests::a_self_claim_contradicting_the_certificate_is_rejected`

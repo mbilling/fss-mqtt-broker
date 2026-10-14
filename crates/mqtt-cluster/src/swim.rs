@@ -54,8 +54,9 @@ impl MemberState {
 }
 
 /// Timing and fan-out parameters for the protocol.
-// The bools are four independent rules, each on or off: three that a v1.1.0 node lacks
-// (issues #971 and #975) and one measured candidate (issue #973). Not an encodable state.
+// The bools are five independent rules, each on or off: four that a v1.1.0 node lacks
+// (issues #971, #975 and #1002) and one measured candidate (issue #973). Not an
+// encodable state.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -163,6 +164,16 @@ pub struct Config {
     /// current one. **Not operator configuration**: none of the detector's settings
     /// is.
     pub confirm_before_dead: bool,
+    /// Keep the probe period from when a round was DUE rather than from when it
+    /// started (issue #1002). A node that wakes late starts its round late; counted
+    /// from that start, every later round is late by as much again, and a member whose
+    /// turn is several rounds off waits that many latenesses to be probed. `true` (the
+    /// default): late by less than a period, the next round is due one period after
+    /// the last was due; a whole period or more behind, the node starts again from
+    /// now and makes up no rounds. A node whose rounds start on time is unaffected.
+    /// `false` is v1.1.0's rule, kept so the formation simulation can run a v1.1.0
+    /// node. **Not operator configuration.**
+    pub period_from_schedule: bool,
 }
 
 impl Default for Config {
@@ -184,6 +195,7 @@ impl Default for Config {
             greet_pruned: true,
             suspicion_scales_with_log_n: false,
             confirm_before_dead: true,
+            period_from_schedule: true,
         }
     }
 }
@@ -1149,7 +1161,19 @@ impl Swim {
             // gets a harmless periodic dribble that doubles as its re-entry
             // greeting after a restart.
             self.greet_unacquainted_seeds(&mut out);
-            self.next_probe_at = now + self.cfg.protocol_period_ms;
+            // The next round is due a period after this one was DUE, not after the
+            // moment this node got round to it: a node that wakes late would
+            // otherwise stretch every period by its lateness, and the member whose
+            // turn is five rounds off would wait five latenesses for it. A node that
+            // is a whole period or more behind starts again from now — it does not
+            // make up rounds.
+            let period = self.cfg.protocol_period_ms;
+            let on_schedule = self.cfg.period_from_schedule;
+            self.next_probe_at = if on_schedule && now - self.next_probe_at < period {
+                self.next_probe_at + period
+            } else {
+                now + period
+            };
         }
         out
     }
@@ -1744,6 +1768,7 @@ mod tests {
             greet_pruned: true,
             suspicion_scales_with_log_n: false,
             confirm_before_dead: false,
+            period_from_schedule: true,
         }
     }
 
@@ -3618,6 +3643,56 @@ mod tests {
         prober.handle(sync, lapsed + 5);
         assert_eq!(member_state(&prober, "b"), Some(MemberState::Alive));
         assert_eq!(current_incarnation(&suspect), 2);
+    }
+
+    /// The probe period is kept from when a round was DUE, not from when a late node
+    /// got round to it: late by less than a period, the next round is still due one
+    /// period after the last was. (It used to be due a period after the late start, so
+    /// a node that woke late stretched every period by its lateness, and a member
+    /// whose turn was several rounds off waited that many latenesses.) A node a whole
+    /// period or more behind starts again from now: rounds are not made up.
+    #[test]
+    fn the_probe_period_runs_from_when_a_round_was_due_not_from_a_late_tick() {
+        let period = fast_cfg().protocol_period_ms;
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        s.apply_update(&alive_update("b", "b:1", 0), 0, &mut out);
+        s.tick(0); // bootstrap: the first round is due one period on
+        let round = |s: &mut Swim, at: u64| -> bool {
+            let Some(seq) = ping_seq(&s.tick(at)) else {
+                return false;
+            };
+            s.handle(m("b", "b:1", Kind::Ack { seq }, vec![]), at + 1);
+            true
+        };
+        assert!(!round(&mut s, period - 1), "not due yet");
+        // 40 % of a period late: the round runs, and the next is due on schedule.
+        let late = period * 2 / 5;
+        assert!(round(&mut s, period + late));
+        assert!(!round(&mut s, 2 * period - 1), "the next is not due early");
+        assert!(
+            round(&mut s, 2 * period),
+            "the next round is due a period after the last was DUE"
+        );
+        // Several periods behind: one round now, and the next a full period on.
+        assert!(round(&mut s, 7 * period + 3));
+        assert!(!round(&mut s, 8 * period + 2), "rounds are not made up");
+        assert!(round(&mut s, 8 * period + 3));
+
+        // v1.1.0's rule: a period after the late START.
+        let mut old = node_with(
+            "a",
+            "a:1",
+            Config {
+                period_from_schedule: false,
+                ..fast_cfg()
+            },
+        );
+        old.apply_update(&alive_update("b", "b:1", 0), 0, &mut out);
+        old.tick(0);
+        assert!(round(&mut old, period + late));
+        assert!(!round(&mut old, 2 * period));
+        assert!(round(&mut old, 2 * period + late));
     }
 
     /// `suspicion_scales_with_log_n`: the window is multiplied by `max(1, log10 n)` —

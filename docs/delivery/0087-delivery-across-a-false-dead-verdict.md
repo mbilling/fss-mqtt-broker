@@ -292,3 +292,17 @@ then, once its sub-decision is settled (T3: O1, O4; T5: O2, O5; T6: O3).
   nightly test sets an episode aside on the prober's own counters and the test's
   clock, not on a log line; new metrics `mqttd_swim_stalled_milliseconds_total` and
   `mqttd_swim_awareness`.
+- 2026-10-14 — T10a, from a second review (verdict: merge; three small items). A
+  per-PR test now fails if the read ahead of the tick goes back through the runtime
+  (a datagram in the kernel's buffer that tokio's reactor has not seen: tokio's read
+  says "nothing", the driver's returns it); until then only the nightly scenario
+  covered it. The lateness bound is stated as it is — five gaps between wake-ups,
+  the tick plus the lateness, not five latenesses — and tested with a gap that lines
+  up with nothing. And the review's observation that the probe period was counted
+  from each late start, so a late node's rounds before the dead member's turn each
+  added their lateness (in every release), is fixed in the state machine: the period
+  is kept from when a round was due. With every survivor 300 to 500 ms late that
+  takes the last survivor's verdict from 7.5 s to 7.0 s in the median at 14 nodes and
+  from 8.8 s to 8.0 s at 30 (10.5 s to 8.9 s and 11.2 s to 9.6 s at worst); a node on
+  time is unaffected and the other tables did not move. The driver warns at start if
+  it cannot have its second handle on the socket.

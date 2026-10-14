@@ -826,7 +826,7 @@ than the ack timeout could wake, find the probe's deadline past and the suspect'
 unread, and declare it `Dead`. The driver now reads its socket before a tick may
 expire anything, and that is all it does about its own lateness: the failure
 detector's clock is real time, so a node that is late sees a real death at most one
-wake-up's lateness later at each of five steps, and no later. (A first version also
+gap between its wake-ups later at each of five steps, and no later. (A first version also
 kept stalled time off that clock and raised the node's awareness; a persistently
 late lone survivor then took 64 s to see a death, against 5.7 s. Withdrawn.) The
 probe's `Ack` must come from the generation that is suspected. And the bound is
