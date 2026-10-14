@@ -264,7 +264,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 413 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 417 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -563,7 +563,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `swim::tests::a_gracefully_left_node_is_readmitted_when_it_restarts`
 - `swim::tests::a_greeting_carries_only_our_own_claim_and_leaves_the_gossip_queue_alone`
 - `swim::tests::a_leaving_node_does_not_refute_its_own_dead`
+- `swim::tests::a_member_pruned_without_a_greeting_is_confirmed_gone_at_the_prune`
 - `swim::tests::a_members_new_life_is_reported_to_the_driver_exactly_once`
+- `swim::tests::a_new_generation_confirms_the_old_one_gone_before_its_own_state_change`
 - `swim::tests::a_node_advertises_its_own_domain_on_outgoing_gossip`
 - `swim::tests::a_node_told_it_is_suspected_answers_with_its_refutation_first`
 - `swim::tests::a_peer_marks_a_leaving_node_dead_immediately`
@@ -571,6 +573,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `swim::tests::a_probe_overtaken_by_a_longer_window_is_sent_afresh_when_it_lapses`
 - `swim::tests::a_probe_rescued_only_by_helpers_still_counts_toward_the_regreet`
 - `swim::tests::a_pruned_member_is_greeted_once_as_its_tombstone_goes`
+- `swim::tests::a_pruned_member_that_answers_the_greeting_is_not_confirmed_gone`
+- `swim::tests::a_pruned_member_whose_greeting_goes_unanswered_is_confirmed_gone`
 - `swim::tests::a_receiver_learns_a_peers_gossiped_failure_domain`
 - `swim::tests::a_reflected_datagram_from_ourselves_is_ignored`
 - `swim::tests::a_relay_poisoned_record_heals_on_first_direct_contact`
@@ -1449,7 +1453,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 824 test(s)
+## `crates/mqttd/src/lib.rs` — 830 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1543,13 +1547,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `backup::tests::the_exporter_borrows_the_running_handle_and_never_opens_its_own`
 - `backup::tests::the_headers_created_at_is_a_parseable_rfc_3339_instant`
 - `backup::tests::the_utc_stamp_is_sortable_and_correct`
-- `cluster::tests::a_dialer_that_gave_up_on_a_dead_peer_is_started_again_by_alive`
+- `cluster::tests::a_peer_confirmed_gone_is_dialed_no_more_until_alive`
 - `cluster::tests::a_suspect_between_dead_and_alive_still_withdraws_the_verdict_at_the_hub`
 - `cluster::tests::alive_after_dead_tells_the_hub_the_verdict_is_withdrawn`
 - `cluster::tests::alive_at_a_new_address_replaces_the_dialer_of_a_peer_held_dead`
 - `cluster::tests::alive_dials_and_dead_tells_the_hub_and_keeps_dialing`
 - `cluster::tests::alive_without_a_routing_address_still_withdraws_the_verdict_from_the_dialer`
 - `cluster::tests::alive_without_routing_address_is_skipped`
+- `cluster::tests::gone_is_told_to_the_hub_once_and_only_while_a_verdict_stands`
 - `cluster::tests::larger_node_id_does_not_dial`
 - `cluster::tests::member_states_drive_the_gauge`
 - `config_view::tests::fingerprint_is_stable_and_hides_the_value`
@@ -1684,8 +1689,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::pending_bounds::the_sweep_retransmits_only_overdue_forwards`
 - `hub::forwarding::zone_fwd_proofs::a_forward_unanswered_when_its_target_is_declared_dead_stays_owed_until_the_peer_answers`
 - `hub::forwarding::zone_fwd_proofs::a_hold_at_the_pending_table_bound_evicts_the_oldest_and_withholds_its_ack`
+- `hub::forwarding::zone_fwd_proofs::a_link_to_a_peer_confirmed_gone_that_stays_up_is_dropped_after_the_countdown`
 - `hub::forwarding::zone_fwd_proofs::a_link_under_a_dead_verdict_takes_its_interest_with_it_until_the_verdict_is_withdrawn`
-- `hub::forwarding::zone_fwd_proofs::a_peer_that_stays_dead_holds_its_publishers_no_longer_than_the_grace_did`
+- `hub::forwarding::zone_fwd_proofs::a_peer_confirmed_gone_while_linked_is_resolved_when_that_link_ends`
+- `hub::forwarding::zone_fwd_proofs::a_peer_confirmed_gone_whose_link_stays_up_and_that_is_alive_again_resolves_nothing`
+- `hub::forwarding::zone_fwd_proofs::a_peer_that_stays_dead_is_held_until_confirmed_gone_and_then_resolved_and_counted`
 - `hub::forwarding::zone_fwd_proofs::a_publish_for_a_peer_declared_dead_is_owed_to_it_as_it_is_to_a_link_down_peer`
 - `hub::forwarding::zone_fwd_proofs::a_qos0_publish_nobody_wants_does_not_walk_the_peer_map`
 - `hub::forwarding::zone_fwd_proofs::a_reached_answer_is_downgraded_for_an_older_peer`
@@ -1704,6 +1712,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::zone_fwd_proofs::an_already_answered_victim_is_not_counted_as_a_withheld_ack`
 - `hub::forwarding::zone_fwd_proofs::closing_the_window_clears_both_holds_and_acks`
 - `hub::forwarding::zone_fwd_proofs::every_exit_from_the_fan_out_restores_the_buffer`
+- `hub::forwarding::zone_fwd_proofs::qos0_for_a_peer_with_no_link_is_counted_peer_unreachable`
 - `hub::forwarding::zone_fwd_proofs::releasing_the_ack_hold_does_not_shrink_the_settle_work_set`
 - `hub::forwarding::zone_fwd_proofs::the_ack_hold_clear_is_one_way_and_narrow`
 - `hub::forwarding::zone_fwd_proofs::the_answer_is_at_most_once`
@@ -1711,6 +1720,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::zone_fwd_proofs::the_early_return_does_not_change_who_receives_a_publish`
 - `hub::forwarding::zone_fwd_proofs::the_early_return_never_swallows_a_retained_broadcast`
 - `hub::forwarding::zone_fwd_proofs::the_interest_buffer_is_reused_across_publishes`
+- `hub::forwarding::zone_fwd_proofs::with_a_durable_plane_the_hold_ends_at_the_countdown_and_is_counted`
 - `hub::forwarding::zone_fwd_proofs::without_a_durable_plane_a_client_reconnecting_here_from_the_unreachable_peer_is_not_handed_the_held_publish`
 - `hub::forwarding::zone_fwd_proofs::without_a_durable_plane_nothing_stands_in_for_what_an_unreachable_peer_is_owed`
 - `hub::mesh::tests::a_moved_membership_invalidates_a_positive_answer`
@@ -2078,16 +2088,16 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `memory_watch::tests::vm_rss_is_parsed_in_bytes_from_the_right_line`
 - `memory_watch::tests::without_a_watermark_nothing_is_ever_browned_out`
 - `peer::tests::a_dialer_links_only_the_member_it_was_aimed_at`
-- `peer::tests::a_dialer_whose_window_is_spent_stops_dialing_and_is_set_going_again_by_alive`
+- `peer::tests::a_dialer_stops_dialing_a_peer_confirmed_gone_and_is_set_going_again_by_alive`
 - `peer::tests::a_frame_produced_during_the_yield_joins_the_same_write`
-- `peer::tests::a_link_served_under_the_verdict_restarts_the_dialers_window`
+- `peer::tests::a_link_served_when_the_peer_is_confirmed_gone_is_served_to_its_end`
 - `peer::tests::a_link_that_negotiated_13_carries_no_rule_state`
 - `peer::tests::a_missed_try_is_retried_in_the_end_window`
 - `peer::tests::a_mover_plans_from_the_link_and_from_its_own_renewals`
 - `peer::tests::a_peer_held_dead_is_redialed_with_a_growing_delay_until_the_verdict_is_withdrawn`
 - `peer::tests::a_peer_that_accepts_and_never_speaks_does_not_wedge_the_dialer`
 - `peer::tests::a_renewal_is_acted_on_within_half_the_room_left_capped`
-- `peer::tests::an_alive_that_arrives_during_the_attempt_that_spends_the_window_is_not_lost`
+- `peer::tests::an_alive_that_arrives_during_an_attempt_after_confirmation_is_not_lost`
 - `peer::tests::control_frames_jump_the_bulk_queue`
 - `peer::tests::peer_qos0_is_shed_when_the_pool_is_full_and_nothing_else_is`
 - `peer::tests::rule_state_is_applied_by_the_link_and_enters_no_hub_lane`
@@ -2560,14 +2570,17 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `publish_reaches_matching_subscriber`
 - `qos1_publish_is_acked_and_downgraded`
 
-## `crates/mqttd/tests/false_dead_delivery.rs` — 9 test(s)
+## `crates/mqttd/tests/false_dead_delivery.rs` — 12 test(s)
 
 - `durable_a_follower_evictor_dials_and_a_durable_session_is_served`
 - `durable_a_leader_evictor_dials_the_lease_moves_and_sessions_follow_it`
+- `durable_a_peer_out_of_reach_is_answered_at_the_countdown_and_counted`
+- `durable_an_owner_that_dies_holds_its_publishers_for_the_failover_not_for_confirmation`
 - `durable_the_evicted_peer_dials_the_link_returns_and_sessions_follow_the_lease`
 - `plain_a_false_verdict_keeps_publish_order_for_every_subscriber`
 - `plain_a_link_cut_keeps_publish_order_and_holds_every_acknowledgement_until_the_heal`
 - `plain_a_link_cut_with_no_verdict_holds_every_publish_and_delivers_it`
+- `plain_a_peer_really_dead_is_answered_at_confirmation_and_counted`
 - `plain_a_verdict_withdrawn_after_two_seconds_finds_the_link_already_back`
 - `plain_the_evicted_peer_dials_the_link_returns_and_nothing_is_lost`
 - `plain_the_evictor_dials_the_link_returns_and_nothing_is_lost`

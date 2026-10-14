@@ -7,7 +7,9 @@
 - **Issues:** [#973](https://github.com/mbilling/fss-mqtt-broker/issues/973) (the loss),
   [#975](https://github.com/mbilling/fss-mqtt-broker/issues/975) (the false verdict a short
   outage still ends in), [#971](https://github.com/mbilling/fss-mqtt-broker/issues/971)
-  (closed: formation, and re-admission after a false verdict)
+  (closed: formation, and re-admission after a false verdict),
+  [#1020](https://github.com/mbilling/fss-mqtt-broker/issues/1020) (0087-T3: confirmation
+  and its resolution)
 - **Related:** [ADR 0016](0016-swim-membership-stability.md) (membership stability, and its
   2026-10-12 amendment), [ADR 0042](0042-durable-plane-stress-harness.md) (T9: "acked means
   durable, cluster-wide" — where the acknowledged forward comes from),
@@ -275,6 +277,9 @@ protocol, forward window and every obligation toward it. `peer_disconnected` kee
   the peer's answer discharges what it is owed. T3 replaces the countdown and that
   resolution with D2's; until it does, a peer that is alive and out of reach for longer
   than the hold — a real partition — is still acknowledged for, undelivered, after it.
+  *(0087-T3 did, by mode: without a durable plane the countdown is gone and a hold ends
+  at confirmation; with one it ends at the earlier of the two until T5. See D2 "As
+  built" and the amendment of 2026-10-14 below.)*
   The 8 ticks are counted *without a link since the peer last had one*, not since the
   verdict: a peer held dead whose link keeps forming and dropping before it answers is
   alive, and is held for as long as it does that, with the pending table as the bound
@@ -505,6 +510,71 @@ At confirmation, what the dead peer still owed is resolved by kind:
 | retained | Unchanged. |
 | rule republish | As the kind it is owed to; `mqttd_rule_actions_total` counts `ok` only when the derived message's gate was answered by evidence, `failed` when it was resolved undeliverable. |
 
+**As built (0087-T3, 2026-10-14), scoped by mode** — O1 and O4 as decided (§6), and the
+cut recorded in the amendment of 2026-10-14 below.
+
+- *Confirmation is a membership event.* SWIM raises `Action::Gone` (`swim.rs`) in the
+  two cases of (4): when a `Dead` member's tombstone is pruned and the parting greeting
+  sent with the prune has gone unanswered for one ack timeout (250 ms) — a live member
+  answers it with a `Sync`, is re-admitted, and nothing is raised; at once when no
+  greeting is sent — and when a new generation of the id joins, before the
+  `StateChange` that reports the new life (a pruned life whose greeting is still
+  pending is confirmed by the new one, once). The driver passes it on as a
+  `MembershipEvent` with `gone` set. The link manager (`cluster.rs`) hands it to the
+  hub as `HubCommand::PeerGone` **only while a verdict stands** there — a restart
+  nobody had noticed ends nothing the hub holds — and tells the dialer, which then
+  dials no more (`DialStanding::Gone`); a link it is serving is served to its end, and
+  the next `Alive` sets it dialing again. That replaces D5's 60 s dial window.
+- *"And no link".* If the peer has a link when the confirmation lands, the link answers
+  for it and nothing is resolved yet; the hub marks it confirmed gone
+  (`VerdictHold::GoneLinked`). Its dialer has stopped and no second confirmation comes,
+  so if that link then ends before membership holds the peer alive again, what it is
+  owed is resolved at once, as at a confirmation with no link. An `Alive` after the
+  confirmation — told to the hub by the link manager — clears the mark: the peer is a
+  member, and a later lost link is a member's. (From the review of PR #1021: without
+  the mark, a stale link outliving the confirmation left the peer's interest held
+  under the lost-link policy with nothing to end it.)
+- *What bounds a link to a node confirmed gone: the hold's own countdown, in both
+  modes.* Nothing else ends a half-open peer link in a bounded time. The peer link
+  has no keepalive frame, no read deadline and no TCP keepalive on the socket
+  (checked in `peer.rs` and `mqtt-cluster`'s `peer.rs` on the tree of this change).
+  A host that has restarted answers the next write with a reset, so a link to a
+  restarted node ends at the next frame sent on it; a host that is gone without one
+  leaves writes to be retransmitted until the kernel gives up (on Linux's defaults,
+  about fifteen minutes). In plain mode an idle link is not written to at all, so
+  nothing ends it; in durable mode the lease group's heartbeats write every 500 ms,
+  which bounds it by that retransmission timeout and no better. So the
+  `GoneLinked` mark counts `REROUTE_GRACE_TICKS` (8) sweep ticks: a live peer's
+  `Alive` — its answer to the parting greeting, or its new life — arrives well
+  inside them; when they pass with the link still up and no `Alive`, the hub drops
+  the link and resolves the node, `peer-gone`. A link to a node confirmed gone thus
+  holds its publishers no more than 8 s past the confirmation.
+- *The resolution* (`erase_peer`): an ordinary forward still owed to the peer — a clean
+  session; a persistent one in non-durable mode (O4) — is discharged and its publisher
+  acknowledged on the next sweep tick (one last look for a successor), and counted
+  `mqttd_publish_resolved_undeliverable_total{reason="peer-gone"}`; a `$share` delivery
+  is placed with a member that is left, and one whose group has nobody left is
+  acknowledged and counted `reason="no-shared-member"`. The forward window for the
+  peer goes with it (D4). The hub logs one WARN line per hold that ends this way, with
+  the counts.
+- *Plain mode (`MQTTD_DURABLE=0`).* No countdown: a hold ends when the peer answers,
+  the verdict is withdrawn, or the peer is confirmed gone. The bound is `dead_ttl` after
+  SWIM's verdict, plus SWIM's own tick at the prune, the 250 ms the greeting is given,
+  and the sweep tick the answer waits for — not "`dead_ttl` plus a sweep tick" exactly,
+  as the plan row put it: the greeting's quarter second is O1's "unanswered".
+- *Durable mode.* The hold ends at the earlier of confirmation and the eight-tick
+  countdown of 0087-T2, and what the countdown ends is counted
+  `reason="hold-expired"`. Until D8 (T5) a publish made after a durable session's
+  takeover is owed to the dead node and to the new owner alike, and the re-route
+  discharge of (2) does not see it (the new owner is not a re-route candidate for a
+  publish it was sent anyway), so holding to confirmation would make every durable
+  failover a `dead_ttl` pause for those publishers. Measured in the episode: a
+  publish made at the leader's verdict for an offline durable session of the dead
+  owner was stored by the new owner and acknowledged 4.0 s after the verdict.
+- *Not built:* the rule-republish row — `mqttd_rule_actions_total` still counts at the
+  action, not at the derived message's resolution. A derived message resolved
+  undeliverable is counted in `resolved_undeliverable` like any other publish.
+
 ### D3 — Bounds, and what the publisher experiences
 
 - **Where held publishes live:** the pending-publish table — 65,536 entries and 64 MiB
@@ -589,6 +659,8 @@ aborting it, and `peer.rs` (`dial_member`) keeps dialing under the verdict:
   change, and the next `Alive` sets it dialing again. (Ending it left an instant in
   which the link manager, seeing the task still running, handed it the `Alive` it was
   about to miss — a member alive with no dialer.) T3's event replaces the window.
+  *(As built, 0087-T3: the window is gone; the dialer stops dialing at
+  confirmation, and waits as it did when its window was spent — see D2 "As built".)*
 - *What counts as a verdict standing.* The link manager keeps its own set of peers
   held dead, and withdraws the verdict — at the hub and at the dialer — on the first
   `Alive` for a peer in it, whatever came between. SWIM can raise `Suspect` between a
@@ -691,10 +763,13 @@ pause is wrong.)*
   The split by peer and by verdict is T7's.)*
 - `mqttd_publish_resolved_undeliverable_total{reason}`: publishes acknowledged at D2's
   confirmation because their subscriber's node was confirmed gone, by reason
-  (`peer-gone`, `no-shared-member`).
+  (`peer-gone`, `no-shared-member`). *(As built, 0087-T3, with a third reason for the
+  durable-mode countdown until T5: `hold-expired`.)*
 - `mqttd_publish_dropped_total{reason="peer-unreachable"}`: QoS 0 not forwarded to a peer
   with matching interest and no link. The `no-subscriber` reason is either emitted or
-  taken out of the help text.
+  taken out of the help text. *(As built, 0087-T3: counted once per such peer, for
+  every forward nobody answers — `QoS` 0, a Will, an event-derived message. The
+  `no-subscriber` reason is T7's.)*
 - One WARN line when a hold starts for a peer and one when it ends, with the count and
   how it ended; a shipped alert on the gauge staying above zero; the held count beside
   each peer in `mqttd --admin placement`.
@@ -729,15 +804,18 @@ clean-session QoS 1 rung at ten nodes, the durable rung, and the `$share` QoS 1 
 
 ## 6. Open sub-decisions
 
-- **O1 — What confirms a peer gone.** Proposed: the tombstone pruned with the parting
-  greeting unanswered and no link (so `dead_ttl`, 30 s, is the bound), or a new generation
-  of the id. Alternative: a separate, shorter bound for routing than for membership.
+- **O1 — What confirms a peer gone. Decided 2026-10-14 (the maintainer):** the
+  tombstone pruned with the parting greeting unanswered and no link — `dead_ttl`, 30 s,
+  after the verdict — or a new generation of the id. A publisher may wait that long for
+  an acknowledgement ("yes 30 seconds is fine"). Not chosen: a separate, shorter bound
+  for routing than for membership. Built in 0087-T3 (D2 "As built").
 - **O2 — D8 in the first cut?** Proposed: yes (see D8).
 - **O3 — At the pending-table bound:** withhold (today) or answer a v5 publisher `0x97`
   when the message is stored nowhere.
-- **O4 — Persistent sessions in non-durable mode on a node confirmed gone:** acknowledge
-  and count at confirmation (proposed), or hold longer for a node that may restart with
-  its disk.
+- **O4 — Persistent sessions in non-durable mode on a node confirmed gone. Decided
+  2026-10-14 (the maintainer), the proposed default:** acknowledge and count at
+  confirmation (resolved-undeliverable); do not hold longer for a node that may restart
+  with its disk. Built in 0087-T3.
 - **O5 — Links below proto 15 during an upgrade:** hold conservatively (proposed), or
   keep today's discharge-on-re-route for them.
 - **O6 — A pair that cannot reach each other while both reach a third node.** SWIM does
@@ -883,6 +961,8 @@ its own, so that a broker whose workers are all busy still answers its probes.
   partition, for every subscriber kind, up to the pending table's bound.
 - After a real node death, publishers to that node's non-durable subscribers wait for
   confirmation — up to 30 s where it is 8 s today. Durable failover is unchanged, given D8.
+  *(As built, 0087-T3: so in plain mode; with a durable plane the 8 s countdown stays
+  an upper bound until D8 — the amendment of 2026-10-14.)*
 - A node's interest outlives a verdict about it by up to `dead_ttl`; the memory is the
   interest snapshot it already held.
 - Operators get series and a log line for what is held and what was resolved
@@ -897,9 +977,20 @@ its own, so that a broker whose workers are all busy still answers its probes.
 - QoS 0, Wills and event-derived messages were not measured across a verdict; their rows
   in §1 are from the code.
 - The proto-6 rows of §1 are from the code; no supported release speaks proto 6.
-- D5 is built (0087-T4), and D1, D4 and D6 (0087-T2) with the bound D1 states in place
-  of D2. D2, D3, D7–D9 are designed against the code and not built; D3's table-fill
-  arithmetic is not a measurement.
+- D5 is built (0087-T4), D1, D4 and D6 (0087-T2), and D2 with the counters of D9
+  (0087-T3) — in durable mode with the countdown of D1 as an upper bound until D8.
+  D3, D7, D8 and the rest of D9 are designed against the code and not built; D3's
+  table-fill arithmetic is not a measurement.
+- 0087-T3's confirmation is injected in the episodes as the event the link manager
+  reads; that SWIM raises it at the prune, after an unanswered greeting, and at a new
+  generation is tested on the state machine (`swim.rs`), not on a running cluster. The
+  episodes hold B "really dead" by cutting the A–B link with B's process running; a
+  killed process was not run.
+- The link manager remembers each node confirmed gone (`confirmed_gone` in
+  `cluster.rs`) until that id's next `Alive` or `Dead`: one entry per node id that
+  departs and never returns under its name, for the life of the process — as its set
+  of verdicts did before 0087-T3. Stable ids keep it small; ephemeral ids grow it.
+  Not pruned when SWIM forgets the member.
 - With D1 built, the hot path was checked by reading the diff — `forward_to_peers`,
   `register_forward` and the constant-time `$share` path are untouched — and by the
   publish-dispatch micro-benchmark (`benches/shared_plan.rs`), not on the rig.
@@ -940,3 +1031,33 @@ releases the ack early or discharges what the unreachable peer is owed (D1 above
 a new session nothing published before it. Not covered (#1014): the re-route to a peer, which
 still hands a held publish to a subscriber created there after it, and a persistent session
 born inside the window that reconnects with `session_present = 1`.
+
+## Amendment (2026-10-14): 0087-T3 is built by mode; durable mode keeps the countdown until T5 (issue #1020)
+
+**Decided by the maintainer the same day**, on T3's analysis before it was built. Holding
+a peer's obligations until it is confirmed gone is right for every subscriber kind but
+one, and that one is the common case of a durable failover: a publish made after the
+lease's new owner has taken over a dead owner's session matches the dead owner's kept
+interest and the new owner's, is sent to the new owner and answered — and stays owed to
+the dead owner, because the re-route discharge of D2 (2) takes only a peer that was NOT
+sent the publish. Before T3 the eight-tick countdown ended that; held to confirmation,
+every such publisher would wait out `dead_ttl` — 30 s after the verdict where it was 8 s.
+A hub-only test showed it (a successor's `Reached` at once; the acknowledgement at the
+eighth sweep), and D8 is what removes it: the dead owner's interest marked durable is
+discharged by the committed owner's answer, whoever was sent what.
+
+So:
+
+- **Without a durable plane** the countdown is gone. A hold ends when the peer answers,
+  the verdict is withdrawn, or the peer is confirmed gone, and then D2's resolution
+  applies, counted. 0087-T3's acceptance is met in this mode.
+- **With a durable plane**, until T5, the hold ends at the earlier of confirmation and
+  the countdown, and what the countdown ends is counted
+  `mqttd_publish_resolved_undeliverable_total{reason="hold-expired"}`. A durable
+  failover holds a publisher no longer than before T3 (an episode pins it: acknowledged
+  4.0 s after the leader's verdict, stored by the new owner, and the test fails at 20 s).
+- **The known gap, until T5:** in durable mode a clean session — or any subscriber —
+  behind a partition longer than eight sweep ticks is acknowledged undelivered, as it
+  was before T3; it is now counted (`hold-expired`) where it was silent. An episode
+  pins it (`durable_a_peer_out_of_reach_is_answered_at_the_countdown_and_counted`), and
+  T5 flips it. T3's acceptance in durable mode is T5's.

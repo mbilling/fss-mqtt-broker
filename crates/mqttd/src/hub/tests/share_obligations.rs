@@ -443,8 +443,9 @@ fn what_is_first_owed_at_the_heal_goes_out_in_publish_order_too() {
         "(a) and what follows goes behind them"
     );
 
-    // (b) the outage outlasts the hold: the peer is held dead, its hold runs out
-    // and its interest is erased; it returns and announces the same filter.
+    // (b) the outage outlasts the hold: the peer is held dead, it is confirmed
+    // gone and its interest is erased; it returns (a new life) and announces the
+    // same filter.
     let mut h = hub();
     h.set_cluster_configured();
     let first = link(&mut h, "p", PROTO_MAX);
@@ -456,10 +457,9 @@ fn what_is_first_owed_at_the_heal_goes_out_in_publish_order_too() {
         1,
         "owed to the peer held dead"
     );
-    for _ in 0..REROUTE_GRACE_TICKS {
-        tick(&mut h);
-    }
-    assert!(!h.interest.has_node(&first.node), "the hold ran out");
+    h.peer_gone(&first.node);
+    tick(&mut h);
+    assert!(!h.interest.has_node(&first.node), "the hold ended");
     assert!(
         owed(&h, during_the_hold).is_empty(),
         "and discharged what was owed"
@@ -1025,19 +1025,21 @@ fn a_share_delivery_follows_a_consumer_that_reconnected_through_another_node() {
 /// "b expires, c returns" — the mirror of
 /// `a_share_delivery_does_not_move_from_one_unreachable_member_to_another`. The
 /// group has a member on b and one on c, and neither node can be reached. The
-/// delivery is owed to b's member; b's hold runs out and b is erased. c is only
-/// out of reach — held dead with its own hold still running, or merely without a
+/// delivery is owed to b's member; b is confirmed gone (ADR 0087 D2) and erased.
+/// c is only out of reach — held dead and not confirmed gone, or merely without a
 /// link — so the delivery is placed with c's member and held, and c's member takes
 /// it when c is back. Until this, erasing b discharged the delivery and
 /// acknowledged the publisher, and c's member was never offered the message.
 ///
-/// And when c does not come back either, its hold running out ends it as before:
-/// the group has nobody, and the publisher is acknowledged.
+/// And when c is confirmed gone too, that ends it: the group has nobody, and the
+/// publisher is acknowledged — and the publish counted `no-shared-member` (D9).
 #[test]
 fn a_share_delivery_moves_to_a_member_on_a_kept_node_when_its_own_nodes_hold_runs_out() {
     for (c_is_dead, c_returns) in [(false, true), (true, true), (true, false)] {
         let case = format!("c_is_dead={c_is_dead} c_returns={c_returns}");
         let mut h = hub();
+        let metrics = std::sync::Arc::new(mqtt_observability::metrics::Metrics::new("so"));
+        h.attach_metrics(metrics.clone());
         let mut b = peer(&mut h, "b", PROTO_MAX, &["m-b"]);
         let c = peer(&mut h, "c", PROTO_MAX, &["m-c"]);
         let (id, mut rx) = publish_shared(&mut h);
@@ -1056,17 +1058,22 @@ fn a_share_delivery_moves_to_a_member_on_a_kept_node_when_its_own_nodes_hold_run
         assert_eq!(owed(&h, id)[0].1, "b", "{case}: c cannot be reached either");
         if c_is_dead {
             // c's link forms and goes again without c saying anything: it is
-            // there, and its hold starts over — so b's runs out first.
+            // there, and its hold starts over.
             let _ = link(&mut h, "c", PROTO_MAX);
             h.peer_disconnected(&c.node, 0);
         }
-        for _ in 4..REROUTE_GRACE_TICKS {
-            assert!(unanswered(&mut rx), "{case}: held while b's hold runs");
+        for _ in 4..REROUTE_GRACE_TICKS * 2 {
+            assert!(
+                unanswered(&mut rx),
+                "{case}: held until b is confirmed gone"
+            );
             tick(&mut h);
         }
+        h.peer_gone(&b.node);
+        tick(&mut h);
         assert!(
             !h.remote_shared.contains_key(&b.node),
-            "{case}: b's hold ran out and b is erased"
+            "{case}: b is confirmed gone and erased"
         );
         assert!(
             unanswered(&mut rx),
@@ -1090,14 +1097,20 @@ fn a_share_delivery_moves_to_a_member_on_a_kept_node_when_its_own_nodes_hold_run
             h.forward_answered(&back.node, now[0].0, ForwardVerdict::Stored);
             assert!(accepted(&mut rx), "{case}");
         } else {
-            for _ in 0..REROUTE_GRACE_TICKS {
-                tick(&mut h);
-            }
+            h.peer_gone(&c.node);
+            tick(&mut h);
             assert!(
                 accepted(&mut rx),
-                "{case}: c's hold ran out too — the group has nobody left"
+                "{case}: c is confirmed gone too — the group has nobody left"
             );
             assert!(h.pending_publishes.is_empty() && h.forward_index.is_empty());
+            assert!(
+                metrics.render().contains(
+                    "mqttd_publish_resolved_undeliverable_total{reason=\"no-shared-member\"} 1"
+                ),
+                "{case}: and counted: {}",
+                metrics.render()
+            );
         }
     }
 }

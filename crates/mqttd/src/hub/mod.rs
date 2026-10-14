@@ -1653,6 +1653,16 @@ pub enum HubCommand {
         /// The node.
         node: NodeId,
     },
+    /// Membership confirmed a node it had declared dead **gone** (ADR 0087 D2): its
+    /// tombstone was pruned with the parting greeting unanswered, or a new
+    /// generation of its id joined. What was held for it is resolved, and counted
+    /// (`mqttd_publish_resolved_undeliverable_total{reason}`). The verdict ends with
+    /// it. A node that has a link at that moment is answering for itself, and only
+    /// the verdict is forgotten.
+    PeerGone {
+        /// The node.
+        node: NodeId,
+    },
     /// A peer said whether its rules select a message event (ADR 0083; proto 13):
     /// while they do, publishes forwarded to it carry their origin
     /// ([`PeerMessage::OriginPublish`]), and every publish here is stamped with one.
@@ -2061,6 +2071,7 @@ impl HubCommand {
             | Self::PeerDisconnected { .. }
             | Self::PeerDead { .. }
             | Self::PeerAlive { .. }
+            | Self::PeerGone { .. }
             | Self::RemoteInterest { .. }
             | Self::RemoteMessageEvents { .. }
             | Self::RemoteSharedInterest { .. }
@@ -2784,6 +2795,10 @@ pub struct Hub {
     /// while draining, which ends with the process (a drain that could be cancelled
     /// would have to clear it with `draining`).
     drain_gated: HashSet<u64>,
+    /// Set while [`erase_peer`](Self::erase_peer) resolves what a node held dead was
+    /// owed, to the reason a `$share` delivery left with nobody to take it is
+    /// counted under (`no-shared-member`, ADR 0087 D9). `false` everywhere else.
+    resolving_unreachable: bool,
     /// Unanswered publishes the pending-publish bound evicted during the drain, which the
     /// barrier therefore did not wait for; reported with its answer.
     drain_evicted: u64,
@@ -2846,8 +2861,9 @@ pub struct Hub {
     /// members, the forwards owed to it and the window of its own forwards are kept,
     /// exactly as for a peer whose link is merely down, and a publish that matches is
     /// owed to it and held. If its link returns the forwards go out and it answers
-    /// for itself. If it does not, the hold runs out and the state is erased
-    /// ([`erase_peer`](Self::erase_peer)).
+    /// for itself. If it does not, the state is erased when membership confirms the
+    /// node gone — or, with a durable plane, when the countdown runs out first —
+    /// ([`erase_peer`](Self::erase_peer), ADR 0087 D2).
     ///
     /// The entry outlives the hold on purpose. A link is admitted by its handshake,
     /// not by membership (D5), so a node held `Dead` can be linked again and bring its
@@ -2996,16 +3012,68 @@ enum VerdictHold {
     /// peer has no link ends the count as well: the peer is a member again, and a
     /// member's lost link holds until it returns or a new verdict falls.
     ///
-    /// **For 0087-T3:** this countdown stands in for the confirmation that a peer is
-    /// gone (ADR 0087 D2, open sub-decision O1). When membership raises that as an
-    /// event, the event ends the hold and the countdown goes.
+    /// **What ends it (ADR 0087 D2, 0087-T3):** the peer's link returning; the
+    /// verdict being withdrawn; or membership confirming the peer gone
+    /// ([`HubCommand::PeerGone`]: the tombstone pruned with the parting greeting
+    /// unanswered, `dead_ttl` after the verdict, or a new generation of its id) —
+    /// and then what it was owed is resolved, and counted. **With a durable plane
+    /// the countdown ends it too**, whichever comes first: until interest says
+    /// whether the lease plane owns it (D8, 0087-T5), a publish owed to a node that
+    /// really died and to the session's new owner as well — every publish made after
+    /// the takeover — has nothing else to discharge it, and holding it to
+    /// confirmation would turn every durable failover into a `dead_ttl` pause for
+    /// publishers. Without a durable plane no session moves between nodes, and the
+    /// countdown does not run: the hold lasts until confirmation.
     Unreachable {
-        /// Sweep ticks left.
+        /// Sweep ticks left (counted only with a durable plane).
         ticks: u8,
     },
     /// Nothing is held on the verdict's account: the node is linked — and served
     /// like any other — or the hold ran out and its routing state was erased.
     Settled,
+    /// Membership confirmed the node gone ([`HubCommand::PeerGone`]) while it had a
+    /// link. The link answers for it for as long as it lasts, but it is the link of
+    /// a node membership has written off — a connection not yet torn down, or the
+    /// last of a process that is going — and its dialer has stopped. So when it
+    /// ends, what the node is owed is resolved as at a confirmation with no link
+    /// ([`peer_disconnected`](Hub::peer_disconnected)); a later link, if one forms,
+    /// does not clear this. Only an `Alive` does ([`HubCommand::PeerAlive`]): the
+    /// node is a member again, and its lost link is a member's.
+    ///
+    /// **Bounded by its own countdown**, in both modes: nothing else ends a
+    /// half-open peer link in a bounded time. The link has no keepalive frame, no
+    /// read deadline and no TCP keepalive; a write to a host that is gone without a
+    /// reset is retransmitted until the kernel gives up (on Linux's defaults, about
+    /// fifteen minutes), and an idle link — nothing owed in either direction, no
+    /// lease group riding it in plain mode — is never written to at all. So when
+    /// [`REROUTE_GRACE_TICKS`] sweeps pass with the link still up and no `Alive` —
+    /// a live peer answers the parting greeting, or its new life is reported, well
+    /// inside that — the link is dropped and the node resolved as at a
+    /// confirmation with no link.
+    GoneLinked {
+        /// Sweep ticks left before the link is dropped and the node resolved.
+        ticks: u8,
+    },
+}
+
+/// Why the hold for a node held dead ended with its state erased (ADR 0087 D2, D9):
+/// the reason its undeliverable publishes are counted under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resolution {
+    /// Membership confirmed the node gone ([`HubCommand::PeerGone`]).
+    PeerGone,
+    /// With a durable plane, the countdown of [`VerdictHold::Unreachable`] ran out
+    /// first (until 0087-T5).
+    HoldExpired,
+}
+
+impl Resolution {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::PeerGone => "peer-gone",
+            Self::HoldExpired => "hold-expired",
+        }
+    }
 }
 
 // The bools are independent obligations, not an encodable state machine.
@@ -3056,6 +3124,7 @@ impl Hub {
                 draining: false,
                 drain_gating: false,
                 drain_gated: HashSet::new(),
+                resolving_unreachable: false,
                 drain_evicted: 0,
                 owned_tasks: tokio::task::JoinSet::new(),
                 truncate_tx: None,
@@ -4221,6 +4290,7 @@ impl Hub {
                 self.takeover_reconcile_ticks = 8;
             }
             HubCommand::PeerAlive { node } => self.peer_alive(&node),
+            HubCommand::PeerGone { node } => self.peer_gone(&node),
             HubCommand::DurableFrame { node, frame } => {
                 self.handle_durable_frame(&node, frame);
             }
@@ -8005,9 +8075,12 @@ impl Hub {
         }
         self.tell_message_events(Some(&node_for_events));
         // A node held `Dead` is linked: it is reachable, whatever membership says
-        // (ADR 0087 D5), and there is nothing left to count down.
+        // (ADR 0087 D5), and there is nothing left to count down. (One confirmed
+        // gone stays so: only an `Alive` makes it a member again.)
         if let Some(hold) = self.held_dead.get_mut(&node_for_events) {
-            *hold = VerdictHold::Settled;
+            if !matches!(hold, VerdictHold::GoneLinked { .. }) {
+                *hold = VerdictHold::Settled;
+            }
         }
         // A link (re)forming while gated publishes are held: schedule a scan so
         // the settle pass re-runs against the now-visible peer state (its
@@ -8067,6 +8140,22 @@ impl Hub {
         // handshake (ADR 0087 D5) — and that link is now gone. No second verdict
         // will follow, so the one that stands starts its hold again: what the link
         // brought back is kept while the node may still return, and no longer.
+        //
+        // A node membership has since confirmed GONE is not coming back under this
+        // verdict: its dialer has stopped, and no confirmation will follow the one
+        // that came. What it is owed is resolved now (ADR 0087 D2).
+        if matches!(
+            self.held_dead.get(node),
+            Some(VerdictHold::GoneLinked { .. })
+        ) {
+            self.held_dead.remove(node);
+            info!(peer = %node.0, "the link of a peer confirmed gone ended; resolving what it was owed");
+            // The takeover window opens as at a verdict's lost link: if a session of
+            // the node is still to be inherited, this is when.
+            self.takeover_reconcile_ticks = 8;
+            self.erase_peer(node, Resolution::PeerGone);
+            return;
+        }
         if let Some(hold) = self.held_dead.get_mut(node) {
             *hold = VerdictHold::Unreachable {
                 ticks: REROUTE_GRACE_TICKS,
@@ -8110,8 +8199,10 @@ impl Hub {
     /// - **a `$share` delivery finds another member** — re-selected at once when the
     ///   group has one that can take it now, and at any later tick of the hold at
     ///   which one has appeared;
-    /// - **the hold runs out** ([`VerdictHold::Unreachable`]) and the peer's state is
-    ///   erased as it used to be at the verdict ([`erase_peer`](Self::erase_peer)).
+    /// - **the peer is confirmed gone** ([`peer_gone`](Self::peer_gone), ADR 0087
+    ///   D2) — or, with a durable plane until 0087-T5, the countdown of
+    ///   [`VerdictHold::Unreachable`] runs out first — and the peer's state is erased
+    ///   and what it was owed resolved and counted ([`erase_peer`](Self::erase_peer)).
     fn peer_dead(&mut self, node: &NodeId) {
         let had_link = self.peers.remove(node).is_some();
         self.retiring_links.retain(|link| &link.node != node);
@@ -8454,32 +8545,110 @@ impl Hub {
     /// since appeared on another node, the group's consumers reconnecting elsewhere
     /// after their node went, and moves to it instead of waiting
     /// ([`move_shared_from_unreachable`](Self::move_shared_from_unreachable)).
+    ///
+    /// The count runs only with a durable plane ([`VerdictHold::Unreachable`] says
+    /// why); without one a hold ends at confirmation ([`peer_gone`](Self::peer_gone)).
     fn sweep_verdict_holds(&mut self) {
         let mut expired: Vec<NodeId> = Vec::new();
-        for (node, hold) in &mut self.held_dead {
-            if let VerdictHold::Unreachable { ticks } = hold {
-                *ticks = ticks.saturating_sub(1);
-                if *ticks == 0 {
-                    expired.push(node.clone());
+        if self.durable_plane.is_some() {
+            for (node, hold) in &mut self.held_dead {
+                if let VerdictHold::Unreachable { ticks } = hold {
+                    *ticks = ticks.saturating_sub(1);
+                    if *ticks == 0 {
+                        expired.push(node.clone());
+                    }
                 }
             }
         }
         for node in expired {
-            self.erase_peer(&node);
+            self.erase_peer(&node, Resolution::HoldExpired);
             self.held_dead.insert(node, VerdictHold::Settled);
+        }
+        // A link to a node confirmed gone is given its countdown in both modes
+        // ([`VerdictHold::GoneLinked`]): then it is dropped, and the node resolved.
+        let mut gone: Vec<NodeId> = Vec::new();
+        for (node, hold) in &mut self.held_dead {
+            if let VerdictHold::GoneLinked { ticks } = hold {
+                *ticks = ticks.saturating_sub(1);
+                if *ticks == 0 {
+                    gone.push(node.clone());
+                }
+            }
+        }
+        for node in gone {
+            self.held_dead.remove(&node);
+            warn!(peer = %node.0, "the link of a peer confirmed gone outlived its countdown with no Alive; dropping it and resolving what the peer was owed");
+            self.drop_link_of_gone(&node);
+            self.takeover_reconcile_ticks = 8;
+            self.erase_peer(&node, Resolution::PeerGone);
         }
         self.move_shared_from_unreachable();
     }
 
-    /// Drop all routing state for a node held `Dead` whose hold has run out, and
-    /// resolve what it was still owed — what `peer_dead` did at the verdict, until
-    /// ADR 0087 D1 put the hold in between.
+    /// Membership confirmed `node` gone (ADR 0087 D2, [`HubCommand::PeerGone`]).
     ///
-    /// **For 0087-T3:** this is today's resolution, kept so that a node that really
-    /// is dead holds no publisher longer than before: an ordinary forward still
-    /// owed to it is discharged and its publisher acknowledged with no answer from
-    /// anyone. D2 replaces it with a resolution per subscriber kind, counted, at
-    /// confirmation.
+    /// The verdict ends here. If the node has a link it is answering for itself —
+    /// a pruned member that was alive after all, or the new generation already
+    /// linked — and nothing it is owed is resolved yet: the obligations are on that
+    /// link. It is marked [`VerdictHold::GoneLinked`], so that if the link ends
+    /// before membership holds the node alive again, what it is owed is resolved
+    /// then: its dialer has stopped and no further confirmation comes. Otherwise
+    /// what it was still owed is resolved per subscriber kind (D2's table), and
+    /// counted: an ordinary forward — a clean session, or a persistent
+    /// one in non-durable mode (O4 as decided: acknowledged and counted at
+    /// confirmation, not held longer) — is discharged, and its publisher answered
+    /// after one last look for a successor; a `$share` delivery is placed with a
+    /// member that is left, and acknowledged if there is none. A durable session's
+    /// forward has normally been discharged before this by its new owner's answer;
+    /// one that has not is resolved as the rest are (until 0087-T5 the hub cannot
+    /// tell it apart).
+    fn peer_gone(&mut self, node: &NodeId) {
+        let Some(hold) = self.held_dead.remove(node) else {
+            return; // no verdict stands
+        };
+        if self.peers.contains_key(node) {
+            info!(peer = %node.0, "peer confirmed gone while linked; the link answers for it until it ends");
+            self.held_dead.insert(
+                node.clone(),
+                VerdictHold::GoneLinked {
+                    ticks: REROUTE_GRACE_TICKS,
+                },
+            );
+            return;
+        }
+        if matches!(hold, VerdictHold::Unreachable { .. }) {
+            self.erase_peer(node, Resolution::PeerGone);
+        }
+    }
+
+    /// Drop the link of a node confirmed gone whose link outlived its countdown
+    /// ([`VerdictHold::GoneLinked`]): as [`peer_dead`](Self::peer_dead) drops a link
+    /// — removing the peer entry drops its outbound sender, which closes the link's
+    /// pump — and as [`peer_disconnected`](Self::peer_disconnected) tells the rest of
+    /// the node that it went.
+    fn drop_link_of_gone(&mut self, node: &NodeId) {
+        if self.peers.remove(node).is_none() {
+            return;
+        }
+        self.retiring_links.retain(|link| &link.node != node);
+        self.recompute_peers_want_origin();
+        self.mark_shared_unreachable(node);
+        if let Some(plane) = &self.durable_plane {
+            plane.fail(node);
+        }
+        self.drop_retained_handoff_state(node);
+        self.recompute_mesh();
+    }
+
+    /// Drop all routing state for a node held `Dead` whose hold has ended — it was
+    /// confirmed gone, or (durable plane) its countdown ran out — and resolve what it
+    /// was still owed (ADR 0087 D2): an ordinary forward still owed to it is
+    /// discharged, its publisher acknowledged after one last look for a successor,
+    /// and the publish counted `resolved_undeliverable{reason}` — `peer-gone` or
+    /// `hold-expired` (D9). With the node gone a clean session on it is gone, and
+    /// a persistent one in non-durable mode lived only there (O4 as decided: not
+    /// held longer); the hub cannot yet tell those from a durable session whose new
+    /// owner has not answered (0087-T5).
     ///
     /// A `$share` delivery is not discharged while its group has a member left. The
     /// erased node's members are gone with it, so the delivery is placed again as a
@@ -8489,11 +8658,22 @@ impl Hub {
     /// member on a node which then returned was never offered ("b expires, c
     /// returns" — issue #973). Only a group with nobody left ends as a publish
     /// nobody subscribes to does: acknowledged.
-    fn erase_peer(&mut self, node: &NodeId) {
+    fn erase_peer(&mut self, node: &NodeId, why: Resolution) {
         // A dead origin retransmits nothing: its forwards died with it, and a
         // successor sends under its own seqs (issue #648).
         self.forward_windows.remove(node);
-        self.known_peer_protos.remove(node);
+        // The protocol the node last negotiated is forgotten when its countdown runs
+        // out, as before 0087-T3 — but not at a confirmation. Membership confirms a
+        // node gone at the instant a new generation of it joins (a restart, a roll),
+        // and forgetting it there would make every member read as not yet capable
+        // until the new process's first handshake: ADR 0073's ownership domain would
+        // shrink to the lease voters and grow back across every roll, moving
+        // sessions twice. Only placement members are asked
+        // ([`every_member_speaks`](Self::every_member_speaks)), so the entry of a
+        // node that is gone for good says nothing; the next handshake overwrites it.
+        if why == Resolution::HoldExpired {
+            self.known_peer_protos.remove(node);
+        }
         let had_interest = self.interest.remove(node);
         let had_groups = self.remote_shared.remove(node).is_some();
         self.rebuild_remote_shared_index();
@@ -8505,6 +8685,7 @@ impl Hub {
         // this node holds alive has no link, the last tick of the grace holds.
         let mut gone_seqs: Vec<u64> = Vec::new();
         let mut shared: Vec<(u64, ForwardObligation)> = Vec::new();
+        let mut discharged: u64 = 0;
         for (id, p) in self.pending_publishes.iter_mut() {
             let seqs: Vec<u64> = p
                 .awaiting
@@ -8520,21 +8701,37 @@ impl Hub {
                 if matches!(obligation.kind, ForwardKind::Shared { .. }) {
                     shared.push((*id, obligation));
                 } else {
-                    debug!(peer = %node.0, topic = %p.topic, "hold ran out; forward obligation discharged");
+                    debug!(peer = %node.0, topic = %p.topic, reason = why.reason(), "forward obligation resolved undeliverable");
                     p.reroute_grace = Some(1);
+                    discharged += 1;
                 }
             }
         }
         for seq in gone_seqs {
             self.forward_index.remove(&seq);
         }
+        // Counted, not silent (ADR 0087 D9): each publish acknowledged because the
+        // node that owned its subscriber is gone, or — with a durable plane, until
+        // 0087-T5 — stayed out of reach for the whole countdown.
+        if let Some(m) = &self.metrics {
+            m.publish_resolved_undeliverable_by(why.reason(), discharged);
+        }
         // The node's members left their groups with the state erased above, so
-        // each delivery is placed among the members that remain.
+        // each delivery is placed among the members that remain; one whose group
+        // has nobody left is acknowledged, and counted `no-shared-member`.
+        let placing = shared.len();
+        self.resolving_unreachable = true;
         for (id, obligation) in shared {
             self.reselect_shared(id, obligation, Reselect::MemberGone);
         }
-        if had_interest || had_groups {
-            info!(peer = %node.0, "peer held dead stayed unreachable; routing state dropped");
+        self.resolving_unreachable = false;
+        if had_interest || had_groups || discharged > 0 || placing > 0 {
+            warn!(
+                peer = %node.0, reason = why.reason(), resolved_undeliverable = discharged,
+                shared_placed_again = placing,
+                "hold for a peer held dead ended: its routing state is dropped and what it \
+                 was owed is resolved (counted in mqttd_publish_resolved_undeliverable_total)"
+            );
         }
     }
 

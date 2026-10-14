@@ -27,6 +27,15 @@
 //!   `AckedAndLost` or `HeldThenLost` any more, `$share` rows included, and an
 //!   episode with no verdict at all — the link alone is cut — joins the matrix
 //!   ([`Fault::LinkCut`]).
+//! - **T3 (D2), confirmed gone.** Three episodes hold B dead for real as A sees it —
+//!   the link cut for good — and assert what ends the hold: in plain mode only
+//!   membership's confirmation that B is gone, after which every publish owed to B is
+//!   acknowledged within a sweep tick and counted by reason
+//!   (`mqttd_publish_resolved_undeliverable_total`); in durable mode, until T5, the
+//!   eight-tick countdown too — both the gap that leaves (a clean session behind a
+//!   long partition, acknowledged undelivered, now counted) and the failover pause it
+//!   keeps (a durable session's publish stored by the lease's new owner and
+//!   acknowledged in seconds).
 //!
 //! What these episodes still show and the design has not reached: in durable mode
 //! the first `QoS` 2 publish after the verdict can be answered by closing the
@@ -135,7 +144,8 @@ struct Node {
     plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
     /// The hub, to ask it whether it has caught up ([`HubCommand::Flush`]).
     hub: mpsc::UnboundedSender<HubCommand>,
-    /// How many `Dead` verdicts this node's link manager has handed its hub.
+    /// How many `Dead` verdicts — and confirmations that a peer is gone — this
+    /// node's link manager has handed its hub.
     verdicts_handed_to_the_hub: Arc<AtomicUsize>,
     /// Whether the relay in front of this node's peer listener carries links
     /// ([`relay_peer_links`]); `false` cuts the ones it has and refuses new ones.
@@ -392,7 +402,10 @@ async fn start_node(id: &str, seeds: Vec<String>, mode: Mode) -> Node {
         let (hub, handed) = (hub_tx.clone(), verdicts_handed_to_the_hub.clone());
         tokio::spawn(async move {
             while let Some(command) = from_link_manager.recv().await {
-                let verdict = matches!(command, HubCommand::PeerDead { .. });
+                let verdict = matches!(
+                    command,
+                    HubCommand::PeerDead { .. } | HubCommand::PeerGone { .. }
+                );
                 if hub.send(command).is_err() {
                     break;
                 }
@@ -557,6 +570,7 @@ impl Cluster {
             peer_addr: self.b.peer_addr.clone(),
             state,
             domain: None,
+            gone: false,
         }
     }
 
@@ -597,6 +611,36 @@ impl Cluster {
             .await
             .expect("A's hub applies the verdict")
             .expect("A's hub is running");
+    }
+
+    /// A — and only A — is told B is **confirmed gone** (ADR 0087 D2): the event A's
+    /// SWIM driver raises when B's tombstone is pruned with the parting greeting
+    /// unanswered, or when a new generation of B joins. Returns the instant it was
+    /// sent, once A's hub has applied it.
+    async fn confirm_b_gone_on_a(&self) -> Instant {
+        let handed = self.a.verdicts_handed_to_the_hub.clone();
+        let before = handed.load(Ordering::SeqCst);
+        let sent = Instant::now();
+        self.a
+            .events
+            .send(MembershipEvent {
+                gone: true,
+                ..self.event(MemberState::Dead)
+            })
+            .unwrap();
+        wait_until(
+            "A's link manager has handed the confirmation to A's hub",
+            Duration::from_secs(10),
+            || handed.load(Ordering::SeqCst) > before,
+        )
+        .await;
+        let (reply, applied) = tokio::sync::oneshot::channel();
+        self.a.hub.send(HubCommand::Flush { reply }).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), applied)
+            .await
+            .expect("A's hub applies the confirmation")
+            .expect("A's hub is running");
+        sent
     }
 
     /// The relay the A–B link runs through: the one in front of whichever of the two
@@ -2435,4 +2479,348 @@ async fn plain_a_false_verdict_keeps_publish_order_for_every_subscriber() {
             s.expect_everything_arrived_in_publish_order(&what);
         }
     }
+}
+
+// ---------------------------------------------------------------------------------
+// B really dead (ADR 0087 D2, 0087-T3): confirmation, and what it resolves
+// ---------------------------------------------------------------------------------
+
+/// How long B stays out of reach and held `Dead` before it is confirmed gone: longer
+/// than the eight-tick countdown that ends a hold in durable mode, so a plain-mode
+/// hold that outlives it is held by nothing but the absence of a confirmation.
+const UNCONFIRMED_FOR: Duration = Duration::from_secs(12);
+
+/// How long after the confirmation a held publish may take to be answered: one sweep
+/// tick (one second) and a margin for a loaded runner.
+const ANSWERED_WITHIN: Duration = Duration::from_secs(4);
+
+/// B is out of reach for real — the link between A and B is cut and stays cut, and A
+/// holds B `Dead` — as A sees a node that has died. Its subscribers are owed what A's
+/// publishers send, and held for (ADR 0087 D1); B never answers.
+async fn b_dies_as_a_sees_it(cluster: &Cluster) {
+    cluster.cut_the_link().await;
+    cluster.falsely_declare_b_dead_on_a().await;
+}
+
+/// 0087-T3's acceptance in plain mode (`MQTTD_DURABLE=0`), the decisions O1 and O4
+/// of 2026-10-14 as built. B dies as A sees it: the link is cut for good and A holds
+/// B `Dead`. Each flow's publish is HELD — longer than any countdown — and answered
+/// only when membership confirms B gone; then it is acknowledged and COUNTED, not
+/// before and not silently:
+///
+/// | flow | owed to | at confirmation |
+/// |---|---|---|
+/// | `clean` | a clean session on B | acknowledged, `resolved_undeliverable{reason="peer-gone"}` |
+/// | `persistent` | a persistent session on B (non-durable: it lived only there, O4) | the same |
+/// | `share-b` | a `$share` group whose only member is on B | acknowledged, `{reason="no-shared-member"}` |
+/// | `share-bc` | a `$share` group with a member on C too | delivered to C's member at once |
+///
+/// Nobody on B receives anything, and no drop counter moves: these were not dropped,
+/// they were owed to a node that is gone.
+// One linear timeline: four flows, the death, the hold, the confirmation, the counts.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn plain_a_peer_really_dead_is_answered_at_confirmation_and_counted() {
+    let cluster = Cluster::start(Mode::Plain, Link::EvictorDials, Founder::Evictor).await;
+    let q1 = QoS::AtLeastOnce;
+    let sub =
+        |on, prefix, clean, filter, qos| Sub::connect(&cluster, on, prefix, clean, filter, qos);
+    let mut flows = vec![
+        Flow::new(
+            &cluster,
+            "clean",
+            On::A,
+            "fd/clean",
+            q1,
+            vec![sub(On::B, "sub-clean", true, "fd/clean/#", q1).await],
+        )
+        .await,
+        Flow::new(
+            &cluster,
+            "persistent",
+            On::A,
+            "fd/pers",
+            q1,
+            vec![sub(On::B, "sub-pers", false, "fd/pers/#", q1).await],
+        )
+        .await,
+        Flow::new(
+            &cluster,
+            "share-b",
+            On::A,
+            "fd/shb",
+            q1,
+            vec![sub(On::B, "sub-shb", true, "$share/gb/fd/shb/#", q1).await],
+        )
+        .await,
+        Flow::new(
+            &cluster,
+            "share-bc",
+            On::A,
+            "fd/shbc",
+            q1,
+            vec![
+                sub(On::B, "sub-shbc-b", true, "$share/gbc/fd/shbc/#", q1).await,
+                sub(On::C, "sub-shbc-c", true, "$share/gbc/fd/shbc/#", q1).await,
+            ],
+        )
+        .await,
+    ];
+    for flow in &mut flows {
+        flow.warm().await;
+    }
+    b_dies_as_a_sees_it(&cluster).await;
+    let before = series(&cluster.a);
+
+    let confirm = async {
+        // SETTLE(really-dead-unconfirmed-hold): not a wait for a state — the time IS
+        // the stimulus. The assertion is that nothing but the confirmation ends the
+        // hold, so the hold must be allowed to outlast every clock that could.
+        tokio::time::sleep(UNCONFIRMED_FOR).await;
+        cluster.confirm_b_gone_on_a().await
+    };
+    let (answers, gone_at) = tokio::join!(
+        join_all(flows.iter_mut().map(|f| f.publish("first", ACK_BOUND))),
+        confirm
+    );
+    for (flow, answer) in flows.iter_mut().zip(&answers) {
+        flow.first = *answer;
+        flow.first_acked_at = flow.publisher.last_acked_at;
+    }
+    join_all(flows.iter_mut().map(|f| f.drain(QUIET, true))).await;
+    let moved_on_a = moved(&before, &series(&cluster.a));
+    cluster.membership_moved_only_as_injected();
+    for flow in &flows {
+        println!(
+            "  {:<11} first {:?}  acked {:?} after the confirmation  received {:?}",
+            flow.name,
+            flow.first,
+            flow.first_acked_at
+                .map(|at| at.checked_duration_since(gone_at)),
+            flow.seen().during
+        );
+    }
+    println!("  moved on A: {moved_on_a:?}");
+
+    for name in ["clean", "persistent", "share-b"] {
+        let flow = flows.iter().find(|f| f.name == name).expect("flow");
+        assert!(
+            flow.first.acked_ok(),
+            "`{name}`: acknowledged: {:?}",
+            flow.first
+        );
+        let acked_at = flow.first_acked_at.expect("acknowledged");
+        assert!(
+            acked_at >= gone_at,
+            "`{name}`: acknowledged {:?} BEFORE B was confirmed gone",
+            gone_at.duration_since(acked_at)
+        );
+        assert!(
+            acked_at.duration_since(gone_at) < ANSWERED_WITHIN,
+            "`{name}`: answered within a sweep tick of the confirmation, not {:?} later",
+            acked_at.duration_since(gone_at)
+        );
+        assert!(
+            flow.seen().during.is_empty(),
+            "`{name}`: nobody received it — B is gone: {:?}",
+            flow.seen().during
+        );
+    }
+    let bc = flows.iter().find(|f| f.name == "share-bc").expect("flow");
+    assert!(
+        bc.first_acked_at.is_some_and(|at| at < gone_at)
+            && bc
+                .seen()
+                .during
+                .get("c")
+                .is_some_and(|t| t.contains(&"first")),
+        "`share-bc`: delivered to C's member without waiting: {:?}",
+        bc.seen()
+    );
+
+    let count = |name: &str| moved_on_a.get(name).copied().unwrap_or(0.0);
+    assert!(
+        (count("mqttd_publish_resolved_undeliverable_total{reason=\"peer-gone\"}") - 2.0).abs()
+            < f64::EPSILON
+            && (count("mqttd_publish_resolved_undeliverable_total{reason=\"no-shared-member\"}")
+                - 1.0)
+                .abs()
+                < f64::EPSILON,
+        "counted by reason (D9): {moved_on_a:?}"
+    );
+    assert!(
+        moved_on_a
+            .keys()
+            .all(|n| !n.starts_with("mqttd_publish_dropped_total")),
+        "nothing was dropped: {moved_on_a:?}"
+    );
+}
+
+/// 0087-T3 in durable mode, until 0087-T5: the hold ends at the earlier of the
+/// confirmation and the eight-tick countdown, so that a durable failover holds a
+/// publisher no longer than it did (ADR 0087 §6 amendment of 2026-10-14). The known
+/// gap this leaves, pinned here so that T5 flips it: B is out of reach from A — a
+/// node that is NOT the lease leader, so no lease moves — and nobody confirms it
+/// gone. A publish for B's clean-session subscriber is acknowledged when the
+/// countdown runs out, eight sweep ticks after the verdict, and delivered to nobody;
+/// what changed is that it is COUNTED (`reason="hold-expired"`) where it was silent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn durable_a_peer_out_of_reach_is_answered_at_the_countdown_and_counted() {
+    let cluster = Cluster::start(Mode::Durable, Link::EvictorDials, Founder::Bystander).await;
+    let q1 = QoS::AtLeastOnce;
+    let mut clean = Flow::new(
+        &cluster,
+        "clean",
+        On::A,
+        "fd/clean",
+        q1,
+        vec![Sub::connect(&cluster, On::B, "sub-clean", true, "fd/clean/#", q1).await],
+    )
+    .await;
+    clean.warm().await;
+    b_dies_as_a_sees_it(&cluster).await;
+    let verdict = Instant::now();
+    let before = series(&cluster.a);
+
+    let answer = clean.publish("first", ACK_BOUND).await;
+    let acked_at = clean.publisher.last_acked_at;
+    clean.drain(QUIET, true).await;
+    let moved_on_a = moved(&before, &series(&cluster.a));
+    cluster.membership_moved_only_as_injected();
+    println!(
+        "  clean: {answer:?}, {:?} after the verdict; moved on A: {moved_on_a:?}",
+        acked_at.map(|at| at.duration_since(verdict))
+    );
+
+    assert!(answer.acked_ok(), "acknowledged: {answer:?}");
+    let held = acked_at.expect("acknowledged").duration_since(verdict);
+    assert!(
+        held >= Duration::from_secs(6) && held < Duration::from_secs(20),
+        "held for the countdown — eight one-second sweep ticks from the verdict — and no \
+         longer: {held:?}"
+    );
+    assert!(
+        clean.seen().during.is_empty(),
+        "delivered to nobody: the T5 gap"
+    );
+    assert!(
+        (moved_on_a
+            .get("mqttd_publish_resolved_undeliverable_total{reason=\"hold-expired\"}")
+            .copied()
+            .unwrap_or(0.0)
+            - 1.0)
+            .abs()
+            < f64::EPSILON,
+        "and counted, where it was silent: {moved_on_a:?}"
+    );
+}
+
+/// 0087-T3's acceptance for a durable session, and the regression guard for the
+/// failover pause. A, the lease group's leader, holds the session's owner B dead and
+/// cannot reach it — as when B has really died — so A reassigns B's groups and the
+/// session's new owner takes it over. A publish for the (offline) session made at
+/// the verdict is owed to B and held; when the new owner announces the session's
+/// filter it is re-routed there, stored, and that answer acknowledges the publisher
+/// — within the failover pause, long before B could be confirmed gone. Nobody
+/// confirms B gone in this test: had the hold been left to last until confirmation
+/// in durable mode (`dead_ttl`, 30 s), the publisher would be waiting still.
+///
+/// The session's client then resumes on its new owner and receives the message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn durable_an_owner_that_dies_holds_its_publishers_for_the_failover_not_for_confirmation() {
+    let cluster = Cluster::start(Mode::Durable, Link::EvictorDials, Founder::Evictor).await;
+    let q1 = QoS::AtLeastOnce;
+    let mut offline = Flow::new(
+        &cluster,
+        "offline",
+        On::A,
+        "fd/off",
+        q1,
+        vec![Sub::connect(&cluster, On::B, "sub-off", false, "fd/off/#", q1).await],
+    )
+    .await;
+    offline.warm().await;
+    let session = offline.subs[0].id.clone();
+    offline.subs[0]
+        .client
+        .take()
+        .expect("connected")
+        .disconnect()
+        .await;
+    b_dies_as_a_sees_it(&cluster).await;
+    let verdict = Instant::now();
+    let before = series(&cluster.a);
+
+    let answer = offline.publish("first", ACK_BOUND).await;
+    let acked_at = offline.publisher.last_acked_at;
+    let held = acked_at.map(|at| at.duration_since(verdict));
+    let moved_on_a = moved(&before, &series(&cluster.a));
+    let owner = cluster
+        .a
+        .placement
+        .read()
+        .unwrap()
+        .committed_session_owner(&session);
+    println!("  offline: {answer:?}, {held:?} after the verdict; the session's owner now {owner:?}; moved on A: {moved_on_a:?}");
+
+    assert!(answer.acked_ok(), "acknowledged: {answer:?}");
+    let held = held.expect("acknowledged");
+    assert!(
+        held < Duration::from_secs(20),
+        "a durable failover holds a publisher for the failover pause, not until the \
+         owner is confirmed gone (`dead_ttl`, 30 s): held {held:?}"
+    );
+    let owner = owner.expect("the leader committed a new owner");
+    assert_ne!(owner, cluster.b.id, "the lease moved off the dead owner");
+
+    // The new owner stored it: the session resumes there and receives it.
+    let node = cluster
+        .nodes()
+        .into_iter()
+        .find(|n| n.id == owner)
+        .expect("the owner is one of the three");
+    let mut received = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while received.is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the session never resumed on {owner:?}"
+        );
+        let Ok((mut client, present)) = Client::connect_v311_explained(
+            node.client_addr,
+            &session,
+            false,
+            Duration::from_secs(4),
+        )
+        .await
+        else {
+            continue;
+        };
+        assert!(present, "the session moved with its lease");
+        let until = Instant::now() + QUIET;
+        while let Some(left) = until.checked_duration_since(Instant::now()) {
+            match client.recv_bounded(left).await {
+                Recv::Packet(Packet::Publish(p)) => {
+                    if let Some(pkid) = p.pkid {
+                        client.puback(pkid).await;
+                    }
+                    received.push(p.topic);
+                }
+                Recv::Packet(_) => {}
+                Recv::Quiet | Recv::Closed => break,
+            }
+        }
+        if received.is_empty() {
+            break;
+        }
+    }
+    assert!(
+        received.iter().any(|t| t == "fd/off/first"),
+        "the new owner stored the publish for the session: received {received:?}"
+    );
+    assert!(
+        !moved_on_a
+            .contains_key("mqttd_publish_resolved_undeliverable_total{reason=\"hold-expired\"}"),
+        "the publish was answered by the new owner, not resolved undeliverable: {moved_on_a:?}"
+    );
 }

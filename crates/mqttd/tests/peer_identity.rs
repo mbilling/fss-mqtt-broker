@@ -577,6 +577,7 @@ fn membership(
         peer_addr: peer_addr.to_string(),
         state,
         domain: None,
+        gone: false,
     }
 }
 

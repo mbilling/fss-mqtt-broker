@@ -1125,6 +1125,13 @@ impl Hub {
             self.drop_pending(id);
             return;
         }
+        // The group's last members went with a node confirmed gone (ADR 0087 D2):
+        // acknowledged, and counted (D9).
+        if self.resolving_unreachable {
+            if let Some(m) = &self.metrics {
+                m.publish_resolved_undeliverable_by("no-shared-member", 1);
+            }
+        }
         // On a settled view "the group has nobody" can be stood behind now, as it
         // is for a publish that arrives a moment later and finds no group at all.
         if !self.routing_unsettled() {

@@ -193,6 +193,8 @@ impl Sim {
                 Action::StateChange { id, state, .. } => {
                     self.views[from].insert(id.0, state);
                 }
+                // Confirmation that a member is gone changes no state in the view.
+                Action::Gone { .. } => {}
             }
         }
     }

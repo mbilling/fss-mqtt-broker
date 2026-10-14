@@ -150,6 +150,11 @@ pub struct MembershipEvent {
     pub state: MemberState,
     /// Its self-advertised failure-domain label (ADR 0016 T5); `None` if not yet learned.
     pub domain: Option<String>,
+    /// The member is **confirmed gone** ([`Action::Gone`], ADR 0087 D2) — its
+    /// tombstone was pruned with the parting greeting unanswered, or a new
+    /// generation of the id joined. `state` is then `Dead`: this is not a change of
+    /// state but the end of the life the verdict was about.
+    pub gone: bool,
 }
 
 /// A sink called once per **certificate request** this node sends: a `Join` greeting
@@ -468,6 +473,19 @@ impl Gossip {
                     peer_addr,
                     state,
                     domain,
+                    gone: false,
+                })),
+                Action::Gone {
+                    id,
+                    addr,
+                    peer_addr,
+                } => out.push(Output::Event(MembershipEvent {
+                    id,
+                    addr,
+                    peer_addr,
+                    state: MemberState::Dead,
+                    domain: None,
+                    gone: true,
                 })),
             }
         }
@@ -1434,7 +1452,9 @@ mod cert_request_tests {
                         let bytes = postcard::to_allocvec(&msg).unwrap();
                         Some((to, self.auth.seal(&bytes, prime)))
                     }
-                    crate::swim::Action::StateChange { .. } => None,
+                    crate::swim::Action::StateChange { .. } | crate::swim::Action::Gone { .. } => {
+                        None
+                    }
                 })
                 .collect()
         }
@@ -1994,8 +2014,8 @@ mod stall_tests {
     /// beyond those five. The lateness here is chosen so that the gaps line up with
     /// nothing: not with the probe period, not with a timeout. The tombstone is not stretched
     /// either: it is pruned `dead_ttl` after the verdict, give or take one wake-up —
-    /// which is what lets the link manager's window, twice `dead_ttl` on the same
-    /// clock (`held_dead_dial_window`), assume it.
+    /// which is what bounds how long a peer held dead is held before it is
+    /// confirmed gone (ADR 0087 D2).
     #[tokio::test(start_paused = true)]
     async fn a_persistently_late_node_declares_a_dead_member_within_five_wake_ups_of_on_time() {
         let cfg = Config::default();

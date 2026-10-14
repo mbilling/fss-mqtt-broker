@@ -402,6 +402,39 @@ pub enum Action {
         /// membership.
         domain: Option<String>,
     },
+    /// A member is **confirmed gone** (ADR 0087 D2, sub-decision O1 as decided on
+    /// 2026-10-14): the process this node knew under `id` no longer exists, and
+    /// whatever was being held for it may be resolved. Raised in two cases:
+    ///
+    /// - its `Dead` tombstone was pruned (`Config::dead_ttl_ms` after the verdict)
+    ///   and the parting greeting sent with the prune (issue #971) went unanswered
+    ///   for `Config::ack_timeout_ms` — a live member answers it with a `Sync` and is
+    ///   re-admitted, and then nothing is raised;
+    /// - a **new generation** of the same id joined: the old process is gone by
+    ///   definition. Raised before the `StateChange` that reports the new life.
+    ///
+    /// Membership says nothing here about links: the routing layer adds that half of
+    /// O1 ("and no link") itself.
+    Gone {
+        /// The member.
+        id: NodeId,
+        /// Its SWIM address, as last known.
+        addr: String,
+        /// Its routing (peer-link) address, as last known; empty if never learned.
+        peer_addr: String,
+    },
+}
+
+/// A member whose tombstone was pruned, waiting for [`Action::Gone`]: the parting
+/// greeting has been sent and an answer would re-admit it.
+#[derive(Debug, Clone)]
+struct Departed {
+    /// The life that was pruned. A later life joining confirms it gone at once.
+    generation: u64,
+    addr: String,
+    peer_addr: String,
+    /// When the greeting counts as unanswered and the member as gone.
+    confirm_at: u64,
 }
 
 /// What became of the last direct probes this node has sent
@@ -491,6 +524,9 @@ pub struct Swim {
     /// What became of the last direct probes sent so far
     /// ([`last_probes`](Self::last_probes)).
     last_probes: LastProbes,
+    /// Members pruned and not yet confirmed gone ([`Action::Gone`]): at most one
+    /// entry per pruned member, for `Config::ack_timeout_ms` each.
+    departed: BTreeMap<NodeId, Departed>,
 }
 
 impl Swim {
@@ -537,6 +573,7 @@ impl Swim {
             failed_probe_rounds: 0,
             new_lives: BTreeSet::new(),
             last_probes: LastProbes::default(),
+            departed: BTreeMap::new(),
         }
     }
 
@@ -889,6 +926,16 @@ impl Swim {
             m.generation = u.generation;
             m.incarnation = u.incarnation;
             if new_life {
+                // The old process is gone by definition (ADR 0087 D2): say so before
+                // the new life is reported, so the routing layer resolves what it
+                // held for the old one first. (Once: a confirmation of a pruned
+                // life still pending is this one.)
+                self.departed.remove(&id);
+                out.push(Action::Gone {
+                    id: id.clone(),
+                    addr: m.addr.clone(),
+                    peer_addr: m.peer_addr.clone(),
+                });
                 // Our probe history is about the old process too (issue #783): its
                 // missed probes are not this life's, and a probe of ours still in
                 // flight was aimed at the corpse — left to conclude, it would
@@ -977,6 +1024,23 @@ impl Swim {
                 });
             }
         } else {
+            // A member pruned a moment ago is heard of again. A later life confirms
+            // the pruned one gone now; the same life alive answered the parting
+            // greeting (or is otherwise alive) and is not gone; a claim that it is
+            // suspect or dead leaves the confirmation to run its course.
+            if let Some(departed) = self.departed.get(&id) {
+                if u.generation > departed.generation {
+                    if let Some(d) = self.departed.remove(&id) {
+                        out.push(Action::Gone {
+                            id: id.clone(),
+                            addr: d.addr,
+                            peer_addr: d.peer_addr,
+                        });
+                    }
+                } else if u.generation == departed.generation && u.state == MemberState::Alive {
+                    self.departed.remove(&id);
+                }
+            }
             self.members.insert(
                 id.clone(),
                 Member {
@@ -1265,18 +1329,71 @@ impl Swim {
     /// about it. If it is alive it answers with a `Sync` (first-hand, so it is
     /// re-admitted at once); if it is not, this is one datagram to a closed port.
     /// A node that is itself leaving greets nobody.
+    ///
+    /// A pruned member is confirmed gone ([`Action::Gone`]) once the greeting has gone
+    /// unanswered for `Config::ack_timeout_ms` — at once when no greeting is sent.
     fn prune_tombstones(&mut self, now: u64, out: &mut Vec<Action>) {
         let mut pruned = Vec::new();
+        let mut gone = Vec::new();
         self.members.retain(|_, m| {
             let keep = m.tombstone_deadline.is_none_or(|d| now < d);
-            if !keep && !unroutable(&m.addr) {
-                pruned.push(m.addr.clone());
+            if !keep {
+                if !unroutable(&m.addr) {
+                    pruned.push(m.addr.clone());
+                }
+                gone.push((
+                    m.id.clone(),
+                    m.generation,
+                    m.addr.clone(),
+                    m.peer_addr.clone(),
+                ));
             }
             keep
         });
-        if self.cfg.greet_pruned && !self.leaving {
+        let greets = self.cfg.greet_pruned && !self.leaving;
+        for (id, generation, addr, peer_addr) in gone {
+            let wait = if greets && !unroutable(&addr) {
+                self.cfg.ack_timeout_ms
+            } else {
+                0
+            };
+            self.departed.insert(
+                id,
+                Departed {
+                    generation,
+                    addr,
+                    peer_addr,
+                    confirm_at: now + wait,
+                },
+            );
+        }
+        if greets {
             for addr in pruned {
                 out.push(self.greet(&addr));
+            }
+        }
+        self.confirm_departed(now, out);
+    }
+
+    /// Raise [`Action::Gone`] for every pruned member whose parting greeting has gone
+    /// unanswered for long enough.
+    fn confirm_departed(&mut self, now: u64, out: &mut Vec<Action>) {
+        if self.departed.is_empty() {
+            return;
+        }
+        let due: Vec<NodeId> = self
+            .departed
+            .iter()
+            .filter(|(_, d)| d.confirm_at <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in due {
+            if let Some(d) = self.departed.remove(&id) {
+                out.push(Action::Gone {
+                    id,
+                    addr: d.addr,
+                    peer_addr: d.peer_addr,
+                });
             }
         }
     }
@@ -1987,7 +2104,7 @@ mod tests {
                     );
                     Some(to.clone())
                 }
-                Action::StateChange { .. } => None,
+                Action::StateChange { .. } | Action::Gone { .. } => None,
             })
             .collect();
         targets.sort();
@@ -2226,7 +2343,7 @@ mod tests {
                     Kind::Ping { seq } => Some(*seq),
                     _ => None,
                 },
-                Action::StateChange { .. } => None,
+                Action::StateChange { .. } | Action::Gone { .. } => None,
             })
             .expect("round 4 sends a Ping");
         s.handle(m("b", "b:1", Kind::Ack { seq }, vec![]), 401);
@@ -2350,7 +2467,7 @@ mod tests {
                     Kind::Ping { seq } => Some(*seq),
                     _ => None,
                 },
-                Action::StateChange { .. } => None,
+                Action::StateChange { .. } | Action::Gone { .. } => None,
             })
             .expect("round 4 sends a Ping");
         s.handle(m("b", "b:1", Kind::Ack { seq }, vec![]), 401);
@@ -3001,7 +3118,7 @@ mod tests {
             .iter()
             .filter_map(|a| match a {
                 Action::Send { to, msg } => Some((to.as_str(), msg)),
-                Action::StateChange { .. } => None,
+                Action::StateChange { .. } | Action::Gone { .. } => None,
             })
             .collect()
     }
@@ -3750,7 +3867,7 @@ mod tests {
                 Kind::Ping { seq } => Some(seq),
                 _ => None,
             },
-            Action::StateChange { .. } => None,
+            Action::StateChange { .. } | Action::Gone { .. } => None,
         })
     }
 
@@ -4348,5 +4465,178 @@ mod tests {
             s.members().iter().all(|m| m.addr != "203.0.113.9:7946"),
             "greeting an address does not make it a member"
         );
+    }
+
+    // ---- ADR 0087 D2 (O1, decided 2026-10-14): a member confirmed gone ----
+
+    /// The `Gone` actions in `actions`, by member id.
+    fn gone_in(actions: &[Action]) -> Vec<String> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Gone { id, .. } => Some(id.0.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The tombstone is pruned and the parting greeting goes out; when it has been
+    /// unanswered for an ack timeout, the member is confirmed gone — once, with the
+    /// addresses it was known by. Nothing is said while the tombstone stands.
+    #[test]
+    fn a_pruned_member_whose_greeting_goes_unanswered_is_confirmed_gone() {
+        let cfg = fast_cfg();
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        s.apply_update(&alive_update("b", "b:1", 0), 0, &mut out);
+        s.tick(0);
+        s.apply_update(&dead_update("b", "b:1", 0), 10, &mut out);
+
+        for t in [10, 10 + cfg.dead_ttl_ms - 1] {
+            assert!(
+                gone_in(&s.tick(t)).is_empty(),
+                "the tombstone stands at {t}"
+            );
+        }
+        let pruned_at = 10 + cfg.dead_ttl_ms;
+        let pruned = s.tick(pruned_at);
+        assert_eq!(joins_to(&pruned), vec!["b:1".to_string()], "greeted");
+        assert!(
+            gone_in(&pruned).is_empty(),
+            "not before the greeting had its chance"
+        );
+        assert!(gone_in(&s.tick(pruned_at + cfg.ack_timeout_ms - 1)).is_empty());
+
+        let confirmed = s.tick(pruned_at + cfg.ack_timeout_ms);
+        assert_eq!(
+            confirmed
+                .iter()
+                .filter_map(|a| match a {
+                    Action::Gone {
+                        id,
+                        addr,
+                        peer_addr,
+                    } => {
+                        Some((id.0.as_str(), addr.as_str(), peer_addr.as_str()))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![("b", "b:1", "b:1-peer")]
+        );
+        for i in 1..=20u64 {
+            let later = s.tick(pruned_at + cfg.ack_timeout_ms + i * 100);
+            assert!(gone_in(&later).is_empty(), "once: {later:?}");
+        }
+    }
+
+    /// A member that answers the parting greeting — the verdict was false, and it is
+    /// alive — is re-admitted and never confirmed gone.
+    #[test]
+    fn a_pruned_member_that_answers_the_greeting_is_not_confirmed_gone() {
+        let cfg = fast_cfg();
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        s.apply_update(&alive_update("b", "b:1", 0), 0, &mut out);
+        s.tick(0);
+        s.apply_update(&dead_update("b", "b:1", 0), 10, &mut out);
+        let pruned_at = 10 + cfg.dead_ttl_ms;
+        s.tick(pruned_at);
+
+        let answer = s.handle(
+            m("b", "b:1", Kind::Sync, vec![alive_update("b", "b:1", 1)]),
+            pruned_at + 1,
+        );
+        assert!(gone_in(&answer).is_empty());
+        assert_eq!(member_state(&s, "b"), Some(MemberState::Alive));
+        for i in 0..=20u64 {
+            let later = s.tick(pruned_at + cfg.ack_timeout_ms + i * 100);
+            assert!(gone_in(&later).is_empty(), "{later:?}");
+        }
+    }
+
+    /// Without a greeting to wait for — v1.1.0's rule, or a node that is leaving —
+    /// the member is confirmed gone at the prune.
+    #[test]
+    fn a_member_pruned_without_a_greeting_is_confirmed_gone_at_the_prune() {
+        let cfg = Config {
+            greet_pruned: false,
+            ..fast_cfg()
+        };
+        let mut s = Swim::new(
+            NodeId("a".to_string()),
+            "a:1".to_string(),
+            peer_addr_of("a:1"),
+            None,
+            1,
+            cfg.clone(),
+            Vec::new(),
+        );
+        let mut out = Vec::new();
+        s.apply_update(&alive_update("b", "b:1", 0), 0, &mut out);
+        s.tick(0);
+        s.apply_update(&dead_update("b", "b:1", 0), 10, &mut out);
+        assert_eq!(
+            gone_in(&s.tick(10 + cfg.dead_ttl_ms)),
+            vec!["b".to_string()]
+        );
+    }
+
+    /// A new generation of the id is the old process gone by definition: confirmed
+    /// at once, and reported BEFORE the new life's state change, whether the old
+    /// life was held dead, alive, or pruned and waiting out its greeting.
+    #[test]
+    fn a_new_generation_confirms_the_old_one_gone_before_its_own_state_change() {
+        let cfg = fast_cfg();
+        let newer = |state| Update {
+            generation: 2,
+            state,
+            ..alive_update("b", "b:1", 0)
+        };
+        let gone_then_alive = |actions: &[Action]| {
+            let gone = actions
+                .iter()
+                .position(|a| matches!(a, Action::Gone { id, .. } if id.0 == "b"));
+            let alive = actions.iter().position(|a| {
+                matches!(a, Action::StateChange { id, state: MemberState::Alive, .. } if id.0 == "b")
+            });
+            assert_eq!(gone_in(actions), vec!["b".to_string()], "{actions:?}");
+            assert!(gone < alive, "Gone comes first: {actions:?}");
+        };
+
+        // Held dead (the tombstone standing).
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        s.apply_update(&alive_update("b", "b:1", 0), 0, &mut out);
+        s.apply_update(&dead_update("b", "b:1", 0), 10, &mut out);
+        let mut out = Vec::new();
+        s.apply_update(&newer(MemberState::Alive), 20, &mut out);
+        gone_then_alive(&out);
+
+        // Alive (a restart nobody had noticed): confirmed all the same. Alive to
+        // alive at the same address is no state change, so none follows.
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        s.apply_update(&alive_update("b", "b:1", 0), 0, &mut out);
+        let mut out = Vec::new();
+        s.apply_update(&newer(MemberState::Alive), 20, &mut out);
+        assert_eq!(gone_in(&out), vec!["b".to_string()], "{out:?}");
+
+        // Pruned, its greeting not yet unanswered: the new life confirms it now, and
+        // the greeting's own confirmation does not follow.
+        let mut s = node("a", "a:1", &[]);
+        let mut out = Vec::new();
+        s.apply_update(&alive_update("b", "b:1", 0), 0, &mut out);
+        s.tick(0);
+        s.apply_update(&dead_update("b", "b:1", 0), 10, &mut out);
+        let pruned_at = 10 + cfg.dead_ttl_ms;
+        s.tick(pruned_at);
+        let mut out = Vec::new();
+        s.apply_update(&newer(MemberState::Alive), pruned_at + 1, &mut out);
+        gone_then_alive(&out);
+        for i in 0..=20u64 {
+            let later = s.tick(pruned_at + cfg.ack_timeout_ms + i * 100);
+            assert!(gone_in(&later).is_empty(), "once: {later:?}");
+        }
     }
 }

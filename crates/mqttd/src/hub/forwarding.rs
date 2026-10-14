@@ -282,7 +282,8 @@ pub(super) struct PendingPublish {
     /// behind.)
     pub(super) forwarded_after_ms: u32,
     /// Engaged when a forward's target was erased — held dead, and out of reach
-    /// until its hold ran out ([`Hub::erase_peer`]): the obligation is gone, and
+    /// until it was confirmed gone or, with a durable plane, its countdown ran out
+    /// ([`Hub::erase_peer`]): the obligation is gone, and
     /// this counts down the sweep ticks left to find a successor or a session
     /// materialised here before the publisher is answered. Since ADR 0087 D1 the
     /// waiting is done while the obligation is still held, so this is armed with
@@ -824,7 +825,7 @@ impl Hub {
         // now, and the frame flows when the link returns. The same holds for a
         // peer membership holds dead (ADR 0087 D1): a verdict keeps the interest,
         // so the publish is owed to it too, until it answers, a successor does,
-        // or its hold runs out.
+        // or it is confirmed gone (ADR 0087 D2).
         let gated = gate.is_some() && qos_num(qos) >= 1;
         // ONE trie walk answers both questions below — who must be forwarded to,
         // and whether a given connected peer is interested. This used to be a
@@ -881,11 +882,15 @@ impl Hub {
             self.observe_fanout(fanout_started, peer_visits);
             return wanted_remotely;
         }
+        // Interested peers reached over a link; the rest have none, and an unanswered
+        // forward is not held for them (ADR 0087 D9).
+        let mut linked_interested = 0usize;
         for (node, peer) in &self.peers {
             peer_visits += 1;
             #[cfg(test)]
             PEER_FANOUT_VISITS.with(|c| c.set(c.get() + 1));
             let interested = InterestIndex::contains(&interested_nodes, node);
+            linked_interested += usize::from(interested);
             if gated && interested {
                 continue; // already handled (acked or legacy) above
             }
@@ -916,6 +921,15 @@ impl Hub {
                 },
                 app,
             ));
+        }
+        // A forward nobody answers — `QoS` 0, a Will, an event-derived message — is
+        // not held for a peer with matching interest and no link, as it never was;
+        // since ADR 0087 D9 it is counted, once per such peer.
+        if !gated {
+            if let Some(m) = &self.metrics {
+                let unreachable = interested_nodes.len().saturating_sub(linked_interested);
+                m.publish_dropped_by("peer-unreachable", unreachable as u64);
+            }
         }
         self.interest_scratch = interested_nodes;
         self.observe_fanout(fanout_started, peer_visits);
@@ -1031,7 +1045,7 @@ impl Hub {
     /// never the unreachable peer's subscriber under a new owner; it is somebody
     /// else, and letting its forward stand in for what the peer is owed can only
     /// lose the publish for a subscriber on a peer that was not dead. There the
-    /// obligation stays until the peer answers or its hold runs out, and the
+    /// obligation stays until the peer answers or is confirmed gone, and the
     /// newcomer is still sent the publish.
     pub(super) fn discharge_unreachable(&mut self, id: u64) {
         if self.durable_plane.is_none() {
@@ -1720,9 +1734,10 @@ impl Hub {
     /// legal at `QoS` 1), and drive takeover re-routes: a forward whose target is
     /// held DEAD and out of reach re-forwards to whichever peers now advertise
     /// matching interest (the dead owner's successor, once it materializes
-    /// inherited sessions — exhibit ⑥). With no such interest for
-    /// [`REROUTE_GRACE_TICKS`] ticks the target's hold runs out, the obligation is
-    /// discharged ([`Hub::erase_peer`]) and the ack releases.
+    /// inherited sessions — exhibit ⑥). When the target is confirmed gone (or,
+    /// with a durable plane, its [`REROUTE_GRACE_TICKS`] countdown runs out first)
+    /// the obligation is discharged ([`Hub::erase_peer`]), counted, and the ack
+    /// releases.
     // Retransmit, downgrade, re-route, grace: one linear sweep pass per pending —
     // splitting it would scatter the obligation lifecycle.
     pub(super) fn sweep_pending_forwards(&mut self) {
@@ -2984,21 +2999,292 @@ mod zone_fwd_proofs {
         assert!(matches!(rx.try_recv(), Ok(PublishOutcome::Accepted)));
     }
 
-    /// The bound this change keeps until confirmation exists (ADR 0087 T3): a peer
-    /// that stays dead and out of reach is held for `REROUTE_GRACE_TICKS` sweeps
-    /// from the verdict and no longer, and then its publishers are answered as they
-    /// were when the verdict erased at once — a forward in flight at the verdict on
-    /// exactly the sweep it was answered on before, and a publish that arrived
-    /// during the hold with it. So a node that really died stalls nobody longer
-    /// than it did.
+    /// ADR 0087 D2 (0087-T3), without a durable plane: a peer that stays dead and
+    /// out of reach is held — a forward in flight at the verdict and a publish that
+    /// arrived during the hold alike — for as long as membership has not confirmed
+    /// it gone, however many ticks that is; no clock ends it. At confirmation what
+    /// it was owed is resolved: discharged, its publishers acknowledged on the
+    /// sweep that follows (one last look for a successor), and each publish counted
+    /// `resolved_undeliverable{reason="peer-gone"}` — not before, and not silently.
     #[test]
-    fn a_peer_that_stays_dead_holds_its_publishers_no_longer_than_the_grace_did() {
+    fn a_peer_that_stays_dead_is_held_until_confirmed_gone_and_then_resolved_and_counted() {
         let mut h = hub();
+        let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("gone"));
+        h.attach_metrics(metrics.clone());
         let peer = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
         let (_in_flight, _seq, mut before) = held_forward(&mut h, &peer.node);
 
         h.peer_dead(&peer.node);
-        // A publish that arrives two ticks into the hold.
+        sweep_tick(&mut h);
+        sweep_tick(&mut h);
+        let (late, mut during) = register(&mut h, "t/x");
+        fan_out(&mut h, "t/x", QoS::AtLeastOnce, false, Some(late));
+        h.pending_local_done(late);
+
+        // Thirty ticks — the production `dead_ttl` — and still held.
+        for tick in 3..=30 {
+            sweep_tick(&mut h);
+            assert!(
+                before.try_recv().is_err() && during.try_recv().is_err(),
+                "both still held after sweep {tick}"
+            );
+        }
+        assert_eq!(h.publishes_held_for_unreachable(), 2);
+        assert!(!metrics.render().contains("resolved_undeliverable_total{"));
+
+        h.peer_gone(&peer.node);
+        sweep_tick(&mut h);
+        assert!(matches!(before.try_recv(), Ok(PublishOutcome::Accepted)));
+        assert!(matches!(during.try_recv(), Ok(PublishOutcome::Accepted)));
+        assert!(
+            metrics
+                .render()
+                .contains("mqttd_publish_resolved_undeliverable_total{reason=\"peer-gone\"} 2"),
+            "counted: {}",
+            metrics.render()
+        );
+        assert!(!h.interest.has_node(&peer.node), "and the peer is erased");
+        assert!(
+            !h.forward_windows.contains_key(&peer.node),
+            "with its forward window (D4)"
+        );
+        assert!(h.pending_publishes.is_empty());
+        assert_eq!(h.publishes_held_for_unreachable(), 0);
+
+        // What arrives after the confirmation finds nobody to owe.
+        let (id, mut after) = register(&mut h, "t/x");
+        fan_out(&mut h, "t/x", QoS::AtLeastOnce, false, Some(id));
+        h.pending_local_done(id);
+        assert!(matches!(after.try_recv(), Ok(PublishOutcome::Accepted)));
+    }
+
+    /// ADR 0087 D2, from review of #1021: a confirmation that lands while the peer
+    /// still has a link — a connection not yet torn down — leaves the link to answer
+    /// for it, but not for ever. Membership has written the node off and its dialer
+    /// has stopped, so when that link ends no hold starts and no confirmation
+    /// follows: what the node was owed is resolved there and then — its interest
+    /// erased, its publishers answered on the next sweep, counted `peer-gone`.
+    #[test]
+    fn a_peer_confirmed_gone_while_linked_is_resolved_when_that_link_ends() {
+        let mut h = hub();
+        let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("gl"));
+        h.attach_metrics(metrics.clone());
+        let first = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
+        h.peer_dead(&first.node);
+        // Linked again under the verdict, and owed a publish over that link.
+        let mut again = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
+        let (id, mut rx) = register(&mut h, "t/x");
+        fan_out(&mut h, "t/x", QoS::AtLeastOnce, false, Some(id));
+        h.pending_local_done(id);
+        assert!(was_sent_a_forward(&mut again));
+
+        h.peer_gone(&again.node);
+        sweep_tick(&mut h);
+        assert!(
+            rx.try_recv().is_err() && h.interest.has_node(&again.node),
+            "while the link lasts it answers for the peer; nothing is resolved"
+        );
+
+        h.peer_disconnected(&again.node, 0);
+        sweep_tick(&mut h);
+        assert!(!h.interest.has_node(&again.node), "the interest is gone");
+        assert!(
+            matches!(rx.try_recv(), Ok(PublishOutcome::Accepted)),
+            "the publisher is answered"
+        );
+        assert!(
+            metrics
+                .render()
+                .contains("mqttd_publish_resolved_undeliverable_total{reason=\"peer-gone\"} 1"),
+            "and counted: {}",
+            metrics.render()
+        );
+        assert!(
+            !h.held_dead.contains_key(&again.node),
+            "and the verdict is over"
+        );
+        assert!(h.pending_publishes.is_empty());
+    }
+
+    /// The bound on that link, from the re-review of #1021: nothing ends a
+    /// half-open peer link in a bounded time — no keepalive frame, no read deadline,
+    /// no TCP keepalive, and in plain mode no raft traffic either — so a link to a
+    /// node confirmed gone that stays up with no `Alive` is given the hold's
+    /// countdown and no more. Then it is dropped, and what the node was owed is
+    /// resolved and counted `peer-gone`. Without a durable plane and with one alike.
+    #[tokio::test]
+    async fn a_link_to_a_peer_confirmed_gone_that_stays_up_is_dropped_after_the_countdown() {
+        for durable in [false, true] {
+            let mut h = if durable {
+                durable_hub().await.0
+            } else {
+                hub()
+            };
+            let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("glc"));
+            h.attach_metrics(metrics.clone());
+            let first = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
+            h.peer_dead(&first.node);
+            let mut zombie = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
+            let (id, mut rx) = register(&mut h, "t/x");
+            fan_out(&mut h, "t/x", QoS::AtLeastOnce, false, Some(id));
+            h.pending_local_done(id);
+            assert!(was_sent_a_forward(&mut zombie), "durable={durable}");
+            h.peer_gone(&zombie.node);
+
+            for tick in 1..REROUTE_GRACE_TICKS {
+                sweep_tick(&mut h);
+                assert!(
+                    rx.try_recv().is_err() && h.peers.contains_key(&zombie.node),
+                    "durable={durable}: the link still answers for the peer at sweep {tick}"
+                );
+            }
+            sweep_tick(&mut h);
+            assert!(
+                !h.peers.contains_key(&zombie.node),
+                "durable={durable}: the link is dropped at the end of the countdown"
+            );
+            sweep_tick(&mut h);
+            assert!(
+                matches!(rx.try_recv(), Ok(PublishOutcome::Accepted)),
+                "durable={durable}: the publisher is answered"
+            );
+            assert!(!h.interest.has_node(&zombie.node), "durable={durable}");
+            assert!(
+                metrics
+                    .render()
+                    .contains("mqttd_publish_resolved_undeliverable_total{reason=\"peer-gone\"} 1"),
+                "durable={durable}: counted: {}",
+                metrics.render()
+            );
+            assert!(!h.held_dead.contains_key(&zombie.node), "durable={durable}");
+            // The pump's sender is gone with the peer entry: the link closes.
+            while let Ok(_frame) = zombie.rx.try_recv() {}
+            assert!(
+                matches!(
+                    zombie.rx.try_recv(),
+                    Err(mpsc::error::TryRecvError::Disconnected)
+                ),
+                "durable={durable}: the link's sender is dropped"
+            );
+        }
+    }
+
+    /// The other side of it: a peer confirmed gone whose link stays up — it was
+    /// alive after all — and that membership then holds alive again is a member.
+    /// Nothing is resolved while the link lasts, the `Alive` clears the mark, and a
+    /// later loss of its link is a member's lost link: interest and what it is owed
+    /// are kept, and nothing is counted.
+    #[test]
+    fn a_peer_confirmed_gone_whose_link_stays_up_and_that_is_alive_again_resolves_nothing() {
+        let mut h = hub();
+        let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("gla"));
+        h.attach_metrics(metrics.clone());
+        let first = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
+        h.peer_dead(&first.node);
+        let mut again = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
+        h.peer_gone(&again.node);
+        let (id, mut rx) = register(&mut h, "t/x");
+        fan_out(&mut h, "t/x", QoS::AtLeastOnce, false, Some(id));
+        h.pending_local_done(id);
+        assert!(was_sent_a_forward(&mut again), "the live link is routed to");
+        // Inside the countdown a live peer's `Alive` arrives (it answers the parting
+        // greeting in a round trip).
+        for _ in 1..REROUTE_GRACE_TICKS {
+            sweep_tick(&mut h);
+        }
+        assert!(rx.try_recv().is_err(), "held for the peer's answer");
+
+        h.peer_alive(&again.node);
+        for _ in 0..REROUTE_GRACE_TICKS * 2 {
+            sweep_tick(&mut h);
+        }
+        assert!(
+            h.peers.contains_key(&again.node),
+            "after the Alive, no countdown drops the live link"
+        );
+        h.peer_disconnected(&again.node, 0);
+        for _ in 0..REROUTE_GRACE_TICKS * 2 {
+            sweep_tick(&mut h);
+        }
+        assert!(
+            h.interest.has_node(&again.node),
+            "a member's lost link keeps its interest"
+        );
+        assert!(
+            h.pending_publishes[&id]
+                .awaiting
+                .values()
+                .any(|o| o.node == again.node),
+            "and what it is owed"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the publisher is held, not answered"
+        );
+        assert!(
+            !metrics.render().contains("resolved_undeliverable_total{"),
+            "nothing is counted: {}",
+            metrics.render()
+        );
+    }
+
+    /// ADR 0087 D9: a forward nobody answers — here `QoS` 0 — is not held for a peer
+    /// with matching interest and no link, and since 0087-T3 that is counted,
+    /// `publish_dropped{reason="peer-unreachable"}`, once per such peer. A linked
+    /// peer is forwarded to and nothing is counted.
+    #[test]
+    fn qos0_for_a_peer_with_no_link_is_counted_peer_unreachable() {
+        let mut h = hub();
+        let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("q0"));
+        h.attach_metrics(metrics.clone());
+        let mut linked = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/#");
+        let away = attach_peer_at(&mut h, "q", PROTO_FORWARD_REACHED, "t/#");
+        let counted = |m: &mqtt_observability::metrics::Metrics| {
+            m.render()
+                .lines()
+                .find(|l| l.starts_with("mqttd_publish_dropped_total{reason=\"peer-unreachable\"}"))
+                .map(str::to_string)
+        };
+        fan_out(&mut h, "t/x", QoS::AtMostOnce, false, None);
+        assert_eq!(counted(&metrics), None, "both linked: nothing counted");
+
+        h.peer_disconnected(&away.node, 0);
+        fan_out(&mut h, "t/x", QoS::AtMostOnce, false, None);
+        h.peer_dead(&away.node);
+        fan_out(&mut h, "t/x", QoS::AtMostOnce, false, None);
+        assert_eq!(
+            counted(&metrics).as_deref(),
+            Some("mqttd_publish_dropped_total{reason=\"peer-unreachable\"} 2"),
+            "once per publish for the peer with no link, link lost or held dead"
+        );
+        assert!(
+            std::iter::from_fn(|| linked.rx.try_recv().ok())
+                .filter(|f| matches!(f, PeerMessage::Publish { .. }))
+                .count()
+                == 3,
+            "the linked peer got all three"
+        );
+    }
+
+    /// ADR 0087 D2 (0087-T3), WITH a durable plane, until 0087-T5: the hold also
+    /// ends at today's countdown — `REROUTE_GRACE_TICKS` sweeps with no link —
+    /// whichever comes first, because until interest says whether the lease plane
+    /// owns it a publish made after a durable session's takeover is owed to the
+    /// dead node and to the new owner alike, and nothing else discharges what the
+    /// dead node is owed. A forward in flight at the verdict is answered on exactly
+    /// the sweep it was answered on before this work, a publish made during the
+    /// hold with it — so a durable failover holds a publisher no longer than it did
+    /// — and both are now counted, `reason="hold-expired"`, where they were silent.
+    /// A confirmation that arrives after the countdown has nothing left to resolve.
+    #[tokio::test]
+    async fn with_a_durable_plane_the_hold_ends_at_the_countdown_and_is_counted() {
+        let (mut h, _store) = durable_hub().await;
+        let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("cap"));
+        h.attach_metrics(metrics.clone());
+        let peer = attach_peer_at(&mut h, "p", PROTO_FORWARD_REACHED, "t/x");
+        let (_in_flight, _seq, mut before) = held_forward(&mut h, &peer.node);
+
+        h.peer_dead(&peer.node);
         sweep_tick(&mut h);
         sweep_tick(&mut h);
         let (late, mut during) = register(&mut h, "t/x");
@@ -3016,18 +3302,27 @@ mod zone_fwd_proofs {
         sweep_tick(&mut h);
         assert!(
             matches!(before.try_recv(), Ok(PublishOutcome::Accepted)),
-            "answered on sweep {REROUTE_GRACE_TICKS}, as the grace answered it"
+            "answered on sweep {REROUTE_GRACE_TICKS}, as before 0087-T3"
         );
         assert!(matches!(during.try_recv(), Ok(PublishOutcome::Accepted)));
-        assert!(!h.interest.has_node(&peer.node), "and the peer is erased");
-        assert!(h.pending_publishes.is_empty());
-        assert_eq!(h.publishes_held_for_unreachable(), 0);
+        assert!(
+            metrics
+                .render()
+                .contains("mqttd_publish_resolved_undeliverable_total{reason=\"hold-expired\"} 2"),
+            "counted: {}",
+            metrics.render()
+        );
+        assert!(!h.interest.has_node(&peer.node));
 
-        // What arrives after the hold finds nobody to owe, as before.
-        let (id, mut after) = register(&mut h, "t/x");
-        fan_out(&mut h, "t/x", QoS::AtLeastOnce, false, Some(id));
-        h.pending_local_done(id);
-        assert!(matches!(after.try_recv(), Ok(PublishOutcome::Accepted)));
+        h.peer_gone(&peer.node);
+        assert!(
+            !metrics.render().contains("reason=\"peer-gone\""),
+            "nothing left for the confirmation to resolve"
+        );
+        assert!(
+            !h.held_dead.contains_key(&peer.node),
+            "and the verdict ends"
+        );
     }
 
     /// A hub with a durable plane attached (idle: its driver is stopped) and the
@@ -3383,7 +3678,7 @@ mod zone_fwd_proofs {
             "c's member cannot be reached either: not somewhere to move to"
         );
 
-        // b returns; c never does, and its hold runs out.
+        // b returns; c never does, and is confirmed gone.
         let mut b_again = link_peer_at(&mut h, "b", PROTO_FORWARD_REACHED);
         h.peer_announced_shared(&b_again.node, vec![group("m-b")]);
         let seq = loop {
@@ -3393,12 +3688,13 @@ mod zone_fwd_proofs {
                 break seq;
             }
         };
+        h.peer_gone(&c.node);
         for _ in 0..REROUTE_GRACE_TICKS {
             sweep_tick(&mut h);
         }
         assert!(
             rx.try_recv().is_err(),
-            "c's hold running out answers nothing that is owed to b"
+            "c's confirmation answers nothing that is owed to b"
         );
         h.forward_answered(&b_again.node, seq, ForwardVerdict::Stored);
         assert!(matches!(rx.try_recv(), Ok(PublishOutcome::Accepted)));
@@ -3408,7 +3704,7 @@ mod zone_fwd_proofs {
     /// d's, on a node with a link, at b's verdict; d refuses (its node in a
     /// brownout). The only member not yet tried is c's, and c cannot be reached: the
     /// pass is exhausted, and the publisher is told of the refusal and retries —
-    /// where holding the delivery for c would have ended, if c's hold ran out, in an
+    /// where holding the delivery for c would have ended, once c was confirmed gone, in an
     /// acknowledgement for a publish nobody received, with b never tried again.
     #[test]
     fn a_refused_share_delivery_is_not_moved_to_a_member_that_cannot_be_reached() {
@@ -3633,9 +3929,9 @@ mod zone_fwd_proofs {
     /// What becomes of a `$share` delivery owed to a member on a node that stays
     /// dead and out of reach. If a member appears on another node while the hold
     /// runs — the group's consumers reconnecting elsewhere — the delivery moves to
-    /// it at the next tick. If none does, the hold runs out and the publisher is
-    /// acknowledged, as for any publish nobody is left to receive; its connection
-    /// is not closed on it.
+    /// it at the next tick. If none does, the hold ends when the node is confirmed
+    /// gone (ADR 0087 D2) and the publisher is acknowledged, as for any publish
+    /// nobody is left to receive; its connection is not closed on it.
     #[test]
     fn a_share_delivery_owed_to_a_dead_node_moves_to_a_new_member_or_ends_with_the_hold() {
         for reappears in [true, false] {
@@ -3684,14 +3980,15 @@ mod zone_fwd_proofs {
                 h.forward_answered(&other.node, seq, ForwardVerdict::Stored);
                 assert!(matches!(rx.try_recv(), Ok(PublishOutcome::Accepted)));
             } else {
-                for _ in 2..REROUTE_GRACE_TICKS {
+                for _ in 2..REROUTE_GRACE_TICKS * 2 {
                     sweep_tick(&mut h);
-                    assert!(rx.try_recv().is_err(), "still held inside the hold");
+                    assert!(rx.try_recv().is_err(), "still held until confirmation");
                 }
+                h.peer_gone(&away.node);
                 sweep_tick(&mut h);
                 assert!(
                     matches!(rx.try_recv(), Ok(PublishOutcome::Accepted)),
-                    "acknowledged when the hold runs out, not withheld"
+                    "acknowledged when the node is confirmed gone, not withheld"
                 );
                 assert!(h.pending_publishes.is_empty() && h.forward_index.is_empty());
             }
@@ -3782,11 +4079,12 @@ mod zone_fwd_proofs {
     /// was told is dead can be linked again, announce its interest, and be routed
     /// to — the verdict still standing. What the verdict then decides is what the
     /// loss of THAT link means. Membership says `Dead` once: no second verdict
-    /// follows when the link goes, so the hold starts again, and when it has run
-    /// out the interest the link brought back goes — or a node that has finished
-    /// the graceful stop it announced would be owed every matching publish for
-    /// good. Once membership holds the peer alive again, a lost link keeps its
-    /// interest for as long as it takes, as for any member.
+    /// follows when the link goes, so the hold starts again, and when the peer is
+    /// confirmed gone the interest the link brought back goes — or a node that has
+    /// finished the graceful stop it announced would be owed every matching publish
+    /// for good. Once membership holds the peer alive again, a lost link keeps its
+    /// interest for as long as it takes, as for any member (and there is no verdict
+    /// left for a confirmation to end).
     #[test]
     fn a_link_under_a_dead_verdict_takes_its_interest_with_it_until_the_verdict_is_withdrawn() {
         for withdrawn in [false, true] {
@@ -3811,6 +4109,12 @@ mod zone_fwd_proofs {
             for _ in 0..REROUTE_GRACE_TICKS {
                 sweep_tick(&mut h);
             }
+            assert!(
+                h.interest.has_node(&again.node),
+                "withdrawn={withdrawn}: held"
+            );
+            h.peer_gone(&again.node);
+            sweep_tick(&mut h);
             assert_eq!(
                 h.interest.has_node(&again.node),
                 withdrawn,
@@ -3857,6 +4161,7 @@ mod zone_fwd_proofs {
                 peer_addr: peer_addr.into(),
                 state,
                 domain: None,
+                gone: false,
             };
 
             let mut h = hub();
