@@ -1011,6 +1011,11 @@ async fn subscribe_on_owner(proc: &mut proc_common::Proc, i: usize, client: &str
                     client: client.to_string(),
                     via_node,
                     session_present: present,
+                    // MQTT 3.1.1, CleanSession 0: a session that never expires.
+                    clean_start: Some(false),
+                    session_expiry_s: None,
+                    will: None,
+                    conn: None,
                 });
                 proc.record(history_check::Event::Subscribe {
                     at_ms,
