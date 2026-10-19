@@ -644,6 +644,43 @@ async fn v5_outbound_topic_alias_assigned_then_referenced() {
     assert_eq!(topic_alias(&p2.properties), Some(1));
 }
 
+/// Issue #1032: a PUBLISH that would set up a new alias but is dropped as too large
+/// for the client must not leave the alias behind, or the next PUBLISH on that topic
+/// references an alias the client never received.
+#[tokio::test]
+async fn v5_an_alias_set_up_by_a_dropped_publish_is_not_referenced() {
+    let addr = start_broker().await;
+    let (mut sub, _) = Client::connect_v5(
+        addr,
+        "ota-big-sub",
+        true,
+        vec![
+            Property::TopicAliasMaximum(5),
+            Property::MaximumPacketSize(256),
+        ],
+    )
+    .await;
+    sub.subscribe(1, "big/+", QoS::AtMostOnce).await;
+
+    let mut pubr = Client::connect_v5_ok(addr, "ota-big-pub").await;
+    pubr.publish("big/a", &[0x42; 1024], QoS::AtMostOnce, None, vec![])
+        .await;
+    pubr.publish("big/a", b"small", QoS::AtMostOnce, None, vec![])
+        .await;
+
+    let p = sub.expect_publish().await;
+    assert_eq!(
+        &p.payload[..],
+        b"small",
+        "the oversize one is dropped for this client"
+    );
+    assert_eq!(
+        p.topic, "big/a",
+        "it carries its topic: the client knows no alias for it"
+    );
+    assert_eq!(topic_alias(&p.properties), Some(1));
+}
+
 // --- flow control (ADR 0012) ------------------------------------------------
 
 #[tokio::test]

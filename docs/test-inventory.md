@@ -1466,7 +1466,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 830 test(s)
+## `crates/mqttd/src/lib.rs` — 831 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1519,6 +1519,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `admission::tests::the_penalty_table_is_bounded_under_address_spraying`
 - `admission::tests::the_per_ip_cap_is_independent_and_the_table_shrinks_to_empty`
 - `admission::tests::unconfigured_caps_admit_everything`
+- `aliases::tests::an_undone_new_mapping_is_set_up_again_on_the_next_publish`
 - `aliases::tests::inbound_establishes_then_references`
 - `aliases::tests::inbound_passes_through_when_no_alias`
 - `aliases::tests::inbound_rejects_out_of_range_zero_and_unknown`
@@ -3087,7 +3088,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_node_exports_its_certificates_time_to_expiry_and_follows_a_rotation`
 - `the_offline_checks_apply_the_same_threshold_and_say_so`
 
-## `crates/mqttd/tests/v5_protocol.rs` — 24 test(s)
+## `crates/mqttd/tests/v5_protocol.rs` — 25 test(s)
 
 - `a_client_supplied_id_is_not_reassigned`
 - `a_zero_length_client_id_is_assigned_and_returned`
@@ -3095,6 +3096,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `v5_a_will_delay_is_bounded_by_the_session_expiry`
 - `v5_a_will_is_cancelled_by_a_reconnect_inside_the_delay`
 - `v5_a_will_is_held_for_its_delay_then_published`
+- `v5_an_alias_set_up_by_a_dropped_publish_is_not_referenced`
 - `v5_application_properties_are_forwarded_to_subscribers`
 - `v5_connect_and_pubsub_roundtrip`
 - `v5_disconnect_cannot_raise_an_expiry_the_connect_set_to_zero`
