@@ -124,6 +124,45 @@ services:
       mqttd:
         condition: service_healthy
 
+  # Every payload format fss-mqtt decodes, on its own topic under formats/, retained and
+  # refreshed every minute (feeds/formats.py; README.md, "Every payload format").
+  sim-formats:
+    image: python:3.14-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170
+    init: true
+    restart: unless-stopped
+    command: ["python3", "/opt/feeds/formats.py"]
+    environment:
+      SIM_HOST: mqttd
+      SIM_LIB: /opt/rules           # sim/mqtt.py and sim/parquet.py
+      FORMATS_INTERVAL: "60"
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ../rules:/opt/rules:ro
+      - ./feeds:/opt/feeds:ro
+    depends_on:
+      mqttd:
+        condition: service_healthy
+
+  # Sparkplug B: two edge nodes on the demo's plants and a primary host application, with
+  # births, data, commands and deaths on spBv1.0/ (feeds/sparkplug.py; README.md,
+  # "Sparkplug B").
+  sim-sparkplug:
+    image: python:3.14-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170
+    init: true
+    restart: unless-stopped
+    command: ["python3", "/opt/feeds/sparkplug.py"]
+    environment:
+      SIM_HOST: mqttd
+      SIM_LIB: /opt/rules
+      SIM_QUIET: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ../rules:/opt/rules:ro
+      - ./feeds:/opt/feeds:ro
+    depends_on:
+      mqttd:
+        condition: service_healthy
+
   sim-homes:
     image: python:3.14-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170
     init: true

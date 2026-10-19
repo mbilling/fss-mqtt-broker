@@ -578,7 +578,13 @@ jobs:
           sh -n demo/rules-live/pki/gen.sh
           PYTHONPYCACHEPREFIX="$RUNNER_TEMP/pycache" \
             python3 -m py_compile demo/rules-live/ui/server.py demo/rules/live.py \
-              demo/rules-live/feeds/wills.py
+              demo/rules-live/feeds/wills.py demo/rules-live/feeds/formats.py \
+              demo/rules-live/feeds/sparkplug.py demo/rules-live/feeds/binfmt.py \
+              demo/rules-live/feeds/arrow.py
+          # The format and Sparkplug feeds build every payload without a broker. The
+          # runner's Python has no compression.zstd, so formats.py skips its zstd ones.
+          PYTHONPYCACHEPREFIX="$RUNNER_TEMP/pycache" python3 demo/rules-live/feeds/formats.py --list
+          PYTHONPYCACHEPREFIX="$RUNNER_TEMP/pycache" python3 demo/rules-live/feeds/sparkplug.py --dump 2 > /dev/null
           node --check demo/rules-live/ui/app.js
 
       # Issue #263: the compose artifacts default to a PINNED image tag, and every mqttd
