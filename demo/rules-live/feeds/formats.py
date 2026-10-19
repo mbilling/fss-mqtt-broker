@@ -20,7 +20,7 @@ The zstd variants (parquet-zstd, avro-zstd, arrow, zstd) need Python 3.14's
 compression.zstd, as in the demo stack; an older Python skips them and says so.
 
 Options can also be set in the environment: SIM_HOST, SIM_PORT and FORMATS_INTERVAL
-(seconds). Exit 0, or 2 for a bad option.
+(seconds). Exit 0; 1 when --once could not publish; 2 for a bad option.
 """
 
 from __future__ import annotations

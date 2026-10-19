@@ -317,9 +317,11 @@ On a schedule:
 | 15 min | the solar SCADA loses power without a DISCONNECT, so the broker publishes its NDEATH from the Will; it is back 20 s later with the next bdSeq |
 | 20 min | the park controller restarts cleanly: it publishes its NDEATH itself, disconnects, and is back 10 s later |
 
-Data and command messages name their metrics by alias only. A client that subscribes after a
-birth sees aliases until the next one, which the rebirth brings every ten minutes. fss-mqtt
-learns the names and types from the births it sees.
+NDATA and DDATA name their metrics by alias only; the host's commands name theirs. A client
+that subscribes after a birth sees aliases until the next one, which the rebirth brings every
+ten minutes. fss-mqtt learns the names and types from the births it sees. The edge nodes do
+not wait for the host's STATE before their births, as a Sparkplug 3.0 edge node configured
+with a primary host would.
 
 ## Change a rule in the editor
 

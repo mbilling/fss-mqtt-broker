@@ -379,9 +379,11 @@ class Edge:
         c = Client(self.host, self.port, f"sparkplug-{self.group}-{self.node}", keepalive=30,
                    timeout=10)
         c.connect(clean=True, will=(self.topic("NDEATH"), self.ndeath(), 1, False))
-        c.subscribe([(self.topic("NCMD"), 1), (f"{NS}/{self.group}/DCMD/{self.node}/+", 1),
-                     (f"{NS}/STATE/{HOST_ID}", 1)])
-        self.client = c
+        self.client = c  # from here a failure drops it, and the next attempt takes a new bdSeq
+        # The edge nodes do not wait for the primary host's STATE before their births, as a
+        # Sparkplug 3.0 edge node configured with a primary host would: the demo's host is
+        # always there, and an explorer sees the births either way.
+        c.subscribe([(self.topic("NCMD"), 1), (f"{NS}/{self.group}/DCMD/{self.node}/+", 1)])
         self.out.note(f"{self.group}/{self.node} connected, bdSeq {self.bd_seq}")
         self.births()
 
@@ -449,7 +451,7 @@ class Edge:
 
     def handle(self, topic: str, body: bytes):
         """NCMD Node Control/Rebirth, and DCMD writes to Setpoint/Max Power."""
-        if topic == self.topic("NCMD") and b"Node Control/Rebirth" in body:
+        if topic == self.topic("NCMD") and _first_metric(body) == ("Node Control/Rebirth", True):
             self.out.note(f"{self.group}/{self.node}: rebirth requested")
             self.births()
         elif topic.startswith(f"{NS}/{self.group}/DCMD/{self.node}/"):
@@ -468,6 +470,9 @@ class Edge:
                 self.connect()
             except (MqttError, OSError) as e:
                 self.out.note(f"{self.group}/{self.node}: {e}")
+                if self.client:  # it got as far as a CONNACK: that bdSeq is spent
+                    self.client.drop()
+                    self.bd_seq = (self.bd_seq + 1) % 256
                 self.client = None
                 self.down_until = time.monotonic() + 5
                 return False
@@ -519,6 +524,23 @@ def _uvarint(b: bytes, i: int):
             return n, i
 
 
+def _first_metric(body: bytes) -> tuple:
+    """A command payload's first metric: (name, boolean_value), either None if absent."""
+    try:
+        for number, _, metric in _fields(body):
+            if number == 2:
+                name = value = None
+                for n, wire, v in _fields(metric):
+                    if n == 1 and wire == 2:
+                        name = v.decode("utf-8", "replace")
+                    elif n == 14 and wire == 0:
+                        value = bool(v)
+                return name, value
+    except (ValueError, IndexError):
+        pass
+    return None, None
+
+
 def _first_double(body: bytes) -> Optional[float]:
     """The double_value (field 13) of a command payload's first metric."""
     try:
@@ -539,13 +561,18 @@ class Host:
     def __init__(self, host: str, port: int, out: "Out"):
         self.host, self.port, self.out = host, port, out
         self.client: Optional[Client] = None
+        self.ts = 0
+        self.retry_at = 0.0
 
     def state(self, online: bool) -> bytes:
-        return json.dumps({"online": online, "timestamp": now_ms()}).encode()
+        """STATE for this connection: its Will, its birth and a clean close carry the same
+        timestamp, as Sparkplug 3.0 requires, so a client can match the Will to the birth."""
+        return json.dumps({"online": online, "timestamp": self.ts}).encode()
 
     def connect(self):
         c = Client(self.host, self.port, HOST_ID, keepalive=30, timeout=10)
         topic = f"{NS}/STATE/{HOST_ID}"
+        self.ts = now_ms()
         c.connect(clean=True, will=(topic, self.state(False), 1, True))
         c.subscribe([(f"{NS}/#", 0)])
         c.publish(topic, self.state(True), qos=1, retain=True)
@@ -564,6 +591,9 @@ class Host:
     def tend(self):
         try:
             if self.client is None:
+                if time.monotonic() < self.retry_at:
+                    return
+                self.retry_at = time.monotonic() + 5
                 self.connect()
             self.client.drain()
             self.client.inbox.clear()  # the host reads everything; the demo needs none of it
