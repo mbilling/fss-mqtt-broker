@@ -60,12 +60,12 @@ SYS_INTERVAL = float(os.environ.get("UI_SYS_INTERVAL", "2"))
 
 # What the page shows: the rules' statistics and trace (ADR 0084; `#` never matches a $SYS
 # topic, so both are named), the six roots the demo's rules publish under, the Will
-# scenarios' Wills and results, and the devices.
+# scenarios' Wills and results, the devices, every payload format, and Sparkplug B.
 FILTERS = [
     "$SYS/brokers/+/rules/#",
     "$SYS/brokers/+/trace/rules/+",
     "alerts/#", "kpi/#", "normalized/#", "analytics/#", "state/#", "events/#", "wills/#",
-    "plant/#", "home/#", "vehicle/#",
+    "plant/#", "home/#", "vehicle/#", "formats/#", "spBv1.0/#",
 ]
 DEVICE_ROOTS = ("plant/", "home/", "vehicle/")
 

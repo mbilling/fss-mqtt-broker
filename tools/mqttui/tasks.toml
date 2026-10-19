@@ -205,7 +205,7 @@ for every rule's input and output. demo/rules-live/README.md walks through it.
 """
 requires = ["docker"]
 duration = "5-15 min for the first build, then seconds"
-caution = "Starts 8 containers (2 one-shot) and binds 127.0.0.1:1883, 8070, 8080 and 9443 (override with MQTT_PORT, UI_PORT, HEALTH_PORT, ADMIN_PORT)."
+caution = "Starts 10 containers (2 one-shot) and binds 127.0.0.1:1883, 8070, 8080 and 9443 (override with MQTT_PORT, UI_PORT, HEALTH_PORT, ADMIN_PORT)."
 
 [[task]]
 id = "demo-rules-live-sim"
@@ -263,6 +263,74 @@ help = "The broker's host"
 name = "PORT"
 default = "1883"
 help = "The broker's plaintext MQTT port"
+
+[[task]]
+id = "demo-rules-live-formats"
+group = "Demo"
+name = "Publish every payload format fss-mqtt decodes, one retained topic each, under formats/"
+script = "demo/rules-live/feeds/formats.py"
+about = """
+The format feed behind demo-rules-live, on its own: JSON, JSON lines, XML, CSV (comma,
+semicolon, pipe), TSV, text, Parquet (GZIP, ZSTD, two row groups), Avro (deflate,
+zstandard, schema-registry and single-object framing), Arrow IPC (file and stream),
+SQLite (a database, a changeset, a patchset), MessagePack, CBOR, Protobuf and its gRPC
+frame, gzip, zstd, binary and empty, about the demo's plants and homes. Each is retained
+under formats/, so an MQTT explorer that subscribes gets one of each at once. With --once
+it publishes them once and exits; --list shows them without a broker.
+"""
+requires = ["python3"]
+duration = "a second with --once"
+args = ["--once", "--host", "${HOST}", "--port", "${PORT}"]
+[[task.env]]
+name = "HOST"
+default = "127.0.0.1"
+help = "The broker's host"
+[[task.env]]
+name = "PORT"
+default = "1883"
+help = "The broker's plaintext MQTT port"
+
+[[task]]
+id = "demo-rules-live-sparkplug"
+group = "Demo"
+name = "Play Sparkplug B edge nodes, devices and a host application into a broker"
+script = "demo/rules-live/feeds/sparkplug.py"
+about = """
+The Sparkplug B feed behind demo-rules-live, on its own: the wind farm's park controller
+and the solar park's SCADA as Sparkplug 3.0 edge nodes with their devices, and a primary
+host application with its STATE. Births name every metric with its alias and type (every
+Sparkplug data type, a DataSet, a Template, PropertySets); data follows by alias; the host
+asks for rebirths and writes setpoints; devices go into service and back; one edge node
+loses power (its NDEATH is the broker's Will to publish) and the other restarts cleanly.
+--fast plays the schedule ten times as fast.
+"""
+requires = ["python3"]
+duration = "runs until stopped"
+args = ["--host", "${HOST}", "--port", "${PORT}"]
+[[task.env]]
+name = "HOST"
+default = "127.0.0.1"
+help = "The broker's host"
+[[task.env]]
+name = "PORT"
+default = "1883"
+help = "The broker's plaintext MQTT port"
+
+[[task]]
+id = "demo-rules-live-binfmt"
+group = "Demo"
+name = "The format feed's MessagePack, CBOR, Protobuf, Avro and SQLite changeset writers (imported, not run)"
+script = "demo/rules-live/feeds/binfmt.py"
+hidden = true
+about = "Imported by demo/rules-live/feeds/formats.py and sparkplug.py."
+
+[[task]]
+id = "demo-rules-live-arrow"
+group = "Demo"
+name = "The format feed's Apache Arrow IPC writer (imported, not run)"
+script = "demo/rules-live/feeds/arrow.py"
+hidden = true
+about = "Imported by demo/rules-live/feeds/formats.py."
 
 [[task]]
 id = "demo-rules-live-pki"
