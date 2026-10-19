@@ -51,7 +51,7 @@
 | [0041](../adr/0041-resource-governance.md) | Resource governance (admission caps, per-client quotas, bounded state) | Accepted | [14/17 done](0041-resource-governance.md) | 3 deferred |
 | [0042](../adr/0042-durable-plane-stress-harness.md) | Durable-plane stress and simulation harness | Accepted | [10/10 done](0042-durable-plane-stress-harness.md) | — |
 | [0043](../adr/0043-elastic-cluster-resize.md) | Elastic cluster resize (grow, shrink, replace) | Accepted | [7/7 done](0043-elastic-cluster-resize.md) | — |
-| [0044](../adr/0044-release-readiness-assurance.md) | Release readiness: out-of-process cluster harness and continuous assurance | Accepted | [10/11 done](0044-release-readiness-assurance.md) | 1 deferred |
+| [0044](../adr/0044-release-readiness-assurance.md) | Release readiness: out-of-process cluster harness and continuous assurance | Accepted | [10/12 done](0044-release-readiness-assurance.md) | 1 open, 1 deferred |
 | [0045](../adr/0045-release-engineering-and-distribution.md) | Release engineering and distribution (signed, reproducible, SBOM-attested) | Accepted | [6/6 done](0045-release-engineering-and-distribution.md) | — |
 | [0046](../adr/0046-file-based-configuration.md) | File-based configuration (layered over env, hot-reloadable, GitOps-friendly) | Accepted | [6/6 done](0046-file-based-configuration.md) | — |
 | [0047](../adr/0047-kubernetes-deployment.md) | Kubernetes deployment (Helm chart, StatefulSet, safe scale-down) | Accepted | [13/13 done](0047-kubernetes-deployment.md) | — |
@@ -158,6 +158,7 @@
 **0044 — Release readiness: out-of-process cluster harness and continuous assurance**
 
 - `0044-P9` 💤 deferred ([#543](https://github.com/mbilling/fss-mqtt-broker/issues/543)): Nightly performance tolerance gate — compare the criterion suites against the recorded baseline and FAIL beyond a stated tolerance, instead of printing numbers for a human to read — "Deferred 2026-10-02: issue #543 closed; was planned."
+- `0044-P13` 🚧 in-progress ([#1038](https://github.com/mbilling/fss-mqtt-broker/issues/1038)): "The independent consistency lane, slice 3: MQTT session promises. QoS 2 exactly once, no protocol error the client sees, Wills published when owed (after their delay or session end, once) and never when not, and Session Present honouring clean start and expiry, the expiry a DISCONNECT sets included; the checks the delivery redesign's review rounds 8 and 9 found broken in design, made executable"
 
 **0048 — Comparative performance benchmarking (published, reproducible, honest)**
 

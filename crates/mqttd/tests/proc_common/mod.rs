@@ -769,6 +769,10 @@ impl Proc {
                     client: self.subs[i].id.clone(),
                     via_node: self.nodes[via].id.clone(),
                     session_present: present,
+                    // MQTT 3.1.1, CleanSession 0: a session that never expires.
+                    clean_start: Some(false),
+                    session_expiry_s: None,
+                    will: None,
                 });
                 self.note(format!(
                     "subscriber {} online via {} (present={present})",

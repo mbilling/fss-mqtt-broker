@@ -27,12 +27,18 @@ test), so it is recorded: `--check-inventory` fails when a test becomes ignored 
 file changing, every ignored test must be declared in `IGNORE_ALLOWLIST` with the tier that
 runs it, and `--check-results` fails if the ignored set in an actual run differs from this one.
 
-## `crates/history-check/src/lib.rs` — 4 test(s)
+## `crates/history-check/src/lib.rs` — 10 test(s)
 
 - `tests::a_clean_history_passes_and_roundtrips_jsonl`
+- `tests::a_connect_recorded_before_the_session_fields_still_parses`
 - `tests::a_history_recorded_before_dup_and_qos_still_parses`
+- `tests::a_qos2_repeat_and_a_protocol_error_are_caught`
 - `tests::each_check_bites`
+- `tests::sessions_end_with_clean_start_and_their_expiry`
 - `tests::the_redelivery_check_accepts_the_legal_shapes`
+- `tests::wills_follow_their_delay_session_and_takeover_rules`
+- `tests::wills_that_are_not_owed_must_not_arrive`
+- `tests::wills_that_are_owed_must_arrive_once_and_not_early`
 
 ## `crates/history-check/src/main.rs` — 0 test(s)
 
