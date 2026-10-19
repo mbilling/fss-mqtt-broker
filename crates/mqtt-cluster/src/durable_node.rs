@@ -240,7 +240,8 @@ pub async fn build_durable_node_with(
         replicas.clone(),
         placement.clone(),
     )
-    .with_ownership_domain_all(ownership_domain_all.clone());
+    .with_ownership_domain_all(ownership_domain_all.clone())
+    .with_lease_store(lease_store.clone());
 
     // --- durable store over the shared transport ---
     let lease_source = LocalLeaseSource::new(lease_store.clone(), local);
