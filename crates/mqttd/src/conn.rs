@@ -2217,8 +2217,13 @@ fn into_will(w: mqtt_codec::packet::LastWill, publisher: crate::rules::Publisher
             _ => None,
         })
         .unwrap_or(0);
+    let expiry_secs = w.properties.0.iter().find_map(|p| match p {
+        mqtt_codec::Property::MessageExpiryInterval(v) => Some(*v),
+        _ => None,
+    });
     Will {
         delay_secs,
+        expiry_secs,
         publisher,
         message: Message {
             topic: w.topic,
@@ -2227,8 +2232,8 @@ fn into_will(w: mqtt_codec::packet::LastWill, publisher: crate::rules::Publisher
             retain: w.retain,
             app,
             // A will's Message Expiry Interval counts from PUBLICATION, which has not
-            // happened yet — the publish path stamps the deadline then (issue #227
-            // keeps will semantics unchanged).
+            // happened yet: `expiry_secs` above carries it, and `publish_will` sends it
+            // as the publication's interval (§3.1.3.2.4, issue #1033).
             expires_at: None,
         },
     }

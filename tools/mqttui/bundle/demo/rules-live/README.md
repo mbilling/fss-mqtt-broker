@@ -154,10 +154,7 @@ retained, so a client that subscribes later sees the last round:
 | `v5-takeover-resumed` | 5: taken over with clean start 0, inside Will Delay 8 s | no Will |
 | `v5-takeover-clean` | 5: taken over with clean start 1, which ends the session | the Will at once |
 
-Three scenarios fail against mqttd today, and their results say so (`known_issue`):
-`v5-drop-props` and `v5-takeover-resumed`
-([#1033](https://github.com/mbilling/fss-mqtt-broker/issues/1033): the Will's Message Expiry
-Interval is not sent, and a takeover inside the Will Delay publishes the Will), and
+One scenario fails against mqttd today, and its result says so (`known_issue`):
 `v5-resumed` ([#1034](https://github.com/mbilling/fss-mqtt-broker/issues/1034): with
 `MQTTD_DURABLE_SESSIONS=0`, as in this stack, a session without subscriptions is not kept).
 mqttd also closes a taken-over MQTT 5 connection without the DISCONNECT 0x8E that §3.1.4

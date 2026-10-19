@@ -3088,11 +3088,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_node_exports_its_certificates_time_to_expiry_and_follows_a_rotation`
 - `the_offline_checks_apply_the_same_threshold_and_say_so`
 
-## `crates/mqttd/tests/v5_protocol.rs` — 25 test(s)
+## `crates/mqttd/tests/v5_protocol.rs` — 27 test(s)
 
 - `a_client_supplied_id_is_not_reassigned`
 - `a_zero_length_client_id_is_assigned_and_returned`
 - `a_zero_length_id_without_clean_start_is_refused`
+- `v5_a_takeover_inside_the_will_delay_cancels_the_will`
+- `v5_a_will_carries_its_message_expiry_interval`
 - `v5_a_will_delay_is_bounded_by_the_session_expiry`
 - `v5_a_will_is_cancelled_by_a_reconnect_inside_the_delay`
 - `v5_a_will_is_held_for_its_delay_then_published`

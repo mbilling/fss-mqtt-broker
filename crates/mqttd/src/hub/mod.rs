@@ -882,6 +882,10 @@ pub struct Will {
     pub message: Message,
     /// Will Delay Interval in seconds (§3.1.3.2.2); `0` publishes immediately.
     pub delay_secs: u32,
+    /// The Will's Message Expiry Interval in seconds, from its own property block:
+    /// sent as the publication's Message Expiry Interval when the Will is published
+    /// (§3.1.3.2.4, issue #1033). `None`: the Will never expires.
+    pub expiry_secs: Option<u32>,
     /// Who set it — the CONNECT username and the client's address — for the rule
     /// engine, which evaluates a Will when the hub publishes it (ADR 0083).
     pub publisher: crate::rules::Publisher,
@@ -4718,7 +4722,7 @@ impl Hub {
             qos: w.qos,
             retain: w.retain,
             app: &w.app,
-            message_expiry: None,
+            message_expiry: will.expiry_secs,
         };
         // A Will is a message from its client to the message events too: it carries
         // an origin while a rule here or on a peer selects one of them.
@@ -4732,7 +4736,7 @@ impl Hub {
             &w.payload,
             w.qos,
             w.retain,
-            None,
+            will.expiry_secs,
             stamped.as_ref().unwrap_or(&w.app),
             None,
             None,
@@ -5089,6 +5093,9 @@ impl Hub {
             self.unsubscribe(&client, &revoked_grants).await;
         }
 
+        // The previous connection's session expiry, before this one replaces it: a
+        // takeover ends a session of expiry 0, which the old Will's fate depends on.
+        let prior_expiry = self.session_expiry.get(&client).copied().unwrap_or(0);
         // Record this session's retention: it survives disconnect iff the expiry
         // interval is non-zero. A zero interval (or v3.1.1 clean_session=1) means the
         // session is dropped at disconnect.
@@ -5135,10 +5142,11 @@ impl Hub {
 
         // Registering replaces any previous connection for this id; dropping the
         // old `Outbound` closes the old writer loop (takeover). The server-side
-        // disconnect is not a client DISCONNECT, so the old will is published —
-        // IMMEDIATELY, delay or not: a takeover ends the old session, and
-        // §3.1.3.2.2 publishes on whichever of "delay elapsed" or "session ended"
-        // comes first.
+        // disconnect is not a client DISCONNECT, so the old Will is not deleted, and
+        // §3.1.2.5 decides it (issue #1033): it is published at once when its delay is
+        // 0, or when the takeover ends the session (a clean start, or the old session's
+        // expiry was 0); otherwise this new connection arrived inside its Will Delay
+        // and continues the session, which cancels it (the note in §3.1.4).
         if let Some(old) = self.online.remove(&client) {
             warn!(client = %client.0, "session takeover: replacing existing connection");
             // EMQX's terms for the old connection's end (ADR 0083): a clean start
@@ -5149,7 +5157,12 @@ impl Hub {
                 HubClose::TakenOver
             });
             if let Some(w) = old.will {
-                self.publish_will(&client, &w).await;
+                if w.delay_secs == 0 || clean_start || prior_expiry == 0 {
+                    self.publish_will(&client, &w).await;
+                } else {
+                    info!(client = %client.0, topic = %w.message.topic,
+                          "taken over inside its will delay by a session resume; will cancelled");
+                }
             }
         }
         let cert_end = admission
@@ -9800,6 +9813,7 @@ mod tests {
             publisher: crate::rules::Publisher::default(),
             message: will,
             delay_secs: 0,
+            expiry_secs: None,
         };
         let (out_tx, out_rx) = {
             let (t, r) = mpsc::unbounded_channel();
@@ -10658,6 +10672,7 @@ mod tests {
             will: Some(Box::new(Will {
                 publisher: crate::rules::Publisher::default(),
                 delay_secs: 0,
+                expiry_secs: None,
                 message: mqtt_core::Message {
                     topic: "wills/victim".into(),
                     payload: Bytes::from_static(b"gone"),
@@ -19290,6 +19305,7 @@ mod tests {
             Some(Will {
                 publisher: crate::rules::Publisher::default(),
                 delay_secs: 0,
+                expiry_secs: None,
                 message: Message {
                     topic: "wills/284".into(),
                     payload: Bytes::from_static(b"offline"),
@@ -19328,6 +19344,7 @@ mod tests {
             Some(Will {
                 publisher: crate::rules::Publisher::default(),
                 delay_secs: 0,
+                expiry_secs: None,
                 message: Message {
                     topic: "wills/284".into(),
                     payload: Bytes::from_static(b"should-not-fire"),

@@ -306,6 +306,71 @@ async fn v5_a_will_is_cancelled_by_a_reconnect_inside_the_delay() {
     );
 }
 
+/// Issue #1033: a takeover inside the Will Delay by a connection that resumes the
+/// session (clean start 0, a non-zero session expiry) cancels the old Will, as a
+/// reconnect inside the delay does: the new connection was opened before the delay
+/// elapsed, and the session goes on (§3.1.2.5 and the note in §3.1.4).
+#[tokio::test]
+async fn v5_a_takeover_inside_the_will_delay_cancels_the_will() {
+    let addr = start_broker().await;
+    let mut watcher = Client::connect_v5_ok(addr, "takeover-watch").await;
+    watcher.subscribe(1, "wills/taken", QoS::AtMostOnce).await;
+
+    let _first = connect_with_delayed_will(addr, "taken-over", "wills/taken", 3, 300).await;
+    let _second = connect_with_delayed_will(addr, "taken-over", "wills/taken", 3, 300).await;
+
+    assert!(
+        matches!(
+            watcher.recv_bounded(Duration::from_secs(5)).await,
+            common::Recv::Quiet
+        ),
+        "a takeover that continues the session inside the will delay must not publish the will"
+    );
+}
+
+/// Issue #1033: a Will's own Message Expiry Interval is sent as the publication's
+/// interval when the Will is published (§3.1.3.2.4).
+#[tokio::test]
+async fn v5_a_will_carries_its_message_expiry_interval() {
+    let addr = start_broker().await;
+    let mut watcher = Client::connect_v5_ok(addr, "expiry-watch").await;
+    watcher
+        .subscribe(1, "wills/expiring", QoS::AtMostOnce)
+        .await;
+
+    let mut c = Client::open(addr, ProtocolVersion::V5).await;
+    c.send(&Packet::Connect(Connect {
+        properties: Properties(vec![]),
+        protocol: ProtocolVersion::V5,
+        clean_session: true,
+        keep_alive: 30,
+        client_id: "expiry-dies".to_string(),
+        last_will: Some(LastWill {
+            topic: "wills/expiring".to_string(),
+            payload: bytes::Bytes::from_static(b"gone"),
+            qos: QoS::AtMostOnce,
+            retain: false,
+            properties: Properties(vec![Property::MessageExpiryInterval(600)]),
+        }),
+        username: None,
+        password: None,
+    }))
+    .await;
+    match c.recv().await {
+        Packet::ConnAck(a) => assert_eq!(a.code, 0),
+        other => panic!("expected CONNACK, got {other:?}"),
+    }
+    drop(c);
+
+    let p = watcher.expect_publish().await;
+    assert_eq!(p.topic, "wills/expiring");
+    let left = message_expiry(&p.properties).expect("the will's message expiry interval is sent");
+    assert!(
+        (590..=600).contains(&left),
+        "the interval is the will's own, less any wait: {left}"
+    );
+}
+
 /// §3.1.3.2.2 publishes on "delay elapsed" OR "session ended", whichever is
 /// FIRST — so a delay longer than the session's own lifetime is bounded by it.
 /// A Will must never outlive the session it describes.
