@@ -3093,6 +3093,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_client_supplied_id_is_not_reassigned`
 - `a_zero_length_client_id_is_assigned_and_returned`
 - `a_zero_length_id_without_clean_start_is_refused`
+- `v5_a_clean_start_session_without_subscriptions_is_kept`
 - `v5_a_takeover_inside_the_will_delay_cancels_the_will`
 - `v5_a_will_carries_its_message_expiry_interval`
 - `v5_a_will_delay_is_bounded_by_the_session_expiry`

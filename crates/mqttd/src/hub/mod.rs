@@ -9205,6 +9205,17 @@ async fn discard_session(
     pending: PendingAttach,
 ) {
     let _ = store.remove(&pending.client).await;
+    // A clean start with a non-zero expiry begins a NEW session that outlives this
+    // connection, so it is recorded now, bound to its owner (ADR 0031), as a
+    // non-clean attach records it through `recover_once`. Without the record, the
+    // session existed only until its first subscription wrote one: a resume of a
+    // session with no subscriptions answered Session Present 0 (issue #1034), and
+    // its owner was unbound. Best-effort like the remove above.
+    if pending.session_expiry != 0 {
+        let _ = store
+            .claim_session(&pending.client, &pending.admission.identity.subject)
+            .await;
+    }
     let _ = self_tx.send(HubCommand::SessionRecovered {
         pending: Box::new(pending),
         recovery: SessionRecovery::Cleaned,

@@ -57,8 +57,6 @@ SLACK = 2.5        # ...and one this much after the window's nominal end is late
 # Where mqttd differs from MQTT today, by scenario: the issue, and what each of the
 # scenario's problems must contain to be that difference. Any other problem is a regression.
 KNOWN_ISSUES = {
-    "v5-resumed": ("#1034: with MQTTD_DURABLE_SESSIONS=0 a session without subscriptions "
-                   "is not kept", ["Session Present 0"]),
 }
 
 

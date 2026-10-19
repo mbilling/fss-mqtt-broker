@@ -33,10 +33,10 @@ PIDS=()
 cleanup() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done; rm -rf "$WORK"; }
 trap cleanup EXIT
 
-# Known differences, by session mode: #1034 (an empty in-memory session is not kept)
-# without the store.
+# Known differences, by session mode: none today. A difference found later is listed
+# here, with its issue, until it is fixed.
 EXPECT_DURABLE=""
-EXPECT_MEMORY="v5-resumed"
+EXPECT_MEMORY=""
 
 run() {
   local mode="$1" expect="$2"

@@ -394,6 +394,35 @@ async fn v5_a_will_delay_is_bounded_by_the_session_expiry() {
 
 // --- session expiry (ADR 0009 phase 1) --------------------------------------
 
+/// Issue #1034: a clean start with a non-zero Session Expiry begins a session that
+/// outlives its connection, subscriptions or not. Resuming it answers Session
+/// Present 1 ([MQTT-3.2.2-3]: the session exists, "even if the rest of the Session
+/// state is empty"). It used to exist only once a subscription had written it.
+#[tokio::test]
+async fn v5_a_clean_start_session_without_subscriptions_is_kept() {
+    let addr = start_broker().await;
+    let (first, _) = Client::connect_v5(
+        addr,
+        "empty-kept",
+        true,
+        vec![Property::SessionExpiryInterval(60)],
+    )
+    .await;
+    drop(first);
+    // SETTLE(v5-empty-session-detach): the reconnect must follow the broker's
+    // handling of the dropped socket, or it races the detach it is testing; there is
+    // no wire observable for "the detach was processed".
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (_again, ack) = Client::connect_v5(
+        addr,
+        "empty-kept",
+        false,
+        vec![Property::SessionExpiryInterval(60)],
+    )
+    .await;
+    assert!(ack.session_present, "the empty session still exists");
+}
+
 #[tokio::test]
 async fn v5_persistent_session_resumes_within_expiry_window() {
     let addr = start_broker().await;
