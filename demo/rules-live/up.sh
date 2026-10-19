@@ -77,6 +77,7 @@ Point any MQTT client at it. '#' never matches \$SYS topics, so those are named:
   rule trace        $sub -t '\$SYS/brokers/+/trace/rules/+'
   derived messages  $sub -t 'alerts/#' -t 'kpi/#' -t 'normalized/#' -t 'analytics/#' -t 'state/#' -t 'events/#'
   device messages   $sub -t 'plant/#' -t 'home/#' -t 'vehicle/#'
+  Will scenarios    $sub -t 'wills/+/result' -t 'wills/summary'
 
 From $(pwd):
   docker compose run --rm admin rules    the admin API (\`run --rm admin help\` lists the verbs)

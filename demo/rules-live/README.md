@@ -14,6 +14,9 @@ the rules while it runs ([ADR 0084](../../docs/adr/0084-watching-and-editing-rul
   clock: wind turbines, SunSpec inverters, DSMR smart meters, heat pumps, EV chargers,
   telematics and OBD-II frames, about four messages a second; and every minute each
   turbine's 50 Hz fast log, a [Parquet file](#turbine-fast-log-parquet) of 0.53 MB.
+- **Will scenarios** ([`feeds/wills.py`](feeds/wills.py)): sixteen ways for an MQTT 3.1.1
+  or 5 connection to end, each [Will checked against the spec](#wills-checked-against-mqtt),
+  a round every two minutes.
 - **A rule editor** at <http://localhost:8070>: the rules with their live counts, each
   rule's trace, the live messages, and an editor that checks, tests and applies a rule
   through the broker's admin API, then shows the new rules arriving on `$SYS`.
@@ -56,6 +59,7 @@ Subscribe to those by name:
 | `$SYS/brokers/+/trace/rules/+` | The rule trace: for each rule, at most 5 records a second, and 5 more for messages its WHERE turned away (`no_result`), of the message it ran on (topic, client id, the first 1 KiB of the payload), the result, and every message it rendered. Not under `rules/#`: a trace subscription must be asked for on purpose | `mosquitto_sub -v -t '$SYS/brokers/+/trace/rules/+'` |
 | `alerts/#`, `kpi/#`, `normalized/#`, `analytics/#`, `state/#`, `events/#` | What the rules derive: the six roots of [the demo's rules](../rules/README.md#where-the-results-go) | `mosquitto_sub -v -t 'alerts/#' -t 'kpi/#' -t 'state/#'` |
 | `plant/#`, `home/#`, `vehicle/#` | What the devices publish | `mosquitto_sub -v -t 'vehicle/#'` |
+| `wills/#` | The Will scenarios' Wills and their verdicts | `mosquitto_sub -v -t 'wills/+/result'` |
 
 The turbines' fast logs are binary (next section), so `-v` on `plant/#` prints half a
 megabyte of Parquet a minute per turbine. Leave them out with `-T 'plant/+/+/fastlog'`.
@@ -92,6 +96,75 @@ expiry, and no more than `rules.state_expiry_per_sec` events a second (1,000 by 
 The rule's own trace and statistics are under `car_silent` on `$SYS`, and in the editor.
 The state is in memory: restarting the broker forgets the keys, and a vehicle that was
 already silent then raises nothing until it has spoken again.
+
+## Wills, checked against MQTT
+
+A client's Will is the message the broker publishes for it when its connection ends
+without a clean DISCONNECT. `sim-wills` ([`feeds/wills.py`](feeds/wills.py)) ends
+connections in sixteen ways, a round every two minutes with the scenarios a few seconds
+apart, and checks each Will:
+
+- it arrives when the spec says: at once, after its Will Delay, or when its session ends,
+  whichever is first;
+- it carries what the client set (QoS, retain, and in MQTT 5 its properties, user
+  properties in order);
+- it never arrives after a clean DISCONNECT, or when the session was resumed or taken over
+  in time.
+
+```sh
+mosquitto_sub -v -t 'wills/#'
+```
+
+Each Will goes to `wills/<scenario>/will` and names its scenario and run. The verdicts are
+retained, so a client that subscribes later sees the last round:
+
+| Topic | What |
+|---|---|
+| `wills/<scenario>/result` | One scenario's verdict: `pass` or `fail`, what the spec expects, what happened, the problems, and SHOULD-level warnings |
+| `wills/summary` | The round: how many scenarios passed, and which failed |
+
+```json
+{"scenario":"v5-delay","round":3,"result":"pass","what":"MQTT 5: Will Delay 4 s, session expiry 60 s","spec":"§3.1.3.2.2","expected":"a Will 3.5-6.5 s after the trigger","observed":"a Will 4.53 s after the trigger","problems":[],"warnings":[],"at":"2026-10-19T12:40:16.231+00:00"}
+```
+
+| Scenario | The connection | Expected |
+|---|---|---|
+| `v311-drop` | 3.1.1: the socket closes, no DISCONNECT | the Will at once |
+| `v311-disconnect` | 3.1.1: a DISCONNECT | no Will |
+| `v311-keepalive` | 3.1.1: silent past 1.5 times its 2 s keep-alive | the Will after about 3 s |
+| `v311-protocol-error` | 3.1.1: a PUBLISH with QoS 3, which the broker must close it for | the Will at once |
+| `v311-takeover` | 3.1.1: a second connection with the same client id | the first one's Will at once |
+| `v311-retained` | 3.1.1: Will Retain set, the socket closes | the Will at once, and retained for later subscribers |
+| `v5-drop-props` | 5: the socket closes; the Will has a content type, payload format, message expiry and three user properties | the Will at once, with them all, user properties in order |
+| `v5-disconnect` | 5: DISCONNECT 0x00 | no Will |
+| `v5-disconnect-with-will` | 5: DISCONNECT 0x04, Disconnect with Will Message | the Will at once |
+| `v5-delay` | 5: Will Delay 4 s, session expiry 60 s, the socket closes | the Will after 4 s |
+| `v5-session-ends-first` | 5: Will Delay 30 s, session expiry 3 s | the Will after 3 s, when the session ends |
+| `v5-no-session` | 5: Will Delay 30 s, session expiry 0 | the Will at once: the session ends with the connection |
+| `v5-resumed` | 5: Will Delay 6 s; the client is back after 2 s with clean start 0 | no Will, and Session Present 1 |
+| `v5-takeover` | 5: taken over; Will Delay 0 | the Will at once |
+| `v5-takeover-resumed` | 5: taken over with clean start 0, inside Will Delay 8 s | no Will |
+| `v5-takeover-clean` | 5: taken over with clean start 1, which ends the session | the Will at once |
+
+Three scenarios fail against mqttd today, and their results say so (`known_issue`):
+`v5-drop-props` and `v5-takeover-resumed`
+([#1033](https://github.com/mbilling/fss-mqtt-broker/issues/1033): the Will's Message Expiry
+Interval is not sent, and a takeover inside the Will Delay publishes the Will), and
+`v5-resumed` ([#1034](https://github.com/mbilling/fss-mqtt-broker/issues/1034): with
+`MQTTD_DURABLE_SESSIONS=0`, as in this stack, a session without subscriptions is not kept).
+mqttd also closes a taken-over MQTT 5 connection without the DISCONNECT 0x8E that §3.1.4
+describes, which the takeover results report as a warning.
+
+The scenarios run against any broker, each once, with the exit status as the verdict:
+
+```sh
+python3 demo/rules-live/feeds/wills.py --once --port 1883     # --list, --only v5-delay,...
+```
+
+CI runs them on every change, against the freshly built broker with the durable session
+store and with the in-memory one ([`scripts/wills-smoke.sh`](../../scripts/wills-smoke.sh)).
+The known failures are expected there, and a run fails as soon as one of them passes, so
+the list is kept up to date.
 
 ## Turbine fast log (Parquet)
 
@@ -346,10 +419,11 @@ For a real deployment, leave the trace off and `[rules] admin_writers` empty, an
 
 | File | What |
 |---|---|
-| [`compose.yaml`](compose.yaml) | The stack: `pki` and `rules-seed` (one-shot), `mqttd`, `sim-power`, `sim-homes`, `sim-cars`, `ui`, and `admin` (run on demand) |
+| [`compose.yaml`](compose.yaml) | The stack: `pki` and `rules-seed` (one-shot), `mqttd`, `sim-power`, `sim-homes`, `sim-cars`, `sim-wills`, `ui`, and `admin` (run on demand) |
 | [`up.sh`](up.sh) | Preflight the ports, build, start, wait until healthy, print where to look |
 | [`pki/gen.sh`](pki/gen.sh) | The throwaway CA, the admin listener's certificate and the `CN=rules-ui` client certificate |
 | [`ui/server.py`](ui/server.py) | The editor's server, standard library only: the page, the admin API over mTLS, and MQTT as server-sent events |
 | [`ui/index.html`](ui/index.html), [`ui/app.js`](ui/app.js), [`ui/style.css`](ui/style.css) | The page, with no third-party code |
+| [`feeds/wills.py`](feeds/wills.py) | The Will scenarios, standard library only; its MQTT client is the simulators' [`sim/mqtt.py`](../rules/sim/mqtt.py) |
 
 The simulators and the rules are [`demo/rules`](../rules/README.md)'s, mounted read-only.
