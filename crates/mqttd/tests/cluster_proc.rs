@@ -1015,6 +1015,7 @@ async fn subscribe_on_owner(proc: &mut proc_common::Proc, i: usize, client: &str
                     clean_start: Some(false),
                     session_expiry_s: None,
                     will: None,
+                    conn: None,
                 });
                 proc.record(history_check::Event::Subscribe {
                     at_ms,

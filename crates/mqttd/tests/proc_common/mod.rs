@@ -773,6 +773,7 @@ impl Proc {
                     clean_start: Some(false),
                     session_expiry_s: None,
                     will: None,
+                    conn: None,
                 });
                 self.note(format!(
                     "subscriber {} online via {} (present={present})",

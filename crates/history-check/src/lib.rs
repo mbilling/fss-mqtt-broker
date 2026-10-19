@@ -30,13 +30,16 @@
 //!    (a packet id is never reused while it is in flight, \[MQTT-2.2.1-4\]).
 //! 8. **Wills when owed, and only then** — a connection that ends without a
 //!    normal DISCONNECT has its Will published once, after its Will Delay or when
-//!    its session ends, whichever is first, to every subscriber of its topic; a
-//!    normal DISCONNECT, or a resume inside the delay, means no Will at all
-//!    (\[MQTT-3.1.2-8\], MQTT 5 §3.1.2.5, §3.1.3.2.2, §3.1.4).
-//! 9. **Session expiry** — check 2 also honours Clean Start and the Session Expiry
-//!    Interval, including a new one sent with DISCONNECT (MQTT 5 §3.1.2.11, §3.14.2.2.2).
+//!    its session ends, whichever is first, to every subscriber of its topic that
+//!    is owed it; a normal DISCONNECT, or a resume inside the delay, means no Will
+//!    at all (\[MQTT-3.1.2-8\], MQTT 5 §3.1.2.5, §3.1.3.2.2, §3.1.4).
 //!
-//! Checks 6 to 9 judge what the recorder gives them: a history without `QoS` 2
+//! Check 2 also honours Clean Start and the Session Expiry Interval, a new one sent
+//! with DISCONNECT included (MQTT 5 §3.1.2.11, §3.14.2.2.2), and a takeover of a
+//! session whose expiry is 0, which ends it. Checks 2 and 8 read the same timeline
+//! of each client's connections ([`spans`]).
+//!
+//! Checks 6 to 8 judge what the recorder gives them: a history without `QoS` 2
 //! deliveries, Wills, DISCONNECTs or expiries keeps them trivially.
 //!
 //! A violation names the events that prove it; the harness prints the offending
@@ -73,6 +76,13 @@ pub enum Event {
         /// The Will this connection set.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         will: Option<Will>,
+        /// The recorder's id for this connection, which its end names. Without ids,
+        /// the recorder must record a connection's end before the same client's next
+        /// CONNECT completes, except in a takeover, where it records no end at all:
+        /// an end recorded after the next CONNECT would be read as the end of the new
+        /// connection.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conn: Option<String>,
     },
     /// The client sent DISCONNECT: reason 0 deletes its Will; MQTT 5's 0x04 asks for
     /// it all the same. An MQTT 5 DISCONNECT may set a new session expiry.
@@ -83,6 +93,9 @@ pub enum Event {
         reason: u8,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_expiry_s: Option<u32>,
+        /// The connection that ended (see `Connect::conn`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conn: Option<String>,
     },
     /// The client's connection ended without it sending DISCONNECT: it dropped the
     /// socket or went silent, its node was killed, its link was cut, or the broker
@@ -91,6 +104,11 @@ pub enum Event {
         at_ms: u64,
         client: String,
         why: String,
+        /// The connection that ended (see `Connect::conn`). A takeover is recorded
+        /// by the next `Connect` alone; a `ConnectionLost` naming the taken-over
+        /// connection is then ignored.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conn: Option<String>,
     },
     /// The test client caught the broker breaking the protocol: a packet id reused
     /// while in flight, an acknowledgement for nothing, a malformed packet.
@@ -128,7 +146,9 @@ pub enum Event {
     /// A `QoS` 2 message is recorded when the client hands it to its application,
     /// once per packet id until the PUBREL: a re-sent PUBLISH of an id the client
     /// still holds is the same message, as a real client sees it, and is not
-    /// recorded again (check 6 counts application deliveries).
+    /// recorded again (check 6 counts application deliveries). The client keeps
+    /// those ids across reconnects of the same session, since the broker may
+    /// re-send them on the next connection.
     ///
     /// **Every** delivery is recorded, including repeats of a payload the same
     /// subscriber already saw. That is deliberate and load-bearing: the recorder
@@ -173,6 +193,9 @@ pub enum Event {
 pub struct Will {
     pub topic: String,
     pub payload: String,
+    /// The Will's `QoS`: a `QoS` 0 Will is not kept for an offline subscriber, and a
+    /// `QoS` 2 one is delivered exactly once.
+    pub qos: u8,
     /// MQTT 5 Will Delay Interval, in seconds; 0 in 3.1.1.
     #[serde(default)]
     pub delay_s: u32,
@@ -303,25 +326,49 @@ fn check_acked_durability(events: &[Event]) -> Vec<Violation> {
     v
 }
 
-/// Check 2: session-present honesty from the client's chair.
-///
-/// A session exists from its first CONNECT until Clean Start discards it or its
-/// expiry interval runs out after its connection ends. A CONNECT that does not
-/// start clean must answer `session_present = true` while it exists and `false`
-/// once it is gone. Histories without the expiry fields read as before: every
-/// session, once established, lasts forever. An expiry boundary closer than
-/// [`TIMING_TOLERANCE_MS`] to the reconnect is not judged.
-fn check_session_present(events: &[Event]) -> Vec<Violation> {
-    #[derive(Default)]
-    struct Session {
-        established: bool,
-        ended_at: Option<u64>,
-        expiry_s: Option<u32>,
+/// How a recorded connection ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndKind {
+    /// DISCONNECT 0x00: the Will is deleted.
+    Normal,
+    /// DISCONNECT with another reason (0x04 asks for the Will), or a lost connection.
+    Abnormal,
+    /// The same client connected again before an end was recorded.
+    TakenOver,
+}
+
+/// One connection of one client, as the history recorded it.
+struct Span<'a> {
+    client: &'a str,
+    at: u64,
+    via_node: &'a str,
+    present: bool,
+    clean: bool,
+    expiry_s: Option<u32>,
+    will: Option<&'a Will>,
+    conn: Option<&'a str>,
+    /// When and how it ended, and an expiry its DISCONNECT set.
+    end: Option<(u64, EndKind, Option<u32>)>,
+}
+
+impl Span<'_> {
+    /// The session's expiry after this connection, a DISCONNECT's override applied.
+    fn expiry_after(&self) -> Option<u32> {
+        match self.end {
+            Some((_, _, Some(exp))) => Some(exp),
+            _ => self.expiry_s,
+        }
     }
-    let mut sessions: BTreeMap<&str, Session> = BTreeMap::new();
-    let mut v = Vec::new();
+}
+
+/// Every client's connections in order. An end applies to the client's open
+/// connection, unless it names a different one (`conn`), which is a stale end of an
+/// earlier connection, taken over already, and is ignored.
+fn spans(events: &[Event]) -> Vec<Span<'_>> {
+    let mut out: Vec<Span> = Vec::new();
+    let mut open: BTreeMap<&str, usize> = BTreeMap::new();
     for ev in events {
-        match ev {
+        let (at, client, kind, exp, conn) = match ev {
             Event::Connect {
                 at_ms,
                 client,
@@ -329,70 +376,131 @@ fn check_session_present(events: &[Event]) -> Vec<Violation> {
                 session_present,
                 clean_start,
                 session_expiry_s,
-                ..
+                will,
+                conn,
             } => {
-                let s = sessions.entry(client).or_default();
-                let expected = if clean_start.unwrap_or(false) || !s.established {
-                    Some(false)
-                } else {
-                    match (s.ended_at, s.expiry_s) {
-                        (Some(_), Some(0)) => Some(false),
-                        (Some(end), Some(exp)) => {
-                            let gone = end + u64::from(exp) * 1_000;
-                            if *at_ms > gone + TIMING_TOLERANCE_MS {
-                                Some(false)
-                            } else if *at_ms + TIMING_TOLERANCE_MS < gone {
-                                Some(true)
-                            } else {
-                                None // too close to the expiry to judge
-                            }
-                        }
-                        _ => Some(true),
-                    }
-                };
-                if let Some(expected) = expected {
-                    if *session_present != expected {
-                        v.push(Violation {
-                            check: "session-present",
-                            detail: format!(
-                                "{client} connected via {via_node} at t+{at_ms}ms \
-                                 (clean start {}): session_present was {session_present}, \
-                                 but the session {}",
-                                clean_start.unwrap_or(false),
-                                if expected {
-                                    "existed: established before and not expired"
-                                } else if s.established {
-                                    "was gone: discarded by clean start, or expired"
-                                } else {
-                                    "was NEVER established before"
-                                }
-                            ),
-                        });
-                    }
+                if let Some(i) = open.remove(client.as_str()) {
+                    out[i].end = Some((*at_ms, EndKind::TakenOver, None));
                 }
-                *s = Session {
-                    established: true,
-                    ended_at: None,
+                open.insert(client, out.len());
+                out.push(Span {
+                    client,
+                    at: *at_ms,
+                    via_node,
+                    present: *session_present,
+                    clean: clean_start.unwrap_or(false),
                     expiry_s: *session_expiry_s,
-                };
+                    will: will.as_ref(),
+                    conn: conn.as_deref(),
+                    end: None,
+                });
+                continue;
             }
             Event::Disconnect {
                 at_ms,
                 client,
+                reason,
                 session_expiry_s,
-                ..
+                conn,
             } => {
-                let s = sessions.entry(client).or_default();
-                s.ended_at = Some(*at_ms);
-                if session_expiry_s.is_some() {
-                    s.expiry_s = *session_expiry_s;
-                }
+                let kind = if *reason == 0 {
+                    EndKind::Normal
+                } else {
+                    EndKind::Abnormal
+                };
+                (*at_ms, client, kind, *session_expiry_s, conn)
             }
-            Event::ConnectionLost { at_ms, client, .. } => {
-                sessions.entry(client).or_default().ended_at = Some(*at_ms);
-            }
-            _ => {}
+            Event::ConnectionLost {
+                at_ms,
+                client,
+                conn,
+                ..
+            } => (*at_ms, client, EndKind::Abnormal, None, conn),
+            _ => continue,
+        };
+        let Some(&i) = open.get(client.as_str()) else {
+            continue;
+        };
+        if conn.is_some() && conn.as_deref() != out[i].conn {
+            continue; // the end of an earlier connection
         }
+        open.remove(client.as_str());
+        out[i].end = Some((at, kind, exp));
+    }
+    out
+}
+
+/// Whether a session that followed `prev` still existed at `at`: `Some(answer)`, or
+/// `None` when `at` is within [`TIMING_TOLERANCE_MS`] of its expiry.
+fn session_exists(prev: &Span, at: u64) -> Option<bool> {
+    let Some((end, kind, _)) = prev.end else {
+        return Some(true); // still connected
+    };
+    let exp = prev.expiry_after();
+    if kind == EndKind::TakenOver {
+        return Some(exp != Some(0)); // a takeover ends a session of expiry 0 (§3.1.4)
+    }
+    match exp {
+        None => Some(true),
+        Some(0) => Some(false),
+        Some(exp) => {
+            let gone = end + u64::from(exp) * 1_000;
+            if at > gone + TIMING_TOLERANCE_MS {
+                Some(false)
+            } else if at + TIMING_TOLERANCE_MS < gone {
+                Some(true)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Check 2: session-present honesty from the client's chair.
+///
+/// A session exists from its first CONNECT until Clean Start discards it, a
+/// takeover ends it (expiry 0), or its expiry interval runs out after its
+/// connection ends. A CONNECT that does not start clean must answer
+/// `session_present = true` while it exists and `false` once it is gone.
+/// Histories without the expiry fields read as before: every session, once
+/// established, lasts forever.
+fn check_session_present(events: &[Event]) -> Vec<Violation> {
+    let all = spans(events);
+    let mut last: BTreeMap<&str, &Span> = BTreeMap::new();
+    let mut v = Vec::new();
+    for span in &all {
+        let expected = if span.clean {
+            Some(false)
+        } else {
+            match last.get(span.client) {
+                None => Some(false),
+                Some(prev) => session_exists(prev, span.at),
+            }
+        };
+        if let Some(expected) = expected {
+            if span.present != expected {
+                v.push(Violation {
+                    check: "session-present",
+                    detail: format!(
+                        "{} connected via {} at t+{}ms (clean start {}): session_present \
+                         was {}, but the session {}",
+                        span.client,
+                        span.via_node,
+                        span.at,
+                        span.clean,
+                        span.present,
+                        if expected {
+                            "existed: established before and not expired"
+                        } else if last.contains_key(span.client) {
+                            "was gone: discarded by clean start, ended, or expired"
+                        } else {
+                            "was NEVER established before"
+                        }
+                    ),
+                });
+            }
+        }
+        last.insert(span.client, span);
     }
     v
 }
@@ -598,7 +706,9 @@ fn check_protocol(events: &[Event]) -> Vec<Violation> {
         .collect()
 }
 
-/// Whether an MQTT topic filter matches a topic (`+` one level, `#` the rest).
+/// Whether an MQTT topic filter matches a topic (`+` one level, `#` the rest). It
+/// does not keep `$`-topics from wildcards or know `$share/`; the recorder uses
+/// neither for Wills.
 fn filter_matches(filter: &str, topic: &str) -> bool {
     let mut f = filter.split('/');
     let mut t = topic.split('/');
@@ -628,11 +738,14 @@ fn filter_matches(filter: &str, topic: &str) -> bool {
 ///   (the note in MQTT 5 §3.1.4).
 ///
 /// An owed Will must reach every client subscribed to a matching filter before it
-/// was due, not more than [`TIMING_TOLERANCE_MS`] early, and only once (a repeat
-/// marked DUP is at-least-once legal). One that is not owed must reach no one. A
-/// Will due within [`TIMING_TOLERANCE_MS`] of the history's end is not judged.
+/// was due that is owed it: one online then, or one whose session still existed
+/// for a Will of `QoS` 1 or 2. It must not arrive more than [`TIMING_TOLERANCE_MS`]
+/// early, nor more than [`WILL_LATE_MS`] late to a subscriber online when it was
+/// due, and only once (below `QoS` 2 a repeat marked DUP is legal). One that is not
+/// owed must reach no one. A Will due too close to the history's end is not judged.
 fn check_wills(events: &[Event]) -> Vec<Violation> {
-    judge_wills(events, &will_verdicts(events))
+    let all = spans(events);
+    judge_wills(events, &all, &will_verdicts(&all))
 }
 
 /// Each Will's verdict: owed from an instant, or not owed and why.
@@ -648,113 +761,97 @@ fn due_after(end: u64, delay_s: u32, expiry_s: Option<u32>) -> u64 {
     }
 }
 
+/// How late an owed Will may reach a subscriber that was online when it was due.
+pub const WILL_LATE_MS: u64 = 5_000;
+
 /// Check 8's first half: what each connection's end owes (see [`check_wills`]).
-fn will_verdicts(events: &[Event]) -> Vec<WillVerdict<'_>> {
-    struct Open<'a> {
-        will: Option<&'a Will>,
-        expiry_s: Option<u32>,
-    }
-    let mut verdicts: Vec<WillVerdict> = Vec::new();
-    let mut open: BTreeMap<&str, Open> = BTreeMap::new();
-    // A connection whose end owes its Will later, unless a reconnect cancels it.
-    let mut pending: BTreeMap<&str, (&Will, u64, u64)> = BTreeMap::new(); // will, ended, due
-    for ev in events {
-        match ev {
-            Event::Connect {
-                at_ms,
-                client,
-                clean_start,
-                session_expiry_s,
-                will,
-                ..
-            } => {
-                let clean = clean_start.unwrap_or(false);
-                // A takeover: the previous connection never recorded its end.
-                if let Some(prev) = open.remove(client.as_str()) {
-                    if let Some(w) = prev.will {
-                        if w.delay_s == 0 || clean || prev.expiry_s == Some(0) {
-                            verdicts.push((w, Ok(*at_ms)));
-                        } else {
-                            verdicts.push((
-                                w,
-                                Err(format!(
-                                    "taken over at t+{at_ms}ms inside its {} s Will Delay \
-                                 by a connection that resumed the session",
-                                    w.delay_s
-                                )),
-                            ));
-                        }
-                    }
-                }
-                // A reconnect after an end that owes a Will later.
-                if let Some((w, ended, due)) = pending.remove(client.as_str()) {
-                    if *at_ms >= due {
-                        verdicts.push((w, Ok(due)));
-                    } else if clean {
-                        verdicts.push((w, Ok(*at_ms)));
-                    } else {
-                        verdicts.push((
-                            w,
-                            Err(format!(
-                                "its connection ended at t+{ended}ms and the client resumed \
-                             the session at t+{at_ms}ms, before the Will was due"
-                            )),
-                        ));
-                    }
-                }
-                open.insert(
-                    client,
-                    Open {
-                        will: will.as_ref(),
-                        expiry_s: *session_expiry_s,
-                    },
-                );
-            }
-            Event::Disconnect {
-                at_ms,
-                client,
-                reason,
-                session_expiry_s,
-            } => {
-                let Some(prev) = open.remove(client.as_str()) else {
-                    continue;
-                };
-                let Some(w) = prev.will else { continue };
-                if *reason == 0 {
-                    verdicts.push((
-                        w,
-                        Err(format!(
-                            "the client sent DISCONNECT 0x00 at t+{at_ms}ms, which deletes it"
-                        )),
-                    ));
+fn will_verdicts<'a>(all: &[Span<'a>]) -> Vec<WillVerdict<'a>> {
+    let mut v = Vec::new();
+    for (i, span) in all.iter().enumerate() {
+        let (Some(w), Some((end, kind, _))) = (span.will, span.end) else {
+            continue; // no Will, or still connected when the history ended
+        };
+        let next = all[i + 1..].iter().find(|n| n.client == span.client);
+        let verdict = match kind {
+            EndKind::Normal => Err(format!(
+                "the client sent DISCONNECT 0x00 at t+{end}ms, which deletes it"
+            )),
+            EndKind::TakenOver => {
+                let clean = next.is_some_and(|n| n.clean);
+                if w.delay_s == 0 || clean || span.expiry_after() == Some(0) {
+                    Ok(end)
                 } else {
-                    let expiry = session_expiry_s.or(prev.expiry_s);
-                    pending.insert(client, (w, *at_ms, due_after(*at_ms, w.delay_s, expiry)));
+                    Err(format!(
+                        "taken over at t+{end}ms inside its {} s Will Delay by a \
+                         connection that resumed the session",
+                        w.delay_s
+                    ))
                 }
             }
-            Event::ConnectionLost { at_ms, client, .. } => {
-                let Some(prev) = open.remove(client.as_str()) else {
-                    continue;
-                };
-                if let Some(w) = prev.will {
-                    pending.insert(
-                        client,
-                        (w, *at_ms, due_after(*at_ms, w.delay_s, prev.expiry_s)),
-                    );
+            EndKind::Abnormal => {
+                let due = due_after(end, w.delay_s, span.expiry_after());
+                match next {
+                    Some(n) if n.at < due && n.clean => Ok(n.at),
+                    Some(n) if n.at < due => Err(format!(
+                        "its connection ended at t+{end}ms and the client resumed the \
+                         session at t+{}ms, before the Will was due",
+                        n.at
+                    )),
+                    _ => Ok(due),
                 }
             }
-            _ => {}
-        }
+        };
+        v.push((w, verdict));
     }
-    // Ends no reconnect cancelled: owed at their due time.
-    for (w, _, due) in pending.values() {
-        verdicts.push((w, Ok(*due)));
+    v
+}
+
+/// Whether `client` is owed a Will due at `due`, and whether it was online then.
+/// A client the history never connects (a watcher recorded only by its
+/// subscription) is online throughout.
+fn watcher_at(all: &[Span], client: &str, due: u64, qos: u8) -> (bool, bool) {
+    let mine: Vec<&Span> = all.iter().filter(|s| s.client == client).collect();
+    if mine.is_empty() {
+        return (true, true);
     }
-    verdicts
+    let online = mine
+        .iter()
+        .any(|s| s.at <= due && s.end.is_none_or(|(end, _, _)| end > due));
+    let session = online
+        || mine
+            .iter()
+            .rfind(|s| s.at <= due)
+            .is_some_and(|prev| session_exists(prev, due) != Some(false));
+    (online || (session && qos > 0), online)
+}
+
+/// The subscribers of a matching filter granted before `due`, less those a later
+/// clean start discarded.
+fn watchers_of<'a>(
+    granted: &[(&'a str, &str, u64)],
+    all: &[Span],
+    w: &Will,
+    due: u64,
+) -> Vec<&'a str> {
+    let mut watchers: Vec<&str> = granted
+        .iter()
+        .filter(|(c, f, at)| {
+            let cleaned = all
+                .iter()
+                .filter(|s| s.client == *c && s.clean && s.at <= due)
+                .map(|s| s.at)
+                .max();
+            *at <= due && cleaned.is_none_or(|c| *at >= c) && filter_matches(f, &w.topic)
+        })
+        .map(|(c, _, _)| *c)
+        .collect();
+    watchers.sort_unstable();
+    watchers.dedup();
+    watchers
 }
 
 /// Check 8's second half: whether what arrived matches the verdicts.
-fn judge_wills(events: &[Event], verdicts: &[WillVerdict]) -> Vec<Violation> {
+fn judge_wills(events: &[Event], all: &[Span], verdicts: &[WillVerdict]) -> Vec<Violation> {
     let end_of_history = events.iter().map(Event::at).max().unwrap_or(0);
     let mut granted: Vec<(&str, &str, u64)> = Vec::new();
     let mut delivered: BTreeMap<&str, Vec<(&str, u64, bool)>> = BTreeMap::new();
@@ -779,71 +876,67 @@ fn judge_wills(events: &[Event], verdicts: &[WillVerdict]) -> Vec<Violation> {
         }
     }
     let mut v = Vec::new();
+    let mut say = |w: &Will, detail: String| {
+        v.push(Violation {
+            check: "will",
+            detail: format!("Will {:?} on {}: {detail}", w.payload, w.topic),
+        });
+    };
     for (w, verdict) in verdicts {
         let got = delivered
             .get(w.payload.as_str())
             .map_or(&[][..], Vec::as_slice);
-        match verdict.clone() {
+        let due = match verdict {
             Err(why) => {
                 if let Some((client, at, _)) = got.first() {
-                    v.push(Violation {
-                        check: "will",
-                        detail: format!(
-                            "Will {:?} on {} reached {client} at t+{at}ms, but was not \
-                             owed: {why}",
-                            w.payload, w.topic
-                        ),
-                    });
+                    say(
+                        w,
+                        format!("reached {client} at t+{at}ms, but was not owed: {why}"),
+                    );
                 }
+                continue;
             }
-            Ok(due) => {
-                if due + TIMING_TOLERANCE_MS > end_of_history {
-                    continue; // the history ended before it could be judged
-                }
-                let mut watchers: Vec<&str> = granted
-                    .iter()
-                    .filter(|(_, f, at)| *at <= due && filter_matches(f, &w.topic))
-                    .map(|(c, _, _)| *c)
-                    .collect();
-                watchers.sort_unstable();
-                watchers.dedup();
-                for watcher in watchers {
-                    let mine: Vec<&(&str, u64, bool)> =
-                        got.iter().filter(|(c, _, _)| *c == watcher).collect();
-                    let first = mine.iter().map(|(_, at, _)| *at).min();
-                    match first {
-                        None => v.push(Violation {
-                            check: "will",
-                            detail: format!(
-                                "Will {:?} on {} was owed from t+{due}ms, but never reached \
-                                 {watcher}, subscribed to it",
-                                w.payload, w.topic
-                            ),
-                        }),
-                        Some(at) if at + TIMING_TOLERANCE_MS < due => v.push(Violation {
-                            check: "will",
-                            detail: format!(
-                                "Will {:?} on {} reached {watcher} at t+{at}ms, before it \
-                                 was due at t+{due}ms (its Will Delay or session expiry \
-                                 was not honoured)",
-                                w.payload, w.topic
-                            ),
-                        }),
-                        Some(_) => {}
-                    }
-                    if mine.iter().filter(|(_, _, dup)| !dup).count() > 1 {
-                        v.push(Violation {
-                            check: "will",
-                            detail: format!(
-                                "Will {:?} on {} reached {watcher} {} times unmarked: it is \
-                                 published once",
-                                w.payload,
-                                w.topic,
-                                mine.iter().filter(|(_, _, dup)| !dup).count()
-                            ),
-                        });
-                    }
-                }
+            Ok(due) => *due,
+        };
+        if due + WILL_LATE_MS + TIMING_TOLERANCE_MS > end_of_history {
+            continue; // the history ended before it could be judged
+        }
+        for watcher in watchers_of(&granted, all, w, due) {
+            let (owed, online) = watcher_at(all, watcher, due, w.qos);
+            if !owed {
+                continue; // offline with no session, or a QoS 0 Will
+            }
+            let mine: Vec<&(&str, u64, bool)> =
+                got.iter().filter(|(c, _, _)| *c == watcher).collect();
+            match mine.iter().map(|(_, at, _)| *at).min() {
+                None => say(
+                    w,
+                    format!("owed from t+{due}ms, but never reached {watcher}"),
+                ),
+                Some(at) if at + TIMING_TOLERANCE_MS < due => say(
+                    w,
+                    format!(
+                        "reached {watcher} at t+{at}ms, before it was due at t+{due}ms \
+                         (its Will Delay or session expiry was not honoured)"
+                    ),
+                ),
+                Some(at) if online && at > due + WILL_LATE_MS + TIMING_TOLERANCE_MS => say(
+                    w,
+                    format!(
+                        "reached {watcher}, online, at t+{at}ms, more than {} s after it \
+                         was due at t+{due}ms",
+                        WILL_LATE_MS / 1_000
+                    ),
+                ),
+                Some(_) => {}
+            }
+            // At QoS 2 a repeat is a repeat; below, one marked DUP is legal.
+            let copies = mine.iter().filter(|(_, _, dup)| w.qos == 2 || !dup).count();
+            if copies > 1 {
+                say(
+                    w,
+                    format!("reached {watcher} {copies} times: it is published once"),
+                );
             }
         }
     }
@@ -919,6 +1012,7 @@ mod tests {
                 clean_start: None,
                 session_expiry_s: None,
                 will: None,
+                conn: None,
             },
             Event::Subscribe {
                 at_ms: 2,
@@ -953,6 +1047,7 @@ mod tests {
                 clean_start: None,
                 session_expiry_s: None,
                 will: None,
+                conn: None,
             },
             Event::RetainedSet {
                 at_ms: 30,
@@ -1019,6 +1114,7 @@ mod tests {
             clean_start: None,
             session_expiry_s: None,
             will: None,
+            conn: None,
         });
         assert!(check(&h).iter().any(|v| v.check == "session-present"));
 
@@ -1201,6 +1297,7 @@ mod tests {
             clean_start: Some(false),
             session_expiry_s: Some(60),
             will: None,
+            conn: None,
         }
     }
 
@@ -1212,6 +1309,7 @@ mod tests {
             session_present,
             clean_start,
             session_expiry_s,
+            conn,
             ..
         } = ev
         else {
@@ -1222,6 +1320,7 @@ mod tests {
             will: Some(Will {
                 topic: format!("wills/{client}"),
                 payload: payload.into(),
+                qos: 1,
                 delay_s,
             }),
             client,
@@ -1229,6 +1328,7 @@ mod tests {
             session_present,
             clean_start,
             session_expiry_s,
+            conn,
         }
     }
 
@@ -1248,6 +1348,7 @@ mod tests {
             at_ms,
             client: client.into(),
             why: "node killed".into(),
+            conn: None,
         }
     }
 
@@ -1312,7 +1413,7 @@ mod tests {
         // Lost connection, no delay: owed at once, never arrives.
         let h = will_history(
             vec![with_will(connect(1, "c", false), "w1", 0), lost(100, "c")],
-            5_000,
+            10_000,
         );
         assert_eq!(checks_of(&h), ["will"], "a missing Will is caught");
         // Arrives twice, unmarked.
@@ -1323,7 +1424,7 @@ mod tests {
                 will_seen(150, "w1", false),
                 will_seen(160, "w1", false),
             ],
-            5_000,
+            10_000,
         );
         assert_eq!(checks_of(&h), ["will"], "a Will published twice is caught");
         // A 10 s Will Delay ignored.
@@ -1349,10 +1450,11 @@ mod tests {
                     client: "c".into(),
                     reason: 0,
                     session_expiry_s: None,
+                    conn: None,
                 },
                 will_seen(150, "w1", false),
             ],
-            5_000,
+            10_000,
         );
         assert_eq!(checks_of(&h), ["will"]);
         // Resumed inside a 5 s delay.
@@ -1389,6 +1491,7 @@ mod tests {
             client: "c".into(),
             reason: 0x04,
             session_expiry_s: None,
+            conn: None,
         };
         let mut clean = connect(1_000, "c", false);
         if let Event::Connect { clean_start, .. } = &mut clean {
@@ -1478,6 +1581,7 @@ mod tests {
             client: "c".into(),
             reason: 0,
             session_expiry_s,
+            conn: None,
         };
         // Expiry 0 set at DISCONNECT replaces the CONNECT's 60 s: the session is gone.
         let h = vec![
@@ -1552,6 +1656,114 @@ mod tests {
             serde_json::to_string(&events[0]).unwrap(),
             old,
             "and writes back unchanged"
+        );
+    }
+
+    fn qos_will(mut ev: Event, qos: u8) -> Event {
+        if let Event::Connect { will: Some(w), .. } = &mut ev {
+            w.qos = qos;
+        }
+        ev
+    }
+
+    fn expiry(mut ev: Event, exp: u32) -> Event {
+        if let Event::Connect {
+            session_expiry_s, ..
+        } = &mut ev
+        {
+            *session_expiry_s = Some(exp);
+        }
+        ev
+    }
+
+    fn conn_id(mut ev: Event, id: &str) -> Event {
+        match &mut ev {
+            Event::Connect { conn, .. } | Event::ConnectionLost { conn, .. } => {
+                *conn = Some(id.into());
+            }
+            _ => {}
+        }
+        ev
+    }
+
+    #[test]
+    fn a_takeover_of_an_expiry_0_session_ends_it_for_both_checks() {
+        let h = will_history(
+            vec![
+                with_will(expiry(connect(1, "c", false), 0), "w1", 8),
+                connect(200, "c", false),
+                will_seen(250, "w1", false),
+            ],
+            20_000,
+        );
+        assert!(check(&h).is_empty(), "{:?}", check(&h));
+        let mut h = h;
+        h[2] = connect(200, "c", true);
+        assert_eq!(checks_of(&h), ["session-present"]);
+    }
+
+    #[test]
+    fn a_late_recorded_end_of_a_taken_over_connection_is_ignored() {
+        let h = will_history(
+            vec![
+                conn_id(with_will(connect(1, "c", false), "w1", 8), "c#1"),
+                conn_id(connect(200, "c", true), "c#2"),
+                conn_id(lost(220, "c"), "c#1"),
+                connect(30_000, "c", true),
+            ],
+            40_000,
+        );
+        assert!(check(&h).is_empty(), "{:?}", check(&h));
+    }
+
+    #[test]
+    fn who_is_owed_a_will_and_how_late_it_may_be() {
+        let watcher_away = |qos, exp| {
+            will_history(
+                vec![
+                    expiry(connect(1, "w", false), exp),
+                    lost(50, "w"),
+                    qos_will(with_will(connect(1, "c", false), "w1", 0), qos),
+                    lost(100, "c"),
+                ],
+                30_000,
+            )
+        };
+        assert!(
+            check(&watcher_away(0, 600)).is_empty(),
+            "a QoS 0 Will skips an offline subscriber"
+        );
+        assert!(
+            check(&watcher_away(1, 0)).is_empty(),
+            "a subscriber with no session is owed nothing"
+        );
+        assert_eq!(
+            checks_of(&watcher_away(1, 600)),
+            ["will"],
+            "an offline session keeps a QoS 1 Will"
+        );
+        let h = will_history(
+            vec![
+                with_will(connect(1, "c", false), "w1", 2),
+                lost(100, "c"),
+                will_seen(60_000, "w1", false),
+            ],
+            70_000,
+        );
+        assert_eq!(checks_of(&h), ["will"], "a Will a minute late is caught");
+        let h = will_history(
+            vec![
+                qos_will(with_will(connect(1, "c", false), "w1", 0), 2),
+                lost(100, "c"),
+                will_seen(150, "w1", false),
+                will_seen(900, "w1", true),
+            ],
+            10_000,
+        );
+        assert_eq!(
+            checks_of(&h),
+            ["will"],
+            "DUP does not excuse a QoS 2 Will repeat"
         );
     }
 }
