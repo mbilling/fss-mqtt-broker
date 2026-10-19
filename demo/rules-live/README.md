@@ -17,6 +17,12 @@ the rules while it runs ([ADR 0084](../../docs/adr/0084-watching-and-editing-rul
 - **Will scenarios** ([`feeds/wills.py`](feeds/wills.py)): sixteen ways for an MQTT 3.1.1
   or 5 connection to end, each [Will checked against the spec](#wills-checked-against-mqtt),
   a round every two minutes.
+- **Every payload format** an MQTT explorer such as
+  [fss-mqtt](https://github.com/mbilling/fss-mqtt) decodes, [one retained topic
+  each](#every-payload-format-one-topic-each) under `formats/`: Parquet, SQLite, Avro, Arrow,
+  MessagePack, CBOR, Protobuf and the rest.
+- **[Sparkplug B](#sparkplug-b)** edge nodes on the wind farm and the solar park, with a
+  primary host application, playing the whole lifecycle on `spBv1.0/`.
 - **A rule editor** at <http://localhost:8070>: the rules with their live counts, each
   rule's trace, the live messages, and an editor that checks, tests and applies a rule
   through the broker's admin API, then shows the new rules arriving on `$SYS`.
@@ -60,6 +66,8 @@ Subscribe to those by name:
 | `alerts/#`, `kpi/#`, `normalized/#`, `analytics/#`, `state/#`, `events/#` | What the rules derive: the six roots of [the demo's rules](../rules/README.md#where-the-results-go) | `mosquitto_sub -v -t 'alerts/#' -t 'kpi/#' -t 'state/#'` |
 | `plant/#`, `home/#`, `vehicle/#` | What the devices publish | `mosquitto_sub -v -t 'vehicle/#'` |
 | `wills/#` | The Will scenarios' Wills and their verdicts | `mosquitto_sub -v -t 'wills/+/result'` |
+| `formats/#` | One retained message per payload format | `mosquitto_sub -v -t 'formats/json' -t 'formats/csv'` |
+| `spBv1.0/#` | Sparkplug B births, data, commands, deaths and the host's STATE | `mosquitto_sub -v -t 'spBv1.0/STATE/#' -t 'spBv1.0/+/NDEATH/#'` |
 
 The turbines' fast logs are binary (next section), so `-v` on `plant/#` prints half a
 megabyte of Parquet a minute per turbine. Leave them out with `-T 'plant/+/+/fastlog'`.
@@ -229,6 +237,91 @@ python3 -c "import pyarrow.parquet as pq; t = pq.read_table('wtg01.parquet'); pr
 
 (DuckDB and pyarrow are not part of the stack: `pip install duckdb pyarrow` in a virtual
 environment of your own.)
+
+## Every payload format, one topic each
+
+`sim-formats` ([`feeds/formats.py`](feeds/formats.py)) publishes, every minute, one message
+in each format an MQTT explorer meets in the field, about the same plants and homes. Each
+is retained under `formats/`, so a client that subscribes to `formats/#` gets one of each at
+once. Each carries an MQTT 5 content type and payload format indicator, at QoS 1. The
+formats are written with the standard library ([`feeds/binfmt.py`](feeds/binfmt.py),
+[`feeds/arrow.py`](feeds/arrow.py) and the simulators'
+[`sim/parquet.py`](../rules/sim/parquet.py)).
+
+| Topic | Content type | What |
+|---|---|---|
+| `formats/json` | `application/json` | wf-falster's status: power, wind, grid, every turbine |
+| `formats/jsonl` | `application/jsonl` | ten grid-frequency readings, a JSON document a line |
+| `formats/xml` | `application/xml` | a production schedule for the next four hours, quarter-hourly |
+| `formats/csv` | `text/csv` | yesterday's production per turbine |
+| `formats/csv-semicolon` | `text/csv; charset=utf-8` | a Danish meter export: semicolons, decimal commas, `Forbrug (kWh)` |
+| `formats/tsv` | `text/tab-separated-values` | pv-lolland's inverter strings |
+| `formats/psv` | `text/plain` | a SCADA alarm list, pipe-delimited, for the explorer to recognise |
+| `formats/text` | `text/plain` | one status line |
+| `formats/parquet` | `application/vnd.apache.parquet` | 24 hours of hourly energy per turbine: 144 rows, two row groups, GZIP, nullable columns, strings, booleans |
+| `formats/parquet-zstd` | `application/vnd.apache.parquet` | a day of quarter-hour meter readings for four homes, ZSTD |
+| `formats/avro` | `application/avro` | the turbines' event log, an Avro container file, deflate |
+| `formats/avro-zstd` | `application/avro` | EV charging sessions, zstandard |
+| `formats/avro-registry` | `application/vnd.confluent.avro` | one event in schema-registry framing (schema id 42): the schema is not in the payload |
+| `formats/avro-single-object` | `application/avro` | one event in Avro's single-object encoding, with the schema's fingerprint |
+| `formats/arrow` | `application/vnd.apache.arrow.file` | 2 s of 50 Hz vibration on three drivetrain sensors, an Arrow IPC file: a dictionary-encoded column, ZSTD buffers |
+| `formats/arrow-stream` | `application/vnd.apache.arrow.stream` | pk-koge's one-second samples for a minute, an Arrow IPC stream |
+| `formats/sqlite` | `application/vnd.sqlite3` | the wind farm's configuration as a SQLite database file: three tables, an index, a view, a trigger |
+| `formats/sqlite-changeset` | `application/x-sqlite-changeset` | the setpoint changes of the last ten minutes, as a SQLite session changeset |
+| `formats/sqlite-patchset` | `application/x-sqlite-patchset` | the same changes as a patchset |
+| `formats/msgpack` | `application/msgpack` | a turbine's state |
+| `formats/cbor` | `application/cbor` | a vibration summary, with a tagged epoch time and a byte string |
+| `formats/protobuf` | `application/x-protobuf` | a telemetry reading, without its schema (the schema is in `formats.py`) |
+| `formats/grpc` | `application/grpc` | the same reading in a gRPC frame |
+| `formats/gzip` | `application/gzip` | the three plants' summary, JSON inside |
+| `formats/zstd` | `application/zstd` | the solar park's 5-minute data, a Parquet file inside (LZ4_RAW pages) |
+| `formats/binary` | `application/octet-stream` | a meter's Modbus holding registers, as read |
+| `formats/empty` | `application/octet-stream` | nothing: an empty payload (not retained, since an empty retained message deletes one) |
+
+The turbines' 0.53 MB fast logs ([above](#turbine-fast-log-parquet)) are the other Parquet
+files in the stack. To see one of a format with no client at hand:
+
+```sh
+python3 demo/rules-live/feeds/formats.py --list          # each topic, content type and size
+python3 demo/rules-live/feeds/formats.py --once --port 1883   # publish them all once
+```
+
+## Sparkplug B
+
+`sim-sparkplug` ([`feeds/sparkplug.py`](feeds/sparkplug.py)) plays [Eclipse
+Sparkplug](https://sparkplug.eclipse.org/) 3.0 on two edge nodes and a primary host
+application:
+
+| Who | Topics | |
+|---|---|---|
+| wf-falster's park power controller | `spBv1.0/wf-falster/{NBIRTH,NDATA,NDEATH,NCMD}/ppc`, and `{DBIRTH,DDATA,DDEATH,DCMD}/ppc/wtg01`..`wtg06` | a device per turbine |
+| pv-lolland's SCADA | `spBv1.0/pv-lolland/.../scada`, devices `inv01`, `inv02` | a device per inverter |
+| the host application `scada-host` | `spBv1.0/STATE/scada-host` | JSON `{"online":true,...}`, retained; its Will says `false` |
+
+Each edge node connects with its NDEATH as its MQTT Will, carrying the bdSeq of the NBIRTH
+that follows. The NBIRTH and a DBIRTH per device name every metric with its alias, data type
+and properties (engineering units, ranges). NDATA and DDATA then carry aliases only, by
+exception, every five seconds, with seq 0 to 255 throughout. The births carry every
+Sparkplug 3.0 data type: the signed and unsigned integers, Float, Double, Boolean, String,
+Text, UUID, DateTime, Bytes, File, every array type, a DataSet (the park's alarm table), a
+Template definition (`TurbineModel`) with an instance per turbine, and PropertySets.
+
+On a schedule:
+
+| Every | What happens |
+|---|---|
+| 3 min | the host writes a turbine's power limit (DCMD `Setpoint/Max Power`); the turbine reports it in its next DDATA |
+| 6 min | the alarm table goes out in an NDATA compressed the way Eclipse Tahu does it (uuid `SPBV1.0_COMPRESSED`, GZIP) |
+| 10 min | the host asks the park controller for a rebirth (NCMD `Node Control/Rebirth`): a new NBIRTH and DBIRTHs, seq from 0 |
+| 12 min | a turbine goes into service: DDEATH, and its DBIRTH a minute later |
+| 15 min | the solar SCADA loses power without a DISCONNECT, so the broker publishes its NDEATH from the Will; it is back 20 s later with the next bdSeq |
+| 20 min | the park controller restarts cleanly: it publishes its NDEATH itself, disconnects, and is back 10 s later |
+
+NDATA and DDATA name their metrics by alias only; the host's commands name theirs. A client
+that subscribes after a birth sees aliases until the next one, which the rebirth brings every
+ten minutes. fss-mqtt learns the names and types from the births it sees. The edge nodes do
+not wait for the host's STATE before their births, as a Sparkplug 3.0 edge node configured
+with a primary host would.
 
 ## Change a rule in the editor
 
@@ -419,11 +512,14 @@ For a real deployment, leave the trace off and `[rules] admin_writers` empty, an
 
 | File | What |
 |---|---|
-| [`compose.yaml`](compose.yaml) | The stack: `pki` and `rules-seed` (one-shot), `mqttd`, `sim-power`, `sim-homes`, `sim-cars`, `sim-wills`, `ui`, and `admin` (run on demand) |
+| [`compose.yaml`](compose.yaml) | The stack: `pki` and `rules-seed` (one-shot), `mqttd`, `sim-power`, `sim-formats`, `sim-sparkplug`, `sim-homes`, `sim-cars`, `sim-wills`, `ui`, and `admin` (run on demand) |
 | [`up.sh`](up.sh) | Preflight the ports, build, start, wait until healthy, print where to look |
 | [`pki/gen.sh`](pki/gen.sh) | The throwaway CA, the admin listener's certificate and the `CN=rules-ui` client certificate |
 | [`ui/server.py`](ui/server.py) | The editor's server, standard library only: the page, the admin API over mTLS, and MQTT as server-sent events |
 | [`ui/index.html`](ui/index.html), [`ui/app.js`](ui/app.js), [`ui/style.css`](ui/style.css) | The page, with no third-party code |
 | [`feeds/wills.py`](feeds/wills.py) | The Will scenarios, standard library only; its MQTT client is the simulators' [`sim/mqtt.py`](../rules/sim/mqtt.py) |
+| [`feeds/formats.py`](feeds/formats.py) | Every payload format, one retained topic each |
+| [`feeds/sparkplug.py`](feeds/sparkplug.py) | Sparkplug B edge nodes, devices and a host application |
+| [`feeds/binfmt.py`](feeds/binfmt.py), [`feeds/arrow.py`](feeds/arrow.py) | MessagePack, CBOR, Protobuf, Avro, SQLite changeset and Arrow IPC writers, standard library only |
 
 The simulators and the rules are [`demo/rules`](../rules/README.md)'s, mounted read-only.
