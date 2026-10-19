@@ -3088,7 +3088,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_node_exports_its_certificates_time_to_expiry_and_follows_a_rotation`
 - `the_offline_checks_apply_the_same_threshold_and_say_so`
 
-## `crates/mqttd/tests/v5_protocol.rs` — 27 test(s)
+## `crates/mqttd/tests/v5_protocol.rs` — 28 test(s)
 
 - `a_client_supplied_id_is_not_reassigned`
 - `a_zero_length_client_id_is_assigned_and_returned`
