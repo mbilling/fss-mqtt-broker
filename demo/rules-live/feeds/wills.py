@@ -17,10 +17,11 @@ The results go to the broker too, retained: wills/<scenario>/result (one JSON do
 scenario: pass or fail, what was expected, what happened) and wills/summary. Without --once
 the scenarios start a few seconds apart and a round begins every --round seconds (120).
 
-Where mqttd is known to differ, the result names the issue (KNOWN_ISSUES). With --once,
---expect-fail lists scenarios that are expected to fail, as CI runs it: the run then
-passes while exactly those fail, and fails when one of them starts passing, so the list is
-kept honest.
+Where mqttd is known to differ, the result names the issue (KNOWN_ISSUES), but only when
+every problem the scenario found is that difference. With --once, --expect-fail lists
+scenarios that are expected to fail, as CI runs it: the run then passes while exactly those
+fail with exactly their known problem, and fails on any other problem in them, or when one
+of them starts passing, so the list is kept honest.
 
 Options can also be set in the environment: SIM_HOST, SIM_PORT, SIM_QUIET (1 or 0) and
 WILLS_ROUND. Exit 0 when every scenario passed (or failed as expected), 1 otherwise, 2 for
@@ -53,13 +54,24 @@ WITH_WILL = 0x04   # MQTT 5 DISCONNECT reason: Disconnect with Will Message (§3
 EARLY = 0.5        # a Will this much before its window opens is early
 SLACK = 2.5        # ...and one this much after the window's nominal end is late
 
-# Where mqttd differs from MQTT today, by scenario.
+# Where mqttd differs from MQTT today, by scenario: the issue, and what each of the
+# scenario's problems must contain to be that difference. Any other problem is a regression.
 KNOWN_ISSUES = {
-    "v5-drop-props": "#1033: the Will's Message Expiry Interval is not sent",
-    "v5-takeover-resumed": "#1033: a takeover inside the Will Delay publishes the Will",
-    "v5-resumed": "#1034: with MQTTD_DURABLE_SESSIONS=0 a session without subscriptions "
-                  "is not kept",
+    "v5-drop-props": ("#1033: the Will's Message Expiry Interval is not sent",
+                      ["message expiry None"]),
+    "v5-takeover-resumed": ("#1033: a takeover inside the Will Delay publishes the Will",
+                            ["the Will was published, and must not be"]),
+    "v5-resumed": ("#1034: with MQTTD_DURABLE_SESSIONS=0 a session without subscriptions "
+                   "is not kept", ["Session Present 0"]),
 }
+
+
+def known(scenario: str, problems: list) -> Optional[str]:
+    """The issue when every problem is the scenario's known difference, else None."""
+    issue, signs = KNOWN_ISSUES.get(scenario, ("", []))
+    if problems and signs and all(any(sig in p for sig in signs) for p in problems):
+        return issue
+    return None
 
 
 @dataclass
@@ -285,7 +297,6 @@ class Watcher:
     def __init__(self, host: str, port: int, say: Callable[[str], None]):
         self.host, self.port, self.say = host, port, say
         self.runs: dict[str, Run] = {}
-        self.stray: list[tuple[float, Message]] = []
         self.lock = threading.Lock()
         self.client: Optional[Client] = None
         self.stopping = threading.Event()
@@ -296,6 +307,8 @@ class Watcher:
         self.thread.start()
 
     def _connect(self):
+        if self.client:
+            self.client.drop()
         c = Client(self.host, self.port, f"wills-watch-{os.getpid()}", keepalive=30,
                    timeout=5, version=5)
         c.connect()
@@ -334,8 +347,8 @@ class Watcher:
                 run = self.runs.get(token)
             if run:
                 run.arrivals.put((now, m))
-            elif not m.retain:
-                self.stray.append((now, m))
+            # Anything else (an earlier round's late Will, a retained Will being cleared)
+            # names no run in progress and is ignored.
 
     def stop(self):
         self.stopping.set()
@@ -380,7 +393,9 @@ def check(run: Run, watcher: Watcher) -> dict:
         after = at - run.trigger
         observed = f"a Will {after:.2f} s after the trigger"
         if after < ex.lo - EARLY:
-            problems.append(f"early: the window opens at {ex.lo:g} s")
+            problems.append(f"early: the window opens at {max(0.0, ex.lo - EARLY):g} s")
+        if after > ex.hi + SLACK:
+            problems.append(f"late: the window closes at {ex.hi + SLACK:g} s")
         if m.qos != min(s.will_qos, 1):
             problems.append(f"QoS {m.qos}, not {min(s.will_qos, 1)}")
         if ex.props:
@@ -394,11 +409,11 @@ def check(run: Run, watcher: Watcher) -> dict:
     watcher.forget(run)
     problems += run.notes
     run.close()
-    known = KNOWN_ISSUES.get(s.name) if problems else None
+    issue = known(s.name, problems)
     return {
         "scenario": s.name, "round": run.round,
         "result": "fail" if problems else "pass",
-        **({"known_issue": known} if known else {}),
+        **({"known_issue": issue} if issue else {}),
         "what": s.what, "spec": s.spec, "expected": ex.describe(), "observed": observed,
         "problems": problems, "warnings": run.warnings, "at": stamp(time.time()),
     }
@@ -599,7 +614,9 @@ def main(argv=None) -> int:
             if args.once or stop:
                 played = {s.name for s in args.scenarios}
                 failed = set(doc["failed"])
-                surprises = sorted(failed - args.expected)
+                # A failure is the expected one only when it is the known difference.
+                unknown = {n for n in failed if not reporter.results[n].get("known_issue")}
+                surprises = sorted((failed - args.expected) | unknown)
                 fixed = sorted((args.expected & played) - failed)
                 if fixed:
                     say(f"expected to fail, and passed: {', '.join(fixed)} (drop them from "
