@@ -550,6 +550,13 @@ jobs:
       - name: Integration blueprint smoke (docs/INTEGRATION.md's external-consumer pattern)
         run: MQTTD_BIN=target/debug/mqttd ./scripts/integration-consumer-smoke.sh
 
+      # The Will scenarios the live rules demo plays (demo/rules-live/feeds/wills.py), each
+      # once against this build: sixteen ways for an MQTT 3.1.1 or 5 connection to end, each
+      # Will checked against the spec, with the durable session store and the in-memory one.
+      # Known differences are listed in the script with their issues, and fail it once fixed.
+      - name: Will scenarios (MQTT 3.1.1 and 5, both session stores)
+        run: MQTTD_BIN=target/debug/mqttd ./scripts/wills-smoke.sh
+
       # ADR 0047 T9: the non-Kubernetes reference deployment, actually booted. Reads the
       # values out of deploy/systemd/mqttd.env.example, so a renamed setting in the shipped
       # artifact fails here instead of on somebody's first install. The runner has both
@@ -570,7 +577,8 @@ jobs:
           bash -n demo/rules-live/up.sh
           sh -n demo/rules-live/pki/gen.sh
           PYTHONPYCACHEPREFIX="$RUNNER_TEMP/pycache" \
-            python3 -m py_compile demo/rules-live/ui/server.py demo/rules/live.py
+            python3 -m py_compile demo/rules-live/ui/server.py demo/rules/live.py \
+              demo/rules-live/feeds/wills.py
           node --check demo/rules-live/ui/app.js
 
       # Issue #263: the compose artifacts default to a PINNED image tag, and every mqttd

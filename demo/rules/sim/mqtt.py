@@ -4,8 +4,10 @@ No third-party package, so the demo runs on a bare Python 3.9+. It speaks MQTT 3
 MQTT 5 with `version=5`: CONNECT (with an optional Will), PUBLISH at QoS 0 and 1,
 SUBSCRIBE, PINGREQ and DISCONNECT, and it can drop its connection without a DISCONNECT, the
 way a device that loses power does. In MQTT 5 a publish may carry a payload format
-indicator, a content type and user properties (`props`), and a received one reports them;
-every other property is skipped.
+indicator, a message expiry, a content type and user properties (`props`), and a received
+one reports them; every other property is skipped. A CONNECT may carry a session expiry,
+its Will a Will delay and the publish properties, and a DISCONNECT a reason code and a
+session expiry. A DISCONNECT the broker sends is kept in `disconnect_reason`.
 """
 
 from __future__ import annotations
@@ -41,20 +43,29 @@ def _string(s: str) -> bytes:
 
 
 # The MQTT 5 properties (§2.2.2.2) this client writes and reads, by identifier.
-PAYLOAD_FORMAT, CONTENT_TYPE, USER_PROPERTY = 0x01, 0x03, 0x26
+PAYLOAD_FORMAT, MESSAGE_EXPIRY, CONTENT_TYPE, USER_PROPERTY = 0x01, 0x02, 0x03, 0x26
+# ...and those it only writes: on a CONNECT, a Will or a DISCONNECT.
+SESSION_EXPIRY, WILL_DELAY = 0x11, 0x18
 # How to skip every other property a PUBLISH may carry: its value's size in bytes, "v" for
 # a variable byte integer, "s" for a length-prefixed string or binary data.
-_SKIP = {0x02: 4, 0x08: "s", 0x09: "s", 0x0B: "v", 0x23: 2}
+_SKIP = {0x08: "s", 0x09: "s", 0x0B: "v", 0x23: 2}
 
 
 def encode_props(props: Optional[dict]) -> bytes:
     """MQTT 5 properties, their length first. `props` may hold `payload_format` (0 binary,
-    1 UTF-8), `content_type` (a string) and `user` (a list of (key, value) string pairs,
-    sent in order)."""
+    1 UTF-8), `message_expiry` (seconds), `content_type` (a string) and `user` (a list of
+    (key, value) string pairs, sent in order); on a CONNECT or a DISCONNECT
+    `session_expiry`, and on a Will `will_delay` (seconds)."""
     out = b""
     if props:
         if props.get("payload_format") is not None:
             out += bytes([PAYLOAD_FORMAT, props["payload_format"]])
+        if props.get("message_expiry") is not None:
+            out += bytes([MESSAGE_EXPIRY]) + struct.pack("!I", props["message_expiry"])
+        if props.get("session_expiry") is not None:
+            out += bytes([SESSION_EXPIRY]) + struct.pack("!I", props["session_expiry"])
+        if props.get("will_delay") is not None:
+            out += bytes([WILL_DELAY]) + struct.pack("!I", props["will_delay"])
         if props.get("content_type") is not None:
             out += bytes([CONTENT_TYPE]) + _string(props["content_type"])
         for k, v in props.get("user", ()):
@@ -90,6 +101,9 @@ def decode_props(data: bytes, i: int) -> tuple[dict, int]:
         if pid == PAYLOAD_FORMAT:
             props["payload_format"] = data[i]
             i += 1
+        elif pid == MESSAGE_EXPIRY:
+            (props["message_expiry"],) = struct.unpack("!I", data[i : i + 4])
+            i += 4
         elif pid == CONTENT_TYPE:
             props["content_type"], i = text(i)
         elif pid == USER_PROPERTY:
@@ -135,24 +149,33 @@ class Client:
         self._next_id = 1
         self._last_sent = 0.0
         self.inbox: list[Message] = []
+        self.disconnect_reason: Optional[int] = None  # the broker's DISCONNECT, MQTT 5
 
     # ---- connection -------------------------------------------------------------------
 
-    def connect(self, clean: bool = True, will: Optional[tuple[str, bytes, int, bool]] = None):
-        """Open the connection; `will` is (topic, payload, qos, retain). On any failure the
+    def connect(self, clean: bool = True, will: Optional[tuple[str, bytes, int, bool]] = None,
+                props: Optional[dict] = None, will_props: Optional[dict] = None) -> bool:
+        """Open the connection; `will` is (topic, payload, qos, retain). MQTT 5 only: `props`
+        are the CONNECT's properties (`session_expiry`), `will_props` the Will's (see
+        `encode_props`). Returns the CONNACK's session present flag. On any failure the
         socket is closed again."""
+        if (props or will_props) and self.version != 5:
+            raise MqttError(f"{self.client_id}: properties need MQTT 5")
         self.sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        self.disconnect_reason = None
         try:
             self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             flags = 0x02 if clean else 0
-            props = encode_props(None) if self.version == 5 else b""
+            v5 = self.version == 5
             body = _string("MQTT") + bytes([self.version])
             tail = _string(self.client_id)
             if will:
                 topic, payload, qos, retain = will
                 flags |= 0x04 | (qos << 3) | (0x20 if retain else 0)
-                tail += props + _string(topic) + struct.pack("!H", len(payload)) + payload
-            body += bytes([flags]) + struct.pack("!H", self.keepalive) + props + tail
+                tail += encode_props(will_props) if v5 else b""
+                tail += _string(topic) + struct.pack("!H", len(payload)) + payload
+            body += bytes([flags]) + struct.pack("!H", self.keepalive)
+            body += (encode_props(props) if v5 else b"") + tail
             self._send(CONNECT << 4, body)
             # A broker that accepts the connection and never answers must not hang the caller.
             got = self._read_packet(self.timeout)
@@ -161,15 +184,21 @@ class Client:
             kind, _, data = got
             if kind != CONNACK or len(data) < 2 or data[1] != 0:
                 raise MqttError(f"{self.client_id}: CONNECT refused ({data.hex()})")
+            return bool(data[0] & 0x01)
         except BaseException:
             self.drop()
             raise
 
-    def disconnect(self):
-        """A clean DISCONNECT: the broker discards the Will. A broker already gone is fine."""
+    def disconnect(self, reason: int = 0, props: Optional[dict] = None):
+        """A DISCONNECT. With reason 0 (the only one in MQTT 3.1.1) the broker discards the
+        Will; MQTT 5's 0x04 asks it to publish the Will all the same. `props` (MQTT 5) may
+        hold `session_expiry`. A broker already gone is fine."""
         if self.sock:
             try:
-                self._send(DISCONNECT << 4, b"")
+                body = b""
+                if self.version == 5 and (reason or props):
+                    body = bytes([reason]) + encode_props(props)
+                self._send(DISCONNECT << 4, body)
             except OSError:
                 pass
             finally:
@@ -306,6 +335,8 @@ class Client:
                 props, at = decode_props(rest, 0)
                 rest = rest[at:]
             self.inbox.append(Message(topic, rest, qos, bool(flags & 1), props))
+        elif kind == DISCONNECT:
+            self.disconnect_reason = data[0] if data else 0
 
     def _read_packet(self, timeout: Optional[float] = None):
         """(type, flags, body), or None when `timeout` passes first."""

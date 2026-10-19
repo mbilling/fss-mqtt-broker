@@ -205,7 +205,7 @@ for every rule's input and output. demo/rules-live/README.md walks through it.
 """
 requires = ["docker"]
 duration = "5-15 min for the first build, then seconds"
-caution = "Starts 7 containers (2 one-shot) and binds 127.0.0.1:1883, 8070, 8080 and 9443 (override with MQTT_PORT, UI_PORT, HEALTH_PORT, ADMIN_PORT)."
+caution = "Starts 8 containers (2 one-shot) and binds 127.0.0.1:1883, 8070, 8080 and 9443 (override with MQTT_PORT, UI_PORT, HEALTH_PORT, ADMIN_PORT)."
 
 [[task]]
 id = "demo-rules-live-sim"
@@ -237,6 +237,32 @@ name = "The rule-engine demo's live player: reconnects and backoff (imported, no
 script = "demo/rules/sim/live.py"
 hidden = true
 about = "Imported by demo/rules/live.py."
+
+[[task]]
+id = "demo-rules-live-wills"
+group = "Demo"
+name = "Play Will scenarios into a broker and check each Will against MQTT 3.1.1 and 5"
+script = "demo/rules-live/feeds/wills.py"
+about = """
+The Will publisher behind demo-rules-live, on its own: sixteen ways for a connection to
+end (a dropped socket, a silent keep-alive, a protocol error, DISCONNECT with and without
+reason 0x04, Will Delay, a session that ends first, a resume inside the delay, three kinds
+of takeover, a retained Will, Will properties), each Will checked for when it arrives, what
+it carries, and that it never arrives when it must not. With --once each scenario runs
+once and the exit status says whether they all passed; the results are also retained on
+wills/<scenario>/result and wills/summary.
+"""
+requires = ["python3"]
+duration = "~15 s"
+args = ["--once", "--host", "${HOST}", "--port", "${PORT}"]
+[[task.env]]
+name = "HOST"
+default = "127.0.0.1"
+help = "The broker's host"
+[[task.env]]
+name = "PORT"
+default = "1883"
+help = "The broker's plaintext MQTT port"
 
 [[task]]
 id = "demo-rules-live-pki"
@@ -549,6 +575,25 @@ working, this fails.
 """
 requires = ["mosquitto_pub", "mosquitto_sub", "python3", "curl", "openssl"]
 duration = "~30s"
+[[task.env]]
+name = "MQTTD_BIN"
+default = ""
+help = "Prebuilt broker; empty builds one first"
+
+[[task]]
+id = "wills-smoke"
+group = "Try it"
+name = "Check every Will scenario against the real broker, in both session stores"
+script = "scripts/wills-smoke.sh"
+about = """
+Runs demo/rules-live/feeds/wills.py once against a freshly built mqttd with the durable
+session store, then with the in-memory one (MQTTD_DURABLE_SESSIONS=0): sixteen ways for an
+MQTT 3.1.1 or 5 connection to end, each Will checked against the spec. Where mqttd differs
+today the scenario is expected to fail, with its issue; the run fails when one of those
+starts passing, so the list stays honest.
+"""
+requires = ["python3", "curl"]
+duration = "~1 min"
 [[task.env]]
 name = "MQTTD_BIN"
 default = ""

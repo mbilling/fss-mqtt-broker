@@ -59,11 +59,12 @@ PKI = Path(os.environ.get("UI_PKI", "/pki"))
 SYS_INTERVAL = float(os.environ.get("UI_SYS_INTERVAL", "2"))
 
 # What the page shows: the rules' statistics and trace (ADR 0084; `#` never matches a $SYS
-# topic, so both are named), the six roots the demo's rules publish under, and the devices.
+# topic, so both are named), the six roots the demo's rules publish under, the Will
+# scenarios' Wills and results, and the devices.
 FILTERS = [
     "$SYS/brokers/+/rules/#",
     "$SYS/brokers/+/trace/rules/+",
-    "alerts/#", "kpi/#", "normalized/#", "analytics/#", "state/#", "events/#",
+    "alerts/#", "kpi/#", "normalized/#", "analytics/#", "state/#", "events/#", "wills/#",
     "plant/#", "home/#", "vehicle/#",
 ]
 DEVICE_ROOTS = ("plant/", "home/", "vehicle/")
