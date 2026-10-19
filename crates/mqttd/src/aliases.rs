@@ -93,10 +93,12 @@ impl OutboundAliases {
     }
 
     /// Rewrite `publish` in place to use a topic alias when possible. A no-op when
-    /// the client advertised no maximum or the topic is empty.
-    pub fn apply(&mut self, publish: &mut Publish) {
+    /// the client advertised no maximum or the topic is empty. Returns the alias when
+    /// this call set up a new mapping, so a PUBLISH that is then not written can take
+    /// it back ([`Self::undo_new`]).
+    pub fn apply(&mut self, publish: &mut Publish) -> Option<u16> {
         if self.max == 0 || publish.topic.is_empty() {
-            return;
+            return None;
         }
         if let Some(&alias) = self.map.get(&publish.topic) {
             // Established mapping: reference it with an empty topic name.
@@ -108,8 +110,21 @@ impl OutboundAliases {
             self.next += 1;
             self.map.insert(publish.topic.clone(), alias);
             set_alias(publish, alias);
+            return Some(alias);
         }
         // Table full and topic unknown: leave the full topic name, no alias.
+        None
+    }
+
+    /// Take back the mapping the last [`Self::apply`] set up, for a PUBLISH that was
+    /// not written after all (too large for the client, issue #1032): the client never
+    /// learnt the alias, so the next PUBLISH on that topic must establish it again
+    /// rather than reference it. Exact because it is called before any other `apply`.
+    pub fn undo_new(&mut self, alias: u16) {
+        if alias + 1 == self.next {
+            self.map.retain(|_, a| *a != alias);
+            self.next = alias;
+        }
     }
 }
 
@@ -215,6 +230,22 @@ mod tests {
         assert_eq!(alias_of(&p3), Some(2));
     }
 
+    #[test]
+    fn an_undone_new_mapping_is_set_up_again_on_the_next_publish() {
+        let mut o = OutboundAliases::new(5);
+        let mut p = publish("big/t");
+        assert_eq!(o.apply(&mut p), Some(1));
+        o.undo_new(1);
+        let mut p = publish("big/t");
+        assert_eq!(o.apply(&mut p), Some(1), "re-established, not referenced");
+        assert_eq!(
+            p.topic, "big/t",
+            "with its topic name, which the client needs"
+        );
+        let mut q = publish("big/t");
+        assert_eq!(o.apply(&mut q), None, "and referenced from then on");
+        assert_eq!(q.topic, "");
+    }
     #[test]
     fn outbound_stops_assigning_when_full_but_keeps_existing() {
         let mut o = OutboundAliases::new(1);

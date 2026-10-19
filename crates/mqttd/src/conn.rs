@@ -2853,6 +2853,7 @@ where
                     // can raise: its delivery, its acknowledgement (it has a packet
                     // id), or its being too large (the client set a maximum).
                     let mut sent = None;
+                    let mut new_alias = None;
                     if let Packet::Publish(p) = &mut *pkt {
                         if events.delivered
                             || (events.acked && p.pkid.is_some())
@@ -2860,7 +2861,7 @@ where
                         {
                             sent = Some((Sent::capture(p, origin), p.pkid));
                         }
-                        outbound_aliases.apply(p);
+                        new_alias = outbound_aliases.apply(p);
                     }
                     let start = writer.queued_len();
                     writer.queue(pkt)?;
@@ -2875,6 +2876,11 @@ where
                             debug!(client = %client.0, size = writer.queued_len() - start, max,
                                    "outbound publish exceeds the client's Maximum Packet Size; dropped for this subscriber");
                             writer.truncate_queued(start);
+                            // The client never sees this PUBLISH, so it never learns an
+                            // alias it would have set up (#1032).
+                            if let Some(alias) = new_alias {
+                                outbound_aliases.undo_new(alias);
+                            }
                             if let Some(m) = &policy.metrics {
                                 m.publish_dropped("too-large");
                             }
