@@ -165,6 +165,7 @@ impl Mesh {
         hub.dispatch(HubCommand::InheritedSessions {
             sessions: Vec::new(),
             complete: true,
+            unread: Vec::new(),
         })
         .await;
 

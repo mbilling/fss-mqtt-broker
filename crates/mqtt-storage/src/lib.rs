@@ -288,15 +288,23 @@ pub struct SessionScan {
     pub sessions: Vec<(ClientId, Vec<Subscription>, Option<u64>)>,
     /// Whether every stored key was either read or cleanly foreign.
     pub complete: bool,
+    /// The sessions that made it incomplete, each with its error, at most
+    /// [`SessionScan::UNREAD_KEPT`] of them (issue #1049): what an operator needs to
+    /// see why a node's scans never complete.
+    pub unread: Vec<(ClientId, String)>,
 }
 
 impl SessionScan {
+    /// How many unread sessions a scan names.
+    pub const UNREAD_KEPT: usize = 16;
+
     /// A complete scan over `sessions`.
     #[must_use]
     pub fn complete(sessions: Vec<(ClientId, Vec<Subscription>, Option<u64>)>) -> Self {
         Self {
             sessions,
             complete: true,
+            unread: Vec::new(),
         }
     }
 }
