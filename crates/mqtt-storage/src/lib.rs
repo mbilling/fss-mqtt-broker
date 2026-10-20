@@ -292,6 +292,8 @@ pub struct SessionScan {
     /// [`SessionScan::UNREAD_KEPT`] of them (issue #1049): what an operator needs to
     /// see why a node's scans never complete.
     pub unread: Vec<(ClientId, String)>,
+    /// How many sessions the scan could not read in all, `unread` holding the first.
+    pub unread_total: usize,
 }
 
 impl SessionScan {
@@ -305,6 +307,7 @@ impl SessionScan {
             sessions,
             complete: true,
             unread: Vec::new(),
+            unread_total: 0,
         }
     }
 }

@@ -264,6 +264,7 @@ impl Fix {
             sessions,
             complete,
             unread: Vec::new(),
+            unread_total: 0,
         })
         .await;
     }
@@ -591,6 +592,7 @@ async fn sweep_once(fix: &mut Fix, complete: bool) {
             sessions: Vec::new(),
             complete,
             unread: Vec::new(),
+            unread_total: 0,
         })
         .await;
     }

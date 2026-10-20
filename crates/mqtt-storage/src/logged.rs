@@ -605,6 +605,7 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
         let mut out = Vec::new();
         let mut complete = true;
         let mut unread = Vec::new();
+        let mut unread_total = 0;
         for key in self.log.keys().await? {
             let Some(id) = key.strip_prefix("m/") else {
                 continue;
@@ -623,6 +624,7 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
                 Ok(None) | Err(StorageError::NotOwner) => {}
                 Err(e) => {
                     complete = false;
+                    unread_total += 1;
                     if unread.len() < SessionScan::UNREAD_KEPT {
                         unread.push((client, e.to_string()));
                     }
@@ -633,6 +635,7 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
             sessions: out,
             complete,
             unread,
+            unread_total,
         })
     }
 

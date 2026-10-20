@@ -166,6 +166,7 @@ impl Mesh {
             sessions: Vec::new(),
             complete: true,
             unread: Vec::new(),
+            unread_total: 0,
         })
         .await;
 
