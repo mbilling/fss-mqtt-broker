@@ -442,7 +442,7 @@ client, as the devices and their gateways make them. It asserts that the 1,333 d
 [`rules_demo.expected`](../../crates/mqttd/tests/rules_demo.expected): topic, QoS, retain
 flag and payload, with nothing missing and nothing extra. It also checks that the
 simulator is deterministic, that `rules.toml` passes `mqttd --check-rules` with no
-warning, that every `⇒` line on this page is one of them, and that every window of
+warning but the one that rule state is experimental in this release, that every `⇒` line on this page is one of them, and that every window of
 `live.py --clock fixture` is the fixture again. After an intended change to
 the rules or the simulator, regenerate the expected output with
 `MQTTD_DEMO_BLESS=1 cargo test -p mqttd --test rules_demo the_demo_derives`, and review

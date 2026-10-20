@@ -863,6 +863,11 @@ impl StateLoading {
         self.open(&name).map(Some)
     }
 
+    /// Whether the file holds any namespace (`proc_dict_*` alone holds none).
+    pub(crate) fn holds_any(&self) -> bool {
+        !self.opened.is_empty()
+    }
+
     /// Every namespace the file holds: the declared ones and the ones its rules use.
     pub(crate) fn into_bindings(self) -> Vec<Arc<StateBinding>> {
         self.opened.into_values().collect()

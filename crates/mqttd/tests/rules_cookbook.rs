@@ -1382,14 +1382,20 @@ fn replay_cmd(r: &Replayed) -> String {
 }
 
 /// What that command prints: the recipe's sequence replayed through its rules by the
-/// real binary. It must exit 0, with nothing on stderr.
+/// real binary. It must exit 0, with nothing on stderr but the warning that rule
+/// state is experimental (ADR 0085 T9, T10).
 fn replay(r: &Replayed) -> String {
     let (code, stdout, stderr) = run_cli_with(
         &[("MQTTD_RULES_FILE", &recipe_rel(r.file))],
         &["--rule-test", "--sequence", &sequence_rel(r)],
     );
     assert_eq!(code, Some(0), "{}: {stdout}{stderr}", r.file);
-    assert_eq!(stderr, "", "{}", r.file);
+    assert_eq!(
+        stderr,
+        format!("warning: {}\n", mqtt_rules::STATE_EXPERIMENTAL_WARNING),
+        "{}",
+        r.file
+    );
     stdout
 }
 
@@ -2878,10 +2884,13 @@ fn every_recipe_passes_check_rules_with_no_warning() {
         assert_eq!(stderr, "", "{} warns", r.file);
         assert_eq!(stdout, check_rules_stdout(r), "{}", r.file);
     }
+    // A recipe that keeps state warns once, and only that: rule state is experimental
+    // until it is durable (ADR 0085 T9, T10).
+    let experimental = format!("warning: {}\n", mqtt_rules::STATE_EXPERIMENTAL_WARNING);
     for r in &REPLAYED {
         let (code, stdout, stderr) = run_cli(&["--check-rules", &recipe_rel(r.file)]);
         assert_eq!(code, Some(0), "{}: {stdout}{stderr}", r.file);
-        assert_eq!(stderr, "", "{} warns", r.file);
+        assert_eq!(stderr, experimental, "{} warns", r.file);
         let n = r.listing.len();
         let mut want = format!(
             "rules OK: {}: {n} rule(s), {n} enabled, sha256 {}\n",
