@@ -3468,8 +3468,9 @@ impl Hub {
         let mut sweep = tokio::time::interval(SESSION_SWEEP_INTERVAL);
         sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // ADR 0074: the truncate flusher. Owned by `owned_tasks` so it aborts with
-        // the hub; a send after abort is the documented not-fatal case (entries
-        // replay at next resume, the subscriber re-acks, the watermark re-advances).
+        // the hub; a send after abort is the documented not-fatal case (the entries
+        // stay in the log; they replay after a restart, the subscriber re-acks, the
+        // watermark re-advances).
         let (truncate_tx, truncate_rx) = mpsc::unbounded_channel();
         self.truncate_tx = Some(truncate_tx);
         self.owned_tasks
@@ -5916,8 +5917,10 @@ impl Hub {
             return;
         };
         // A closed/absent flusher is the documented not-fatal case: the entries stay
-        // in the log and are replayed on the next resume. A duplicate at QoS 1 is
-        // spec-legal; losing one would not be.
+        // in the log until a later truncate covers them. A resume on this node skips
+        // them (`settled_above_watermark`, issue #1056); after a restart or an
+        // ownership move they replay. A duplicate at QoS 1 is spec-legal; losing one
+        // would not be.
         if let Some(tx) = &self.truncate_tx {
             let _ = tx.send((client.clone(), up_to));
         }
@@ -9296,9 +9299,10 @@ async fn run_truncate_flusher(
             let served = client.clone();
             let handle = flushes.spawn(async move {
                 if let Err(e) = store.ack(&client, up_to).await {
-                    // Not fatal: the entries stay in the log and are replayed on the
-                    // next resume. A duplicate at QoS 1 is spec-legal; losing one
-                    // would not be.
+                    // Not fatal: the entries stay in the log until a later truncate
+                    // covers them; a resume on this node skips them (#1056), and
+                    // after a restart or an ownership move they replay. A duplicate
+                    // at QoS 1 is spec-legal; losing one would not be.
                     debug!(client = %client.0, up_to, error = %e,
                            "detached truncate of the acknowledged session log failed");
                 }
@@ -14473,6 +14477,47 @@ mod tests {
     /// Kept verbatim modulo the issue #241 API rename — it is the **regression witness**
     /// for the no-silent-change criterion: with the DEFAULT limits, the boundary is still
     /// exactly 10 000 pushes with no eviction and one eviction on the 10 001st.
+    /// Issue #1056: everything at or below the truncation watermark is settled the
+    /// moment [`Inflight::advance_ack`] hands it to the detached flusher, before the
+    /// truncate commits, and stays settled after the advance prunes it from
+    /// `released`. Above the watermark, only what was released is settled.
+    #[test]
+    fn the_resume_skip_covers_the_watermark_and_what_was_released_above_it() {
+        let mut inf = Inflight::default();
+        for offset in 1..=6 {
+            inf.track(offset);
+        }
+        // 3 is still owed: 1 and 2 settle the prefix, 4 and 5 are released above it.
+        for offset in [1, 2, 4, 5] {
+            inf.release(offset);
+        }
+        assert_eq!(inf.advance_ack(), Some(2), "the contiguous prefix");
+        for offset in [1, 2] {
+            assert!(
+                inf.settled_above_watermark(offset),
+                "offset {offset} is at or below the watermark: settled though the \
+                 detached truncate may not have committed"
+            );
+        }
+        assert!(!inf.settled_above_watermark(3), "3 is still owed");
+        assert!(inf.settled_above_watermark(4));
+        assert!(inf.settled_above_watermark(5));
+        assert!(!inf.settled_above_watermark(6), "6 was never acknowledged");
+
+        // 3 is acknowledged: the watermark covers 5, and the set is pruned — the
+        // watermark alone now says those offsets are settled.
+        inf.release(3);
+        assert_eq!(inf.advance_ack(), Some(5));
+        assert!(
+            inf.released.is_empty(),
+            "pruned once the watermark covers them"
+        );
+        for offset in 1..=5 {
+            assert!(inf.settled_above_watermark(offset), "offset {offset}");
+        }
+        assert!(!inf.settled_above_watermark(6));
+    }
+
     #[test]
     fn flow_control_backlog_is_bounded_drop_oldest() {
         let limits = SubscriberLimits::default();
