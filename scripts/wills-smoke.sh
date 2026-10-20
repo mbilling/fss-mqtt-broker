@@ -63,8 +63,8 @@ print(*[s.getsockname()[1] for s in ss])
     sleep 0.2
   done
   curl -fsS "http://127.0.0.1:$health/readyz" >/dev/null || { echo "FATAL: mqttd ($mode) never became ready"; exit 1; }
-  # A node founding a new cluster reports ready a second or two before it can commit
-  # (#1035): wait until a retained message comes back, so the scenarios test Wills.
+  # Readiness waits for the first lease since #1035; a retained round trip before the
+  # scenarios still confirms the node commits, so a failure here is not read as a Will's.
   PYTHONPATH=demo/rules python3 - "$port" <<'PY' || { echo "FATAL: mqttd ($mode) never kept a retained message"; exit 1; }
 import sys, time
 from sim.mqtt import Client, MqttError

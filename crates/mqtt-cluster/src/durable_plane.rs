@@ -121,6 +121,9 @@ pub struct DurablePlane {
     /// A live replication-factor change (ADR 0080 §4): the reload's proposal in,
     /// progress out to `/statusz`.
     replica_change: Arc<crate::replica_change::ReplicaChangeControl>,
+    /// The lease group's applied state, when the node wires it in: readiness waits for
+    /// the first lease to be minted (issue #1035). `None` keeps the old rule.
+    lease_store: Option<crate::lease_store::LeaseStore>,
 }
 
 /// Aborts a spawned task when dropped — used to bound the replica-writer's lifetime to the
@@ -175,6 +178,7 @@ impl DurablePlane {
             _writers: Arc::new(aborts),
             writer_stats,
             ownership_domain_all: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lease_store: None,
             replica_change: Arc::new(crate::replica_change::ReplicaChangeControl::new()),
         }
     }
@@ -183,6 +187,14 @@ impl DurablePlane {
     #[must_use]
     pub fn with_ownership_domain_all(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
         self.ownership_domain_all = flag;
+        self
+    }
+
+    /// The lease group's applied state, so [`lease_group_ready`](Self::lease_group_ready)
+    /// can wait for the first lease (issue #1035).
+    #[must_use]
+    pub fn with_lease_store(mut self, store: crate::lease_store::LeaseStore) -> Self {
+        self.lease_store = Some(store);
         self
     }
 
@@ -303,8 +315,21 @@ impl DurablePlane {
     /// a group with no leader — reports not-ready, which is the signal an orchestrator
     /// should gate client traffic on (the node should not take sessions it cannot yet
     /// durably own). See [`voter_count`](Self::voter_count).
+    ///
+    /// It also waits for the group to have minted its first lease (issue #1035). A node
+    /// founding a cluster has a leader and is a voter a second or two before its driver
+    /// assigns any group, and every durable write in between fails `NotOwner`: a
+    /// retained set queues, a persistent session is not kept. A restart, or a joiner
+    /// that has caught up, already has the minted leases in its applied state.
     #[must_use]
     pub fn lease_group_ready(&self) -> bool {
+        if self
+            .lease_store
+            .as_ref()
+            .is_some_and(|s| s.high_epoch() == 0)
+        {
+            return false;
+        }
         let metrics = self.raft.metrics().borrow().clone();
         // ADR 0073: under the cluster-wide scale-out capability a LEARNER is a
         // first-class durable owner (the leader assigns leases to it and it reads
@@ -1074,6 +1099,57 @@ mod tests {
             .unwrap();
         // Leader of a group it is a voter in → ready.
         assert!(p.lease_group_ready());
+
+        p.raft().shutdown().await.unwrap();
+    }
+
+    /// Issue #1035: wired to its lease store, a node that leads and votes is still not
+    /// ready until the group has minted a lease: a fresh founding's durable writes fail
+    /// `NotOwner` until then.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lease_group_ready_waits_for_the_first_lease() {
+        let net = MeshRaftNetwork::new();
+        let store = LeaseStore::new();
+        let (ls, sm) = Adaptor::new(store.clone());
+        let raft: LeaseRaft = Raft::new(raft_id(&n("first-lease")), config(), net.clone(), ls, sm)
+            .await
+            .unwrap();
+        let p = DurablePlane::new(
+            raft,
+            net,
+            Arc::new(PeerReplicaTransport::new()),
+            Arc::new(Mutex::new(ReplicaState::new())),
+            Arc::new(std::sync::RwLock::new(crate::placement::Placement::new(
+                n("first-lease"),
+                crate::placement::DEFAULT_REPLICAS,
+            ))),
+        )
+        .with_lease_store(store);
+        p.raft()
+            .initialize(members(&["first-lease"]))
+            .await
+            .unwrap();
+        p.raft()
+            .wait(Some(Duration::from_secs(10)))
+            .state(ServerState::Leader, "node leads its own group")
+            .await
+            .unwrap();
+        assert!(
+            !p.lease_group_ready(),
+            "a leader voter with no lease minted is not ready"
+        );
+
+        p.raft()
+            .client_write(crate::lease_raft::LeaseRequest::Assign {
+                group: 0,
+                node: raft_id(&n("first-lease")),
+            })
+            .await
+            .unwrap();
+        assert!(
+            p.lease_group_ready(),
+            "ready once the first lease is minted"
+        );
 
         p.raft().shutdown().await.unwrap();
     }
