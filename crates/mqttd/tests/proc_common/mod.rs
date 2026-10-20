@@ -296,7 +296,11 @@ impl ProcNode {
             .env("MQTTD_DATA_DIR", &self.data_dir)
             .env("MQTTD_HEALTH_BIND", self.health_addr.to_string())
             .env("MQTTD_SHUTDOWN_GRACE", "0")
-            .env("RUST_LOG", "info")
+            // MQTTD_PROC_LOG widens the spawned nodes' log filter for a reproduction.
+            .env(
+                "RUST_LOG",
+                std::env::var("MQTTD_PROC_LOG").unwrap_or_else(|_| "info".to_string()),
+            )
             .envs(self.extra_env.iter().map(|(k, v)| (k.clone(), v.clone())))
             .stdout(std::process::Stdio::from(log.try_clone().unwrap()))
             .stderr(std::process::Stdio::from(log))
@@ -623,11 +627,25 @@ pub struct RetainedSet {
 pub struct Subscriber {
     pub id: String,
     pub topic: String,
+    /// The subscription's `QoS`: half the subscribers take `QoS` 2, so a `QoS` 2
+    /// publish reaches them as one and history-check's exactly-once promise (check 6)
+    /// has deliveries to judge.
+    pub qos: QoS,
     pub conn: Option<common::Client>,
     /// Which node index the live connection was made through (dies with it).
     pub via_node: usize,
     pub established: bool,
     pub received: BTreeSet<Vec<u8>>,
+    /// How many connections this client has opened: numbers the connection id every
+    /// `Connect`, `Disconnect` and `ConnectionLost` carries, so the checker's timeline
+    /// pairs an end with its own connection (issue #1055).
+    pub conn_seq: u64,
+    /// `QoS` 2 packet ids this client has answered PUBREC and not yet seen the PUBREL
+    /// of — the receiver's half of exactly once [MQTT-4.3.3-2]. Kept across the
+    /// client's reconnects, as a persistent session's state is: a PUBLISH re-sent for
+    /// one of these is the same message, acknowledged again and delivered to the
+    /// application (recorded) once.
+    pub qos2_inbound: BTreeSet<u16>,
 }
 
 pub struct Proc {
@@ -674,7 +692,22 @@ impl Proc {
     /// process's state (running, exited-with-status, or killed by the schedule —
     /// a dead node is a different fact from a slow one), the schedule trace, and
     /// the seed to reproduce with.
+    /// `MQTTD_PROC_KEEP_LOGS=<dir>`: the nodes' whole logs survive the run there, beyond
+    /// the tails a failure prints — a reproduction's evidence, pass or fail.
+    pub fn keep_logs(&self) {
+        if let Ok(dir) = std::env::var("MQTTD_PROC_KEEP_LOGS") {
+            let _ = std::fs::create_dir_all(&dir);
+            for n in &self.nodes {
+                let _ = std::fs::copy(
+                    &n.log_path,
+                    std::path::Path::new(&dir).join(format!("{}.log", n.id)),
+                );
+            }
+        }
+    }
+
     pub fn fail(&mut self, what: &str) -> ! {
+        self.keep_logs();
         for n in &self.nodes {
             eprintln!("---- log tail of {} ----\n{}", n.id, log_tail(&n.log_path));
             eprintln!(
@@ -764,6 +797,8 @@ impl Proc {
                 self.subs[i].conn = Some(client);
                 self.subs[i].via_node = via;
                 self.subs[i].established = true;
+                self.subs[i].conn_seq += 1;
+                let conn = self.conn_id(i);
                 self.record(history_check::Event::Connect {
                     at_ms: self.at_ms(),
                     client: self.subs[i].id.clone(),
@@ -773,7 +808,7 @@ impl Proc {
                     clean_start: Some(false),
                     session_expiry_s: None,
                     will: None,
-                    conn: None,
+                    conn: Some(conn),
                 });
                 self.note(format!(
                     "subscriber {} online via {} (present={present})",
@@ -818,47 +853,124 @@ impl Proc {
                 return;
             };
             match conn.recv_bounded(Duration::from_millis(700)).await {
-                common::Recv::Packet(Packet::Publish(p)) => {
-                    // A QoS 1 delivery counts only once its PUBACK is written (see
-                    // above), so ack FIRST and record after. If the connection went
-                    // away between the receive and here, nothing was acknowledged
-                    // and nothing is recorded.
-                    let acked = match p.pkid {
-                        Some(pkid) => match self.subs[i].conn.as_mut() {
-                            Some(c) => {
-                                c.puback(pkid).await;
-                                true
-                            }
-                            None => false,
-                        },
-                        None => true,
-                    };
-                    if acked {
-                        // EVERY delivery is recorded, repeats included. The set is
-                        // still populated because three other call sites read it,
-                        // but it no longer GATES the recording: a history that
-                        // silently drops duplicates cannot support any counting
-                        // promise, which is what `check_redelivery_marked` needs.
-                        self.subs[i].received.insert(p.payload.to_vec());
-                        let ev = history_check::Event::Deliver {
+                common::Recv::Packet(Packet::Publish(p)) => self.deliver_to_subscriber(i, &p).await,
+                common::Recv::Packet(Packet::PubRel(a)) => {
+                    // The broker completes a `QoS` 2 flow this client answered PUBREC,
+                    // on this connection or an earlier one.
+                    let pkid = a.pkid;
+                    match self.subs[i].conn.as_mut() {
+                        Some(c) => c.pubcomp(pkid).await,
+                        None => return,
+                    }
+                    if !self.subs[i].qos2_inbound.remove(&pkid) {
+                        let id = self.subs[i].id.clone();
+                        self.record(history_check::Event::ProtocolError {
                             at_ms: self.at_ms(),
-                            client: self.subs[i].id.clone(),
-                            topic: p.topic.clone(),
-                            payload: String::from_utf8_lossy(&p.payload).into_owned(),
-                            dup: p.dup,
-                            qos: p.qos as u8,
-                        };
-                        self.record(ev);
+                            client: id,
+                            what: format!(
+                                "PUBREL for packet id {pkid}, which this client never \
+                                 answered PUBREC [MQTT-4.3.3]"
+                            ),
+                        });
                     }
                 }
                 common::Recv::Packet(_) => {}
                 common::Recv::Closed => {
-                    self.subs[i].conn = None;
+                    self.connection_lost(i, "the connection closed");
                     return;
                 }
                 common::Recv::Quiet => return,
             }
         }
+    }
+
+    /// One PUBLISH to subscriber `i`: acknowledged as its `QoS` asks, and recorded as an
+    /// application delivery — once per `QoS` 2 message, however many times the broker
+    /// sends it (the receiver's half of exactly once, [MQTT-4.3.3-2]: a PUBLISH for a
+    /// packet id answered PUBREC and not yet PUBRELed is the same message, acknowledged
+    /// again and not delivered again). A re-send without DUP is a protocol error the
+    /// client saw [MQTT-3.3.1-1].
+    async fn deliver_to_subscriber(&mut self, i: usize, p: &mqtt_codec::packet::Publish) {
+        match (p.qos, p.pkid) {
+            (QoS::AtMostOnce, _) | (_, None) => {}
+            (QoS::ExactlyOnce, Some(pkid)) => {
+                let repeat = self.subs[i].qos2_inbound.contains(&pkid);
+                match self.subs[i].conn.as_mut() {
+                    Some(c) => c.pubrec(pkid).await,
+                    None => return,
+                }
+                if repeat {
+                    let id = self.subs[i].id.clone();
+                    if p.dup {
+                        self.note(format!(
+                            "{id}: QoS 2 PUBLISH re-sent for packet id {pkid} (DUP); answered \
+                             PUBREC again, not delivered again"
+                        ));
+                    } else {
+                        self.record(history_check::Event::ProtocolError {
+                            at_ms: self.at_ms(),
+                            client: id,
+                            what: format!(
+                                "a QoS 2 PUBLISH re-sent for in-flight packet id {pkid} \
+                                 without DUP [MQTT-3.3.1-1]"
+                            ),
+                        });
+                    }
+                    return;
+                }
+                self.subs[i].qos2_inbound.insert(pkid);
+            }
+            (QoS::AtLeastOnce, Some(pkid)) => match self.subs[i].conn.as_mut() {
+                Some(c) => c.puback(pkid).await,
+                None => return,
+            },
+        }
+        self.subs[i].received.insert(p.payload.to_vec());
+        let ev = history_check::Event::Deliver {
+            at_ms: self.at_ms(),
+            client: self.subs[i].id.clone(),
+            topic: p.topic.clone(),
+            payload: String::from_utf8_lossy(&p.payload).into_owned(),
+            dup: p.dup,
+            qos: p.qos as u8,
+        };
+        self.record(ev);
+    }
+
+    /// The connection id of subscriber `i`'s current (or latest) connection.
+    pub fn conn_id(&self, i: usize) -> String {
+        format!("{}#{}", self.subs[i].id, self.subs[i].conn_seq)
+    }
+
+    /// Subscriber `i`'s connection is gone without a DISCONNECT of its own: recorded
+    /// as `ConnectionLost` on its connection id, so the checker's timeline ends the
+    /// right connection (a late-recorded end must not close a newer one).
+    pub fn connection_lost(&mut self, i: usize, why: &str) {
+        self.subs[i].conn = None;
+        let conn = self.conn_id(i);
+        self.record(history_check::Event::ConnectionLost {
+            at_ms: self.at_ms(),
+            client: self.subs[i].id.clone(),
+            why: why.to_string(),
+            conn: Some(conn),
+        });
+    }
+
+    /// A clean DISCONNECT of subscriber `i`, recorded (reason 0: no Will is owed, the
+    /// session keeps its expiry).
+    pub async fn disconnect_subscriber(&mut self, i: usize) {
+        let Some(mut conn) = self.subs[i].conn.take() else {
+            return;
+        };
+        conn.disconnect().await;
+        let conn = self.conn_id(i);
+        self.record(history_check::Event::Disconnect {
+            at_ms: self.at_ms(),
+            client: self.subs[i].id.clone(),
+            reason: 0,
+            session_expiry_s: None,
+            conn: Some(conn),
+        });
     }
 
     /// One `QoS` 1 publish to a seeded subscriber's topic from a fresh publisher
@@ -966,13 +1078,193 @@ impl Proc {
     }
 
     /// Churn a seeded subscriber: disconnect if online, resume if offline.
+    /// A `QoS` 2 publish whose flow may lose its connection part-way (seeded: not at
+    /// all, after the PUBLISH, or after the PUBREC) and is then resumed on another
+    /// node with the same client id and `clean_session = 0`, re-sending what MQTT asks
+    /// re-sent: the PUBLISH with DUP if no PUBREC was seen, else the PUBREL. The
+    /// obligation is the PUBREC (the broker has the message); PUBCOMP completes the
+    /// flow. The publisher's connections are recorded like a subscriber's, so check 2
+    /// judges its resume (present on the other node) and check 6 judges whether the
+    /// re-sent PUBLISH reached any subscriber's application twice (issue #1055).
+    #[allow(clippy::too_many_lines)]
+    pub async fn publish_qos2_step(&mut self) {
+        let s = self.rng.pick(self.subs.len());
+        self.payload_counter += 1;
+        let n = self.payload_counter;
+        let payload = format!("m-{}-{n}", self.seed).into_bytes();
+        let topic = self.subs[s].topic.clone();
+        let pub_id = format!("pub2-{}-{n}", self.seed);
+        let drop_phase = self.rng.range(0, 3);
+        let mut conn_seq = 0u64;
+        let mut pubrec_on: Option<u64> = None;
+        let mut pubcomp = false;
+        let mut dropped = false;
+        let mut resends = 0u32;
+        let deadline = Instant::now() + Duration::from_secs(40);
+        while Instant::now() < deadline && !pubcomp {
+            let alive = self.alive_nodes();
+            if alive.is_empty() {
+                break;
+            }
+            let via = alive[self.rng.pick(alive.len())];
+            let addr = self.nodes[via].client_addr;
+            let Some((mut c, present)) =
+                common::Client::connect_v311_within(addr, &pub_id, false, Duration::from_secs(8))
+                    .await
+            else {
+                // SETTLE(qos2-publisher-reconnect): the node refused the TCP connect
+                // (mid-kill or mid-boot); the step's own 40 s deadline bounds the retries.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                continue;
+            };
+            conn_seq += 1;
+            let conn = format!("{pub_id}#{conn_seq}");
+            self.record(history_check::Event::Connect {
+                at_ms: self.at_ms(),
+                client: pub_id.clone(),
+                via_node: self.nodes[via].id.clone(),
+                session_present: present,
+                clean_start: Some(false),
+                session_expiry_s: None,
+                will: None,
+                conn: Some(conn.clone()),
+            });
+            if pubrec_on.is_none() {
+                let dup = conn_seq > 1;
+                if dup {
+                    resends += 1;
+                }
+                c.publish_qos2(&topic, &payload, 5, dup).await;
+                if drop_phase == 1 && !dropped {
+                    dropped = true;
+                    drop(c);
+                    self.publisher_lost(
+                        &pub_id,
+                        &conn,
+                        "the test dropped the connection after the PUBLISH (QoS 2)",
+                    );
+                    continue;
+                }
+                let wait = Instant::now() + Duration::from_secs(15);
+                let got = loop {
+                    let left = wait.saturating_duration_since(Instant::now());
+                    match c.recv_bounded(left).await {
+                        common::Recv::Packet(Packet::PubRec(a)) if a.pkid == 5 => break Some(true),
+                        common::Recv::Packet(_) => {}
+                        common::Recv::Quiet => break Some(false),
+                        common::Recv::Closed => break None,
+                    }
+                };
+                match got {
+                    Some(true) => pubrec_on = Some(conn_seq),
+                    Some(false) => {
+                        // No PUBREC: not an obligation. Leave by the front door.
+                        c.disconnect().await;
+                        self.publisher_disconnected(&pub_id, &conn);
+                        break;
+                    }
+                    None => {
+                        self.publisher_lost(
+                            &pub_id,
+                            &conn,
+                            "the connection ended while awaiting PUBREC",
+                        );
+                        continue;
+                    }
+                }
+            }
+            if drop_phase == 2 && !dropped {
+                dropped = true;
+                drop(c);
+                self.publisher_lost(
+                    &pub_id,
+                    &conn,
+                    "the test dropped the connection after the PUBREC (QoS 2)",
+                );
+                continue;
+            }
+            if pubrec_on != Some(conn_seq) {
+                resends += 1; // the PUBREL goes out on a later connection than the PUBREC
+            }
+            c.pubrel(5).await;
+            let wait = Instant::now() + Duration::from_secs(15);
+            let got = loop {
+                let left = wait.saturating_duration_since(Instant::now());
+                match c.recv_bounded(left).await {
+                    common::Recv::Packet(Packet::PubComp(a)) if a.pkid == 5 => break Some(true),
+                    common::Recv::Packet(_) => {}
+                    common::Recv::Quiet => break Some(false),
+                    common::Recv::Closed => break None,
+                }
+            };
+            match got {
+                Some(true) => {
+                    pubcomp = true;
+                    c.disconnect().await;
+                    self.publisher_disconnected(&pub_id, &conn);
+                }
+                Some(false) => {
+                    drop(c);
+                    self.publisher_lost(
+                        &pub_id,
+                        &conn,
+                        "no PUBCOMP within 15 s; the test dropped the connection",
+                    );
+                }
+                None => self.publisher_lost(
+                    &pub_id,
+                    &conn,
+                    "the connection ended while awaiting PUBCOMP",
+                ),
+            }
+        }
+        let acked = pubrec_on.is_some();
+        self.record(history_check::Event::Publish {
+            at_ms: self.at_ms(),
+            publisher: pub_id.clone(),
+            topic: topic.clone(),
+            payload: String::from_utf8_lossy(&payload).into_owned(),
+            acked,
+            seq: n,
+        });
+        if acked {
+            self.acked.entry(topic.clone()).or_default().push(payload);
+        }
+        self.note(format!(
+            "qos2 publish #{n} to {topic}: {} (drop phase {drop_phase}, {conn_seq} connection(s), \
+             {resends} re-send(s), PUBCOMP {pubcomp})",
+            if acked {
+                "ACKED (PUBREC, obligation)"
+            } else {
+                "not acked"
+            }
+        ));
+    }
+
+    fn publisher_lost(&mut self, client: &str, conn: &str, why: &str) {
+        self.record(history_check::Event::ConnectionLost {
+            at_ms: self.at_ms(),
+            client: client.to_string(),
+            why: why.to_string(),
+            conn: Some(conn.to_string()),
+        });
+    }
+
+    fn publisher_disconnected(&mut self, client: &str, conn: &str) {
+        self.record(history_check::Event::Disconnect {
+            at_ms: self.at_ms(),
+            client: client.to_string(),
+            reason: 0,
+            session_expiry_s: None,
+            conn: Some(conn.to_string()),
+        });
+    }
+
     pub async fn churn_step(&mut self) {
         let s = self.rng.pick(self.subs.len());
         if self.subs[s].conn.is_some() {
             self.drain_subscriber(s).await;
-            if let Some(mut conn) = self.subs[s].conn.take() {
-                conn.disconnect().await;
-            }
+            self.disconnect_subscriber(s).await;
             self.note(format!("subscriber {} disconnected", self.subs[s].id));
         } else {
             self.bring_subscriber_online(s, false).await;
@@ -1050,10 +1342,12 @@ impl Proc {
         self.nodes[victim].kill().await;
         self.alive[victim] = false;
         let id = self.nodes[victim].id.clone();
-        for sub in &mut self.subs {
-            if sub.conn.is_some() && sub.via_node == victim {
-                sub.conn = None; // its connection died with the process
-            }
+        let lost: Vec<usize> = (0..self.subs.len())
+            .filter(|i| self.subs[*i].conn.is_some() && self.subs[*i].via_node == victim)
+            .collect();
+        for i in lost {
+            // Its connection died with the process.
+            self.connection_lost(i, &format!("node {id} SIGKILLed"));
         }
         let acked = burst.await.unwrap_or_default();
         let owed = acked.len();
@@ -1353,17 +1647,25 @@ pub async fn establish_subscribers(proc: &mut Proc, n: usize) {
         proc.subs.push(Subscriber {
             id: format!("psub-{seed}-{i}"),
             topic: format!("pr/{seed}/{i}"),
+            qos: if i % 2 == 1 {
+                QoS::ExactlyOnce
+            } else {
+                QoS::AtLeastOnce
+            },
             conn: None,
             via_node: 0,
             established: false,
             received: BTreeSet::new(),
+            conn_seq: 0,
+            qos2_inbound: BTreeSet::new(),
         });
         proc.bring_subscriber_online(i, true).await;
         let topic = proc.subs[i].topic.clone();
+        let qos = proc.subs[i].qos;
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let sub = proc.subs[i].conn.as_mut().unwrap();
-            let ack = sub.subscribe(1, &topic, QoS::AtLeastOnce).await;
+            let ack = sub.subscribe(1, &topic, qos).await;
             if ack.return_codes.iter().all(|c| *c != 0x80) {
                 let ev = history_check::Event::Subscribe {
                     at_ms: proc.at_ms(),
@@ -1421,9 +1723,7 @@ pub async fn oracle_acked_facts(proc: &mut Proc) {
     for i in 0..proc.subs.len() {
         if proc.subs[i].conn.is_some() {
             proc.drain_subscriber(i).await;
-            if let Some(mut conn) = proc.subs[i].conn.take() {
-                conn.disconnect().await;
-            }
+            proc.disconnect_subscriber(i).await;
         }
         let topic = proc.subs[i].topic.clone();
         let owed = proc.acked.get(&topic).cloned().unwrap_or_default();

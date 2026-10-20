@@ -112,7 +112,8 @@ async fn run_schedule(seed: u64) {
             continue;
         }
         match proc.rng.range(0, 100) {
-            0..=34 => proc.publish_step().await,
+            0..=22 => proc.publish_step().await,
+            23..=34 => proc.publish_qos2_step().await,
             35..=57 => proc.retained_step().await,
             58..=73 => proc.churn_step().await,
             74..=87 => proc.flap_step(),
@@ -121,10 +122,17 @@ async fn run_schedule(seed: u64) {
     }
     let count = |needle: &str| proc.trace.iter().filter(|l| l.contains(needle)).count();
     eprintln!(
-        "cluster_proc: seed {seed} schedule: {} publishes ({} owed), {} retained, \
-         {} sigkills (mid-burst), {} restarts, {} severs, {} slows",
-        count("publish #"),
+        "cluster_proc: seed {seed} schedule: {} publishes ({} owed), {} QoS 2 publishes \
+         ({} owed, {} with re-sends), {} retained, {} sigkills (mid-burst), {} restarts, \
+         {} severs, {} slows",
+        count("publish #") - count("qos2 publish #"),
         count("ACKED (obligation)"),
+        count("qos2 publish #"),
+        count("ACKED (PUBREC, obligation)"),
+        proc.trace
+            .iter()
+            .filter(|l| l.contains("qos2 publish #") && !l.contains(" 0 re-send(s)"))
+            .count(),
         count("retained set #"),
         count("SIGKILLED"),
         count("RESTARTED"),
@@ -273,6 +281,7 @@ async fn run_schedule(seed: u64) {
     // nightly job archives what was checked (and the checker binary can re-run
     // it standalone).
     let violations = history_check::check(&proc.history);
+    proc.keep_logs();
     if let Ok(dir) = std::env::var("MQTTD_PROC_HISTORY_DIR") {
         let _ = std::fs::create_dir_all(&dir);
         let path = std::path::Path::new(&dir).join(format!("seed-{seed}.jsonl"));
@@ -999,10 +1008,13 @@ async fn subscribe_on_owner(proc: &mut proc_common::Proc, i: usize, client: &str
                 proc.subs.push(proc_common::Subscriber {
                     id: client.to_string(),
                     topic: topic.clone(),
+                    qos: QoS::AtLeastOnce,
                     conn: Some(conn),
                     via_node: i,
                     established: true,
                     received: std::collections::BTreeSet::new(),
+                    conn_seq: 1,
+                    qos2_inbound: std::collections::BTreeSet::new(),
                 });
                 let at_ms = proc.at_ms();
                 let via_node = proc.nodes[i].id.clone();

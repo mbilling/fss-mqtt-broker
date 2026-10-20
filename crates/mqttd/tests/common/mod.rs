@@ -728,6 +728,20 @@ impl Client {
         .await;
     }
 
+    /// A `QoS` 2 PUBLISH; `dup` is set on a re-send after a reconnect [MQTT-3.3.1-1].
+    pub async fn publish_qos2(&mut self, topic: &str, payload: &[u8], pkid: u16, dup: bool) {
+        self.send(&Packet::Publish(Publish {
+            properties: Properties::new(),
+            dup,
+            qos: QoS::ExactlyOnce,
+            retain: false,
+            topic: topic.into(),
+            pkid: Some(pkid),
+            payload: bytes::Bytes::copy_from_slice(payload),
+        }))
+        .await;
+    }
+
     /// Publish a retained message (`QoS` 0).
     pub async fn publish_retained(&mut self, topic: &str, payload: &[u8]) {
         self.send(&Packet::Publish(Publish {
