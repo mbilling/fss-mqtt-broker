@@ -728,9 +728,23 @@ impl Client {
         .await;
     }
 
+    /// Like [`send`](Self::send), for a harness whose broker may die under the
+    /// connection: a write the kernel refuses (the peer closed or reset) is `Err`, not
+    /// a panic, so the caller records the connection lost and carries on.
+    pub async fn try_send(&mut self, packet: &Packet) -> Result<(), ()> {
+        self.writer.send(packet).await.map_err(|_| ())
+    }
+
     /// A `QoS` 2 PUBLISH; `dup` is set on a re-send after a reconnect [MQTT-3.3.1-1].
-    pub async fn publish_qos2(&mut self, topic: &str, payload: &[u8], pkid: u16, dup: bool) {
-        self.send(&Packet::Publish(Publish {
+    /// `Err` when the connection is already gone (see [`try_send`](Self::try_send)).
+    pub async fn publish_qos2(
+        &mut self,
+        topic: &str,
+        payload: &[u8],
+        pkid: u16,
+        dup: bool,
+    ) -> Result<(), ()> {
+        self.try_send(&Packet::Publish(Publish {
             properties: Properties::new(),
             dup,
             qos: QoS::ExactlyOnce,
@@ -739,7 +753,25 @@ impl Client {
             pkid: Some(pkid),
             payload: bytes::Bytes::copy_from_slice(payload),
         }))
-        .await;
+        .await
+    }
+
+    /// A DISCONNECT that tolerates a connection the broker has already closed, and
+    /// waits (briefly) for the close without asserting it — for a harness client whose
+    /// broker may have died. Whatever still arrives is dropped.
+    pub async fn disconnect_tolerant(&mut self) {
+        let _ = self
+            .try_send(&Packet::Disconnect(
+                mqtt_codec::packet::Disconnect::default(),
+            ))
+            .await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match self.recv_bounded(Duration::from_millis(300)).await {
+                Recv::Packet(_) => {}
+                Recv::Quiet | Recv::Closed => return,
+            }
+        }
     }
 
     /// Publish a retained message (`QoS` 0).

@@ -858,9 +858,13 @@ impl Proc {
                     // The broker completes a `QoS` 2 flow this client answered PUBREC,
                     // on this connection or an earlier one.
                     let pkid = a.pkid;
-                    match self.subs[i].conn.as_mut() {
-                        Some(c) => c.pubcomp(pkid).await,
+                    let sent = match self.subs[i].conn.as_mut() {
+                        Some(c) => c.try_send(&Packet::PubComp(pkid.into())).await,
                         None => return,
+                    };
+                    if sent.is_err() {
+                        self.connection_lost(i, "the connection closed under a PUBCOMP");
+                        return;
                     }
                     if !self.subs[i].qos2_inbound.remove(&pkid) {
                         let id = self.subs[i].id.clone();
@@ -895,9 +899,13 @@ impl Proc {
             (QoS::AtMostOnce, _) | (_, None) => {}
             (QoS::ExactlyOnce, Some(pkid)) => {
                 let repeat = self.subs[i].qos2_inbound.contains(&pkid);
-                match self.subs[i].conn.as_mut() {
-                    Some(c) => c.pubrec(pkid).await,
+                let sent = match self.subs[i].conn.as_mut() {
+                    Some(c) => c.try_send(&Packet::PubRec(pkid.into())).await,
                     None => return,
+                };
+                if sent.is_err() {
+                    self.connection_lost(i, "the connection closed under a PUBREC");
+                    return;
                 }
                 if repeat {
                     let id = self.subs[i].id.clone();
@@ -920,10 +928,16 @@ impl Proc {
                 }
                 self.subs[i].qos2_inbound.insert(pkid);
             }
-            (QoS::AtLeastOnce, Some(pkid)) => match self.subs[i].conn.as_mut() {
-                Some(c) => c.puback(pkid).await,
-                None => return,
-            },
+            (QoS::AtLeastOnce, Some(pkid)) => {
+                let sent = match self.subs[i].conn.as_mut() {
+                    Some(c) => c.try_send(&Packet::PubAck(pkid.into())).await,
+                    None => return,
+                };
+                if sent.is_err() {
+                    self.connection_lost(i, "the connection closed under a PUBACK");
+                    return;
+                }
+            }
         }
         self.subs[i].received.insert(p.payload.to_vec());
         let ev = history_check::Event::Deliver {
@@ -1134,7 +1148,10 @@ impl Proc {
                 if dup {
                     resends += 1;
                 }
-                c.publish_qos2(&topic, &payload, 5, dup).await;
+                if c.publish_qos2(&topic, &payload, 5, dup).await.is_err() {
+                    self.publisher_lost(&pub_id, &conn, "the connection closed under the PUBLISH");
+                    continue;
+                }
                 if drop_phase == 1 && !dropped {
                     dropped = true;
                     drop(c);
@@ -1159,7 +1176,7 @@ impl Proc {
                     Some(true) => pubrec_on = Some(conn_seq),
                     Some(false) => {
                         // No PUBREC: not an obligation. Leave by the front door.
-                        c.disconnect().await;
+                        c.disconnect_tolerant().await;
                         self.publisher_disconnected(&pub_id, &conn);
                         break;
                     }
@@ -1186,7 +1203,10 @@ impl Proc {
             if pubrec_on != Some(conn_seq) {
                 resends += 1; // the PUBREL goes out on a later connection than the PUBREC
             }
-            c.pubrel(5).await;
+            if c.try_send(&Packet::PubRel(5.into())).await.is_err() {
+                self.publisher_lost(&pub_id, &conn, "the connection closed under the PUBREL");
+                continue;
+            }
             let wait = Instant::now() + Duration::from_secs(15);
             let got = loop {
                 let left = wait.saturating_duration_since(Instant::now());
@@ -1200,7 +1220,7 @@ impl Proc {
             match got {
                 Some(true) => {
                     pubcomp = true;
-                    c.disconnect().await;
+                    c.disconnect_tolerant().await;
                     self.publisher_disconnected(&pub_id, &conn);
                 }
                 Some(false) => {
