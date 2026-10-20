@@ -4690,7 +4690,8 @@ impl Hub {
     }
 
     /// Publish a client's Will message (on takeover or an ungraceful end). Carries the
-    /// will's own application properties (ADR 0030); a will never sets a message-expiry.
+    /// will's own application properties (ADR 0030) and its own Message Expiry Interval,
+    /// sent as the publication's (§3.1.3.2.4, issue #1033).
     ///
     /// UNGATED, and that is load-bearing (issue #238): there is no publisher to refuse
     /// and nothing that will retry, so a Will whose durable copy a watermark refuses is
@@ -4762,7 +4763,7 @@ impl Hub {
                     qos: w.qos,
                     retain: w.retain,
                     app: &w.app,
-                    message_expiry: None,
+                    message_expiry: will.expiry_secs,
                 };
                 rules.on_will_from(&facts, origin.as_deref(), |cmd| {
                     let _ = self_tx.send(cmd);
@@ -7369,7 +7370,8 @@ impl Hub {
             // `graceful = false`, decided deliberately (round-2 finding 2). `graceful`
             // controls exactly one thing — will publication — and suppressing it here
             // would make the rehome the ONLY broker-initiated close that hides a will:
-            // session takeover and `evict` both fire it, and issue #265 existed precisely
+            // `evict` fires it, as a session takeover does unless the new connection
+            // resumes the session inside the Will Delay (#1033), and issue #265 existed precisely
             // because broker-initiated closes were silently NOT firing it (its exit 1:
             // "every broker-initiated close fires the Will"; its exit 2, documenting
             // suppression, was rejected as a spec violation). The spec agrees:
@@ -9193,6 +9195,35 @@ async fn recover_session(
     });
 }
 
+/// A clean start's durable half, shared by the spawned discard and the session's append
+/// lane: remove the prior session, and record the NEW one when it outlives this
+/// connection (a non-zero expiry), bound to its owner (ADR 0031), as a non-clean
+/// attach records it through `recover_once`. Without the record the session existed
+/// only once its first subscription wrote one: a resume of a session with no
+/// subscriptions answered Session Present 0 (issue #1034), its owner unbound. Both
+/// steps are best-effort; a refused or failed claim is logged.
+pub(super) async fn clean_start_store(store: &Arc<dyn SessionStore>, pending: &PendingAttach) {
+    let _ = store.remove(&pending.client).await;
+    if pending.session_expiry == 0 {
+        return;
+    }
+    match store
+        .claim_session(&pending.client, &pending.admission.identity.subject)
+        .await
+    {
+        Ok(SessionClaim::Granted { .. }) => {}
+        Ok(SessionClaim::Denied { owner }) => warn!(
+            client = %pending.client.0, %owner,
+            "clean start: the new session's record is held by another identity"
+        ),
+        Err(error) => warn!(
+            client = %pending.client.0, %error,
+            "clean start: the new session could not be recorded; a resume before its \
+             first subscription will answer session_present = false"
+        ),
+    }
+}
+
 /// Discard a clean-start client's prior **durable** state off the hub command loop, then
 /// post `SessionRecovered::Cleaned` so the fresh session registers on the loop (ADR
 /// 0017). The `remove` can do a first-touch group recovery on a cold owner; running it
@@ -9204,18 +9235,7 @@ async fn discard_session(
     self_tx: mpsc::UnboundedSender<HubCommand>,
     pending: PendingAttach,
 ) {
-    let _ = store.remove(&pending.client).await;
-    // A clean start with a non-zero expiry begins a NEW session that outlives this
-    // connection, so it is recorded now, bound to its owner (ADR 0031), as a
-    // non-clean attach records it through `recover_once`. Without the record, the
-    // session existed only until its first subscription wrote one: a resume of a
-    // session with no subscriptions answered Session Present 0 (issue #1034), and
-    // its owner was unbound. Best-effort like the remove above.
-    if pending.session_expiry != 0 {
-        let _ = store
-            .claim_session(&pending.client, &pending.admission.identity.subject)
-            .await;
-    }
+    clean_start_store(&store, &pending).await;
     let _ = self_tx.send(HubCommand::SessionRecovered {
         pending: Box::new(pending),
         recovery: SessionRecovery::Cleaned,
@@ -19291,8 +19311,9 @@ mod tests {
     ///
     /// A server DISCONNECT is not a client DISCONNECT: [MQTT-3.1.2-8] / §3.14.4 delete the
     /// will only on a client DISCONNECT with reason `0x00`. Suppressing it would also make
-    /// the rehome the ONLY broker-initiated close that hides a will — session takeover and
-    /// `evict` both publish it, and issue #265 existed because broker-initiated closes were
+    /// the rehome the ONLY broker-initiated close that hides a will — `evict` publishes it,
+    /// as a session takeover does unless the new connection resumes the session inside the
+    /// Will Delay (#1033), and issue #265 existed because broker-initiated closes were
     /// silently NOT publishing it.
     ///
     /// The control in the same test is the anti-overcorrection partner: a client's own
