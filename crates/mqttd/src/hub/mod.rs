@@ -1077,12 +1077,18 @@ struct Inflight {
     /// prefix, so an out-of-order PUBACK cannot discard a message still in flight
     /// behind it.
     outstanding: BTreeSet<Offset>,
-    /// Offsets the subscriber has acknowledged that sit ABOVE the truncation watermark
-    /// (issue #1056): an older entry still owed — a `QoS` 2 flow whose PUBREL is
-    /// withheld, say — keeps [`safe_ack`](Self::safe_ack) below them, so they stay in
-    /// the durable queue although they are settled. A resume must not replay them as
-    /// new messages; [`advance_ack`](Self::advance_ack) forgets them once truncation
-    /// covers them.
+    /// Offsets settled (acknowledged by the subscriber, or evicted by the drop-oldest
+    /// backlog bound) that sit ABOVE the truncation watermark (issue #1056): an older
+    /// entry still owed — a `QoS` 2 flow whose PUBREL is withheld, say — keeps
+    /// [`safe_ack`](Self::safe_ack) below them, so they stay in the durable queue
+    /// although nothing is owed for them. A resume must not replay them as new
+    /// messages; [`advance_ack`](Self::advance_ack) forgets them once the watermark
+    /// covers them, and [`settled_above_watermark`](Self::settled_above_watermark)
+    /// treats everything at or below the watermark as settled from then on. The
+    /// `QoS` 2 retire path moves `acked_through` without pruning this set; what it
+    /// leaves below the watermark is redundant there and pruned by the next advance.
+    /// Memory-only: a restart or an ownership move while a hole stands starts empty
+    /// (the residual is #1058's).
     released: BTreeSet<Offset>,
     /// The highest offset ever tracked, so a fully drained session truncates its whole
     /// log rather than stalling at the last released offset.
@@ -1156,10 +1162,12 @@ impl Inflight {
         }
     }
 
-    /// Whether `offset` was acknowledged by an earlier connection and only awaits
-    /// truncation (issue #1056).
+    /// Whether `offset` was settled on an earlier connection and only awaits
+    /// truncation (issue #1056). At or below `acked_through` it is settled by
+    /// construction, whether or not the detached truncation (ADR 0074) has committed:
+    /// a resume in that window reads it back and must not send it again.
     fn settled_above_watermark(&self, offset: Offset) -> bool {
-        self.released.contains(&offset)
+        offset <= self.acked_through || self.released.contains(&offset)
     }
 
     /// Contiguous prefix no longer owed to the subscriber. This is eligibility for
@@ -15053,8 +15061,6 @@ mod tests {
         assert!(store.outbound(&c).await.unwrap()[0].pubrec_seen);
     }
 
-    /// ADR 0057 excludes `QoS` 1 by design: a fresh-id DUP redelivery is what
-    /// at-least-once means, so persisting its id would buy nothing.
     /// Issue #1056: a `QoS` 2 flow whose PUBREL is withheld keeps the truncation
     /// watermark below everything delivered after it. The `QoS` 1 messages behind it
     /// are acknowledged — settled, not owed — yet stay in the durable queue. A resume
@@ -15125,6 +15131,8 @@ mod tests {
         );
     }
 
+    /// ADR 0057 excludes `QoS` 1 by design: a fresh-id DUP redelivery is what
+    /// at-least-once means, so persisting its id would buy nothing.
     #[tokio::test]
     async fn a_qos1_delivery_records_no_outbound_id() {
         let store = std::sync::Arc::new(MemorySessionStore::new());
