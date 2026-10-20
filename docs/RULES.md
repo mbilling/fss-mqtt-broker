@@ -2322,8 +2322,12 @@ messages, in a store inside the broker that only rules read and write
 | A value **another topic** delivered earlier | `kv_set` in one rule, `kv_get` in another | [22](RULES-COOKBOOK.md#22-enrich-with-the-last-known-value) |
 | A rule from EMQX that calls `kv_store_*` or `proc_dict_*` | it runs as it is | [23](RULES-COOKBOOK.md#23-a-rule-from-emqx-that-uses-kv_store) |
 
-Three things to know before anything else:
+Four things to know before anything else:
 
+- **State is experimental in this release.** It stays so until it is durable (a
+  snapshot to disk, then `strong` consistency; ADR 0085 T10 and T9). A file that uses
+  it loads with a warning saying so, and the state functions, `[state.<name>]` and the
+  state admin routes may still change in a minor release.
 - **State is in memory.** A node that restarts has none. A namespace declared
   `consistency = "eventual"` is held by every node of the cluster and given back to a
   restarted node by the others; if every node stops at once it is gone. No backup

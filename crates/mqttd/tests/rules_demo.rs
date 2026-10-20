@@ -8,8 +8,8 @@
 //! the derived messages a `QoS` 1 subscriber receives are exactly `rules_demo.expected`
 //! beside this file: topic, `QoS`, retain flag and payload, with nothing missing and
 //! nothing extra. It also checks that the simulator is deterministic, that the rules file
-//! passes `--check-rules` with no warning, and that every derived message the README quotes
-//! is one the fixture produces.
+//! passes `--check-rules` warning only that rule state is experimental, and that every
+//! derived message the README quotes is one the fixture produces.
 //!
 //! The live simulator (`live.py`, which the demo stack in `demo/rules-live/` runs) plays the
 //! same ten minutes endlessly, in windows aligned to the wall clock. Its tests here check
@@ -589,7 +589,8 @@ fn the_simulator_is_deterministic() {
     );
 }
 
-/// `mqttd --check-rules` loads the demo's file with no warning.
+/// `mqttd --check-rules` loads the demo's file with no warning but the one that rule
+/// state is experimental (the demo keeps state; ADR 0085 T9, T10).
 #[test]
 fn the_demo_rules_file_checks_clean() {
     let out = mqttd()
@@ -603,9 +604,10 @@ fn the_demo_rules_file_checks_clean() {
         "--check-rules failed:\n{}{stderr}",
         String::from_utf8_lossy(&out.stdout)
     );
-    assert!(
-        !stderr.contains("WARN") && !stderr.to_lowercase().contains("warning"),
-        "--check-rules warned:\n{stderr}"
+    assert_eq!(
+        stderr,
+        format!("warning: {}\n", mqtt_rules::STATE_EXPERIMENTAL_WARNING),
+        "--check-rules warned"
     );
 }
 

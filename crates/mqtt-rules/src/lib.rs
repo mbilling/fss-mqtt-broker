@@ -125,6 +125,14 @@ pub const MAX_REGEX_LITERALS_PER_FILE: usize = 512;
 /// together (see [`MAX_REGEX_LITERALS_PER_FILE`]).
 pub const MAX_REGEX_LITERAL_BYTES_PER_FILE: usize = 256 * 1024;
 
+/// The load warning of a file that holds rule state (ADR 0085): the store is
+/// experimental until it is durable (ADR 0085 T9, T10), because a whole-cluster
+/// restart loses all of it.
+pub const STATE_EXPERIMENTAL_WARNING: &str =
+    "rule state is EXPERIMENTAL in this release: it is held in memory, a restarted node \
+     comes back without its `local` namespaces and `kv_store`, and when every node stops \
+     at once all of it is gone. Keep in it only what a rule can rebuild (ADR 0085)";
+
 /// A rule statement that does not parse.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{message} (line {line}, column {column}, near `{near}`)")]
@@ -895,6 +903,9 @@ impl RuleSet {
                  they do not share keys (kv_get does not read what kv_store_put wrote)"
                     .to_string(),
             );
+        }
+        if loading.state.holds_any() {
+            warnings.push(STATE_EXPERIMENTAL_WARNING.to_string());
         }
         set.state = loading.state.into_bindings();
         set.warnings.clone_from(&warnings);

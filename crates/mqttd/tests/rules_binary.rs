@@ -5596,8 +5596,12 @@ fn check_rules_loads_rule_state_and_refuses_it_where_it_is_switched_off() {
     assert_eq!(ran.code, Some(0), "{ran:?}");
     assert_eq!(
         ran.stderr,
-        "warning: the file calls both EMQX's kv_store_* functions and mqttd's kv_* functions: \
-         they do not share keys (kv_get does not read what kv_store_put wrote)\n"
+        format!(
+            "warning: the file calls both EMQX's kv_store_* functions and mqttd's kv_* \
+             functions: they do not share keys (kv_get does not read what kv_store_put \
+             wrote)\nwarning: {}\n",
+            mqtt_rules::STATE_EXPERIMENTAL_WARNING
+        )
     );
     assert!(
         ran.stdout
@@ -5890,9 +5894,12 @@ actions = [{ function = "console" }]
                 state at the end (+300s):\n  \
                 alerts: \"hot:s1\" = 1735689600000 (first, expires +7200s)\n  \
                 kv_store: \"alerts\" = 1 (lww)\n";
-    let warning = "warning: the file calls both EMQX's kv_store_* functions and mqttd's kv_* \
-                   functions: they do not share keys (kv_get does not read what kv_store_put \
-                   wrote)\n";
+    let warning = format!(
+        "warning: the file calls both EMQX's kv_store_* functions and mqttd's kv_* \
+         functions: they do not share keys (kv_get does not read what kv_store_put \
+         wrote)\nwarning: {}\n",
+        mqtt_rules::STATE_EXPERIMENTAL_WARNING
+    );
     let mut by_env = mqttd();
     by_env
         .args([

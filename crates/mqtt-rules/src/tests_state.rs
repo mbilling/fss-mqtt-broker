@@ -264,7 +264,8 @@ sql = '''SELECT kv_set('alerts:x', 2) AS v, kv_store_get('p') AS p FROM "t/#"'''
         loaded.warnings,
         [
             "the file calls both EMQX's kv_store_* functions and mqttd's kv_* functions: they do \
-          not share keys (kv_get does not read what kv_store_put wrote)"
+          not share keys (kv_get does not read what kv_store_put wrote)",
+            crate::STATE_EXPERIMENTAL_WARNING,
         ]
     );
 }

@@ -189,6 +189,46 @@ impl std::ops::Index<&u64> for PendingTable {
     }
 }
 
+/// How many settle passes a forward is held for a takeover that stays open (issue
+/// #1031) before it is answered `Failed` instead. A pass runs every tick and again
+/// at every scan landing, and during an open window a scan lands about every tick,
+/// so in practice this is nearer 15 s than 30 s. A takeover's scan lands in well
+/// under a second on a healthy node; this bounds only a takeover that keeps
+/// re-arming.
+pub(super) const HELD_FORWARD_MAX_TICKS: u16 = 30;
+
+/// The most forwards one node holds for a takeover at once (issue #1031). Each holds
+/// its payload; past this a matched forward is answered `Failed` at once ("cannot
+/// say, retry") rather than held, so a burst during a takeover costs bounded memory.
+pub(super) const MAX_HELD_FORWARDS: usize = 4096;
+
+/// An acked forward whose answer waits for the scan of this node's open takeover
+/// (issue #1031): what it carried, who its fan-out reached, when it arrived, and
+/// which scan can release it. See [`Hub::hold_forward_for_takeover`].
+#[derive(Debug)]
+pub(super) struct HeldForward {
+    pub(super) node: NodeId,
+    pub(super) seq: u64,
+    pub(super) topic: String,
+    pub(super) payload: Bytes,
+    pub(super) qos: QoS,
+    pub(super) message_expiry: Option<u32>,
+    pub(super) app: AppProperties,
+    /// The sessions the fan-out handed it at arrival.
+    pub(super) reached: HashSet<ClientId>,
+    pub(super) since: Instant,
+    /// Settle passes it has waited through.
+    pub(super) ticks: u16,
+    /// The number of the latest scan started before the hold: only a scan numbered
+    /// above it can release it (a scan already in flight at the hold may have read
+    /// before the session's group was this node's).
+    pub(super) after_scan: u64,
+    /// A complete scan numbered above `after_scan`, started under the ownership
+    /// that holds now, has landed: the sessions the takeover was bringing are
+    /// materialised, which is what the hold waited for.
+    pub(super) scan_landed: bool,
+}
+
 #[allow(clippy::struct_excessive_bools)]
 /// A `QoS` 1 publish whose acknowledgement is gated on **cluster-wide** durability
 /// (ADR 0042 T9): the local fan-out's durable appends (synchronous), the retained
@@ -693,6 +733,177 @@ impl Hub {
         clients: impl ExactSizeIterator<Item = ClientId>,
     ) {
         self.pending_publishes.note_reached(id, clients);
+    }
+
+    /// Hold the answer to acked forward `(node, seq)` (issue #1031): its fan-out
+    /// matched a subscriber here while this node's takeover is open, so answering
+    /// `Reached` now would release the origin's ack although a session this node is
+    /// still materialising may be owed the publish too. The live deliveries have
+    /// happened; what they reached is recorded, the verdict gate is marked held (its
+    /// appends then answer nothing), and [`settle_held_forwards`](Self::settle_held_forwards)
+    /// finishes the job once a complete scan started after the hold has landed —
+    /// not the whole settle window, which outlives the scan by seconds. A retransmit
+    /// of the forward meanwhile finds the gate in flight and is absorbed, as today.
+    /// Past [`MAX_HELD_FORWARDS`] the forward is answered `Failed` instead.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn hold_forward_for_takeover(
+        &mut self,
+        node: NodeId,
+        seq: u64,
+        topic: String,
+        payload: Bytes,
+        qos: QoS,
+        retain: bool,
+        message_expiry: Option<u32>,
+        app: AppProperties,
+    ) {
+        if self.held_forwards.len() >= MAX_HELD_FORWARDS {
+            debug!(origin = %node.0, seq, "held-forward cap reached; answered Failed (#1031)");
+            self.finish_peer_verdict(&node, seq, DurableOutcome::Failed, false, true);
+            return;
+        }
+        let reached: HashSet<ClientId> = self
+            .ordinary_targets(&topic, None, retain)
+            .into_iter()
+            .map(|(c, _, _)| c)
+            .collect();
+        let gate = self
+            .remote_append_pending
+            .entry((node.clone(), seq))
+            .or_insert(RemoteAppendGate {
+                awaiting: 0,
+                worst: DurableOutcome::Ok,
+                congested: false,
+                answered: false,
+                reached: true,
+                held: false,
+            });
+        gate.reached = true;
+        gate.held = true;
+        debug!(
+            origin = %node.0, seq, topic = %topic, matched = reached.len(),
+            "forward matched during an open takeover; answer held until the scan lands (#1031)"
+        );
+        self.held_forwards.push(HeldForward {
+            node,
+            seq,
+            topic,
+            payload,
+            qos,
+            message_expiry,
+            app,
+            reached,
+            since: Instant::now(),
+            ticks: 0,
+            after_scan: self.scan_started.0,
+            scan_landed: false,
+        });
+    }
+
+    /// Complete scan number `scan` landed under the ownership that holds now: every
+    /// forward held before it started may be released by the next settle pass
+    /// (issue #1031).
+    pub(super) fn note_scan_landed(&mut self, scan: u64) {
+        for h in &mut self.held_forwards {
+            if scan > h.after_scan {
+                h.scan_landed = true;
+            }
+        }
+    }
+
+    /// Release the forwards held for an open takeover (issue #1031) once a complete
+    /// scan started after the hold has landed, or the takeover is no longer open
+    /// (then nothing more is coming, and the answer is what it is outside one):
+    /// each is re-applied to the sessions materialised since it arrived —
+    /// the ones its fan-out did not reach, that existed when it was made (#1011) —
+    /// as a replay (#784: a session already holding the publish is skipped), and
+    /// then answered with the combined verdict; a re-apply that submitted appends is
+    /// answered by its last one. Called wherever the settle pass is, so a window
+    /// that never closes answers `Failed` after [`HELD_FORWARD_MAX_TICKS`]: "cannot
+    /// say, retry", today's answer to a fan-out that matched nobody mid-takeover.
+    pub(super) fn settle_held_forwards(&mut self) {
+        if self.held_forwards.is_empty() {
+            return;
+        }
+        let takeover_over = !self.takeover_open();
+        let held = std::mem::take(&mut self.held_forwards);
+        let mut timed_out = 0usize;
+        for mut h in held {
+            h.ticks += 1;
+            let release = takeover_over || h.scan_landed;
+            if !release && h.ticks < HELD_FORWARD_MAX_TICKS {
+                self.held_forwards.push(h);
+                continue;
+            }
+            let out = if release {
+                self.reapply_held_forward(&h)
+            } else {
+                timed_out += 1;
+                DurableOutcome::Failed
+            };
+            let key = (h.node.clone(), h.seq);
+            let Some(g) = self.remote_append_pending.get_mut(&key) else {
+                self.answer_forward(&h.node, h.seq, out.to_verdict_reached(true));
+                continue;
+            };
+            g.held = false;
+            g.worst = g.worst.and(out);
+            if g.awaiting == 0 {
+                if let Some(g) = self.remote_append_pending.remove(&key) {
+                    self.answer_forward(&h.node, h.seq, g.worst.to_verdict_reached(true));
+                }
+            }
+        }
+        if timed_out > 0 {
+            warn!(
+                forwards = timed_out,
+                "takeover still open after {HELD_FORWARD_MAX_TICKS} settle passes; held \
+                 forwards answered Failed rather than held longer (their publishers retry)"
+            );
+        }
+    }
+
+    /// Hand held forward `h` to the sessions it is still owed to (see
+    /// [`settle_held_forwards`](Self::settle_held_forwards)).
+    fn reapply_held_forward(&mut self, h: &HeldForward) -> DurableOutcome {
+        let targets: Vec<(ClientId, QoS)> = self
+            .table
+            .matching_clients(&h.topic)
+            .into_iter()
+            .filter(|c| !h.reached.contains(c))
+            .filter(|c| {
+                self.online
+                    .get(c)
+                    .is_none_or(|o| o.resumed && o.attached_at > h.since)
+            })
+            .map(|c| {
+                let granted = self.granted_qos(&c, &h.topic);
+                (c, granted)
+            })
+            .collect();
+        debug!(
+            origin = %h.node.0, seq = h.seq, topic = %h.topic, sessions = targets.len(),
+            "takeover closed; a held forward is handed to the sessions materialised since (#1031)"
+        );
+        let mut all = DurableOutcome::Ok;
+        for (c, granted) in targets {
+            all = all.and(self.deliver_to_client(
+                &c,
+                &h.topic,
+                &h.payload,
+                min_qos(h.qos, granted),
+                h.message_expiry,
+                &h.app,
+                false,
+                &AppendGate::Peer {
+                    node: h.node.clone(),
+                    seq: h.seq,
+                    origin: None,
+                    replay: true,
+                },
+            ));
+        }
+        all
     }
 
     /// The takeover window closed for this node (an inherited-session scan just
