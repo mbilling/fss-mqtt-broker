@@ -1467,7 +1467,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 835 test(s)
+## `crates/mqttd/src/lib.rs` — 837 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1841,6 +1841,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_restarted_owners_snapshot_exports_committed_tokens_and_readopts_the_record`
 - `hub::tests::a_restore_skips_a_retained_sys_value_and_goes_on`
 - `hub::tests::a_restored_retained_value_is_retained_state_and_never_touches_a_restored_queue`
+- `hub::tests::a_resume_does_not_replay_messages_acknowledged_behind_a_withheld_pubrel`
 - `hub::tests::a_resumed_session_loses_grants_the_current_policy_denies`
 - `hub::tests::a_retained_commit_in_the_interest_window_reaches_the_fresh_subscriber`
 - `hub::tests::a_retained_publish_refused_by_brownout_leaves_the_previous_retained_value_intact`
@@ -2076,6 +2077,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::the_raw_broadcast_no_longer_warms_caches_under_durable`
 - `hub::tests::the_rehome_scan_is_skipped_while_ownership_has_not_moved`
 - `hub::tests::the_replication_capability_needs_every_member_at_proto_9`
+- `hub::tests::the_resume_skip_covers_the_watermark_and_what_was_released_above_it`
 - `hub::tests::the_retained_digest_is_order_independent_and_set_sensitive`
 - `hub::tests::the_retained_queue_bound_drops_the_oldest_loudly`
 - `hub::tests::the_snapshot_carries_tokens_and_tombstone_entries`

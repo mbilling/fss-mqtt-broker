@@ -1077,6 +1077,19 @@ struct Inflight {
     /// prefix, so an out-of-order PUBACK cannot discard a message still in flight
     /// behind it.
     outstanding: BTreeSet<Offset>,
+    /// Offsets settled (acknowledged by the subscriber, or evicted by the drop-oldest
+    /// backlog bound) that sit ABOVE the truncation watermark (issue #1056): an older
+    /// entry still owed — a `QoS` 2 flow whose PUBREL is withheld, say — keeps
+    /// [`safe_ack`](Self::safe_ack) below them, so they stay in the durable queue
+    /// although nothing is owed for them. A resume must not replay them as new
+    /// messages; [`advance_ack`](Self::advance_ack) forgets them once the watermark
+    /// covers them, and [`settled_above_watermark`](Self::settled_above_watermark)
+    /// treats everything at or below the watermark as settled from then on. The
+    /// `QoS` 2 retire path moves `acked_through` without pruning this set; what it
+    /// leaves below the watermark is redundant there and pruned by the next advance.
+    /// Memory-only: a restart or an ownership move while a hole stands starts empty
+    /// (the residual is #1058's).
+    released: BTreeSet<Offset>,
     /// The highest offset ever tracked, so a fully drained session truncates its whole
     /// log rather than stalling at the last released offset.
     high_water: Offset,
@@ -1111,6 +1124,7 @@ impl Default for Inflight {
             receive_maximum: RECEIVE_MAXIMUM_DEFAULT,
             backlog: BacklogQueue::default(),
             outstanding: BTreeSet::new(),
+            released: BTreeSet::new(),
             high_water: 0,
             acked_through: 0,
             records_pending: 0,
@@ -1143,6 +1157,17 @@ impl Inflight {
     /// The subscriber has acknowledged the message stored at `offset`.
     fn release(&mut self, offset: Offset) {
         self.outstanding.remove(&offset);
+        if offset > self.acked_through {
+            self.released.insert(offset);
+        }
+    }
+
+    /// Whether `offset` was settled on an earlier connection and only awaits
+    /// truncation (issue #1056). At or below `acked_through` it is settled by
+    /// construction, whether or not the detached truncation (ADR 0074) has committed:
+    /// a resume in that window reads it back and must not send it again.
+    fn settled_above_watermark(&self, offset: Offset) -> bool {
+        offset <= self.acked_through || self.released.contains(&offset)
     }
 
     /// Contiguous prefix no longer owed to the subscriber. This is eligibility for
@@ -1166,6 +1191,7 @@ impl Inflight {
         let safe = self.safe_ack();
         (safe > self.acked_through).then(|| {
             self.acked_through = safe;
+            self.released.retain(|o| *o > safe);
             safe
         })
     }
@@ -3442,8 +3468,9 @@ impl Hub {
         let mut sweep = tokio::time::interval(SESSION_SWEEP_INTERVAL);
         sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // ADR 0074: the truncate flusher. Owned by `owned_tasks` so it aborts with
-        // the hub; a send after abort is the documented not-fatal case (entries
-        // replay at next resume, the subscriber re-acks, the watermark re-advances).
+        // the hub; a send after abort is the documented not-fatal case (the entries
+        // stay in the log; they replay after a restart, the subscriber re-acks, the
+        // watermark re-advances).
         let (truncate_tx, truncate_rx) = mpsc::unbounded_channel();
         self.truncate_tx = Some(truncate_tx);
         self.owned_tasks
@@ -5368,6 +5395,19 @@ impl Hub {
                     restored.remove(&qm.offset);
                     continue;
                 }
+                // Acknowledged on an earlier connection, kept in the queue only because
+                // an older entry still owed blocks truncation (issue #1056): settled,
+                // not owed, and a copy here would be a new message to the client.
+                if self
+                    .inflight
+                    .get(&client)
+                    .is_some_and(|inf| inf.settled_above_watermark(qm.offset))
+                {
+                    debug!(client = %client.0, offset = qm.offset,
+                           "queued message was acknowledged before this connection and awaits \
+                            truncation; not replaying (#1056)");
+                    continue;
+                }
                 // A broker restart with a durably-recorded id (ADR 0057): resume the
                 // handshake mid-phrase UNDER THE ORIGINAL ID, never through a fresh
                 // allocation. Before PUBREC: the PUBLISH goes out again with DUP and
@@ -5877,8 +5917,10 @@ impl Hub {
             return;
         };
         // A closed/absent flusher is the documented not-fatal case: the entries stay
-        // in the log and are replayed on the next resume. A duplicate at QoS 1 is
-        // spec-legal; losing one would not be.
+        // in the log until a later truncate covers them. A resume on this node skips
+        // them (`settled_above_watermark`, issue #1056); after a restart or an
+        // ownership move they replay. A duplicate at QoS 1 is spec-legal; losing one
+        // would not be.
         if let Some(tx) = &self.truncate_tx {
             let _ = tx.send((client.clone(), up_to));
         }
@@ -9257,9 +9299,10 @@ async fn run_truncate_flusher(
             let served = client.clone();
             let handle = flushes.spawn(async move {
                 if let Err(e) = store.ack(&client, up_to).await {
-                    // Not fatal: the entries stay in the log and are replayed on the
-                    // next resume. A duplicate at QoS 1 is spec-legal; losing one
-                    // would not be.
+                    // Not fatal: the entries stay in the log until a later truncate
+                    // covers them; a resume on this node skips them (#1056), and
+                    // after a restart or an ownership move they replay. A duplicate
+                    // at QoS 1 is spec-legal; losing one would not be.
                     debug!(client = %client.0, up_to, error = %e,
                            "detached truncate of the acknowledged session log failed");
                 }
@@ -14434,6 +14477,47 @@ mod tests {
     /// Kept verbatim modulo the issue #241 API rename — it is the **regression witness**
     /// for the no-silent-change criterion: with the DEFAULT limits, the boundary is still
     /// exactly 10 000 pushes with no eviction and one eviction on the 10 001st.
+    /// Issue #1056: everything at or below the truncation watermark is settled the
+    /// moment [`Inflight::advance_ack`] hands it to the detached flusher, before the
+    /// truncate commits, and stays settled after the advance prunes it from
+    /// `released`. Above the watermark, only what was released is settled.
+    #[test]
+    fn the_resume_skip_covers_the_watermark_and_what_was_released_above_it() {
+        let mut inf = Inflight::default();
+        for offset in 1..=6 {
+            inf.track(offset);
+        }
+        // 3 is still owed: 1 and 2 settle the prefix, 4 and 5 are released above it.
+        for offset in [1, 2, 4, 5] {
+            inf.release(offset);
+        }
+        assert_eq!(inf.advance_ack(), Some(2), "the contiguous prefix");
+        for offset in [1, 2] {
+            assert!(
+                inf.settled_above_watermark(offset),
+                "offset {offset} is at or below the watermark: settled though the \
+                 detached truncate may not have committed"
+            );
+        }
+        assert!(!inf.settled_above_watermark(3), "3 is still owed");
+        assert!(inf.settled_above_watermark(4));
+        assert!(inf.settled_above_watermark(5));
+        assert!(!inf.settled_above_watermark(6), "6 was never acknowledged");
+
+        // 3 is acknowledged: the watermark covers 5, and the set is pruned — the
+        // watermark alone now says those offsets are settled.
+        inf.release(3);
+        assert_eq!(inf.advance_ack(), Some(5));
+        assert!(
+            inf.released.is_empty(),
+            "pruned once the watermark covers them"
+        );
+        for offset in 1..=5 {
+            assert!(inf.settled_above_watermark(offset), "offset {offset}");
+        }
+        assert!(!inf.settled_above_watermark(6));
+    }
+
     #[test]
     fn flow_control_backlog_is_bounded_drop_oldest() {
         let limits = SubscriberLimits::default();
@@ -15113,6 +15197,76 @@ mod tests {
         let rel = recv_packet(&mut rx).await.unwrap();
         assert!(matches!(&rel, Packet::PubRel(k) if k.pkid == pkid));
         assert!(store.outbound(&c).await.unwrap()[0].pubrec_seen);
+    }
+
+    /// Issue #1056: a `QoS` 2 flow whose PUBREL is withheld keeps the truncation
+    /// watermark below everything delivered after it. The `QoS` 1 messages behind it
+    /// are acknowledged — settled, not owed — yet stay in the durable queue. A resume
+    /// re-sends the withheld flow (the PUBLISH again, DUP set) and nothing else: the
+    /// acknowledged messages were replayed as new messages before.
+    #[tokio::test]
+    async fn a_resume_does_not_replay_messages_acknowledged_behind_a_withheld_pubrel() {
+        let store = FlakyStore::new(0);
+        let tx = start_hub_with_arc(store.clone());
+        let (mut rx, _) = attach_full(&tx, "c", 1, false, u32::MAX, 8).await;
+        subscribe_qos(&tx, "c", "t", QoS::ExactlyOnce);
+
+        publish_qos2(&tx, "t", b"hole");
+        let hole = pkid_of(&recv_packet(&mut rx).await.unwrap());
+        store
+            .fail_outbound
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        pub_rec(&tx, "c", hole);
+        assert!(recv_packet(&mut rx).await.is_none(), "PUBREL withheld");
+
+        // Two messages behind the hole, delivered and acknowledged.
+        for payload in [b"behind-1".as_slice(), b"behind-2"] {
+            publish_qos1(&tx, "t", payload);
+            let p = recv_packet(&mut rx).await.expect("delivered");
+            assert_eq!(payload_of(&p), payload);
+            pub_ack(&tx, "c", pkid_of(&p));
+        }
+        let c = ClientId("c".into());
+        detach(&tx, "c", 1);
+        let (mut rx, present) = attach_full(&tx, "c", 2, false, u32::MAX, 8).await;
+        assert!(present);
+        assert_eq!(
+            store.pending(&c, 0, 16).await.unwrap().len(),
+            3,
+            "the queue still holds all three: nothing below the hole truncates"
+        );
+
+        let first = recv_packet(&mut rx)
+            .await
+            .expect("the withheld QoS 2 flow is resumed");
+        assert_eq!(payload_of(&first), b"hole");
+        assert!(
+            matches!(&first, Packet::Publish(p) if p.dup),
+            "a re-sent PUBLISH carries DUP [MQTT-3.3.1-1]: {first:?}"
+        );
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "messages the client acknowledged before the resume are not replayed (#1056)"
+        );
+
+        // The hole clears: PUBREC advances the phase, PUBREL goes out, PUBCOMP ends the
+        // flow, and the truncation that follows takes the acknowledged tail with it.
+        store
+            .fail_outbound
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let hole = pkid_of(&first);
+        pub_rec(&tx, "c", hole);
+        let rel = recv_packet(&mut rx).await.unwrap();
+        assert!(
+            matches!(&rel, Packet::PubRel(k) if k.pkid == hole),
+            "{rel:?}"
+        );
+        pub_comp(&tx, "c", hole);
+        wait_qos2_store_empty(store.as_ref(), "c").await;
+        assert!(
+            store.pending(&c, 0, 16).await.unwrap().is_empty(),
+            "once the hole clears, everything acknowledged truncates"
+        );
     }
 
     /// ADR 0057 excludes `QoS` 1 by design: a fresh-id DUP redelivery is what
