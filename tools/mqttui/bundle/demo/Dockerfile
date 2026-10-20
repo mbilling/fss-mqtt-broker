@@ -3,7 +3,7 @@
 # repo root (see docker-compose.yml `build.context: ..`).
 # Base images are digest-pinned (OpenSSF Pinned-Dependencies); Dependabot's docker
 # ecosystem entry for /demo proposes the digest bumps.
-FROM rust:1-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6 AS builder
+FROM rust:1-bookworm@sha256:e12566d5abc17a0da741628782cdb504b68b8961f5bfcf677936bf3e8b32de29 AS builder
 WORKDIR /src
 COPY . .
 # Pure-Rust TLS (rustls/ring) + OTLP-over-rustls: no OpenSSL/system crypto needed.
