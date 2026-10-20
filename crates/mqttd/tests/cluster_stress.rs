@@ -271,6 +271,9 @@ struct StressNode {
     /// (ADR 0042 T4): while `true`, durable session writes fail `Backend` and
     /// the broker must withhold the corresponding acks (fail closed).
     disk_faults: Arc<std::sync::atomic::AtomicBool>,
+    /// Holds the node's inherited-session scans in flight while `true` (issue #1031):
+    /// the takeover window of every group it takes stays open until released.
+    scan_hold: Arc<std::sync::atomic::AtomicBool>,
     /// The hub's command channel — the harness drives brownout entry/exit
     /// through it (ADR 0041 T5), exactly like the store-size watcher does.
     hub_tx: mpsc::UnboundedSender<mqttd::hub::HubCommand>,
@@ -366,6 +369,7 @@ async fn start_stress_node_full(
     // broker withholds the corresponding acks — fail closed, never a lie.
     let store = common::FlakyStore::wrap(store);
     let disk_faults = store.fail_writes.clone();
+    let scan_hold = store.hold_scans.clone();
     let plane_observer = plane.clone();
     let (mut hub, hub_tx) =
         Hub::with_config_and_placement(node_id.clone(), store, Some(placement.clone()));
@@ -479,6 +483,7 @@ async fn start_stress_node_full(
         plane: Some(plane_observer),
         data_dir: data_dir.to_path_buf(),
         disk_faults,
+        scan_hold,
         hub_tx,
         aborts,
     }
@@ -2001,6 +2006,222 @@ async fn growth_migrates_moved_sessions_eagerly_and_acks_stay_honest() {
             String::from_utf8_lossy(payload)
         );
     }
+}
+
+/// Issue #1031 — a node part-way through a takeover answers a forward for its OTHER
+/// subscribers, and the moved session never gets the publish. The exhibit above
+/// covers the joiner that matches NOBODY during its takeover (the forward is held
+/// as `Failed`); this is the joiner that matches SOMEBODY: a live subscriber on the
+/// same topic connects to the new owner before its scan lands, so the forward
+/// matches that subscriber (`matched > 0`), is answered `Reached`, and the
+/// publisher would be acknowledged — while the offline session the joiner now owns
+/// is still materialised nowhere. Since the fix the joiner holds its answer until
+/// its scan lands, then hands the publish to the sessions the scan brought. The
+/// scan is held open by the store seam for as long as the test needs; nothing is
+/// killed. The ack must be held while the scan is, released once it lands, and both
+/// the live subscriber and, on resume, the moved session must have the payload.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_takeover_with_a_live_subscriber_still_delivers_to_the_moved_session() {
+    stress_tracing();
+    let disk = tempfile::tempdir().expect("tempdir");
+    let dir = |n: &str| {
+        let d = disk.path().join(n);
+        std::fs::create_dir_all(&d).expect("node dir");
+        d
+    };
+    let topic = "tw/t";
+    // An offline durable session the founder owns alone, which a joiner owns in
+    // the grown ring.
+    let sub_id = {
+        let a = NodeId("tw-a".to_string());
+        let mut grown = Placement::new(a.clone(), DEFAULT_REPLICAS);
+        for j in ["tw-b", "tw-c"] {
+            grown.observe(
+                &NodeId(j.to_string()),
+                mqtt_cluster::swim::MemberState::Alive,
+                "x:7000",
+                None,
+            );
+        }
+        (0..100_000)
+            .map(|i| format!("tw-sub-{i}"))
+            .find(|c| grown.owner(c) != a)
+            .expect("some session moves to a joiner")
+    };
+
+    let a = start_stress_node("tw-a", vec![], &dir("a")).await;
+    establish_offline_subscriber(&[&a], &sub_id, topic).await;
+
+    // The grow, 1 → 3, with BOTH joiners' scans held: whichever one takes the
+    // session's group holds its takeover open until the test releases it.
+    let b = start_stress_node("tw-b", vec![a.swim_addr.clone()], &dir("b")).await;
+    let c = start_stress_node("tw-c", vec![a.swim_addr.clone()], &dir("c")).await;
+    for n in [&b, &c] {
+        n.scan_hold.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    wait_cluster_ready(&[&a, &b, &c]).await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let owner = loop {
+        let owner = a.placement.read().unwrap().owner(&sub_id);
+        if owner != a.node_id {
+            break owner;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the picked session never moved off the founder after the grow"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let new_owner = [&b, &c]
+        .into_iter()
+        .find(|n| n.node_id == owner)
+        .expect("a joiner owns the moved session");
+    // The founder's own scan is NOT held: it releases the moved session from its
+    // routing, so the publish below reaches the new owner only by forward. Wait
+    // for that release rather than race it: a clean-session probe on the founder
+    // sees the founder's view of the interest in `topic`.
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            !a.placement.read().unwrap().owner(&sub_id).eq(&a.node_id)
+        })
+        .await
+    );
+
+    // A LIVE subscriber on the same topic attaches to the new owner while its
+    // takeover scan is still in flight: the forward will match it.
+    let (mut live, _) = common::Client::connect_v311_within(
+        new_owner.client_addr,
+        "tw-live",
+        true,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("the live subscriber connects to the new owner");
+    let ack = live.subscribe(1, topic, QoS::AtLeastOnce).await;
+    assert!(ack.return_codes.iter().all(|c| *c != 0x80));
+    // Let the new owner's interest reach the founder: a QoS 0 probe through the
+    // founder arrives at the live subscriber only once the founder forwards there.
+    {
+        let (mut probe, _) = common::Client::connect_v311_within(
+            a.client_addr,
+            "tw-probe",
+            true,
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("probe connects");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            probe
+                .publish(topic, b"tw-warm", QoS::AtMostOnce, None, vec![])
+                .await;
+            match live.recv_bounded(Duration::from_millis(500)).await {
+                common::Recv::Packet(Packet::Publish(p)) if p.payload.as_ref() == b"tw-warm" => {
+                    break
+                }
+                common::Recv::Packet(_) | common::Recv::Quiet => {}
+                common::Recv::Closed => panic!("live subscriber lost its connection"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the founder never forwarded to the new owner's live subscriber"
+            );
+        }
+        probe.disconnect().await;
+    }
+
+    // The publish under test, through the founder. While the founder still routes the
+    // moved session itself, its local enqueue fails ("not the owning node") and
+    // v3.1.1 can only refuse by closing: such an attempt is retried on a fresh
+    // connection. Once the founder forwards instead, the new owner's takeover is
+    // open and the forward matches the live subscriber: the ack must now be HELD
+    // (issue #1031), not released, until the new owner's scan lands.
+    let refusals_end = Instant::now() + Duration::from_mins(1);
+    let mut publisher = loop {
+        assert!(
+            Instant::now() < refusals_end,
+            "the founder kept refusing the publish: it never released the moved session"
+        );
+        let (mut publisher, _) = common::Client::connect_v311_within(
+            a.client_addr,
+            "tw-pub",
+            true,
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("publisher connects to the founder");
+        publisher
+            .publish(topic, b"tw-m1", QoS::AtLeastOnce, Some(7), vec![])
+            .await;
+        match publisher.recv_bounded(Duration::from_secs(4)).await {
+            common::Recv::Packet(Packet::PubAck(k)) if k.pkid == 7 => {
+                panic!("acked while the new owner's takeover scan was still held (#1031)")
+            }
+            common::Recv::Packet(p) => panic!("unexpected packet to the publisher: {p:?}"),
+            common::Recv::Quiet => break publisher,
+            common::Recv::Closed => {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        }
+    };
+    assert!(
+        new_owner
+            .scan_hold
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "the scan hold was released early"
+    );
+    // The takeover completes: the held ack is released.
+    let released = Instant::now();
+    for n in [&b, &c] {
+        n.scan_hold
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+    let ack_deadline = released + Duration::from_mins(1);
+    loop {
+        let left = ack_deadline.saturating_duration_since(Instant::now());
+        match publisher.recv_bounded(left).await {
+            common::Recv::Packet(Packet::PubAck(k)) if k.pkid == 7 => break,
+            common::Recv::Packet(_) => {}
+            common::Recv::Quiet => {
+                panic!("the held publish was not acked within a minute of the scan landing")
+            }
+            common::Recv::Closed => panic!("the publisher was closed on instead of acked"),
+        }
+    }
+    let ack_after = released.elapsed();
+    publisher.disconnect().await;
+    // The live subscriber got it (it is what the forward matched); every copy it is
+    // sent is acknowledged and counted, so a duplicate is on record too.
+    let mut copies: Vec<Option<u16>> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match live.recv_bounded(Duration::from_secs(3)).await {
+            common::Recv::Packet(Packet::Publish(p)) if p.payload.as_ref() == b"tw-m1" => {
+                if let Some(pkid) = p.pkid {
+                    live.send(&Packet::PubAck(pkid.into())).await;
+                }
+                copies.push(p.pkid);
+            }
+            common::Recv::Quiet if !copies.is_empty() => break,
+            common::Recv::Packet(_) | common::Recv::Quiet => {}
+            common::Recv::Closed => panic!("live subscriber lost its connection"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the live subscriber on the new owner never received the acked publish"
+        );
+    }
+    eprintln!(
+        "#1031 record: acked {ack_after:?} after the scan was released; the live \
+         subscriber received {} cop{} (pkids {copies:?})",
+        copies.len(),
+        if copies.len() == 1 { "y" } else { "ies" }
+    );
+    live.disconnect().await;
+
+    // The moved session resumes on its new owner: the acked payload must be there.
+    resume_and_verify(&[&a, &b, &c], &sub_id, &[b"tw-m1"]).await;
 }
 
 /// ADR 0043 P3 — decommission, end to end on a FOUR-node cluster: acked facts

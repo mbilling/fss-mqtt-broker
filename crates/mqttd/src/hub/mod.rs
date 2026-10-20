@@ -2700,6 +2700,12 @@ pub struct Hub {
     /// Whether an off-loop inherited-session scan is running (ADR 0042 T9,
     /// exhibit ⑥) — one at a time.
     inherited_scan_inflight: bool,
+    /// How many inherited-session scans this hub has started, and the committed
+    /// ownership epoch the latest one started at (issue #1031). One scan runs at a
+    /// time, so the scan that lands is always the latest started; a forward held for
+    /// a takeover is released only by a complete scan that started after the hold,
+    /// with no ownership change since it started.
+    scan_started: (u64, Option<u64>),
     /// Whether this hub's interest gossip is AUTHORITATIVE (0043-P4 exhibit ②):
     /// a fresh hub's routing table is empty until its boot scan materializes the
     /// durable sessions it owns, and gossiping that emptiness ERASES what peers
@@ -2856,6 +2862,11 @@ pub struct Hub {
     /// (issue #242): `(origin, seq)` → what is still owed before the verdict can be
     /// answered. Entries drain via [`HubCommand::AppendDone`].
     remote_append_pending: HashMap<(NodeId, u64), RemoteAppendGate>,
+    /// Acked forwards whose answer waits for this node's open takeover to close
+    /// (issue #1031): matched a subscriber here, so the origin would take `Reached`
+    /// as the ack's release, while a session the takeover is still materialising
+    /// may be owed the publish too. Released by [`Self::settle_held_forwards`].
+    held_forwards: Vec<forwarding::HeldForward>,
     /// Receiver side of acked forwards (issue #648): per origin, the forwards
     /// recently applied and the answer each got, so a retransmission is answered
     /// again instead of applied again. Bounded per origin by
@@ -3145,6 +3156,7 @@ impl Hub {
                 qos2_retire_inflight: HashSet::new(),
                 qos2_epoch: HashMap::new(),
                 remote_append_pending: HashMap::new(),
+                held_forwards: Vec::new(),
                 forward_windows: HashMap::new(),
                 held_dead: HashMap::new(),
                 node_id,
@@ -3208,6 +3220,7 @@ impl Hub {
                 forward_index: HashMap::new(),
                 durable_writes: 0,
                 inherited_scan_inflight: false,
+                scan_started: (0, None),
                 interest_authoritative: false,
                 interest_suppressed_ticks: 0,
                 last_scan_complete: false,
@@ -4106,6 +4119,26 @@ impl Hub {
                         },
                     )
                     .await;
+                // A fan-out that matched SOMEBODY while this node's takeover is still
+                // open is not answered yet (issue #1031): `Reached` would release the
+                // origin's ack, and a session this node is materialising right now —
+                // moved here by the very lease change that opened the window — may be
+                // owed this publish too. The live deliveries stand; the answer waits
+                // for the scan, then covers the sessions it brought. A relaxed forward
+                // (#399) gives up its early answer for the hold too.
+                if matched > 0 && matches!(durable, DurableOutcome::Ok) && self.takeover_open() {
+                    self.hold_forward_for_takeover(
+                        node,
+                        seq,
+                        topic,
+                        payload,
+                        qos,
+                        retain,
+                        message_expiry,
+                        app,
+                    );
+                    return;
+                }
                 // A fan-out that matched NOBODY mid-settle maps to FAILED, never
                 // `Refused`: the message may genuinely be owed and delivered once the
                 // view settles, so "nothing was stored, retry" would be a FALSE refusal
@@ -6860,7 +6893,7 @@ impl Hub {
         // already drives it at this exact cadence — so this changes the held
         // case from "never" to "once per tick" and changes the idle case not at
         // all.
-        self.settle_pending_publishes();
+        self.settle_passes();
 
         // Retained anti-entropy (issue #87): re-offer our digest to every peer on a
         // slow cadence. A commit fans out ONE unacked frame; before this, a frame
@@ -6913,6 +6946,60 @@ impl Hub {
     /// the enumeration reads through the durable store and may trigger first-touch
     /// group recovery (quorum reads) — exactly the eager recovery a takeover wants,
     /// but never on the actor loop. One scan at a time.
+    /// The settle pass and what rides on it: the held publishes this node
+    /// originated ([`settle_pending_publishes`](Self::settle_pending_publishes)) and
+    /// the forwards it holds for an open takeover
+    /// ([`settle_held_forwards`](Self::settle_held_forwards), issue #1031). Run on
+    /// every tick and whenever a scan lands.
+    fn settle_passes(&mut self) {
+        self.settle_pending_publishes();
+        self.settle_held_forwards();
+    }
+
+    /// Mark an inherited-session scan as started: in flight, numbered, and stamped
+    /// with the ownership epoch it reads under (see [`Hub::scan_started`]).
+    fn begin_scan(&mut self) {
+        self.inherited_scan_inflight = true;
+        self.scan_started = (self.scan_started.0 + 1, self.ownership_epoch_now());
+    }
+
+    /// The committed ownership epoch this node's placement holds now (`None` without
+    /// a placement).
+    fn ownership_epoch_now(&self) -> Option<u64> {
+        self.placement.as_ref().map(|p| {
+            p.read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .ownership_epoch()
+        })
+    }
+
+    /// Whether a TAKEOVER is open on this durable node (issue #1031): the eager
+    /// migration window is armed or a scan is materialising sessions. The takeover
+    /// half of [`routing_unsettled`](Self::routing_unsettled) only: an incomplete
+    /// scan (#1049), a mesh that is not whole or interest not yet authoritative say
+    /// nothing about a session moving here, so they hold no forward.
+    fn takeover_open(&self) -> bool {
+        self.sessions_can_move()
+            && self.clustered()
+            && (self.takeover_reconcile_ticks > 0 || self.inherited_scan_inflight)
+    }
+
+    /// Whether a session can move to this node: it has a durable plane (with
+    /// node-local storage a session never changes owner).
+    #[cfg(not(test))]
+    fn sessions_can_move(&self) -> bool {
+        self.durable_plane.is_some()
+    }
+
+    #[cfg(test)]
+    fn sessions_can_move(&self) -> bool {
+        self.durable_plane.is_some()
+            || self
+                .probe
+                .sessions_move
+                .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn spawn_inherited_session_scan(&mut self) {
         if self.inherited_scan_inflight {
             return;
@@ -6921,7 +7008,7 @@ impl Hub {
         self.probe
             .scans_started
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.inherited_scan_inflight = true;
+        self.begin_scan();
         let store = self.store.clone();
         let tx = self.self_tx.clone();
         debug!("inherited-session scan started");
@@ -7074,7 +7161,13 @@ impl Hub {
             self.gossip_interest();
         }
         self.release_moved_sessions();
-        self.settle_pending_publishes();
+        // A complete scan that read under the ownership that holds now: the sessions
+        // this node owns are materialised. One that started under an older epoch may
+        // have skipped a group whose lease has landed since (issue #1031 review).
+        if complete && self.scan_started.1 == self.ownership_epoch_now() {
+            self.note_scan_landed(self.scan_started.0);
+        }
+        self.settle_passes();
     }
 
     /// The mirror of [`inherit_sessions`] for a ring that GREW (ADR 0043 P2):

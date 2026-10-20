@@ -189,6 +189,10 @@ pub(super) struct AppendLane {
 /// last job lands — a peer is never told `Stored` before the store actually stored
 /// (issue #242).
 #[derive(Debug)]
+// Four flags, each a distinct fact about the forward (congested, answered early,
+// reached a subscriber, held for a takeover); an enum would have to name their
+// product.
+#[allow(clippy::struct_excessive_bools)]
 pub(super) struct RemoteAppendGate {
     /// Lane jobs still unresolved for this forward.
     pub(super) awaiting: usize,
@@ -208,6 +212,11 @@ pub(super) struct RemoteAppendGate {
     /// The fan-out matched a subscriber here, so a stored answer is
     /// [`ForwardVerdict::Reached`](mqtt_cluster::peer::ForwardVerdict::Reached) (#738).
     pub(super) reached: bool,
+    /// The forward arrived while this node's takeover was open and matched a
+    /// subscriber (issue #1031): the answer waits for
+    /// [`Hub::settle_held_forwards`], however its appends end, because a session
+    /// the takeover is still materialising may be owed the publish too.
+    pub(super) held: bool,
 }
 
 /// Bound on jobs queued in one session's append lane (issue #242). At the cap the
@@ -925,6 +934,7 @@ impl Hub {
                         congested: false,
                         answered: false,
                         reached: false,
+                        held: false,
                     });
                 g.awaiting += 1;
                 // The valve's owner half (issue #399): a deep lane holds a
@@ -1045,7 +1055,17 @@ impl Hub {
                 if let Some(g) = self.remote_append_pending.get_mut(&(node.clone(), seq)) {
                     g.awaiting = g.awaiting.saturating_sub(1);
                     g.worst = g.worst.and(out);
-                    if g.awaiting == 0 {
+                    // A gate held for an open takeover (issue #1031) is answered by
+                    // the hold's release, not by its last append — unless an append
+                    // failed: `Failed` withholds at the origin whatever the takeover
+                    // brings, so there is nothing left to hold for, and a verdict
+                    // the origin is waiting on must not be delayed by the window.
+                    if g.held && !matches!(g.worst, DurableOutcome::Ok) {
+                        g.held = false;
+                        self.held_forwards
+                            .retain(|h| !(h.node == node && h.seq == seq));
+                    }
+                    if g.awaiting == 0 && !g.held {
                         if let Some(g) = self.remote_append_pending.remove(&(node.clone(), seq)) {
                             if g.answered {
                                 // The relaxed early verdict (issue #399) already
