@@ -1467,7 +1467,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 831 test(s)
+## `crates/mqttd/src/lib.rs` — 832 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -2003,6 +2003,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::session_expiry_finite_retains_then_expires`
 - `hub::tests::session_expiry_reconnect_cancels_expiry`
 - `hub::tests::session_expiry_zero_discards_at_disconnect`
+- `hub::tests::settle_gate::a_forward_matched_during_an_open_takeover_waits_for_the_scan_and_covers_the_moved_session`
 - `hub::tests::settle_gate::a_held_ack_retires_on_the_sweep_when_the_window_closes_without_a_scan`
 - `hub::tests::settle_gate::a_held_publish_is_re_delivered_to_a_materialised_session_once_not_per_pass`
 - `hub::tests::settle_gate::a_new_persistent_session_created_after_a_held_publish_is_not_handed_it`
@@ -2504,13 +2505,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `a_soak_under_sustained_load_shows_no_drift` — `#[ignore]`d
 
-## `crates/mqttd/tests/cluster_stress.rs` — 15 test(s)
+## `crates/mqttd/tests/cluster_stress.rs` — 16 test(s)
 
 - `a_browned_out_session_owner_refuses_the_publisher_rather_than_owing_a_lost_message`
 - `a_cross_node_shared_subscriber_is_never_bypassed_by_an_ack`
 - `a_decommissioned_nodes_departure_loses_nothing`
 - `a_fleet_scale_grow_and_shrink_soak_loses_no_acked_fact`
 - `a_full_cluster_stop_start_recovers_every_acked_fact`
+- `a_takeover_with_a_live_subscriber_still_delivers_to_the_moved_session`
 - `a_v5_publisher_on_a_healthy_node_is_told_0x97_when_the_session_owning_peer_refuses`
 - `another_tests_cluster_greeting_a_recycled_seed_address_is_not_admitted`
 - `cost_reduction_five_to_three_via_two_decommissions`

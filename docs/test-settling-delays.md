@@ -49,6 +49,7 @@ caller changes this file and the gate fails until it is regenerated and re-read.
 | `crates/mqttd/tests/cluster.rs` | `retained_mqtt5_properties_replay_from_any_nodes_cache` | `cluster-sever-eof-props` | 400ms | in the test itself |
 | `crates/mqttd/tests/cluster.rs` | `divergent_retained_writes_across_a_partition_converge_after_heal` | `cluster-sever-eof-divergent` | 400ms | in the test itself |
 | `crates/mqttd/tests/common/mod.rs` | `send_fragmented` | `wire-fragment-gap` | ? | helper, 1 call site(s) |
+| `crates/mqttd/tests/common/mod.rs` | `all_sessions` | `scan-hold` | 20ms | helper, 3 call site(s) |
 | `crates/mqttd/tests/durable_bench.rs` | `durable_path_floor` | `bench-inter-arm-quiesce` | 2s | in the test itself |
 | `crates/mqttd/tests/durable_sessions.rs` | `lease_group_forms_and_is_stable_under_slow_durable_commits` | `lease-term-stability-window` | 5s | in the test itself |
 | `crates/mqttd/tests/false_dead_delivery.rs` | `relay_one_way` | `peer-announcement-held-back` | ANNOUNCEMENT_DELAY | helper, 2 call site(s) |

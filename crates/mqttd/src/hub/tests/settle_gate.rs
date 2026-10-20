@@ -1232,6 +1232,105 @@ async fn a_proto_11_peer_gets_the_untagged_forward_and_an_untagged_replay_still_
 }
 
 // ---------------------------------------------------------------------------
+// Issue #1031 — a forward that matches a subscriber during an open takeover is
+// answered only once the scan has landed, and covers what the scan brought.
+// ---------------------------------------------------------------------------
+
+/// A live subscriber on `tw/#` is here; an offline session on `tw/#` is in the store
+/// and about to be materialised by the takeover scan that is in flight. An acked
+/// forward on `tw/1` arrives: the live subscriber is delivered at once, but the
+/// origin is NOT answered — `Reached` would release its ack with the moved session
+/// handed nothing. A retransmit meanwhile is absorbed. When the scan lands, the
+/// moved session's queue holds the publish, and the origin gets one `Reached`.
+#[tokio::test]
+async fn a_forward_matched_during_an_open_takeover_waits_for_the_scan_and_covers_the_moved_session()
+{
+    let mut fix = clustered_fixture();
+    let (peer_tx, mut peer_rx): (PeerOutbound, _) = mpsc::unbounded_channel();
+    fix.dispatch(HubCommand::PeerConnected {
+        node: NodeId("origin".into()),
+        conn_id: 1,
+        ctl: peer_tx.clone(),
+        tx: peer_tx,
+        cert_serial: None,
+        cert_ends: crate::hub::LinkCertEnds::default(),
+        proto: mqtt_cluster::peer::PROTO_MAX,
+        depth: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    })
+    .await;
+    let (mut live, meter, _) = attach_watched(&mut fix.hub, "live", true, 0, 7, "tw/#").await;
+    fix.meters.push(meter);
+    fix.store_only_session("moved", "tw/#").await;
+    // The takeover is open: its scan is in flight.
+    fix.hub.takeover_reconcile_ticks = 0;
+    fix.hub.inherited_scan_inflight = true;
+    assert!(fix.hub.routing_unsettled());
+
+    let forward = || HubCommand::RemotePublishAcked {
+        node: NodeId("origin".into()),
+        seq: 1,
+        topic: "tw/1".into(),
+        payload: Bytes::from_static(b"settle-gate"),
+        qos: QoS::AtLeastOnce,
+        retain: false,
+        message_expiry: None,
+        app: AppProperties::default(),
+        origin: Some(31),
+        replay: false,
+    };
+    let verdicts = |rx: &mut mpsc::UnboundedReceiver<PeerMessage>| {
+        let mut v = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            match frame {
+                PeerMessage::PublishVerdict { seq, verdict } => v.push((seq, verdict)),
+                PeerMessage::PublishAck { seq, ok } => panic!("a bare ack {seq} {ok}"),
+                _ => {}
+            }
+        }
+        v
+    };
+    fix.dispatch(forward()).await;
+    assert_eq!(
+        published_topics(&mut live),
+        vec!["tw/1".to_string()],
+        "the live subscriber is delivered at once"
+    );
+    assert_eq!(
+        verdicts(&mut peer_rx),
+        Vec::new(),
+        "answered while the takeover was open: the origin releases its ack with the \
+         moved session handed nothing (#1031)"
+    );
+    assert_eq!(fix.hub.held_forwards.len(), 1);
+    // A retransmit of the held forward is absorbed: no second copy, no answer.
+    fix.dispatch(forward()).await;
+    assert_eq!(published_topics(&mut live), Vec::<String>::new());
+    assert_eq!(verdicts(&mut peer_rx), Vec::new());
+
+    // The scan lands and brings the moved session.
+    fix.scan_lands(&["moved"], true).await;
+    assert!(!fix.hub.routing_unsettled());
+    assert!(fix.hub.held_forwards.is_empty());
+    let queued = fix.queued("moved").await;
+    assert_eq!(
+        queued.len(),
+        1,
+        "the session the takeover materialised must be handed the publish (#1031)"
+    );
+    assert_eq!(queued[0].message.topic, "tw/1");
+    assert_eq!(
+        verdicts(&mut peer_rx),
+        vec![(1, mqtt_cluster::peer::ForwardVerdict::Reached)],
+        "one answer, after the scan, and it says Reached"
+    );
+    assert_eq!(
+        published_topics(&mut live),
+        Vec::<String>::new(),
+        "the live subscriber is not handed a second copy"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Issue #1011 — the settle-window re-delivery is owed to sessions that existed
 // when the publish was made, not to one created since.
 // ---------------------------------------------------------------------------

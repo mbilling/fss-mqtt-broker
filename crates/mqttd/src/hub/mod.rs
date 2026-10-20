@@ -2856,6 +2856,11 @@ pub struct Hub {
     /// (issue #242): `(origin, seq)` → what is still owed before the verdict can be
     /// answered. Entries drain via [`HubCommand::AppendDone`].
     remote_append_pending: HashMap<(NodeId, u64), RemoteAppendGate>,
+    /// Acked forwards whose answer waits for this node's open takeover to close
+    /// (issue #1031): matched a subscriber here, so the origin would take `Reached`
+    /// as the ack's release, while a session the takeover is still materialising
+    /// may be owed the publish too. Released by [`Self::settle_held_forwards`].
+    held_forwards: Vec<forwarding::HeldForward>,
     /// Receiver side of acked forwards (issue #648): per origin, the forwards
     /// recently applied and the answer each got, so a retransmission is answered
     /// again instead of applied again. Bounded per origin by
@@ -3145,6 +3150,7 @@ impl Hub {
                 qos2_retire_inflight: HashSet::new(),
                 qos2_epoch: HashMap::new(),
                 remote_append_pending: HashMap::new(),
+                held_forwards: Vec::new(),
                 forward_windows: HashMap::new(),
                 held_dead: HashMap::new(),
                 node_id,
@@ -4106,6 +4112,26 @@ impl Hub {
                         },
                     )
                     .await;
+                // A fan-out that matched SOMEBODY while this node's takeover is still
+                // open is not answered yet (issue #1031): `Reached` would release the
+                // origin's ack, and a session this node is materialising right now —
+                // moved here by the very lease change that opened the window — may be
+                // owed this publish too. The live deliveries stand; the answer waits
+                // for the scan, then covers the sessions it brought.
+                if matched > 0 && matches!(durable, DurableOutcome::Ok) && self.routing_unsettled()
+                {
+                    self.hold_forward_for_takeover(
+                        node,
+                        seq,
+                        topic,
+                        payload,
+                        qos,
+                        retain,
+                        message_expiry,
+                        app,
+                    );
+                    return;
+                }
                 // A fan-out that matched NOBODY mid-settle maps to FAILED, never
                 // `Refused`: the message may genuinely be owed and delivered once the
                 // view settles, so "nothing was stored, retry" would be a FALSE refusal
@@ -6860,7 +6886,7 @@ impl Hub {
         // already drives it at this exact cadence — so this changes the held
         // case from "never" to "once per tick" and changes the idle case not at
         // all.
-        self.settle_pending_publishes();
+        self.settle_passes();
 
         // Retained anti-entropy (issue #87): re-offer our digest to every peer on a
         // slow cadence. A commit fans out ONE unacked frame; before this, a frame
@@ -7074,7 +7100,7 @@ impl Hub {
             self.gossip_interest();
         }
         self.release_moved_sessions();
-        self.settle_pending_publishes();
+        self.settle_passes();
     }
 
     /// The mirror of [`inherit_sessions`] for a ring that GREW (ADR 0043 P2):
@@ -7538,6 +7564,16 @@ impl Hub {
     /// (`register_pending`) and for answering a peer's gated forward that
     /// matched nothing here (the receiver-side twin). Only meaningful on a
     /// multi-node cluster.
+    /// The settle pass and what rides on it: the held publishes this node
+    /// originated ([`settle_pending_publishes`](Self::settle_pending_publishes)) and
+    /// the forwards it holds for an open takeover
+    /// ([`settle_held_forwards`](Self::settle_held_forwards), issue #1031). Run on
+    /// every tick and whenever a scan lands.
+    fn settle_passes(&mut self) {
+        self.settle_pending_publishes();
+        self.settle_held_forwards();
+    }
+
     fn routing_unsettled(&self) -> bool {
         self.clustered()
             && (self.takeover_reconcile_ticks > 0

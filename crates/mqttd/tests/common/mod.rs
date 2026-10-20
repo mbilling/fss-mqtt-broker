@@ -1186,6 +1186,10 @@ pub mod enhanced {
 pub struct FlakyStore {
     inner: std::sync::Arc<dyn mqtt_storage::SessionStore>,
     pub fail_writes: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// While `true`, `all_sessions` waits before it reads: the node's inherited-session
+    /// scan stays in flight, holding its takeover window open for as long as a test
+    /// needs (issue #1031). Every other call goes through untouched.
+    pub hold_scans: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FlakyStore {
@@ -1193,6 +1197,7 @@ impl FlakyStore {
         std::sync::Arc::new(Self {
             inner,
             fail_writes: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            hold_scans: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -1390,6 +1395,12 @@ impl mqtt_storage::SessionStore for FlakyStore {
     }
 
     async fn all_sessions(&self) -> Result<mqtt_storage::SessionScan, mqtt_storage::StorageError> {
+        while self.hold_scans.load(std::sync::atomic::Ordering::SeqCst) {
+            // SETTLE(scan-hold): a fault injection, not a wait for state — the hold
+            // ends when the test that set it clears it, and that test's own deadlines
+            // bound how long; nothing here could be polled for instead.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         self.inner.all_sessions().await
     }
 }
