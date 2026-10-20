@@ -3,6 +3,10 @@
 - **Status:** Accepted
 - **Date:** 2026-10-09 (reviewed against the code and accepted: 2026-10-11)
 - **Deciders:** project maintainers
+- **Maturity:** experimental in 1.2.0, decided 2026-10-20: the store is in memory, so
+  every file that uses it loads with a warning (`STATE_EXPERIMENTAL_WARNING`), and its
+  functions, settings and admin routes may change in a minor release. It stops being
+  experimental when it is durable (T10 snapshot, T9 `strong`).
 - **Delivery:** [docs/delivery/0085-rule-state-store.md](../delivery/0085-rule-state-store.md) — plan, progress, and changelog
 - **Revisits:** [ADR 0083](0083-rule-engine.md) §1 (the `mqtt-rules` crate "holds no
   broker state"): the crate stays free of broker state and I/O, and reaches the store

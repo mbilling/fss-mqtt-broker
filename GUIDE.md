@@ -953,6 +953,14 @@ be found. Each is tracked; none is a silent surprise.
   ([`rust-toolchain.toml`](rust-toolchain.toml)). That is a *reproducibility*
   anchor, not a requirement on you: it is what makes "rebuild the tag and get
   identical bytes" checkable (ADR 0045 T2).
+- **Rule state is experimental.** The store behind the rule engine's `kv_*` and
+  `kv_store_*` functions ([ADR 0085](docs/adr/0085-rule-state-store.md)) is held in
+  memory: a restarted node comes back without its `local` namespaces, and when every
+  node stops at once all of it is gone. No backup carries it. It stays experimental
+  until it is durable (a snapshot to disk, ADR 0085 T10; `strong` consistency, T9):
+  until then its functions, its `[state.<name>]` settings and its admin routes may
+  change in a minor release, and every rules file that uses it is loaded with a
+  warning saying so. Keep in it only what a rule can rebuild.
 - **Released binaries:** `linux/amd64` and `linux/arm64`, statically linked
   against musl, signed with SBOM and SLSA provenance. Other platforms build from
   source; they are not released artifacts and are not tested in CI.
