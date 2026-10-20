@@ -1236,17 +1236,10 @@ async fn a_proto_11_peer_gets_the_untagged_forward_and_an_untagged_replay_still_
 // answered only once the scan has landed, and covers what the scan brought.
 // ---------------------------------------------------------------------------
 
-/// A live subscriber on `tw/#` is here; an offline session on `tw/#` is in the store
-/// and about to be materialised by the takeover scan that is in flight. An acked
-/// forward on `tw/1` arrives: the live subscriber is delivered at once, but the
-/// origin is NOT answered — `Reached` would release its ack with the moved session
-/// handed nothing. A retransmit meanwhile is absorbed. When the scan lands, the
-/// moved session's queue holds the publish, and the origin gets one `Reached`.
-#[tokio::test]
-async fn a_forward_matched_during_an_open_takeover_waits_for_the_scan_and_covers_the_moved_session()
-{
-    let mut fix = clustered_fixture();
-    let (peer_tx, mut peer_rx): (PeerOutbound, _) = mpsc::unbounded_channel();
+/// A peer link to `origin`, at the current protocol, for the #1031 tests: returns the
+/// receiver of every frame this hub sends that peer.
+async fn link_origin(fix: &mut Fix) -> mpsc::UnboundedReceiver<PeerMessage> {
+    let (peer_tx, peer_rx): (PeerOutbound, _) = mpsc::unbounded_channel();
     fix.dispatch(HubCommand::PeerConnected {
         node: NodeId("origin".into()),
         conn_id: 1,
@@ -1258,58 +1251,92 @@ async fn a_forward_matched_during_an_open_takeover_waits_for_the_scan_and_covers
         depth: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     })
     .await;
-    let (mut live, meter, _) = attach_watched(&mut fix.hub, "live", true, 0, 7, "tw/#").await;
-    fix.meters.push(meter);
-    fix.store_only_session("moved", "tw/#").await;
-    // The takeover is open: its scan is in flight.
-    fix.hub.takeover_reconcile_ticks = 0;
-    fix.hub.inherited_scan_inflight = true;
-    assert!(fix.hub.routing_unsettled());
+    peer_rx
+}
 
-    let forward = || HubCommand::RemotePublishAcked {
+/// Acked forward `seq` from `origin` on `tw/1`.
+fn tw_forward(seq: u64) -> HubCommand {
+    HubCommand::RemotePublishAcked {
         node: NodeId("origin".into()),
-        seq: 1,
+        seq,
         topic: "tw/1".into(),
         payload: Bytes::from_static(b"settle-gate"),
         qos: QoS::AtLeastOnce,
         retain: false,
         message_expiry: None,
         app: AppProperties::default(),
-        origin: Some(31),
+        origin: Some(30 + seq),
         replay: false,
-    };
-    let verdicts = |rx: &mut mpsc::UnboundedReceiver<PeerMessage>| {
-        let mut v = Vec::new();
-        while let Ok(frame) = rx.try_recv() {
-            match frame {
-                PeerMessage::PublishVerdict { seq, verdict } => v.push((seq, verdict)),
-                PeerMessage::PublishAck { seq, ok } => panic!("a bare ack {seq} {ok}"),
-                _ => {}
-            }
+    }
+}
+
+/// The verdicts this hub has sent `origin` so far.
+fn tw_verdicts(
+    rx: &mut mpsc::UnboundedReceiver<PeerMessage>,
+) -> Vec<(u64, mqtt_cluster::peer::ForwardVerdict)> {
+    let mut v = Vec::new();
+    while let Ok(frame) = rx.try_recv() {
+        match frame {
+            PeerMessage::PublishVerdict { seq, verdict } => v.push((seq, verdict)),
+            PeerMessage::PublishAck { seq, ok } => panic!("a bare ack {seq} {ok}"),
+            _ => {}
         }
-        v
-    };
-    fix.dispatch(forward()).await;
+    }
+    v
+}
+
+/// A durable-capable clustered fixture with a live subscriber on `tw/#` and an
+/// offline session on `tw/#` in the store, the takeover not yet open.
+async fn takeover_fixture() -> (Fix, mpsc::UnboundedReceiver<PeerMessage>, Watched) {
+    let mut fix = clustered_fixture();
+    fix.hub
+        .probe
+        .sessions_move
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let peer_rx = link_origin(&mut fix).await;
+    let (live, meter, _) = attach_watched(&mut fix.hub, "live", true, 0, 7, "tw/#").await;
+    fix.meters.push(meter);
+    fix.store_only_session("moved", "tw/#").await;
+    fix.hub.takeover_reconcile_ticks = 0;
+    fix.hub.inherited_scan_inflight = false;
+    (fix, peer_rx, live)
+}
+
+/// A live subscriber on `tw/#` is here; an offline session on `tw/#` is in the store
+/// and about to be materialised by this node's takeover. An acked forward on `tw/1`
+/// arrives while the takeover is open: the live subscriber is delivered at once, but
+/// the origin is NOT answered — `Reached` would release its ack with the moved
+/// session handed nothing. A retransmit meanwhile is absorbed. When a scan started
+/// after the hold lands, the moved session's queue holds the publish, and the origin
+/// gets one `Reached`.
+#[tokio::test]
+async fn a_forward_matched_during_an_open_takeover_waits_for_the_scan_and_covers_the_moved_session()
+{
+    let (mut fix, mut peer_rx, mut live) = takeover_fixture().await;
+    fix.hub.takeover_reconcile_ticks = 3;
+    assert!(fix.hub.takeover_open());
+
+    fix.dispatch(tw_forward(1)).await;
     assert_eq!(
         published_topics(&mut live),
         vec!["tw/1".to_string()],
         "the live subscriber is delivered at once"
     );
     assert_eq!(
-        verdicts(&mut peer_rx),
+        tw_verdicts(&mut peer_rx),
         Vec::new(),
         "answered while the takeover was open: the origin releases its ack with the \
          moved session handed nothing (#1031)"
     );
     assert_eq!(fix.hub.held_forwards.len(), 1);
     // A retransmit of the held forward is absorbed: no second copy, no answer.
-    fix.dispatch(forward()).await;
+    fix.dispatch(tw_forward(1)).await;
     assert_eq!(published_topics(&mut live), Vec::<String>::new());
-    assert_eq!(verdicts(&mut peer_rx), Vec::new());
+    assert_eq!(tw_verdicts(&mut peer_rx), Vec::new());
 
-    // The scan lands and brings the moved session.
+    // A scan starts after the hold, and lands complete, bringing the moved session.
+    fix.hub.begin_scan();
     fix.scan_lands(&["moved"], true).await;
-    assert!(!fix.hub.routing_unsettled());
     assert!(fix.hub.held_forwards.is_empty());
     let queued = fix.queued("moved").await;
     assert_eq!(
@@ -1319,7 +1346,7 @@ async fn a_forward_matched_during_an_open_takeover_waits_for_the_scan_and_covers
     );
     assert_eq!(queued[0].message.topic, "tw/1");
     assert_eq!(
-        verdicts(&mut peer_rx),
+        tw_verdicts(&mut peer_rx),
         vec![(1, mqtt_cluster::peer::ForwardVerdict::Reached)],
         "one answer, after the scan, and it says Reached"
     );
@@ -1327,6 +1354,80 @@ async fn a_forward_matched_during_an_open_takeover_waits_for_the_scan_and_covers
         published_topics(&mut live),
         Vec::<String>::new(),
         "the live subscriber is not handed a second copy"
+    );
+}
+
+/// A scan already in flight when the forward is held may have read the store before
+/// the session's group was this node's: its landing must not release the hold. A
+/// scan started after the hold does.
+#[tokio::test]
+async fn a_scan_in_flight_before_the_hold_does_not_release_it() {
+    let (mut fix, mut peer_rx, _live) = takeover_fixture().await;
+    fix.hub.begin_scan();
+    assert!(fix.hub.takeover_open());
+    fix.dispatch(tw_forward(1)).await;
+    assert_eq!(fix.hub.held_forwards.len(), 1);
+
+    // The earlier scan lands complete, without the session: still held, and the
+    // takeover is open again (the eager window), as it is while a lease is landing.
+    fix.hub.takeover_reconcile_ticks = 3;
+    fix.scan_lands(&[], true).await;
+    assert_eq!(
+        fix.hub.held_forwards.len(),
+        1,
+        "released by a scan that started before the hold (#1031 review)"
+    );
+    assert_eq!(tw_verdicts(&mut peer_rx), Vec::new());
+
+    fix.hub.begin_scan();
+    fix.scan_lands(&["moved"], true).await;
+    assert!(fix.hub.held_forwards.is_empty());
+    assert_eq!(fix.queued("moved").await.len(), 1);
+    assert_eq!(
+        tw_verdicts(&mut peer_rx),
+        vec![(1, mqtt_cluster::peer::ForwardVerdict::Reached)]
+    );
+}
+
+/// Routing unsettled for a reason that is not a takeover — the last scan incomplete
+/// (#1049), interest not yet authoritative — moves no session here, so a matched
+/// forward is answered at once, as before #1031's fix.
+#[tokio::test]
+async fn a_forward_is_not_held_when_routing_is_unsettled_without_a_takeover() {
+    let (mut fix, mut peer_rx, mut live) = takeover_fixture().await;
+    fix.hub.last_scan_complete = false;
+    fix.hub.interest_authoritative = false;
+    assert!(fix.hub.routing_unsettled());
+    assert!(!fix.hub.takeover_open());
+
+    fix.dispatch(tw_forward(1)).await;
+    assert_eq!(published_topics(&mut live), vec!["tw/1".to_string()]);
+    assert!(fix.hub.held_forwards.is_empty());
+    assert_eq!(
+        tw_verdicts(&mut peer_rx),
+        vec![(1, mqtt_cluster::peer::ForwardVerdict::Reached)],
+        "no takeover is open, so nothing is coming that the forward could be owed to"
+    );
+}
+
+/// A takeover that stays open past [`HELD_FORWARD_MAX_TICKS`] settle passes answers
+/// its held forwards `Failed` ("cannot say, retry"): the publisher retries.
+#[tokio::test]
+async fn a_takeover_that_stays_open_answers_held_forwards_failed() {
+    let (mut fix, mut peer_rx, _live) = takeover_fixture().await;
+    fix.hub.inherited_scan_inflight = true;
+    fix.dispatch(tw_forward(1)).await;
+    assert_eq!(fix.hub.held_forwards.len(), 1);
+    for _ in 1..crate::hub::forwarding::HELD_FORWARD_MAX_TICKS {
+        fix.hub.settle_held_forwards();
+    }
+    assert_eq!(tw_verdicts(&mut peer_rx), Vec::new(), "held until the cap");
+    fix.hub.settle_held_forwards();
+    quiesce(&mut fix.hub).await;
+    assert!(fix.hub.held_forwards.is_empty());
+    assert_eq!(
+        tw_verdicts(&mut peer_rx),
+        vec![(1, mqtt_cluster::peer::ForwardVerdict::Failed)]
     );
 }
 

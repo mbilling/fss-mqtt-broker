@@ -2131,9 +2131,6 @@ async fn a_takeover_with_a_live_subscriber_still_delivers_to_the_moved_session()
         probe.disconnect().await;
     }
 
-    // The publish under test, through the founder, acked while the new owner's
-    // scan is still held: whatever the broker answers, the ack is a promise to
-    // EVERY subscriber of the topic, the moved offline session included.
     // The publish under test, through the founder. While the founder still routes the
     // moved session itself, its local enqueue fails ("not the owning node") and
     // v3.1.1 can only refuse by closing: such an attempt is retried on a fresh
