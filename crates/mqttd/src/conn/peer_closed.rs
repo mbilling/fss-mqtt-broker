@@ -24,8 +24,10 @@ pub struct PeerClosedWatch {
 }
 
 enum Source {
+    /// A second tokio stream over a duplicate of the client's socket, used only for
+    /// its readiness: never read from or written to.
     #[cfg(unix)]
-    Tcp(tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>),
+    Tcp(TcpStream),
     Quic(quinn::Connection),
 }
 
@@ -54,9 +56,13 @@ impl PeerClosedWatch {
         // The duplicate shares the open file (and its O_NONBLOCK) with `stream`
         // but is a separate reactor registration, so it cannot steal readiness
         // from the read loop.
+        //
+        // Registered as a tokio `TcpStream` rather than an `AsyncFd`: tokio 1.54
+        // deprecated the safe `AsyncFd` constructors, and their replacements are
+        // `unsafe`, which this crate forbids. Both are safe conversions here.
         let fd = stream.as_fd().try_clone_to_owned().ok()?;
-        let fd = tokio::io::unix::AsyncFd::with_interest(fd, tokio::io::Interest::READABLE).ok()?;
-        Some(Self::from_source(Source::Tcp(fd)))
+        let dup = TcpStream::from_std(std::net::TcpStream::from(fd)).ok()?;
+        Some(Self::from_source(Source::Tcp(dup)))
     }
 
     /// Non-unix targets: no watch, the pre-#825 behaviour.
@@ -80,17 +86,22 @@ impl PeerClosedWatch {
     pub async fn closed(&self) {
         match &self.source {
             #[cfg(unix)]
-            Source::Tcp(fd) => loop {
-                match fd.readable().await {
-                    Ok(mut guard) => {
+            Source::Tcp(dup) => loop {
+                match dup.ready(tokio::io::Interest::READABLE).await {
+                    Ok(ready) => {
                         #[cfg(test)]
                         self.wakeups
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let ready = guard.ready();
                         if ready.is_read_closed() || ready.is_error() {
                             return;
                         }
-                        guard.clear_ready();
+                        // Clear the "data arrived" readiness without reading: a
+                        // `try_io` whose closure reports `WouldBlock` clears it, so
+                        // the next `ready` waits for the next event instead of
+                        // spinning on data the read loop is leaving unread.
+                        let _ = dup.try_io(tokio::io::Interest::READABLE, || {
+                            Err::<(), _>(std::io::ErrorKind::WouldBlock.into())
+                        });
                     }
                     // The reactor is gone (runtime shutting down): nothing to watch.
                     Err(_) => std::future::pending::<()>().await,
