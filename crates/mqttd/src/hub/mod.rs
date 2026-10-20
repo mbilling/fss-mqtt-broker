@@ -7100,6 +7100,9 @@ impl Hub {
             self.gossip_interest();
         }
         self.release_moved_sessions();
+        if complete {
+            self.note_scan_landed();
+        }
         self.settle_passes();
     }
 

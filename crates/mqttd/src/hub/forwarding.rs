@@ -213,6 +213,10 @@ pub(super) struct HeldForward {
     pub(super) since: Instant,
     /// Settle passes it has waited through.
     pub(super) ticks: u16,
+    /// A complete inherited-session scan has landed since the hold began: the
+    /// sessions the open takeover was bringing are materialised, which is what the
+    /// hold waited for.
+    pub(super) scan_landed: bool,
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -727,7 +731,8 @@ impl Hub {
     /// still materialising may be owed the publish too. The live deliveries have
     /// happened; what they reached is recorded, the verdict gate is marked held (its
     /// appends then answer nothing), and [`settle_held_forwards`](Self::settle_held_forwards)
-    /// finishes the job when the window closes. A retransmit of the forward meanwhile
+    /// finishes the job once the next complete scan has landed — not the whole settle
+    /// window, which outlives the scan by seconds and would hold every ack that long. A retransmit of the forward meanwhile
     /// finds the gate in flight and is absorbed, as today.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn hold_forward_for_takeover(
@@ -774,11 +779,21 @@ impl Hub {
             reached,
             since: Instant::now(),
             ticks: 0,
+            scan_landed: false,
         });
     }
 
-    /// Release the forwards held for an open takeover (issue #1031) once the window
-    /// is over: each is re-applied to the sessions materialised since it arrived —
+    /// A complete inherited-session scan landed: every held forward may now be
+    /// released by the next settle pass (issue #1031).
+    pub(super) fn note_scan_landed(&mut self) {
+        for h in &mut self.held_forwards {
+            h.scan_landed = true;
+        }
+    }
+
+    /// Release the forwards held for an open takeover (issue #1031) once a complete
+    /// scan has landed since the hold began (or the whole settle window is over):
+    /// each is re-applied to the sessions materialised since it arrived —
     /// the ones its fan-out did not reach, that existed when it was made (#1011) —
     /// as a replay (#784: a session already holding the publish is skipped), and
     /// then answered with the combined verdict; a re-apply that submitted appends is
@@ -793,11 +808,12 @@ impl Hub {
         let held = std::mem::take(&mut self.held_forwards);
         for mut h in held {
             h.ticks += 1;
-            if !window_over && h.ticks < HELD_FORWARD_MAX_TICKS {
+            let release = window_over || h.scan_landed;
+            if !release && h.ticks < HELD_FORWARD_MAX_TICKS {
                 self.held_forwards.push(h);
                 continue;
             }
-            let out = if window_over {
+            let out = if release {
                 self.reapply_held_forward(&h)
             } else {
                 warn!(
