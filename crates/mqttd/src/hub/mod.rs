@@ -1957,6 +1957,10 @@ pub enum HubCommand {
         /// key was skipped for a transient reason — the view may be missing
         /// sessions, so it must not settle the interest-authoritative flag.
         complete: bool,
+        /// The sessions the scan could not read, with their errors (issue #1049): the
+        /// first few, and how many in all.
+        unread: Vec<(ClientId, String)>,
+        unread_total: usize,
     },
     /// Liveness probe (the health endpoint): the hub replies as soon as the actor
     /// loop dequeues this command, proving the loop is draining and not wedged.
@@ -2717,6 +2721,9 @@ pub struct Hub {
     /// owed this" no matter how many window ticks have elapsed. The settle
     /// window closes on this OBSERVABLE state, never on time alone.
     last_scan_complete: bool,
+    /// Consecutive session scans that landed incomplete (issue #1049), for the warnings
+    /// that name what they could not read and say when they complete again.
+    incomplete_scans: u32,
     /// Whether peer networking is configured (set at startup, before `run`):
     /// the stable half of [`clustered`](Self::clustered) — a restarted cluster
     /// node must not be mistaken for a standalone broker while SWIM re-learns
@@ -3204,6 +3211,7 @@ impl Hub {
                 interest_authoritative: false,
                 interest_suppressed_ticks: 0,
                 last_scan_complete: false,
+                incomplete_scans: 0,
                 cluster_configured: false,
                 // A boot window (like the post-PeerDead takeover window): a
                 // restarted or newly-joined node may already own groups with
@@ -4298,7 +4306,13 @@ impl Hub {
             HubCommand::DurableFrame { node, frame } => {
                 self.handle_durable_frame(&node, frame);
             }
-            HubCommand::InheritedSessions { sessions, complete } => {
+            HubCommand::InheritedSessions {
+                sessions,
+                complete,
+                unread,
+                unread_total,
+            } => {
+                self.report_scan(complete, &unread, unread_total);
                 self.inherit_sessions(sessions, complete);
             }
             HubCommand::Flush { reply } => {
@@ -6920,6 +6934,8 @@ impl Hub {
                     mqtt_storage::SessionScan {
                         sessions: Vec::new(),
                         complete: false,
+                        unread: vec![(ClientId("<every session>".into()), e.to_string())],
+                        unread_total: 1,
                     }
                 }
             };
@@ -6931,8 +6947,46 @@ impl Hub {
             let _ = tx.send(HubCommand::InheritedSessions {
                 sessions: scan.sessions,
                 complete: scan.complete,
+                unread: scan.unread,
+                unread_total: scan.unread_total,
             });
         });
+    }
+
+    /// Say why the session scans do not complete (issue #1049). While they do not, a
+    /// clustered node holds the PUBACK of every gated publish no session matches, so a
+    /// scan that never completes is a `QoS` 1 outage on this node: warn on the first
+    /// incomplete scan and every tenth in a row, naming the sessions it could not read
+    /// and their errors (the first [`SessionScan::UNREAD_KEPT`], with the total), and
+    /// once more when the scans complete again.
+    ///
+    /// [`SessionScan::UNREAD_KEPT`]: mqtt_storage::SessionScan::UNREAD_KEPT
+    fn report_scan(&mut self, complete: bool, unread: &[(ClientId, String)], unread_total: usize) {
+        if complete {
+            if self.incomplete_scans > 0 {
+                warn!(
+                    scans = self.incomplete_scans,
+                    "session scan complete again after incomplete scans"
+                );
+            }
+            self.incomplete_scans = 0;
+            return;
+        }
+        self.incomplete_scans = self.incomplete_scans.saturating_add(1);
+        if self.incomplete_scans == 1 || self.incomplete_scans.is_multiple_of(10) {
+            let named: Vec<String> = unread
+                .iter()
+                .map(|(c, e)| format!("{}: {e}", c.0))
+                .collect();
+            warn!(
+                scans = self.incomplete_scans,
+                unread = unread_total,
+                named = named.len(),
+                sessions = ?named,
+                "session scan incomplete: these sessions could not be read, so routing \
+                 stays unsettled and gated publishes no session matches keep their acks"
+            );
+        }
     }
 
     /// Materialize sessions a takeover handed this node, before their clients

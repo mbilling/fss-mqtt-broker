@@ -260,8 +260,13 @@ impl Fix {
             let subs = self.store.subscriptions(&id).await.unwrap();
             sessions.push((id, subs, None));
         }
-        self.dispatch(HubCommand::InheritedSessions { sessions, complete })
-            .await;
+        self.dispatch(HubCommand::InheritedSessions {
+            sessions,
+            complete,
+            unread: Vec::new(),
+            unread_total: 0,
+        })
+        .await;
     }
 
     async fn queued(&self, client: &str) -> Vec<mqtt_storage::QueuedMessage> {
@@ -586,6 +591,8 @@ async fn sweep_once(fix: &mut Fix, complete: bool) {
         fix.dispatch(HubCommand::InheritedSessions {
             sessions: Vec::new(),
             complete,
+            unread: Vec::new(),
+            unread_total: 0,
         })
         .await;
     }
