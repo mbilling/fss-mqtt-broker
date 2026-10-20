@@ -144,8 +144,9 @@ pub struct AppendJob {
 pub enum LaneJob {
     /// Run the job's store work and post [`HubCommand::AppendDone`].
     Deliver(Box<AppendJob>),
-    /// Run the clean-start durable discard (`store.remove`) and post
-    /// `SessionRecovered::Cleaned`, exactly like the spawned path (ADR 0017) — plus a
+    /// Run the clean-start durable discard (`clean_start_store`: remove, then record a
+    /// new session that outlives the connection) and post `SessionRecovered::Cleaned`,
+    /// exactly like the spawned path (ADR 0017) — plus a
     /// bookkeeping `AppendDone` so the lane's outstanding count drains.
     Discard(Box<PendingAttach>),
     /// Run the durable session discard (`store.remove`) for a zero-expiry detach or
@@ -575,7 +576,7 @@ async fn run_barrier_job(
             // the queue it just emptied (issue #242). Best-effort like the
             // spawned path; the in-memory wipe already happened on-loop.
             let client = pending.client.clone();
-            let _ = store.remove(&client).await;
+            super::clean_start_store(store, &pending).await;
             let _ = self_tx.send(HubCommand::SessionRecovered {
                 pending,
                 recovery: SessionRecovery::Cleaned,

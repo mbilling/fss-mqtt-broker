@@ -33,10 +33,10 @@ PIDS=()
 cleanup() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done; rm -rf "$WORK"; }
 trap cleanup EXIT
 
-# Known differences, by session mode: #1033 (Will Message Expiry, takeover inside the
-# Will Delay) in both; #1034 (an empty in-memory session is not kept) without the store.
-EXPECT_DURABLE="v5-drop-props,v5-takeover-resumed"
-EXPECT_MEMORY="$EXPECT_DURABLE,v5-resumed"
+# Known differences, by session mode: none today. A difference found later is listed
+# here, with its issue, until it is fixed.
+EXPECT_DURABLE=""
+EXPECT_MEMORY=""
 
 run() {
   local mode="$1" expect="$2"
