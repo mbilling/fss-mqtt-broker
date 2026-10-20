@@ -1077,6 +1077,13 @@ struct Inflight {
     /// prefix, so an out-of-order PUBACK cannot discard a message still in flight
     /// behind it.
     outstanding: BTreeSet<Offset>,
+    /// Offsets the subscriber has acknowledged that sit ABOVE the truncation watermark
+    /// (issue #1056): an older entry still owed — a `QoS` 2 flow whose PUBREL is
+    /// withheld, say — keeps [`safe_ack`](Self::safe_ack) below them, so they stay in
+    /// the durable queue although they are settled. A resume must not replay them as
+    /// new messages; [`advance_ack`](Self::advance_ack) forgets them once truncation
+    /// covers them.
+    released: BTreeSet<Offset>,
     /// The highest offset ever tracked, so a fully drained session truncates its whole
     /// log rather than stalling at the last released offset.
     high_water: Offset,
@@ -1111,6 +1118,7 @@ impl Default for Inflight {
             receive_maximum: RECEIVE_MAXIMUM_DEFAULT,
             backlog: BacklogQueue::default(),
             outstanding: BTreeSet::new(),
+            released: BTreeSet::new(),
             high_water: 0,
             acked_through: 0,
             records_pending: 0,
@@ -1143,6 +1151,15 @@ impl Inflight {
     /// The subscriber has acknowledged the message stored at `offset`.
     fn release(&mut self, offset: Offset) {
         self.outstanding.remove(&offset);
+        if offset > self.acked_through {
+            self.released.insert(offset);
+        }
+    }
+
+    /// Whether `offset` was acknowledged by an earlier connection and only awaits
+    /// truncation (issue #1056).
+    fn settled_above_watermark(&self, offset: Offset) -> bool {
+        self.released.contains(&offset)
     }
 
     /// Contiguous prefix no longer owed to the subscriber. This is eligibility for
@@ -1166,6 +1183,7 @@ impl Inflight {
         let safe = self.safe_ack();
         (safe > self.acked_through).then(|| {
             self.acked_through = safe;
+            self.released.retain(|o| *o > safe);
             safe
         })
     }
@@ -5333,6 +5351,19 @@ impl Hub {
                     debug!(client = %client.0, offset = qm.offset,
                            "queued message is still in flight in memory; not replaying");
                     restored.remove(&qm.offset);
+                    continue;
+                }
+                // Acknowledged on an earlier connection, kept in the queue only because
+                // an older entry still owed blocks truncation (issue #1056): settled,
+                // not owed, and a copy here would be a new message to the client.
+                if self
+                    .inflight
+                    .get(&client)
+                    .is_some_and(|inf| inf.settled_above_watermark(qm.offset))
+                {
+                    debug!(client = %client.0, offset = qm.offset,
+                           "queued message was acknowledged before this connection and awaits \
+                            truncation; not replaying (#1056)");
                     continue;
                 }
                 // A broker restart with a durably-recorded id (ADR 0057): resume the
@@ -15024,6 +15055,76 @@ mod tests {
 
     /// ADR 0057 excludes `QoS` 1 by design: a fresh-id DUP redelivery is what
     /// at-least-once means, so persisting its id would buy nothing.
+    /// Issue #1056: a `QoS` 2 flow whose PUBREL is withheld keeps the truncation
+    /// watermark below everything delivered after it. The `QoS` 1 messages behind it
+    /// are acknowledged — settled, not owed — yet stay in the durable queue. A resume
+    /// re-sends the withheld flow (the PUBLISH again, DUP set) and nothing else: the
+    /// acknowledged messages were replayed as new messages before.
+    #[tokio::test]
+    async fn a_resume_does_not_replay_messages_acknowledged_behind_a_withheld_pubrel() {
+        let store = FlakyStore::new(0);
+        let tx = start_hub_with_arc(store.clone());
+        let (mut rx, _) = attach_full(&tx, "c", 1, false, u32::MAX, 8).await;
+        subscribe_qos(&tx, "c", "t", QoS::ExactlyOnce);
+
+        publish_qos2(&tx, "t", b"hole");
+        let hole = pkid_of(&recv_packet(&mut rx).await.unwrap());
+        store
+            .fail_outbound
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        pub_rec(&tx, "c", hole);
+        assert!(recv_packet(&mut rx).await.is_none(), "PUBREL withheld");
+
+        // Two messages behind the hole, delivered and acknowledged.
+        for payload in [b"behind-1".as_slice(), b"behind-2"] {
+            publish_qos1(&tx, "t", payload);
+            let p = recv_packet(&mut rx).await.expect("delivered");
+            assert_eq!(payload_of(&p), payload);
+            pub_ack(&tx, "c", pkid_of(&p));
+        }
+        let c = ClientId("c".into());
+        detach(&tx, "c", 1);
+        let (mut rx, present) = attach_full(&tx, "c", 2, false, u32::MAX, 8).await;
+        assert!(present);
+        assert_eq!(
+            store.pending(&c, 0, 16).await.unwrap().len(),
+            3,
+            "the queue still holds all three: nothing below the hole truncates"
+        );
+
+        let first = recv_packet(&mut rx)
+            .await
+            .expect("the withheld QoS 2 flow is resumed");
+        assert_eq!(payload_of(&first), b"hole");
+        assert!(
+            matches!(&first, Packet::Publish(p) if p.dup),
+            "a re-sent PUBLISH carries DUP [MQTT-3.3.1-1]: {first:?}"
+        );
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "messages the client acknowledged before the resume are not replayed (#1056)"
+        );
+
+        // The hole clears: PUBREC advances the phase, PUBREL goes out, PUBCOMP ends the
+        // flow, and the truncation that follows takes the acknowledged tail with it.
+        store
+            .fail_outbound
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let hole = pkid_of(&first);
+        pub_rec(&tx, "c", hole);
+        let rel = recv_packet(&mut rx).await.unwrap();
+        assert!(
+            matches!(&rel, Packet::PubRel(k) if k.pkid == hole),
+            "{rel:?}"
+        );
+        pub_comp(&tx, "c", hole);
+        wait_qos2_store_empty(store.as_ref(), "c").await;
+        assert!(
+            store.pending(&c, 0, 16).await.unwrap().is_empty(),
+            "once the hole clears, everything acknowledged truncates"
+        );
+    }
+
     #[tokio::test]
     async fn a_qos1_delivery_records_no_outbound_id() {
         let store = std::sync::Arc::new(MemorySessionStore::new());
