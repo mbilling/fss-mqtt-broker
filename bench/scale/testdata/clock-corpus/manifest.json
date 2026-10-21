@@ -14,6 +14,7 @@
       "driver7"
     ],
     "phase": "results/nodes=3/laneE/sites-4/clock/preflight",
+    "reference_ip": "10.99.1.11",
     "run": "calibrate-d8-20260919T163522Z"
   },
   "host-below-reference-root-delay": {
@@ -31,6 +32,7 @@
       "driver7"
     ],
     "phase": "results/nodes=3/laneE/sites-4/clock/open",
+    "reference_ip": "10.99.1.11",
     "run": "calibrate-d8-20260919T163522Z"
   },
   "host-stale-under-load": {
@@ -48,6 +50,7 @@
       "driver7"
     ],
     "phase": "results/nodes=3/laneE/sites-1/clock/final",
+    "reference_ip": "10.99.1.11",
     "run": "calibrate-d8-20260919T152645Z"
   },
   "reference-between-upstream-polls": {
@@ -65,7 +68,26 @@
       "driver7"
     ],
     "phase": "results/nodes=3/laneE/sites-1/clock/sample-2",
+    "reference_ip": "10.99.1.11",
     "run": "calibrate-d8-20260919T140651Z"
+  },
+  "reference-changed-upstream-stratum": {
+    "hosts": [
+      "broker0",
+      "broker1",
+      "broker2",
+      "driver0",
+      "driver1",
+      "driver2",
+      "driver3",
+      "driver4",
+      "driver5",
+      "driver6",
+      "driver7"
+    ],
+    "phase": "1-n3/results/nodes=3/laneE/sites-1/clock/sample-5",
+    "reference_ip": "10.99.1.11",
+    "run": "knee-20261021T161937Z"
   },
   "shared-upstream-path": {
     "hosts": [
@@ -82,6 +104,7 @@
       "driver7"
     ],
     "phase": "results/nodes=3/clock-preflight",
+    "reference_ip": "10.99.1.11",
     "run": "calibrate-d8-20260919T134958Z"
   }
 }

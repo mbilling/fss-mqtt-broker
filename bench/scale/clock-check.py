@@ -19,11 +19,12 @@ FLEET_MAX_AGE_S = 900
 REFERENCE_MAX_AGE_S = 2 * 1024 + 60
 
 
-def tracking(text, max_error_ms=5.0, max_age_s=FLEET_MAX_AGE_S, reference=None):
+def tracking(text, max_error_ms=5.0, max_age_s=FLEET_MAX_AGE_S, reference=None, reference_ip=None):
     """One host's chrony tracking report -> its clock error bounds.
 
     `reference` is the parsed report of the fleet's NTP reference host, or None
-    when this host IS the reference. Two bounds come back:
+    when this host IS the reference. `reference_ip` is that host's private
+    address, the one every fleet host's chrony is pointed at. Two bounds come back:
 
     absolute_error_ms = |system offset| + root delay / 2 + root dispersion
         chrony's documented bound against TRUE time. Root delay is the round trip
@@ -72,7 +73,17 @@ def tracking(text, max_error_ms=5.0, max_age_s=FLEET_MAX_AGE_S, reference=None):
     else:
         # The cancellation is only valid for a host that really is one hop below
         # the reference. Anything else has an unknown path and gets no discount.
-        if stratum != reference["stratum"] + 1:
+        # chrony names the source a host is synchronised to in its Reference ID,
+        # so with the reference's address known that is the test. Stratum is
+        # only the fallback: it lags the reference by up to one fleet poll. On
+        # 2026-10-21 the reference swapped a stratum-1 upstream for a stratum-2
+        # one (its own stratum 2 -> 3) mid-rung; all ten hosts still named
+        # 10.99.1.11 at stratum 3, inside 0.7 ms, and the run died.
+        if reference_ip is not None:
+            named = fields["Reference ID"].split("(", 1)[-1].rstrip(")").strip()
+            if named != reference_ip:
+                raise ValueError(f"clock is not disciplined to the fleet reference ({reference_ip}); it follows {named}")
+        elif stratum != reference["stratum"] + 1:
             raise ValueError("clock is not disciplined to the fleet reference")
         # The difference estimates this host's own hop, and it is CLAMPED at zero
         # rather than trusted to be positive. The two reports are snapshots taken
@@ -109,13 +120,15 @@ def tracking(text, max_error_ms=5.0, max_age_s=FLEET_MAX_AGE_S, reference=None):
             "stratum": stratum, "root_delay_s": root_delay}
 
 
-def validate_phase(directory, hosts, max_error_ms=5.0):
+def validate_phase(directory, hosts, max_error_ms=5.0, reference_ip=None):
     """`hosts[0]` is the fleet's NTP reference (clock-sync.sh points every other
-    host at the first broker); the rest are gated on their error against it."""
+    host at the first broker, at `reference_ip`); the rest are gated on their
+    error against it."""
     reference = tracking((directory / f"{hosts[0]}.txt").read_text(), max_error_ms)
     report = {hosts[0]: reference}
     for host in hosts[1:]:
-        report[host] = tracking((directory / f"{host}.txt").read_text(), max_error_ms, reference=reference)
+        report[host] = tracking((directory / f"{host}.txt").read_text(), max_error_ms,
+                                reference=reference, reference_ip=reference_ip)
     return report
 
 
@@ -124,8 +137,9 @@ if __name__ == "__main__":
     parser.add_argument("directory", type=Path)
     parser.add_argument("max_error_ms", type=float)
     parser.add_argument("hosts", nargs="+")
+    parser.add_argument("--reference-ip", help="the reference host's private address, which every other host follows")
     args = parser.parse_args()
     try:
-        print(json.dumps(validate_phase(args.directory, args.hosts, args.max_error_ms), indent=2))
+        print(json.dumps(validate_phase(args.directory, args.hosts, args.max_error_ms, args.reference_ip), indent=2))
     except (ValueError, KeyError, OSError) as exc:
         parser.exit(1, f"INVALID CLOCK: {exc}\n")

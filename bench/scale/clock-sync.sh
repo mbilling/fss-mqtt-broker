@@ -33,7 +33,8 @@ qos1_clock_capture() { # destination directory; retain even failed reports
     for pid in "${pids[@]}"; do wait "$pid" || failed=1; done
     mapfile -t hosts < <(qos1_clock_hosts)
     [ "$failed" = 0 ] || return 1
-    python3 "$SCALE_DIR/clock-check.py" "$dest" "$QOS1_CLOCK_MAX_ERROR_MS" "${hosts[@]}" >"$dest/validated.json"
+    python3 "$SCALE_DIR/clock-check.py" "$dest" "$QOS1_CLOCK_MAX_ERROR_MS" "${hosts[@]}" \
+        --reference-ip "$(inv '.brokers[0].private_ip')" >"$dest/validated.json"
 }
 
 qos1_clock_setup() {
