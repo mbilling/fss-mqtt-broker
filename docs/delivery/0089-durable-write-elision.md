@@ -5,7 +5,7 @@ adr_status: Accepted
 tasks:
   - id: 0089-T1
     title: "Characterisation first: hub tests that pin today's order (durable before the wire) and the obligation ledger, and a cluster_proc schedule that kills a session's owner with deliveries in flight; the tests D1-D5 will flip"
-    status: in-progress
+    status: done
     issue: 1068
     notes: "Size M. hub/lanes.rs, hub/forwarding.rs, hub/delivery.rs tests; proc_common (a kill aimed at an owner with an online persistent subscriber under load). No behaviour change. First piece: hub::tests::a_durable_qos1_delivery_reaches_the_wire_only_after_its_append (an append held by FlakyStore::hold_enqueue keeps the live PUBLISH off the wire and the publisher unanswered; released, both proceed and the copy stays until the PUBACK). The crash half is inflight_durability::an_acked_qos1_in_flight_to_an_online_subscriber_survives_a_crash (#124), which T2 must keep green with elision on."
   - id: 0089-T2
