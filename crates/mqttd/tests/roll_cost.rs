@@ -16,9 +16,9 @@
 //!   the rolled node is away. The "mass reconnects per rolled node" fear is
 //!   refuted structurally: the blast radius is ~hosted-sessions/N-th of the
 //!   fleet, not the fleet.
-//! * The dropped clients resume with `session_present=1` on a survivor and
-//!   their subscriptions still deliver. A client that resumes in the seconds
-//!   around the rolled node's readmission can be routed onto the group's
+//! * The dropped clients resume at once, while the rolled node is away, with
+//!   `session_present=1` on a survivor, and their subscriptions still deliver.
+//!   A session whose group the rolled node owns is routed onto the group's
 //!   INTERIM owner (the ring hands the readmitted node its groups back a
 //!   couple of seconds after it turns ready, and relocation is decided once,
 //!   at CONNECT) — that node then closes the connection itself, promptly, so
@@ -294,25 +294,18 @@ async fn a_rolled_node_disconnects_only_its_own_clients() {
         );
     }
 
-    // Restart over the same data dir (the pod's PV) and rejoin via the whole
-    // topology, as a restarted pod does.
-    let restart = Instant::now();
-    nodes[rolled].swim_seeds = nodes
-        .iter()
-        .enumerate()
-        .filter(|(j, _)| *j != rolled)
-        .map(|(_, n)| n.swim_bind.clone())
-        .collect::<Vec<_>>()
-        .join(",");
-    nodes[rolled].spawn();
-    wait_all_ready(&mut nodes, seed).await;
-    let readmit = restart.elapsed();
-
-    // The dropped clients resume durably — once each, on whatever node the
-    // Service offers (here: a survivor), with their session intact.
+    // The dropped clients resume durably at once, as a real client does when the drain
+    // closes its connection: on whatever node the Service offers (here: a survivor),
+    // while the rolled node is still away, with their session intact. A session whose
+    // group the rolled node owns lands on the group's INTERIM owner — the ring hands the
+    // group back when the node is readmitted, and relocation is decided once, at
+    // CONNECT — which is the case the rehome below exists for. Resuming after the
+    // readmission instead raced the hand-back: a client that lost the race landed on
+    // the owner directly and nothing was rehomed (issue #1027). The takeover of the
+    // rolled node's groups is in progress meanwhile, so allow the mid-roll budget.
     for &i in &closed {
         let via = (rolled + 1) % nodes.len();
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(90);
         let conn = loop {
             if let Some((conn, present)) = common::Client::connect_v311_within(
                 nodes[via].client_addr,
@@ -339,10 +332,24 @@ async fn a_rolled_node_disconnects_only_its_own_clients() {
         clients[i].via = via;
     }
 
-    // A client that resumed in the seconds around the rolled node's readmission
-    // can land on the INTERIM owner its group had while the node was away: the
-    // ring hands b's groups back a couple of seconds after b turns ready, and
-    // relocation is decided once, at CONNECT. The node that finds itself hosting
+    // Restart over the same data dir (the pod's PV) and rejoin via the whole
+    // topology, as a restarted pod does.
+    let restart = Instant::now();
+    nodes[rolled].swim_seeds = nodes
+        .iter()
+        .enumerate()
+        .filter(|(j, _)| *j != rolled)
+        .map(|(_, n)| n.swim_bind.clone())
+        .collect::<Vec<_>>()
+        .join(",");
+    nodes[rolled].spawn();
+    wait_all_ready(&mut nodes, seed).await;
+    let readmit = restart.elapsed();
+
+    // A client that resumed while the rolled node was away sits on the INTERIM owner
+    // its group had meanwhile: the ring hands b's groups back a couple of seconds
+    // after b turns ready, and relocation is decided once, at CONNECT. The node that
+    // finds itself hosting
     // a session for a group it no longer owns CLOSES that connection (rehome on
     // settle, 0043-P6 / issue #284) so the client relocates on its next CONNECT,
     // instead of sitting silently undeliverable until its keepalive fires.
