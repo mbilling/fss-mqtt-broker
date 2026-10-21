@@ -40,6 +40,7 @@ caller changes this file and the gate fails until it is regenerated and re-read.
 | `crates/mqtt-cluster/src/durable_node.rs` | `a_founded_factor_is_adopted_and_outlives_a_different_setting` | `founded-factor-holds` | 100ms | in the test itself |
 | `crates/mqttd/src/admission.rs` | `the_penalty_decays_back_to_admission` | `admission-penalty-decay` | 120ms | in the test itself |
 | `crates/mqttd/src/http_auth.rs` | `the_cache_expires_and_is_bounded` | `http-auth-cache-ttl` | 80ms | in the test itself |
+| `crates/mqttd/src/hub/mod.rs` | `enqueue_with_expiry` | `append-hold` | 10ms | helper, 8 call site(s) |
 | `crates/mqttd/src/hub/mod.rs` | `enqueue_with_expiry` | `store-slow-first-enqueue` | ? | helper, 8 call site(s) |
 | `crates/mqttd/src/hub/mod.rs` | `an_uncongested_relaxed_forward_is_answered_at_submit` | `early-verdict-uniqueness` | 100ms | in the test itself |
 | `crates/mqttd/src/hub/mod.rs` | `the_durability_property_is_inert_without_the_operator_opt_in` | `inert-property-negative-window` | 300ms | in the test itself |

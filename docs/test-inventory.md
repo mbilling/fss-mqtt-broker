@@ -1467,7 +1467,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 837 test(s)
+## `crates/mqttd/src/lib.rs` — 838 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1775,6 +1775,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_divergent_retained_value_is_detected_and_counted`
 - `hub::tests::a_drain_gated_message_is_not_handed_to_a_member_whose_node_was_declared_dead`
 - `hub::tests::a_dropped_replay_entry_does_not_pin_the_log`
+- `hub::tests::a_durable_qos1_delivery_reaches_the_wire_only_after_its_append`
 - `hub::tests::a_failed_durable_append_is_counted_by_reason`
 - `hub::tests::a_failed_local_commit_retries_until_heal_and_keeps_order`
 - `hub::tests::a_failed_offline_enqueue_withholds_the_publishers_ack`
