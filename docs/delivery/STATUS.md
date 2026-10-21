@@ -96,7 +96,7 @@
 | [0086](../adr/0086-wasm-rule-functions.md) | Rule functions in a WebAssembly sandbox: the real jq first, operator plugins on the same mechanism | Accepted | [4/4 done](0086-wasm-rule-functions.md) | — |
 | [0087](../adr/0087-delivery-across-a-false-dead-verdict.md) | A QoS ≥ 1 publish is acknowledged only when every node that owns a subscriber has accepted it: no path around the acknowledged forward | Proposed | [7/13 done](0087-delivery-across-a-false-dead-verdict.md) | 6 open |
 | [0088](../adr/0088-credential-lifetimes-and-rotation.md) | Cluster credentials have a lifetime the deployer sets, the broker enforces it strictly, and whoever operates the cluster rotates in time | Accepted | [3/7 done](0088-credential-lifetimes-and-rotation.md) | 4 open |
-| [0089](../adr/0089-durable-write-elision.md) | Write elision on the durable QoS 1 path: a message the subscriber has acknowledged need never be written | Proposed | [0/5 done](0089-durable-write-elision.md) | 5 open |
+| [0089](../adr/0089-durable-write-elision.md) | Write elision on the durable QoS 1 path: a message the subscriber has acknowledged need never be written | Accepted | [0/5 done](0089-durable-write-elision.md) | 5 open |
 
 ## Open and deferred work
 

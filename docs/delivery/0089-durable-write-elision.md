@@ -1,7 +1,7 @@
 ---
 adr: "0089"
 title: "Write elision on the durable QoS 1 path: a message the subscriber has acknowledged need never be written"
-adr_status: Proposed
+adr_status: Accepted
 tasks:
   - id: 0089-T1
     title: "Characterisation first: hub tests that pin today's order (durable before the wire) and the obligation ledger, and a cluster_proc schedule that kills a session's owner with deliveries in flight; the tests D1-D5 will flip"

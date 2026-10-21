@@ -1,7 +1,7 @@
 # ADR 0089 — Write elision on the durable QoS 1 path: a message the subscriber has acknowledged need never be written
 
-- **Status:** Proposed
-- **Date:** 2026-10-21
+- **Status:** Accepted
+- **Date:** 2026-10-21 (accepted the same day)
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0089-durable-write-elision.md](../delivery/0089-durable-write-elision.md) — plan, progress, and changelog
 - **Issue:** [#1068](https://github.com/mbilling/fss-mqtt-broker/issues/1068)
@@ -19,6 +19,11 @@
 > subscribers and acknowledged before the fsync write; write only if it cannot. Durable QoS
 > 1 is the path the project most wants to be great at. This record states the idea so it
 > keeps the durability promise, and what would have to be shown before it is on by default.
+>
+> **Accepted 2026-10-21** by the maintainer, with the rule restated in their words: the
+> message is sent to the subscriber within `write_elision_ms`; if it is not delivered and
+> acknowledged in that time, it is written to disk, and the publisher is acknowledged once
+> the write is durable. The default stays 0 until the evidence below is in.
 
 ## Context
 
@@ -46,7 +51,7 @@ message the write protects nothing that the subscriber's acknowledgement does no
 settle: once the subscriber has acknowledged it, no session is owed it, and the durable copy
 is truncated soon after (ADR 0074).
 
-## Decision (proposed)
+## Decision
 
 ### D1. The promise, restated
 
