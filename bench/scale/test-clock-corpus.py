@@ -44,7 +44,7 @@ class Corpus(unittest.TestCase):
         reference, exactly as `validate_phase` is called in production."""
         for case, meta in sorted(self.manifest.items()):
             with self.subTest(case=case, run=meta["run"]):
-                report = clock.validate_phase(CORPUS / case, meta["hosts"], BUDGET_MS)
+                report = clock.validate_phase(CORPUS / case, meta["hosts"], BUDGET_MS, meta["reference_ip"])
                 self.assertEqual(sorted(report), sorted(meta["hosts"]))
                 worst = max(r["error_ms"] for r in report.values())
                 self.assertLess(worst, BUDGET_MS, f"{case}: worst fleet error {worst:.3f} ms")
@@ -75,6 +75,23 @@ class Corpus(unittest.TestCase):
         reference = delays["broker0"]["root_delay_s"]
         below = [h for h, r in delays.items() if h != "broker0" and r["root_delay_s"] < reference]
         self.assertGreaterEqual(len(below), 5, f"only {below} below the reference")
+
+        # 5. The reference changed upstream mid-rung and moved to the fleet's
+        #    stratum while every host still followed it — which the stratum rule
+        #    called "not disciplined to the fleet reference".
+        moved = hosts("reference-changed-upstream-stratum")
+        self.assertTrue(all(r["stratum"] == moved["broker0"]["stratum"] for r in moved.values()))
+
+    def test_a_host_following_another_source_is_refused(self):
+        """The address test must refuse what the stratum test refused: a host
+        synchronised to anything but the reference has an unknown path."""
+        case = "reference-changed-upstream-stratum"
+        good = (CORPUS / case / "driver0.txt").read_text()
+        reference = clock.tracking((CORPUS / case / "broker0.txt").read_text(), BUDGET_MS)
+        clock.tracking(good, BUDGET_MS, reference=reference, reference_ip="10.99.1.11")  # must not raise
+        with self.assertRaises(ValueError):
+            clock.tracking(good.replace("(10.99.1.11)", "(78.47.56.71)", 1), BUDGET_MS,
+                           reference=reference, reference_ip="10.99.1.11")
 
     def test_a_genuinely_bad_clock_is_still_refused(self):
         """The corpus proves the gate is not too strict. It must not become the

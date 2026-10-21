@@ -1,0 +1,14 @@
+Reference ID    : 4E2F3847 (78.47.56.71)
+Stratum         : 3
+Ref time (UTC)  : Wed Oct 21 16:27:32 2026
+System time     : 0.000115122 seconds fast of NTP time
+Last offset     : +0.000051095 seconds
+RMS offset      : 0.000513676 seconds
+Frequency       : 10.950 ppm slow
+Residual freq   : -0.075 ppm
+Skew            : 1.662 ppm
+Root delay      : 0.007966196 seconds
+Root dispersion : 0.001041961 seconds
+Update interval : 64.1 seconds
+Leap status     : Normal
+Captured epoch : 1792600116.074948928
