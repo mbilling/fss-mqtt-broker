@@ -3882,7 +3882,7 @@ impl Hub {
                 session_expiry_override,
             } => {
                 // ADR 0089: a held delivery whose subscriber is gone is written now.
-                self.flush_elided(&client);
+                self.flush_elided(&client, "disconnect");
                 self.detach(&client, conn_id, graceful, session_expiry_override)
                     .await;
             }

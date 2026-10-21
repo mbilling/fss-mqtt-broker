@@ -332,6 +332,9 @@ struct OtelInstruments {
     publish_ack: OtelHistogram<f64>,
     http_auth_latency: OtelHistogram<f64>,
     durable_append_failures: OtelCounter<u64>,
+    durable_elided: OtelCounter<u64>,
+    durable_elision_fallbacks: OtelCounter<u64>,
+    durable_elision_hold: OtelHistogram<f64>,
     durable_recovery_failures: OtelCounter<u64>,
     lease_quorum_ack_ms: OtelGauge<i64>,
     gossip_rejected: OtelCounter<u64>,
@@ -494,6 +497,9 @@ impl OtelInstruments {
                 .f64_histogram("durable_append_latency_seconds")
                 .build(),
             durable_append_failures: meter.u64_counter("durable_append_failures").build(),
+            durable_elided: meter.u64_counter("durable_elided").build(),
+            durable_elision_fallbacks: meter.u64_counter("durable_elision_fallback").build(),
+            durable_elision_hold: meter.f64_histogram("durable_elision_hold_seconds").build(),
             durable_recovery_failures: meter.u64_counter("durable_recovery_failures").build(),
             lease_quorum_ack_ms: meter.i64_gauge("lease_quorum_ack_ms").build(),
             gossip_rejected: meter.u64_counter("gossip_rejected").build(),
@@ -662,6 +668,9 @@ pub struct Metrics {
     /// `error` is a denial — the hook failed closed.
     http_auth_outcomes_total: Family<ReasonLabel, Counter>,
     durable_append_failures_total: Family<ReasonLabel, Counter>,
+    durable_elided_total: Counter,
+    durable_elision_fallback_total: Family<ReasonLabel, Counter>,
+    durable_elision_hold_seconds: Histogram,
     /// Durable session *recovery* refusals (ADR 0049): a persistent attach that stayed
     /// unavailable past its deadline and got CONNACK 0x88. Distinct from an *append*
     /// failure — the signal that was silent for 11 h in the 2026-07-14 incident.
@@ -1279,6 +1288,25 @@ impl Metrics {
             "durable_append_failures",
             "Durable append failures, by reason (no-quorum, not-owner, backend)",
         );
+        let durable_elided_total = register_counter(
+            &mut registry,
+            "durable_elided",
+            "Durable QoS 1 deliveries the subscriber acknowledged inside the write-elision \
+             window, so never written (ADR 0089)",
+        );
+        let durable_elision_fallback_total = register_family(
+            &mut registry,
+            "durable_elision_fallback",
+            "Held durable QoS 1 deliveries written after all, by reason (timeout, \
+             disconnect, brownout, drain; ADR 0089)",
+        );
+        let durable_elision_hold_seconds = Histogram::new(fine_latency_buckets());
+        registry.register(
+            "durable_elision_hold_seconds",
+            "How long an elided delivery was held before the subscriber's PUBACK discharged \
+             it: the subscriber's acknowledgement latency (ADR 0089)",
+            durable_elision_hold_seconds.clone(),
+        );
         let durable_recovery_failures_total = register_family(
             &mut registry,
             "durable_recovery_failures",
@@ -1856,6 +1884,9 @@ impl Metrics {
             http_auth_latency_seconds,
             http_auth_outcomes_total,
             durable_append_failures_total,
+            durable_elided_total,
+            durable_elision_fallback_total,
+            durable_elision_hold_seconds,
             durable_recovery_failures_total,
             lease_quorum_ack_ms,
             gossip_rejected_total,
@@ -2561,6 +2592,28 @@ impl Metrics {
             .inc();
         self.otel
             .durable_append_failures
+            .add(1, &[KeyValue::new("reason", reason.to_string())]);
+    }
+
+    /// A held delivery was acknowledged inside the write-elision window after `held_seconds`
+    /// and was never written (ADR 0089).
+    pub fn durable_elided(&self, held_seconds: f64) {
+        self.durable_elided_total.inc();
+        self.durable_elision_hold_seconds.observe(held_seconds);
+        self.otel.durable_elided.add(1, &[]);
+        self.otel.durable_elision_hold.record(held_seconds, &[]);
+    }
+
+    /// A held delivery fell back to a durable write; `reason` is a bounded class
+    /// (`"timeout"`, `"disconnect"`, `"brownout"`, `"drain"`).
+    pub fn durable_elision_fallback(&self, reason: &str) {
+        self.durable_elision_fallback_total
+            .get_or_create(&ReasonLabel {
+                reason: reason.to_string(),
+            })
+            .inc();
+        self.otel
+            .durable_elision_fallbacks
             .add(1, &[KeyValue::new("reason", reason.to_string())]);
     }
 
@@ -3766,6 +3819,8 @@ mod tests {
         m.set_lease_role(true, 7);
         m.observe_durable_append_latency(0.002);
         m.durable_append_failed("no-quorum");
+        m.durable_elided(0.001);
+        m.durable_elision_fallback("timeout");
         m.gossip_rejected("replay");
         m.swim_last_probes("sent", 3);
         m.swim_last_probes("spared", 2);
@@ -3819,6 +3874,15 @@ mod tests {
         );
         assert!(
             out.contains("mqttd_durable_append_failures_total{reason=\"no-quorum\"} 1"),
+            "{out}"
+        );
+        assert!(out.contains("mqttd_durable_elided_total 1"), "{out}");
+        assert!(
+            out.contains("mqttd_durable_elision_fallback_total{reason=\"timeout\"} 1"),
+            "{out}"
+        );
+        assert!(
+            out.contains("mqttd_durable_elision_hold_seconds_count 1"),
             "{out}"
         );
         assert!(
