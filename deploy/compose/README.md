@@ -104,6 +104,19 @@ automatically, with no flag and nothing in the output saying so, and a stray cop
 downgrade a cluster invisibly. The `-f … -f …` form appears in shell history, in CI logs,
 and in the bug report somebody eventually files.
 
+## Upgrading to a new release
+
+One node at a time, waiting for the cluster after each:
+
+```sh
+scripts/roll-upgrade.sh compose --image ghcr.io/mbilling/fss-mqtt-broker:X.Y.Z \
+  --dir deploy/compose mqttd-1 mqttd-2 mqttd-3
+```
+
+It recreates each service on the new image and waits until all three are ready, and stay
+ready, before the next. Then set `MQTTD_IMAGE` to the same tag in `deploy/compose/.env`, or
+a later `docker compose up -d` recreates every node on the old default.
+
 ## Upgrading an existing plaintext cluster
 
 If you already run a cluster from an older copy of this file, **there is no rolling upgrade.
