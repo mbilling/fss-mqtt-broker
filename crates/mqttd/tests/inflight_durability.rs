@@ -73,8 +73,19 @@ impl Drop for Broker {
 impl Broker {
     /// Spawn the real binary on `addr`, persisting to `data_dir`.
     fn spawn(addr: SocketAddr, data_dir: &std::path::Path, which: &'static str) -> Self {
+        Self::spawn_with(addr, data_dir, which, &[])
+    }
+
+    /// [`spawn`](Self::spawn) with extra environment, e.g. a write-elision window.
+    fn spawn_with(
+        addr: SocketAddr,
+        data_dir: &std::path::Path,
+        which: &'static str,
+        extra: &[(&str, &str)],
+    ) -> Self {
         let log = std::fs::File::create(log_path(data_dir, which)).expect("create the broker log");
         let child = Command::new(env!("CARGO_BIN_EXE_mqttd"))
+            .envs(extra.iter().copied())
             .env("MQTTD_NODE_ID", "inflight")
             .env("MQTTD_PLAINTEXT_BIND", addr.to_string())
             .env("MQTTD_ALLOW_ANONYMOUS", "1")
@@ -162,6 +173,19 @@ fn tail(log: &str) -> String {
 /// subscriber acknowledges. This test is what holds that in place.
 #[tokio::test]
 async fn an_acked_qos1_in_flight_to_an_online_subscriber_survives_a_crash() {
+    acked_in_flight_survives_a_crash(&[]).await;
+}
+
+/// The same with write elision on (ADR 0089): the subscriber never acknowledges, so
+/// the window ends, the delivery is written, and only then is the publisher acked.
+/// The crash after that ack must still redeliver it.
+#[tokio::test]
+async fn an_acked_qos1_in_flight_survives_a_crash_with_write_elision_on() {
+    acked_in_flight_survives_a_crash(&[("MQTTD_DURABLE_WRITE_ELISION_MS", "20")]).await;
+}
+
+#[allow(clippy::too_many_lines)]
+async fn acked_in_flight_survives_a_crash(extra: &[(&str, &str)]) {
     // The band allocator (`proc_common`), not `bind(":0")`: a port released from the
     // ephemeral range can be handed straight back out as an outbound source port before
     // the broker binds it. That is the same race `proc_common` was written to close, and
@@ -169,12 +193,26 @@ async fn an_acked_qos1_in_flight_to_an_online_subscriber_survives_a_crash() {
     let addr: SocketAddr = format!("127.0.0.1:{}", free_tcp_port()).parse().unwrap();
     let data_dir = tempfile::tempdir().expect("temp data dir");
 
-    let mut broker = Broker::spawn(addr, data_dir.path(), "first");
+    let mut broker = Broker::spawn_with(addr, data_dir.path(), "first", extra);
     broker.wait_until_listening(addr).await;
 
     // 1. A PERSISTENT subscriber, online and subscribed at QoS 1.
     let (mut sub, _present) = Client::connect_v311(addr, "inflight-sub", false).await;
     sub.subscribe(1, "inflight/test", QoS::AtLeastOnce).await;
+
+    // 1b. With write elision on, a session's first delivery takes today's path and
+    //     reserves its packet ids; warm it, so the delivery under test is held.
+    if !extra.is_empty() {
+        let mut warmer = Client::connect(addr, "inflight-warm").await;
+        warmer
+            .publish("inflight/test", b"warm", QoS::AtLeastOnce, Some(1), vec![])
+            .await;
+        assert_eq!(warmer.recv().await, Packet::PubAck(1.into()));
+        match sub.recv_bounded(Duration::from_secs(10)).await {
+            Recv::Packet(Packet::Publish(p)) => sub.puback(p.pkid.expect("QoS 1")).await,
+            other => panic!("step 1b: expected the warm-up PUBLISH, got {other:?}"),
+        }
+    }
 
     // 2. The publisher gets its PUBACK: the broker has taken responsibility.
     let mut pubr = Client::connect(addr, "inflight-pub").await;
@@ -215,7 +253,7 @@ async fn an_acked_qos1_in_flight_to_an_online_subscriber_survives_a_crash() {
     drop(pubr);
 
     // 5. Restart on the same data directory and resume the session.
-    let mut restarted = Broker::spawn(addr, data_dir.path(), "restarted");
+    let mut restarted = Broker::spawn_with(addr, data_dir.path(), "restarted", extra);
     restarted.wait_until_listening(addr).await;
     // No pre-wait for the durable plane. Recovery is the BROKER's promise, not the test's to
     // arrange: `hub.rs`'s attach path retries store recovery under `ATTACH_RECOVERY_TIMEOUT`

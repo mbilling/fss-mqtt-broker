@@ -135,6 +135,10 @@ pub struct AppendJob {
     pub(super) message_expiry: Option<u32>,
     /// When the hub queued the job, for the `lane_queue` durable stage.
     pub(super) queued_at: Instant,
+    /// A delivery already on the wire under this packet id (ADR 0089 write elision):
+    /// its append is the fallback write, so completion links the stored offset to
+    /// that in-flight entry instead of sending the message a second time.
+    pub(super) delivered: Option<u16>,
 }
 
 /// What a lane worker receives: append/passthrough work, or a clean-start discard
@@ -360,6 +364,7 @@ impl AppendJob {
             retain: false,
             message_expiry: None,
             queued_at: Instant::now(),
+            delivered: None,
         }
     }
 
@@ -784,6 +789,21 @@ impl Hub {
             }
             return Submitted::Refused(PublishRefusal::Brownout);
         }
+        self.submit_append_job(client, message, message_expiry, gate, planned_conn, None)
+    }
+
+    /// The append job itself, after [`submit_append`](Self::submit_append)'s brownout
+    /// arm. `delivered` names the packet id a write-elision fallback (ADR 0089) is
+    /// already in flight under; the caller has checked brownout itself.
+    pub(super) fn submit_append_job(
+        &mut self,
+        client: &ClientId,
+        message: &Message,
+        message_expiry: Option<u32>,
+        gate: &AppendGate,
+        planned_conn: Option<u64>,
+        delivered: Option<u16>,
+    ) -> Submitted {
         let (origin, dedupe) = gate.origin(&self.node_id);
         let job = AppendJob {
             client: client.clone(),
@@ -802,6 +822,7 @@ impl Hub {
             retain: message.retain,
             message_expiry,
             queued_at: Instant::now(),
+            delivered,
         };
         self.submit_lane_job(job)
     }
@@ -825,6 +846,7 @@ impl Hub {
             retain: message.retain,
             message_expiry,
             queued_at: Instant::now(),
+            delivered: None,
         };
         self.submit_lane_job(job)
     }
@@ -1009,6 +1031,16 @@ impl Hub {
                     }
                 },
             };
+        // A write-elision fallback (ADR 0089): the message went on the wire before
+        // this write. Never send it again; give its in-flight entry the offset, so the
+        // subscriber's PUBACK truncates it, or settle the offset at once if that PUBACK
+        // has already come.
+        if let Some(pkid) = job.delivered {
+            send = false;
+            if let Some(o) = offset {
+                self.link_elided_offset(&job.client, pkid, &job.message, o);
+            }
+        }
         self.note_queue_rejected(&job, outcome, send);
         if send && self.park_ordering_gated_qos0(&job) {
             send = false;

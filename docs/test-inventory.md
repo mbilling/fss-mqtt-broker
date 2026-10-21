@@ -1467,7 +1467,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 838 test(s)
+## `crates/mqttd/src/lib.rs` — 841 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1866,6 +1866,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_will_is_still_delivered_live_under_brownout_and_counted_as_a_drop`
 - `hub::tests::a_windowed_commit_in_sys_is_never_delivered`
 - `hub::tests::a_windowed_commit_reaches_an_offline_durable_subscriber_on_resume`
+- `hub::tests::an_acknowledged_held_delivery_is_never_written`
 - `hub::tests::an_already_durable_append_does_not_overtake_a_waiting_one`
 - `hub::tests::an_expired_retained_value_is_not_replayed_and_is_reaped`
 - `hub::tests::an_idle_lane_gives_back_what_an_overload_grew`
@@ -1877,6 +1878,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::an_oversized_single_retained_message_is_skipped_not_sent`
 - `hub::tests::an_owner_dedups_a_retransmitted_handoff`
 - `hub::tests::an_owner_reaps_an_expired_retained_value_as_a_committed_clear`
+- `hub::tests::an_unacknowledged_held_delivery_is_written_when_its_window_ends`
 - `hub::tests::an_unanswered_shared_forward_holds_the_ack_and_retransmits_the_shared_frame`
 - `hub::tests::an_uncongested_relaxed_forward_is_answered_at_submit`
 - `hub::tests::an_unconverged_or_unnameable_roster_member_blocks_the_reap`
@@ -1920,6 +1922,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::forwarding_is_counted_and_local_delivery_is_not`
 - `hub::tests::gauge_refresh_snapshots_sessions_and_subscriptions`
 - `hub::tests::growth_releases_moved_sessions_on_the_old_owner`
+- `hub::tests::held_deliveries_fall_back_in_order_when_the_subscriber_leaves`
 - `hub::tests::hub_dispatch_time_is_exported_and_stays_flat_while_a_store_is_parked`
 - `hub::tests::inherited_session_expiry_is_swept_after_takeover`
 - `hub::tests::interest_snapshots_follow_subscription_changes`
@@ -2618,8 +2621,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `caching_spares_the_hook_a_repeat_of_the_same_credential`
 - `without_caching_every_connect_asks_the_hook`
 
-## `crates/mqttd/tests/inflight_durability.rs` — 3 test(s)
+## `crates/mqttd/tests/inflight_durability.rs` — 4 test(s)
 
+- `an_acked_qos1_in_flight_survives_a_crash_with_write_elision_on`
 - `an_acked_qos1_in_flight_to_an_online_subscriber_survives_a_crash`
 - `an_acked_qos2_before_pubrec_republishes_dup_under_the_same_id`
 - `an_acked_qos2_past_pubrec_resumes_with_pubrel_under_the_same_id`
