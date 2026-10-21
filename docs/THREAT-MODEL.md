@@ -1,6 +1,6 @@
 # Threat model
 
-**Verified against `v1.2.0` (2026-10-12).** This is the one-document answer to "what
+**Verified against `v1.2.0` (2026-10-21).** This is the one-document answer to "what
 is your threat model?" (ADR 0066 T1). It consolidates — it does not invent: every
 mitigation row names the ADR that decided it and the code that enforces it, and every
 accepted risk is quoted from the record that accepted it. The maintenance rule: a PR
@@ -338,6 +338,7 @@ expiry. "Tests" names the test that fails if the mitigation is removed:
 | Rogue node joins the mesh | Mutual TLS against a **dedicated cluster CA** — possession of a cluster cert is admission; client cert required on accept, server cert verified on dial | ADR 0002; `mqttd/src/peer.rs` |
 | Admitted cert claims another node's id | `Hello.node_id` must equal the certificate Subject CN, checked on **both** link directions | ADR 0004 step 5; `mqttd/src/peer.rs` (`handle`, `expected_cn`) |
 | Revoked node keeps its links | Cluster CRL read per accept/per dial from a `watch` — a reload applies without restart; revoked fails closed | ADR 0040 T4; `mqttd/src/peer.rs` |
+| A stolen or expired node certificate keeps working | Peer links end within about 2 s of either side's `notAfter`, no grace; the bus neither dials nor accepts with expired material and does not resume TLS sessions; lifetimes are stated at deployment (`gen-certs.sh --lifetime`), exported as `mqttd_tls_expiry_seconds{role}` and warned at `tls.expiry_warn_permille` | ADR 0088 T1–T3; `mqttd/src/peer.rs`, `mqttd/src/tls_expiry.rs` |
 
 ### Tampering / Elevation
 
