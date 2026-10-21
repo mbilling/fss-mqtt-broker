@@ -2755,12 +2755,23 @@ async fn durable_an_owner_that_dies_holds_its_publishers_for_the_failover_not_fo
     let acked_at = offline.publisher.last_acked_at;
     let held = acked_at.map(|at| at.duration_since(verdict));
     let moved_on_a = moved(&before, &series(&cluster.a));
-    let owner = cluster
-        .a
-        .placement
-        .read()
-        .unwrap()
-        .committed_session_owner(&session);
+    // The ack comes from the new owner, which can store the publish only while it holds
+    // the session's lease; A learns the committed owner from its durable driver's push,
+    // once a tick, so read it until it lands rather than once (issue #1064).
+    let owner_on_a = || {
+        cluster
+            .a
+            .placement
+            .read()
+            .unwrap()
+            .committed_session_owner(&session)
+    };
+    let owner_deadline = Instant::now() + Duration::from_secs(10);
+    let mut owner = owner_on_a();
+    while owner.as_ref().is_none_or(|o| *o == cluster.b.id) && Instant::now() < owner_deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        owner = owner_on_a();
+    }
     println!("  offline: {answer:?}, {held:?} after the verdict; the session's owner now {owner:?}; moved on A: {moved_on_a:?}");
 
     assert!(answer.acked_ok(), "acknowledged: {answer:?}");
