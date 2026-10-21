@@ -20,7 +20,7 @@
 >
 > All three use shared subscriptions. [Scale-out ↓](#cluster-scale-out-qos-0-shared-subscriptions)
 >
-> **Newest, on the unreleased 1.2.0 candidate** (read from the brokers' counters; above 3 nodes mostly not certified by the rig, and not at all past 10): **durable QoS 1 delivered 173,000 → 206,000 → 240,000 msg/s on 10 → 12 → 14 nodes**, about 17k per node at each size, p99 ≤ 500 ms, with publishers slowed and nothing dropped. QoS 1 with clean sessions held 39–45k msg/s per node on 10 nodes on the release candidate (2026-10-21), the same as the earlier build on the same hosts. More than a billion messages ledgered, none lost. [What we measured ↓](#scale-what-we-measured-on-the-120-candidate)
+> **Newest, measured on 1.2.0** (read from the brokers' counters, 2026-10-21): durable QoS 1 on 10 nodes **270,000 msg/s on the log store, certified**, and about 185,000 on the default store; QoS 1 with clean sessions 39–45k msg/s per node on 10 nodes. On a pre-release build (2026-10-12), durable QoS 1 delivered **173,000 → 206,000 → 240,000 msg/s on 10 → 12 → 14 nodes**. More than a billion messages ledgered, none lost. [What we measured ↓](#scale-what-we-measured-on-120)
 
 ---
 
@@ -82,10 +82,10 @@ HiveMQ CE  2024.3   ████████████████████
 
 ![mqttd at 150,000 msg/s](docs/benchmarks/img/timeline-mqttd-150k.svg)
 
-### Scale: what we measured on the 1.2.0 candidate
+### Scale: what we measured on 1.2.0
 
 **The per-node rate held from 3 to 10 nodes, and no message was lost.** Campaigns on one
-provisioning of 4-vCPU brokers each, 3 and 10 nodes on the same hosts, on the release
+provisioning of 4-vCPU brokers each, 3 and 10 nodes on the same hosts, on the 1.2.0 release
 candidate (2026-10-21):
 
 | | 3 nodes | 10 nodes | p99 | messages ledgered · lost |
@@ -94,7 +94,7 @@ candidate (2026-10-21):
 | **Durable QoS 1**: persistent sessions, every delivery fsynced and quorum-acked, default store (redb) | 16.0k per node taken in full (48,017 msg/s); stops taking more at 19.3k (57,973) | 14.9k per node taken in full (148,717 msg/s); stops taking more at 18.5k (185,376) | ≤ 500 ms | 444,664,692 · 0 (both stores) |
 | **Durable QoS 1 on the log store** (`MQTTD_REPLICA_STORE=log`, experimental), same hosts | 30.0k per node (90,003 msg/s), certified GREEN | 27.0k per node (270,034 msg/s), certified GREEN; 29.9k (298,530) at the top of its ladder | ≤ 500 ms | |
 
-![QoS 1 per node on the 1.2.0 candidate: rungs the rig certified, and rungs that hold](docs/benchmarks/img/scale-out-qos1-candidate.svg)
+![QoS 1 per node on a 1.2.0 pre-release build: rungs the rig certified, and rungs that hold](docs/benchmarks/img/scale-out-qos1-candidate.svg)
 
 - **Clean sessions did not find a limit at either size.** Every rung delivered its whole
   offer.
@@ -123,9 +123,9 @@ candidate (2026-10-21):
 received, and no broker dropped one) and p99 is at or below 1 s. Every rung here holds.
 That rule is simpler than the rig's certification, which graded some of these rungs
 NOT CARRIED, for a saturated load-generator host, driver-side evidence it refused, or an
-offer the cluster did not take in full. The binary is an unreleased candidate build of
-`ec407218` with the release recipe, not the signed release. Brokers are Hetzner CCX23
-(4 vCPU). Each rung is one 60 s window. These are not points on the
+offer the cluster did not take in full. The binary is the 1.2.0 release candidate
+(`ec407218`, built with the release recipe). The released `v1.2.0` differs from it only by
+a patch to two TLS libraries (#1063) and by tests. Brokers are Hetzner CCX23 (4 vCPU). Each rung is one 60 s window. These are not points on the
 [certified curve](docs/benchmarks/QOS1-SCALE-CURVE.md). Every rung, both readings and the
 commands: [qos1-knees-2026-10-21.md](bench/scale/qos1-knees-2026-10-21.md) ·
 [durable-knees-2026-10-21.md](bench/scale/durable-knees-2026-10-21.md) ·
@@ -142,7 +142,7 @@ with 28 persistent consumers per site.
 | 12 | 179,039 msg/s (14.9k per node) | 205,750 of 216,000 (17.1k per node) | ≤ 500 ms | 83,430,832 · 0 |
 | 14 | 208,739 msg/s (14.9k per node) | 240,497 of 252,000 (17.2k per node) | ≤ 500 ms | 131,558,906 · 0 |
 
-![Durable QoS 1 total msg/s at 10, 12 and 14 nodes on the 1.2.0 candidate: every rung holds, none certified](docs/benchmarks/img/scale-out-durable-candidate.svg)
+![Durable QoS 1 total msg/s at 10, 12 and 14 nodes on a 1.2.0 pre-release build: every rung holds, none certified](docs/benchmarks/img/scale-out-durable-candidate.svg)
 
 - **Adding nodes added throughput.** 10 → 12 → 14 nodes delivered 150,419 → 179,039 →
   208,739 msg/s offered 15k per node, and 173,100 → 205,750 → 240,497 offered 18k, at the
@@ -152,7 +152,8 @@ with 28 persistent consumers per site.
 - **The larger clusters forwarded more between brokers and kept the rate**: 4.78% of
   publishes at 10 nodes, 13.41% at 12, 15.79% at 14.
 
-**Limits.** Same reading rule and same unreleased candidate as above, default store. The
+**Limits.** Same reading rule as above, on a pre-release build of 1.2.0 (`7d4eced`,
+2026-10-12), default store. The
 rig certified none of these six rungs: on each, publishers ran behind schedule. Each is
 one 60 s window. The closing arm, a repeat of the 14-node cluster as a drift control, did
 not run: the re-formed cluster did not reach a full mesh
@@ -259,8 +260,8 @@ rung: [QOS1-SCALE-CURVE.md](docs/benchmarks/QOS1-SCALE-CURVE.md#7-and-10-nodes--
 reproduce: [QOS1-SCALE-CURVE.md § Reproduction](docs/benchmarks/QOS1-SCALE-CURVE.md#reproduction).
 
 
-The newest runs, on the 1.2.0 candidate, are not points on this curve and have their own
-section: [Scale: what we measured on the 1.2.0 candidate](#scale-what-we-measured-on-the-120-candidate).
+The newest runs, on 1.2.0, are not points on this curve and have their own section:
+[Scale: what we measured on 1.2.0](#scale-what-we-measured-on-120).
 
 MB/s is application payload (216 B/message). **The constraint is packets, not
 bytes** — measured: holding 60,000 msg/s and growing the payload to 8 KiB reached
@@ -432,7 +433,7 @@ Plaintext + anonymous: a first look, never a deployment. Secured version (TLS 1.
 | Integrations | |
 |---|---|
 | Bridge | `mqtt-bridge`: separate signed binary/image, deny-by-default directional rules, loop prevention, bounded spool, HA pairs |
-| Rule engine | EMQX-compatible rule SQL: filter, transform and re-route at QoS 0/1/2, evaluated once per message on the node it arrived at; opt-in per-rule statistics and trace on `$SYS`, rules editable through the admin API; EMQX's `jq` function (the real jq, in a WebAssembly sandbox, off unless switched on) and functions of your own as WebAssembly modules pinned by hash; rules that remember, experimental until durable (a keyed, bounded, expiring in-memory store read and written from SQL: duration, change, counts with idempotency keys, silence as an event, distinct counts; per node or replicated to every node; EMQX's `kv_store_*` and `proc_dict_*`); unreleased ([RULES.md](docs/RULES.md), [cookbook](docs/RULES-COOKBOOK.md), [live demo](demo/rules-live/README.md)) |
+| Rule engine | EMQX-compatible rule SQL: filter, transform and re-route at QoS 0/1/2, evaluated once per message on the node it arrived at; opt-in per-rule statistics and trace on `$SYS`, rules editable through the admin API; EMQX's `jq` function (the real jq, in a WebAssembly sandbox, off unless switched on) and functions of your own as WebAssembly modules pinned by hash; rules that remember, experimental until durable (a keyed, bounded, expiring in-memory store read and written from SQL: duration, change, counts with idempotency keys, silence as an event, distinct counts; per node or replicated to every node; EMQX's `kv_store_*` and `proc_dict_*`); since 1.2.0, rule state experimental ([RULES.md](docs/RULES.md), [cookbook](docs/RULES-COOKBOOK.md), [live demo](demo/rules-live/README.md)) |
 | Kafka / webhook / DB | `$share` consumer group on durable sessions ([INTEGRATION.md](docs/INTEGRATION.md)); the rule engine has no sinks, by design |
 | Migration | converters for Mosquitto, EMQX, HiveMQ configs + ACLs → reviewed draft ([MIGRATION.md](docs/MIGRATION.md)) |
 | Plugins | HTTP auth hook; `Authenticator` / `Authorizer` traits; no dynamic loader |
