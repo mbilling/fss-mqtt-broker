@@ -73,6 +73,11 @@ class FailsAfterTests(unittest.TestCase):
         self.check(["NOT CARRIED: INVALID EVIDENCE (x); NOT STEADY (y)", "NOT CARRIED: INVALID EVIDENCE (x); PUBLISHERS LATE (9%)"],
                    [1, 2], True)
 
+    def test_a_pause_incomplete_rung_counts_as_a_fail(self):
+        # 2026-10-21: withheld acknowledgements used to end the run; now they grade the rung.
+        self.check(["NOT CARRIED: PAUSE INCOMPLETE (pub-s0-0: 590 of 600 connected workers paused)",
+                    "FAILED: LOSS (the broker dropped 135 message(s): append-backlog-full 135)"], [1, 2], True)
+
     def test_green_and_yellow_reset_failed_and_not_carried_count(self):
         self.check(["RED", "YELLOW; LATENCY FLOOR (x)", "FAILED: LOSS (0.01%)", "GREEN", "NOT CARRIED: OFFER NOT MET",
                     "NOT CARRIED: verdict unavailable"], [1, 0, 1, 0, 1, 2], True)

@@ -2712,17 +2712,18 @@ IMAGES
 	# down and make the rung look slower than it ran.
     if [ -n "${QOS1_DRIVER_ARCHIVE:-}" ]; then
         for ((di=0; di<D; di++)); do driver_batch "$di" "set -e"$'\n'"${pause[di]}"; done
-        local pause_deadline=$((SECONDS + 60)) all_paused=no
+        local pause_deadline=$((SECONDS + 60)) all_paused=no pause_why=""
         while [ "$SECONDS" -lt "$pause_deadline" ]; do
             for ((di=0; di<D; di++)); do
                 driver_batch "$di" "set -e"$'\n'"${pubscrape[di]}" >"$rdir/.batch/paused-$di" || die "publisher terminal scrape failed"
                 batch_split "$rdir" "-terminal.prom" "$rdir/.batch/paused-$di"
             done
-            if python3 - "$rdir" <<'PAUSED'
+            if pause_why=$(python3 - "$rdir" <<'PAUSED'
 import json,sys,importlib.util
 from pathlib import Path
 p=Path(sys.argv[1])
 # Shell invokes script from scale dir in production; avoid assumptions below via scalar parser.
+bad=[]
 for ep in json.loads((p/'manifest.json').read_text())['endpoints']:
  if ep['role']!='pub':continue
  vals={r.split()[0]:float(r.split()[1]) for r in (p/(ep['name']+'-terminal.prom')).read_text().splitlines() if r and not r.startswith('#') and len(r.split())==2}
@@ -2734,12 +2735,26 @@ for ep in json.loads((p/'manifest.json').read_text())['endpoints']:
  # Measured 2026-09-22: one container had 27 connect failures of 750, so 723
  # connected and 723 paused, and a five-rung payload sweep died on rung one.
  live=vals.get('connect_succ',ep['clients'])
- if vals.get('audit_paused_workers')!=live or vals.get('audit_sent')!=vals.get('audit_acked'):sys.exit(1)
+ if vals.get('audit_paused_workers')!=live or vals.get('audit_sent')!=vals.get('audit_acked'):
+  bad.append(f"{ep['name']}: {vals.get('audit_paused_workers',0):.0f} of {live:.0f} connected workers paused, "
+             f"{vals.get('audit_sent',0)-vals.get('audit_acked',0):.0f} sent but unacknowledged")
+if bad:
+ print("; ".join(bad)); sys.exit(1)
 PAUSED
+)
             then all_paused=yes; break; fi
             sleep 1
         done
-        [ "$all_paused" = yes ] || die "publishers did not pause with every PUBACK completed"
+        # A publisher that cannot pause with every PUBACK in is a broker that
+        # withheld acknowledgements: work refused, which is this rung's result,
+        # not the campaign's end. On 2026-10-21 one session's full append lane
+        # withheld 135 acks at a 3-node rung, those publishers were dropped, and
+        # the whole run died before the ladder could grade it. Record it, finish
+        # the rung (stop, drain, ledgers), and let the verdict say NOT CARRIED.
+        if [ "$all_paused" != yes ]; then
+            printf '%s\n' "${pause_why:-the pause check never passed}" >"$rdir/pause-incomplete.txt"
+            warn "lane E: rung $sites: publishers did not pause with every PUBACK completed — graded PAUSE INCOMPLETE, the run continues (${pause_why:-no detail})"
+        fi
     fi
 
 	pids=()

@@ -1123,6 +1123,18 @@ def self_test() -> None:
         if r["pass"] or not any("UNRESET" in f for f in r["flags"]):
             failures.append(f"a rung on an un-reset cluster was accepted: {r['flags']}")
 
+        # 11b. PAUSE INCOMPLETE: the brokers withheld acknowledgements, so some
+        #      publishers could not pause at the rung's end (2026-10-21: a full
+        #      append lane). Graded, never carried, and not FAILED by itself.
+        d = lane_e_fixture(
+            root, "sites-4-pause", offered=30_000, sent=30_000, recv=30_000, late=0,
+            drained="yes", settled=30_000 * 70, broker=clean_broker)
+        (d / "pause-incomplete.txt").write_text("pub-s0-0: 590 of 600 connected workers paused, 10 sent but unacknowledged\n")
+        r = lane_e_rung(d)
+        if r["carried"] or r["failed"] or not any("PAUSE INCOMPLETE" in f for f in r["flags"]) \
+                or not rung_verdict(r).startswith("NOT CARRIED"):
+            failures.append(f"a rung whose publishers could not pause was not NOT CARRIED: {rung_verdict(r)}")
+
         # 12. FAILED CONTROLS make the whole TRIAL inconclusive — not the control
         #     rung alone. These are ladder-level rules, so they run against
         #     `lane_e_ladder` directly.
@@ -1923,6 +1935,18 @@ def lane_e_rung(rdir: Path) -> dict:
             "still on the cluster when this one started — it measures residual load too)"
         )
 
+    # PAUSE INCOMPLETE: at the rung's end some publishers could not pause with
+    # every PUBACK in, so the brokers withheld acknowledgements (work refused,
+    # e.g. a full append lane). Not loss by itself; the ledger and the drop
+    # counters say whether anything was. Never a clean measurement of the offer.
+    pause_note = rdir / "pause-incomplete.txt"
+    pause_ok = not pause_note.exists()
+    if not pause_ok:
+        flags.append(
+            "PAUSE INCOMPLETE (publishers could not pause with every PUBACK in — the brokers "
+            f"withheld acknowledgements: {pause_note.read_text().strip() or 'no detail'})"
+        )
+
     # FAILED means LOST, and nothing else does. A broker drop is loss whatever
     # its reason — a bound reached is still a message the application never got.
     if dropped > 0 and not any(f.startswith("LOSS") for f in flags):
@@ -1943,7 +1967,7 @@ def lane_e_rung(rdir: Path) -> dict:
             + "; this rung measured the routing path)"
         )
     failed = any(f.startswith("LOSS") for f in flags)
-    carried = not failed and not any(f.startswith("NOT DURABLE") for f in flags) and _lane_e_carried(
+    carried = not failed and pause_ok and not any(f.startswith("NOT DURABLE") for f in flags) and _lane_e_carried(
         offer_met, delivered, late_share, settled_ok, reset_ok, core_ok, steady, qos, sub_qos,
         completed, bounds, dropped, deliv_by_qos, evidence, drained, recv_rate, offered, sites)
     return {
