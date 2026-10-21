@@ -16,7 +16,7 @@
 > **Linear scale-out, 3 → 10 nodes:**
 > - **QoS 0:** ~114,000 msg/s **per 4-vCPU node** — **1.14M msg/s on 10 nodes, 40 vCPU in total**; 1.2M at p99 ≤ 2 s, no loss.
 > - **QoS 1, clean sessions:** ~39,000–45,000 msg/s per node — **390,000–450,000 msg/s on 10 nodes**.
-> - **Durable QoS 1** (ack after fsync + replication): **90,000 msg/s on 3 nodes, 12 vCPU** ([↓](#durable-and-qos-1-scale-out)).
+> - **Durable QoS 1** (ack after fsync + replication): **90,000 msg/s on 3 nodes, 12 vCPU** on the log store, again GREEN on the release candidate; **270,000 msg/s on 10 nodes** ([↓](#durable-and-qos-1-scale-out)).
 >
 > All three use shared subscriptions. [Scale-out ↓](#cluster-scale-out-qos-0-shared-subscriptions)
 >
@@ -85,13 +85,14 @@ HiveMQ CE  2024.3   ████████████████████
 ### Scale: what we measured on the 1.2.0 candidate
 
 **The per-node rate held from 3 to 10 nodes, and no message was lost.** Campaigns on one
-provisioning of 4-vCPU brokers each, 3 and 10 nodes on the same hosts. QoS 1 is from the
-release candidate (2026-10-21); durable QoS 1 from 2026-10-12:
+provisioning of 4-vCPU brokers each, 3 and 10 nodes on the same hosts, on the release
+candidate (2026-10-21):
 
 | | 3 nodes | 10 nodes | p99 | messages ledgered · lost |
 |---|---|---|---|---|
 | **QoS 1, clean sessions** | 40.0k msg/s per node (120,000 msg/s), and 50.0k (150,000) at the top of its ladder | 39.0k per node (390,000 msg/s), 42.0k (420,000) and 45.0k (450,000), the highest rung run | ≤ 50 ms | 323,555,538 · 0 |
-| **Durable QoS 1**: persistent sessions, every delivery fsynced and quorum-acked, default store | stops taking more at 20.7–20.9k per node (62,243 and 62,611 msg/s) | 15.0k per node taken in full (150,000 msg/s); stops taking more at 19.2–21.1k (192,217 and 210,547) | ≤ 500 ms; ≤ 1000 ms on the most overloaded rung | 193,366,130 · 0 |
+| **Durable QoS 1**: persistent sessions, every delivery fsynced and quorum-acked, default store (redb) | 16.0k per node taken in full (48,017 msg/s); stops taking more at 19.3k (57,973) | 14.9k per node taken in full (148,717 msg/s); stops taking more at 18.5k (185,376) | ≤ 500 ms | 444,664,692 · 0 (both stores) |
+| **Durable QoS 1 on the log store** (`MQTTD_REPLICA_STORE=log`, experimental), same hosts | 30.0k per node (90,003 msg/s), certified GREEN | 27.0k per node (270,034 msg/s), certified GREEN; 29.9k (298,530) at the top of its ladder | ≤ 500 ms | |
 
 ![QoS 1 per node on the 1.2.0 candidate: rungs the rig certified, and rungs that hold](docs/benchmarks/img/scale-out-qos1-candidate.svg)
 
@@ -100,29 +101,34 @@ release candidate (2026-10-21); durable QoS 1 from 2026-10-12:
 - **No regression from 2026-10-12 to the release candidate.** On the same hosts, the
   2026-10-12 build delivered 390,005 msg/s at 10 nodes and the candidate 390,004, both at
   p99 ≤ 25 ms ([the comparison](bench/scale/qos1-knees-2026-10-21.md#what-it-shows)).
-- **Durable QoS 1 has the same ceiling per node at 3 and at 10 nodes, about 21k msg/s.**
-  Offered more than that, the brokers acknowledge more slowly, publishers fall behind
-  their schedule, and nothing is dropped.
+- **Durable QoS 1 has the same ceiling per node at 3 and at 10 nodes**, about 19k msg/s on
+  the default store. Offered more than that, the brokers acknowledge more slowly,
+  publishers fall behind their schedule, and nothing is dropped. The 2026-10-12 build on the
+  same hosts stopped at the same point (185,025 msg/s at 10 nodes), so the release carries
+  durable QoS 1 as before.
+- **The log store carries at least 46% more durable QoS 1 on the same hardware**: 27k
+  against 18.5k msg/s per node at 10 nodes, 30k against 19.3k at 3, certified by the rig
+  ([the A/B](bench/scale/durable-knees-2026-10-21.md#what-it-shows)). It is still
+  experimental (ADR 0078 criteria 1 and 5 are open), so it is not the default.
 - **Some cross-node traffic did not stop it scaling.** At 3 nodes no publish was
   forwarded between brokers (0.00%). On the loaded durable 10-node rungs 13–17% of
-  publishes were, 31–38% on the busiest broker, and the cluster reached the same ceiling
+  publishes were, up to 40% on the busiest broker, and the cluster reached the same ceiling
   per node. Clean sessions at 10 nodes forwarded 0.00%. The durable case forwards by
   design: a persistent session lives on the broker that owns it, not on the one its
   client dialled, so at 10 nodes some brokers hold no local member of a site's `$share`
-  group ([the counters](bench/scale/durable-knees-2026-10-12.md#cross-node-traffic)).
+  group ([the counters](bench/scale/durable-knees-2026-10-21.md#cross-node-traffic)).
 
 **How to read this.** Rates are the brokers' own counters over a 60 s window. A rung
 *holds* if no message was lost (every message identity sent was acknowledged and
 received, and no broker dropped one) and p99 is at or below 1 s. Every rung here holds.
 That rule is simpler than the rig's certification, which graded some of these rungs
 NOT CARRIED, for a saturated load-generator host, driver-side evidence it refused, or an
-offer the cluster did not take in full. The binaries are unreleased candidate builds
-(`ec407218` for QoS 1, built with the release recipe; `7d4eced` for durable QoS 1), not the
-signed release. Brokers are Hetzner
-CCX23 (4 vCPU). Each rung is one 60 s window, and the durable figures are for the default
-store, not the log store of the 3-node figure below. These are not points on the
+offer the cluster did not take in full. The binary is an unreleased candidate build of
+`ec407218` with the release recipe, not the signed release. Brokers are Hetzner CCX23
+(4 vCPU). Each rung is one 60 s window. These are not points on the
 [certified curve](docs/benchmarks/QOS1-SCALE-CURVE.md). Every rung, both readings and the
 commands: [qos1-knees-2026-10-21.md](bench/scale/qos1-knees-2026-10-21.md) ·
+[durable-knees-2026-10-21.md](bench/scale/durable-knees-2026-10-21.md) ·
 [qos1-knees-2026-10-12.md](bench/scale/qos1-knees-2026-10-12.md) ·
 [durable-knees-2026-10-12.md](bench/scale/durable-knees-2026-10-12.md).
 
