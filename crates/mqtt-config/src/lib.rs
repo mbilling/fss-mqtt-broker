@@ -3692,6 +3692,7 @@ mod tests {
             | "MQTTD_HTTP_AUTH_CACHE_MAX"
             | "MQTTD_OTLP_INTERVAL"
             | "MQTTD_SHUTDOWN_GRACE"
+            | "MQTTD_DURABLE_WRITE_ELISION_MS"
             | "MQTTD_READY_MIN_MEMBERS"
             | "MQTTD_CONFIG_WATCH"
             | "MQTTD_OIDC_JWKS_REFRESH"
@@ -3925,8 +3926,9 @@ mod tests {
             // (ADR 0085),
             // plus MQTTD_RULES_FUNCTION_MAX_MS (ADR 0086, the ceiling on one call),
             // plus MQTTD_TLS_EXPIRY_WARN_PERMILLE (ADR 0088 D2),
-            // plus MQTTD_TLS_END_SESSIONS_AT_CERT_EXPIRY (ADR 0088 O2).
-            126,
+            // plus MQTTD_TLS_END_SESSIONS_AT_CERT_EXPIRY (ADR 0088 O2),
+            // plus MQTTD_DURABLE_WRITE_ELISION_MS (ADR 0089).
+            127,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never
