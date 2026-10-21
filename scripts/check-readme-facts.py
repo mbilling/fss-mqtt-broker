@@ -309,12 +309,12 @@ def main() -> int:
     # (`13–17%`) — with a range kept whole, so neither end can drift. Prose numbers
     # (node counts, dates, `p99 ≤ 500 ms`) are left to the reader.
     section = re.search(
-        r"^### Scale: what we measured on the 1\.2\.0 candidate\n(.*?)(?=^#{2,3} )",
+        r"^### Scale: what we measured on 1\.2\.0\n(.*?)(?=^#{2,3} )",
         text, re.MULTILINE | re.DOTALL)
     figure_count = 0
     if not section:
         problems.append(
-            "the '### Scale: what we measured on the 1.2.0 candidate' section is gone — "
+            "the '### Scale: what we measured on 1.2.0' section is gone — "
             "restore it or update this script"
         )
     else:
