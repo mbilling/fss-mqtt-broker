@@ -248,6 +248,8 @@ impl Hub {
     /// Actor-path PUBACK: `QoS` 1 truncate stays detached; outstanding `QoS` 2
     /// retirement is submitted to the session lane rather than awaited.
     pub(super) fn dispatch_pub_ack(&mut self, client: &ClientId, pkid: u16) {
+        // ADR 0089: a held delivery acknowledged is discharged without a write.
+        self.elided_acked(client, pkid);
         let completed = self.complete_pending(client, pkid, OutState::AwaitingPubAck);
         if completed {
             self.truncate_acked(client);
