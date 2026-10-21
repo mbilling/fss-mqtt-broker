@@ -25,9 +25,19 @@ tasks:
     notes: "Size S-M. mqtt-observability, health.rs, OPERATIONS, README durability wording, THREAT-MODEL row. First cut, for the T5 rig sweep: mqttd_durable_elided_total, mqttd_durable_elision_fallback_total{reason} (timeout, disconnect, brownout, drain) and mqttd_durable_elision_hold_seconds (the subscriber's acknowledgement latency for a discharged delivery), wired from hub/elision.rs. Open: the elided share on /statusz, OPERATIONS, the durability wording, the THREAT-MODEL row."
   - id: 0089-T5
     title: "The evidence and the default: the rig A/B of 'What counts as done' (keeping-up, lagging and offline consumers; redb and the segment log; one provisioning), the fault suites with elision on, then a decision on the default"
+    status: in-progress
+    issue: 1068
+    notes: "Size M plus rig time. A bench/scale card. The default changes only on all four criteria. First sweep 2026-10-21 (knee-20261021T173147Z; 3 nodes, 2 copies, redb, MQTTD_SHARED_PREFER_LOCAL=0): at 10 sites 5/10/20 ms elided 1.5/1.6/6.1%, 50 ms 98.1% with writes 35.8 -> 6.8 ms; the path is bistable under the original D5. Led to Amendment 1 (A1-A4)."
+  - id: 0089-T6
+    title: "Amendment 1 A2: the head rule narrowed to an append in flight; a characterisation test that a written-but-unacknowledged delivery no longer blocks the next hold, and the order a crash then replays"
     status: planned
     issue: 1068
-    notes: "Size M plus rig time. A bench/scale card. The default changes only on all four criteria."
+    notes: "Size S-M. hub/elision.rs may_elide; hub tests; cluster_proc with elision on."
+  - id: 0089-T7
+    title: "Amendment 1 A3-A4: a session that keeps missing the window stops being held for an interval; the window shortens only near the D7 bound; the lagging-subscriber rig shape"
+    status: planned
+    issue: 1068
+    notes: "Size M. hub/elision.rs, a fallback history per session; a gauge for the window in force; criterion 2 on the rig."
 ---
 
 # Delivery 0089 — write elision on the durable QoS 1 path
@@ -46,5 +56,7 @@ above; the table below is generated from it.
 | 0089-T2 | 🚧 in-progress | [#1068](https://github.com/mbilling/fss-mqtt-broker/issues/1068) | — | "Size L. The obligation ledger gains a second discharge (the subscriber's PUBACK); every path that settles a publish must respect it. mqtt-config (the key), CONFIGURATION. First cut: hub/elision.rs; durable.write_elision_ms / MQTTD_DURABLE_WRITE_ELISION_MS (default 0, a startup WARN when set). Eligible: QoS 1, a local publish or a peer's first forward, the session online on its owner with nothing durable owed, a packet id and a send slot free, no brownout, drain or open takeover, room in the bound (16,384 entries, 64 MiB). A session's held deliveries fall back together in send order (timer, Detach, brownout, drain); the fallback append carries the in-flight packet id, so it never resends and links its offset for the late PUBACK. Tests: three hub tests (an acknowledged delivery is never written; an unacknowledged one is written at its window end and truncated by the late PUBACK; held deliveries fall back and replay in order), inflight_durability's #124 crash test with elision on, cluster_proc (7/7, 4 seeds) with elision on. Local durable_bench, release, 3 nodes on one Mac, same build, 16 publishers x window 8, 16 subscribers: qos1-durable-owner 4,068 -> 36,338 msg/s (8.9x), relay 4,347 -> 34,177 (7.9x), p50 30.7 -> 0.16 ms; p95/p99 unchanged near 40/47 ms (the share still written); clean-session 141k either way. Direction only: a laptop disk (F_FULLFSYNC ~30 ms) exaggerates the write's cost against the rig's. Open: a metric for discharged and fallback counts (T4), the cluster cases (T3)." |
 | 0089-T3 | ⬜ planned | [#1068](https://github.com/mbilling/fss-mqtt-broker/issues/1068) | — | "Size M. hub/forwarding.rs verdicts, the #1053 hold, the ingress-credit style bound. cluster_stress and false_dead_delivery with elision on." |
 | 0089-T4 | 🚧 in-progress | [#1068](https://github.com/mbilling/fss-mqtt-broker/issues/1068) | — | "Size S-M. mqtt-observability, health.rs, OPERATIONS, README durability wording, THREAT-MODEL row. First cut, for the T5 rig sweep: mqttd_durable_elided_total, mqttd_durable_elision_fallback_total{reason} (timeout, disconnect, brownout, drain) and mqttd_durable_elision_hold_seconds (the subscriber's acknowledgement latency for a discharged delivery), wired from hub/elision.rs. Open: the elided share on /statusz, OPERATIONS, the durability wording, the THREAT-MODEL row." |
-| 0089-T5 | ⬜ planned | [#1068](https://github.com/mbilling/fss-mqtt-broker/issues/1068) | — | "Size M plus rig time. A bench/scale card. The default changes only on all four criteria." |
+| 0089-T5 | 🚧 in-progress | [#1068](https://github.com/mbilling/fss-mqtt-broker/issues/1068) | — | "Size M plus rig time. A bench/scale card. The default changes only on all four criteria. First sweep 2026-10-21 (knee-20261021T173147Z; 3 nodes, 2 copies, redb, MQTTD_SHARED_PREFER_LOCAL=0): at 10 sites 5/10/20 ms elided 1.5/1.6/6.1%, 50 ms 98.1% with writes 35.8 -> 6.8 ms; the path is bistable under the original D5. Led to Amendment 1 (A1-A4)." |
+| 0089-T6 | ⬜ planned | [#1068](https://github.com/mbilling/fss-mqtt-broker/issues/1068) | — | "Size S-M. hub/elision.rs may_elide; hub tests; cluster_proc with elision on." |
+| 0089-T7 | ⬜ planned | [#1068](https://github.com/mbilling/fss-mqtt-broker/issues/1068) | — | "Size M. hub/elision.rs, a fallback history per session; a gauge for the window in force; criterion 2 on the rig." |
 <!-- /status-table:0089 -->

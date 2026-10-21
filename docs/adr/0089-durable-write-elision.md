@@ -24,6 +24,11 @@
 > message is sent to the subscriber within `write_elision_ms`; if it is not delivered and
 > acknowledged in that time, it is written to disk, and the publisher is acknowledged once
 > the write is durable. The default stays 0 until the evidence below is in.
+>
+> **Amended 2026-10-21** by the maintainer after the first rig sweep (T5): the window is
+> 30–50 ms, documented at 50 ms; the head rule of D5 is narrowed to what order needs; a
+> subscriber that keeps missing the window stops being held; the window shrinks only for
+> memory. See [Amendment 1](#amendment-1--the-window-the-head-rule-and-slow-subscribers).
 
 ## Context
 
@@ -187,10 +192,73 @@ durable confirmation:
   compose with this. A faster write raises the ceiling; elision removes the write where it
   is not needed.
 
+## Amendment 1 — the window, the head rule and slow subscribers
+
+Decided 2026-10-21 by the maintainer, on the first rig sweep: 3 × CCX23 brokers, 2 copies,
+the default redb store, persistent `$share` consumers that keep up, and
+`MQTTD_SHARED_PREFER_LOCAL=0`, so two thirds of publishes cross nodes before the subscriber's
+PUBACK can discharge them. One provisioning, run `knee-20261021T173147Z`; the card is
+[`bench/scale/elision-window-n3-2026-10-21.md`](../../bench/scale/elision-window-n3-2026-10-21.md).
+
+**What it showed.** At 10 sites (60,000 msg/s offered, 20k per node):
+
+| window | elided | fallbacks | write latency | PUBACK hold p99 / p99.9 |
+|---|---|---|---|---|
+| 0 (off) | — | — | 35.8 ms | — |
+| 5 ms | 1.5% | 713 | 31.2 ms | capped at the window |
+| 10 ms | 1.6% | 419 | 33.0 ms | capped at the window |
+| 20 ms | 6.1% | 850 | 34.7 ms | capped at the window |
+| 50 ms | **98.1%** | 59 | **6.8 ms** | 19.7 / 29.6 ms |
+
+At 1 site every window elided 99.6%. Under load the path is **bistable**: a few timeouts put
+a session on the durable path, D5 keeps it there while anything it was written is
+unacknowledged, writes slow to 30–90 ms, and a busy session (300 msg/s here) almost never sees
+the gap it needs to return. A window that covers the loaded PUBACK tail never tips over.
+
+### A1. The window
+
+`durable.write_elision_ms` is documented at **50 ms**; 30–50 ms is the supported range. It
+must cover the subscriber's acknowledgement tail under load (p99.9 30–44 ms at 10–15 sites
+here), not its mean (under 3 ms). For a subscriber that keeps up a long window costs nothing:
+a held delivery is discharged at its PUBACK, not at the window's end.
+
+**The default becomes 50 ms in 1.3.0** (maintainer, 2026-10-21, together with the segment log
+store as the default replica store, ADR 0078). Until then it stays 0. The flip rests on the
+criteria above with A2 and A3 in, the cluster cases (T3), and one rig confirmation of the
+combined 1.3.0 defaults.
+
+The window does **not** follow load. Raising it after timeouts appear comes too late, since
+the sessions are already on the durable path; and a short window under light load saves
+nothing.
+
+### A2. The head rule, narrowed
+
+D5's first clause stays: while any delivery for a session is **held**, every later one takes
+the durable path, and a session's held deliveries fall back together and in order. Its second
+clause ("or has fallen back to a write that is not yet acknowledged") is replaced by: **while
+any append for the session is in flight**. A delivery that is already written and on the
+wire, but not yet acknowledged, no longer blocks the next one from being held.
+
+Order holds. After a crash the written delivery replays from the store; the later held one
+was either acknowledged (and is never resent) or was never acknowledged to its publisher,
+which resends it after. MQTT requires a resend to keep the original order of what is resent,
+and nothing acknowledged is resent.
+
+### A3. A subscriber that keeps missing the window
+
+A session whose recent deliveries keep falling back on `timeout` stops being eligible for a
+while, so its publishers pay the write alone and not the window on top (criterion 2). It
+becomes eligible again after a quiet interval. The threshold and the interval are measured in
+T7, not fixed here.
+
+### A4. Memory
+
+The window shortens, or new holds stop, only as the node nears the D7 bound. That is the one
+cost of a long window that grows with load.
+
 ## Open questions
 
-- The default window, and whether it should follow the measured acknowledgement latency
-  rather than be fixed.
 - Whether a publish whose subscriber is on another node (a relocated session's frontend)
-  is eligible, given the extra hop in the acknowledgement path.
+  is eligible, given the extra hop in the acknowledgement path. (The T5 sweep forced the
+  extra hop and held 98% at 50 ms; the relocated-frontend case is still untested.)
 - Whether a resend after a crash in the window can carry `DUP` to the subscriber (#1058).
