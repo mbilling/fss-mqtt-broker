@@ -32,6 +32,8 @@ pub(super) struct Elided {
     pub(super) message_expiry: Option<u32>,
     pub(super) gate: AppendGate,
     pub(super) deadline: Instant,
+    /// When it went on the wire: the hold time a discharge reports.
+    pub(super) sent: Instant,
 }
 
 /// The node's held deliveries.
@@ -46,8 +48,8 @@ pub(super) struct ElisionState {
     pub(super) deadlines: VecDeque<(Instant, ClientId)>,
     pub(super) entries: usize,
     pub(super) bytes: usize,
-    /// Deliveries discharged by the subscriber's PUBACK, and fallbacks by reason
-    /// (counted here; exported by T4).
+    /// Deliveries discharged by the subscriber's PUBACK, and fallbacks (exported by
+    /// reason as `mqttd_durable_elision_fallback_total`).
     pub(super) discharged: u64,
     pub(super) fallbacks: u64,
 }
@@ -133,6 +135,9 @@ impl Hub {
         let Some(pkid) = pkid else {
             // Not in flight after all (the connection had just closed): write it as an
             // offline delivery, and let that write carry the obligation.
+            if let Some(m) = &self.metrics {
+                m.durable_elision_fallback("disconnect");
+            }
             let out = self.fallback_write(client, message, message_expiry, gate, None);
             self.release_registration(&gate.then());
             return out;
@@ -140,7 +145,8 @@ impl Hub {
         if let Some(m) = &self.metrics {
             m.publish_delivered(qos_num(message.qos));
         }
-        let deadline = Instant::now() + window;
+        let sent = Instant::now();
+        let deadline = sent + window;
         self.elision.entries += 1;
         self.elision.bytes += message.payload.len();
         self.elision
@@ -153,6 +159,7 @@ impl Hub {
                 message_expiry,
                 gate: gate.clone(),
                 deadline,
+                sent,
             });
         self.elision.deadlines.push_back((deadline, client.clone()));
         DurableOutcome::Ok
@@ -174,12 +181,16 @@ impl Hub {
         self.elision.entries -= 1;
         self.elision.bytes -= e.message.payload.len();
         self.elision.discharged += 1;
+        if let Some(m) = &self.metrics {
+            m.durable_elided(e.sent.elapsed().as_secs_f64());
+        }
         self.settle_discharged(&e.gate.then());
         true
     }
 
-    /// Fall back every delivery `client` holds, in send order (D3, D5).
-    pub(super) fn flush_elided(&mut self, client: &ClientId) {
+    /// Fall back every delivery `client` holds, in send order (D3, D5). `reason` is
+    /// the bounded class the fallback is counted under.
+    pub(super) fn flush_elided(&mut self, client: &ClientId, reason: &'static str) {
         let Some(queue) = self.elision.by_client.remove(client) else {
             return;
         };
@@ -187,6 +198,9 @@ impl Hub {
             self.elision.entries -= 1;
             self.elision.bytes -= e.message.payload.len();
             self.elision.fallbacks += 1;
+            if let Some(m) = &self.metrics {
+                m.durable_elision_fallback(reason);
+            }
             let then = e.gate.then();
             let _ =
                 self.fallback_write(client, &e.message, e.message_expiry, &e.gate, Some(e.pkid));
@@ -202,9 +216,10 @@ impl Hub {
             return;
         }
         if self.brownout || self.draining {
+            let reason = if self.brownout { "brownout" } else { "drain" };
             let clients: Vec<ClientId> = self.elision.by_client.keys().cloned().collect();
             for c in clients {
-                self.flush_elided(&c);
+                self.flush_elided(&c, reason);
             }
             self.elision.deadlines.clear();
             return;
@@ -222,7 +237,7 @@ impl Hub {
                 .and_then(VecDeque::front)
                 .is_some_and(|e| e.deadline <= now);
             if expired {
-                self.flush_elided(&client);
+                self.flush_elided(&client, "timeout");
             }
         }
     }
