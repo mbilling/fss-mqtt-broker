@@ -15,12 +15,12 @@
 >
 > **Linear scale-out, 3 → 10 nodes:**
 > - **QoS 0:** ~114,000 msg/s **per 4-vCPU node** — **1.14M msg/s on 10 nodes, 40 vCPU in total**; 1.2M at p99 ≤ 2 s, no loss.
-> - **QoS 1, clean sessions:** ~39,000–42,000 msg/s per node — **390,000–420,000 msg/s on 10 nodes**.
+> - **QoS 1, clean sessions:** ~39,000–45,000 msg/s per node — **390,000–450,000 msg/s on 10 nodes**.
 > - **Durable QoS 1** (ack after fsync + replication): **90,000 msg/s on 3 nodes, 12 vCPU** ([↓](#durable-and-qos-1-scale-out)).
 >
 > All three use shared subscriptions. [Scale-out ↓](#cluster-scale-out-qos-0-shared-subscriptions)
 >
-> **Newest, on the unreleased 1.2.0 candidate** (read from the brokers' counters; above 3 nodes mostly not certified by the rig, and not at all past 10): **durable QoS 1 delivered 173,000 → 206,000 → 240,000 msg/s on 10 → 12 → 14 nodes**, about 17k per node at each size, p99 ≤ 500 ms, with publishers slowed and nothing dropped. QoS 1 with clean sessions held 39–42k msg/s per node on 10 nodes. 733 million messages ledgered, none lost. [What we measured ↓](#scale-what-we-measured-on-the-120-candidate)
+> **Newest, on the unreleased 1.2.0 candidate** (read from the brokers' counters; above 3 nodes mostly not certified by the rig, and not at all past 10): **durable QoS 1 delivered 173,000 → 206,000 → 240,000 msg/s on 10 → 12 → 14 nodes**, about 17k per node at each size, p99 ≤ 500 ms, with publishers slowed and nothing dropped. QoS 1 with clean sessions held 39–45k msg/s per node on 10 nodes on the release candidate (2026-10-21), the same as the earlier build on the same hosts. More than a billion messages ledgered, none lost. [What we measured ↓](#scale-what-we-measured-on-the-120-candidate)
 
 ---
 
@@ -84,18 +84,22 @@ HiveMQ CE  2024.3   ████████████████████
 
 ### Scale: what we measured on the 1.2.0 candidate
 
-**The per-node rate held from 3 to 10 nodes, and no message was lost.** Two campaigns on
-2026-10-12, each on one provisioning of 4-vCPU brokers, 3 and 10 nodes on the same hosts:
+**The per-node rate held from 3 to 10 nodes, and no message was lost.** Campaigns on one
+provisioning of 4-vCPU brokers each, 3 and 10 nodes on the same hosts. QoS 1 is from the
+release candidate (2026-10-21); durable QoS 1 from 2026-10-12:
 
 | | 3 nodes | 10 nodes | p99 | messages ledgered · lost |
 |---|---|---|---|---|
-| **QoS 1, clean sessions** | 40.0k msg/s per node (120,000 msg/s), and 50.0k (150,000) at the top of its ladder | 39.0k per node (390,000 msg/s) and 42.0k (420,000), the highest rung run | ≤ 50 ms | 233,716,926 · 0 |
+| **QoS 1, clean sessions** | 40.0k msg/s per node (120,000 msg/s), and 50.0k (150,000) at the top of its ladder | 39.0k per node (390,000 msg/s), 42.0k (420,000) and 45.0k (450,000), the highest rung run | ≤ 50 ms | 323,555,538 · 0 |
 | **Durable QoS 1**: persistent sessions, every delivery fsynced and quorum-acked, default store | stops taking more at 20.7–20.9k per node (62,243 and 62,611 msg/s) | 15.0k per node taken in full (150,000 msg/s); stops taking more at 19.2–21.1k (192,217 and 210,547) | ≤ 500 ms; ≤ 1000 ms on the most overloaded rung | 193,366,130 · 0 |
 
 ![QoS 1 per node on the 1.2.0 candidate: rungs the rig certified, and rungs that hold](docs/benchmarks/img/scale-out-qos1-candidate.svg)
 
 - **Clean sessions did not find a limit at either size.** Every rung delivered its whole
   offer.
+- **No regression from 2026-10-12 to the release candidate.** On the same hosts, the
+  2026-10-12 build delivered 390,005 msg/s at 10 nodes and the candidate 390,004, both at
+  p99 ≤ 25 ms ([the comparison](bench/scale/qos1-knees-2026-10-21.md#what-it-shows)).
 - **Durable QoS 1 has the same ceiling per node at 3 and at 10 nodes, about 21k msg/s.**
   Offered more than that, the brokers acknowledge more slowly, publishers fall behind
   their schedule, and nothing is dropped.
@@ -110,14 +114,16 @@ HiveMQ CE  2024.3   ████████████████████
 **How to read this.** Rates are the brokers' own counters over a 60 s window. A rung
 *holds* if no message was lost (every message identity sent was acknowledged and
 received, and no broker dropped one) and p99 is at or below 1 s. Every rung here holds.
-That rule is simpler than the rig's certification: the rig graded 4 of these 12 rungs
-GREEN and the rest NOT CARRIED, for a saturated load-generator host, driver-side evidence
-it refused, or an offer the cluster did not take in full. The binary is an unreleased
-candidate build of the 1.2.0 commit `7d4eced`, not the signed release. Brokers are Hetzner
+That rule is simpler than the rig's certification, which graded some of these rungs
+NOT CARRIED, for a saturated load-generator host, driver-side evidence it refused, or an
+offer the cluster did not take in full. The binaries are unreleased candidate builds
+(`ec407218` for QoS 1, built with the release recipe; `7d4eced` for durable QoS 1), not the
+signed release. Brokers are Hetzner
 CCX23 (4 vCPU). Each rung is one 60 s window, and the durable figures are for the default
 store, not the log store of the 3-node figure below. These are not points on the
 [certified curve](docs/benchmarks/QOS1-SCALE-CURVE.md). Every rung, both readings and the
-commands: [qos1-knees-2026-10-12.md](bench/scale/qos1-knees-2026-10-12.md) ·
+commands: [qos1-knees-2026-10-21.md](bench/scale/qos1-knees-2026-10-21.md) ·
+[qos1-knees-2026-10-12.md](bench/scale/qos1-knees-2026-10-12.md) ·
 [durable-knees-2026-10-12.md](bench/scale/durable-knees-2026-10-12.md).
 
 **Durable QoS 1 past 10 nodes: the total grew at each size.** A third campaign the same

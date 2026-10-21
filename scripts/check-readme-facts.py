@@ -319,8 +319,8 @@ def main() -> int:
         )
     else:
         cards = [ROOT / "bench" / "scale" / n
-                 for n in ("qos1-knees-2026-10-12.md", "durable-knees-2026-10-12.md",
-                           "durable-scaleout-10-12-14.md")]
+                 for n in ("qos1-knees-2026-10-12.md", "qos1-knees-2026-10-21.md",
+                           "durable-knees-2026-10-12.md", "durable-scaleout-10-12-14.md")]
         stated = set()
         for card in cards:
             stated |= scale_figures(card.read_text(encoding="utf-8"))
