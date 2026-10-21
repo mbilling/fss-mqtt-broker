@@ -691,6 +691,39 @@ default = ""
 help = "Prebuilt broker; empty builds one first"
 
 [[task]]
+id = "roll-upgrade"
+group = "Operate"
+name = "Upgrade a systemd or Compose cluster one node at a time"
+script = "scripts/roll-upgrade.sh"
+about = """
+A rolling upgrade for the deployments Kubernetes does not cover: systemd hosts over ssh, the
+Compose reference deployment, or any environment through your own upgrade and readiness
+commands. It checks the target is the same release or the next minor (ADR 0039), refuses a
+cluster that is not ready, then upgrades each node in turn and waits until every node is ready
+again, and stays ready for a settle window, before the next. It stops at the first node that
+does not come back and touches none after it. It restarts real brokers, so it is not offered
+here: run it from a shell, with --dry-run first.
+"""
+requires = ["bash"]
+duration = "~25s per node"
+hidden = true
+
+[[task]]
+id = "roll-upgrade-test"
+group = "Internal"
+name = "Check the rolling-upgrade script against stub nodes"
+script = "scripts/roll-upgrade-test.sh"
+about = """
+Drives scripts/roll-upgrade.sh's custom mode over three stub nodes: the roll goes in order,
+stops at a node that does not come back without touching the next, refuses a skipped minor
+(and --force overrides it), refuses a cluster that is not ready, and --dry-run changes nothing.
+CI runs it on every PR.
+"""
+requires = ["bash"]
+duration = "~15s"
+hidden = true
+
+[[task]]
 id = "deploy-smoke"
 group = "Try it"
 name = "Boot the three-node compose/systemd reference deployment"

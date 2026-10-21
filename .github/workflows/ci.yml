@@ -596,6 +596,10 @@ jobs:
         run: |
           git fetch --tags --force --quiet
           ./scripts/check-deploy-image-pin.sh
+      # The rolling-upgrade script's own logic (order, stop on a node that does not come
+      # back, the ADR 0039 skew refusal, dry run), against stub nodes: no cluster needed.
+      - name: Rolling-upgrade script
+        run: ./scripts/roll-upgrade-test.sh
 
   mqttui:
     name: mqttui (separate workspace)

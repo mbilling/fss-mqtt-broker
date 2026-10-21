@@ -280,8 +280,10 @@ mqttd --probe /readyz      # should it get client traffic?  (pull it from the LB
 `reload` goes through validate-before-swap: a bad edit is rejected and the running config
 kept (ADR 0032). A tightened ACL reaches already-connected clients (ADR 0040).
 
-**Rolling restart:** one node at a time, waiting for `--probe /readyz` to pass before
-moving on. `TimeoutStopSec=60` is longer than `MQTTD_SHUTDOWN_GRACE=30` on purpose, so
+**Rolling restart or upgrade:** one node at a time, waiting for `--probe /readyz` to pass
+before moving on. `scripts/roll-upgrade.sh systemd --binary ./mqttd host1 host2 host3`
+does it over ssh: it installs the new binary (keeping the old one as `mqttd.prev`),
+restarts the unit, and waits for the whole cluster before the next host. `TimeoutStopSec=60` is longer than `MQTTD_SHUTDOWN_GRACE=30` on purpose, so
 systemd never `SIGKILL`s a broker that is still draining.
 
 **Decommissioning a node for good:** run `mqttd --decommission` first — it hands every key

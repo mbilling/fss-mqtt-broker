@@ -747,7 +747,7 @@ endpoint, roles, errors).
 - consensus for control (epochs, ownership), small replica sets for data
 - refuse at the edge: reason code or backpressure, never a silent drop
 - bridge is a separate process and failure domain
-- decisions: [`docs/adr/`](docs/adr/) (88 ADRs, per-task status) · tour: [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [THREAT-MODEL.md](docs/THREAT-MODEL.md)
+- decisions: [`docs/adr/`](docs/adr/) (89 ADRs, per-task status) · tour: [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [THREAT-MODEL.md](docs/THREAT-MODEL.md)
 
 **Workspace layout**
 
@@ -834,7 +834,7 @@ Tracked on the [delivery dashboard](docs/delivery/STATUS.md).
 ```sh
 cargo build && cargo test && cargo clippy --all-targets && cargo deny check
 ./scripts/interop/run.sh     # foreign-client conformance
-mqttui --list                # There are 141 runnable scripts here: demos, smokes, migrations, benches
+mqttui --list                # There are 143 runnable scripts here: demos, smokes, migrations, benches
 ```
 
 ---
