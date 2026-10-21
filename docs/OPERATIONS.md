@@ -536,6 +536,19 @@ ordinary replace motion — wipe its data dir and give it seeds so it JOINS
 
 ## Rolling upgrades
 
+**Outside Kubernetes**, `scripts/roll-upgrade.sh` does the same motion for systemd hosts
+(over ssh), the Compose reference deployment, or any environment through your own upgrade
+and readiness commands. It refuses a target outside the adjacent-release rule below and a
+cluster that is not ready, then upgrades one node at a time. After each node it waits until
+every node is ready, counts the whole cluster where `/readyz` is readable, and stays ready
+for a settle window. It stops at the first node that does not come back. Run it with
+`--dry-run` first; `scripts/roll-upgrade.sh --help` lists every option.
+
+```sh
+scripts/roll-upgrade.sh systemd --binary ./mqttd node1 node2 node3
+scripts/roll-upgrade.sh compose --image ghcr.io/mbilling/fss-mqtt-broker:X.Y.Z --dir deploy/compose mqttd-1 mqttd-2 mqttd-3
+```
+
 `helm upgrade` with a new image tag rolls one pod at a time (OrderedReady +
 RollingUpdate + PDB `maxUnavailable: 1`); each pod drains via `preStop` before its
 restart and rejoins behind the caught-up watermark. Version-skew rules are
