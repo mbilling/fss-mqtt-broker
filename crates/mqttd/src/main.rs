@@ -3139,6 +3139,16 @@ fn wire_hub(
     hub.set_subscriber_limits(subscriber_limits_from_config(config)?);
     // ADR 0072: per-message durability tiers, only under the operator's opt-in.
     hub.set_allow_relaxed_publish(config.durable.allow_relaxed_publish);
+    // ADR 0089: write elision on the durable QoS 1 path, off unless a window is set.
+    hub.set_write_elision_ms(config.durable.write_elision_ms);
+    if config.durable.write_elision_ms > 0 {
+        warn!(
+            window_ms = config.durable.write_elision_ms,
+            "EXPERIMENTAL: durable write elision is on (ADR 0089): a QoS 1 delivery to an \
+             online persistent subscriber is sent before it is written, and written only if \
+             the subscriber does not acknowledge it within the window"
+        );
+    }
     hub.set_end_sessions_at_cert_expiry(config.tls.end_sessions_at_cert_expiry);
     hub.set_shared_prefer_local(config.cluster.shared_prefer_local);
     // Issue #613 item 3.4: the locality DIAL, not the switch. `effective_...` folds

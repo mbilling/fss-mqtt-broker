@@ -626,6 +626,11 @@ impl Hub {
             // keeps the durable-before-wire ordering structural: the send site
             // literally receives the offset from the completion.
             if persistent && qos != QoS::AtMostOnce {
+                // ADR 0089: sent now and held; the subscriber's PUBACK or the fallback
+                // write discharges the publisher's obligation, whichever comes first.
+                if self.may_elide(client, &message, gate) {
+                    return self.elide(client, &tx, &message, message_expiry, retain, gate);
+                }
                 return match self.submit_append(
                     client,
                     &message,
@@ -2101,6 +2106,7 @@ impl Hub {
             retain,
             message_expiry,
             queued_at: Instant::now(),
+            delivered: None,
         };
         match self.submit_lane_job(job) {
             Submitted::Queued => QosSend::Staged,

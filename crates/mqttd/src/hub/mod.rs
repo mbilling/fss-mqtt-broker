@@ -70,6 +70,7 @@ pub mod admin;
 mod forwarding;
 use forwarding::{ForwardKind, ForwardObligation, InterestIndex, PendingPublish, Reselect};
 mod delivery;
+mod elision;
 /// The rule engine's message events, as far as the hub decides them (ADR 0083).
 mod events;
 pub(crate) use events::origin_from_wire;
@@ -2893,6 +2894,9 @@ pub struct Hub {
     /// as the ack's release, while a session the takeover is still materialising
     /// may be owed the publish too. Released by [`Self::settle_held_forwards`].
     held_forwards: Vec<forwarding::HeldForward>,
+    /// Deliveries held unwritten for the write-elision window (ADR 0089); empty and
+    /// unused while `durable.write_elision_ms` is 0.
+    elision: Box<elision::ElisionState>,
     /// Receiver side of acked forwards (issue #648): per origin, the forwards
     /// recently applied and the answer each got, so a retransmission is answered
     /// again instead of applied again. Bounded per origin by
@@ -3126,6 +3130,14 @@ impl Resolution {
 
 // The bools are independent obligations, not an encodable state machine.
 
+/// Sleeps until the earliest held delivery's window ends (ADR 0089).
+async fn elision_wake(state: &elision::ElisionState) {
+    match state.deadlines.front() {
+        Some((deadline, _)) => tokio::time::sleep_until(*deadline).await,
+        None => tokio::time::sleep(Duration::from_millis(5)).await,
+    }
+}
+
 impl Hub {
     /// Create the hub (default node id and in-memory stores) and the sender
     /// that connection tasks use to reach it.
@@ -3183,6 +3195,7 @@ impl Hub {
                 qos2_epoch: HashMap::new(),
                 remote_append_pending: HashMap::new(),
                 held_forwards: Vec::new(),
+                elision: Box::default(),
                 forward_windows: HashMap::new(),
                 held_dead: HashMap::new(),
                 node_id,
@@ -3506,6 +3519,9 @@ impl Hub {
                     if futures_util::FutureExt::now_or_never(sweep.tick()).is_some() {
                         self.run_sweep().await;
                     }
+                    if self.elision.entries > 0 {
+                        self.expire_elided();
+                    }
                     tokio::task::yield_now().await;
                 }
                 continue;
@@ -3519,6 +3535,10 @@ impl Hub {
                     None => break,
                 },
                 _ = sweep.tick() => self.run_sweep().await,
+                // ADR 0089: the earliest held delivery's window, only while one is held.
+                () = elision_wake(&self.elision), if self.elision.entries > 0 => {
+                    self.expire_elided();
+                }
             }
         }
     }
@@ -3861,6 +3881,8 @@ impl Hub {
                 graceful,
                 session_expiry_override,
             } => {
+                // ADR 0089: a held delivery whose subscriber is gone is written now.
+                self.flush_elided(&client);
                 self.detach(&client, conn_id, graceful, session_expiry_override)
                     .await;
             }
@@ -9598,7 +9620,16 @@ mod tests {
     }
 
     fn start_hub_with_arc(store: std::sync::Arc<dyn mqtt_storage::SessionStore>) -> HubTx {
-        let (hub, tx) = Hub::with_config(NodeId("hub-test".into()), store);
+        start_hub_eliding(store, 0)
+    }
+
+    /// [`start_hub_with_arc`] with `durable.write_elision_ms = window_ms` (ADR 0089).
+    fn start_hub_eliding(
+        store: std::sync::Arc<dyn mqtt_storage::SessionStore>,
+        window_ms: u32,
+    ) -> HubTx {
+        let (mut hub, tx) = Hub::with_config(NodeId("hub-test".into()), store);
+        hub.set_write_elision_ms(window_ms);
         tokio::spawn(hub.run());
         tx
     }
@@ -15226,6 +15257,153 @@ mod tests {
             1,
             "the durable copy stays until the subscriber acknowledges"
         );
+    }
+
+    /// A first delivery to `c` on today's path, acknowledged: it reserves the session's
+    /// packet-id block, so later deliveries can be held (ADR 0089 D2).
+    async fn warm_packet_ids(tx: &HubTx, rx: &mut crate::hub::OutboundRx, c: &str) {
+        let done = publish_gated(tx, "t", b"warm", QoS::AtLeastOnce, false);
+        let p = recv_packet(rx).await.expect("the warm-up delivery");
+        pub_ack(tx, c, pkid_of(&p));
+        assert!(matches!(
+            timeout(Duration::from_secs(2), done).await,
+            Ok(Ok(PublishOutcome::Accepted))
+        ));
+    }
+
+    /// ADR 0089 D1: with write elision on, a durable `QoS` 1 delivery goes on the wire
+    /// at once, before any write (the T1 order flipped), the publisher waits, and the
+    /// subscriber's PUBACK inside the window discharges it: accepted, and nothing was
+    /// ever written.
+    #[tokio::test]
+    async fn an_acknowledged_held_delivery_is_never_written() {
+        let store = FlakyStore::new(0);
+        let tx = start_hub_eliding(store.clone(), 2_000);
+        let (mut rx, _) = attach_full(&tx, "c", 1, false, u32::MAX, 8).await;
+        subscribe_qos(&tx, "c", "t", QoS::AtLeastOnce);
+        let _ = attach(&tx, "barrier", 99, true).await;
+        warm_packet_ids(&tx, &mut rx, "c").await;
+        // Any write would hang: the delivery must not depend on one.
+        store
+            .hold_enqueue
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let mut done = publish_gated(&tx, "t", b"elided", QoS::AtLeastOnce, false);
+        let delivered = recv_packet(&mut rx)
+            .await
+            .expect("sent at once, before any write (ADR 0089)");
+        assert_eq!(payload_of(&delivered), b"elided");
+        assert!(
+            timeout(Duration::from_millis(200), &mut done)
+                .await
+                .is_err(),
+            "the publisher was answered before the subscriber acknowledged (D1)"
+        );
+        pub_ack(&tx, "c", pkid_of(&delivered));
+        assert!(matches!(
+            timeout(Duration::from_secs(2), done).await,
+            Ok(Ok(PublishOutcome::Accepted))
+        ));
+        store
+            .hold_enqueue
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let _ = attach(&tx, "barrier2", 98, true).await;
+        let c = ClientId("c".into());
+        assert!(
+            store.pending(&c, 0, 16).await.unwrap().is_empty(),
+            "a delivery the subscriber acknowledged inside the window is never written"
+        );
+    }
+
+    /// ADR 0089 D3: a delivery not acknowledged within the window is written, and only
+    /// then is the publisher accepted; the copy stays until the late PUBACK, which
+    /// truncates it. The message is not sent a second time.
+    #[tokio::test]
+    async fn an_unacknowledged_held_delivery_is_written_when_its_window_ends() {
+        let store = FlakyStore::new(0);
+        let tx = start_hub_eliding(store.clone(), 50);
+        let (mut rx, _) = attach_full(&tx, "c", 1, false, u32::MAX, 8).await;
+        subscribe_qos(&tx, "c", "t", QoS::AtLeastOnce);
+        let _ = attach(&tx, "barrier", 99, true).await;
+        warm_packet_ids(&tx, &mut rx, "c").await;
+
+        let done = publish_gated(&tx, "t", b"late", QoS::AtLeastOnce, false);
+        let delivered = recv_packet(&mut rx).await.expect("sent at once");
+        assert!(matches!(
+            timeout(Duration::from_secs(2), done).await,
+            Ok(Ok(PublishOutcome::Accepted))
+        ));
+        let c = ClientId("c".into());
+        assert_eq!(
+            store.pending(&c, 0, 16).await.unwrap().len(),
+            1,
+            "the window ended unacknowledged: the delivery was written before the ack"
+        );
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "the fallback write must not send the message again"
+        );
+        pub_ack(&tx, "c", pkid_of(&delivered));
+        wait_qos2_store_empty(store.as_ref(), "c").await;
+        for _ in 0..50 {
+            if store.pending(&c, 0, 16).await.unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            store.pending(&c, 0, 16).await.unwrap().is_empty(),
+            "the late PUBACK truncates the fallback copy"
+        );
+    }
+
+    /// ADR 0089 D5: held deliveries fall back together and in order, so a replay after
+    /// a reconnect keeps the session's order. Two deliveries held, neither acknowledged,
+    /// the subscriber disconnects: both are written at once, in send order.
+    #[tokio::test]
+    async fn held_deliveries_fall_back_in_order_when_the_subscriber_leaves() {
+        let store = FlakyStore::new(0);
+        let tx = start_hub_eliding(store.clone(), 60_000);
+        let (mut rx, _) = attach_full(&tx, "c", 1, false, u32::MAX, 8).await;
+        subscribe_qos(&tx, "c", "t", QoS::AtLeastOnce);
+        let _ = attach(&tx, "barrier", 99, true).await;
+        warm_packet_ids(&tx, &mut rx, "c").await;
+
+        let first = publish_gated(&tx, "t", b"one", QoS::AtLeastOnce, false);
+        let second = publish_gated(&tx, "t", b"two", QoS::AtLeastOnce, false);
+        assert_eq!(payload_of(&recv_packet(&mut rx).await.unwrap()), b"one");
+        assert_eq!(payload_of(&recv_packet(&mut rx).await.unwrap()), b"two");
+        let c = ClientId("c".into());
+        assert!(
+            store.pending(&c, 0, 16).await.unwrap().is_empty(),
+            "held, not written"
+        );
+
+        detach(&tx, "c", 1);
+        for done in [first, second] {
+            assert!(matches!(
+                timeout(Duration::from_secs(2), done).await,
+                Ok(Ok(PublishOutcome::Accepted))
+            ));
+        }
+        let queued: Vec<Vec<u8>> = store
+            .pending(&c, 0, 16)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|q| q.message.payload.to_vec())
+            .collect();
+        assert_eq!(
+            queued,
+            vec![b"one".to_vec(), b"two".to_vec()],
+            "written in send order"
+        );
+
+        // And the resume replays them, in that order.
+        let (mut rx, present) = attach_full(&tx, "c", 2, false, u32::MAX, 8).await;
+        assert!(present);
+        assert_eq!(payload_of(&recv_packet(&mut rx).await.unwrap()), b"one");
+        assert_eq!(payload_of(&recv_packet(&mut rx).await.unwrap()), b"two");
     }
 
     #[tokio::test]

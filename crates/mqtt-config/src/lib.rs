@@ -593,6 +593,13 @@ pub struct Durable {
     /// the loud opt-out escape hatch, and the automatic posture whenever ANY member
     /// (e.g. a rolled-back binary) lacks the capability.
     pub ownership_domain: OwnershipDomain,
+    /// Write elision on the durable `QoS` 1 path (`MQTTD_DURABLE_WRITE_ELISION_MS`,
+    /// ADR 0089), in milliseconds: how long a delivery to an online persistent
+    /// subscriber is held, sent but not yet written, waiting for the subscriber's
+    /// PUBACK to stand in for the durable write. `0` (the default) is today's path:
+    /// every such delivery is written before it is sent. The publisher's ack still
+    /// waits for the subscriber's PUBACK or the write, whichever comes first.
+    pub write_elision_ms: u32,
 }
 
 /// The durable ownership domain (`durable.ownership_domain`, ADR 0073).
@@ -822,6 +829,7 @@ impl Default for Durable {
             allow_ephemeral: false,
             allow_relaxed_publish: false,
             ownership_domain: OwnershipDomain::Members,
+            write_elision_ms: 0,
         }
     }
 }
@@ -1586,6 +1594,9 @@ impl Config {
         });
         on!("MQTTD_STORE_MAX_BYTES", v, {
             self.durable.store_max_bytes = Some(num("MQTTD_STORE_MAX_BYTES", &v)?);
+        });
+        on!("MQTTD_DURABLE_WRITE_ELISION_MS", v, {
+            self.durable.write_elision_ms = num("MQTTD_DURABLE_WRITE_ELISION_MS", &v)?;
         });
         on!("MQTTD_MIN_REPLICAS", v, {
             self.durable.min_replicas = MinReplicas::parse(&v)
@@ -2485,6 +2496,7 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_LEASE_VOTERS",
     "MQTTD_REPLICAS",
     "MQTTD_MIN_REPLICAS",
+    "MQTTD_DURABLE_WRITE_ELISION_MS",
     "MQTTD_STORE_MAX_BYTES",
     "MQTTD_ALLOW_EPHEMERAL_DURABILITY",
     "MQTTD_ALLOW_RELAXED_PUBLISH",
@@ -3680,6 +3692,7 @@ mod tests {
             | "MQTTD_HTTP_AUTH_CACHE_MAX"
             | "MQTTD_OTLP_INTERVAL"
             | "MQTTD_SHUTDOWN_GRACE"
+            | "MQTTD_DURABLE_WRITE_ELISION_MS"
             | "MQTTD_READY_MIN_MEMBERS"
             | "MQTTD_CONFIG_WATCH"
             | "MQTTD_OIDC_JWKS_REFRESH"
@@ -3913,8 +3926,9 @@ mod tests {
             // (ADR 0085),
             // plus MQTTD_RULES_FUNCTION_MAX_MS (ADR 0086, the ceiling on one call),
             // plus MQTTD_TLS_EXPIRY_WARN_PERMILLE (ADR 0088 D2),
-            // plus MQTTD_TLS_END_SESSIONS_AT_CERT_EXPIRY (ADR 0088 O2).
-            126,
+            // plus MQTTD_TLS_END_SESSIONS_AT_CERT_EXPIRY (ADR 0088 O2),
+            // plus MQTTD_DURABLE_WRITE_ELISION_MS (ADR 0089).
+            127,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never
