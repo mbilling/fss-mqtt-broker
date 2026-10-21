@@ -5,9 +5,9 @@ adr_status: Accepted
 tasks:
   - id: 0089-T1
     title: "Characterisation first: hub tests that pin today's order (durable before the wire) and the obligation ledger, and a cluster_proc schedule that kills a session's owner with deliveries in flight; the tests D1-D5 will flip"
-    status: planned
+    status: in-progress
     issue: 1068
-    notes: "Size M. hub/lanes.rs, hub/forwarding.rs, hub/delivery.rs tests; proc_common (a kill aimed at an owner with an online persistent subscriber under load). No behaviour change."
+    notes: "Size M. hub/lanes.rs, hub/forwarding.rs, hub/delivery.rs tests; proc_common (a kill aimed at an owner with an online persistent subscriber under load). No behaviour change. First piece: hub::tests::a_durable_qos1_delivery_reaches_the_wire_only_after_its_append (an append held by FlakyStore::hold_enqueue keeps the live PUBLISH off the wire and the publisher unanswered; released, both proceed and the copy stays until the PUBACK). The crash half is inflight_durability::an_acked_qos1_in_flight_to_an_online_subscriber_survives_a_crash (#124), which T2 must keep green with elision on."
   - id: 0089-T2
     title: "D1-D5 on one node behind durable.write_elision_ms (default 0): eligibility, the held window, the fallback to today's append, the per-session head rule, fan-out over several owed sessions"
     status: planned
@@ -42,7 +42,7 @@ above; the table below is generated from it.
 <!-- status-table:0089 -->
 | Task | Status | Issue | When | Evidence / notes |
 |------|--------|-------|------|------------------|
-| 0089-T1 | ⬜ planned | [#1068](https://github.com/mbilling/fss-mqtt-broker/issues/1068) | — | "Size M. hub/lanes.rs, hub/forwarding.rs, hub/delivery.rs tests; proc_common (a kill aimed at an owner with an online persistent subscriber under load). No behaviour change." |
+| 0089-T1 | 🚧 in-progress | [#1068](https://github.com/mbilling/fss-mqtt-broker/issues/1068) | — | "Size M. hub/lanes.rs, hub/forwarding.rs, hub/delivery.rs tests; proc_common (a kill aimed at an owner with an online persistent subscriber under load). No behaviour change. First piece: hub::tests::a_durable_qos1_delivery_reaches_the_wire_only_after_its_append (an append held by FlakyStore::hold_enqueue keeps the live PUBLISH off the wire and the publisher unanswered; released, both proceed and the copy stays until the PUBACK). The crash half is inflight_durability::an_acked_qos1_in_flight_to_an_online_subscriber_survives_a_crash (#124), which T2 must keep green with elision on." |
 | 0089-T2 | ⬜ planned | [#1068](https://github.com/mbilling/fss-mqtt-broker/issues/1068) | — | "Size L. The obligation ledger gains a second discharge (the subscriber's PUBACK); every path that settles a publish must respect it. mqtt-config (the key), CONFIGURATION." |
 | 0089-T3 | ⬜ planned | [#1068](https://github.com/mbilling/fss-mqtt-broker/issues/1068) | — | "Size M. hub/forwarding.rs verdicts, the #1053 hold, the ingress-credit style bound. cluster_stress and false_dead_delivery with elision on." |
 | 0089-T4 | ⬜ planned | [#1068](https://github.com/mbilling/fss-mqtt-broker/issues/1068) | — | "Size S-M. mqtt-observability, health.rs, OPERATIONS, README durability wording, THREAT-MODEL row." |

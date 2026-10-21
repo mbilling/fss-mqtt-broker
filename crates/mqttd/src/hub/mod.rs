@@ -9757,6 +9757,9 @@ mod tests {
         /// The next this-many REPLAY reads (`pending` at `REPLAY_LIMIT`) fail with
         /// `NoQuorum`; the one-entry warm-up read in `recover_once` is untouched.
         fail_replay: std::sync::atomic::AtomicUsize,
+        /// While true, every durable append waits before it is applied: a delivery's
+        /// write is held for as long as a test needs (ADR 0089 T1).
+        hold_enqueue: std::sync::atomic::AtomicBool,
     }
 
     impl FlakyStore {
@@ -9767,6 +9770,7 @@ mod tests {
                 fail_enqueue_no_quorum: false,
                 fail_outbound: std::sync::atomic::AtomicBool::new(false),
                 fail_replay: std::sync::atomic::AtomicUsize::new(0),
+                hold_enqueue: std::sync::atomic::AtomicBool::new(false),
             })
         }
 
@@ -9779,6 +9783,7 @@ mod tests {
                 fail_enqueue_no_quorum: true,
                 fail_outbound: std::sync::atomic::AtomicBool::new(false),
                 fail_replay: std::sync::atomic::AtomicUsize::new(0),
+                hold_enqueue: std::sync::atomic::AtomicBool::new(false),
             })
         }
     }
@@ -9826,6 +9831,11 @@ mod tests {
         ) -> Result<mqtt_storage::Enqueued, mqtt_storage::StorageError> {
             if self.fail_enqueue_no_quorum {
                 return Err(mqtt_storage::StorageError::NoQuorum);
+            }
+            while self.hold_enqueue.load(std::sync::atomic::Ordering::SeqCst) {
+                // SETTLE(append-hold): a fault injection, not a wait for state; the
+                // test that set the hold clears it, and its own deadlines bound it.
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
             self.inner
                 .enqueue_with_expiry(client, message, expiry_at)
@@ -15169,6 +15179,55 @@ mod tests {
     /// is withheld — the subscriber re-sends PUBREC, and that retry is the write's retry.
     /// A PUBREL sent on a failed write would restore into `AwaitingPubRec` and re-PUBLISH
     /// a message the subscriber already released: a duplicate of our own making.
+    /// ADR 0089 T1: today's order on the durable `QoS` 1 path, pinned so that T2 changes
+    /// it on purpose. While a persistent, online subscriber's append is held, nothing
+    /// reaches its wire and the publisher is not answered (#124: durable before the wire,
+    /// ack after durable). Released, the delivery goes out, the publisher is accepted,
+    /// and the store holds the message until the subscriber acknowledges it. With write
+    /// elision on, the first half flips: the delivery is sent at once, and the
+    /// subscriber's PUBACK may stand in for the write (ADR 0089 D1).
+    #[tokio::test]
+    async fn a_durable_qos1_delivery_reaches_the_wire_only_after_its_append() {
+        let store = FlakyStore::new(0);
+        let tx = start_hub_with_arc(store.clone());
+        let (mut rx, _) = attach_full(&tx, "c", 1, false, u32::MAX, 8).await;
+        subscribe_qos(&tx, "c", "t", QoS::AtLeastOnce);
+        let _ = attach(&tx, "barrier", 99, true).await; // the subscribe is applied
+
+        store
+            .hold_enqueue
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut done = publish_gated(&tx, "t", b"held", QoS::AtLeastOnce, false);
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "a durable QoS 1 delivery went on the wire before its append (#124)"
+        );
+        assert!(
+            timeout(Duration::from_millis(300), &mut done)
+                .await
+                .is_err(),
+            "the publisher was answered before the append was durable"
+        );
+
+        store
+            .hold_enqueue
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let delivered = recv_packet(&mut rx)
+            .await
+            .expect("delivered once the append is durable");
+        assert_eq!(payload_of(&delivered), b"held");
+        assert!(matches!(
+            timeout(Duration::from_secs(2), done).await,
+            Ok(Ok(PublishOutcome::Accepted))
+        ));
+        let c = ClientId("c".into());
+        assert_eq!(
+            store.pending(&c, 0, 16).await.unwrap().len(),
+            1,
+            "the durable copy stays until the subscriber acknowledges"
+        );
+    }
+
     #[tokio::test]
     async fn a_failed_phase_advance_withholds_the_pubrel() {
         let store = FlakyStore::new(0);
