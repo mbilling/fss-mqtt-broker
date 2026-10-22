@@ -872,6 +872,7 @@ async fn publish_once(
 ///    acknowledged, at any point, must have been delivered. One that never was is the
 ///    publisher's to resend (`QoS` 1); nothing acknowledged may be lost.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[allow(clippy::too_many_lines)] // one schedule, its four phases in order
 async fn a_kill_of_the_owner_with_deliveries_held_loses_no_acked_message() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -902,7 +903,7 @@ async fn a_kill_of_the_owner_with_deliveries_held_loses_no_acked_message() {
         let (acking, live_payloads) = (acking.clone(), live_payloads.clone());
         tokio::spawn(async move {
             loop {
-                match conn.recv_bounded(Duration::from_secs(60)).await {
+                match conn.recv_bounded(Duration::from_mins(1)).await {
                     common::Recv::Packet(Packet::Publish(p)) => {
                         live_payloads.lock().unwrap().push(p.payload.to_vec());
                         if let (Some(pkid), true) = (p.pkid, acking.load(Ordering::SeqCst)) {
@@ -966,7 +967,7 @@ async fn a_kill_of_the_owner_with_deliveries_held_loses_no_acked_message() {
                 format!("eh-{seed}-{i}"),
                 topic.clone(),
                 p.clone(),
-                Duration::from_secs(60),
+                Duration::from_mins(1),
             ))
         })
         .collect();
@@ -997,7 +998,7 @@ async fn a_kill_of_the_owner_with_deliveries_held_loses_no_acked_message() {
     proc.bring_subscriber_online(0, true).await;
     let mut delivered: std::collections::BTreeSet<Vec<u8>> =
         live_payloads.lock().unwrap().iter().cloned().collect();
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     loop {
         proc.drain_subscriber(0).await;
         delivered.extend(proc.subs[0].received.iter().cloned());
