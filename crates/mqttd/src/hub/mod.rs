@@ -3884,6 +3884,7 @@ impl Hub {
                 // ADR 0089: a held delivery whose subscriber is gone is written now.
                 self.flush_elided(&client, "disconnect");
                 self.forget_backoff(&client);
+                self.forget_writing(&client, conn_id);
                 self.detach(&client, conn_id, graceful, session_expiry_override)
                     .await;
             }
@@ -15594,6 +15595,118 @@ mod tests {
         );
         assert_eq!(window_in_force(w, MAX_ELIDED / 4 * 3 + 1, 0), w / 2);
         assert_eq!(window_in_force(w, 0, MAX_ELIDED_BYTES / 4 * 3 + 1), w / 2);
+    }
+
+    /// ADR 0089 Amendment 1 A5: a write in flight blocks a hold only on its own topic.
+    /// With every write hanging, a `QoS` 2 delivery on `b` (always written) stays in
+    /// flight; a `QoS` 1 delivery on `a` is held and sent at once past it, and one on
+    /// `b` is not, since it would overtake `b`'s write.
+    #[tokio::test]
+    async fn a_write_in_flight_on_one_topic_does_not_block_a_hold_on_another() {
+        let store = FlakyStore::new(0);
+        let tx = start_hub_eliding(store.clone(), 60_000);
+        let (mut rx, _) = attach_full(&tx, "c", 1, false, u32::MAX, 8).await;
+        subscribe_qos(&tx, "c", "t", QoS::AtLeastOnce);
+        subscribe_qos(&tx, "c", "a", QoS::AtLeastOnce);
+        subscribe_qos(&tx, "c", "b", QoS::ExactlyOnce);
+        let _ = attach(&tx, "barrier", 99, true).await;
+        warm_packet_ids(&tx, &mut rx, "c").await;
+
+        store
+            .hold_enqueue
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _on_b2 = publish_gated(&tx, "b", b"b-written", QoS::ExactlyOnce, false);
+        let on_a = publish_gated(&tx, "a", b"a-held", QoS::AtLeastOnce, false);
+        let p = recv_packet(&mut rx)
+            .await
+            .expect("held and sent at once: b's write is on another topic");
+        assert_eq!(payload_of(&p), b"a-held");
+        let _on_b = publish_gated(&tx, "b", b"b-next", QoS::AtLeastOnce, false);
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "a QoS 1 delivery on b waits behind b's write in flight"
+        );
+        pub_ack(&tx, "c", pkid_of(&p));
+        assert!(matches!(
+            timeout(Duration::from_secs(2), on_a).await,
+            Ok(Ok(PublishOutcome::Accepted))
+        ));
+        store
+            .hold_enqueue
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// ADR 0089 Amendment 1 A5 (and the gap it closes in T2): a delivery that takes the
+    /// durable path while its session holds an earlier one on the same topic has that
+    /// one written first, so the store and the resume keep the topic's order. A held
+    /// delivery on another topic stays held.
+    #[tokio::test]
+    async fn a_held_delivery_is_written_before_a_later_durable_one_on_its_topic() {
+        let store = FlakyStore::new(0);
+        let tx = start_hub_eliding(store.clone(), 60_000);
+        let (mut rx, _) = attach_full(&tx, "c", 1, false, u32::MAX, 8).await;
+        subscribe_qos(&tx, "c", "t", QoS::ExactlyOnce);
+        subscribe_qos(&tx, "c", "u", QoS::AtLeastOnce);
+        let _ = attach(&tx, "barrier", 99, true).await;
+        warm_packet_ids(&tx, &mut rx, "c").await;
+
+        let first = publish_gated(&tx, "t", b"one", QoS::AtLeastOnce, false);
+        assert_eq!(payload_of(&recv_packet(&mut rx).await.unwrap()), b"one");
+        let other = publish_gated(&tx, "u", b"other", QoS::AtLeastOnce, false);
+        assert_eq!(payload_of(&recv_packet(&mut rx).await.unwrap()), b"other");
+        let c = ClientId("c".into());
+        assert!(
+            store.pending(&c, 0, 16).await.unwrap().is_empty(),
+            "both held"
+        );
+
+        publish_qos2(&tx, "t", b"two");
+        assert_eq!(payload_of(&recv_packet(&mut rx).await.unwrap()), b"two");
+        assert!(matches!(
+            timeout(Duration::from_secs(2), first).await,
+            Ok(Ok(PublishOutcome::Accepted))
+        ));
+        let queued: Vec<Vec<u8>> = store
+            .pending(&c, 0, 16)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|q| q.message.payload.to_vec())
+            .collect();
+        assert_eq!(
+            queued,
+            vec![b"one".to_vec(), b"two".to_vec()],
+            "the held one on t was written first; the one on u is still held"
+        );
+
+        detach(&tx, "c", 1);
+        assert!(matches!(
+            timeout(Duration::from_secs(2), other).await,
+            Ok(Ok(PublishOutcome::Accepted))
+        ));
+        let (mut rx, present) = attach_full(&tx, "c", 2, false, u32::MAX, 8).await;
+        assert!(present);
+        let mut replay = Vec::new();
+        while let Some(p) = recv_packet(&mut rx).await {
+            if let Packet::Publish(p) = p {
+                replay.push(p.payload.to_vec());
+            }
+        }
+
+        let on_t: Vec<_> = replay
+            .iter()
+            .filter(|p| p.as_slice() != b"other")
+            .cloned()
+            .collect();
+        assert_eq!(
+            on_t,
+            vec![b"one".to_vec(), b"two".to_vec()],
+            "t replays in order"
+        );
+        assert!(
+            replay.iter().any(|p| p.as_slice() == b"other"),
+            "u replays too"
+        );
     }
 
     #[tokio::test]

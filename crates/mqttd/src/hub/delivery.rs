@@ -631,6 +631,9 @@ impl Hub {
                 if self.may_elide(client, &message, gate) {
                     return self.elide(client, &tx, &message, message_expiry, retain, gate);
                 }
+                // Written instead: what this session still holds on the topic is
+                // written first, so the store keeps the wire's order (Amendment 1 A5).
+                self.flush_elided_topic(client, &message.topic);
                 return match self.submit_append(
                     client,
                     &message,
@@ -2107,6 +2110,7 @@ impl Hub {
             message_expiry,
             queued_at: Instant::now(),
             delivered: None,
+            topic_counted: false,
         };
         match self.submit_lane_job(job) {
             Submitted::Queued => QosSend::Staged,
