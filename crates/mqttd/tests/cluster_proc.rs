@@ -883,8 +883,10 @@ async fn a_kill_of_the_owner_with_deliveries_held_loses_no_acked_message() {
     let ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
     let owned = one_durable_client_per_node(seed, &ids);
     for n in &mut nodes {
-        n.extra_env
-            .push(("MQTTD_DURABLE_WRITE_ELISION_MS".to_string(), "3000".to_string()));
+        n.extra_env.push((
+            "MQTTD_DURABLE_WRITE_ELISION_MS".to_string(),
+            "3000".to_string(),
+        ));
         n.spawn();
     }
     wait_all_ready(&mut nodes, seed).await;
