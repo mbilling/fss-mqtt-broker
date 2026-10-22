@@ -25,6 +25,31 @@ use std::collections::VecDeque;
 pub(super) const MAX_ELIDED: usize = 16_384;
 /// The most payload bytes a node holds unwritten at once (D7).
 pub(super) const MAX_ELIDED_BYTES: usize = 64 << 20;
+/// Consecutive window timeouts, with no PUBACK discharging a held delivery between them,
+/// after which a session stops being held (Amendment 1 A3).
+pub(super) const BACKOFF_STRIKES: u8 = 3;
+/// How long a session that keeps missing the window is written directly instead.
+pub(super) const BACKOFF: Duration = Duration::from_secs(2);
+
+/// The window a new hold gets: the configured one, halved once the node holds more than
+/// three quarters of the D7 bound in entries or bytes (Amendment 1 A4). At the bound
+/// itself `may_elide` stops new holds.
+pub(super) fn window_in_force(window: Duration, entries: usize, bytes: usize) -> Duration {
+    if entries > MAX_ELIDED / 4 * 3 || bytes > MAX_ELIDED_BYTES / 4 * 3 {
+        window / 2
+    } else {
+        window
+    }
+}
+
+/// A session's record of missing the window (Amendment 1 A3).
+#[derive(Debug, Default)]
+pub(super) struct Backoff {
+    /// Window timeouts since the last discharge.
+    strikes: u8,
+    /// Not held again before this.
+    until: Option<Instant>,
+}
 
 /// One delivery on the wire and held: what a fallback write needs.
 #[derive(Debug)]
@@ -54,6 +79,9 @@ pub(super) struct ElisionState {
     /// reason as `mqttd_durable_elision_fallback_total`).
     pub(super) discharged: u64,
     pub(super) fallbacks: u64,
+    /// Sessions that have missed the window lately (Amendment 1 A3). An entry goes when
+    /// its session is discharged again or detaches.
+    pub(super) backoff: HashMap<ClientId, Backoff>,
 }
 
 impl Hub {
@@ -76,6 +104,17 @@ impl Hub {
             || self.draining
             || self.connecting.contains_key(client)
             || self.takeover_open()
+        {
+            return false;
+        }
+        // A subscriber that keeps missing the window is written directly for a while,
+        // so its publishers pay the write, not the window on top (Amendment 1 A3).
+        if self
+            .elision
+            .backoff
+            .get(client)
+            .and_then(|b| b.until)
+            .is_some_and(|until| Instant::now() < until)
         {
             return false;
         }
@@ -151,7 +190,7 @@ impl Hub {
             m.publish_delivered(qos_num(message.qos));
         }
         let sent = Instant::now();
-        let deadline = sent + window;
+        let deadline = sent + window_in_force(window, self.elision.entries, self.elision.bytes);
         self.elision.entries += 1;
         self.elision.bytes += message.payload.len();
         self.elision
@@ -186,6 +225,7 @@ impl Hub {
         self.elision.entries -= 1;
         self.elision.bytes -= e.message.payload.len();
         self.elision.discharged += 1;
+        self.elision.backoff.remove(client);
         if let Some(m) = &self.metrics {
             m.durable_elided(e.sent.elapsed().as_secs_f64());
         }
@@ -243,8 +283,29 @@ impl Hub {
                 .is_some_and(|e| e.deadline <= now);
             if expired {
                 self.flush_elided(&client, "timeout");
+                self.note_timeout(&client);
             }
         }
+    }
+
+    /// `client`'s held deliveries missed the window: one strike (Amendment 1 A3). At
+    /// [`BACKOFF_STRIKES`] the session is written directly for [`BACKOFF`].
+    fn note_timeout(&mut self, client: &ClientId) {
+        let b = self.elision.backoff.entry(client.clone()).or_default();
+        b.strikes = b.strikes.saturating_add(1);
+        if b.strikes >= BACKOFF_STRIKES {
+            b.strikes = 0;
+            b.until = Some(Instant::now() + BACKOFF);
+            if let Some(m) = &self.metrics {
+                m.durable_elision_backoff();
+            }
+        }
+    }
+
+    /// The session detached: what it held is written (`flush_elided`), and its record
+    /// of missing the window goes with it.
+    pub(super) fn forget_backoff(&mut self, client: &ClientId) {
+        self.elision.backoff.remove(client);
     }
 
     /// The write a held delivery falls back to. Its obligation is registered by the

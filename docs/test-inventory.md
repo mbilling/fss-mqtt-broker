@@ -962,13 +962,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tls::tls12_hardening_tests::the_tls12_suites_are_exactly_the_allowlist`
 - `tls::tls12_hardening_tests::tls12_session_tickets_are_off`
 
-## `crates/mqtt-observability/src/lib.rs` — 27 test(s)
+## `crates/mqtt-observability/src/lib.rs` — 28 test(s)
 
 - `audit_export::tests::a_full_queue_sheds_and_counts_instead_of_blocking`
 - `audit_export::tests::frames_reach_a_tcp_listener_and_flush_waits`
 - `audit_export::tests::rfc3339_formatting_matches_known_dates`
 - `metrics::tests::counters_and_gauges_move_and_render`
 - `metrics::tests::durable_stage_and_publish_ack_histograms_render`
+- `metrics::tests::elision_counters_move_and_render`
 - `metrics::tests::hub_dispatch_and_append_lane_metrics_render`
 - `metrics::tests::no_unbounded_label_keys_are_used`
 - `metrics::tests::otlp_export_posts_to_the_endpoint`
@@ -1467,7 +1468,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 843 test(s)
+## `crates/mqttd/src/lib.rs` — 846 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1771,6 +1772,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_different_identity_cannot_take_over_an_online_session`
 - `hub::tests::a_differing_retained_digest_pulls_the_peers_set`
 - `hub::tests::a_discard_with_an_inflight_append_leaves_no_ghost_queue`
+- `hub::tests::a_discharge_clears_the_missed_windows`
 - `hub::tests::a_discharged_tombstone_is_reaped_after_the_roster_converges`
 - `hub::tests::a_divergent_retained_value_is_detected_and_counted`
 - `hub::tests::a_drain_gated_message_is_not_handed_to_a_member_whose_node_was_declared_dead`
@@ -1850,6 +1852,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_retained_replay_carries_the_remaining_expiry_interval`
 - `hub::tests::a_retained_sys_value_is_never_replayed`
 - `hub::tests::a_session_that_becomes_misplaced_by_attaching_is_rehomed`
+- `hub::tests::a_session_that_keeps_missing_the_window_is_written_directly`
 - `hub::tests::a_shared_group_refusing_every_drain_gated_delivery_still_gets_it_plainly`
 - `hub::tests::a_shared_group_whose_last_candidate_died_still_gets_a_drain_gated_message`
 - `hub::tests::a_single_axis_still_toggles_brownout_on_its_own`
@@ -2089,6 +2092,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::the_snapshot_carries_tokens_and_tombstone_entries`
 - `hub::tests::the_subscribe_replay_seeds_the_windows_ledger`
 - `hub::tests::the_sweep_moves_peer_sheds_into_publish_dropped`
+- `hub::tests::the_window_halves_only_near_the_memory_bound`
 - `hub::tests::the_windowed_apply_defers_to_a_live_copy_already_delivered`
 - `hub::tests::transient_lease_does_not_downgrade_a_persistent_attach`
 - `hub::tests::truncate_flusher::a_burst_flushes_once_at_its_highest_watermark`
