@@ -598,7 +598,10 @@ pub struct Durable {
     /// subscriber is held, sent but not yet written, waiting for the subscriber's
     /// PUBACK to stand in for the durable write. `0` (the default) is today's path:
     /// every such delivery is written before it is sent. The publisher's ack still
-    /// waits for the subscriber's PUBACK or the write, whichever comes first.
+    /// waits for the subscriber's PUBACK or the write, whichever comes first. When on,
+    /// use 30-50 ms (50 documented, ADR 0089 Amendment 1): the window must cover the
+    /// subscriber's acknowledgement tail under load, and a subscriber that keeps up
+    /// pays nothing for a long one.
     pub write_elision_ms: u32,
 }
 
