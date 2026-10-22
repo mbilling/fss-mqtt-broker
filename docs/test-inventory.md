@@ -1468,7 +1468,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 848 test(s)
+## `crates/mqttd/src/lib.rs` — 849 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1675,6 +1675,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `health::tests::statusz_reports_the_derived_write_floor_and_its_source`
 - `health::tests::statusz_reports_the_running_rules`
 - `health::tests::statusz_reports_the_store_self_measurement`
+- `health::tests::statusz_reports_write_elision_when_it_is_on`
 - `health::tests::the_healthy_majority_is_not_quarantined_by_foreign_gossip`
 - `health::tests::unknown_paths_are_404`
 - `health::tests::waits_for_the_full_request_head_before_responding`

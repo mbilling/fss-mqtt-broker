@@ -92,6 +92,17 @@ struct TierLabel {
 }
 
 /// `{reason}` label — a small fixed set of reason classes (never free-form text).
+/// Write elision's totals (ADR 0089 D9), read by `/statusz`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ElisionSnapshot {
+    /// Held deliveries the subscriber acknowledged inside the window: never written.
+    pub elided: u64,
+    /// Held deliveries written after all, every reason.
+    pub written: u64,
+    /// Sessions backed off for missing the window (Amendment 1 A3).
+    pub backoffs: u64,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct ReasonLabel {
     reason: String,
@@ -2625,6 +2636,28 @@ impl Metrics {
         self.otel
             .durable_elision_fallbacks
             .add(1, &[KeyValue::new("reason", reason.to_string())]);
+    }
+
+    /// Write elision's totals for `/statusz` (ADR 0089 D9): held deliveries the
+    /// subscriber acknowledged (never written), held deliveries written after all
+    /// (every reason), and sessions backed off for missing the window.
+    #[must_use]
+    pub fn elision_snapshot(&self) -> ElisionSnapshot {
+        let written = ["timeout", "disconnect", "brownout", "drain", "head"]
+            .iter()
+            .map(|r| {
+                self.durable_elision_fallback_total
+                    .get_or_create(&ReasonLabel {
+                        reason: (*r).to_string(),
+                    })
+                    .get()
+            })
+            .sum();
+        ElisionSnapshot {
+            elided: self.durable_elided_total.get(),
+            written,
+            backoffs: self.durable_elision_backoff_total.get(),
+        }
     }
 
     /// A session kept missing the write-elision window and is written directly for a

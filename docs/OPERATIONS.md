@@ -1628,6 +1628,45 @@ nothing of it is in a backup. A rules file that uses none creates none.
 - **Not built yet:** a bulk purge and a change of expiry on stored keys (planned, ADR
   0085 T13 to T15), `strong` consistency, and a snapshot to disk.
 
+## Write elision on the durable QoS 1 path (ADR 0089)
+
+`durable.write_elision_ms` (`MQTTD_DURABLE_WRITE_ELISION_MS`) is `0` (off) by default.
+Set to 30–50 ms, a QoS 1 delivery to an online persistent subscriber is sent at once and
+**held**. It is written only if the subscriber's PUBACK does not arrive inside the window.
+The publisher's ack waits for that PUBACK or the quorum write, whichever comes first.
+**What an acknowledgement means does not change:** the message is either durable on a
+quorum, or every session it was owed to has acknowledged it.
+
+**Choosing the window.** It must cover the subscriber's acknowledgement tail under load,
+not its mean. On the 2026-10-21 rig the mean was under 3 ms, but p99.9 was 30–44 ms at the
+knee. With 5–20 ms windows most deliveries ended up written, and 50 ms kept 98% off the
+disk ([the sweep](../bench/scale/elision-window-n3-2026-10-21.md)). A subscriber that keeps
+up pays nothing for a longer window, because a held delivery is discharged at its PUBACK.
+
+**What the broker does on its own:**
+- A session that misses the window three times in a row is written directly for 2 s.
+- Past three quarters of the per-node bound (16,384 deliveries or 64 MiB), new holds get
+  half the window.
+- At the bound, new deliveries are written.
+- Under brownout or a drain, everything held is written at once.
+
+**What to watch:**
+
+| signal | reading |
+|---|---|
+| `mqttd_durable_elided_total` | deliveries the subscriber acknowledged inside the window, never written |
+| `mqttd_durable_elision_fallback_total{reason}` | held deliveries written after all: `timeout` (the window ended), `disconnect`, `brownout`, `drain`, `head` (written before a later durable delivery on the same topic) |
+| `mqttd_durable_elision_hold_seconds` | how long a discharged delivery was held: the subscribers' acknowledgement latency, censored at the window |
+| `mqttd_durable_elision_backoff_total` | sessions backed off for missing the window |
+| `/statusz` → `write_elision` | `window_ms`, `elided`, `written`, `discharged_x100` (the share of held deliveries discharged, ×100), `backoffs` |
+
+**If most deliveries are still written:**
+- **Mostly `timeout` fallbacks:** the window is shorter than the subscribers' tail. Look at
+  the hold histogram's upper buckets, and lengthen the window toward 50 ms.
+- **Few fallbacks of any reason:** deliveries are not being held at all, because they are
+  ineligible. Typical causes are a session with a write in flight on the same topic, a full
+  receive quota, or QoS 2 (never held).
+
 ## Monitoring for the operator (and humans)
 
 The signals the future controller will reconcile on
