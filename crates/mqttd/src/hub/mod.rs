@@ -15406,6 +15406,101 @@ mod tests {
         assert_eq!(payload_of(&recv_packet(&mut rx).await.unwrap()), b"two");
     }
 
+    /// ADR 0089 Amendment 1 A2: a delivery already written and on the wire, still
+    /// unacknowledged, no longer keeps the next one on the durable path. The session's
+    /// first delivery is written (it reserves the packet-id block) and left unacked;
+    /// with every write then hanging, the next delivery can only arrive if it is held.
+    #[tokio::test]
+    async fn a_written_unacknowledged_delivery_no_longer_blocks_the_next_hold() {
+        let store = FlakyStore::new(0);
+        let tx = start_hub_eliding(store.clone(), 60_000);
+        let (mut rx, _) = attach_full(&tx, "c", 1, false, u32::MAX, 8).await;
+        subscribe_qos(&tx, "c", "t", QoS::AtLeastOnce);
+        let _ = attach(&tx, "barrier", 99, true).await;
+
+        let written = publish_gated(&tx, "t", b"written", QoS::AtLeastOnce, false);
+        assert_eq!(payload_of(&recv_packet(&mut rx).await.unwrap()), b"written");
+        assert!(matches!(
+            timeout(Duration::from_secs(2), written).await,
+            Ok(Ok(PublishOutcome::Accepted))
+        ));
+        let c = ClientId("c".into());
+        assert_eq!(store.pending(&c, 0, 16).await.unwrap().len(), 1, "written");
+
+        store
+            .hold_enqueue
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut held = publish_gated(&tx, "t", b"held", QoS::AtLeastOnce, false);
+        let p = recv_packet(&mut rx)
+            .await
+            .expect("held and sent at once, though the written one is unacknowledged");
+        assert_eq!(payload_of(&p), b"held");
+        assert!(
+            timeout(Duration::from_millis(200), &mut held)
+                .await
+                .is_err(),
+            "the publisher waits for the subscriber's PUBACK"
+        );
+        pub_ack(&tx, "c", pkid_of(&p));
+        assert!(matches!(
+            timeout(Duration::from_secs(2), held).await,
+            Ok(Ok(PublishOutcome::Accepted))
+        ));
+        store
+            .hold_enqueue
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// ADR 0089 Amendment 1 A2, the order: a delivery held behind a written one, both
+    /// unacknowledged, falls back after it when the subscriber leaves, and the resume
+    /// replays them in send order.
+    #[tokio::test]
+    async fn a_hold_behind_a_written_delivery_replays_after_it() {
+        let store = FlakyStore::new(0);
+        let tx = start_hub_eliding(store.clone(), 60_000);
+        let (mut rx, _) = attach_full(&tx, "c", 1, false, u32::MAX, 8).await;
+        subscribe_qos(&tx, "c", "t", QoS::AtLeastOnce);
+        let _ = attach(&tx, "barrier", 99, true).await;
+
+        let first = publish_gated(&tx, "t", b"one", QoS::AtLeastOnce, false);
+        assert_eq!(payload_of(&recv_packet(&mut rx).await.unwrap()), b"one");
+        assert!(matches!(
+            timeout(Duration::from_secs(2), first).await,
+            Ok(Ok(PublishOutcome::Accepted))
+        ));
+        let second = publish_gated(&tx, "t", b"two", QoS::AtLeastOnce, false);
+        assert_eq!(payload_of(&recv_packet(&mut rx).await.unwrap()), b"two");
+        let c = ClientId("c".into());
+        assert_eq!(
+            store.pending(&c, 0, 16).await.unwrap().len(),
+            1,
+            "the second is held, not written"
+        );
+
+        detach(&tx, "c", 1);
+        assert!(matches!(
+            timeout(Duration::from_secs(2), second).await,
+            Ok(Ok(PublishOutcome::Accepted))
+        ));
+        let queued: Vec<Vec<u8>> = store
+            .pending(&c, 0, 16)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|q| q.message.payload.to_vec())
+            .collect();
+        assert_eq!(
+            queued,
+            vec![b"one".to_vec(), b"two".to_vec()],
+            "store order"
+        );
+
+        let (mut rx, present) = attach_full(&tx, "c", 2, false, u32::MAX, 8).await;
+        assert!(present);
+        assert_eq!(payload_of(&recv_packet(&mut rx).await.unwrap()), b"one");
+        assert_eq!(payload_of(&recv_packet(&mut rx).await.unwrap()), b"two");
+    }
+
     #[tokio::test]
     async fn a_failed_phase_advance_withholds_the_pubrel() {
         let store = FlakyStore::new(0);

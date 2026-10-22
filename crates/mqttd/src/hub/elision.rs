@@ -94,12 +94,15 @@ impl Hub {
             return false;
         }
         if let Some(inf) = self.inflight.get(client) {
-            // Nothing durable still owed (D5), and a packet id and a send slot free now:
-            // a delivery that would wait in the backlog or for a packet-id block is
-            // written as before. (A session's first delivery reserves its first block,
-            // durably, on that path; elision starts from the next one.)
-            if !inf.outstanding.is_empty()
-                || inf.quota_full()
+            // A packet id and a send slot free now: a delivery that would wait in the
+            // backlog or for a packet-id block is written as before. (A session's first
+            // delivery reserves its first block, durably, on that path; elision starts
+            // from the next one.) A delivery already written and on the wire, still
+            // unacknowledged, does not block (Amendment 1 A2): it is ahead of this one
+            // on the wire and in the store, so a replay keeps the order. Only a write
+            // still in flight does (the lane check above): its delivery is sent after
+            // the write, and a held one would overtake it.
+            if inf.quota_full()
                 || !inf.backlog.is_empty()
                 || inf.records_pending > 0
                 || (inf.block_remaining == 0 && inf.banked_base.is_none())
