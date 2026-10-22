@@ -1202,6 +1202,86 @@ mod tests {
         assert_eq!(snap(&r), before);
     }
 
+    /// ADR 0078 §6 criterion 5: replay time at open, per GB of log. Writes
+    /// `MQTTD_REPLAY_BENCH_MB` (default 1024) of LIVE appends (nothing truncated, so
+    /// every byte is replayed: the worst case) over 10,000 sessions in batches of
+    /// 1,000 on one shard, closes the store, and times `open_store` on the default
+    /// segment size.
+    /// Prints MB, records and ms per GB. Run in release, on the disk being measured:
+    /// `cargo test --release -p mqtt-cluster replay_time_at_open -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement: writes a GB to disk; run in release"]
+    #[allow(clippy::cast_precision_loss)] // sizes and counts printed as MB and rates
+    fn replay_time_at_open_per_gb() {
+        let mb: u64 = std::env::var("MQTTD_REPLAY_BENCH_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1024);
+        let dir = tempfile::tempdir().unwrap();
+        let record = vec![0x5a_u8; 200];
+        let sessions = 10_000u64;
+        let per_batch = 1_000u64;
+        let target = mb * 1024 * 1024;
+        let mut written = 0u64;
+        let mut records = 0u64;
+        // One shard: every key's batch goes to the shard that owns it.
+        let shards = 1;
+        {
+            let state = std::sync::Mutex::new(
+                ReplicaState::open_store(dir.path(), shards, StoreBackend::Log).unwrap(),
+            );
+            let mut next = std::collections::HashMap::<u64, u64>::new();
+            while written < target {
+                let batch: Vec<(Epoch, ReplOp)> = (0..per_batch)
+                    .map(|i| {
+                        let s = (records + i) % sessions;
+                        let off = next.entry(s).or_insert(0);
+                        *off += 1;
+                        (2, ap(&format!("s/{s}"), *off, *off, &record))
+                    })
+                    .collect();
+                let applied = ReplicaState::apply_batch_sharded(&state, 0, &batch);
+                assert!(applied.iter().all(|ok| *ok), "every append applied");
+                records += per_batch;
+                written += per_batch * record.len() as u64;
+            }
+        }
+        let on_disk: u64 = walk(dir.path());
+        let started = std::time::Instant::now();
+        let reopened = ReplicaState::open_store(dir.path(), shards, StoreBackend::Log).unwrap();
+        let open = started.elapsed();
+        assert_eq!(
+            reopened.keys().len() as u64,
+            sessions,
+            "every session replayed"
+        );
+        let gb = on_disk as f64 / (1024.0 * 1024.0 * 1024.0);
+        eprintln!(
+            "replay at open: {records} records, {:.0} MB payload, {:.0} MB on disk, open {open:?}, \
+             {:.0} ms per GB of log, {:.0} records/s",
+            written as f64 / 1_048_576.0,
+            on_disk as f64 / 1_048_576.0,
+            open.as_secs_f64() * 1000.0 / gb,
+            records as f64 / open.as_secs_f64()
+        );
+    }
+
+    /// Bytes under `dir`, recursively.
+    fn walk(dir: &std::path::Path) -> u64 {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                let m = e.metadata().unwrap();
+                if m.is_dir() {
+                    walk(&e.path())
+                } else {
+                    m.len()
+                }
+            })
+            .sum()
+    }
+
     // --- T3: space reclamation ---------------------------------------------
 
     fn log_stats(state: &std::sync::Mutex<ReplicaState>) -> (usize, u64, u64, Lsn) {
