@@ -1,15 +1,17 @@
 //! Write elision on the durable `QoS` 1 path (ADR 0089).
 //!
-//! A `QoS` 1 delivery to a persistent session whose subscriber is online, with nothing
-//! earlier for it still owed durably, may be sent at once and HELD instead of written
-//! first: the publisher's obligation for that session is then discharged by whichever
+//! A `QoS` 1 delivery to a persistent session whose subscriber is online, with no write
+//! for it still in flight, may be sent at once and HELD instead of written first: the publisher's obligation for that session is then discharged by whichever
 //! comes first, the subscriber's PUBACK (no write, no replication) or the durable write
 //! the window falls back to. A node that dies inside a window has acknowledged nobody
 //! for that delivery, so the publisher resends it; nothing acknowledged is lost.
 //!
-//! **Order (D5).** A held delivery has no offset. A session's held deliveries therefore
-//! fall back TOGETHER and in send order, and a session with a durable entry still owed
-//! is never eligible, so nothing written can overtake a delivery still held.
+//! **Order (D5, Amendment 1 A2).** A held delivery has no offset. A session's held
+//! deliveries therefore fall back TOGETHER and in send order, and while one is held every
+//! later delivery is written, so nothing written can overtake a delivery still held. A
+//! session with a write still in flight is not eligible either: that delivery goes on the
+//! wire after its write, and a held one would overtake it. One already written and sent,
+//! still unacknowledged, does not block: it is ahead on the wire and in the store.
 //!
 //! `durable.write_elision_ms = 0` (the default) builds none of this state, and every
 //! delivery takes the path it took before.
@@ -94,12 +96,15 @@ impl Hub {
             return false;
         }
         if let Some(inf) = self.inflight.get(client) {
-            // Nothing durable still owed (D5), and a packet id and a send slot free now:
-            // a delivery that would wait in the backlog or for a packet-id block is
-            // written as before. (A session's first delivery reserves its first block,
-            // durably, on that path; elision starts from the next one.)
-            if !inf.outstanding.is_empty()
-                || inf.quota_full()
+            // A packet id and a send slot free now: a delivery that would wait in the
+            // backlog or for a packet-id block is written as before. (A session's first
+            // delivery reserves its first block, durably, on that path; elision starts
+            // from the next one.) A delivery already written and on the wire, still
+            // unacknowledged, does not block (Amendment 1 A2): it is ahead of this one
+            // on the wire and in the store, so a replay keeps the order. Only a write
+            // still in flight does (the lane check above): its delivery is sent after
+            // the write, and a held one would overtake it.
+            if inf.quota_full()
                 || !inf.backlog.is_empty()
                 || inf.records_pending > 0
                 || (inf.block_remaining == 0 && inf.banked_base.is_none())
