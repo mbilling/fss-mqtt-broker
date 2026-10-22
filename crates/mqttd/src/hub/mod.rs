@@ -13943,6 +13943,63 @@ mod tests {
         );
     }
 
+    /// ADR 0089 D6 (T3): a forward is held like a local publish, and its origin is
+    /// answered only when the hold is discharged. With every write hanging, the
+    /// subscriber's PUBACK is the only thing that can release the answer, and it is
+    /// `Reached`. A takeover re-route (`replay`) is never held: it is written first,
+    /// so with the write hanging it is not delivered.
+    #[tokio::test]
+    async fn a_forward_is_answered_only_when_its_hold_is_discharged() {
+        let store = FlakyStore::new(0);
+        let tx = start_hub_eliding(store.clone(), 60_000);
+        let mut peer = connect_peer_at_proto(&tx, "origin", 1, super::PROTO_FORWARD_REACHED);
+        let (mut rx, _) = attach_full(&tx, "c", 1, false, u32::MAX, 8).await;
+        subscribe_qos(&tx, "c", "t", QoS::AtLeastOnce);
+        subscribe_qos(&tx, "c", "f/t", QoS::AtLeastOnce);
+        let _ = attach(&tx, "barrier", 99, true).await;
+        warm_packet_ids(&tx, &mut rx, "c").await;
+        store
+            .hold_enqueue
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let forward = |seq: u64, replay: bool| HubCommand::RemotePublishAcked {
+            node: NodeId("origin".into()),
+            seq,
+            topic: "f/t".into(),
+            payload: Bytes::from_static(b"fwd"),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            message_expiry: None,
+            app: mqtt_core::AppProperties::default(),
+            origin: None,
+            replay,
+        };
+        tx.send(forward(1, false)).unwrap();
+        let p = recv_packet(&mut rx).await.expect("held and sent at once");
+        assert!(
+            timeout(Duration::from_millis(200), next_forward_answer(&mut peer))
+                .await
+                .is_err(),
+            "no answer while the hold is open"
+        );
+        pub_ack(&tx, "c", pkid_of(&p));
+        match next_forward_answer(&mut peer).await {
+            PeerMessage::PublishVerdict { seq, verdict } => {
+                assert_eq!((seq, verdict), (1, ForwardVerdict::Reached));
+            }
+            other => panic!("expected a PublishVerdict, got {other:?}"),
+        }
+
+        tx.send(forward(2, true)).unwrap();
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "a re-route is written first, not held"
+        );
+        store
+            .hold_enqueue
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// #738: a forward this node stored for a subscriber is answered `Reached`; one
     /// that matched nobody is answered `Stored`, which claims only that nothing failed.
     /// The origin releases a held ack on the first and never on the second.

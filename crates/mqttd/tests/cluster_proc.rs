@@ -304,6 +304,26 @@ async fn run_schedule(seed: u64) {
         proc.history.len()
     );
 
+    // ADR 0089 T3: run with write elision on, the schedule must actually have held
+    // and discharged deliveries, or its pass says nothing about elision. (Counters
+    // restart with a node, so this reads what the live nodes did since.)
+    if std::env::var("MQTTD_DURABLE_WRITE_ELISION_MS").is_ok_and(|v| v.trim() != "0") {
+        let mut elided = 0.0;
+        for node in &proc.nodes {
+            if let Some(body) = proc_common::http_get(node.health_addr, "/metrics").await {
+                elided += body
+                    .lines()
+                    .filter_map(|l| l.strip_prefix("mqttd_durable_elided_total "))
+                    .filter_map(|v| v.trim().parse::<f64>().ok())
+                    .sum::<f64>();
+            }
+        }
+        eprintln!("cluster_proc: seed {seed}: {elided} deliveries elided");
+        if elided <= 0.0 {
+            proc.fail("write elision is on, but no node discharged a held delivery");
+        }
+    }
+
     // Tear the cluster down (SIGKILL — the dirs are temp).
     for node in &mut proc.nodes {
         node.kill().await;
@@ -802,6 +822,209 @@ async fn the_default_write_floor_arms_itself_and_refuses_the_single_copy_promise
     )
     .await;
 
+    for node in &mut proc.nodes {
+        node.kill().await;
+    }
+}
+
+/// One `QoS` 1 publish through `addr` on its own connection; `Some(payload)` if its
+/// PUBACK arrived within `budget` (ADR 0089 T3 helper).
+async fn publish_once(
+    addr: std::net::SocketAddr,
+    client_id: String,
+    topic: String,
+    payload: Vec<u8>,
+    budget: Duration,
+) -> Option<Vec<u8>> {
+    let (mut publisher, _) =
+        common::Client::connect_v311_within(addr, &client_id, true, Duration::from_secs(8)).await?;
+    publisher
+        .publish(&topic, &payload, QoS::AtLeastOnce, Some(5), vec![])
+        .await;
+    let deadline = Instant::now() + budget;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        match publisher.recv_bounded(left).await {
+            common::Recv::Packet(Packet::PubAck(a)) if a.pkid == 5 => return Some(payload),
+            common::Recv::Packet(_) => {}
+            common::Recv::Quiet | common::Recv::Closed => return None,
+        }
+    }
+}
+
+/// ADR 0089 T3, and T1's promised schedule: SIGKILL a session's owner while durable
+/// `QoS` 1 deliveries to it are HELD (sent, not written, not acknowledged), and lose no
+/// acknowledged message.
+///
+/// 1. Three nodes with a 3 s window; the subscriber's session lives on its HRW owner
+///    (node 0), and a reader task acknowledges what it receives. Publishes go through
+///    node 1, so each crosses to the owner.
+/// 2. Publish until node 0 reports a discharged hold (`mqttd_durable_elided_total`):
+///    elision is engaged, and any takeover window after formation is over. A suite run
+///    with elision on can no longer pass without holding anything.
+/// 3. The reader stops acknowledging; five publishes go out concurrently. All five
+///    reach the subscriber's socket and none of their publishers is acknowledged: they
+///    are held. Then node 0 is killed inside the window.
+/// 4. After the restart and the subscriber's resume, every publish that WAS
+///    acknowledged, at any point, must have been delivered. One that never was is the
+///    publisher's to resend (`QoS` 1); nothing acknowledged may be lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[allow(clippy::too_many_lines)] // one schedule, its four phases in order
+async fn a_kill_of_the_owner_with_deliveries_held_loses_no_acked_message() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let _serial = SERIAL.lock().await;
+    let seed = 89;
+    let disk = tempfile::tempdir().expect("tempdir");
+    let mut nodes = build_topology(seed, disk.path()).await;
+    let ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
+    let owned = one_durable_client_per_node(seed, &ids);
+    for n in &mut nodes {
+        n.extra_env.push((
+            "MQTTD_DURABLE_WRITE_ELISION_MS".to_string(),
+            "3000".to_string(),
+        ));
+        n.spawn();
+    }
+    wait_all_ready(&mut nodes, seed).await;
+    let mut proc = proc_over(seed, nodes);
+    subscribe_on_owner(&mut proc, 0, &owned[0]).await;
+    let topic = proc.subs[0].topic.clone();
+
+    // The reader: acknowledges while `acking`, records every payload it sees.
+    let acking = Arc::new(AtomicBool::new(true));
+    let live_payloads: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+    let mut conn = proc.subs[0].conn.take().expect("subscribed online");
+    let reader = {
+        let (acking, live_payloads) = (acking.clone(), live_payloads.clone());
+        tokio::spawn(async move {
+            loop {
+                match conn.recv_bounded(Duration::from_mins(1)).await {
+                    common::Recv::Packet(Packet::Publish(p)) => {
+                        live_payloads.lock().unwrap().push(p.payload.to_vec());
+                        if let (Some(pkid), true) = (p.pkid, acking.load(Ordering::SeqCst)) {
+                            conn.puback(pkid).await;
+                        }
+                    }
+                    common::Recv::Packet(_) | common::Recv::Quiet => {}
+                    common::Recv::Closed => return,
+                }
+            }
+        })
+    };
+
+    // 2. Engage: publish through node 1 until node 0 has discharged a hold.
+    let via = proc.nodes[1].client_addr;
+    let mut acked: Vec<Vec<u8>> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut k = 0;
+    loop {
+        k += 1;
+        let payload = format!("warm-{seed}-{k}").into_bytes();
+        if let Some(p) = publish_once(
+            via,
+            format!("ew-{seed}-{k}"),
+            topic.clone(),
+            payload,
+            Duration::from_secs(10),
+        )
+        .await
+        {
+            acked.push(p);
+        }
+        if proc.nodes[0]
+            .metric("mqttd_durable_elided_total")
+            .await
+            .unwrap_or(0)
+            > 0
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "write elision never engaged on the owner ({k} publishes)\n{}",
+            log_tail(&proc.nodes[0].log_path)
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // 3. Hold five, then kill the owner inside the window.
+    acking.store(false, Ordering::SeqCst);
+    let before = live_payloads.lock().unwrap().len();
+    let held: Vec<Vec<u8>> = (0..5)
+        .map(|i| format!("held-{seed}-{i}").into_bytes())
+        .collect();
+    let publishers: Vec<_> = held
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            tokio::spawn(publish_once(
+                via,
+                format!("eh-{seed}-{i}"),
+                topic.clone(),
+                p.clone(),
+                Duration::from_mins(1),
+            ))
+        })
+        .collect();
+    let on_wire = Instant::now() + Duration::from_millis(1500);
+    while live_payloads.lock().unwrap().len() < before + held.len() {
+        assert!(
+            Instant::now() < on_wire,
+            "the held deliveries never reached the subscriber's socket"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        publishers.iter().all(|h| !h.is_finished()),
+        "a held delivery's publisher was acknowledged before the subscriber's PUBACK \
+         or the window's end: it was not held"
+    );
+    proc.note("killing the owner with five deliveries held".into());
+    kill_and_disconnect(&mut proc, 0).await;
+    reader.abort();
+    for h in publishers {
+        if let Some(p) = h.await.expect("publisher task") {
+            acked.push(p);
+        }
+    }
+
+    // 4. Restart, resume, and check every acknowledged publish was delivered.
+    proc.restart_step().await;
+    proc.bring_subscriber_online(0, true).await;
+    let mut delivered: std::collections::BTreeSet<Vec<u8>> =
+        live_payloads.lock().unwrap().iter().cloned().collect();
+    let deadline = Instant::now() + Duration::from_mins(1);
+    loop {
+        proc.drain_subscriber(0).await;
+        delivered.extend(proc.subs[0].received.iter().cloned());
+        let missing: Vec<String> = acked
+            .iter()
+            .filter(|p| !delivered.contains(*p))
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect();
+        if missing.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "acknowledged and never delivered: {missing:?}\n---- node 0 ----\n{}",
+            log_tail(&proc.nodes[0].log_path)
+        );
+        if proc.subs[0].conn.is_none() {
+            proc.bring_subscriber_online(0, true).await;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    eprintln!(
+        "cluster_proc: elision kill: {} acknowledged ({} of the held five), all delivered",
+        acked.len(),
+        acked.iter().filter(|p| held.contains(p)).count()
+    );
     for node in &mut proc.nodes {
         node.kill().await;
     }

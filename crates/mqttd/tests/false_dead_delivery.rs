@@ -288,6 +288,7 @@ async fn start_node(id: &str, seeds: Vec<String>, mode: Mode) -> Node {
     // As `main` does for a node with peer networking: the cluster honesty gates apply
     // from the first moment (the settle window, the pending-publish gate).
     hub.set_cluster_configured();
+    hub.set_write_elision_ms(common::write_elision_ms());
     hub.attach_metrics(metrics.clone());
     tokio::spawn(hub.run());
 

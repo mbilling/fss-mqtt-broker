@@ -377,6 +377,7 @@ async fn start_stress_node_full(
     // gates must hold from the first moment of a (re)start, before SWIM has
     // re-learned the membership, exactly as main.rs wires it.
     hub.set_cluster_configured();
+    hub.set_write_elision_ms(common::write_elision_ms());
     hub.attach_durable_plane(plane);
     hub.attach_durable_retained(durable_retained);
     // The disk-backed retained CACHE, exactly as production wires it with a
