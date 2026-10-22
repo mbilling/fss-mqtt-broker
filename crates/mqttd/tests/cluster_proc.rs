@@ -1010,12 +1010,11 @@ async fn a_kill_of_the_owner_with_deliveries_held_loses_no_acked_message() {
         if missing.is_empty() {
             break;
         }
-        if Instant::now() >= deadline {
-            panic!(
-                "acknowledged and never delivered: {missing:?}\n---- node 0 ----\n{}",
-                log_tail(&proc.nodes[0].log_path)
-            );
-        }
+        assert!(
+            Instant::now() < deadline,
+            "acknowledged and never delivered: {missing:?}\n---- node 0 ----\n{}",
+            log_tail(&proc.nodes[0].log_path)
+        );
         if proc.subs[0].conn.is_none() {
             proc.bring_subscriber_online(0, true).await;
         }
