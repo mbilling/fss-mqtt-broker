@@ -39,6 +39,17 @@ pub const V5: ProtocolVersion = ProtocolVersion::V5;
 /// starved of CPU — does not spuriously time out; it bounds only the failure path.
 const RECV_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The write-elision window a harness that builds its own `Hub` runs with (ADR 0089 T3):
+/// `MQTTD_DURABLE_WRITE_ELISION_MS`, as the broker reads it, or 0 (off). Set it to run a
+/// fault suite with elision on.
+#[allow(dead_code)] // not every test binary that includes `common` builds a hub
+pub fn write_elision_ms() -> u32 {
+    std::env::var("MQTTD_DURABLE_WRITE_ELISION_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
 /// Spawn a permissive in-process broker (anonymous allowed, open ACL) on an
 /// ephemeral port and return its address. The common path for protocol tests.
 pub async fn start_broker() -> SocketAddr {
