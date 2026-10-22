@@ -896,15 +896,15 @@ async fn a_kill_of_the_owner_with_deliveries_held_loses_no_acked_message() {
 
     // The reader: acknowledges while `acking`, records every payload it sees.
     let acking = Arc::new(AtomicBool::new(true));
-    let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+    let live_payloads: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
     let mut conn = proc.subs[0].conn.take().expect("subscribed online");
     let reader = {
-        let (acking, seen) = (acking.clone(), seen.clone());
+        let (acking, live_payloads) = (acking.clone(), live_payloads.clone());
         tokio::spawn(async move {
             loop {
                 match conn.recv_bounded(Duration::from_secs(60)).await {
                     common::Recv::Packet(Packet::Publish(p)) => {
-                        seen.lock().unwrap().push(p.payload.to_vec());
+                        live_payloads.lock().unwrap().push(p.payload.to_vec());
                         if let (Some(pkid), true) = (p.pkid, acking.load(Ordering::SeqCst)) {
                             conn.puback(pkid).await;
                         }
@@ -953,7 +953,7 @@ async fn a_kill_of_the_owner_with_deliveries_held_loses_no_acked_message() {
 
     // 3. Hold five, then kill the owner inside the window.
     acking.store(false, Ordering::SeqCst);
-    let before = seen.lock().unwrap().len();
+    let before = live_payloads.lock().unwrap().len();
     let held: Vec<Vec<u8>> = (0..5)
         .map(|i| format!("held-{seed}-{i}").into_bytes())
         .collect();
@@ -971,7 +971,7 @@ async fn a_kill_of_the_owner_with_deliveries_held_loses_no_acked_message() {
         })
         .collect();
     let on_wire = Instant::now() + Duration::from_millis(1500);
-    while seen.lock().unwrap().len() < before + held.len() {
+    while live_payloads.lock().unwrap().len() < before + held.len() {
         assert!(
             Instant::now() < on_wire,
             "the held deliveries never reached the subscriber's socket"
@@ -996,7 +996,7 @@ async fn a_kill_of_the_owner_with_deliveries_held_loses_no_acked_message() {
     proc.restart_step().await;
     proc.bring_subscriber_online(0, true).await;
     let mut delivered: std::collections::BTreeSet<Vec<u8>> =
-        seen.lock().unwrap().iter().cloned().collect();
+        live_payloads.lock().unwrap().iter().cloned().collect();
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         proc.drain_subscriber(0).await;
