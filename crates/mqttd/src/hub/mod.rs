@@ -9793,6 +9793,11 @@ mod tests {
         /// While true, every durable append waits before it is applied: a delivery's
         /// write is held for as long as a test needs (ADR 0089 T1).
         hold_enqueue: std::sync::atomic::AtomicBool,
+        /// A fixed latency every durable append pays, in ms: the disk + quorum write a
+        /// test models (ADR 0089's cost-model tests). 0 = none.
+        write_delay_ms: std::sync::atomic::AtomicU64,
+        /// Durable appends applied, so a test can count the writes elision saved.
+        appends: std::sync::atomic::AtomicUsize,
     }
 
     impl FlakyStore {
@@ -9804,6 +9809,8 @@ mod tests {
                 fail_outbound: std::sync::atomic::AtomicBool::new(false),
                 fail_replay: std::sync::atomic::AtomicUsize::new(0),
                 hold_enqueue: std::sync::atomic::AtomicBool::new(false),
+                write_delay_ms: std::sync::atomic::AtomicU64::new(0),
+                appends: std::sync::atomic::AtomicUsize::new(0),
             })
         }
 
@@ -9817,6 +9824,8 @@ mod tests {
                 fail_outbound: std::sync::atomic::AtomicBool::new(false),
                 fail_replay: std::sync::atomic::AtomicUsize::new(0),
                 hold_enqueue: std::sync::atomic::AtomicBool::new(false),
+                write_delay_ms: std::sync::atomic::AtomicU64::new(0),
+                appends: std::sync::atomic::AtomicUsize::new(0),
             })
         }
     }
@@ -9869,6 +9878,16 @@ mod tests {
                 // SETTLE(append-hold): a fault injection, not a wait for state; the
                 // test that set the hold clears it, and its own deadlines bound it.
                 tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            self.appends
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let delay = self
+                .write_delay_ms
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if delay > 0 {
+                // SETTLE(write-delay): the modeled cost of a durable write, not a wait
+                // for state; it is the quantity the cost-model tests compare against.
+                tokio::time::sleep(Duration::from_millis(delay)).await;
             }
             self.inner
                 .enqueue_with_expiry(client, message, expiry_at)
@@ -15763,6 +15782,245 @@ mod tests {
         assert!(
             replay.iter().any(|p| p.as_slice() == b"other"),
             "u replays too"
+        );
+    }
+
+    // ---- ADR 0089: when write elision is faster than writing first, and when not ----
+    //
+    // The cost model, asserted on the publisher's side. W is the durable write (the
+    // store's modeled delay), A the subscriber's PUBACK latency, w the window. Writing
+    // first, the publisher waits about W. Holding, it waits A when A < w, else w + W.
+    // So elision wins on latency when subscribers acknowledge faster than the write,
+    // loses (w + W) when they are slower than the window, and Amendment 1 A3 bounds
+    // the loss: after three misses the session is written first again (about W).
+
+    /// The modeled durable write, in ms.
+    const COST_W_MS: u64 = 40;
+    /// The modeled durable write.
+    const COST_W: Duration = Duration::from_millis(COST_W_MS);
+    /// The window.
+    const COST_WINDOW_MS: u32 = 60;
+    /// The least a missed window can cost the publisher: w + W, less scheduling slack.
+    const COST_MISSED_FLOOR: Duration =
+        Duration::from_millis(COST_W_MS + COST_WINDOW_MS as u64 - 5);
+    /// Under this, the publisher did not pay a window on top of the write.
+    const COST_NO_WINDOW_CEIL: Duration =
+        Duration::from_millis(COST_W_MS + COST_WINDOW_MS as u64 - 10);
+
+    /// A hub over a store whose every append costs [`COST_W`], one persistent `QoS` 1
+    /// subscriber `c` on `t` (packet ids warmed, so its next delivery may be held).
+    async fn cost_hub(
+        window_ms: u32,
+    ) -> (std::sync::Arc<FlakyStore>, HubTx, crate::hub::OutboundRx) {
+        let store = FlakyStore::new(0);
+        let tx = start_hub_eliding(store.clone(), window_ms);
+        let (mut rx, _) = attach_full(&tx, "c", 1, false, u32::MAX, 16).await;
+        subscribe_qos(&tx, "c", "t", QoS::AtLeastOnce);
+        let _ = attach(&tx, "barrier", 99, true).await;
+        warm_packet_ids(&tx, &mut rx, "c").await;
+        store
+            .write_delay_ms
+            .store(COST_W_MS, std::sync::atomic::Ordering::SeqCst);
+        (store, tx, rx)
+    }
+
+    /// One publish to `t`, its delivery to `c` acknowledged after `ack_after` (`None`:
+    /// never). Returns how long the publisher waited for its own acknowledgement.
+    async fn publisher_wait(
+        tx: &HubTx,
+        rx: &mut crate::hub::OutboundRx,
+        ack_after: Option<Duration>,
+    ) -> Duration {
+        let started = Instant::now();
+        let done = publish_gated(tx, "t", b"m", QoS::AtLeastOnce, false);
+        let p = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(p) = recv_packet(rx).await {
+                    return p;
+                }
+            }
+        })
+        .await
+        .expect("the delivery");
+        let pkid = pkid_of(&p);
+        // The subscriber acknowledges on its own clock, while the publisher waits.
+        let subscriber = ack_after.map(|a| {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                // SETTLE(subscriber-ack-delay): the modeled subscriber's acknowledgement
+                // latency, not a wait for state.
+                tokio::time::sleep(a).await;
+                pub_ack(&tx, "c", pkid);
+            })
+        });
+        assert!(matches!(
+            timeout(Duration::from_secs(3), done).await,
+            Ok(Ok(PublishOutcome::Accepted))
+        ));
+        let waited = started.elapsed();
+        match subscriber {
+            Some(task) => task.await.expect("the subscriber's ack"),
+            None => pub_ack(tx, "c", pkid),
+        }
+        waited
+    }
+
+    fn median(mut v: Vec<Duration>) -> Duration {
+        v.sort();
+        v[v.len() / 2]
+    }
+
+    /// A subscriber that keeps up (A of about 0, far under W): holding is faster than
+    /// writing first, and nothing is written.
+    #[tokio::test]
+    async fn elision_is_faster_than_writing_first_when_the_subscriber_keeps_up() {
+        let (store, tx, mut rx) = cost_hub(COST_WINDOW_MS).await;
+        let writes_before = store.appends.load(std::sync::atomic::Ordering::SeqCst);
+        let mut held = Vec::new();
+        for _ in 0..5 {
+            held.push(publisher_wait(&tx, &mut rx, Some(Duration::ZERO)).await);
+        }
+        let held = median(held);
+        assert_eq!(
+            store.appends.load(std::sync::atomic::Ordering::SeqCst),
+            writes_before,
+            "acknowledged inside the window: nothing written"
+        );
+
+        let (_store, tx, mut rx) = cost_hub(0).await;
+        let mut written = Vec::new();
+        for _ in 0..5 {
+            written.push(publisher_wait(&tx, &mut rx, Some(Duration::ZERO)).await);
+        }
+        let written = median(written);
+        eprintln!("cost model, keeping up: held {held:?}, written first {written:?}");
+        assert!(
+            written >= COST_W,
+            "writing first pays the write: {written:?}"
+        );
+        assert!(
+            held < COST_W / 2,
+            "held {held:?} must beat writing first {written:?} (W = {COST_W:?})"
+        );
+    }
+
+    /// A subscriber slower than the window (A > w): each hold costs w + W, worse than
+    /// writing first (about W), until three misses back the session off and it is
+    /// written first again.
+    #[tokio::test]
+    async fn a_subscriber_slower_than_the_window_costs_w_plus_w_until_it_backs_off() {
+        let (store, tx, mut rx) = cost_hub(COST_WINDOW_MS).await;
+        let slow = Some(Duration::from_millis(150));
+        let mut misses = Vec::new();
+        for _ in 0..3 {
+            misses.push(publisher_wait(&tx, &mut rx, slow).await);
+        }
+        for m in &misses {
+            assert!(
+                *m >= COST_MISSED_FLOOR,
+                "a missed window costs w + W: {m:?}"
+            );
+        }
+        let writes = store.appends.load(std::sync::atomic::Ordering::SeqCst);
+        let backed_off = publisher_wait(&tx, &mut rx, slow).await;
+        eprintln!(
+            "cost model, slower than the window: missed {misses:?}, backed off {backed_off:?}"
+        );
+        assert!(
+            backed_off >= COST_W && backed_off < COST_NO_WINDOW_CEIL,
+            "backed off, the session is written first again (about W): {backed_off:?}"
+        );
+        assert_eq!(
+            store.appends.load(std::sync::atomic::Ordering::SeqCst),
+            writes + 1,
+            "and the delivery was written"
+        );
+    }
+
+    /// An offline subscriber: nothing can be held, so elision costs nothing; the
+    /// publisher waits for the write either way (about W, no window on top).
+    #[tokio::test]
+    async fn elision_costs_nothing_when_the_subscriber_is_offline() {
+        for window_ms in [COST_WINDOW_MS, 0] {
+            let (_store, tx, _rx) = cost_hub(window_ms).await;
+            detach(&tx, "c", 1);
+            let _ = attach(&tx, "barrier2", 98, true).await;
+            let mut waits = Vec::new();
+            for _ in 0..3 {
+                let started = Instant::now();
+                let done = publish_gated(&tx, "t", b"m", QoS::AtLeastOnce, false);
+                assert!(matches!(
+                    timeout(Duration::from_secs(3), done).await,
+                    Ok(Ok(PublishOutcome::Accepted))
+                ));
+                waits.push(started.elapsed());
+            }
+            let w = median(waits);
+            eprintln!("cost model, offline, window {window_ms} ms: {w:?}");
+            assert!(
+                w >= COST_W && w < COST_W + Duration::from_millis(u64::from(COST_WINDOW_MS) / 2),
+                "window {window_ms} ms, offline: about W, no window paid: {w:?}"
+            );
+        }
+    }
+
+    /// One publish to `t` delivered to `c` (acknowledged at once) and `s` (acknowledged
+    /// only after the publisher's own acknowledgement): how long the publisher waited.
+    async fn fanout_round(
+        tx: &HubTx,
+        rx: &mut crate::hub::OutboundRx,
+        slow_rx: &mut crate::hub::OutboundRx,
+    ) -> Duration {
+        let started = Instant::now();
+        let done = publish_gated(tx, "t", b"m", QoS::AtLeastOnce, false);
+        let fast = recv_packet(rx).await.expect("c");
+        pub_ack(tx, "c", pkid_of(&fast));
+        let slow = recv_packet(slow_rx).await.expect("s");
+        assert!(matches!(
+            timeout(Duration::from_secs(3), done).await,
+            Ok(Ok(PublishOutcome::Accepted))
+        ));
+        let waited = started.elapsed();
+        pub_ack(tx, "s", pkid_of(&slow));
+        waited
+    }
+
+    /// Fan-out to two sessions, one fast and one slow: the publisher waits for the
+    /// slower obligation (D4), so it pays w + W while the slow session is held, then
+    /// about W once that session backs off, and only the slow session is written.
+    #[tokio::test]
+    async fn fan_out_waits_for_the_slowest_session_and_backs_off_with_it() {
+        let (store, tx, mut rx) = cost_hub(COST_WINDOW_MS).await;
+        let (mut slow_rx, _) = attach_full(&tx, "s", 2, false, u32::MAX, 16).await;
+        subscribe_qos(&tx, "s", "t", QoS::AtLeastOnce);
+        let _ = attach(&tx, "barrier3", 97, true).await;
+        // Warm the slow session's packet ids too (one delivery to both).
+        let warm = publish_gated(&tx, "t", b"warm", QoS::AtLeastOnce, false);
+        let a = recv_packet(&mut rx).await.expect("c warm");
+        let b = recv_packet(&mut slow_rx).await.expect("s warm");
+        pub_ack(&tx, "c", pkid_of(&a));
+        pub_ack(&tx, "s", pkid_of(&b));
+        assert!(matches!(
+            timeout(Duration::from_secs(3), warm).await,
+            Ok(Ok(PublishOutcome::Accepted))
+        ));
+        for _ in 0..3 {
+            let w = fanout_round(&tx, &mut rx, &mut slow_rx).await;
+            assert!(
+                w >= COST_MISSED_FLOOR,
+                "the slow session's missed window sets the wait: {w:?}"
+            );
+        }
+        let writes = store.appends.load(std::sync::atomic::Ordering::SeqCst);
+        let w = fanout_round(&tx, &mut rx, &mut slow_rx).await;
+        assert!(
+            w >= COST_W && w < COST_NO_WINDOW_CEIL,
+            "the slow session backed off: about W: {w:?}"
+        );
+        assert_eq!(
+            store.appends.load(std::sync::atomic::Ordering::SeqCst),
+            writes + 1,
+            "only the slow session was written; the fast one was held and discharged"
         );
     }
 

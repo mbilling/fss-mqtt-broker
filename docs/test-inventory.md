@@ -1468,7 +1468,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 850 test(s)
+## `crates/mqttd/src/lib.rs` — 854 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1865,6 +1865,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_stalled_qos0_subscriber_is_shed_not_queued_without_limit`
 - `hub::tests::a_stalled_record_outbound_does_not_delay_a_group_b_publish`
 - `hub::tests::a_subscriber_ack_completes_while_its_truncate_is_still_parked`
+- `hub::tests::a_subscriber_slower_than_the_window_costs_w_plus_w_until_it_backs_off`
 - `hub::tests::a_successful_shared_enqueue_still_acks`
 - `hub::tests::a_third_node_composes_a_refusal_and_a_store_into_a_withhold`
 - `hub::tests::a_tombstone_only_node_still_offers_its_digest`
@@ -1916,9 +1917,12 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::commands_sort_into_the_control_and_data_lanes`
 - `hub::tests::durable_failure_reasons_are_bounded`
 - `hub::tests::durable_off_keeps_the_adr_0014_behaviour_with_no_retained_commit`
+- `hub::tests::elision_costs_nothing_when_the_subscriber_is_offline`
+- `hub::tests::elision_is_faster_than_writing_first_when_the_subscriber_keeps_up`
 - `hub::tests::evicting_a_v311_client_closes_without_a_disconnect_packet`
 - `hub::tests::eviction_disconnects_the_target_and_leaves_others_undisturbed`
 - `hub::tests::expired_queued_message_is_dropped_at_replay`
+- `hub::tests::fan_out_waits_for_the_slowest_session_and_backs_off_with_it`
 - `hub::tests::flow_control_backlog_is_bounded_drop_oldest`
 - `hub::tests::flush_waits_for_every_publish_sent_before_it`
 - `hub::tests::forward_repeat::a_forward_retransmitted_across_a_dead_verdict_is_applied_once`
