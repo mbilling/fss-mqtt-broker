@@ -549,6 +549,60 @@ blocking, and it is the right behaviour to expect; but "connects are unaffected"
 true of clients whose own groups are healthy, and ADR 0061 §5's own text is the accurate
 one (residual store awaits stay in the attach/control classes).
 
+## Result 4 — write elision against writing first (ADR 0089)
+
+The question: with `durable.write_elision_ms` set, when is holding a delivery
+faster than writing it first, and when is it not? Let W be the durable write, A the
+subscriber's acknowledgement latency and w the window.
+- **Writing first,** the publisher waits about W.
+- **Holding,** it waits A when A < w, and w + W otherwise.
+
+The hub tests `elision_is_faster_than_writing_first_when_the_subscriber_keeps_up` and
+its three siblings assert this on a store with a modeled W. This run checks it on
+real fsync.
+
+**Shape:**
+- 3 nodes on one Mac (release build), 16 publishers × 8 in flight, 16 persistent
+  subscribers, 200 B payloads, 15 s windows.
+- Each subscriber acknowledges after `MQTTD_BENCH_SUB_ACK_DELAY_MS`, without pausing
+  its reads; offline means `MQTTD_BENCH_SUBS_OFFLINE=1`.
+- The laptop's W (F_FULLFSYNC) is about 30 ms. Every run printed VALID.
+
+Results, `qos1-durable-owner` (the relay arm is the same shape):
+
+| subscriber | writing first | held, w = 50 ms | written with elision |
+|---|---|---|---|
+| acks at once | 4,345 msg/s, p50 29.2 / p99 43.8 ms | **73,983 msg/s, p50 0.33 / p99 42.2 ms** | 53k of 1.48M (3.6%) |
+| acks after 20 ms (A < W) | 4,198, p50 30.0 / p99 46.9 | **5,588, p50 22.6 / p99 30.0** | 6.7k of 111k (6%) |
+| acks after 100 ms (A > w) | 3,931, p50 32.1 / p99 49.9 | 3,730, p50 32.3 / **p99 86.9** | all (0 held to the end, 3,063 timeouts) |
+| offline | 3,730, p50 33.5 / p99 54.7 | 3,663, p50 34.8 / p99 52.0 | all |
+
+What it shows:
+- **Elision is faster whenever subscribers acknowledge faster than the write.** That
+  holds even at A = 20 ms against W of about 30 ms: +33% throughput, and the p99 falls.
+- **It is slower when they acknowledge slower than the window.** Each miss costs w + W
+  until three misses back the session off (Amendment 1 A3). The median stays at the
+  write's, and the cost shows in p99: 87 ms against 50.
+- **It costs nothing for offline subscribers.**
+- **The figures are directional.** A laptop's fsync is slower than a server's, which
+  overstates the write's cost. The rig is where the absolute numbers come from (#1083).
+
+Reproduce with one invocation per cell:
+
+```sh
+cargo test --release -p mqttd --test durable_bench --no-run
+for win in 0 50; do for delay in 0 20 100; do
+  MQTTD_DURABLE_WRITE_ELISION_MS=$win MQTTD_BENCH_SUB_ACK_DELAY_MS=$delay \
+  MQTTD_BENCH_PUBLISHERS=16 MQTTD_BENCH_WINDOW=8 MQTTD_BENCH_SUBS=16 MQTTD_BENCH_PAYLOAD=200 \
+  MQTTD_BENCH_REPS=1 MQTTD_BENCH_SECS=15 \
+  cargo test --release -p mqttd --test durable_bench -- durable_path_floor --ignored --nocapture --exact
+done; done   # and MQTTD_BENCH_SUBS_OFFLINE=1 for the offline row
+```
+
+Publishers now connect before the clock, 32 at a time with two retries each. Before
+this, a burst of hundreds of CONNECTs on one machine failed some of them and voided
+the run.
+
 ## Findings this benchmark surfaced
 
 A macro-benchmark's first job is to find things, and this one found four. None is

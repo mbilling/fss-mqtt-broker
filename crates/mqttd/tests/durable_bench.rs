@@ -148,6 +148,17 @@ struct Cfg {
     /// to the 1:1 arm and the DELTA between the two runs isolates the broker's
     /// shared-resolution cost on the hub loop, the scale rig's lane-B shape.
     shared: bool,
+    /// `MQTTD_BENCH_SUB_ACK_DELAY_MS` (ADR 0089): each subscriber acknowledges a
+    /// delivery this long after it arrives, without pausing its reads, so a run can
+    /// model a subscriber that keeps up (0), one near the write-elision window, and
+    /// one slower than it.
+    sub_ack_delay: Duration,
+    /// `MQTTD_BENCH_SUBS_OFFLINE=1`: the subscribers subscribe and then leave, so
+    /// every delivery is queued for an offline session and nothing can be held.
+    subs_offline: bool,
+    /// The spawned brokers' `MQTTD_DURABLE_WRITE_ELISION_MS`, inherited from this
+    /// process's environment; reported so a run carries the window it ran with.
+    elision_ms: u32,
 }
 
 impl Cfg {
@@ -170,13 +181,21 @@ impl Cfg {
                     || panic!("MQTTD_BENCH_TIER must be 'local' or 'relaxed', got {t:?}")
             }),
             shared: env_usize("MQTTD_BENCH_SHARED", 0) == 1,
+            sub_ack_delay: Duration::from_millis(
+                env_usize("MQTTD_BENCH_SUB_ACK_DELAY_MS", 0) as u64
+            ),
+            subs_offline: env_usize("MQTTD_BENCH_SUBS_OFFLINE", 0) == 1,
+            elision_ms: env_usize("MQTTD_DURABLE_WRITE_ELISION_MS", 0)
+                .try_into()
+                .unwrap_or(u32::MAX),
         }
     }
 
     fn describe(&self) -> String {
         format!(
             "publishers={} window={} (={}, in flight) subs={} payload={}B warmup={}s measure={}s reps={} \
-             node_workers={} RUST_LOG={} profile={} placement={} tier={} subscription={}",
+             node_workers={} RUST_LOG={} profile={} placement={} tier={} subscription={} \
+             write_elision_ms={} sub_ack_delay={}ms subscribers={}",
             self.publishers,
             self.window,
             self.publishers * self.window,
@@ -199,6 +218,9 @@ impl Cfg {
             } else {
                 "1:1 (one topic per subscriber)"
             },
+            self.elision_ms,
+            self.sub_ack_delay.as_millis(),
+            if self.subs_offline { "offline" } else { "online" },
         )
     }
 }
@@ -848,48 +870,33 @@ struct PubResult {
     diagnosis: Option<String>,
 }
 
-/// One publisher connection running a sliding window of `window` in-flight
-/// publishes until `stop`. Packet id `k` is re-issued the moment its ack lands, so
-/// exactly `window` publishes are outstanding for the whole run and the offered
-/// rate equals the achieved rate by construction.
-#[allow(clippy::too_many_arguments)] // one measurement task, mirrors run_publisher
-async fn publisher(
+/// Connect one publisher, retrying a failed CONNECT twice: the bench's load is the
+/// publishes, and a CONNECT lost to a local connect burst is not a broker result.
+async fn connect_publisher(
     addr: SocketAddr,
-    id: String,
-    topic: String,
-    qos: QoS,
-    window: usize,
-    payload_len: usize,
-    stop: Instant,
-    tier: Option<String>,
-) -> PubResult {
-    // A tier lane (ADR 0072) publishes as MQTT 5 — the `mqttd-durability`
-    // property does not exist in v3.1.1 — and stamps every PUBLISH with it.
-    // The measured ack RTT then IS the selected tier's ack latency.
-    let connected = if tier.is_some() {
-        tokio::time::timeout(
-            Duration::from_secs(20),
-            common::Client::connect_v5(addr, &id, true, vec![]),
-        )
-        .await
-        .ok()
-        .filter(|(_, ack)| ack.code == 0)
-        .map(|(c, _)| c)
-    } else {
-        common::Client::connect_v311_within(addr, &id, true, Duration::from_secs(20))
+    id: &str,
+    tier: Option<&str>,
+) -> Option<common::Client> {
+    for _ in 0..3 {
+        let c = if tier.is_some() {
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                common::Client::connect_v5(addr, id, true, vec![]),
+            )
             .await
+            .ok()
+            .filter(|(_, ack)| ack.code == 0)
             .map(|(c, _)| c)
-    };
-    match connected {
-        Some(c) => run_publisher(c, id, topic, qos, window, payload_len, stop, tier).await,
-        None => PubResult {
-            samples: Vec::new(),
-            errors: 1,
-            diagnosis: Some(format!(
-                "{id}: CONNECT to {addr} never got a success CONNACK"
-            )),
-        },
+        } else {
+            common::Client::connect_v311_within(addr, id, true, Duration::from_secs(20))
+                .await
+                .map(|(c, _)| c)
+        };
+        if c.is_some() {
+            return c;
+        }
     }
+    None
 }
 
 /// The publishing loop over an ALREADY-CONNECTED client. Split out so an experiment
@@ -1003,20 +1010,43 @@ async fn run_publisher(
 /// count: a durable ack the subscriber never sees would be a correctness bug, and
 /// the acked-facts oracle in `cluster_proc.rs` owns that judgement — here it is
 /// simply reported).
-async fn drainer(mut c: common::Client, stop: Instant, expected_qos: QoS) -> usize {
+async fn drainer(
+    mut c: common::Client,
+    stop: Instant,
+    expected_qos: QoS,
+    ack_delay: Duration,
+) -> usize {
     let mut state = subscriber::DrainState::default();
+    // Replies owed, each due `ack_delay` after its delivery arrived, oldest first:
+    // the subscriber acknowledges on its own clock without pausing its reads.
+    let mut due: std::collections::VecDeque<(Instant, Packet)> = std::collections::VecDeque::new();
     loop {
-        let left = stop.saturating_duration_since(Instant::now());
+        let now = Instant::now();
+        while due.front().is_some_and(|(at, _)| *at <= now) {
+            let (_, reply) = due.pop_front().expect("front exists");
+            c.send(&reply).await;
+        }
+        let left = stop.saturating_duration_since(now);
         if left.is_zero() {
             return state.delivered;
         }
-        match c.recv_bounded(left.min(Duration::from_millis(500))).await {
+        let next_due = due.front().map_or(Duration::from_millis(500), |(at, _)| {
+            at.saturating_duration_since(now)
+        });
+        let wait = left
+            .min(Duration::from_millis(500))
+            .min(next_due.max(Duration::from_millis(1)));
+        match c.recv_bounded(wait).await {
             common::Recv::Packet(packet) => {
                 if let Packet::Publish(p) = &packet {
                     assert_eq!(p.qos, expected_qos, "unexpected subscriber delivery QoS");
                 }
                 if let Some(reply) = state.receive(&packet) {
-                    c.send(&reply).await;
+                    if ack_delay.is_zero() {
+                        c.send(&reply).await;
+                    } else {
+                        due.push_back((Instant::now() + ack_delay, reply));
+                    }
                 }
             }
             common::Recv::Quiet => {}
@@ -1074,6 +1104,10 @@ struct RunStats {
     stalls_1s: usize,
     errors: usize,
     append_count: f64,
+    /// `mqttd_durable_elided_total` over the arm, summed over nodes (ADR 0089).
+    elided: f64,
+    /// `mqttd_durable_elision_fallback_total` over the arm, every reason.
+    elision_fallbacks: f64,
     append_mean_ms: f64,
     append_p99_ms: f64,
     dispatch_p99_ms: f64,
@@ -1444,6 +1478,23 @@ async fn run_arm(cl: &mut Cluster, cfg: &Cfg, arm: &Arm, tag: &str) -> RunStats 
     let cpu_before: Vec<f64> = pids.iter().filter_map(|p| cpu_secs(*p)).collect();
     let driver_cpu_before = cpu_secs(std::process::id()).unwrap_or(0.0);
 
+    // Publishers connect BEFORE the clock, a batch at a time: a burst of hundreds of
+    // CONNECTs on one machine fails some of them, and a failed CONNECT voids the run.
+    let mut connected: Vec<Option<common::Client>> = Vec::with_capacity(cfg.publishers);
+    for batch in (0..cfg.publishers).collect::<Vec<_>>().chunks(32) {
+        let mut set = tokio::task::JoinSet::new();
+        for &k in batch {
+            let (addr, id, tier) = (pub_addrs[k], pub_ids[k].clone(), cfg.tier.clone());
+            set.spawn(async move { (k, connect_publisher(addr, &id, tier.as_deref()).await) });
+        }
+        let mut got: Vec<(usize, Option<common::Client>)> = Vec::new();
+        while let Some(r) = set.join_next().await {
+            got.push(r.expect("connect task"));
+        }
+        got.sort_by_key(|(k, _)| *k);
+        connected.extend(got.into_iter().map(|(_, c)| c));
+    }
+
     let started = Instant::now();
     let measure_from = started + cfg.warmup;
     let stop = measure_from + cfg.measure;
@@ -1456,26 +1507,43 @@ async fn run_arm(cl: &mut Cluster, cfg: &Cfg, arm: &Arm, tag: &str) -> RunStats 
         measurement_window(tag, arm.label, unix_ms, cfg.warmup, cfg.measure)
     );
 
+    // Offline subscribers (ADR 0089): every delivery is queued for a session with no
+    // connection, so nothing can be held and the publisher waits for the write.
+    let subs = if cfg.subs_offline {
+        drop(subs);
+        // SETTLE(bench-offline-detach): the subscribers' sockets close; the brokers
+        // detach the sessions on their own clock, and this is a measurement boundary.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        Vec::new()
+    } else {
+        subs
+    };
     let mut drains = Vec::new();
     for c in subs {
         drains.push(tokio::spawn(drainer(
             c,
             stop + Duration::from_secs(2),
             arm.qos,
+            cfg.sub_ack_delay,
         )));
     }
     let mut pubs = Vec::new();
-    for k in 0..cfg.publishers {
-        pubs.push(tokio::spawn(publisher(
-            pub_addrs[k],
-            pub_ids[k].clone(),
-            topics[k % cfg.subs].clone(),
-            arm.qos,
-            cfg.window,
-            cfg.payload,
-            stop,
-            cfg.tier.clone(),
-        )));
+    for (k, conn) in connected.into_iter().enumerate() {
+        let (id, topic) = (pub_ids[k].clone(), topics[k % cfg.subs].clone());
+        let (qos, window, payload, tier) = (arm.qos, cfg.window, cfg.payload, cfg.tier.clone());
+        let addr = pub_addrs[k];
+        pubs.push(tokio::spawn(async move {
+            match conn {
+                Some(c) => run_publisher(c, id, topic, qos, window, payload, stop, tier).await,
+                None => PubResult {
+                    samples: Vec::new(),
+                    errors: 1,
+                    diagnosis: Some(format!(
+                        "{id}: CONNECT to {addr} never got a success CONNACK (3 tries)"
+                    )),
+                },
+            }
+        }));
     }
 
     let mut samples: Vec<Duration> = Vec::new();
@@ -1516,6 +1584,17 @@ async fn run_arm(cl: &mut Cluster, cfg: &Cfg, arm: &Arm, tag: &str) -> RunStats 
     let secs = cfg.measure.as_secs_f64();
     let completed = samples.len();
 
+    let elided: f64 = (0..cl.endpoints.len())
+        .map(|i| {
+            after[i].get("mqttd_durable_elided_total") - before[i].get("mqttd_durable_elided_total")
+        })
+        .sum();
+    let elision_fallbacks: f64 = (0..cl.endpoints.len())
+        .map(|i| {
+            after[i].sum_prefix("mqttd_durable_elision_fallback_total")
+                - before[i].sum_prefix("mqttd_durable_elision_fallback_total")
+        })
+        .sum();
     let append_count: f64 = (0..cl.endpoints.len())
         .map(|i| {
             after[i].hist_count("mqttd_durable_append_latency_seconds", None)
@@ -1579,6 +1658,8 @@ async fn run_arm(cl: &mut Cluster, cfg: &Cfg, arm: &Arm, tag: &str) -> RunStats 
             .count(),
         errors,
         append_count,
+        elided,
+        elision_fallbacks,
         append_mean_ms: if append_count > 0.0 {
             append_sum / append_count * 1000.0
         } else {
@@ -1760,7 +1841,8 @@ async fn durable_path_floor() {
             let st = run_arm(&mut cl, &cfg, arm, &tag).await;
             println!(
                 "  rep {rep} {:<20} {:>9.0} msg/s  p50 {:>7.2}ms p95 {:>7.2}ms p99 {:>7.2}ms p999 {:>8.2}ms max {:>8.2}ms stalls>=1s {:>3}  \
-                 appends {:>7.0} (mean {:>6.2}ms, p99<={:>7.2}ms)  dispatch(publish) p99<={:>7.2}ms  \
+                 appends {:>7.0} (mean {:>6.2}ms, p99<={:>7.2}ms)  elided {:>7.0} fallbacks {:>6.0}  \
+                 dispatch(publish) p99<={:>7.2}ms  \
                  lane {:>4.0}  driverCPU {:>5.1}s nodeCPU {:?}  {}",
                 arm.label,
                 st.rate,
@@ -1773,6 +1855,8 @@ async fn durable_path_floor() {
                 st.append_count,
                 st.append_mean_ms,
                 st.append_p99_ms,
+                st.elided,
+                st.elision_fallbacks,
                 st.dispatch_p99_ms,
                 st.lane_jobs,
                 st.driver_cpu,
@@ -1829,6 +1913,12 @@ async fn durable_path_floor() {
                     "max_ms": ms(st.max),
                     "stalls_1s": st.stalls_1s,
                     "append_mean_ms": st.append_mean_ms,
+                    "appends": st.append_count,
+                    "elided": st.elided,
+                    "elision_fallbacks": st.elision_fallbacks,
+                    "write_elision_ms": cfg.elision_ms,
+                    "sub_ack_delay_ms": cfg.sub_ack_delay.as_millis(),
+                    "subs_offline": cfg.subs_offline,
                     "stages": st.stages.iter().map(|(l, n, mean, p99)| serde_json::json!({
                         "stage": l, "samples": n, "mean_ms": mean, "p99_ms": p99,
                     })).collect::<Vec<_>>(),
@@ -2161,7 +2251,12 @@ async fn degraded_group_does_not_delay_other_groups() {
     let experiment_end = Instant::now() + phase * 4 + Duration::from_mins(2);
     let mut drains = Vec::new();
     for c in subs {
-        drains.push(tokio::spawn(drainer(c, experiment_end, QoS::AtLeastOnce)));
+        drains.push(tokio::spawn(drainer(
+            c,
+            experiment_end,
+            QoS::AtLeastOnce,
+            Duration::ZERO,
+        )));
     }
 
     let mut phases: Vec<(&str, PhaseResult)> = Vec::new();

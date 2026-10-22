@@ -140,8 +140,13 @@ mod tests {
             .expect("outbound ID must be stored before the subscriber acknowledges");
         }
         // Exercise the actual timed benchmark drainer, not a second implementation.
-        let delivered =
-            crate::drainer(sub, std::time::Instant::now() + Duration::from_secs(2), qos).await;
+        let delivered = crate::drainer(
+            sub,
+            std::time::Instant::now() + Duration::from_secs(2),
+            qos,
+            Duration::ZERO,
+        )
+        .await;
         assert_eq!(delivered, 1);
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
