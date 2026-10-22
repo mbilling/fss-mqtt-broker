@@ -82,6 +82,9 @@ pub(super) struct ElisionState {
     /// Sessions that have missed the window lately (Amendment 1 A3). An entry goes when
     /// its session is discharged again or detaches.
     pub(super) backoff: HashMap<ClientId, Backoff>,
+    /// Writes in flight whose live send waits for them, per session, connection and
+    /// topic (Amendment 1 A5): a hold may not overtake one on its own topic.
+    pub(super) writing: HashMap<(ClientId, u64, String), usize>,
 }
 
 impl Hub {
@@ -127,11 +130,15 @@ impl Hub {
         ) {
             return false;
         }
-        if self
-            .append_lanes
-            .get(client)
-            .is_some_and(|l| l.outstanding > 0)
-        {
+        // A write in flight on this topic: its delivery goes on the wire after the
+        // write, and a held one would overtake it. Other topics' writes do not block:
+        // MQTT orders a topic, not a session (Amendment 1 A5).
+        let conn = self.online.get(client).map(|o| o.conn_id);
+        if conn.is_some_and(|c| {
+            self.elision
+                .writing
+                .contains_key(&(client.clone(), c, message.topic.clone()))
+        }) {
             return false;
         }
         if let Some(inf) = self.inflight.get(client) {
@@ -251,6 +258,66 @@ impl Hub {
                 self.fallback_write(client, &e.message, e.message_expiry, &e.gate, Some(e.pkid));
             self.release_registration(&then);
         }
+    }
+
+    /// A delivery on `topic` takes the durable path: what `client` holds on that topic is
+    /// written first, in send order, so its appends sit ahead in the lane and the store
+    /// keeps the wire's order (Amendment 1 A5; fallback reason `head`). Held deliveries
+    /// on other topics stay held.
+    pub(super) fn flush_elided_topic(&mut self, client: &ClientId, topic: &str) {
+        let Some(queue) = self.elision.by_client.get_mut(client) else {
+            return;
+        };
+        if !queue.iter().any(|e| e.message.topic == topic) {
+            return;
+        }
+        let (same, rest): (VecDeque<Elided>, VecDeque<Elided>) = std::mem::take(queue)
+            .into_iter()
+            .partition(|e| e.message.topic == topic);
+        if rest.is_empty() {
+            self.elision.by_client.remove(client);
+        } else {
+            *self
+                .elision
+                .by_client
+                .get_mut(client)
+                .expect("present above") = rest;
+        }
+        for e in same {
+            self.elision.entries -= 1;
+            self.elision.bytes -= e.message.payload.len();
+            self.elision.fallbacks += 1;
+            if let Some(m) = &self.metrics {
+                m.durable_elision_fallback("head");
+            }
+            let then = e.gate.then();
+            let _ =
+                self.fallback_write(client, &e.message, e.message_expiry, &e.gate, Some(e.pkid));
+            self.release_registration(&then);
+        }
+    }
+
+    /// A counted write landed (Amendment 1 A5).
+    pub(super) fn write_landed(&mut self, job: &AppendJob) {
+        let key = (
+            job.client.clone(),
+            job.planned_conn.unwrap_or_default(),
+            job.message.topic.clone(),
+        );
+        if let Some(n) = self.elision.writing.get_mut(&key) {
+            *n -= 1;
+            if *n == 0 {
+                self.elision.writing.remove(&key);
+            }
+        }
+    }
+
+    /// Connection `conn_id` of `client` detached: its writes in flight no longer gate
+    /// a hold. A later connection counts its own.
+    pub(super) fn forget_writing(&mut self, client: &ClientId, conn_id: u64) {
+        self.elision
+            .writing
+            .retain(|(c, conn, _), _| !(c == client && *conn == conn_id));
     }
 
     /// The window ended for the oldest held deliveries; also, under brownout or a

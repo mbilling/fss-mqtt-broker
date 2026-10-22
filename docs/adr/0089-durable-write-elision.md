@@ -29,6 +29,7 @@
 > 30–50 ms, documented at 50 ms; the head rule of D5 is narrowed to what order needs; a
 > subscriber that keeps missing the window stops being held; the window shrinks only for
 > memory. See [Amendment 1](#amendment-1--the-window-the-head-rule-and-slow-subscribers).
+> On 2026-10-22 the maintainer added A5: the head rule applies per topic.
 
 ## Context
 
@@ -255,6 +256,30 @@ T7, not fixed here.
 
 The window shortens, or new holds stop, only as the node nears the D7 bound. That is the one
 cost of a long window that grows with load.
+
+### A5. The head rule per topic (2026-10-22)
+
+MQTT orders messages per topic: what one client publishes to a topic reaches a subscriber
+in that order. Nothing orders two topics. The head rule therefore applies per **session and
+topic**, not per session:
+
+- **A write in flight blocks a hold only on its own topic.** A held delivery on topic A may
+  go on the wire ahead of a written one on topic B whose write has not landed.
+- **A held delivery is written before a later one on its topic.** When a delivery takes the
+  durable path while its session holds earlier deliveries on the same topic, those are
+  written first, in send order, and counted as fallbacks with reason `head` (D9). Their
+  appends then sit ahead of it in the session's lane, so the store and a resume replay the
+  topic in the order it went on the wire. Held deliveries on other topics stay held.
+- **A timeout still writes all of a session's held deliveries, in send order.** That is
+  stricter than A5 needs, and simpler.
+
+The second point also closes a gap in the first implementation (T2). It wrote an ineligible
+delivery at once while earlier ones for the same session were still held, for example under
+a full receive quota or the D7 bound. A replay could then deliver the later one first.
+
+What it buys depends on how many publishers share a topic. In the T5 sweep every publisher
+has its own topic, so a (session, topic) pair sees about 0.5 msg/s against 300 msg/s for
+the session. Where many publishers share one topic, the rule stays close to per session.
 
 ## Open questions
 

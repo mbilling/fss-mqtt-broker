@@ -139,6 +139,10 @@ pub struct AppendJob {
     /// its append is the fallback write, so completion links the stored offset to
     /// that in-flight entry instead of sending the message a second time.
     pub(super) delivered: Option<u16>,
+    /// A live send that waits for this job (a delivery or a passthrough) while write
+    /// elision is on: counted per session, connection and topic until it completes,
+    /// so a hold on the same topic cannot overtake it (ADR 0089 Amendment 1 A5).
+    pub(super) topic_counted: bool,
 }
 
 /// What a lane worker receives: append/passthrough work, or a clean-start discard
@@ -365,6 +369,7 @@ impl AppendJob {
             message_expiry: None,
             queued_at: Instant::now(),
             delivered: None,
+            topic_counted: false,
         }
     }
 
@@ -805,6 +810,7 @@ impl Hub {
         delivered: Option<u16>,
     ) -> Submitted {
         let (origin, dedupe) = gate.origin(&self.node_id);
+        let counted = delivered.is_none() && self.elision.window.is_some();
         let job = AppendJob {
             client: client.clone(),
             message: message.clone(),
@@ -823,8 +829,9 @@ impl Hub {
             message_expiry,
             queued_at: Instant::now(),
             delivered,
+            topic_counted: counted && planned_conn.is_some(),
         };
-        self.submit_lane_job(job)
+        self.submit_counted(job)
     }
 
     /// Route a no-append send through `client`'s busy lane so it cannot overtake an
@@ -847,8 +854,26 @@ impl Hub {
             message_expiry,
             queued_at: Instant::now(),
             delivered: None,
+            topic_counted: planned_conn.is_some() && self.elision.window.is_some(),
         };
-        self.submit_lane_job(job)
+        self.submit_counted(job)
+    }
+
+    /// [`submit_lane_job`](Self::submit_lane_job), counting a job whose live send waits
+    /// for it toward its topic's writes in flight (ADR 0089 Amendment 1 A5).
+    fn submit_counted(&mut self, job: AppendJob) -> Submitted {
+        let key = job.topic_counted.then(|| {
+            (
+                job.client.clone(),
+                job.planned_conn.unwrap_or_default(),
+                job.message.topic.clone(),
+            )
+        });
+        let out = self.submit_lane_job(job);
+        if let (Some(key), Submitted::Queued) = (key, &out) {
+            *self.elision.writing.entry(key).or_default() += 1;
+        }
+        out
     }
 
     /// This session's append lane, spawning it (bounded channel + worker) on first use.
@@ -980,6 +1005,9 @@ impl Hub {
     pub(super) fn append_done(&mut self, job: AppendJob, outcome: LaneOutcome) {
         if let Some(lane) = self.append_lanes.get_mut(&job.client) {
             lane.outstanding = lane.outstanding.saturating_sub(1);
+        }
+        if job.topic_counted {
+            self.write_landed(&job);
         }
         // The second lane stage — ADR 0057's outbound-id record (issue #242
         // finding A) — has its own completion contract: the post-record wire send.

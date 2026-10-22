@@ -1468,7 +1468,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 846 test(s)
+## `crates/mqttd/src/lib.rs` — 848 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1796,6 +1796,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_group_with_no_committed_lease_is_never_rehomed`
 - `hub::tests::a_handoff_is_retransmitted_until_the_owner_acks`
 - `hub::tests::a_handoff_retransmitted_before_its_ack_is_not_a_second_mutation`
+- `hub::tests::a_held_delivery_is_written_before_a_later_durable_one_on_its_topic`
 - `hub::tests::a_hold_behind_a_written_delivery_replays_after_it`
 - `hub::tests::a_hub_command_slot_stays_publish_sized`
 - `hub::tests::a_large_retained_set_is_chunked_under_the_frame_budget`
@@ -1870,6 +1871,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_will_is_still_delivered_live_under_brownout_and_counted_as_a_drop`
 - `hub::tests::a_windowed_commit_in_sys_is_never_delivered`
 - `hub::tests::a_windowed_commit_reaches_an_offline_durable_subscriber_on_resume`
+- `hub::tests::a_write_in_flight_on_one_topic_does_not_block_a_hold_on_another`
 - `hub::tests::a_written_unacknowledged_delivery_no_longer_blocks_the_next_hold`
 - `hub::tests::an_acknowledged_held_delivery_is_never_written`
 - `hub::tests::an_already_durable_append_does_not_overtake_a_waiting_one`
