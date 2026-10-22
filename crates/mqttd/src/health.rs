@@ -102,6 +102,8 @@ pub struct HealthState {
     decommission: Arc<OnceLock<Arc<DrainStatus>>>,
     /// When set, `GET /metrics` serves Prometheus exposition (ADR 0020); otherwise it 404s.
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
+    /// `durable.write_elision_ms` (ADR 0089); 0 leaves `/statusz` without the block.
+    write_elision_ms: u32,
     /// Identity block for `/statusz` (ADR 0054): the node id plus the shared
     /// cluster identity (founder flag + cluster id, filled at founding or on
     /// gossip adoption). `None` = `/statusz` 404s (opt-in via [`with_status`]).
@@ -242,6 +244,7 @@ impl HealthState {
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             decommission: Arc::new(OnceLock::new()),
             metrics: None,
+            write_elision_ms: 0,
             identity: None,
             refound: None,
             swim_isolated: None,
@@ -312,6 +315,14 @@ impl HealthState {
     #[must_use]
     pub fn with_metrics(mut self, metrics: Arc<mqtt_observability::metrics::Metrics>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// The write-elision window in force (ADR 0089), so `/statusz` can report what
+    /// share of held deliveries the subscribers' PUBACKs discharged.
+    #[must_use]
+    pub fn with_write_elision_ms(mut self, ms: u32) -> Self {
+        self.write_elision_ms = ms;
         self
     }
 
@@ -620,6 +631,21 @@ impl HealthState {
                 );
             }
             s.push('}');
+        }
+        // Write elision (ADR 0089 D9): the window, and what the held deliveries came
+        // to. `discharged_x100` is the share of held deliveries the subscriber's
+        // PUBACK discharged inside the window; the rest were written.
+        if let (true, Some(m)) = (self.write_elision_ms > 0, &self.metrics) {
+            let e = m.elision_snapshot();
+            let discharged_x100 = (e.elided * 10_000)
+                .checked_div(e.elided + e.written)
+                .unwrap_or(0);
+            let _ = write!(
+                s,
+                ",\"write_elision\":{{\"window_ms\":{},\"elided\":{},\"written\":{},\
+                 \"discharged_x100\":{discharged_x100},\"backoffs\":{}}}",
+                self.write_elision_ms, e.elided, e.written, e.backoffs
+            );
         }
         // Membership: the placement view (self + non-dead peers). Deterministic order.
         if let Some(p) = &self.placement {
@@ -1263,6 +1289,52 @@ mod tests {
     /// ADR 0084: once the rules are loaded, `/statusz` carries the running set's digest
     /// and counts — the cluster view compares the digest across nodes — and follows a
     /// reload. Before, there is no block.
+    /// ADR 0089 D9: with write elision on, `/statusz` reports the window and what the
+    /// held deliveries came to; with it off, there is no block.
+    #[tokio::test]
+    async fn statusz_reports_write_elision_when_it_is_on() {
+        let status = |state: HealthState| {
+            let cluster = Arc::new(
+                mqtt_cluster::cluster_identity::ClusterIdentity::load_or_mint(true, None).unwrap(),
+            );
+            state.with_status(
+                "node-a".into(),
+                cluster,
+                Arc::new(super::BrownoutStatus::default()),
+                Arc::new(crate::reload::ConfigStamp::default()),
+                Arc::new(std::sync::OnceLock::new()),
+                None,
+            )
+        };
+        let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("t"));
+        for _ in 0..3 {
+            metrics.durable_elided(0.001);
+        }
+        metrics.durable_elision_fallback("timeout");
+        metrics.durable_elision_backoff();
+
+        let off = status(
+            HealthState::new(spawn_live_hub(), Some(placement(1)), None, 1)
+                .with_metrics(metrics.clone()),
+        );
+        let (_, body, _) = super::route(&off, "/statusz").await;
+        assert!(!body.contains("write_elision"), "off: no block: {body}");
+
+        let on = status(
+            HealthState::new(spawn_live_hub(), Some(placement(1)), None, 1)
+                .with_metrics(metrics)
+                .with_write_elision_ms(50),
+        );
+        let (_, body, _) = super::route(&on, "/statusz").await;
+        assert!(
+            body.contains(
+                "\"write_elision\":{\"window_ms\":50,\"elided\":3,\"written\":1,\
+                 \"discharged_x100\":7500,\"backoffs\":1}"
+            ),
+            "{body}"
+        );
+    }
+
     #[tokio::test]
     async fn statusz_reports_the_running_rules() {
         let cluster = Arc::new(

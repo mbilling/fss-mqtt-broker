@@ -2749,6 +2749,7 @@ async fn start_health(
         min_members,
     )
     .with_metrics(metrics)
+    .with_write_elision_ms(config.durable.write_elision_ms)
     .with_startup_complete(startup_complete.clone())
     // /statusz (ADR 0054): the structured operator-facing state body; the cluster
     // identity fills its founder flag and (once known) cluster_id.
