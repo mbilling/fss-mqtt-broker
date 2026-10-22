@@ -335,6 +335,7 @@ struct OtelInstruments {
     durable_elided: OtelCounter<u64>,
     durable_elision_fallbacks: OtelCounter<u64>,
     durable_elision_hold: OtelHistogram<f64>,
+    durable_elision_backoffs: OtelCounter<u64>,
     durable_recovery_failures: OtelCounter<u64>,
     lease_quorum_ack_ms: OtelGauge<i64>,
     gossip_rejected: OtelCounter<u64>,
@@ -500,6 +501,7 @@ impl OtelInstruments {
             durable_elided: meter.u64_counter("durable_elided").build(),
             durable_elision_fallbacks: meter.u64_counter("durable_elision_fallback").build(),
             durable_elision_hold: meter.f64_histogram("durable_elision_hold_seconds").build(),
+            durable_elision_backoffs: meter.u64_counter("durable_elision_backoff").build(),
             durable_recovery_failures: meter.u64_counter("durable_recovery_failures").build(),
             lease_quorum_ack_ms: meter.i64_gauge("lease_quorum_ack_ms").build(),
             gossip_rejected: meter.u64_counter("gossip_rejected").build(),
@@ -671,6 +673,7 @@ pub struct Metrics {
     durable_elided_total: Counter,
     durable_elision_fallback_total: Family<ReasonLabel, Counter>,
     durable_elision_hold_seconds: Histogram,
+    durable_elision_backoff_total: Counter,
     /// Durable session *recovery* refusals (ADR 0049): a persistent attach that stayed
     /// unavailable past its deadline and got CONNACK 0x88. Distinct from an *append*
     /// failure — the signal that was silent for 11 h in the 2026-07-14 incident.
@@ -1307,6 +1310,12 @@ impl Metrics {
              it: the subscriber's acknowledgement latency (ADR 0089)",
             durable_elision_hold_seconds.clone(),
         );
+        let durable_elision_backoff_total = register_counter(
+            &mut registry,
+            "durable_elision_backoff",
+            "Sessions that kept missing the write-elision window and were written directly \
+             for a while instead of held (ADR 0089 Amendment 1 A3)",
+        );
         let durable_recovery_failures_total = register_family(
             &mut registry,
             "durable_recovery_failures",
@@ -1887,6 +1896,7 @@ impl Metrics {
             durable_elided_total,
             durable_elision_fallback_total,
             durable_elision_hold_seconds,
+            durable_elision_backoff_total,
             durable_recovery_failures_total,
             lease_quorum_ack_ms,
             gossip_rejected_total,
@@ -2615,6 +2625,13 @@ impl Metrics {
         self.otel
             .durable_elision_fallbacks
             .add(1, &[KeyValue::new("reason", reason.to_string())]);
+    }
+
+    /// A session kept missing the write-elision window and is written directly for a
+    /// while (ADR 0089 Amendment 1 A3).
+    pub fn durable_elision_backoff(&self) {
+        self.durable_elision_backoff_total.inc();
+        self.otel.durable_elision_backoffs.add(1, &[]);
     }
 
     /// A durable session recovery was refused (persistent attach rejected with 0x88,
@@ -3798,6 +3815,29 @@ mod tests {
         assert!(out.trim_end().ends_with("# EOF"), "missing # EOF:\n{out}");
     }
 
+    /// ADR 0089: write elision's counters (T4) and the backoff counter (Amendment 1 A3).
+    #[test]
+    fn elision_counters_move_and_render() {
+        let m = Metrics::new("t");
+        m.durable_elided(0.001);
+        m.durable_elision_fallback("timeout");
+        m.durable_elision_backoff();
+        let out = m.render();
+        assert!(out.contains("mqttd_durable_elided_total 1"), "{out}");
+        assert!(
+            out.contains("mqttd_durable_elision_backoff_total 1"),
+            "{out}"
+        );
+        assert!(
+            out.contains("mqttd_durable_elision_fallback_total{reason=\"timeout\"} 1"),
+            "{out}"
+        );
+        assert!(
+            out.contains("mqttd_durable_elision_hold_seconds_count 1"),
+            "{out}"
+        );
+    }
+
     #[test]
     fn counters_and_gauges_move_and_render() {
         let m = Metrics::new("t");
@@ -3819,8 +3859,6 @@ mod tests {
         m.set_lease_role(true, 7);
         m.observe_durable_append_latency(0.002);
         m.durable_append_failed("no-quorum");
-        m.durable_elided(0.001);
-        m.durable_elision_fallback("timeout");
         m.gossip_rejected("replay");
         m.swim_last_probes("sent", 3);
         m.swim_last_probes("spared", 2);
@@ -3874,15 +3912,6 @@ mod tests {
         );
         assert!(
             out.contains("mqttd_durable_append_failures_total{reason=\"no-quorum\"} 1"),
-            "{out}"
-        );
-        assert!(out.contains("mqttd_durable_elided_total 1"), "{out}");
-        assert!(
-            out.contains("mqttd_durable_elision_fallback_total{reason=\"timeout\"} 1"),
-            "{out}"
-        );
-        assert!(
-            out.contains("mqttd_durable_elision_hold_seconds_count 1"),
             "{out}"
         );
         assert!(

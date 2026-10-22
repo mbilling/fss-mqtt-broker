@@ -3883,6 +3883,7 @@ impl Hub {
             } => {
                 // ADR 0089: a held delivery whose subscriber is gone is written now.
                 self.flush_elided(&client, "disconnect");
+                self.forget_backoff(&client);
                 self.detach(&client, conn_id, graceful, session_expiry_override)
                     .await;
             }
@@ -15499,6 +15500,100 @@ mod tests {
         assert!(present);
         assert_eq!(payload_of(&recv_packet(&mut rx).await.unwrap()), b"one");
         assert_eq!(payload_of(&recv_packet(&mut rx).await.unwrap()), b"two");
+    }
+
+    /// One held delivery left unacknowledged until its window ends; the publisher is
+    /// accepted once the fallback write lands (ADR 0089 Amendment 1 A3 tests).
+    async fn miss_the_window(tx: &HubTx, rx: &mut crate::hub::OutboundRx, body: &'static [u8]) {
+        let done = publish_gated(tx, "t", body, QoS::AtLeastOnce, false);
+        assert_eq!(payload_of(&recv_packet(rx).await.unwrap()), body);
+        assert!(matches!(
+            timeout(Duration::from_secs(2), done).await,
+            Ok(Ok(PublishOutcome::Accepted))
+        ));
+    }
+
+    /// ADR 0089 Amendment 1 A3: a subscriber that misses the window three times running
+    /// is written directly for a while. With every write then hanging, its next delivery
+    /// is not sent at once: it waits for its write, as on today's path.
+    #[tokio::test]
+    async fn a_session_that_keeps_missing_the_window_is_written_directly() {
+        let store = FlakyStore::new(0);
+        let tx = start_hub_eliding(store.clone(), 20);
+        let (mut rx, _) = attach_full(&tx, "c", 1, false, u32::MAX, 8).await;
+        subscribe_qos(&tx, "c", "t", QoS::AtLeastOnce);
+        let _ = attach(&tx, "barrier", 99, true).await;
+        warm_packet_ids(&tx, &mut rx, "c").await;
+        for body in [b"one".as_slice(), b"two", b"three"] {
+            miss_the_window(&tx, &mut rx, body).await;
+        }
+
+        store
+            .hold_enqueue
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let done = publish_gated(&tx, "t", b"four", QoS::AtLeastOnce, false);
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "backed off: written first, so a hanging write keeps it off the wire"
+        );
+        store
+            .hold_enqueue
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(payload_of(&recv_packet(&mut rx).await.unwrap()), b"four");
+        assert!(matches!(
+            timeout(Duration::from_secs(2), done).await,
+            Ok(Ok(PublishOutcome::Accepted))
+        ));
+    }
+
+    /// ADR 0089 Amendment 1 A3: the count is of timeouts in a row. A delivery the
+    /// subscriber acknowledges inside the window clears it, so two misses, a discharge
+    /// and two more misses leave the session held.
+    #[tokio::test]
+    async fn a_discharge_clears_the_missed_windows() {
+        let store = FlakyStore::new(0);
+        let tx = start_hub_eliding(store.clone(), 20);
+        let (mut rx, _) = attach_full(&tx, "c", 1, false, u32::MAX, 16).await;
+        subscribe_qos(&tx, "c", "t", QoS::AtLeastOnce);
+        let _ = attach(&tx, "barrier", 99, true).await;
+        warm_packet_ids(&tx, &mut rx, "c").await;
+        miss_the_window(&tx, &mut rx, b"one").await;
+        miss_the_window(&tx, &mut rx, b"two").await;
+        warm_packet_ids(&tx, &mut rx, "c").await;
+        miss_the_window(&tx, &mut rx, b"three").await;
+        miss_the_window(&tx, &mut rx, b"four").await;
+
+        store
+            .hold_enqueue
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let done = publish_gated(&tx, "t", b"five", QoS::AtLeastOnce, false);
+        let p = recv_packet(&mut rx)
+            .await
+            .expect("still held: sent at once");
+        assert_eq!(payload_of(&p), b"five");
+        pub_ack(&tx, "c", pkid_of(&p));
+        assert!(matches!(
+            timeout(Duration::from_secs(2), done).await,
+            Ok(Ok(PublishOutcome::Accepted))
+        ));
+        store
+            .hold_enqueue
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// ADR 0089 Amendment 1 A4: the window halves only past three quarters of the D7
+    /// bound, in entries or in bytes.
+    #[test]
+    fn the_window_halves_only_near_the_memory_bound() {
+        use crate::hub::elision::{window_in_force, MAX_ELIDED, MAX_ELIDED_BYTES};
+        let w = Duration::from_millis(50);
+        assert_eq!(window_in_force(w, 0, 0), w);
+        assert_eq!(
+            window_in_force(w, MAX_ELIDED / 4 * 3, MAX_ELIDED_BYTES / 4 * 3),
+            w
+        );
+        assert_eq!(window_in_force(w, MAX_ELIDED / 4 * 3 + 1, 0), w / 2);
+        assert_eq!(window_in_force(w, 0, MAX_ELIDED_BYTES / 4 * 3 + 1), w / 2);
     }
 
     #[tokio::test]
