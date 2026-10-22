@@ -1791,6 +1791,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_failed_shared_enqueue_withholds_the_publishers_ack`
 - `hub::tests::a_foreign_topics_retained_publish_routes_the_commit_to_its_owner`
 - `hub::tests::a_forward_for_a_just_released_moved_session_is_not_answered_stored`
+- `hub::tests::a_forward_is_answered_only_when_its_hold_is_discharged`
 - `hub::tests::a_forward_that_matched_a_subscriber_is_answered_reached`
 - `hub::tests::a_forwarded_publish_is_counted_received_and_then_accounted_nowhere`
 - `hub::tests::a_full_append_lane_withholds_the_publisher_and_reorders_nothing`
@@ -2509,10 +2510,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `retained_message_replicates_across_nodes`
 - `shared_subscription_delivers_once_cluster_wide`
 
-## `crates/mqttd/tests/cluster_proc.rs` — 7 test(s)
+## `crates/mqttd/tests/cluster_proc.rs` — 8 test(s)
 
 - `a_disk_bound_crash_mid_write_loses_no_acked_fact`
 - `a_durable_publish_feeds_every_stage_histogram`
+- `a_kill_of_the_owner_with_deliveries_held_loses_no_acked_message`
 - `peer_link_work_counters_are_exported_per_link`
 - `rapid_kill_restart_flapping_loses_no_acked_fact`
 - `spawned_node_ports_come_from_outside_the_ephemeral_range`
