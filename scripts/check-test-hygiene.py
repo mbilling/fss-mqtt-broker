@@ -2463,6 +2463,11 @@ IGNORE_ALLOWLIST: dict[str, tuple[str, str | None]] = {
         "micro-benchmark for the host's durability barrier; --release only",
         None,
     ),
+    "crates/mqtt-cluster/src/lib.rs::cluster_log::replica_log::tests::replay_time_at_open_per_gb": (
+        "measurement for ADR 0078 criterion 5: writes a GB to disk and times the reopen; "
+        "--release only, on the disk being measured",
+        None,
+    ),
 }
 
 
