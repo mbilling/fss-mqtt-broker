@@ -35,10 +35,24 @@ if [ "$CLOUD" = upcloud ]; then
 	exit 0
 fi
 
+# A network blip must not turn into a fleet left billing: retry the destroy, and an
+# audit that cannot reach the API is a FAILURE, never an all-clear. On 2026-10-23 the
+# laptop's DNS went away for a few minutes; the destroy failed, every audit listing
+# failed into an empty answer, and "nothing leaked" was printed over 30 running servers.
+TEARDOWN_TRIES=${TEARDOWN_TRIES:-3}
+TEARDOWN_RETRY_SECS=${TEARDOWN_RETRY_SECS:-20}
+
 if [ -f "$TFDIR/terraform.tfstate" ]; then
-	say "OpenTofu destroy from local state"
-	(cd "$TFDIR" && "$TF" destroy -auto-approve -var node_count=1 "${TOFU_SSH_PUBKEY_ARGS[@]}") ||
-		warn "OpenTofu destroy failed — continuing to the label audit"
+	destroyed=0
+	for ((try = 1; try <= TEARDOWN_TRIES; try++)); do
+		say "OpenTofu destroy from local state (attempt $try of $TEARDOWN_TRIES)"
+		if (cd "$TFDIR" && "$TF" destroy -auto-approve -var node_count=1 "${TOFU_SSH_PUBKEY_ARGS[@]}"); then
+			destroyed=1
+			break
+		fi
+		[ "$try" -lt "$TEARDOWN_TRIES" ] && sleep "$TEARDOWN_RETRY_SECS"
+	done
+	[ "$destroyed" = 1 ] || warn "OpenTofu destroy failed $TEARDOWN_TRIES times — continuing to the label audit"
 fi
 
 if ! command -v hcloud >/dev/null; then
@@ -49,8 +63,23 @@ fi
 
 say "auditing by label purpose=mqttd-bench-scale"
 LEAKED=0
+UNAUDITED=()
+AUDIT_ERR=$(mktemp)
+trap 'rm -f "$AUDIT_ERR"' EXIT
 for kind in server network firewall placement-group ssh-key; do
-	out=$(hcloud "$kind" list -l purpose=mqttd-bench-scale -o noheader 2>/dev/null || true)
+	out="" listed=0
+	for ((try = 1; try <= 5; try++)); do
+		if out=$(hcloud "$kind" list -l purpose=mqttd-bench-scale -o noheader 2>"$AUDIT_ERR"); then
+			listed=1
+			break
+		fi
+		sleep "$TEARDOWN_RETRY_SECS"
+	done
+	if [ "$listed" = 0 ]; then
+		UNAUDITED+=("$kind")
+		warn "could not list ${kind}s: $(head -c 200 "$AUDIT_ERR")"
+		continue
+	fi
 	if [ -n "$out" ]; then
 		LEAKED=1
 		printf '\033[1;31mLEAKED %s:\033[0m\n%s\n' "$kind" "$out" >&2
@@ -62,6 +91,9 @@ for kind in server network firewall placement-group ssh-key; do
 	fi
 done
 
+if [ "${#UNAUDITED[@]}" -gt 0 ]; then
+	die "the label audit could NOT reach the Hetzner API for: ${UNAUDITED[*]}. Resources may still be billing. Re-run ./teardown.sh --force when the network is back, and check 'hcloud server list'"
+fi
 if [ "$LEAKED" = 1 ] && [ "$FORCE" != 1 ]; then
 	die "leaked resources found (listed above). Re-run with --force to delete them."
 fi
