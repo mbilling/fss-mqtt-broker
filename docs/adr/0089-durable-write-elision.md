@@ -223,10 +223,11 @@ must cover the subscriber's acknowledgement tail under load (p99.9 30–44 ms at
 here), not its mean (under 3 ms). For a subscriber that keeps up a long window costs nothing:
 a held delivery is discharged at its PUBACK, not at the window's end.
 
-**The default becomes 50 ms in 1.3.0** (maintainer, 2026-10-21, together with the segment log
-store as the default replica store, ADR 0078). Until then it stays 0. The flip rests on the
-criteria above with A2 and A3 in, the cluster cases (T3), and one rig confirmation of the
-combined 1.3.0 defaults.
+**The default is 50 ms from 1.3.0** (maintainer, 2026-10-21, together with the segment log
+store as the default replica store for fresh data dirs, ADR 0078). It rests on A2, A3 and A5,
+the cluster cases (T3), and the 2026-10-22/23 rig runs on main
+([`bench/scale/elision-ab-n3-2026-10-22.md`](../../bench/scale/elision-ab-n3-2026-10-22.md),
+[`bench/scale/rc130-max-n10-2026-10-23.md`](../../bench/scale/rc130-max-n10-2026-10-23.md)).
 
 The window does **not** follow load. Raising it after timeouts appear comes too late, since
 the sessions are already on the durable path; and a short window under light load saves

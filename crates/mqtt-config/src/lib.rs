@@ -596,12 +596,12 @@ pub struct Durable {
     /// Write elision on the durable `QoS` 1 path (`MQTTD_DURABLE_WRITE_ELISION_MS`,
     /// ADR 0089), in milliseconds: how long a delivery to an online persistent
     /// subscriber is held, sent but not yet written, waiting for the subscriber's
-    /// PUBACK to stand in for the durable write. `0` (the default) is today's path:
-    /// every such delivery is written before it is sent. The publisher's ack still
-    /// waits for the subscriber's PUBACK or the write, whichever comes first. When on,
-    /// use 30-50 ms (50 documented, ADR 0089 Amendment 1): the window must cover the
-    /// subscriber's acknowledgement tail under load, and a subscriber that keeps up
-    /// pays nothing for a long one.
+    /// PUBACK to stand in for the durable write. `50` (the default since 1.3.0, ADR
+    /// 0089 Amendment 1); 30-50 ms is the supported range: the window must cover the
+    /// subscriber's acknowledgement tail under load, and a subscriber that keeps up pays
+    /// nothing for a long one. The publisher's ack waits for the subscriber's PUBACK or
+    /// the write, whichever comes first. `0` turns it off: every such delivery is
+    /// written before it is sent, as before 1.3.0.
     pub write_elision_ms: u32,
 }
 
@@ -832,7 +832,7 @@ impl Default for Durable {
             allow_ephemeral: false,
             allow_relaxed_publish: false,
             ownership_domain: OwnershipDomain::Members,
-            write_elision_ms: 0,
+            write_elision_ms: 50,
         }
     }
 }

@@ -1630,8 +1630,8 @@ nothing of it is in a backup. A rules file that uses none creates none.
 
 ## Write elision on the durable QoS 1 path (ADR 0089)
 
-`durable.write_elision_ms` (`MQTTD_DURABLE_WRITE_ELISION_MS`) is `0` (off) by default.
-Set to 30–50 ms, a QoS 1 delivery to an online persistent subscriber is sent at once and
+`durable.write_elision_ms` (`MQTTD_DURABLE_WRITE_ELISION_MS`) is `50` by default since
+1.3.0, and `0` turns it off. With a window of 30–50 ms, a QoS 1 delivery to an online persistent subscriber is sent at once and
 **held**. It is written only if the subscriber's PUBACK does not arrive inside the window.
 The publisher's ack waits for that PUBACK or the quorum write, whichever comes first.
 **What an acknowledgement means does not change:** the message is either durable on a

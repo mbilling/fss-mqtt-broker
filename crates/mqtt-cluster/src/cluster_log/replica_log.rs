@@ -1174,6 +1174,39 @@ mod tests {
 
     /// A crash that tears the last batch loses exactly that batch — never
     /// acked — and the store reopens to the state before it.
+    /// ADR 0078's 1.3.0 default (option A): unset, a fresh data dir gets the segment
+    /// log; an existing redb store is kept, not imported; a log store stays a log
+    /// store; no data dir is in memory.
+    #[test]
+    fn the_default_store_is_the_log_for_a_fresh_dir_and_keeps_an_existing_one() {
+        let fresh = tempfile::tempdir().unwrap();
+        assert_eq!(
+            StoreBackend::for_data_dir(Some(fresh.path())).0,
+            StoreBackend::Log
+        );
+        assert_eq!(StoreBackend::for_data_dir(None).0, StoreBackend::Log);
+
+        let redb = tempfile::tempdir().unwrap();
+        drop(ReplicaState::open_store_with(redb.path(), 1, StoreBackend::Redb, 4096).unwrap());
+        assert_eq!(
+            StoreBackend::for_data_dir(Some(redb.path())).0,
+            StoreBackend::Redb,
+            "an existing redb store is kept: an upgrade changes nothing on disk"
+        );
+        assert!(
+            redb.path().join(super::super::shard_file_name(0)).exists()
+                || redb.path().join(super::super::R_LEGACY_FILE).exists(),
+            "and nothing was imported or renamed"
+        );
+
+        let log = tempfile::tempdir().unwrap();
+        drop(ReplicaState::open_store_with(log.path(), 1, StoreBackend::Log, 4096).unwrap());
+        assert_eq!(
+            StoreBackend::for_data_dir(Some(log.path())).0,
+            StoreBackend::Log
+        );
+    }
+
     #[test]
     fn a_torn_last_batch_reopens_to_the_state_before_it() {
         let dir = tempfile::tempdir().unwrap();

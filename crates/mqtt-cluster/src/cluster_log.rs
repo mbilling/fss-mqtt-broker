@@ -57,6 +57,29 @@ pub enum StoreBackend {
     Log,
 }
 
+impl StoreBackend {
+    /// The store a node opens when `MQTTD_REPLICA_STORE` is unset (ADR 0078, the
+    /// 1.3.0 default): the segment log for a FRESH data dir, and whatever a data dir
+    /// already holds otherwise. An existing redb store is KEPT, not imported, so an
+    /// upgrade from 1.2 changes nothing on disk and stays rollback-safe; setting
+    /// `MQTTD_REPLICA_STORE=log` migrates it, once. Returns the choice and why.
+    #[must_use]
+    pub fn for_data_dir(dir: Option<&Path>) -> (Self, &'static str) {
+        match dir {
+            None => (Self::Log, "no data dir: the replica store is in memory"),
+            Some(d) if d.join(replica_log::LOG_DIR).exists() => {
+                (Self::Log, "the data dir holds a segment-log store")
+            }
+            Some(d) if !ReplicaState::redb_is_fresh(d) => (
+                Self::Redb,
+                "the data dir holds a redb store, which is kept; set MQTTD_REPLICA_STORE=log \
+                 to import it into the segment log (once; there is no conversion back)",
+            ),
+            Some(_) => (Self::Log, "a fresh data dir: the segment log (ADR 0078)"),
+        }
+    }
+}
+
 impl std::str::FromStr for StoreBackend {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
