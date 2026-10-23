@@ -202,9 +202,9 @@ On the calibration shape (`bench/scale/qos1-campaign/durable-calibrate-n3.env`,
 1. **The writer's hot path is not the limit.** At the most loaded durable rung,
    `summarize-curve.py`'s verdict is DISK-BOUND or NOT STORE-BOUND — never
    WRITER-BOUND (amended 2026-09-28, below).
-2. **Throughput follows the disk where the disk binds.** On a DISK-BOUND rung,
+2. ~~**Throughput follows the disk where the disk binds.** On a DISK-BOUND rung,
    durable appends per second across the three brokers track each broker's
-   barrier floor.
+   barrier floor.~~ **Dropped 2026-10-23** (below).
 3. **The knee moves.** The GREEN knee per node rises above the 2,000–6,000 msg/s
    bracket measured on redb.
 4. **Nothing is lost or reordered.** The existing durability and failover suites
@@ -245,6 +245,23 @@ with `C` the mean commit in ms. Three verdicts:
 Re-read under this verdict, both 2026-09-28 calibrations (redb, and the log
 store on the musl allocator) are WRITER-BOUND: work share up to 104% (commits
 overlap in the window).
+
+**Amendment, 2026-10-23: criterion 2 is dropped.** Decided by the maintainer. On the
+2026-10-21 run (`bench/scale/durable-knees-2026-10-21.md`), the log store's knee rung at
+3 nodes read DISK-BOUND, but the brokers' durable appends were even (38,626 to 41,118
+per second) across barrier floors 2.9× apart (996 to 2,906 per second). At 10 nodes it
+was the same: floors 751 to 2,863 per second, appends with no relation to them. The
+criterion cannot hold on this shape, whatever the store, for two reasons:
+
+- **Placement sets each broker's share of the writes.** A broker owns about 1/N of the
+  sessions and writes for them; a faster disk is not given more of them.
+- **Group commit absorbs a slower disk.** A slower flush gathers a deeper batch, so one
+  flush covers more appends and the slower broker keeps up with its share.
+
+What the criterion was for, that the store is not what limits throughput, is already
+asked by criterion 1, which the 2026-10-21 log-store arms meet (DISK-BOUND at 10 and 3
+nodes, disks at most 42% and 34% utilised, no broker WRITER-BOUND). The default changes
+on criteria 1, 3, 4 and 5.
 
 ## Consequences
 
