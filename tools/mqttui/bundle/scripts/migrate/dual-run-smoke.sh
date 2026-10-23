@@ -46,6 +46,15 @@ command -v mosquitto_sub >/dev/null || { echo "FATAL: mosquitto_sub is not insta
 WORK="$(mktemp -d)"
 PIDS=()
 cleanup() {
+  rc=$?
+  # A failed assertion is only diagnosable from the brokers' side of it: print the
+  # logs before they are deleted (CI keeps nothing else).
+  if [[ $rc -ne 0 ]]; then
+    for f in mqttd.log bridge.log legacy.log; do
+      [[ -s "$WORK/$f" ]] || continue
+      echo "  ── $f (last 60 lines) ──"; tail -60 "$WORK/$f" | sed 's/^/         /'
+    done
+  fi
   for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
   for p in "${PIDS[@]:-}"; do wait "$p" 2>/dev/null || true; done   # reap: an unreaped
   rm -rf "$WORK"                                                    # job prints "Terminated"
@@ -91,7 +100,7 @@ ok "a RETAINED message pre-exists on the incumbent (fleet/truck7/config)"
 
 # ── mqttd, empty, beside it ──────────────────────────────────────────────────────────
 MQTTD_PLAINTEXT_BIND="127.0.0.1:$MQTTD_PORT" MQTTD_HEALTH_BIND="127.0.0.1:$HPORT" \
-  MQTTD_DATA_DIR="$WORK/data" MQTTD_ALLOW_ANONYMOUS=1 RUST_LOG=warn \
+  MQTTD_DATA_DIR="$WORK/data" MQTTD_ALLOW_ANONYMOUS=1 RUST_LOG=info \
   "$MQTTD_BIN" > "$WORK/mqttd.log" 2>&1 &
 PIDS+=($!)
 for _ in $(seq 1 100); do
