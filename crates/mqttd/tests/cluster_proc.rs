@@ -304,25 +304,9 @@ async fn run_schedule(seed: u64) {
         proc.history.len()
     );
 
-    // ADR 0089 T3: run with write elision on, the schedule must actually have held
-    // and discharged deliveries, or its pass says nothing about elision. (Counters
-    // restart with a node, so this reads what the live nodes did since.)
-    if std::env::var("MQTTD_DURABLE_WRITE_ELISION_MS").is_ok_and(|v| v.trim() != "0") {
-        let mut elided = 0.0;
-        for node in &proc.nodes {
-            if let Some(body) = proc_common::http_get(node.health_addr, "/metrics").await {
-                elided += body
-                    .lines()
-                    .filter_map(|l| l.strip_prefix("mqttd_durable_elided_total "))
-                    .filter_map(|v| v.trim().parse::<f64>().ok())
-                    .sum::<f64>();
-            }
-        }
-        eprintln!("cluster_proc: seed {seed}: {elided} deliveries elided");
-        if elided <= 0.0 {
-            proc.fail("write elision is on, but no node discharged a held delivery");
-        }
-    }
+    // ADR 0089: this schedule's subscribers receive offline or inside a takeover
+    // window, so it holds nothing even with write elision on; a pass here is no
+    // evidence about elision. That is a_kill_of_the_owner_with_deliveries_held's job.
 
     // Tear the cluster down (SIGKILL — the dirs are temp).
     for node in &mut proc.nodes {
