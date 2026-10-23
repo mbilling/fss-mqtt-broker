@@ -142,6 +142,18 @@ fn stage_crossing(dir: &std::path::Path) -> (std::path::PathBuf, u64) {
     // `store_watch::scan` sums whichever it finds — so extending any ONE of them
     // moves the `replicas` total by exactly the same amount. Take the file the
     // broker actually created rather than assuming the layout.
+    // Since 1.3.0 a fresh data dir is a segment-log store (ADR 0078): one of its
+    // segments, which the watch counts the same way.
+    let first_segment = || {
+        let shards = dir.join(mqtt_cluster::cluster_log::replica_log::LOG_DIR);
+        std::fs::read_dir(shards).ok()?.flatten().find_map(|shard| {
+            std::fs::read_dir(shard.path())
+                .ok()?
+                .flatten()
+                .map(|e| e.path())
+                .find(|p| p.is_file())
+        })
+    };
     let path = [
         "replicas.redb".to_string(),
         mqtt_cluster::cluster_log::shard_file_name(0),
@@ -149,6 +161,7 @@ fn stage_crossing(dir: &std::path::Path) -> (std::path::PathBuf, u64) {
     .into_iter()
     .map(|name| dir.join(name))
     .find(|p| p.exists())
+    .or_else(first_segment)
     .expect("the broker created a replica store");
     let f = std::fs::OpenOptions::new()
         .write(true)

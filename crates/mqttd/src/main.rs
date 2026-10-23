@@ -2274,25 +2274,26 @@ async fn start_hub(
                 }
             }
         });
-        // ADR 0078: the replica store's engine. `redb` (the default) until the
-        // segment log's hardware evidence flips it; `log` imports an existing
+        // ADR 0078: the replica store's engine. Unset, a fresh data dir gets the
+        // segment log and an existing store keeps its engine (1.3.0): an upgrade from
+        // 1.2 changes nothing on disk. `MQTTD_REPLICA_STORE=log` imports an existing
         // redb store once, and there is no way back from it.
-        let replica_store = match std::env::var("MQTTD_REPLICA_STORE") {
-            Ok(v) => v
+        let replica_store = if let Ok(v) = std::env::var("MQTTD_REPLICA_STORE") {
+            let chosen = v
                 .parse::<mqtt_cluster::cluster_log::StoreBackend>()
                 .unwrap_or_else(|e| {
                     tracing::error!("MQTTD_REPLICA_STORE: {e}");
                     std::process::exit(2);
-                }),
-            Err(_) => mqtt_cluster::cluster_log::StoreBackend::Redb,
-        };
-        if replica_store == mqtt_cluster::cluster_log::StoreBackend::Log {
-            tracing::warn!(
-                "MQTTD_REPLICA_STORE=log: the replica store is the append-only segment log \
-                 (ADR 0078). EXPERIMENTAL until its evidence is in; an existing redb store \
-                 is imported once and there is no conversion back"
+                });
+            info!(store = ?chosen, "replica store set by MQTTD_REPLICA_STORE (ADR 0078)");
+            chosen
+        } else {
+            let (chosen, why) = mqtt_cluster::cluster_log::StoreBackend::for_data_dir(
+                data_dir.as_deref().map(Path::new),
             );
-        }
+            info!(store = ?chosen, "replica store (ADR 0078): {why}");
+            chosen
+        };
         // ADR 0080: set while every member can apply the lease group's
         // replication-factor commands. The hub keeps it current; the lease leader
         // reads it before founding a fresh cluster's factor.
@@ -3140,14 +3141,15 @@ fn wire_hub(
     hub.set_subscriber_limits(subscriber_limits_from_config(config)?);
     // ADR 0072: per-message durability tiers, only under the operator's opt-in.
     hub.set_allow_relaxed_publish(config.durable.allow_relaxed_publish);
-    // ADR 0089: write elision on the durable QoS 1 path, off unless a window is set.
+    // ADR 0089: write elision on the durable QoS 1 path (50 ms by default since 1.3.0;
+    // 0 turns it off).
     hub.set_write_elision_ms(config.durable.write_elision_ms);
     if config.durable.write_elision_ms > 0 {
-        warn!(
+        info!(
             window_ms = config.durable.write_elision_ms,
-            "EXPERIMENTAL: durable write elision is on (ADR 0089): a QoS 1 delivery to an \
-             online persistent subscriber is sent before it is written, and written only if \
-             the subscriber does not acknowledge it within the window"
+            "durable write elision (ADR 0089): a QoS 1 delivery to an online persistent \
+             subscriber is sent at once and written only if the subscriber does not \
+             acknowledge it within the window; durable.write_elision_ms = 0 turns it off"
         );
     }
     hub.set_end_sessions_at_cert_expiry(config.tls.end_sessions_at_cert_expiry);

@@ -218,9 +218,9 @@ does not reproduce under a controlled harness.
 replicas carried 122,594 msg/s at most against 104,716 for 3. Measured 2026-09-30
 on an unreleased build of main ([0080-replicas-ab-n3.md](bench/scale/0080-replicas-ab-n3.md)).
 
-**Write elision** (ADR 0089, `durable.write_elision_ms`, off by default; 50 ms is planned as
-the 1.3.0 default): a delivery to an online persistent subscriber goes out at once and is
-written only if its PUBACK does not arrive inside the window. The publisher's ack then waits
+**Write elision** (ADR 0089, `durable.write_elision_ms`, 50 ms by default from 1.3.0): a
+delivery to an online persistent subscriber goes out at once and is written only if its
+PUBACK does not arrive inside the window. The publisher's ack then waits
 for the subscriber's PUBACK **or** fsync + replication, whichever comes first, so an
 acknowledged message is still never lost. On 3 nodes at 60,000 msg/s, a 50 ms window kept
 98% of deliveries off the disk and cut p99 from ≤ 500 ms to ≤ 25 ms

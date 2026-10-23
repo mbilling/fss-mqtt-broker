@@ -184,10 +184,11 @@ def render(env_vars: list[str], toml_keys: dict[str, str], docs: dict[str, str])
             continue
         if var == "MQTTD_REPLICA_STORE":
             desc = (
-                f"{why}. Source: `{where}`. `redb` (default) or `log` — the replica store's "
-                "engine (ADR 0078). `log` is the append-only segment log, EXPERIMENTAL until "
-                "its hardware evidence is in: it imports an existing redb store once (the redb "
-                "files are kept as `*.imported`) and there is no conversion back."
+                f"{why}. Source: `{where}`. `log` or `redb` — the replica store's engine "
+                "(ADR 0078). Unset (the default since 1.3.0), a fresh data dir gets `log`, the "
+                "append-only segment log, and a data dir that already holds a store keeps it, so "
+                "an upgrade changes nothing on disk. `log` on a redb data dir imports it once "
+                "(the redb files are kept as `*.imported`) and there is no conversion back."
             )
         elif var == "MQTTD_REPLICATION_OVERLAP":
             desc = (
