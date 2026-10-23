@@ -51,6 +51,9 @@ if os.path.basename(sys.argv[0]) == "hcloud" and os.getenv("LEAK_GROUPS") == "1"
     if sys.argv[1:3] == ["placement-group", "list"]:
         print("501 mqttd-bench-brokers 10 spread\\n502 mqttd-bench-brokers-b 4 spread")
     sys.exit(0)
+# The label audit's listings: an empty answer, or an unreachable API.
+if os.path.basename(sys.argv[0]) == "hcloud" and sys.argv[2:3] == ["list"]:
+    sys.exit(77 if os.getenv("FAIL_LIST") == "1" else 0)
 # Stop before output/bootstrap, but let the EXIT trap exercise destroy.
 sys.exit(77 if "apply" in sys.argv or os.path.basename(sys.argv[0]) in ("hcloud", "ssh") else 0)
 '''
@@ -66,6 +69,9 @@ sys.exit(77 if "apply" in sys.argv or os.path.basename(sys.argv[0]) in ("hcloud"
             # lane E waits for a stable full mesh before its control; the fakes
             # report one from the first scrape, so do not sleep between rounds.
             "MESH_POLL_SECS": "0",
+            # teardown.sh waits between destroy and audit retries; the fakes
+            # answer at once, so the waits only slow the suite.
+            "TEARDOWN_RETRY_SECS": "0",
             # The driver gate and the swap hook need real hosts to burst and a
             # tofu to replace them with; test-resize.py drives both against
             # scripted hosts. Here they would only fail on the fakes' silence.
@@ -477,6 +483,24 @@ with_cpu_sampling "$3" work
         self.assertEqual(calls[0], ["tofu", str(self.rig / "terraform"),
                                    ["destroy", "-auto-approve", "-var", "node_count=1"]])
         self.assertTrue(all(c[0] == "hcloud" for c in calls[1:]), calls)
+
+    def test_teardown_retries_a_failed_destroy(self):
+        (self.rig / "terraform/terraform.tfstate").write_text("{}")
+        result = self.run_script("teardown.sh", HCLOUD_TOKEN="dummy", FAIL_DESTROY="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        destroys = [c for c in self.calls() if c[0] == "tofu" and "destroy" in c[2]]
+        self.assertEqual(len(destroys), 3, self.calls())
+        self.assertIn("destroy failed 3 times", result.stderr)
+
+    def test_teardown_audit_that_cannot_reach_the_api_fails(self):
+        # 2026-10-23: DNS went away, every listing failed into an empty answer,
+        # and "nothing leaked" was printed over 30 running servers.
+        result = self.run_script("teardown.sh", HCLOUD_TOKEN="dummy", FAIL_LIST="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could NOT reach the Hetzner API", result.stderr)
+        self.assertNotIn("nothing leaked", result.stderr + result.stdout)
+        lists = [c for c in self.calls() if c[0] == "hcloud" and c[2][1:2] == ["list"]]
+        self.assertEqual(len(lists), 5 * 5, lists)
 
     def test_non_default_ssh_key_is_passed_on_apply_and_every_destroy(self):
         key = self.root / "hetzner"
