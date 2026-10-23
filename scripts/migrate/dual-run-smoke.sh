@@ -184,11 +184,19 @@ ok "2. mqttd -> incumbent: a QoS 1 publish crosses outbound (a moved client can 
 # re-sync runs in BOTH directions on every reconnect, so a retained value deleted while the
 # bridge is down is RESURRECTED from the other side. Assertion 6 below pins the mitigation
 # (prune with the bridge UP and the tombstone crosses).
-mosquitto_sub -h 127.0.0.1 -p "$MQTTD_PORT" -t 'fleet/truck7/config' -C 1 -W 8 > "$WORK/ret.txt" 2>&1 || true
+# On the CI runners the re-sync has missed one 8 s subscribe (2 of 4 runs on
+# 2026-10-23, never locally, cause not yet known): poll with fresh subscribers for
+# up to 30 s and print how long it took, so a slow re-sync reads as slow and a lost
+# one as lost — with the brokers' logs printed on failure.
+T0=$SECONDS
+for _ in 1 2 3 4 5 6; do
+  mosquitto_sub -h 127.0.0.1 -p "$MQTTD_PORT" -t 'fleet/truck7/config' -C 1 -W 5 > "$WORK/ret.txt" 2>&1 || true
+  grep -q 'interval=30' "$WORK/ret.txt" && break
+done
 grep -q 'interval=30' "$WORK/ret.txt" \
-  || { echo "  FAIL — the incumbent's RETAINED message did not cross to mqttd. Got:";
+  || { echo "  FAIL — the incumbent's RETAINED message did not cross to mqttd within $((SECONDS - T0)) s. Got:";
        sed 's/^/         /' "$WORK/ret.txt"; exit 1; }
-ok "3. RETAINED state crossed on its own and is retained on mqttd (a fresh subscriber gets it)"
+ok "3. RETAINED state crossed on its own and is retained on mqttd (a fresh subscriber gets it; $((SECONDS - T0)) s after asking)"
 
 # ── 4. a `both` rule does not amplify INBOUND (mqttd's own No Local) ─────────────────
 # Publish on the incumbent, count on mqttd. If the loop were open, the message would go
