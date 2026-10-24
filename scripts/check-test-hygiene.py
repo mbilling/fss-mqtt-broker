@@ -2405,6 +2405,22 @@ IGNORE_ALLOWLIST: dict[str, tuple[str, str | None]] = {
         "the next reconnect",
         None,
     ),
+    # Two known defects of the same issue, asserted as the behaviour its fix (0087-T5, D8)
+    # must have, so they fail on main by design. No tier runs them until the fix lands;
+    # the fix removes the `#[ignore]`s and these entries together. The control of the
+    # second, in the same file, passes and runs in every tier.
+    "crates/mqttd/tests/false_dead_delivery.rs::durable_a_publish_held_past_the_countdown_is_delivered_when_the_link_returns": (
+        "known defect #973: in durable mode a node that holds a live member dead and cannot "
+        "reach it for eight sweep ticks acknowledges the QoS 1 publishes it holds for that "
+        "member's subscribers (`hold-expired`), and when the link returns they are not delivered",
+        None,
+    ),
+    "crates/mqttd/tests/false_dead_delivery.rs::durable_a_new_subscription_elsewhere_does_not_take_what_a_peer_held_dead_is_owed": (
+        "known defect #973: in durable mode any subscription matching the topic that appears "
+        "on another node discharges what a member wrongly held dead is owed, so the publisher "
+        "is acknowledged and the member's subscriber never receives the publish",
+        None,
+    ),
     "crates/mqtt-cluster/tests/swim_formation_sim.rs::formation_report": (
         "measurement, not a pass/fail: it prints what a signed-gossip formation does at seven "
         "sizes on v1.1.0's rules, with each cause removed in turn, on this tree and in mixed "

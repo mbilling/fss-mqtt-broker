@@ -2617,11 +2617,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `publish_reaches_matching_subscriber`
 - `qos1_publish_is_acked_and_downgraded`
 
-## `crates/mqttd/tests/false_dead_delivery.rs` — 12 test(s)
+## `crates/mqttd/tests/false_dead_delivery.rs` — 15 test(s)
 
 - `durable_a_follower_evictor_dials_and_a_durable_session_is_served`
 - `durable_a_leader_evictor_dials_the_lease_moves_and_sessions_follow_it`
+- `durable_a_new_subscription_elsewhere_does_not_take_what_a_peer_held_dead_is_owed` — `#[ignore]`d
 - `durable_a_peer_out_of_reach_is_answered_at_the_countdown_and_counted`
+- `durable_a_publish_held_past_the_countdown_is_delivered_when_the_link_returns` — `#[ignore]`d
+- `durable_a_publish_in_flight_at_a_verdict_is_delivered_when_the_link_returns`
 - `durable_an_owner_that_dies_holds_its_publishers_for_the_failover_not_for_confirmation`
 - `durable_the_evicted_peer_dials_the_link_returns_and_sessions_follow_the_lease`
 - `plain_a_false_verdict_keeps_publish_order_for_every_subscriber`
