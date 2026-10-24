@@ -1476,3 +1476,155 @@ async fn a_remap_ping_pong_within_one_bridge_is_stopped_by_no_local() {
 
     bridge.shutdown();
 }
+
+/// Issue #1100, the real mechanism: a message the router forwards toward a side **while
+/// that side is connecting** can be stranded in the side's spool for as long as the
+/// connection then stays up. The supervisor connects, drains the spool (`replay_spool`),
+/// and only then sets the side's `connected` flag; the router reads that flag and, on
+/// `false`, pushes into the same spool. A router that read `false` before the flag was set
+/// but reached the spool after the drain leaves its message there, and nothing drains a
+/// spool except the next reconnect. The source was already acknowledged (the spool is
+/// "durably accepted", ADR 0060 T2), so the source will never retry: the message is
+/// delivered only if the side happens to drop and reconnect, and lost if the bridge is
+/// replaced or its spool discarded.
+///
+/// This is what `scripts/migrate/dual-run-smoke.sh` step 3 caught in CI. The bridge's
+/// upstream side subscribed and received the incumbent's retained value in the same
+/// millisecond its local side connected to mqttd: the bridge logged it "forwarded across
+/// the boundary", mqttd never received a PUBLISH on that topic, and the bridge's own
+/// `fss_bridge_spool_depth{side="local"}` read 1 with `fss_bridge_connected{side="local"}
+/// 1` thirty seconds later. mqttd is not involved: the issue's first reading (a retained
+/// write lost between `/readyz` and the first ownership commit) does not reproduce
+/// against mqttd alone, at any offset from ready, on either store.
+///
+/// The CI race needs one message to land in a window a few microseconds to a few
+/// milliseconds wide (the drain holds the spool's lock across its fsync, and a router
+/// push that read `false` waits behind it). This test makes the window certain to be hit
+/// rather than lucky: the upstream streams messages the whole time the local side is
+/// down and coming up, so the router is pushing into the local spool at the instant the
+/// supervisor drains it. A multi-thread runtime is required — on a current-thread
+/// runtime the supervisor's drain-then-flag sequence has no await point and the router
+/// cannot interleave with it at all.
+///
+/// The assertion is the invariant a fix must restore, whatever its shape: once the side
+/// is connected and the stream has stopped, its spool empties. A message accepted for a
+/// connected side is either sent or still sent later; it never waits for a reconnect
+/// that may not come.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "known defect #1100: a forward that races the local side's connect is stranded in its spool until the next reconnect"]
+async fn a_message_spooled_while_its_side_connects_is_not_stranded_in_the_spool() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let upstream = start_broker().await;
+    // Reserve the local address and free it, so the local side starts DOWN and its
+    // connects are refused until the test serves a broker there.
+    let local_addr = TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let spool_dir = tempfile::tempdir().unwrap();
+    // The smoke's shape: an inbound QoS 1 rule over a disk spool, sharing off.
+    let cfg = BridgeConfig::parse_toml(&format!(
+        r#"
+        share_group = ""
+        [local]
+        url = "{local_addr}"
+        [spool]
+        dir = "{dir}"
+        max_messages = 100000
+        [[upstreams]]
+        name = "incumbent"
+        url = "{upstream}"
+        [[upstreams.rules]]
+        direction = "in"
+        filter = "t/#"
+        qos = 1
+        "#,
+        dir = spool_dir.path().display(),
+    ))
+    .unwrap();
+    let bridge = Bridge::start(cfg);
+    await_connected(&bridge, "incumbent").await;
+
+    // The stream: one message every millisecond until told to stop (or a hard bound), so
+    // the router is forwarding toward the local side at every instant of its connect.
+    let stop = Arc::new(AtomicBool::new(false));
+    let publisher = {
+        let stop = stop.clone();
+        let mut up_pub = client(upstream, "stream-pub").await;
+        tokio::spawn(async move {
+            let mut n = 0u64;
+            while !stop.load(Ordering::SeqCst) && n < 20_000 {
+                up_pub
+                    .publish(
+                        &format!("t/{n}"),
+                        Bytes::from(n.to_string()),
+                        QoS::AtMostOnce,
+                        false,
+                        None,
+                        Properties::new(),
+                    )
+                    .await
+                    .unwrap();
+                n += 1;
+                // SETTLE(bridge-connect-stream): the pause is the stream's RATE, not a wait
+                // for state — it spreads the messages across the local side's connect so one
+                // is in flight in the router whenever the supervisor drains the spool.
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            n
+        })
+    };
+    // Some of it is spooled while the local side is down — the ordinary path, replayed at
+    // connect — and the stream is still running when the side comes up.
+    await_spool_depth(&bridge, "local", 20).await;
+    serve_broker(TcpListener::bind(local_addr).await.unwrap());
+    await_connected(&bridge, "local").await;
+    // Keep streaming past the connect — until a hundred more messages have crossed inbound
+    // — then stop: everything after the flag goes live.
+    let crossed_at_connect = bridge.metrics().forwarded_in_count();
+    await_metrics(
+        &bridge,
+        "the stream never kept crossing after the local side connected",
+        |_| bridge.metrics().forwarded_in_count() >= crossed_at_connect + 100,
+    )
+    .await;
+    stop.store(true, Ordering::SeqCst);
+    let published = publisher.await.unwrap();
+
+    // The local side is connected and nothing more is arriving: its spool must empty.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let render = bridge.metrics().render();
+        let depth = spool_depth(&render, "local");
+        if depth == Some(0) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{depth:?} message(s) of the {published} streamed sit in the LOCAL spool while the \
+             local side is connected: the router spooled them after the supervisor's \
+             connect-time drain and before it set `connected`, and nothing drains a spool \
+             but the next reconnect (issue #1100). They were already acknowledged to the \
+             source, which will not resend them. The bridge's metrics:\n{render}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        render_connected(&bridge, "local"),
+        "the local side must still be connected: a reconnect would have drained the spool \
+         and hidden the defect"
+    );
+
+    bridge.shutdown();
+}
+
+/// Whether `side` currently reports `fss_bridge_connected 1`.
+fn render_connected(bridge: &Bridge, side: &str) -> bool {
+    bridge
+        .metrics()
+        .render()
+        .contains(&format!("fss_bridge_connected{{side=\"{side}\"}} 1"))
+}

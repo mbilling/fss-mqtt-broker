@@ -2395,6 +2395,16 @@ IGNORE_ALLOWLIST: dict[str, tuple[str, str | None]] = {
         "every QoS 1 publish no known session matches for as long as that key stays stuck",
         None,
     ),
+    # A known defect, asserted as the behaviour its fix must have, so it fails on main by
+    # design. No tier runs it until the fix lands; the fix removes the `#[ignore]` and this
+    # entry together.
+    "crates/mqtt-bridge/tests/engine.rs::a_message_spooled_while_its_side_connects_is_not_stranded_in_the_spool": (
+        "known defect #1100: a message the router forwards toward a side while that side is "
+        "connecting can be spooled after the supervisor's connect-time drain and before it sets "
+        "the side connected, and then waits in the spool, already acked to its source, until "
+        "the next reconnect",
+        None,
+    ),
     "crates/mqtt-cluster/tests/swim_formation_sim.rs::formation_report": (
         "measurement, not a pass/fail: it prints what a signed-gossip formation does at seven "
         "sizes on v1.1.0's rules, with each cause removed in turn, on this tree and in mixed "
