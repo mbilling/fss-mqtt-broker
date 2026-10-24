@@ -2284,7 +2284,7 @@ for row in (p/'endpoints.tsv').read_text().splitlines():
 MANIFEST
     { declare -p subs pubs scrape pollscrape pubscrape pause terminal ledger; } >"$rdir/commands.sh"
     if [ -n "${QOS1_DRIVER_ARCHIVE:-}" ]; then
-        qos1_clock_capture "$rdir/clock/preflight" || die "clock preflight failed"
+        lane_e_clock_capture "$rdir" preflight
     fi
 
 	# ── the broker must be demonstrably RESET before this rung (#534, acc. 6) ──
@@ -2522,7 +2522,7 @@ IMAGES
 		local phase="$1" i q host
 		local -a wp=()
         if [ -n "${QOS1_DRIVER_ARCHIVE:-}" ]; then
-            qos1_clock_capture "$rdir/clock/$phase" || die "clock health failed during $phase"
+            lane_e_clock_capture "$rdir" "$phase"
         fi
 		for ((i = 0; i < N; i++)); do
 			rssh "$(broker_pub_ip "$i")" "$mainpid; $stamp; curl -s -m 10 http://localhost:8080/metrics; $stamp" \
@@ -2863,7 +2863,7 @@ CONNFAIL
 	echo "connect_fail=${lane_e_connect_fail:-0}" >>"$rdir/rung.txt"
 	echo "sites=$sites offered=$((sites * LANE_E_SITE_RATE)) publishers=$((sites * LANE_E_PUBS_PER_SITE)) consumers=$((sites * LANE_E_SUBS_PER_SITE)) per_consumer=$((LANE_E_SITE_RATE / LANE_E_SUBS_PER_SITE)) p99_budget_ms=$LANE_E_P99_BUDGET_MS qos=$LANE_E_QOS sub_qos=$LANE_E_SUB_QOS window_secs=$LANE_E_SECS window=aligned cpu_window=$cpu_window settle_s=$((LANE_E_SETTLE + settle_waited)) settled=$settled settled_conns=$settled_conns expected_conns=$expect_conns steady=$steady steady_s=$steady_s steady_reason=$steady_reason drained=$drained drain_secs=$drain_secs drain_deadline_s=$LANE_E_DRAIN_SECS control=$is_control reset=$reset reset_conns=$reset_conns reset_sessions=$reset_sessions session_expiry=$LANE_E_SESSION_EXPIRY durable=$([ "$LANE_E_SESSION_EXPIRY" -gt 0 ] && echo yes || echo no)" >"$rdir/rung.txt"
     if [ -n "${QOS1_DRIVER_ARCHIVE:-}" ]; then
-        qos1_clock_capture "$rdir/clock/final" || die "clock health failed after drain"
+        lane_e_clock_capture "$rdir" final
     fi
 	if [ -f "$rdir/perf/.collect" ]; then
 		rm -f "$rdir/perf/.collect"
@@ -3242,6 +3242,20 @@ spec.loader.exec_module(m)
 r = m.lane_e_rung(pathlib.Path(sys.argv[1]))
 print(m.rung_verdict(r))
 PY
+}
+
+# lane_e_clock_capture <rdir> <phase>: the rung's clock evidence for one phase.
+# A clock past its bound makes THIS rung's latency unreadable, not the run: the
+# reason is appended to clock-invalid.txt, the extractor refuses the phase, and
+# summarize-curve.py grades the rung INVALID EVIDENCE, which the stop rule counts
+# as neither pass nor fail. On 2026-10-23 one broker's chrony reported 5.8 ms
+# under a heavy rung (budget 5 ms) and the die here ended a 10-node run mid-ladder.
+lane_e_clock_capture() {
+	local rdir="$1" phase="$2" why
+	qos1_clock_capture "$rdir/clock/$phase" && return 0
+	why=$(tail -n 1 "$rdir/clock/$phase/check.err" 2>/dev/null)
+	printf '%s: %s\n' "$phase" "${why:-the clock capture failed}" >>"$rdir/clock-invalid.txt"
+	warn "lane E: $(basename "$rdir"): clock health failed at $phase — the rung is graded INVALID EVIDENCE, the run continues (${why:-no detail})"
 }
 
 # lane_e_fails_after <fails> <verdict>: the ladder's count of consecutive

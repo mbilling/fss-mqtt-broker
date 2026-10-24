@@ -42,6 +42,48 @@ done
     return [int(c) for c in out if c != "stop"], stopped, r
 
 
+class ClockCaptureTests(unittest.TestCase):
+    """A clock past its bound grades the rung; it does not end the run."""
+
+    def capture(self, ok):
+        import tempfile
+        src = (SCALE / "run-curve.sh").read_text()
+        with tempfile.TemporaryDirectory() as td:
+            rdir = Path(td) / "sites-17"
+            body = f'''
+set -euo pipefail
+warn() {{ echo "WARN $*" >&2; }}
+die() {{ echo "DIED $*" >&2; exit 9; }}
+qos1_clock_capture() {{
+	mkdir -p "$1"
+	[ "{int(ok)}" = 1 ] && return 0
+	echo "broker3: error bound 5.812 ms > 5 ms" >"$1/check.err"; return 1
+}}
+{shell_fn(src, "lane_e_clock_capture")}
+lane_e_clock_capture "{rdir}" close
+echo continued
+'''
+            r = subprocess.run(["bash", "-c", body], text=True, capture_output=True)
+            note = rdir / "clock-invalid.txt"
+            return r, note.read_text() if note.exists() else None
+
+    def test_a_breach_is_recorded_and_the_run_continues(self):
+        r, note = self.capture(ok=False)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("continued", r.stdout)
+        self.assertNotIn("DIED", r.stderr)
+        self.assertEqual(note, "close: broker3: error bound 5.812 ms > 5 ms\n")
+
+    def test_a_healthy_clock_leaves_no_note(self):
+        r, note = self.capture(ok=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNone(note)
+
+    def test_no_clock_gate_dies_mid_run(self):
+        src = (SCALE / "run-curve.sh").read_text()
+        self.assertNotRegex(src, r"qos1_clock_capture[^\n]*\|\|\s*die")
+
+
 class FailsAfterTests(unittest.TestCase):
     def check(self, verdicts, counts, stopped, stop_after=2):
         # Whatever bash is first on PATH, and /bin/bash (3.2 on macOS) when it
@@ -72,6 +114,11 @@ class FailsAfterTests(unittest.TestCase):
     def test_any_other_flag_beside_invalid_evidence_counts(self):
         self.check(["NOT CARRIED: INVALID EVIDENCE (x); NOT STEADY (y)", "NOT CARRIED: INVALID EVIDENCE (x); PUBLISHERS LATE (9%)"],
                    [1, 2], True)
+
+    def test_a_clock_breach_is_neutral(self):
+        # The verdict summarize-curve.py gives a rung with clock-invalid.txt.
+        clock = "NOT CARRIED: INVALID EVIDENCE (clock health failed: close: broker3 error bound 5.812 ms > 5 ms, root dispersion)"
+        self.check(["RED", clock, clock, "RED"], [1, 1, 1, 2], True)
 
     def test_a_pause_incomplete_rung_counts_as_a_fail(self):
         # 2026-10-21: withheld acknowledgements used to end the run; now they grade the rung.

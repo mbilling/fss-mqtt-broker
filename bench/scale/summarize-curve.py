@@ -1135,6 +1135,19 @@ def self_test() -> None:
                 or not rung_verdict(r).startswith("NOT CARRIED"):
             failures.append(f"a rung whose publishers could not pause was not NOT CARRIED: {rung_verdict(r)}")
 
+        # 11c. A CLOCK past its bound during the rung (2026-10-23: 5.8 ms against
+        #      a 5 ms budget, under load) makes the rung's latency unreadable:
+        #      INVALID EVIDENCE alone, so the stop rule counts it as neither.
+        d = lane_e_fixture(
+            root, "sites-4-clock", offered=30_000, sent=30_000, recv=30_000, late=0,
+            drained="yes", settled=30_000 * 70, broker=clean_broker)
+        (d / "clock-invalid.txt").write_text("close: broker3 error bound 5.812 ms > 5 ms; root dispersion\n")
+        r = lane_e_rung(d)
+        v = rung_verdict(r)
+        if r["carried"] or r["failed"] or not v.startswith("NOT CARRIED: INVALID EVIDENCE (clock health failed: close") \
+                or v.count(";") or "5.812 ms" not in v:
+            failures.append(f"a rung whose clock broke its bound was not NOT CARRIED: INVALID EVIDENCE alone: {v}")
+
         # 12. FAILED CONTROLS make the whole TRIAL inconclusive — not the control
         #     rung alone. These are ladder-level rules, so they run against
         #     `lane_e_ladder` directly.
@@ -1691,6 +1704,14 @@ def lane_e_rung(rdir: Path) -> dict:
 
     flags = []
     if evidence_error: flags.append("INVALID EVIDENCE (" + evidence_error + ")")
+    # The rig's own record of a clock past its bound (run-curve.sh records it and
+    # goes on). The extractor re-validates the raw reports and normally refuses
+    # the same phase; this keeps the rung uncarried even when it did not.
+    clock_note = rdir / "clock-invalid.txt"
+    if clock_note.exists() and not evidence_error:
+        flags.append("INVALID EVIDENCE (clock health failed: "
+                     + (" / ".join(l for l in clock_note.read_text().splitlines() if l.strip()) or "no detail")
+                     .replace(";", ",") + ")")
     if evidence and evidence.get("telemetry") and not evidence["telemetry"]["queues_bounded"]:
         flags.append("QUEUE GROWTH OR BACKLOG BUDGET EXCEEDED")
     # A failed gate excludes a capacity point; it does not identify the cause.
@@ -1967,7 +1988,7 @@ def lane_e_rung(rdir: Path) -> dict:
             + "; this rung measured the routing path)"
         )
     failed = any(f.startswith("LOSS") for f in flags)
-    carried = not failed and pause_ok and not any(f.startswith("NOT DURABLE") for f in flags) and _lane_e_carried(
+    carried = not failed and pause_ok and not any(f.startswith(("NOT DURABLE", "INVALID EVIDENCE")) for f in flags) and _lane_e_carried(
         offer_met, delivered, late_share, settled_ok, reset_ok, core_ok, steady, qos, sub_qos,
         completed, bounds, dropped, deliv_by_qos, evidence, drained, recv_rate, offered, sites)
     return {
