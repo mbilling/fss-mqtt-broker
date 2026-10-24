@@ -2386,6 +2386,15 @@ IGNORE_ALLOWLIST: dict[str, tuple[str, str | None]] = {
         "asserted by `the_sweep_retransmits_only_overdue_forwards`, which every tier runs",
         None,
     ),
+    # A known defect, asserted as the behaviour its fix must have, so it fails on main by
+    # design. No tier runs it until the fix lands; the fix removes the `#[ignore]` and this
+    # entry together. Its two controls in the same file pass and run in every tier.
+    "crates/mqttd/src/lib.rs::hub::tests::unreadable_session::a_stuck_session_does_not_hold_the_ack_of_a_publish_no_session_matches": (
+        "known defect #1049: one durable session the node owns and cannot read (NoQuorum on "
+        "every read) keeps every session scan incomplete, and the node holds the PUBACK of "
+        "every QoS 1 publish no known session matches for as long as that key stays stuck",
+        None,
+    ),
     "crates/mqtt-cluster/tests/swim_formation_sim.rs::formation_report": (
         "measurement, not a pass/fail: it prints what a signed-gossip formation does at seven "
         "sizes on v1.1.0's rules, with each cause removed in turn, on this tree and in mixed "

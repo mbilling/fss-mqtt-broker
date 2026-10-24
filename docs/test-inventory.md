@@ -1470,7 +1470,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 854 test(s)
+## `crates/mqttd/src/lib.rs` — 857 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -2111,6 +2111,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::truncate_flusher::every_busy_session_is_flushed_in_turn`
 - `hub::tests::two_groups_on_one_filter_rotate_independently`
 - `hub::tests::two_publishes_to_one_offline_subscriber_append_in_arrival_order`
+- `hub::tests::unreadable_session::a_held_ack_is_released_once_the_stuck_session_reads_again`
+- `hub::tests::unreadable_session::a_stuck_session_does_not_hold_the_ack_of_a_publish_no_session_matches` — `#[ignore]`d
+- `hub::tests::unreadable_session::a_stuck_session_does_not_hold_the_ack_of_a_publish_that_reached_a_live_subscriber`
 - `hub::tests::while_draining_a_rule_derived_forward_holds_the_barrier_until_the_peer_answers`
 - `hub::tests::without_no_local_a_publisher_receives_its_own_delivery`
 - `ingress::tests::credit_is_returned_when_the_permit_drops_and_the_cap_bounds_one_connection`
