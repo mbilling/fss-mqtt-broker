@@ -272,4 +272,15 @@ spec:
           annotations:
             summary: A certificate, CA or CRL is about to expire or has expired.
             runbook: docs/OPERATIONS.md#alert-tls-material-nearing-expiry
+        - alert: MqttdDurableSessionQuarantined
+          # Issue #1049. The node quarantines a session only after two minutes of scans
+          # that could not read it, so the rule needs no `for:` of its own. While one is
+          # quarantined, publishes only its unread subscriptions match are acked and not
+          # stored for it: page.
+          expr: mqttd_sessions_quarantined > 0
+          labels:
+            severity: page
+          annotations:
+            summary: A durable session this node owns cannot be read and is quarantined; publishes for its unread subscriptions are not stored.
+            runbook: docs/OPERATIONS.md#alert-durable-session-quarantined
 {{- end }}

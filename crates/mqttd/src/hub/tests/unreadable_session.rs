@@ -28,6 +28,7 @@ use mqtt_core::Subscription;
 use mqtt_storage::logged::ReplicatedSessionStore;
 use mqtt_storage::repl::{LogEntry, ReplError, ReplicatedLog};
 use mqtt_storage::Offset;
+use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 
 /// The session whose group cannot be recovered.
@@ -52,6 +53,9 @@ const BOUND_TICKS: u32 = 10 * EXPIRY_RECONCILE_EVERY;
 struct StuckLog {
     inner: Arc<InMemoryReplicatedLog>,
     stuck: Arc<Mutex<HashSet<String>>>,
+    /// While set, the key listing itself fails: the whole enumeration errors,
+    /// which the hub reports as the `<every session>` placeholder.
+    keys_fail: Arc<AtomicBool>,
 }
 
 impl StuckLog {
@@ -109,6 +113,9 @@ impl ReplicatedLog for StuckLog {
     }
 
     async fn keys(&self) -> Result<Vec<String>, ReplError> {
+        if self.keys_fail.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(ReplError::NoQuorum);
+        }
         self.inner.keys().await
     }
 }
@@ -168,37 +175,99 @@ impl Warnings {
 /// Returns the hub and the set of keys the log refuses, so a test can let the key
 /// recover.
 async fn stuck_fixture() -> (Hub, Arc<Mutex<HashSet<String>>>) {
+    let fix = fixture(&[STUCK], true).await;
+    (fix.hub, fix.stuck)
+}
+
+/// What [`fixture`] builds: the hub, the fault switches, and the two operator
+/// surfaces the quarantine is published on.
+struct Fixture {
+    hub: Hub,
+    /// The keys the log refuses.
+    stuck: Arc<Mutex<HashSet<String>>>,
+    /// Fail the key listing itself.
+    keys_fail: Arc<AtomicBool>,
+    /// The `/statusz` mirror the hub writes.
+    quarantine: Arc<crate::health::SessionQuarantine>,
+    metrics: Arc<mqtt_observability::metrics::Metrics>,
+}
+
+/// The general form of [`stuck_fixture`]: one stored persistent session per name in
+/// `clients`, each subscribed to `{name}/#`, whose keys are refused from the start
+/// when `armed` (or once a test arms them).
+async fn fixture(clients: &[&str], armed: bool) -> Fixture {
     let log = Arc::new(InMemoryReplicatedLog::new());
     let seed = ReplicatedSessionStore::new(log.clone());
-    let stuck = ClientId(STUCK.into());
-    seed.ensure_session(&stuck).await.unwrap();
-    seed.set_subscriptions(
-        &stuck,
-        &[Subscription {
-            filter: "stuck/#".into(),
-            max_qos: QoS::AtLeastOnce,
-            no_local: false,
-            sub_id: None,
-        }],
-    )
-    .await
-    .unwrap();
-    let keys = log.keys().await.unwrap();
+    let mut keys = HashSet::new();
+    for name in clients {
+        let client = ClientId((*name).into());
+        seed.ensure_session(&client).await.unwrap();
+        seed.set_subscriptions(
+            &client,
+            &[Subscription {
+                filter: format!("{name}/#"),
+                max_qos: QoS::AtLeastOnce,
+                no_local: false,
+                sub_id: None,
+            }],
+        )
+        .await
+        .unwrap();
+        keys.insert(format!("m/{name}"));
+        keys.insert(format!("q/{name}"));
+    }
+    let stored = log.keys().await.unwrap();
     assert!(
-        keys.contains(&format!("m/{STUCK}")),
-        "fixture invariant: the stuck session is stored ({keys:?})"
+        clients.iter().all(|n| stored.contains(&format!("m/{n}"))),
+        "fixture invariant: the stuck sessions are stored ({stored:?})"
     );
-    let stuck_keys = Arc::new(Mutex::new(HashSet::from([
-        format!("m/{STUCK}"),
-        format!("q/{STUCK}"),
-    ])));
+    let stuck_keys = Arc::new(Mutex::new(if armed { keys } else { HashSet::new() }));
+    let keys_fail = Arc::new(AtomicBool::new(false));
     let store = ReplicatedSessionStore::new(StuckLog {
         inner: log,
         stuck: stuck_keys.clone(),
+        keys_fail: keys_fail.clone(),
     });
     let (mut hub, _tx) = Hub::with_config(NodeId("stuck-node".into()), Arc::new(store));
     hub.set_cluster_configured();
-    (hub, stuck_keys)
+    let quarantine = Arc::new(crate::health::SessionQuarantine::default());
+    hub.attach_session_quarantine(quarantine.clone());
+    let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("stuck-node"));
+    hub.attach_metrics(metrics.clone());
+    Fixture {
+        hub,
+        stuck: stuck_keys,
+        keys_fail,
+        quarantine,
+        metrics,
+    }
+}
+
+/// Arm (`true`) or clear (`false`) the fault on `clients`' keys.
+fn set_stuck(stuck: &Mutex<HashSet<String>>, clients: &[&str], on: bool) {
+    let mut keys = stuck
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for name in clients {
+        for key in [format!("m/{name}"), format!("q/{name}")] {
+            if on {
+                keys.insert(key);
+            } else {
+                keys.remove(&key);
+            }
+        }
+    }
+}
+
+/// The `mqttd_sessions_quarantined` value the hub's next gauge refresh exports.
+async fn quarantined_gauge(fix: &Fixture) -> String {
+    fix.hub.refresh_gauges().await;
+    fix.metrics
+        .render()
+        .lines()
+        .find(|l| l.starts_with("mqttd_sessions_quarantined "))
+        .map(str::to_string)
+        .unwrap_or_default()
 }
 
 /// One sweep tick, and the scan it spawned (if any) landed — the real scan, read
@@ -335,11 +404,12 @@ async fn a_held_ack_is_released_once_the_stuck_session_reads_again() {
 /// quarantine should also show on `/statusz` is the fix's call — `/readyz` is out
 /// of scope by decision (an incomplete scan is not made not-ready).
 ///
-/// Fails on main: every scan lands `complete = false` on the stuck key,
-/// `last_scan_complete` never turns true, and the ack is still held after
-/// [`BOUND_TICKS`] ticks.
+/// Failed before the fix: every scan landed `complete = false` on the stuck key,
+/// `last_scan_complete` never turned true, and the ack was still held after
+/// [`BOUND_TICKS`] ticks. Since the fix (`hub/quarantine.rs`) the stuck session is
+/// quarantined after two minutes of failed scans, named at WARN, and the scan
+/// counts as complete.
 #[tokio::test]
-#[ignore = "known defect #1049: one unreadable owned session holds every unmatched QoS 1 ack"]
 async fn a_stuck_session_does_not_hold_the_ack_of_a_publish_no_session_matches() {
     let warnings = Warnings::default();
     let _log = warnings.capture();
@@ -361,6 +431,216 @@ async fn a_stuck_session_does_not_hold_the_ack_of_a_publish_no_session_matches()
         hub.takeover_reconcile_ticks,
         hub.routing_unsettled(),
     );
+    assert!(
+        hub.quarantined_sessions
+            .contains_key(&ClientId(STUCK.into())),
+        "the ack came because the stuck session is quarantined, not by some other path"
+    );
+    let text = warnings.text();
+    assert!(
+        text.contains("durable session QUARANTINED") && text.contains("client=stuck"),
+        "the quarantine names the session at WARN; logged:\n{text}"
+    );
+}
+
+/// **Quarantine clears when the key reads again**, and the session is then served
+/// as any other: the clearing scan materialises its subscriptions, a publish to
+/// them is stored for it, and both operator surfaces drop it.
+///
+/// On the way, the stated residual (`hub/quarantine.rs`): while quarantined, a
+/// publish whose only match is a subscription of the session this node never read
+/// is acked `Accepted` and not stored for it — the cost the issue accepts, since
+/// its queue refuses the append anyway.
+#[tokio::test]
+async fn a_quarantine_is_lifted_once_the_session_reads_again() {
+    let warnings = Warnings::default();
+    let _log = warnings.capture();
+    let mut fix = fixture(&[STUCK], true).await;
+    boot_until_the_first_scan_lands(&mut fix.hub, &warnings).await;
+    let stuck = ClientId(STUCK.into());
+
+    let mut ticks = 0;
+    while !fix.hub.quarantined_sessions.contains_key(&stuck) && ticks < BOUND_TICKS {
+        tick(&mut fix.hub).await;
+        ticks += 1;
+    }
+    assert!(
+        fix.hub.quarantined_sessions.contains_key(&stuck),
+        "not quarantined within {BOUND_TICKS} ticks"
+    );
+    assert!(
+        ticks >= super::super::quarantine::QUARANTINE_AFTER_TICKS - EXPIRY_RECONCILE_EVERY,
+        "quarantined after {ticks} ticks: sooner than the two minutes a transient \
+         recovery is given"
+    );
+    assert!(fix.hub.last_scan_complete && !fix.hub.routing_unsettled());
+    let (count, listed) = fix.quarantine.read();
+    assert_eq!(count, 1);
+    assert_eq!(listed[0].0, STUCK);
+    assert!(listed[0].1.contains("quorum"), "{listed:?}");
+    assert_eq!(
+        quarantined_gauge(&fix).await,
+        "mqttd_sessions_quarantined 1"
+    );
+
+    // The residual: never read, so nobody here matches it, and the ack is released.
+    let mut ack = publish_gated(&mut fix.hub, "stuck/lost").await;
+    assert_eq!(ack.try_recv(), Ok(PublishOutcome::Accepted));
+
+    set_stuck(&fix.stuck, &[STUCK], false);
+    let mut ticks = 0;
+    while fix.hub.quarantined_sessions.contains_key(&stuck) && ticks < BOUND_TICKS {
+        tick(&mut fix.hub).await;
+        ticks += 1;
+    }
+    assert!(
+        !fix.hub.quarantined_sessions.contains_key(&stuck),
+        "the key reads again, yet the quarantine stands after {BOUND_TICKS} ticks"
+    );
+    assert!(
+        ticks <= EXPIRY_RECONCILE_EVERY,
+        "lifted on the next periodic scan, not later ({ticks} ticks)"
+    );
+    assert!(
+        warnings.text().contains("quarantine lifted"),
+        "the lift is logged"
+    );
+    assert!(fix.hub.last_scan_complete && !fix.hub.routing_unsettled());
+    assert!(
+        fix.hub.has_materialized_subs(&stuck),
+        "the clearing scan materialised the session's subscriptions"
+    );
+    assert_eq!(fix.quarantine.read().0, 0);
+    assert_eq!(
+        quarantined_gauge(&fix).await,
+        "mqttd_sessions_quarantined 0"
+    );
+
+    let mut ack = publish_gated(&mut fix.hub, "stuck/kept").await;
+    assert_eq!(ack.try_recv(), Ok(PublishOutcome::Accepted));
+    let queue = fix.hub.store.pending(&stuck, 0, usize::MAX).await.unwrap();
+    assert!(
+        queue.iter().any(|q| &*q.message.topic == "stuck/kept"),
+        "stored for the session once it reads again"
+    );
+    assert!(
+        !queue.iter().any(|q| &*q.message.topic == "stuck/lost"),
+        "nothing from the quarantine is re-delivered: it was never stored"
+    );
+}
+
+/// **A publish to a subscription of a quarantined session this node DOES know is
+/// not acked.** The session was read and materialised, then its keys went
+/// unreadable and it was quarantined: the publish routes to it, the append fails,
+/// and the ack is withheld — quarantine releases only acks the session is not
+/// known to be owed.
+#[tokio::test]
+async fn a_publish_to_a_known_subscription_of_a_quarantined_session_is_not_acked() {
+    let warnings = Warnings::default();
+    let _log = warnings.capture();
+    let mut fix = fixture(&[STUCK], false).await;
+    let stuck = ClientId(STUCK.into());
+    for _ in 0..EXPIRY_RECONCILE_EVERY {
+        tick(&mut fix.hub).await;
+        if fix.hub.last_scan_complete {
+            break;
+        }
+    }
+    assert!(
+        fix.hub.last_scan_complete && fix.hub.has_materialized_subs(&stuck),
+        "fixture invariant: the boot scan read and materialised the session"
+    );
+
+    set_stuck(&fix.stuck, &[STUCK], true);
+    // What a membership change does: an eager window, so the next scans run.
+    fix.hub.takeover_reconcile_ticks = 8;
+    let mut ticks = 0;
+    while !fix.hub.quarantined_sessions.contains_key(&stuck) && ticks < BOUND_TICKS {
+        tick(&mut fix.hub).await;
+        ticks += 1;
+    }
+    assert!(
+        fix.hub.quarantined_sessions.contains_key(&stuck),
+        "not quarantined within {BOUND_TICKS} ticks"
+    );
+    assert!(fix.hub.last_scan_complete && !fix.hub.routing_unsettled());
+
+    let mut ack = publish_gated(&mut fix.hub, "stuck/owed").await;
+    assert_eq!(
+        ack.try_recv(),
+        Err(oneshot::error::TryRecvError::Closed),
+        "a publish owed to a session whose queue refuses it is withheld (the publisher \
+         retries), never acked"
+    );
+}
+
+/// **A failed enumeration is never quarantined.** When the store cannot even list
+/// its keys, the hub reports the placeholder `<every session>`; it is not a client,
+/// it names nothing that could be stuck, and quarantining it would declare every
+/// session seen. However long it lasts, the scans stay incomplete and the
+/// unmatched ack stays held.
+#[tokio::test]
+async fn a_failed_enumeration_is_never_quarantined() {
+    let warnings = Warnings::default();
+    let _log = warnings.capture();
+    let mut fix = fixture(&[STUCK], false).await;
+    fix.keys_fail
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut ack = publish_gated(&mut fix.hub, "nobody/listens").await;
+    for _ in 0..BOUND_TICKS {
+        tick(&mut fix.hub).await;
+    }
+    assert!(
+        fix.hub.incomplete_scans > 0,
+        "fixture invariant: scans landed"
+    );
+    assert!(
+        fix.hub.quarantined_sessions.is_empty(),
+        "quarantined: {:?}",
+        fix.hub.quarantined_sessions
+    );
+    assert!(!fix.hub.last_scan_complete && fix.hub.routing_unsettled());
+    assert!(held(&mut ack), "held while the store cannot enumerate");
+    assert!(
+        warnings.text().contains("<every session>"),
+        "the failed enumeration is still reported"
+    );
+    assert_eq!(fix.quarantine.read().0, 0);
+}
+
+/// **A cut unread list never counts as complete.** More sessions are unreadable
+/// than the store names ([`SessionScan::UNREAD_KEPT`]): the hub cannot know that
+/// every one it was not told about is quarantined, so however many it quarantines
+/// the scans stay incomplete and the unmatched ack stays held.
+///
+/// [`SessionScan::UNREAD_KEPT`]: mqtt_storage::SessionScan::UNREAD_KEPT
+#[tokio::test]
+async fn a_truncated_unread_list_never_counts_as_complete() {
+    let warnings = Warnings::default();
+    let _log = warnings.capture();
+    let names: Vec<String> = (0..=mqtt_storage::SessionScan::UNREAD_KEPT)
+        .map(|i| format!("stuck-{i:02}"))
+        .collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut fix = fixture(&refs, true).await;
+    let mut ack = publish_gated(&mut fix.hub, "nobody/listens").await;
+    for _ in 0..BOUND_TICKS {
+        tick(&mut fix.hub).await;
+    }
+    assert!(
+        fix.hub.incomplete_scans > 0,
+        "fixture invariant: scans landed"
+    );
+    assert!(
+        !fix.hub.quarantined_sessions.is_empty(),
+        "fixture invariant: the named sessions were quarantined"
+    );
+    assert!(
+        fix.hub.quarantined_sessions.len() <= mqtt_storage::SessionScan::UNREAD_KEPT,
+        "only named sessions are quarantined"
+    );
+    assert!(!fix.hub.last_scan_complete && fix.hub.routing_unsettled());
+    assert!(held(&mut ack), "held while unnamed sessions are unread");
 }
 
 /// A GATED `QoS` 1 publish: `done` is `Some`, so the returned receiver is the

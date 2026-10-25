@@ -76,6 +76,34 @@ impl BrownoutStatus {
     }
 }
 
+/// The durable sessions the hub has quarantined as unreadable (issue #1049),
+/// written by the hub on every change and read by the `/statusz` body
+/// (`session_quarantine`). `count` is whole; `sessions` holds the first
+/// [`QUARANTINE_LISTED`](crate::hub::QUARANTINE_LISTED), each `(client id, last error)`.
+#[derive(Debug, Default)]
+pub struct SessionQuarantine {
+    state: std::sync::Mutex<(usize, Vec<(String, String)>)>,
+}
+
+impl SessionQuarantine {
+    /// Replace the snapshot: `count` quarantined sessions, the first of them listed.
+    pub fn set(&self, count: usize, sessions: Vec<(String, String)>) {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = (count, sessions);
+    }
+
+    /// `(count, listed sessions)`.
+    #[must_use]
+    pub fn read(&self) -> (usize, Vec<(String, String)>) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
 /// Cap on the bytes read while consuming the request HEAD (request line + every
 /// header, through the terminating blank line) — a crude guard against a client
 /// that streams forever. Generous: real probes and Prometheus-family scrapers
@@ -130,6 +158,9 @@ pub struct HealthState {
     /// looking healthy while peers evict us). Surfaced on `/statusz` so an operator
     /// reading the evictee sees the contradiction the counts alone hide.
     swim_isolated: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The durable sessions the hub quarantined as unreadable (issue #1049), for the
+    /// `/statusz` `session_quarantine` block.
+    session_quarantine: Option<Arc<SessionQuarantine>>,
     /// The boot-time volume probe (ADR 0076) + the durable writer's counters,
     /// for the `/statusz` `store` block: the barrier floor durable throughput
     /// should be read against, and the live group-commit shape.
@@ -248,6 +279,7 @@ impl HealthState {
             identity: None,
             refound: None,
             swim_isolated: None,
+            session_quarantine: None,
             store_probe: None,
             store_shards: None,
             cordon: None,
@@ -347,6 +379,15 @@ impl HealthState {
     #[must_use]
     pub fn with_swim_isolated(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
         self.swim_isolated = Some(flag);
+        self
+    }
+
+    /// Surface the hub's quarantined sessions (issue #1049) on `/statusz`.
+    /// Statusz-only: readiness is NOT gated on it (a decision on #1049 — an
+    /// incomplete or quarantined scan does not make a node not-ready).
+    #[must_use]
+    pub fn with_session_quarantine(mut self, status: Arc<SessionQuarantine>) -> Self {
+        self.session_quarantine = Some(status);
         self
     }
 
@@ -571,6 +612,30 @@ impl HealthState {
         if let Some(flag) = &self.swim_isolated {
             if flag.load(std::sync::atomic::Ordering::Relaxed) {
                 s.push_str(",\"swim_isolated\":true");
+            }
+        }
+        // Quarantined sessions (issue #1049): durable sessions this node owns and
+        // cannot read, which its session scans no longer wait for. Present only while
+        // there are any; the count is whole, the list the first few.
+        if let Some(q) = &self.session_quarantine {
+            let (count, sessions) = q.read();
+            if count > 0 {
+                let _ = write!(
+                    s,
+                    ",\"session_quarantine\":{{\"count\":{count},\"sessions\":["
+                );
+                for (i, (client, error)) in sessions.iter().enumerate() {
+                    if i > 0 {
+                        s.push(',');
+                    }
+                    let _ = write!(
+                        s,
+                        "{{\"client\":\"{}\",\"error\":\"{}\"}}",
+                        json_escape(client),
+                        json_escape(error)
+                    );
+                }
+                s.push_str("]}");
             }
         }
         // Cordon (ADR 0081 T8): refusing new connections on an operator's say-so.
@@ -1380,6 +1445,58 @@ mod tests {
                 "\"rules\":{{\"digest\":\"{digest}\",\"rules\":0,\"enabled\":0}}"
             )),
             "{body}"
+        );
+    }
+
+    /// Issue #1049: the hub's quarantined sessions are named on `/statusz`, with
+    /// their errors and the whole count, only while there are any — and readiness
+    /// does not move (an incomplete or quarantined scan is not made not-ready).
+    #[tokio::test]
+    async fn statusz_names_the_quarantined_sessions() {
+        let quarantine = Arc::new(super::SessionQuarantine::default());
+        let state = HealthState::new(spawn_live_hub(), None, None, 1)
+            .with_status(
+                "node-a".into(),
+                Arc::new(
+                    mqtt_cluster::cluster_identity::ClusterIdentity::load_or_mint(true, None)
+                        .unwrap(),
+                ),
+                Arc::new(super::BrownoutStatus::default()),
+                Arc::new(crate::reload::ConfigStamp::default()),
+                Arc::new(std::sync::OnceLock::new()),
+                None,
+            )
+            .with_session_quarantine(quarantine.clone());
+        let (_, body, _) = super::route(&state, "/statusz").await;
+        assert!(
+            !body.contains("session_quarantine"),
+            "absent while empty: {body}"
+        );
+
+        quarantine.set(
+            2,
+            vec![("stuck \"one\"".into(), "no replication quorum".into())],
+        );
+        let (status, body, _) = super::route(&state, "/statusz").await;
+        assert_eq!(status, 200);
+        assert!(
+            body.contains(
+                "\"session_quarantine\":{\"count\":2,\"sessions\":[{\"client\":\"stuck \\\"one\\\"\",\
+                 \"error\":\"no replication quorum\"}]}"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains("\"ready\":true"),
+            "readiness unchanged: {body}"
+        );
+        serde_json::from_str::<serde_json::Value>(&body).expect("valid JSON");
+
+        quarantine.set(0, Vec::new());
+        let (_, body, _) = super::route(&state, "/statusz").await;
+        assert!(
+            !body.contains("session_quarantine"),
+            "gone once lifted: {body}"
         );
     }
 

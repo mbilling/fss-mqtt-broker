@@ -167,6 +167,7 @@ impl Mesh {
             complete: true,
             unread: Vec::new(),
             unread_total: 0,
+            enumerated: true,
         })
         .await;
 

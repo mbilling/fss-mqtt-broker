@@ -416,6 +416,66 @@ accepting that an acknowledged message may exist on one copy only, and one furth
 lose it — the broker logs a warning saying so on every start while
 `ready_min_members >= 2`.
 
+## One node never acknowledges QoS 1 publishes (`session scan incomplete`)
+
+**Symptom:** QoS 1 publishers attached to one node get no PUBACK, or get it only after
+minutes, while the other nodes ack at once. QoS 0 works, `/readyz` is ready, and
+`mqttd_routing_unsettled{reason="scan-incomplete"}` reads `1` on that node.
+
+**The cause:** the node owns a durable session it cannot read (`no replication quorum`,
+usually a placement group that would not recover after churn). Until it has read every
+session it owns, it cannot tell that a publish matching no session it knows is owed to
+nobody, so it holds that publish's PUBACK. The log names the session:
+
+```text
+WARN mqttd::hub: session scan incomplete: these sessions could not be read, ...
+     sessions=["<client-id>: no replication quorum"]
+```
+
+A transient one after a node restart or a takeover clears within seconds
+(`session scan complete again`). The recovery itself logs why it refuses, per group, once
+a minute: `durable key recovery refused (NoQuorum)` with `group=` and `refusal=`
+(`below-quorum`, or `all-hollow-…` when every copy of the replica set was hollow and the
+full roster sweep could not stand in for them: the roster is unknown, has members the
+node cannot observe, does not name the node yet, has a member that did not answer, or its
+union has a gap; `recommit-short` when the recovered history could not be re-written to a
+write quorum).
+
+**What the broker does on its own (issue #1049):** a session that stays unreadable for
+two minutes of scans is **quarantined**:
+
+```text
+WARN mqttd::hub: durable session QUARANTINED: ... client=<client-id> error=no replication quorum
+```
+
+- `mqttd_sessions_quarantined` counts the quarantined sessions, and `/statusz` lists them
+  under `session_quarantine` (client id and last error).
+- The node's scans stop waiting for a quarantined session, and the held acks are
+  released.
+- The quarantine lifts on the first scan that reads the session again (`quarantine
+  lifted`). The session is then served as before.
+- More unreadable sessions than one scan names (16) are never quarantined into a
+  complete scan, because the node cannot know every one of them is stuck. The acks stay
+  held, and the warning repeats.
+
+**What quarantine costs, while it lasts:**
+
+- A publish matching a subscription of the quarantined session that the node **knows**
+  (read before the key went unreadable) is still routed to it. Its append fails, and the
+  publisher's ack is **withheld**, so the publisher retries. Nothing changes there.
+- A publish whose only match is a subscription the node has **never read** is acked and
+  **not stored** for that session. The session's queue refuses every append with the
+  same error, so the message could not have been stored for it anyway. Once the node
+  gossips its interest, other nodes forget those filters too. Nothing acked during the
+  quarantine is re-delivered when it lifts.
+- `/readyz` stays ready on purpose. Watch `mqttd_sessions_quarantined > 0` (the chart's
+  `MqttdDurableSessionQuarantined` alert pages on it) and
+  `mqttd_routing_unsettled{reason="scan-incomplete"}` instead.
+
+**Fix it:** find out why the group does not recover (the `refusal=` lines above, and
+`replica_groups` on `/statusz` on every node). Restoring the missing members usually
+lets it recover. Meanwhile, send QoS 1 publishers to other nodes if acks are still held.
+
 ## The backup-age alert is firing (`mqttd_backup_last_success_timestamp_seconds` is stale)
 
 A run that fails writes **nothing** and does not advance that series, on purpose — a file

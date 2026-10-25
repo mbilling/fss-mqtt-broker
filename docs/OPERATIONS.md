@@ -1667,6 +1667,30 @@ up pays nothing for a longer window, because a held delivery is discharged at it
   ineligible. Typical causes are a session with a write in flight on the same topic, a full
   receive quota, or QoS 2 (never held).
 
+## Session scans and quarantined sessions
+
+A clustered node re-reads the durable sessions it owns on a scan: at boot, during a
+takeover, and every 30 s while its routing view is unsettled (always, with durable
+sessions). While a scan has not read everything, the node holds the PUBACK of each QoS 1
+publish that matches no session it knows. One session it owns but cannot read would
+otherwise hold those acks for as long as it stays unreadable (issue #1049), so a session
+unread for two minutes of scans is **quarantined**:
+
+| signal | reading |
+|---|---|
+| `session scan incomplete` (WARN) | the first incomplete scan and every tenth, naming the sessions and errors |
+| `durable session QUARANTINED` (WARN) | a session is no longer waited for, with its client id and error |
+| `quarantine lifted` (WARN) | it read again |
+| `mqttd_sessions_quarantined` | how many are quarantined now |
+| `/statusz` → `session_quarantine` | `count`, and `sessions` (`client`, `error`) for the first 64 |
+| `mqttd_routing_unsettled{reason="scan-incomplete"}` | `1` while the scans hold acks; `0` once every unread session is quarantined |
+
+While a session is quarantined, a publish whose only match is a subscription of it the
+node never read is acked and not stored for it. One that matches a subscription the node
+knows is still withheld. `/readyz` does not change. See
+[TROUBLESHOOTING](TROUBLESHOOTING.md#one-node-never-acknowledges-qos-1-publishes-session-scan-incomplete)
+for the procedure.
+
 ## Monitoring for the operator (and humans)
 
 The signals the future controller will reconcile on
@@ -1723,6 +1747,7 @@ the human-readable superset.
 | **Publishes shed at ingress** | `rate(mqttd_publish_dropped_total{reason="hub-ingress"}[5m]) > 0` for 5m (warn) | [runbook](#alert-publishes-shed-at-ingress) |
 | **Append lane saturating** | `mqttd_append_lane_jobs` growing sustained (warn); `rate(mqttd_publish_dropped_total{reason="append-backlog-full"}[5m]) > 0` (page) | [runbook](#alert-append-lane-saturating) |
 | **TLS material nearing expiry** | `mqttd_tls_lifetime_spent_ratio >= ignoring(role) group_left() mqttd_tls_expiry_warn_ratio` for 5m (warn); `mqttd_tls_lifetime_spent_ratio >= 0.9 and mqttd_tls_expiry_seconds < 2592000` (page) | [runbook](#alert-tls-material-nearing-expiry) |
+| **Durable session quarantined** | `mqttd_sessions_quarantined > 0` (page; the OTel instrument is `sessions_quarantined`) | [runbook](#alert-durable-session-quarantined) |
 
 ### Alert: Split brain
 
@@ -1931,6 +1956,12 @@ the human-readable superset.
   read (the log says so) or a revocation list without a `nextUpdate`.
 
 `curl <pod>:8080/statusz` is the human-readable superset of all of it.
+
+### Alert: Durable session quarantined
+
+**Rule:** `mqttd_sessions_quarantined > 0` (page; the OTel instrument is `sessions_quarantined`) — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
+
+**When it fires / what to do:** A durable session this node owns has been unreadable for two minutes of scans (usually `NoQuorum` on its placement group) and is no longer waited for (issue #1049). While it is quarantined, a publish whose only match is a subscription of it the node never read is acked and NOT stored for that session. `/statusz` → `session_quarantine` names the sessions and their errors, and the log's `refusal=` on the recovery warnings says which check refuses the group. Restore the group's replicas (bring back the nodes that hold them; see [Session scans and quarantined sessions](#session-scans-and-quarantined-sessions) and TROUBLESHOOTING); the alert clears when the session reads again (`quarantine lifted`). Keep the data dirs before wiping anything: they are what explains the cause
 
 ## Migrating onto mqttd
 

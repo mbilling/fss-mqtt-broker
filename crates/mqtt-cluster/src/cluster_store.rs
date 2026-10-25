@@ -213,7 +213,51 @@ pub struct GroupRoutedLog<S: LeaseSource, T: ReplicaTransport + Clone + 'static>
     /// different shards commit at the same time.
     owner_writer:
         Option<Arc<Vec<tokio::sync::mpsc::UnboundedSender<crate::cluster_log::DurableWrite>>>>,
+    /// When each `(group, refusal)` was last warned about (issue #1049), so a key
+    /// whose recovery keeps refusing is named at WARN once a minute, not on every
+    /// retry.
+    refusals_warned: Mutex<HashMap<(GroupId, RecoveryRefusal), std::time::Instant>>,
 }
+
+/// Why a key's recovery refused (issue #1049). Every one of these is answered
+/// [`ReplError::NoQuorum`] — the error's meaning is unchanged: recovery is not safe
+/// now, retry later. The distinction exists for the log only, so that a key that
+/// stays unrecoverable says WHICH invariant refuses it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum RecoveryRefusal {
+    /// Fewer replicas of the set answered than the quorum rule needs.
+    BelowQuorum,
+    /// Every copy that answered was hollow, and the durable roster to sweep instead
+    /// is not known yet.
+    RosterUnknown,
+    /// Every copy was hollow, and the roster has members this node cannot observe.
+    RosterUnobservable,
+    /// Every copy was hollow, and the roster is from before this node joined.
+    RosterStale,
+    /// Every copy was hollow, and a roster member outside the set did not answer.
+    RosterMemberSilent,
+    /// Every copy was hollow, the full sweep answered, and the union has a gap.
+    UnionGap,
+    /// The recovered history could not be re-committed to a write quorum.
+    RecommitShort,
+}
+
+impl RecoveryRefusal {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::BelowQuorum => "below-quorum",
+            Self::RosterUnknown => "all-hollow-roster-unknown",
+            Self::RosterUnobservable => "all-hollow-roster-unobservable",
+            Self::RosterStale => "all-hollow-roster-stale",
+            Self::RosterMemberSilent => "all-hollow-roster-member-silent",
+            Self::UnionGap => "all-hollow-union-gap",
+            Self::RecommitShort => "recommit-short",
+        }
+    }
+}
+
+/// How often one `(group, refusal)` is warned about.
+const REFUSAL_WARN_EVERY: std::time::Duration = std::time::Duration::from_mins(1);
 
 impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> std::fmt::Debug
     for GroupRoutedLog<S, T>
@@ -246,7 +290,48 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
             groups: Mutex::new(BTreeMap::new()),
             recovering: Mutex::new(HashMap::new()),
             owner_writer: None,
+            refusals_warned: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Refuse `key`'s recovery for `why` (issue #1049): `NoQuorum`, as always, and a
+    /// log line that names the group and the invariant — at WARN at most once a
+    /// minute per group and reason, at DEBUG otherwise. A transient refusal during
+    /// churn therefore costs one WARN; one that never clears keeps saying why.
+    fn refuse(&self, key: &str, why: RecoveryRefusal, detail: &str) -> ReplError {
+        let group = group_of_key(key);
+        let now = std::time::Instant::now();
+        let warn = {
+            let mut warned = self
+                .refusals_warned
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match warned.get(&(group, why)) {
+                Some(at) if now.duration_since(*at) < REFUSAL_WARN_EVERY => false,
+                _ => {
+                    warned.insert((group, why), now);
+                    true
+                }
+            }
+        };
+        if warn {
+            tracing::warn!(
+                key,
+                group,
+                refusal = why.as_str(),
+                detail,
+                "durable key recovery refused (NoQuorum); it is retried on the next touch"
+            );
+        } else {
+            tracing::debug!(
+                key,
+                group,
+                refusal = why.as_str(),
+                detail,
+                "durable key recovery refused (NoQuorum)"
+            );
+        }
+        ReplError::NoQuorum
     }
 
     /// Route every group's owner-side local acks through the node-wide
@@ -419,7 +504,17 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
             // floor keeps the offset space above every read replica's durable
             // truncation watermark (the exhibit's second face: an empty merge
             // must not restart a truncated queue's offsets at 1).
-            let recovered = entry.log.recommit_tagged(key, &recovered).await?;
+            let recovered = match entry.log.recommit_tagged(key, &recovered).await {
+                Ok(r) => r,
+                Err(ReplError::NoQuorum) => {
+                    return Err(self.refuse(
+                        key,
+                        RecoveryRefusal::RecommitShort,
+                        "the recovered history could not be re-committed to a write quorum",
+                    ));
+                }
+                Err(e) => return Err(e),
+            };
             // Continue above every seq this epoch has already used for the key, in
             // ANY read — including a tail the merge dropped (#634). Under a new
             // epoch nothing qualifies and the counter continues from the re-commit
@@ -603,7 +698,13 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
             }
         }
         if !quorum.met_by(read_from.iter().copied()) {
-            return Err(ReplError::NoQuorum);
+            let detail = format!(
+                "{} of {} replicas answered: {:?}",
+                read_from.len(),
+                replica_set.len(),
+                replica_set.iter().map(|n| &n.0).collect::<Vec<_>>()
+            );
+            return Err(self.refuse(key, RecoveryRefusal::BelowQuorum, &detail));
         }
         if !reads.iter().any(|r| r.complete) {
             // Issue #390 — the grow hand-off race: a quorum of the CURRENT set
@@ -661,13 +762,29 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
             .durable_roster()
             .cloned()
         else {
-            return Err(ReplError::NoQuorum); // roster not known yet: cannot sweep
+            // Roster not known yet: cannot sweep.
+            return Err(self.refuse(
+                key,
+                RecoveryRefusal::RosterUnknown,
+                "every copy of the replica set is hollow and the durable roster is not known",
+            ));
         };
         if unknown > 0 {
-            return Err(ReplError::NoQuorum); // an unobservable member might hold history
+            // An unobservable member might hold history.
+            let detail = format!(
+                "every copy of the replica set is hollow and {unknown} roster member(s) \
+                 cannot be observed"
+            );
+            return Err(self.refuse(key, RecoveryRefusal::RosterUnobservable, &detail));
         }
         if !known.contains(&self.local) {
-            return Err(ReplError::NoQuorum); // a roster from before we joined: stale
+            // A roster from before we joined: stale.
+            return Err(self.refuse(
+                key,
+                RecoveryRefusal::RosterStale,
+                "every copy of the replica set is hollow and the durable roster does not \
+                 name this node",
+            ));
         }
         let extras: Vec<NodeId> = known
             .iter()
@@ -690,7 +807,13 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
             }
         }
         if answered < extras.len() {
-            return Err(ReplError::NoQuorum);
+            let detail = format!(
+                "every copy of the replica set is hollow and {} of {} roster member(s) \
+                 outside it did not answer",
+                extras.len() - answered,
+                extras.len()
+            );
+            return Err(self.refuse(key, RecoveryRefusal::RosterMemberSilent, &detail));
         }
         let floor = reads.iter().map(|r| r.watermark).max().unwrap_or(0);
         let merged = merge_replica_logs_tagged(&reads);
@@ -703,7 +826,11 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
             .flat_map(|r| r.entries.iter())
             .any(|e| e.offset > served_high);
         if holds_above {
-            return Err(ReplError::NoQuorum);
+            let detail = format!(
+                "every copy of the replica set is hollow and the full roster sweep's union \
+                 has a gap above offset {served_high}"
+            );
+            return Err(self.refuse(key, RecoveryRefusal::UnionGap, &detail));
         }
         tracing::info!(
             key,
@@ -1968,6 +2095,29 @@ mod tests {
             matches!(err, mqtt_storage::repl::ReplError::NoQuorum),
             "below quorum, recovery must fail closed with NoQuorum (never an empty log); got {err:?}"
         );
+        // And the log says which invariant refused, for the key's group (issue #1049).
+        assert_eq!(
+            refusals(&log),
+            vec![(
+                super::group_of_key(&qkey),
+                super::RecoveryRefusal::BelowQuorum
+            )]
+        );
+    }
+
+    /// The `(group, refusal)` pairs `log` has warned about (issue #1049), in order.
+    fn refusals<S: LeaseSource, T: super::ReplicaTransport + Clone + 'static>(
+        log: &GroupRoutedLog<S, T>,
+    ) -> Vec<(GroupId, super::RecoveryRefusal)> {
+        let mut seen: Vec<_> = log
+            .refusals_warned
+            .lock()
+            .unwrap()
+            .keys()
+            .copied()
+            .collect();
+        seen.sort_by_key(|(g, r)| (*g, r.as_str()));
+        seen
     }
 
     /// A lease source that also reports a replication record, as the lease
@@ -2283,6 +2433,14 @@ mod tests {
         assert!(
             matches!(err, mqtt_storage::repl::ReplError::NoQuorum),
             "a merge with no complete read must refuse (ADR 0043 P1), got {err:?}"
+        );
+        // Every copy hollow, and no roster to sweep: said as such (issue #1049).
+        assert_eq!(
+            refusals(&log),
+            vec![(
+                super::group_of_key(&qkey),
+                super::RecoveryRefusal::RosterUnknown
+            )]
         );
 
         // A complete copy (f2, holding 1..=2) joins the reads: recovery now serves

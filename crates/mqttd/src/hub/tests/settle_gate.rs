@@ -265,6 +265,7 @@ impl Fix {
             complete,
             unread: Vec::new(),
             unread_total: 0,
+            enumerated: true,
         })
         .await;
     }
@@ -593,6 +594,7 @@ async fn sweep_once(fix: &mut Fix, complete: bool) {
             complete,
             unread: Vec::new(),
             unread_total: 0,
+            enumerated: true,
         })
         .await;
     }
