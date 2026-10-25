@@ -782,6 +782,7 @@ endpoint, roles, errors).
 | `mqttd` | the broker binary: hub, connections, peer mesh |
 | `mqttd-operator` | Kubernetes operator for `MqttdCluster` |
 | `history-check` | independent checker of recorded client-visible histories |
+| `mqtt-load` | the benchmark rig's load generator (ADR 0090): paced msg/s, ack and end-to-end latency on one clock, identity ledger |
 
 ---
 
