@@ -2696,9 +2696,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `plaintext_mesh_without_binding_still_routes`
 - `the_node_holding_a_peer_dead_keeps_dialing_it_and_serves_the_link`
 
-## `crates/mqttd/tests/peer_link_expiry.rs` — 4 test(s)
+## `crates/mqttd/tests/peer_link_expiry.rs` — 6 test(s)
 
 - `a_peer_link_ends_within_a_minute_of_its_peers_certificate`
+- `a_relay_stream_ends_when_the_certificate_it_was_admitted_under_expires` — `#[ignore]`d
+- `a_relay_stream_ends_when_the_crl_revokes_the_certificate_it_was_admitted_under` — `#[ignore]`d
 - `an_expired_node_is_out_and_stays_out`
 - `renewed_nodes_move_their_links_before_the_old_end_without_a_gap`
 - `renewed_nodes_move_their_links_without_an_election`

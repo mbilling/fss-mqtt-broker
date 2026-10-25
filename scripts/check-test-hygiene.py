@@ -2405,6 +2405,24 @@ IGNORE_ALLOWLIST: dict[str, tuple[str, str | None]] = {
         "the next reconnect",
         None,
     ),
+    # Two known defects of the same issue, asserted as the behaviour its fix must have, so
+    # they fail on main by design. No tier runs them until the fix lands; the fix removes the
+    # `#[ignore]`s and these entries together. Each has its control in the same test (the
+    # peer link between the same two nodes ends), and the file's other tests run in every
+    # tier.
+    "crates/mqttd/tests/peer_link_expiry.rs::a_relay_stream_ends_when_the_certificate_it_was_admitted_under_expires": (
+        "known defect #1016: a relay stream (ADR 0005 `ProxyHello`) is admitted on the peer "
+        "listener under the landing node's peer certificate and never registered as a peer, so "
+        "the expiry sweep does not end it: the relayed session is still served a minute after "
+        "that certificate's notAfter, while the peer link ended within three seconds",
+        None,
+    ),
+    "crates/mqttd/tests/peer_link_expiry.rs::a_relay_stream_ends_when_the_crl_revokes_the_certificate_it_was_admitted_under": (
+        "known defect #1016: a relay stream (ADR 0005 `ProxyHello`) is not ended by the "
+        "reload's peer sweep when the cluster CRL revokes the certificate it was admitted under; "
+        "the peer link is ended at once and the relayed session keeps being served",
+        None,
+    ),
     # Two known defects of the same issue, asserted as the behaviour its fix (0087-T5, D8)
     # must have, so they fail on main by design. No tier runs them until the fix lands;
     # the fix removes the `#[ignore]`s and these entries together. The control of the
