@@ -126,15 +126,12 @@ the chart is CI-gated):
 ```sh
 # CRDs ship in crds/ and are applied on first install.
 helm install mqttd-operator deploy/helm/mqttd-operator -n mqttd
-# Mint the same Secrets the broker chart needs, then:
+# The example names the Secrets deploy/helm/mqttd/bootstrap.sh mints (run it first):
 kubectl -n mqttd apply -f deploy/helm/mqttd-operator/example-mqttdcluster.yaml
 kubectl -n mqttd get mqc mqttd -w
 ```
 
-The example names its server TLS and gossip-key Secrets `mqttd-server-tls` and
-`mqttd-gossip-key`, while `bootstrap.sh` mints `mqttd-tls` and `mqttd-gossip`: match the
-example's `secrets` to what you minted. Chart and operator details:
-[KUBERNETES.md](docs/KUBERNETES.md).
+Chart and operator details: [KUBERNETES.md](docs/KUBERNETES.md).
 
 Next: the secured setup, TLS 1.3 + mTLS + ACL and CI-tested, in
 [GUIDE.md](GUIDE.md#single-node-secured-tls-13--mtls--acl); Windows in
