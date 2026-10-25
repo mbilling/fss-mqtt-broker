@@ -130,6 +130,7 @@ fn cfg() -> Config {
         suspicion_scales_with_log_n: false,
         confirm_before_dead: true,
         period_from_schedule: true,
+        check_relayed_dead: true,
     }
 }
 

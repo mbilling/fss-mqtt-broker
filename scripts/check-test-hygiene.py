@@ -2411,42 +2411,33 @@ IGNORE_ALLOWLIST: dict[str, tuple[str, str | None]] = {
         None,
     ),
     "crates/mqtt-cluster/tests/swim_formation_sim.rs::false_dead_report": (
-        "measurement, not a pass/fail: for six ways of deciding a suspect is dead, five "
-        "cluster sizes and seven outage lengths it prints how many of 32 seeded runs end with "
+        "measurement, not a pass/fail: for nine ways of deciding a suspect is dead, six "
+        "cluster sizes and eight outage lengths it prints how many of 32 seeded runs end with "
         "a healthy member declared DEAD, the same in a cluster part-way through the upgrade "
-        "from v1.1.0, and what each costs when the member really died (issues #973 and "
-        "#975; fifteen minutes, --release). Its figures are recorded in ADR 0016's "
-        "amendments of 2026-10-13 and ADR 0087; the default's bound and the behaviour without "
-        "the last probe are asserted by "
-        "`a_member_cut_off_for_up_to_two_seconds_is_not_declared_dead` and "
+        "from v1.2.0 or v1.1.0, and what each costs when the member really died (issues #973 "
+        "and #975; half an hour, --release). Its figures are recorded in ADR 0016's "
+        "amendments of 2026-10-13 and 2026-10-25 and ADR 0087; the default's bound and the "
+        "behaviour without the last probe are asserted by "
+        "`a_member_cut_off_for_up_to_three_seconds_is_not_declared_dead`, "
+        "`a_member_cut_off_for_less_than_the_suspicion_window_is_not_dead_once_reachable` and "
         "`without_the_last_probe_a_short_cut_ends_in_a_false_dead`, which every tier runs",
         None,
     ),
     "crates/mqtt-cluster/tests/swim_formation_sim.rs::fault_shapes_report": (
-        "measurement, not a pass/fail: the default detector and the same detector without "
+        "measurement, not a pass/fail: the default detector, v1.2.0's, and v1.2.0's without "
         "its last direct probe under packet loss, a member reachable one way only, one link "
         "lost one way, a member whose datagrams arrive late and a node that was itself "
         "stalled, 32 seeded runs per cell (issues #975 and #1002; --release). Its figures are "
-        "recorded in ADR 0016's amendments of 2026-10-13; what they show is asserted, on a "
+        "recorded in ADR 0016's amendments of 2026-10-13 and 2026-10-25; what they show is "
+        "asserted, on a "
         "few seeds, by `a_member_that_cannot_complete_a_round_trip_is_declared_dead_as_before`, "
         "`one_link_lost_one_way_raises_no_verdict`, "
         "`packet_loss_neither_keeps_a_dead_member_nor_adds_false_verdicts`, "
         "`a_prober_stalled_on_its_last_probe_declares_nobody_dead`, "
         "`a_node_stopped_for_two_seconds_neither_dies_nor_declares`, "
         "`a_real_death_is_seen_on_time_by_survivors_that_are_all_late` and "
-        "`with_ticks_on_no_grid_a_cut_of_two_seconds_less_twice_the_latency_ends_in_no_dead`, "
+        "`with_ticks_on_no_grid_a_cut_of_three_seconds_less_twice_the_latency_ends_in_no_dead`, "
         "which every tier runs",
-        None,
-    ),
-    # A known defect, asserted as the behaviour the issue states is correct, so it fails on
-    # main by design (deterministically: the simulation is a pure function of its seed). No
-    # tier runs it until 0087-T10b decides the bound; the fix removes the `#[ignore]` and
-    # this entry together, or T10b's decision removes both with the issue.
-    "crates/mqtt-cluster/tests/swim_formation_sim.rs::a_member_cut_off_for_less_than_the_suspicion_window_is_not_dead_once_reachable": (
-        "known defect #975: a member of a formed cluster cut off for 2.5 s or 3 s, less than "
-        "the 4 s suspicion window, is turned DEAD by some node after the cut has ended in 1 to "
-        "8 of 32 seeded runs at 10, 14 and 16 nodes (a relayed DEAD is adopted unchecked, and "
-        "the window does not grow with the cluster)",
         None,
     ),
     "crates/mqttd/tests/swim_formation_proc.rs::a_broker_stopped_for_two_seconds_is_declared_dead_by_no_one": (
@@ -2455,7 +2446,7 @@ IGNORE_ALLOWLIST: dict[str, tuple[str, str | None]] = {
         "deadlines, so on a loaded per-PR runner a failure would say more about the runner "
         "than about the detector, and the run takes a minute and a half. The bound itself "
         "is asserted in virtual time by "
-        "`a_member_cut_off_for_up_to_two_seconds_is_not_declared_dead`, which every tier runs",
+        "`a_member_cut_off_for_up_to_three_seconds_is_not_declared_dead`, which every tier runs",
         "nightly",
     ),
     "crates/mqttd/tests/swim_formation_proc.rs::a_prober_stopped_with_its_last_probe_out_does_not_declare_the_suspect_dead": (

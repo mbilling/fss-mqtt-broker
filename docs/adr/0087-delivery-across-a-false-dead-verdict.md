@@ -939,6 +939,43 @@ the cluster, which is what the packet-loss cells need — is 0087-T10b, together
 question T10a raises and does not answer: whether membership should run on a thread of
 its own, so that a broker whose workers are all busy still answers its probes.
 
+**As built (0087-T10b, 2026-10-25, #975), in part.** Two rules, each answering one of
+the two ways the 2.5 s and 3 s cells still ended in a verdict, traced run by run:
+
+- **a `Dead` another node relays is checked before it is adopted**
+  (`Config::check_relayed_dead`): about a member it holds `Alive` or `Suspect`, a node
+  sends the member the same last probe, carrying the claim, and declares it `Dead` only
+  if it stays silent; nothing is passed on meanwhile. This removes the adoptions after
+  the cut of a verdict reached during it, and the mixed-version verdicts' spread;
+- **the window's floor is 2.5 s** (from 1.5 s): with three suspecters the window still
+  shortens, but no node asks a cut-off member the last time sooner than 3 s less twice
+  the latency into the cut — the bound of "As hardened", moved from 2 s to 3 s. This
+  removes the last probes sent during the cut that ran out just after it, which no check
+  can tell from a real silence.
+
+| Detector | Nodes | 0.5 s | 1 s | 1.5 s | 2 s | 2.5 s | 3 s | 3.5 s | 5 s |
+|---|---|---|---|---|---|---|---|---|---|
+| **the default since T10b** | 3 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 32 |
+| | 5 | 0 | 0 | 0 | 0 | 0 | 0 | 2 | 28 |
+| | 10 | 0 | 0 | 0 | 0 | 0 | 0 | 3 | 28 |
+| | 14 | 0 | 0 | 0 | 0 | 0 | 0 | 2 | 27 |
+| | 16 | 0 | 0 | 0 | 0 | 0 | 0 | 5 | 26 |
+| | 30 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 23 |
+| v1.2.0 (the default of T10/T10a) | 10 | 0 | 0 | 0 | 0 | 1 | 3 | 16 | 31 |
+| | 14 | 0 | 0 | 0 | 0 | 1 | 8 | 12 | 30 |
+| | 16 | 0 | 0 | 0 | 0 | 3 | 5 | 11 | 28 |
+
+What it costs when the member is really dead (ms until the last survivor holds it
+`Dead`, median / worst of 16): 6099 / 8337 at 14 nodes and 7441 / 8956 at 30, against
+5613 / 8337 and 7005 / 8347 on v1.2.0 — 0.4 to 0.8 s in the median at 3 to 30 nodes. No
+wire change, no operator setting. ADR 0016's amendment of 2026-10-25 has the rest: each
+rule alone, the roll from 1.2.0, packet loss, and why a rule sparing a probe that runs
+out after the member has spoken again was built, measured to change nothing, and
+withdrawn. T10b is not done: whether the window grows with the cluster (the packet-loss
+cells at 14 nodes and more; `log10 N` on top of the default clears the 3.5 s column from
+14 nodes up for 0.3 to 1.3 s more), whether membership runs on a thread of its own, and
+whether awareness decays with time are still open.
+
 ## Alternatives considered
 
 - **Only keep dialing (D5 alone).** Measured: it removes the loss for a false verdict in

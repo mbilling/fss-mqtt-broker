@@ -54,9 +54,9 @@ impl MemberState {
 }
 
 /// Timing and fan-out parameters for the protocol.
-// The bools are five independent rules, each on or off: four that a v1.1.0 node lacks
-// (issues #971, #975 and #1002) and one measured candidate (issue #973). Not an
-// encodable state.
+// The bools are six independent rules, each on or off: four that a v1.1.0 node lacks
+// (issues #971, #975 and #1002), one that a v1.2.0 node lacks (issue #975, 0087-T10b)
+// and one measured candidate (issue #973). Not an encodable state.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -70,7 +70,10 @@ pub struct Config {
     pub suspicion_timeout_ms: u64,
     /// The floor the suspicion window shrinks to once `suspicion_confirmations` distinct
     /// nodes independently suspect the same peer (ADR 0016 §3). Clamped to be `<=`
-    /// `suspicion_timeout_ms`.
+    /// `suspicion_timeout_ms`. 2.5 s by default since 0087-T10b (1.5 s up to 1.2.0): no
+    /// node then asks a member that went silent the last time (`confirm_before_dead`)
+    /// sooner than two ack timeouts and this floor into the silence — 3 s less twice
+    /// the latency — so an outage shorter than that ends before the question is put.
     pub suspicion_min_timeout_ms: u64,
     /// Number of **distinct** independent suspecters at which the suspicion window
     /// reaches its floor (ADR 0016 §3). One prober alone holds the full window; the
@@ -174,6 +177,25 @@ pub struct Config {
     /// `false` is v1.1.0's rule, kept so the formation simulation can run a v1.1.0
     /// node. **Not operator configuration.**
     pub period_from_schedule: bool,
+    /// Ask a member before adopting a `Dead` another node relays about it (issue #975,
+    /// ADR 0087 T10b). A `Dead` that arrives second-hand about a member this node holds
+    /// `Alive` or `Suspect` in the same life is not adopted on the spot: the member is
+    /// sent one `Ping` carrying the claim and given one ack timeout, exactly like the
+    /// last direct probe of `confirm_before_dead`, and on the same terms — only the
+    /// member's own `Ack` to that probe, from the life held, answers it. Silent, it is
+    /// declared `Dead` by this node (and only then is the claim gossiped on);
+    /// answering, it is kept, and its `Ack` usually carries its refutation. A
+    /// member's own `Dead` (a graceful leave, first-hand) and a `Dead` about a member
+    /// this node does not hold are adopted at once, as before.
+    ///
+    /// The check is a fresh probe, not a memory of having heard from the member, so a
+    /// member that really died is held `Dead` by every node at most one ack timeout
+    /// after it would have been; and a node that can reach a member the others cannot
+    /// keeps it, which is what the first-hand refutation of issue #383 already made it
+    /// do a moment later. No new wire element: a `Ping` carrying a claim about its
+    /// receiver, as every release sends. `false` is the rule of every release up to
+    /// 1.2.0: the relayed `Dead` is adopted unchecked. **Not operator configuration.**
+    pub check_relayed_dead: bool,
 }
 
 impl Default for Config {
@@ -182,7 +204,7 @@ impl Default for Config {
             protocol_period_ms: 1000,
             ack_timeout_ms: 250,
             suspicion_timeout_ms: 4000,
-            suspicion_min_timeout_ms: 1500,
+            suspicion_min_timeout_ms: 2500,
             suspicion_confirmations: 3,
             dead_ttl_ms: 30_000,
             indirect_probes: 3,
@@ -196,6 +218,7 @@ impl Default for Config {
             suspicion_scales_with_log_n: false,
             confirm_before_dead: true,
             period_from_schedule: true,
+            check_relayed_dead: true,
         }
     }
 }
@@ -239,11 +262,48 @@ pub struct Member {
     /// that helpers could not rescue either, reset by any ack.)
     unanswered_probes: u32,
     /// `Config::confirm_before_dead`: the last direct probe sent at the end of this
-    /// member's suspicion window, as `(its seq, when it gives up)`. `Some` only while
-    /// that probe is outstanding; cleared when the member answers it, when the member
-    /// stops being `Suspect` or starts a new life, and when the probe runs out inside
-    /// a window that has grown since it was sent (`expire_suspects`).
-    confirm: Option<(u64, u64)>,
+    /// member's suspicion window — or, with `Config::check_relayed_dead`, the one sent
+    /// when another node told us it is `Dead`. `Some` only while that probe is
+    /// outstanding; cleared when the member answers it, when the member stops being
+    /// `Suspect` (or is no longer claimed `Dead`) or starts a new life, and when a
+    /// window's probe runs out inside a window that has grown since it was sent
+    /// (`expire_suspects`).
+    confirm: Option<LastProbe>,
+}
+
+/// A last direct probe that is out (`Member::confirm`).
+#[derive(Debug, Clone, Copy)]
+struct LastProbe {
+    /// The `Ping`'s sequence number, which the member's `Ack` must echo.
+    seq: u64,
+    /// When it gives up.
+    deadline: u64,
+    /// `Config::check_relayed_dead`: the incarnation of the `Dead` another node relayed
+    /// about the member, which this probe is checking. `None` for the probe at the end
+    /// of a suspicion window that nobody has claimed `Dead`.
+    dead: Option<Incarnation>,
+}
+
+/// Where a membership update comes from ([`Swim::apply_update_from`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// This node's own verdict ([`Swim::declare`]).
+    Own,
+    /// A claim about the sender itself, in the sender's own datagram.
+    FirstHand,
+    /// A claim about a third party, passed on by the sender.
+    Relayed,
+}
+
+impl Source {
+    /// Where `u`, piggybacked on a datagram from `sender`, comes from.
+    fn of(u: &Update, sender: &str) -> Self {
+        if u.id == sender {
+            Self::FirstHand
+        } else {
+            Self::Relayed
+        }
+    }
 }
 
 /// True when `addr` names the unspecified host (`0.0.0.0` / `[::]`) or is empty —
@@ -813,19 +873,23 @@ impl Swim {
     /// Handles self-refutation: a `Suspect`/`Dead` claim about us at an incarnation
     /// `>=` ours triggers a bump-and-`Alive` to override it everywhere.
     ///
-    /// Third-party/relayed form: the tombstone fence applies in full. The message
-    /// handler uses [`apply_update_from`](Self::apply_update_from) so a FIRST-HAND
-    /// self-claim can pierce the fence (issue #383).
+    /// This node's OWN claim (from [`declare`](Self::declare)): the tombstone fence
+    /// applies in full, and a `Dead` is adopted at once — it is this node's verdict, not
+    /// one it was told. The message handler uses
+    /// [`apply_update_from`](Self::apply_update_from), so that a FIRST-HAND self-claim
+    /// can pierce the fence (issue #383) and a relayed `Dead` is checked first
+    /// (`Config::check_relayed_dead`).
     fn apply_update(&mut self, u: &Update, now: u64, out: &mut Vec<Action>) {
-        self.apply_update_from(u, now, out, false);
+        self.apply_update_from(u, now, out, Source::Own);
     }
 
-    /// [`apply_update`](Self::apply_update) with provenance: `first_hand` is true iff
-    /// the update is a claim **about the sender itself**, arriving in the sender's own
+    /// [`apply_update`](Self::apply_update) with provenance. [`Source::FirstHand`]: the
+    /// update is a claim **about the sender itself**, arriving in the sender's own
     /// datagram (in the signed posture the sender identity is certificate-bound, and
     /// anti-replay windows reject captured datagrams — so first-hand is trustworthy).
     #[allow(clippy::too_many_lines)]
-    fn apply_update_from(&mut self, u: &Update, now: u64, out: &mut Vec<Action>, first_hand: bool) {
+    fn apply_update_from(&mut self, u: &Update, now: u64, out: &mut Vec<Action>, source: Source) {
+        let first_hand = source == Source::FirstHand;
         if u.id == self.local.0 {
             // A claim about an EARLIER life of this id is not about this process
             // (issue #92): incarnations are only comparable within one life, so
@@ -919,6 +983,23 @@ impl Swim {
             if !supersedes {
                 return;
             }
+            // A `Dead` another node relays about a member we hold in good standing, in
+            // the life we hold (issue #975, ADR 0087 T10b): that node's verdict, not
+            // ours, and it may be about a member that was silent only for a moment and
+            // is back. Asked first, as our own verdict would be: one `Ping` carrying the
+            // claim. Silent, it is declared `Dead` when that probe runs out
+            // (`expire_suspects`) and the claim goes on from there; answering, it is
+            // kept. Not relayed meanwhile. A member's own `Dead` (a graceful leave) is
+            // first-hand and adopted at once.
+            if self.cfg.check_relayed_dead
+                && source == Source::Relayed
+                && !new_life
+                && u.state == MemberState::Dead
+                && m.state != MemberState::Dead
+            {
+                self.check_relayed_dead(&id, u.incarnation, now, out);
+                return;
+            }
             let changed = m.state != u.state;
             // A new life resets the incarnation space, so treat it as an advance: the
             // suspecter set below belongs to the old process and must not carry over.
@@ -983,8 +1064,9 @@ impl Swim {
             // still suspected, its window still runs from `state_since`, and its `Ack`
             // to the probe that is out is as much proof of life as it was — dropping
             // the probe here would ignore that `Ack` and send a second probe on the
-            // next tick.
-            if changed || new_life {
+            // next tick. Nor does a member held `Alive` becoming `Suspect` end the
+            // check of a relayed `Dead` (`Config::check_relayed_dead`) that is out.
+            if (changed && u.state != MemberState::Suspect) || new_life {
                 let answered = first_hand && u.state == MemberState::Alive && !new_life;
                 if m.confirm.take().is_some() && answered {
                     // The suspect's own refutation, in its own datagram, while the
@@ -1399,6 +1481,18 @@ impl Swim {
     }
 
     fn expire_suspects(&mut self, now: u64, out: &mut Vec<Action>) {
+        // The check of a relayed `Dead` (`Config::check_relayed_dead`) that has run out:
+        // the verdict is due whatever the member's own window says.
+        let checked: Vec<(NodeId, LastProbe)> = self
+            .members
+            .values()
+            .filter_map(|m| m.confirm.map(|p| (m, p)))
+            .filter(|(_, p)| p.dead.is_some() && now >= p.deadline)
+            .map(|(m, p)| (m.id.clone(), p))
+            .collect();
+        for (id, probe) in checked {
+            self.conclude_last_probe(&id, probe, now, out);
+        }
         // A last probe that ran out unanswered while the member's window is NOT lapsed:
         // the window grew after the probe was sent (this node's awareness rose, or a
         // suspicion at a higher incarnation reset the suspecters). The verdict is not
@@ -1410,7 +1504,7 @@ impl Swim {
             .values()
             .filter(|m| {
                 m.state == MemberState::Suspect
-                    && m.confirm.is_some_and(|(_, deadline)| now >= deadline)
+                    && m.confirm.is_some_and(|p| now >= p.deadline)
                     && now.saturating_sub(m.state_since) < self.effective_suspicion_timeout(m)
             })
             .map(|m| m.id.clone())
@@ -1438,13 +1532,42 @@ impl Swim {
                         continue;
                     }
                     // Asked, and still inside its ack timeout.
-                    Some((_, deadline)) if now < deadline => continue,
-                    // Asked, and silent: dead.
-                    Some(_) => self.last_probes.silent += 1,
+                    Some(p) if now < p.deadline => continue,
+                    // Asked, and no answer to it.
+                    Some(p) => {
+                        self.conclude_last_probe(&id, p, now, out);
+                        continue;
+                    }
                 }
             }
             self.declare(&id, MemberState::Dead, now, out);
         }
+    }
+
+    /// A last direct probe of `id` has run out without its `Ack`: the member is
+    /// declared `Dead` — unless the probe was checking a relayed `Dead`
+    /// (`Config::check_relayed_dead`) that no longer stands, the member having since
+    /// been heard of at a higher incarnation. Then the probe is dropped, and the
+    /// member's own window, if it is suspected, goes on.
+    fn conclude_last_probe(
+        &mut self,
+        id: &NodeId,
+        probe: LastProbe,
+        now: u64,
+        out: &mut Vec<Action>,
+    ) {
+        let Some(m) = self.members.get_mut(id) else {
+            return;
+        };
+        m.confirm = None;
+        let incarnation = match probe.dead {
+            Some(claimed) if claimed < m.incarnation => return,
+            Some(claimed) => claimed,
+            None => m.incarnation,
+        };
+        m.incarnation = incarnation;
+        self.last_probes.silent += 1;
+        self.declare(id, MemberState::Dead, now, out);
     }
 
     /// `Config::confirm_before_dead`: send `id` one `Ping` that carries our suspicion
@@ -1455,24 +1578,57 @@ impl Swim {
     /// its `Ack` carries no refutation, [`on_confirm_ack`](Self::on_confirm_ack)
     /// still keeps it.
     fn confirm_suspect(&mut self, id: &NodeId, now: u64, out: &mut Vec<Action>) {
+        self.send_last_probe(id, None, now, out);
+    }
+
+    /// `Config::check_relayed_dead`: another node told us `id` is `Dead` at
+    /// `incarnation`. Ask the member, with one `Ping` that carries that claim — the
+    /// same last probe as at the end of a window, and concluded the same way
+    /// ([`conclude_last_probe`](Self::conclude_last_probe), one ack timeout on): a
+    /// member that hears us refutes the claim, and its `Ack` carries the refutation
+    /// first-hand. A last probe already out for this member is not sent again: it is
+    /// marked as checking the claim, so that its silence is a verdict whatever the
+    /// window says.
+    fn check_relayed_dead(
+        &mut self,
+        id: &NodeId,
+        incarnation: Incarnation,
+        now: u64,
+        out: &mut Vec<Action>,
+    ) {
+        let Some(m) = self.members.get_mut(id) else {
+            return;
+        };
+        if let Some(probe) = &mut m.confirm {
+            probe.dead = probe.dead.max(Some(incarnation));
+            return;
+        }
+        self.send_last_probe(id, Some(incarnation), now, out);
+    }
+
+    /// Send `id` a last direct probe: one `Ping` that carries the claim being checked —
+    /// our suspicion of it, or the `Dead` at `dead` another node relayed — and nothing
+    /// else.
+    fn send_last_probe(
+        &mut self,
+        id: &NodeId,
+        dead: Option<Incarnation>,
+        now: u64,
+        out: &mut Vec<Action>,
+    ) {
         let deadline = now + self.scaled_ack_timeout();
         self.seq += 1;
         let seq = self.seq;
         let Some(m) = self.members.get_mut(id) else {
             return;
         };
-        m.confirm = Some((seq, deadline));
+        m.confirm = Some(LastProbe {
+            seq,
+            deadline,
+            dead,
+        });
         self.last_probes.sent += 1;
-        let claim = Update {
-            id: id.0.clone(),
-            addr: m.addr.clone(),
-            peer_addr: m.peer_addr.clone(),
-            incarnation: m.incarnation,
-            generation: m.generation,
-            state: MemberState::Suspect,
-            suspecter: Some(self.local.0.clone()),
-            failure_domain: m.failure_domain.clone(),
-        };
+        let claim = Self::claim_held(&self.local, m, dead);
         let to = m.addr.clone();
         // The claim and nothing else, and not out of the gossip queue. Every update
         // there has a bounded number of retransmissions, and a node whose windows for
@@ -1492,19 +1648,32 @@ impl Swim {
         out.push(Action::Send { to, msg });
     }
 
+    /// The claim a last probe of `m` puts to it: the relayed `Dead` at `dead` when it
+    /// is checking one that still stands, else our suspicion of it at the incarnation
+    /// we hold.
+    fn claim_held(local: &NodeId, m: &Member, dead: Option<Incarnation>) -> Update {
+        let (state, incarnation, suspecter) = match dead {
+            Some(claimed) if claimed >= m.incarnation => (MemberState::Dead, claimed, None),
+            _ => (MemberState::Suspect, m.incarnation, Some(local.0.clone())),
+        };
+        Update {
+            id: m.id.0.clone(),
+            addr: m.addr.clone(),
+            peer_addr: m.peer_addr.clone(),
+            incarnation,
+            generation: m.generation,
+            state,
+            suspecter,
+            failure_domain: m.failure_domain.clone(),
+        }
+    }
+
     /// `Config::confirm_before_dead`: `from` sent an `Ack` with `seq`. If that is the
-    /// answer to the last direct probe of a member we still hold `Suspect`, the member
-    /// is alive and hears us — proof no relay can fake — so it is not declared `Dead`
-    /// on this window: the window starts again from now, at its full length (the
-    /// suspicions that had shortened it are answered by the same proof).
-    ///
-    /// Still holding it `Suspect` here means the `Ack` carried no refutation that
-    /// supersedes our claim (one that did has already cleared the probe in
-    /// `apply_update`): our claim was stale, or the member queued its refutation
-    /// behind other gossip. Only the member can state its incarnation, so it is asked:
-    /// one `Join` that carries the suspicion as it is held now, answered by a `Sync`
-    /// that leads with the member's own claim about itself, first-hand. Returns whether
-    /// the `Ack` was that answer.
+    /// answer to the last direct probe of a member we still hold `Suspect` — or, with
+    /// `Config::check_relayed_dead`, the probe checking a `Dead` another node relayed
+    /// about a member we hold `Alive` or `Suspect` — the member is alive and hears us,
+    /// proof no relay can fake, so it is not declared `Dead`
+    /// ([`spare`](Self::spare)). Returns whether the `Ack` was that answer.
     ///
     /// `generation` is the life the `Ack` came from (the datagram's `from_generation`)
     /// and must be the life held for the member. An `Ack` from an EARLIER life — the
@@ -1528,42 +1697,55 @@ impl Swim {
         let Some(m) = self.members.get_mut(from) else {
             return false;
         };
-        if m.state != MemberState::Suspect
-            || m.confirm.map(|(s, _)| s) != Some(seq)
-            || generation != m.generation
-        {
+        let Some(probe) = m.confirm else {
+            return false;
+        };
+        if m.state == MemberState::Dead || probe.seq != seq || generation != m.generation {
             return false;
         }
         m.confirm = None;
         self.last_probes.spared += 1;
-        m.state_since = now;
-        m.suspecters.clear();
-        m.unanswered_probes = 0; // it hears us
-        let addr = m.addr.clone();
-        // What we still hold against it, as we hold it NOW — which is not always what
-        // the probe carried: a suspicion at a higher incarnation may have arrived
-        // while the probe was out. Told of that one, the member refutes it, and its
-        // `Sync` supersedes; told nothing, it would answer `Alive` at the incarnation
-        // we already suspect, which supersedes nothing, and sit `Suspect` for another
-        // whole window. (A claim that is stale to it is ignored, and its `Sync` then
-        // carries the higher incarnation it is already at.)
-        let held = Update {
-            id: from.0.clone(),
-            addr: m.addr.clone(),
-            peer_addr: m.peer_addr.clone(),
-            incarnation: m.incarnation,
-            generation: m.generation,
-            state: MemberState::Suspect,
-            suspecter: Some(self.local.0.clone()),
-            failure_domain: m.failure_domain.clone(),
+        self.spare(from, probe, now, out);
+        true
+    }
+
+    /// A member answered its last probe: it is not declared `Dead` on it. A
+    /// suspect's window starts again from now, at its full length (the suspicions that
+    /// had shortened it are answered by the same proof).
+    ///
+    /// Still holding a claim against it here means no refutation that supersedes the
+    /// claim has reached us (one that did has already cleared the probe in
+    /// `apply_update`): our claim was stale, the member queued its refutation behind
+    /// other gossip, or it has not heard the claim at all. Only the member can state
+    /// its incarnation, so it is asked: one `Join` that carries the claim as it is held
+    /// now, answered by a `Sync` that leads with the member's own claim about itself,
+    /// first-hand. What is held now is not always what the probe carried: a suspicion
+    /// at a higher incarnation may have arrived while the probe was out. Told of that
+    /// one, the member refutes it, and its `Sync` supersedes; told nothing, it would
+    /// answer `Alive` at the incarnation we already suspect, which supersedes nothing,
+    /// and sit `Suspect` for another whole window. (A claim that is stale to it is
+    /// ignored, and its `Sync` then carries the higher incarnation it is already at.)
+    fn spare(&mut self, id: &NodeId, probe: LastProbe, now: u64, out: &mut Vec<Action>) {
+        let Some(m) = self.members.get_mut(id) else {
+            return;
         };
+        m.unanswered_probes = 0; // it hears us
         self.failed_probe_rounds = 0; // and our outbound path works
+        let dead = probe.dead.filter(|claimed| *claimed >= m.incarnation);
+        if m.state == MemberState::Suspect {
+            m.state_since = now;
+            m.suspecters.clear();
+        } else if dead.is_none() {
+            // Held `Alive`, and the relayed `Dead` has been refuted: nothing to ask.
+            return;
+        }
+        let held = Self::claim_held(&self.local, m, dead);
+        let addr = m.addr.clone();
         let mut ask = self.greet(&addr);
         if let Action::Send { msg, .. } = &mut ask {
             msg.gossip.push(held);
         }
         out.push(ask);
-        true
     }
 
     fn start_probe(&mut self, now: u64, out: &mut Vec<Action>) {
@@ -1692,7 +1874,7 @@ impl Swim {
                         suspecter: None,
                         failure_domain: msg.from_domain.clone(),
                     };
-                    self.apply_update_from(&update, now, &mut out, true);
+                    self.apply_update_from(&update, now, &mut out, Source::FirstHand);
                 }
             } else {
                 let update = Update {
@@ -1706,7 +1888,7 @@ impl Swim {
                     // First contact teaches the sender's label directly (ADR 0016 T5).
                     failure_domain: msg.from_domain.clone(),
                 };
-                self.apply_update_from(&update, now, &mut out, true);
+                self.apply_update_from(&update, now, &mut out, Source::FirstHand);
             }
         }
 
@@ -1714,8 +1896,7 @@ impl Swim {
         // (issue #383) — its own refutation may pierce a tombstone; everything else
         // is a relay and stays fully fenced.
         for u in &msg.gossip {
-            let first_hand = u.id == msg.from;
-            self.apply_update_from(u, now, &mut out, first_hand);
+            self.apply_update_from(u, now, &mut out, Source::of(u, &msg.from));
         }
 
         match msg.kind {
@@ -1886,6 +2067,7 @@ mod tests {
             suspicion_scales_with_log_n: false,
             confirm_before_dead: false,
             period_from_schedule: true,
+            check_relayed_dead: false,
         }
     }
 
@@ -3846,6 +4028,313 @@ mod tests {
             s.expire_suspects(dead_at, &mut out);
             assert_eq!(member_state(&s, "b"), Some(MemberState::Dead), "{ctx}");
         }
+    }
+
+    // --- issue #975 / ADR 0087 T10b: a relayed `Dead` is checked first ---------
+
+    /// The rules of this tree: the last probe, and a relayed `Dead` checked first.
+    fn checking_cfg() -> Config {
+        Config {
+            confirm_before_dead: true,
+            check_relayed_dead: true,
+            ..fast_cfg()
+        }
+    }
+
+    /// `a`, holding `b` and `c` `Alive` at incarnation 1, each learned first-hand, with
+    /// nothing left in its gossip queue.
+    fn holding_b_and_c(cfg: &Config) -> Swim {
+        let mut a = node_with("a", "a:1", cfg.clone());
+        a.handle(
+            m("b", "b:1", Kind::Sync, vec![alive_update("b", "b:1", 1)]),
+            0,
+        );
+        a.handle(
+            m("c", "c:1", Kind::Sync, vec![alive_update("c", "c:1", 1)]),
+            0,
+        );
+        while !a.take_gossip().is_empty() {}
+        a
+    }
+
+    /// `c` tells `a` that `b` is `Dead` at incarnation `inc`.
+    fn told_dead(a: &mut Swim, inc: u64, now: u64) -> Vec<Action> {
+        a.handle(
+            m("c", "c:1", Kind::Sync, vec![dead_update("b", "b:1", inc)]),
+            now,
+        )
+    }
+
+    fn turned_dead(actions: &[Action], id: &str) -> bool {
+        actions.iter().any(|a| {
+            matches!(a, Action::StateChange { id: who, state: MemberState::Dead, .. }
+                if who.0 == id)
+        })
+    }
+
+    /// `check_relayed_dead`: a `Dead` another node relays about a member this node
+    /// holds `Alive` is not adopted, and not passed on: the member is sent one `Ping`
+    /// that carries the claim. A live member refutes it in its `Ack`, and is never
+    /// `Dead` here — not when the probe's ack timeout passes either.
+    #[test]
+    fn a_relayed_dead_about_a_member_that_answers_is_not_adopted() {
+        let cfg = checking_cfg();
+        let mut a = holding_b_and_c(&cfg);
+        let mut b = node_with("b", "b:1", cfg.clone());
+
+        let told = told_dead(&mut a, 1, 10);
+        assert_eq!(member_state(&a, "b"), Some(MemberState::Alive));
+        assert!(!turned_dead(&told, "b"), "{told:?}");
+        let sent = sends(&told);
+        assert_eq!(sent.len(), 1, "one probe and nothing else: {told:?}");
+        let (to, ping) = sent[0];
+        assert_eq!(to, "b:1");
+        assert!(matches!(ping.kind, Kind::Ping { .. }));
+        assert_eq!(
+            ping.gossip,
+            vec![dead_update("b", "b:1", 1)],
+            "the probe puts the claim to the member, and carries nothing else"
+        );
+        assert!(
+            !a.take_gossip().iter().any(|u| u.id == "b"),
+            "a claim this node has not checked is not passed on"
+        );
+
+        // b hears it, refutes, and its ack leads with the refutation.
+        let replies = b.handle(ping.clone(), 11);
+        let (_, ack) = *sends(&replies)
+            .iter()
+            .find(|(to, msg)| *to == "a:1" && matches!(msg.kind, Kind::Ack { .. }))
+            .expect("b acks the probe");
+        assert_eq!(ack.gossip[0].id, "b");
+        assert_eq!(ack.gossip[0].incarnation, 2);
+        let answered = a.handle(ack.clone(), 12);
+        assert!(!turned_dead(&answered, "b"));
+        assert_eq!(member_state(&a, "b"), Some(MemberState::Alive));
+        assert_eq!(a.members[&NodeId("b".into())].incarnation, 2);
+
+        let mut out = Vec::new();
+        a.expire_suspects(10 + 10 * cfg.ack_timeout_ms, &mut out);
+        assert_eq!(member_state(&a, "b"), Some(MemberState::Alive));
+        assert!(!turned_dead(&out, "b"));
+        let counted = a.last_probes();
+        assert_eq!((counted.sent, counted.spared, counted.silent), (1, 1, 0));
+        // The refutation is what a passes on.
+        assert!(a
+            .take_gossip()
+            .iter()
+            .any(|u| u.id == "b" && u.state == MemberState::Alive && u.incarnation == 2));
+    }
+
+    /// `check_relayed_dead`: a member that answers the probe without refuting (an older
+    /// build that queues its refutation last) is kept on its `Ack` alone, and asked
+    /// with a `Join` that carries the claim, so that its `Sync` states its incarnation
+    /// first-hand.
+    #[test]
+    fn a_member_that_acks_a_relayed_dead_without_refuting_is_kept_and_asked() {
+        let cfg = checking_cfg();
+        let mut a = holding_b_and_c(&cfg);
+        let seq = ping_seq(&told_dead(&mut a, 1, 10)).expect("the probe");
+        let asked = a.handle(m("b", "b:1", Kind::Ack { seq }, vec![]), 12);
+        assert_eq!(member_state(&a, "b"), Some(MemberState::Alive));
+        let (_, join) = *sends(&asked)
+            .iter()
+            .find(|(to, msg)| *to == "b:1" && matches!(msg.kind, Kind::Join))
+            .expect("b is asked for its own claim");
+        assert!(
+            join.gossip.contains(&dead_update("b", "b:1", 1)),
+            "{:?}",
+            join.gossip
+        );
+        let mut out = Vec::new();
+        a.expire_suspects(10 + 10 * cfg.ack_timeout_ms, &mut out);
+        assert_eq!(member_state(&a, "b"), Some(MemberState::Alive));
+        let counted = a.last_probes();
+        assert_eq!((counted.sent, counted.spared, counted.silent), (1, 1, 0));
+    }
+
+    /// `check_relayed_dead`, the other side: a member that does not answer is declared
+    /// `Dead` the moment the probe's ack timeout runs out — this node's own verdict,
+    /// which it then passes on. Only the member's own `Ack` to that probe answers it.
+    #[test]
+    fn a_relayed_dead_about_a_silent_member_is_adopted_when_its_probe_runs_out() {
+        let cfg = checking_cfg();
+        let mut a = holding_b_and_c(&cfg);
+        let seq = ping_seq(&told_dead(&mut a, 1, 10)).expect("the probe");
+        // c answering with the probe's number is not b answering; nor is b answering
+        // another number.
+        a.handle(m("c", "c:1", Kind::Ack { seq }, vec![]), 11);
+        a.handle(m("b", "b:1", Kind::Ack { seq: seq + 7 }, vec![]), 11);
+
+        let mut out = Vec::new();
+        a.expire_suspects(10 + cfg.ack_timeout_ms - 1, &mut out);
+        assert_eq!(member_state(&a, "b"), Some(MemberState::Alive));
+        assert!(out.is_empty(), "asked once: {out:?}");
+        a.expire_suspects(10 + cfg.ack_timeout_ms, &mut out);
+        assert_eq!(member_state(&a, "b"), Some(MemberState::Dead));
+        assert!(turned_dead(&out, "b"), "{out:?}");
+        let counted = a.last_probes();
+        assert_eq!((counted.sent, counted.spared, counted.silent), (1, 0, 1));
+        assert!(
+            a.take_gossip()
+                .iter()
+                .any(|u| u.id == "b" && u.state == MemberState::Dead && u.incarnation == 1),
+            "the verdict is passed on once it is this node's"
+        );
+        // A tombstone like any other: a relayed refutation does not lift it.
+        a.handle(
+            m("c", "c:1", Kind::Sync, vec![alive_update("b", "b:1", 2)]),
+            10 + cfg.ack_timeout_ms + 1,
+        );
+        assert_eq!(member_state(&a, "b"), Some(MemberState::Dead));
+    }
+
+    /// `check_relayed_dead`: the claim is checked at the incarnation it names. A relayed
+    /// `Dead` at a higher incarnation than the one held is put to the member at that
+    /// incarnation, and the verdict on its silence is at that incarnation too.
+    #[test]
+    fn a_relayed_dead_at_a_higher_incarnation_is_checked_and_declared_at_it() {
+        let cfg = checking_cfg();
+        let mut a = holding_b_and_c(&cfg);
+        let told = told_dead(&mut a, 4, 10);
+        let (_, ping) = sends(&told)[0];
+        assert_eq!(ping.gossip, vec![dead_update("b", "b:1", 4)]);
+        let mut out = Vec::new();
+        a.expire_suspects(10 + cfg.ack_timeout_ms, &mut out);
+        assert_eq!(member_state(&a, "b"), Some(MemberState::Dead));
+        assert_eq!(a.members[&NodeId("b".into())].incarnation, 4);
+    }
+
+    /// `check_relayed_dead`: a refutation that arrives by gossip while the claim is
+    /// being checked ends the check — the claim no longer stands, and the member's
+    /// silence to the probe is not a verdict on it.
+    #[test]
+    fn a_relayed_dead_refuted_while_it_is_checked_is_dropped() {
+        let cfg = checking_cfg();
+        let mut a = holding_b_and_c(&cfg);
+        told_dead(&mut a, 1, 10);
+        a.handle(
+            m("c", "c:1", Kind::Sync, vec![alive_update("b", "b:1", 2)]),
+            12,
+        );
+        let mut out = Vec::new();
+        a.expire_suspects(10 + 10 * cfg.ack_timeout_ms, &mut out);
+        assert_eq!(member_state(&a, "b"), Some(MemberState::Alive));
+        assert!(!turned_dead(&out, "b"));
+        let counted = a.last_probes();
+        assert_eq!((counted.sent, counted.spared, counted.silent), (1, 0, 0));
+    }
+
+    /// `check_relayed_dead` about a SUSPECT. Its window has not lapsed: the relayed
+    /// claim is checked on its own account, and the member's silence is a verdict at
+    /// once, whatever the window says. Its window has lapsed and its last probe is
+    /// out: no second probe is sent — the one that is out now checks the claim too.
+    /// A suspicion arriving while the check is out does not end it.
+    #[test]
+    fn a_relayed_dead_about_a_suspect_is_checked_by_one_probe() {
+        let cfg = checking_cfg();
+        // The window still runs.
+        let mut a = holding_b_and_c(&cfg);
+        a.handle(
+            m(
+                "c",
+                "c:1",
+                Kind::Sync,
+                vec![suspect_from("b", "b:1", 1, "c")],
+            ),
+            5,
+        );
+        assert_eq!(member_state(&a, "b"), Some(MemberState::Suspect));
+        let told = told_dead(&mut a, 1, 10);
+        assert!(ping_seq(&told).is_some(), "{told:?}");
+        let mut out = Vec::new();
+        a.expire_suspects(10 + cfg.ack_timeout_ms, &mut out);
+        assert!(10 + cfg.ack_timeout_ms < 5 + cfg.suspicion_timeout_ms);
+        assert_eq!(member_state(&a, "b"), Some(MemberState::Dead));
+
+        // Held Alive when the claim came, suspected while it is checked.
+        let mut a = holding_b_and_c(&cfg);
+        told_dead(&mut a, 1, 10);
+        a.handle(
+            m(
+                "c",
+                "c:1",
+                Kind::Sync,
+                vec![suspect_from("b", "b:1", 1, "c")],
+            ),
+            11,
+        );
+        let mut out = Vec::new();
+        a.expire_suspects(10 + cfg.ack_timeout_ms, &mut out);
+        assert_eq!(member_state(&a, "b"), Some(MemberState::Dead));
+
+        // The window lapsed first, and its last probe is out.
+        let mut a = holding_b_and_c(&cfg);
+        a.handle(
+            m(
+                "c",
+                "c:1",
+                Kind::Sync,
+                vec![suspect_from("b", "b:1", 1, "c")],
+            ),
+            0,
+        );
+        let lapsed = cfg.suspicion_timeout_ms + 1;
+        let mut out = Vec::new();
+        a.expire_suspects(lapsed, &mut out);
+        assert!(ping_seq(&out).is_some(), "the window's last probe");
+        let told = told_dead(&mut a, 1, lapsed + 1);
+        assert!(sends(&told).is_empty(), "not asked twice: {told:?}");
+        let mut out = Vec::new();
+        a.expire_suspects(lapsed + cfg.ack_timeout_ms, &mut out);
+        assert_eq!(member_state(&a, "b"), Some(MemberState::Dead));
+        let counted = a.last_probes();
+        assert_eq!((counted.sent, counted.spared, counted.silent), (1, 0, 1));
+    }
+
+    /// What `check_relayed_dead` leaves as it was: a member's own `Dead` — a graceful
+    /// leave, first-hand — is adopted at once; a `Dead` about a member this node has
+    /// never heard of is recorded at once (there is nobody to ask); and with the rule
+    /// off (1.2.0's), a relayed `Dead` is adopted at once.
+    #[test]
+    fn a_leave_an_unknown_member_and_the_1_2_rule_adopt_a_dead_at_once() {
+        let cfg = checking_cfg();
+        let mut a = holding_b_and_c(&cfg);
+        let left = a.handle(
+            m("b", "b:1", Kind::Sync, vec![dead_update("b", "b:1", 1)]),
+            10,
+        );
+        assert_eq!(member_state(&a, "b"), Some(MemberState::Dead));
+        assert!(ping_seq(&left).is_none());
+
+        let mut a = holding_b_and_c(&cfg);
+        a.handle(
+            m("c", "c:1", Kind::Sync, vec![dead_update("d", "d:1", 1)]),
+            10,
+        );
+        assert_eq!(member_state(&a, "d"), Some(MemberState::Dead));
+
+        let unchecked = Config {
+            check_relayed_dead: false,
+            ..cfg
+        };
+        let mut a = holding_b_and_c(&unchecked);
+        let told = told_dead(&mut a, 1, 10);
+        assert_eq!(member_state(&a, "b"), Some(MemberState::Dead));
+        assert!(turned_dead(&told, "b"));
+        assert!(ping_seq(&told).is_none());
+    }
+
+    /// The default carries both rules of 0087-T10b: the relayed `Dead` is checked, and
+    /// the window's floor is 2.5 s, so that no node asks a cut-off member the last time
+    /// sooner than 3 s less twice the latency into the cut (two 250 ms ack timeouts,
+    /// then the floor) — the arithmetic `swim_formation_sim.rs` pins.
+    #[test]
+    fn by_default_a_relayed_dead_is_checked_and_the_floor_is_two_and_a_half_seconds() {
+        let cfg = Config::default();
+        assert!(cfg.check_relayed_dead);
+        assert_eq!(cfg.suspicion_min_timeout_ms, 2500);
+        assert_eq!(2 * cfg.ack_timeout_ms + cfg.suspicion_min_timeout_ms, 3000);
     }
 
     // --- helpers ---------------------------------------------------------------

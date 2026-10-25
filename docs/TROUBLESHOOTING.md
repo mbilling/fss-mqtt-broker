@@ -203,12 +203,13 @@ multiplies its own ack timeouts and windows, so it is slower to accuse others
   probe relayed through three other members for another 0.25 s. Routing is not
   touched. A `SUSPECT` followed by `RECOVERED` within a few seconds is the detector
   working: the member was slow or unreachable for a moment, was told, and answered.
-- **`DEAD`**: the suspicion stood for its window — 4 s, shortening to 1.5 s once three
+- **`DEAD`**: the suspicion stood for its window — 4 s, shortening to 2.5 s once three
   nodes suspect the member — and the member then also failed to answer one last probe
-  sent to it directly (0.25 s). A broker that really died is held dead by every other
-  node in about 4 to 7 s (8.4 s at worst), some 0.3 s later than on 1.1.0, which did
-  not ask. The verdict stands for 30 s; a member that was alive is then greeted and
-  comes back.
+  sent to it directly (0.25 s). A node told by another that a member is dead asks the
+  member the same way before it agrees. A broker that really died is held dead by every
+  other node in about 5 to 7.5 s (9 s at worst), some 0.4 to 0.8 s later than on 1.2.0,
+  which shortened the window to 1.5 s and took another node's verdict on its word. The
+  verdict stands for 30 s; a member that was alive is then greeted and comes back.
 
 The metrics say what the lines do not.
 
@@ -232,15 +233,15 @@ The metrics say what the lines do not.
 
 What a `DEAD` about a live broker points to:
 
-- **An outage of that broker of about two seconds or more that then ended** — a long
-  pause of the process or its host, a network cut. Anything shorter than two seconds
+- **An outage of that broker of about three seconds or more that then ended** — a long
+  pause of the process or its host, a network cut. Anything shorter than three seconds
   less twice the network's latency does not end in a verdict, and that is arithmetic
   on the timings above: nobody suspects the member sooner than 0.5 s into the outage
-  (the two 0.25 s timeouts) and nobody asks it the last time sooner than 1.5 s after
+  (the two 0.25 s timeouts) and nobody asks it the last time sooner than 2.5 s after
   that, so the question arrives once the outage is over. In practice the margin is
   usually a little more, because a node acts on a timeout at its next 0.1 s tick; at
-  2.5 s a verdict is still rare (one simulated run in thirty at 10 and 14 nodes), at
-  3 s it is not.
+  3.5 s a verdict is still rare (two to five simulated runs in thirty-two at 5 to 16
+  nodes), at 5 s it is not. (On 1.2.0 these were two and two and a half seconds.)
 - **That broker was not being scheduled.** If its own
   `mqttd_swim_stalled_milliseconds_total` is climbing, the broker itself went quiet —
   every worker thread busy near saturation, a paused or migrated VM, a stopped
@@ -249,9 +250,10 @@ What a `DEAD` about a live broker points to:
 - **Packet loss on the gossip network.** The last probe and its answer are two
   datagrams. Look for many `SUSPECT`/`RECOVERED` pairs about different members on
   every node; larger clusters are affected first.
-- **A cluster part-way through the upgrade from 1.1.0.** A 1.1.0 node declares a
-  suspect dead without asking it, and the other nodes adopt that verdict from gossip.
-  It ends when the roll does.
+- **A cluster part-way through an upgrade.** A 1.1.0 node declares a suspect dead
+  without asking it; a 1.2.0 node asks, but on the shorter window, and adopts another
+  node's verdict without asking. Upgraded nodes check such a verdict before they adopt
+  it, so it is mostly the old nodes' own. It ends when the roll does.
 - **A member reachable in one direction only.** A member that cannot hear the others
   (its own log then says `SWIM isolation`), or cannot be heard, is declared dead. If only
   the path from one node to it is broken, no verdict is raised at all: the other

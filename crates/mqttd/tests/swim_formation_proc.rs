@@ -315,8 +315,9 @@ async fn twelve_signed_brokers_form_a_whole_mesh_without_a_certificate_storm() {
 }
 
 /// How long the member is stopped: longer than it takes to be suspected (a probe and
-/// its indirect round, 0.5 s), longer than the suspicion window's floor (1.5 s, with
-/// three suspecters), shorter than its ceiling (4 s).
+/// its indirect round, 0.5 s), longer than the suspicion window's floor was up to 1.2.0
+/// (1.5 s, with three suspecters; 2.5 s since 0087-T10b), shorter than its ceiling
+/// (4 s).
 const STOP: Duration = Duration::from_secs(2);
 
 /// How many times it is stopped. One stop is noticed by its peers only if one of them
@@ -403,7 +404,7 @@ async fn await_quiet(nodes: &mut [ProcNode], phase: &str) {
 /// the tombstone's 30 s.
 ///
 /// The simulation holds the bound over seeds, in virtual time
-/// (`a_member_cut_off_for_up_to_two_seconds_is_not_declared_dead`); this is the
+/// (`a_member_cut_off_for_up_to_three_seconds_is_not_declared_dead`); this is the
 /// counterpart on real sockets, clocks and certificates.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "timing-sensitive on a loaded runner: twelve brokers and a verdict that is a \

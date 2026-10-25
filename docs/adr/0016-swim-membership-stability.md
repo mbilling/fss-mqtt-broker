@@ -1157,3 +1157,222 @@ it by this amendment:
   are, and where a property could be asserted instead it is: under loss, every `Dead`
   a node declares is a last probe of its own that ran out, and every `Dead` a node
   adopts is about a member some node had so declared.
+
+## Amendment (2026-10-25): a relayed `Dead` is checked before it is adopted, and the window's floor is 2.5 s (issue #975, ADR 0087 T10b)
+
+What the two amendments above left of #975: a member cut off for 2.5 s or 3 s — shorter
+than the 4 s window — was still turned `Dead` by some node once it was reachable again
+(1 to 8 runs of 32 at 10, 14 and 16 nodes), and a `Dead` a node was told about was
+adopted unchecked. Pinned by `a_member_cut_off_for_less_than_the_suspicion_window_is_not_dead_once_reachable`,
+which failed on 1.2.0 and now runs in every tier.
+
+### What was wrong, traced run by run
+
+Two mechanisms, in every failing run of that test:
+
+1. **A relayed `Dead` was adopted unchecked**, also about a member the node could reach.
+   With three suspecters the window is at its floor, so a node asked the member the last
+   time during the cut, heard nothing (correctly: it was cut off) and declared it `Dead`;
+   the other nodes adopted that verdict from gossip after the cut had ended, each one a
+   further `Dead` about a member that would have answered them at once. In the failing
+   3 s runs at 16 nodes this was 1 to 11 adoptions after the cut, per run.
+2. **A last probe sent during the cut that ran out just after it** was declared. This one
+   no rule about the timeout can remove: a probe sent while the member is cut off is
+   lost, so its silence just after the cut ends says nothing different from its silence
+   just before. No check of finite length tells a member that is back from one that is
+   not when its question was put before the member was back. What can be decided is
+   *when* the first question is put.
+
+### Decision
+
+- **`Config::check_relayed_dead`, on.** A `Dead` that arrives second-hand about a member
+  this node holds `Alive` or `Suspect`, in the life it holds, is not adopted and not
+  passed on. The member is sent one `Ping` carrying the claim — the last probe of the
+  amendment of 2026-10-13, on the same terms: only the member's own `Ack` to that probe,
+  from the life held, answers it. Silent for one ack timeout, it is declared `Dead` by
+  this node, on its own evidence, and the verdict is gossiped from there; answering, it is
+  kept, and its `Ack` carries its refutation (a node told it is `Dead` bumps its
+  incarnation and leads with the refutation), or, if it does not, the member is sent one
+  `Join` carrying the claim and its `Sync` states its incarnation. A last probe already
+  out for the member is not sent twice: it now checks the claim too, and its silence is
+  a verdict whatever the window says. A refutation arriving by gossip while the check is
+  out ends it. Unchanged: a member's own `Dead` (a graceful leave, first-hand), a `Dead`
+  about a member this node does not hold, and everything about tombstones.
+- **`suspicion_min_timeout_ms` = 2500** (from 1500). §3's fast track stays — three
+  independent suspecters still shorten the 4 s window — but not below 2.5 s. With two
+  ack timeouts before anyone suspects, no node asks a cut-off member the last time sooner
+  than **3 s less twice the network's latency** into the cut, so a cut shorter than that
+  has ended before any question is put and nothing is declared at all (the derivation of
+  the amendment for #1002, with 2500 for 1500: 2998 ms in a broker, 3098 ms on the
+  simulation's grid; `a_member_cut_off_for_up_to_three_seconds_is_not_declared_dead` and
+  `with_ticks_on_no_grid_a_cut_of_three_seconds_less_twice_the_latency_ends_in_no_dead`
+  pin it as arithmetic).
+
+Each answers one mechanism; the floor alone clears the cells of the test, and the check
+is what bounds the damage when a verdict is reached anyway — past the bound, by a node
+still on 1.2.0 or 1.1.0 during a roll, under loss, or by an isolated member about the
+nodes it could not reach (below). Neither is operator configuration.
+
+### Why it is safe
+
+- **A real death is still declared everywhere.** The check is a fresh probe, not a
+  memory of having heard from the member: there is no "recently seen" state that could
+  keep a dead member `Alive`. Every node that holds the member gets the verdict at most
+  one ack timeout (health-scaled) after it would have adopted it before; and every node
+  also runs its own window, which ends in its own last probe. Deaf and mute members are
+  declared as before (the probe needs a round trip). Measured below: every survivor holds
+  a dead member `Dead` in every run, at every size, also under 10 % loss.
+- **A member that one node can reach and the others cannot** is kept by that node and
+  declared by the others: each node's verdict rests on its own round trip. That is what
+  this record already did a moment later — #383's first-hand refutation pierces the
+  tombstone the moment the member's own datagram arrives — so the views were split
+  before as well; the node now simply does not flip to `Dead` and back. The others
+  converge among themselves, each on its own probe. What the reachable node does with a
+  member the others hold `Dead` is ADR 0087 D1's member without a link, seen from the
+  other side.
+- **The tombstone, refutation and generations** are untouched: the check runs only
+  while the member is not `Dead` here, in the life held; a `Dead` at a higher
+  incarnation is put to the member and, if it is silent, declared at that incarnation; a
+  refutation, relayed or first-hand, ends the check.
+- **Signed gossip and replay.** The answer is the last probe's: an `Ack` signed by the
+  member, naming its own sequence number. The exposure is the one the 2026-10-13
+  amendment states for the last probe and the ordinary probe: an attacker who can
+  replay a recent `Ack` of the member with the right number buys one more ack timeout.
+- **The wire and the roll from 1.2.0.** No new element: a `Ping` carrying a claim about
+  its receiver, an `Ack`, a `Join` and a `Sync`, as every release sends. A 1.2.0 node
+  answers the check as it answers the last probe. In a mixed cluster the 1.2.0 nodes
+  still declare on the shorter floor and adopt unchecked; the upgraded nodes check their
+  verdicts, so what they cost is the 1.2.0 nodes' own (the table below).
+
+### Evidence
+
+All from the formation simulation (`swim_formation_sim.rs`): 32 seeds a cell, one member
+of a formed cluster cut off, the cell counting the runs in which some node turned a
+member `Dead` (`false_dead_report`, `fault_shapes_report`). The v1.2.0 rows are the
+default with both rules off, which is that release's state machine.
+
+**A clean cut.** Runs of 32 with a `Dead`: the default / v1.2.0.
+
+| nodes | 0.5 s | 1 s | 1.5 s | 2 s | 2.5 s | 3 s | 3.5 s | 5 s |
+|---|---|---|---|---|---|---|---|---|
+| 3 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 6 | 32 / 32 |
+| 5 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 6 | 2 / 14 | 28 / 29 |
+| 10 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 1 | 0 / 3 | 3 / 16 | 28 / 31 |
+| 14 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 1 | 0 / 8 | 2 / 12 | 27 / 30 |
+| 16 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 3 | 0 / 5 | 5 / 11 | 26 / 28 |
+| 30 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 3 | 23 / 26 |
+
+Each rule alone (runs with a `Dead`, 2.5 s / 3 s / 3.5 s): the check alone, on 1.2.0's
+floor, leaves the cells as they were (10 nodes 1 / 3 / 16, 14 nodes 1 / 8 / 12, 16 nodes
+3 / 5 / 11) — the declarations there are mechanism 2 — and takes out the adoptions
+(after-the-cut runs at 3 s: 3, 8, 5 become 2, 8, 4; `Dead` transitions per run, worst,
+at 16 nodes: 14 become 4). The floor alone gives the default's counts in these columns.
+Where verdicts are reached anyway, the check keeps them few: at 5 s the worst run has 14
+`Dead` transitions at 14 nodes, 16 at 16 and 20 at 30 — with the floor alone 26, 30 and
+29, on v1.2.0 26, 30 and 53.
+
+**The price**: ms until the last survivor holds a member that really died `Dead`, median /
+worst of 16 seeds.
+
+| detector | 3 nodes | 5 | 10 | 14 | 16 | 30 |
+|---|---|---|---|---|---|---|
+| **default** | 4910 / 4996 | 5119 / 7482 | 5640 / 6789 | 6099 / 8337 | 6363 / 8221 | 7441 / 8956 |
+| v1.2.0 | 4089 / 4996 | 4716 / 6982 | 4997 / 6011 | 5613 / 8337 | 5687 / 7484 | 7005 / 8347 |
+| v1.2.0 + the check | 4309 / 4996 | 5019 / 6982 | 5136 / 6589 | 5968 / 8337 | 5981 / 7574 | 7304 / 8646 |
+| v1.2.0 + the 2.5 s floor | 4773 / 4996 | 5078 / 7312 | 5571 / 6403 | 5720 / 8337 | 5982 / 7958 | 7063 / 8746 |
+| default × `log10 N` | 4910 / 4996 | 5119 / 7482 | 5640 / 6789 | 6417 / 8794 | 7171 / 8704 | 8738 / 10407 |
+| memberlist's defaults, no last probe | 15077 / 16079 | 9019 / 17918 | 6838 / 16195 | 7775 / 20079 | 8357 / 20259 | 10869 / 23494 |
+
+0.4 to 0.8 s in the median and up to 0.8 s at worst over v1.2.0; the two rules add up
+to it (the check 0.1 to 0.4 s, the floor 0.1 to 0.7 s). (Passing a relayed `Dead` on while it is checked, instead of after, was measured
+and saves 0.1 to 0.2 s at 14 to 30 nodes; it was not taken, because during a roll it
+hands an unchecked verdict to the nodes that adopt unchecked.)
+
+**A cluster part-way through the upgrade** (14 nodes; runs of 32 with a `Dead`).
+
+| | 1.5 s | 2 s | 2.5 s | 3 s | 3.5 s | 5 s |
+|---|---|---|---|---|---|---|
+| every node upgraded | 0 | 0 | 0 | 0 | 2 | 27 |
+| one node left on v1.2.0 | 0 | 0 | 0 | 3 | 5 | 27 |
+| half the nodes on v1.2.0 | 0 | 0 | 0 | 7 | 9 | 30 |
+| every node on v1.2.0 | 0 | 0 | 1 | 8 | 12 | 30 |
+| one node left on v1.1.0 | 5 | 4 | 10 | 10 | 16 | 30 |
+| every node on v1.1.0 | 16 | 21 | 23 | 25 | 28 | 32 |
+
+With one node left on v1.2.0 the 3 s verdicts are that node's own (0 to 2 transitions a
+run, against 0 to 8 with every node on v1.2.0).
+
+**Packet loss**, on one network for every detector (the amendment for #1002). Runs of 32
+with a false `Dead` within 75 s, the default / v1.2.0; in the right half one member is
+also cut off for 1.5 s.
+
+| nodes | nobody at fault: 5 % | 10 % | 20 % | a 1.5 s cut as well: 5 % | 10 % | 20 % |
+|---|---|---|---|---|---|---|
+| 10 | 0 / 0 | 0 / 0 | 7 / 10 | 0 / 0 | 0 / 0 | 9 / 10 |
+| 14 | 0 / 0 | 2 / 2 | 27 / 30 | 1 / 1 | 3 / 4 | 26 / 25 |
+| 30 | 1 / 1 | 13 / 11 | 32 / 32 | 1 / 1 | 9 / 10 | 32 / 32 |
+
+Much the same number of runs, and far fewer verdicts in each: at 30 nodes and 20 % loss
+the worst run has 192 `Dead` transitions against 361, at 14 nodes 9 against 22, and at 30
+nodes and 10 % loss 4 against 31. Two cells are a run or two worse (30 nodes at 10 %, 13
+against 11; 14 nodes with the cut at 20 %, 26 against 25). Under 10 % loss every survivor
+still holds a member that really died `Dead` in every run, 0.4 to 0.9 s later in the
+median than on v1.2.0. Loss is where the window's scaling with the cluster, not either
+rule here, would have to act.
+
+**Other fault shapes** (`fault_shapes_report`, runs of 32 with a `Dead`, the default /
+v1.2.0). A member that hears nothing, or is not heard, for 3 s: none at 5 to 30 nodes,
+against 4, 7, 6, 1 (deaf) and 6, 2, 8, 0 (mute) at 5, 10, 14, 30; for good, it is
+declared by every survivor, 0.1 to 1.0 s later in the median. A node stopped for 3 s:
+none, against up to 6 at 14 nodes. One link lost one way: none, as before. A member
+whose datagrams arrive 0.6 s to 2 s late for 20 s: fewer runs with a verdict in every
+cell (at 14 nodes 15 / 19, 20 / 28 and 31 / 32 for 0.6, 1 and 2 s), and no more runs
+with a verdict after the fault in any cell (at 30 nodes and 0.6 s, 5 against 15). The bound
+with ticks off the grid: with every tick 0 to 99 ms late no `Dead` up to 3.2 s at any
+size; on a 50 ms grid one run of 32 at 5 nodes from 3050 ms — past 2998, as the
+arithmetic allows. Survivors that are all 300 to 500 ms late for 30 s hold a member that
+died `Dead` within 7962 / 9331 ms at 14 nodes (6099 / 8337 on time; the test's bound is
+twice on time's worst).
+
+**Not built, measured.** The SWIM paper's `log10 N` scaling on top of the default clears
+the 3.5 s column from 14 nodes up and halves the 5 s cells at 14 and 16 (17 runs of 32)
+and at 30 (4), for 0.3 s (14 nodes) to 1.3 s (30) more in the median; it is
+`Config::suspicion_scales_with_log_n`, still off, and the scaling question stays with
+T10b together with the packet-loss cells. A rule that a last probe running out after
+the member has answered something else of this node's since it was sent is not
+declared (#975's candidate (b)) was built and measured: it changed no cell, because a
+member back from a cut seldom says anything to the prober inside one ack timeout, and
+it would have let any recent `Ack` of the member, to anything, stand in for the answer
+to the probe. Withdrawn.
+
+### What this does not change
+
+- **What lies past the bound.** A cut of 3.5 s still ends in a verdict in a few runs of
+  32 (above), and one of 5 s in most.
+- **Packet loss** at 14 nodes and more (above).
+- **Where membership runs**, and whether awareness decays with time: T10b's other two
+  questions, open.
+
+### Tests
+
+- `a_member_cut_off_for_less_than_the_suspicion_window_is_not_dead_once_reachable` —
+  2.5 s and 3 s at 10, 14 and 16 nodes, 32 seeds: no `Dead`, during the cut or after.
+- `a_member_cut_off_for_up_to_three_seconds_is_not_declared_dead` and
+  `with_ticks_on_no_grid_a_cut_of_three_seconds_less_twice_the_latency_ends_in_no_dead`
+  — the bound, 3098 ms on the grid and 2998 ms with ticks on no grid, as arithmetic
+  (renamed from their two-second forms).
+- `a_member_falsely_declared_dead_is_readmitted_within_the_tombstone_ttl` counted the
+  isolated member's verdicts about the others being adopted after an 8 s cut as its
+  "false deaths"; with the check those are gone (each is put to the member declared,
+  which answers), and the test now asks for verdicts reached during the cut that
+  outlast it — the mutual evictions it is about.
+- In the state machine: `a_relayed_dead_about_a_member_that_answers_is_not_adopted`,
+  `a_member_that_acks_a_relayed_dead_without_refuting_is_kept_and_asked`,
+  `a_relayed_dead_about_a_silent_member_is_adopted_when_its_probe_runs_out`,
+  `a_relayed_dead_at_a_higher_incarnation_is_checked_and_declared_at_it`,
+  `a_relayed_dead_refuted_while_it_is_checked_is_dropped`,
+  `a_relayed_dead_about_a_suspect_is_checked_by_one_probe`,
+  `a_leave_an_unknown_member_and_the_1_2_rule_adopt_a_dead_at_once`,
+  `by_default_a_relayed_dead_is_checked_and_the_floor_is_two_and_a_half_seconds`.
+- The formation simulation can run a v1.2.0 node (its driver is this tree's; its state
+  machine has both rules off) beside a current one; the reports have its rows.
