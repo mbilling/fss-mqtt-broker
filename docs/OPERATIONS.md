@@ -1747,6 +1747,7 @@ the human-readable superset.
 | **Publishes shed at ingress** | `rate(mqttd_publish_dropped_total{reason="hub-ingress"}[5m]) > 0` for 5m (warn) | [runbook](#alert-publishes-shed-at-ingress) |
 | **Append lane saturating** | `mqttd_append_lane_jobs` growing sustained (warn); `rate(mqttd_publish_dropped_total{reason="append-backlog-full"}[5m]) > 0` (page) | [runbook](#alert-append-lane-saturating) |
 | **TLS material nearing expiry** | `mqttd_tls_lifetime_spent_ratio >= ignoring(role) group_left() mqttd_tls_expiry_warn_ratio` for 5m (warn); `mqttd_tls_lifetime_spent_ratio >= 0.9 and mqttd_tls_expiry_seconds < 2592000` (page) | [runbook](#alert-tls-material-nearing-expiry) |
+| **Durable session quarantined** | `mqttd_sessions_quarantined > 0` (page; the OTel instrument is `sessions_quarantined`) | [runbook](#alert-durable-session-quarantined) |
 
 ### Alert: Split brain
 
@@ -1955,6 +1956,12 @@ the human-readable superset.
   read (the log says so) or a revocation list without a `nextUpdate`.
 
 `curl <pod>:8080/statusz` is the human-readable superset of all of it.
+
+### Alert: Durable session quarantined
+
+**Rule:** `mqttd_sessions_quarantined > 0` (page; the OTel instrument is `sessions_quarantined`) — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
+
+**When it fires / what to do:** A durable session this node owns has been unreadable for two minutes of scans (usually `NoQuorum` on its placement group) and is no longer waited for (issue #1049). While it is quarantined, a publish whose only match is a subscription of it the node never read is acked and NOT stored for that session. `/statusz` → `session_quarantine` names the sessions and their errors, and the log's `refusal=` on the recovery warnings says which check refuses the group. Restore the group's replicas (bring back the nodes that hold them; see [Session scans and quarantined sessions](#session-scans-and-quarantined-sessions) and TROUBLESHOOTING); the alert clears when the session reads again (`quarantine lifted`). Keep the data dirs before wiping anything: they are what explains the cause
 
 ## Migrating onto mqttd
 

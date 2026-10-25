@@ -468,7 +468,8 @@ WARN mqttd::hub: durable session QUARANTINED: ... client=<client-id> error=no re
   same error, so the message could not have been stored for it anyway. Once the node
   gossips its interest, other nodes forget those filters too. Nothing acked during the
   quarantine is re-delivered when it lifts.
-- `/readyz` stays ready on purpose. Watch `mqttd_sessions_quarantined > 0` and
+- `/readyz` stays ready on purpose. Watch `mqttd_sessions_quarantined > 0` (the chart's
+  `MqttdDurableSessionQuarantined` alert pages on it) and
   `mqttd_routing_unsettled{reason="scan-incomplete"}` instead.
 
 **Fix it:** find out why the group does not recover (the `refusal=` lines above, and

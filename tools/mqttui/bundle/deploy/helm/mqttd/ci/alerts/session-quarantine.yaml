@@ -1,0 +1,34 @@
+# promtool unit test for the chart's quarantined-session alert (issue #1049).
+# Run by scripts/k8s/check-alert-rules.sh, which renders the chart's PrometheusRule into
+# rules.yaml beside a copy of this file.
+#
+# node-0 quarantines one session at minute 10 and lifts it at minute 30; node-1 never
+# quarantines anything and must stay quiet throughout.
+rule_files:
+  - rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'mqttd_sessions_quarantined{instance="node-0"}'
+        values: '0x9 1x20 0x10'
+      - series: 'mqttd_sessions_quarantined{instance="node-1"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: MqttdDurableSessionQuarantined
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: MqttdDurableSessionQuarantined
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              instance: node-0
+            exp_annotations:
+              summary: A durable session this node owns cannot be read and is quarantined; publishes for its unread subscriptions are not stored.
+              runbook: docs/OPERATIONS.md#alert-durable-session-quarantined
+      - eval_time: 35m
+        alertname: MqttdDurableSessionQuarantined
+        exp_alerts: []

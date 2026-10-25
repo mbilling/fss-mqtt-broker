@@ -168,6 +168,8 @@ broker exports for every certificate, CA and revocation list it has loaded
 Renew a certificate before two thirds of its lifetime are spent and neither fires.
 cert-manager's default renews at exactly two thirds: set `renewBefore` above a third of
 `duration`.
+`MqttdDurableSessionQuarantined` pages when a node has quarantined a durable session it
+cannot read (`mqttd_sessions_quarantined > 0`, issue #1049).
 
 ## Related
 
