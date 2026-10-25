@@ -130,7 +130,7 @@ one file the API can write is the rules file, and only for the certificates name
 [Security](#security) · [Clustering](#clustering) ·
 [Bridging](#bridging-to-other-security-zones) · [How it compares](#how-it-compares) ·
 [Enterprise readiness](#enterprise-readiness) ·
-[**Limitations**](#limitations) · [Install](#install) ·
+[**Limitations**](#limitations) · [Install](#install-and-verify) ·
 [Secured quickstart](#single-node-secured-tls-13--mtls--acl) ·
 [Configuration](#configuration) · [Kubernetes](#on-kubernetes-helm) ·
 [Documentation index](docs/README.md) ·
@@ -784,6 +784,46 @@ error? the [troubleshooting guide](docs/TROUBLESHOOTING.md).
 - [ ] **Run ≥3 nodes for HA, never 2.** A two-node durable cluster has *worse* write
   availability than one node (write quorum is 2-of-2). Go from 1 to 3.
 
+### Production deployment, in one screen
+
+Sizing, clustering and hardening as the README summarised them until 2026-10-25. Each
+item links to the page that carries the detail.
+
+**Sizing** — [SIZING.md](docs/SIZING.md), preset [`bounded-node.toml`](docs/examples/bounded-node.toml). Nine knobs bound a node:
+
+| knob | ships as |
+|---|---|
+| `MQTTD_DATA_DIR` | required (durable on) |
+| `MQTTD_STORE_MAX_BYTES` | unbounded |
+| `MQTTD_MAX_CONNECTIONS` (+`_PER_IP`) | uncapped |
+| `MQTTD_MAX_PACKET_SIZE` | 1 MiB |
+| `MQTTD_MAX_SESSIONS` | uncapped |
+| `MQTTD_MAX_QUEUED_MESSAGES` | 100,000 / drop-oldest |
+| `MQTTD_MAX_BACKLOG_*`, `MQTTD_MAX_INFLIGHT_MESSAGES` | 10,000 / off / 65,535 |
+| `MQTTD_MAX_RETAINED_MESSAGES` | uncapped |
+| `MQTTD_AUTH_PENALTY_THRESHOLD` | unlimited attempts |
+
+Memory watermark at 75–85% of the container limit; the container limit is the hard bound. ~19 KiB per idle connection.
+
+**Clustering**
+- **≥ 3 nodes, never 2** (2-node write quorum is 2-of-2: worse than 1)
+- one founder boots with an empty seed list; others seed off any member
+- one cluster-bus certificate **per node**
+- grow: start a node · shrink: `SIGUSR1` · replace: grow then shrink · upgrade: one node at a time
+- day 2: [OPERATIONS.md](docs/OPERATIONS.md)
+
+**Hardening** — 51-item baseline with auditor checks: [HARDENING.md](docs/HARDENING.md)
+- [ ] no `INSECURE:` lines in the startup log
+- [ ] `MQTTD_DATA_DIR` on a volume
+- [ ] no plaintext listener; TLS 1.3; client certs carry `clientAuth` EKU
+- [ ] anonymous off; Argon2id passwords via `mqttd --hash-password`; file mode ≤ 640
+- [ ] ACL file, `default = "deny"`
+- [ ] caps and watermarks set
+- [ ] per-node bus certs; gossip key from file
+- [ ] CRL configured, reload tested
+- [ ] rule trace off; `[rules] admin_writers` empty, or only the ACL file's editors
+- [ ] `--read-only --cap-drop ALL --security-opt no-new-privileges`, or the shipped systemd unit
+
 ## Limitations
 
 The gaps worth knowing before you evaluate this, stated here rather than left to
@@ -1031,7 +1071,7 @@ on resume, and the **capability advertisement** — that the CONNACK says `Subsc
 Identifiers Available = 0` and that a real client which uses one is refused with `0xA1` rather
 than silently degraded.
 
-## Install
+## Install and verify
 
 Releases are cut from signed semver tags by an automated, security-grade pipeline
 ([ADR 0045](docs/adr/0045-release-engineering-and-distribution.md)): every artifact
@@ -1051,8 +1091,10 @@ docker run --rm -e MQTTD_DATA_DIR=/var/lib/mqttd \
 # `mqttd --version` prints the version and exits; `mqttd --help` lists every flag.
 # An unrecognised flag is now an ERROR (exit 2), not a silent broker start.
 
-# Verify the image signature before trusting it:
-cosign verify ghcr.io/mbilling/fss-mqtt-broker:0.9.0 \
+# Verify the image signature before trusting it. Pin the release you run; the newest
+# is on https://github.com/mbilling/fss-mqtt-broker/releases (1.2.0 on 2026-10-25):
+VERSION=1.2.0
+cosign verify ghcr.io/mbilling/fss-mqtt-broker:$VERSION \
   --certificate-identity-regexp 'https://github.com/mbilling/fss-mqtt-broker/.github/workflows/release.yml@.*' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
@@ -1084,12 +1126,57 @@ docker run -d --name mqttd \
 > while active). `MQTTD_DURABLE_SESSIONS=0` — the lightweight in-memory store — is an
 > explicit choice already and needs no flag.
 
-> **What exists today: `v0.9.0`** — both musl binaries with signatures and
+> **What every release ships** (the first was `v0.9.0`; the newest is on the
+> [Releases page](https://github.com/mbilling/fss-mqtt-broker/releases)) — both musl binaries with signatures and
 > certificates, a signed CycloneDX SBOM, a multi-arch image, and SLSA provenance,
 > plus the same set for `mqtt-bridge`. Every one has been verified end to end
-> against the published artifacts, so this is a real thing you can pull and check,
+> against the published `v0.9.0` artifacts, so this is a real thing you can pull and check,
 > not a pipeline that merely exists. `:latest` tracks the newest non-prerelease;
 > pin the version for reproducibility.
+
+### Every way to install
+
+The summary that was the README's Installation section until 2026-10-25. `VERSION` is the
+release you pin, as above.
+
+Every release · static musl `linux/amd64` + `linux/arm64` · cosign-signed · SLSA · CycloneDX SBOM · verify: [RELEASING.md](RELEASING.md).
+
+**Docker**
+```sh
+docker run -d --name mqttd --read-only --cap-drop ALL --security-opt no-new-privileges \
+  -v mqttd-data:/var/lib/mqttd -v "$PWD/pki":/etc/mqttd/tls:ro -v "$PWD/acl.toml":/etc/mqttd/acl.toml:ro \
+  -p 8883:8883 -p 8080:8080 \
+  -e MQTTD_TLS_BIND=0.0.0.0:8883 -e MQTTD_TLS_CERT=/etc/mqttd/tls/server.crt -e MQTTD_TLS_KEY=/etc/mqttd/tls/server.key \
+  -e MQTTD_ACL_FILE=/etc/mqttd/acl.toml -e MQTTD_DATA_DIR=/var/lib/mqttd -e MQTTD_HEALTH_BIND=0.0.0.0:8080 \
+  ghcr.io/mbilling/fss-mqtt-broker:$VERSION
+cosign verify ghcr.io/mbilling/fss-mqtt-broker:$VERSION \
+  --certificate-identity-regexp 'https://github.com/mbilling/fss-mqtt-broker/.github/workflows/release.yml@.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+**Kubernetes**
+```sh
+LEAF_DAYS=30 NS=mqttd REPLICAS=3 ./deploy/helm/mqttd/bootstrap.sh
+helm install mqttd deploy/helm/mqttd -n mqttd --set replicaCount=3 \
+  --set secrets.tls.secretName=mqttd-tls --set secrets.peerTls.secretName=mqttd-peer-tls \
+  --set secrets.gossipKey.secretName=mqttd-gossip
+```
+Operator: `deploy/helm/mqttd-operator` · guide: [KUBERNETES.md](docs/KUBERNETES.md)
+
+**Compose / systemd**
+```sh
+cd deploy/compose && ./bootstrap.sh && docker compose up -d    # 3 TLS nodes, one host
+```
+Bare metal: [`deploy/systemd/`](deploy/systemd/) · tutorial: [SECURED-CLUSTER-TUTORIAL.md](docs/SECURED-CLUSTER-TUTORIAL.md)
+
+**Binaries:** [GitHub Releases](https://github.com/mbilling/fss-mqtt-broker/releases) (`mqttd-*`, `mqttd-fips-*`, `mqtt-bridge-*`)
+
+**Source** (Rust ≥ 1.96)
+```sh
+git clone https://github.com/mbilling/fss-mqtt-broker && cd fss-mqtt-broker
+cargo build --release --bin mqttd
+cargo install --locked --path tools/mqttui    # runnable map of every demo/test/migration script
+```
 
 ## Running
 
@@ -1199,7 +1286,7 @@ mosquitto_sub -h 127.0.0.1 -p 8883 --cafile pki/ca.crt \
 The same posture — TLS 1.3, mutual TLS, deny-by-default ACL, durable state on a
 volume — as one hardened `docker run`, reusing the `pki/` and `acl.toml` minted
 in steps 1–2 above. This is the container shape of the secured walkthrough; the
-plaintext `docker run` in [Install](#install) is only ever the first look.
+plaintext `docker run` in [Install](#install-and-verify) is only ever the first look.
 
 ```sh
 # The image runs as uid 65532 (nonroot), so the mounted material must be
@@ -1332,6 +1419,40 @@ generated reference):
 file is found). Experimental store pins `MQTTD_STORE_SHARDS` / `MQTTD_STORE_LINGER`
 are documented in CONFIGURATION.md — they are **not** a QoS 2 prerequisite
 (ADR 0076 measured both slower than the defaults).
+
+### A minimal secured file, and the commands around it
+
+The README's Configuration summary until 2026-10-25:
+
+Layering: **defaults < TOML < `MQTTD_*` env < CLI** · strict schema · secrets by path · hot reload.
+
+```toml
+[node]
+id = "node-1"
+data_dir = "/var/lib/mqttd"
+
+[listeners]
+tls_bind    = "0.0.0.0:8883"
+health_bind = "0.0.0.0:8080"      # /livez /readyz /metrics
+
+[tls]
+cert      = "/etc/mqttd/tls/server.crt"
+key       = "/etc/mqttd/tls/server.key"
+client_ca = "/etc/mqttd/tls/client-ca.crt"   # mTLS
+
+[security]
+allow_anonymous = false
+acl_file = "/etc/mqttd/acl.toml"             # deny by default
+```
+
+```sh
+mqttd --check-config --config mqttd.toml    # validate, binds nothing
+mqttd --print-config --config mqttd.toml    # effective config, secrets fingerprinted
+mqttd --check-tls --config mqttd.toml       # certs, keys, CAs, CRLs: match, order, expiry
+kill -HUP "$(pidof mqttd)"                  # reload policy, TLS, quotas
+```
+
+Template: [`docs/mqttd.example.toml`](docs/mqttd.example.toml) · every key: [CONFIGURATION.md](docs/CONFIGURATION.md)
 
 ### Health probes
 
