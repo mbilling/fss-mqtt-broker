@@ -20,7 +20,7 @@ spec:
   # Defaults to the operator's pinned broker release when omitted.
   # image: ghcr.io/mbilling/fss-mqtt-broker:0.9.1
   secrets:
-    tls: mqttd-server-tls
+    tls: mqttd-tls
     acl: mqttd-acl
     peerTls: mqttd-peer-tls
     # Instead of peerTls: one certificate per pod from cert-manager's csi-driver. The
@@ -30,7 +30,7 @@ spec:
     #   issuerName: mqttd-cluster-ca
     #   duration: 24h
     #   renewBefore: 10h
-    gossipKey: mqttd-gossip-key
+    gossipKey: mqttd-gossip
   persistence:
     size: 10Gi
   # The admin API (ADR 0081, docs/ADMIN-API.md) on port 9443 of every pod, served with

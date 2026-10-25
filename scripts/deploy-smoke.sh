@@ -484,8 +484,12 @@ mutually-authenticated bus (so all four peer-certificate rules hold)"
 # old ones, reload. The node directory IS the installed path here, so the script's own
 # move-into-place is the install. No restart: the same PID must serve the new certificate.
 gen_metric() { # <health_port> <series, labels included> -> its value, or ""
-  curl -fsS --max-time 5 "http://127.0.0.1:$1/metrics" 2>/dev/null \
-    | awk -v s="$2" '$1 == s { print $2; exit }'
+  # The body is read in full before awk sees it: an awk that exits at its line used to
+  # close the pipe under curl, which failed the step with curl's write error (23) under
+  # pipefail whenever /metrics was large enough (issue #1019).
+  local body
+  body="$(curl -fsS --max-time 5 "http://127.0.0.1:$1/metrics" 2>/dev/null)" || return 0
+  awk -v s="$2" '$1 == s { print $2; exit }' <<<"$body"
 }
 served_serial() { # <port> -> the serial of the certificate that listener serves right now
   openssl s_client -connect "127.0.0.1:$1" </dev/null 2>/dev/null \

@@ -1226,6 +1226,20 @@ requires = ["helm", "promtool"]
 duration = "~5s"
 
 [[task]]
+id = "k8s-operator-example"
+group = "Kubernetes"
+name = "Check the operator example names only Secrets the bootstrap script creates"
+script = "scripts/k8s/check-operator-example.py"
+about = """
+Reads deploy/helm/mqttd-operator/example-mqttdcluster.yaml's spec.secrets and the
+`kubectl create` lines of deploy/helm/mqttd/bootstrap.sh, and fails if the example names a
+Secret or ConfigMap the script does not create: the documented path is "run the bootstrap
+script, then apply the example".
+"""
+requires = ["python3"]
+duration = "~1s"
+
+[[task]]
 id = "k8s-operator-rbac-parity"
 group = "Kubernetes"
 name = "Check the operator's RBAC matches between the chart and the dev manifest"
