@@ -70,7 +70,7 @@ pub async fn consumer(
         loop {
             match Packet::decode(&mut buf, VERSION) {
                 Ok(Some(Packet::Publish(p))) => {
-                    on_publish(&ctx, ledger_stream, &p, now, &mut batch)
+                    on_publish(&ctx, ledger_stream, &p, now, &mut batch);
                 }
                 Ok(Some(Packet::PingResp)) => {}
                 Ok(Some(Packet::Disconnect(_))) => {

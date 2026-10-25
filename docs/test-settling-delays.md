@@ -64,6 +64,7 @@ caller changes this file and the gate fails until it is regenerated and re-read.
 | `crates/mqttd/tests/http_auth.rs` | `stub_hook` | `http-auth-hang-stub` | 60s | helper, 6 call site(s) |
 | `crates/mqttd/tests/keepalive_lwt.rs` | `pinging_client_stays_connected_past_keepalive` | `keepalive-ping-cadence` | 500ms | in the test itself |
 | `crates/mqttd/tests/keepalive_lwt.rs` | `zero_keepalive_is_never_idle_disconnected` | `keepalive-zero-idle-window` | 2500ms | in the test itself |
+| `crates/mqttd/tests/loadgen.rs` | `one_way` | `loadgen-delay-proxy` | ? | helper, 5 call site(s) |
 | `crates/mqttd/tests/peer_identity.rs` | `a_cluster_crl_reload_tears_down_the_revoked_nodes_link` | `crl-redial-attempt-window` | 2s | in the test itself |
 | `crates/mqttd/tests/peer_identity.rs` | `a_stale_address_does_not_keep_flapping_the_link_of_the_node_that_answers` | `stale-dialer-stays-away` | 5s | in the test itself |
 | `crates/mqttd/tests/peer_link_expiry.rs` | `an_expired_node_is_out_and_stays_out` | `expired-peer-stays-unlinked` | 12s | in the test itself |

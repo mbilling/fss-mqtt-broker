@@ -2527,6 +2527,7 @@ dependencies = [
  "mqtt-codec",
  "mqtt-config",
  "mqtt-core",
+ "mqtt-load",
  "mqtt-net",
  "mqtt-observability",
  "mqtt-rules",

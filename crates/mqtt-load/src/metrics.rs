@@ -83,6 +83,7 @@ fn histogram(out: &mut String, name: &str, help: &str, h: &Latency) {
 
 /// Render `v` in the Prometheus text format.
 #[must_use]
+#[allow(clippy::too_many_lines)] // one line per series
 pub fn render(v: &View<'_>) -> String {
     let mut o = String::with_capacity(4096);
     counter(
