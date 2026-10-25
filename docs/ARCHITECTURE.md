@@ -44,6 +44,7 @@ source feeding the same hub ([ADR 0001](adr/0001-session-durability.md)).
 | `mqttd` | Binary + hub + conn — this page. |
 | `mqtt-bridge` | Zone-crossing MQTT client (not a cluster member). |
 | `mqttd-operator` | `MqttdCluster` reconciler. |
+| `mqtt-load` | The benchmark rig's load generator (ADR 0090): a client of the broker, never linked into it. |
 
 ## `mqttd` library modules (`crates/mqttd/src/lib.rs`)
 
