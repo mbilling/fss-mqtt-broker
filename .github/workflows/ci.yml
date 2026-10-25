@@ -460,6 +460,8 @@ jobs:
       # equal mqtt-load's own on a real summary.
       - name: The rig2 ramp's verdicts, capacity lines and histogram merge (offline)
         run: python3 bench/scale/rig2/test-verdict.py
+      - name: The README's evidence charts draw every bar from headline.csv in its tier
+        run: python3 bench/scale/chart-readme.py --self-test
 
   interop:
     name: foreign-client interop (mosquitto + paho)
