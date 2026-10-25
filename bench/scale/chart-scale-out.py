@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Draw the README's scale-out charts: QoS 0 and QoS 1 msg/s vs nodes, and the
+"""Draw the scale-out charts in docs/benchmarks/EVIDENCE.md: QoS 0 and QoS 1 msg/s vs nodes, and the
 per-rung chart of a campaign whose rungs are not all certified.
 
     python3 bench/scale/chart-scale-out.py            # all, into docs/benchmarks/img/

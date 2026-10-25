@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Draw the README's per-vCPU comparison from docs/benchmarks/data/per-vcpu.csv.
+"""Draw EVIDENCE.md's per-vCPU comparison from docs/benchmarks/data/per-vcpu.csv.
 
 One bar group per workload class, each on its own scale, so a bar is only ever
 read against bars of the same class: the classes differ by 2-10x in what a
