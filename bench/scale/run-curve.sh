@@ -580,7 +580,9 @@ LANE_E_DRIVER_GATE_SECS="${LANE_E_DRIVER_GATE_SECS:-20}"
 LANE_E_SWAP_HOOK="${LANE_E_SWAP_HOOK:-}"
 # Stop a ladder past its knee: after LANE_E_STOP_AFTER_FAILS consecutive ladder
 # rungs that are RED, FAILED (lost messages) or NOT CARRIED (summarize-curve.py's
-# own verdict, read the moment each rung ends), skip the rest of the ladder and go
+# own verdict, read the moment each rung ends; a rung only VOIDED by the harness
+# — INVALID EVIDENCE, HARNESS-LIMITED, LATENCY UNREADABLE — neither counts nor
+# resets, see lane_e_fails_after), skip the rest of the ladder and go
 # straight to the control. GREEN and YELLOW rungs keep it climbing: the latency
 # around the knee is what the ladder reports, so it must measure the yellow band. The rungs above a
 # knee confirm what the failing ones already showed, at full fleet cost. The
@@ -3247,34 +3249,43 @@ PY
 # lane_e_clock_capture <rdir> <phase>: the rung's clock evidence for one phase.
 # A clock past its bound makes THIS rung's latency unreadable, not the run: the
 # reason is appended to clock-invalid.txt, the extractor refuses the phase, and
-# summarize-curve.py grades the rung INVALID EVIDENCE, which the stop rule counts
-# as neither pass nor fail. On 2026-10-23 one broker's chrony reported 5.8 ms
+# summarize-curve.py grades the rung's latency UNREADABLE, which the stop rule
+# counts as neither pass nor fail (an offer the brokers did not take still counts). On 2026-10-23 one broker's chrony reported 5.8 ms
 # under a heavy rung (budget 5 ms) and the die here ended a 10-node run mid-ladder.
 lane_e_clock_capture() {
 	local rdir="$1" phase="$2" why
 	qos1_clock_capture "$rdir/clock/$phase" && return 0
 	why=$(tail -n 1 "$rdir/clock/$phase/check.err" 2>/dev/null)
 	printf '%s: %s\n' "$phase" "${why:-the clock capture failed}" >>"$rdir/clock-invalid.txt"
-	warn "lane E: $(basename "$rdir"): clock health failed at $phase — the rung is graded INVALID EVIDENCE, the run continues (${why:-no detail})"
+	warn "lane E: $(basename "$rdir"): clock health failed at $phase — the rung's latency is graded UNREADABLE, the run continues (${why:-no detail})"
 }
 
 # lane_e_fails_after <fails> <verdict>: the ladder's count of consecutive
 # failing rungs once a rung with this verdict is added. GREEN and YELLOW reset
-# it; RED, FAILED and NOT CARRIED count. A NOT CARRIED rung whose ONLY flags
-# are INVALID EVIDENCE says nothing about the knee either way — its
-# measurement is unusable, not failed — so it neither counts nor resets. On
-# 2026-09-26 two such rungs at 39k/node (QoS 1, 10 nodes; every broker
-# received the full offer) stopped a ladder that had not reached its knee.
+# it; RED, FAILED and NOT CARRIED count. A NOT CARRIED rung whose only gating
+# flags VOID it — INVALID EVIDENCE (an input missing), HARNESS-LIMITED (the
+# generator could not offer the load) or LATENCY UNREADABLE (a clock breach) —
+# says nothing about the knee either way, so it neither counts nor resets.
+# "NOTE: " flags are diagnostics and are skipped. Certification reads the
+# brokers (ADR 0048, amended 2026-10-25): an audited rung whose brokers did not
+# take the offer is NOT CARRIED: OFFER NOT TAKEN and counts. On 2026-09-26 two
+# INVALID EVIDENCE rungs at 39k/node (QoS 1, 10 nodes; every broker received
+# the full offer) stopped a ladder that had not reached its knee.
 lane_e_fails_after() {
-	local fails="$1" verdict="$2" flags flag neutral=yes
+	local fails="$1" verdict="$2" flags flag neutral=yes voided=no
 	local -a flag_list
 	flags="${verdict#NOT CARRIED: }"
 	[ "$flags" = "$verdict" ] && neutral=no
 	IFS=';' read -r -a flag_list <<<"$flags"
 	for flag in ${flag_list[@]+"${flag_list[@]}"}; do
 		flag="${flag# }"
-		case "$flag" in "INVALID EVIDENCE"*) ;; *) neutral=no ;; esac
+		case "$flag" in
+		"NOTE: "*) ;;
+		"INVALID EVIDENCE"* | "HARNESS-LIMITED"* | "LATENCY UNREADABLE"*) voided=yes ;;
+		*) neutral=no ;;
+		esac
 	done
+	[ "$voided" = yes ] || neutral=no
 	if [[ "$verdict" == GREEN* || "$verdict" == YELLOW* ]]; then echo 0
 	elif [ "$neutral" = yes ]; then echo "$fails"
 	else echo $((fails + 1)); fi
@@ -3330,7 +3341,8 @@ lane_e_forward_canary
 lane_e_driver_gate
 lane_e_calibrate
 declare -a e_seen=()
-# Set before the loop: a neutral (INVALID EVIDENCE only) first rung carries
+# Set before the loop: a neutral (voided: INVALID EVIDENCE, HARNESS-LIMITED,
+# LATENCY UNREADABLE) first rung carries
 # the count forward unchanged, and under `set -u` an unset one aborts the run.
 e_fails=0
 for e_sites in "${LANE_E_SITES[@]}"; do

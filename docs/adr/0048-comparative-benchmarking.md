@@ -252,3 +252,74 @@ rungs are regraded where the raw runs survive (the 2026-09-26 QoS 0 scale-out:
 the 120k/node rungs are YELLOW at p99 ≤ 2 s with zero loss). The 2026-09-16
 single-node knees were qualified at ≥ 99% delivered and their raw runs are not
 retained, so zero loss is **not re-checked** for them; the record says so.
+
+### Amendment (2026-10-25): certification reads the broker only
+
+The rung a ladder certifies is a claim about the broker, so it is judged from what
+the brokers recorded and nothing else. Until now an audited lane E rung was certified
+only if the harness also behaved: its drivers' sent rate met the offer, at most 5% of
+publishes ran behind their schedule (`PUBLISHERS LATE`, `LATE_OK = 0.05`), the window
+opened steady, and the drivers' scrapes fit a 2% bracket (`INVALID EVIDENCE`).
+
+**Why.** The audit driver's QoS 1 publishers are synchronous: `emqtt:publish` returns
+on the PUBACK, one in flight, ten messages a second on an absolute schedule, so each
+publisher has a 100 ms slot. A "late" publish is a PUBACK that took longer than what
+was left of its slot. The late gate therefore measured the brokers' ack latency through
+the harness against a fixed 100 ms budget — a budget no user states, and tighter than
+the 1 s p99 line the rung is graded by — and voided rungs the brokers had carried in
+full. On the 1.3.0 RC run (2026-10-25, 10 nodes, 45 sites) the brokers received
+270,001 of 270,000 msg/s offered, delivered all of it, dropped nothing, closed a
+43.7M-identity ledger, and held p99 at ≤ 500 ms; the rig said NOT CARRIED: PUBLISHERS
+LATE (5.7%).
+
+**The rule** (`bench/scale/summarize-curve.py`, `audited_grade`). An audited QoS 1
+rung is **certified** (GREEN) when, from the brokers' own counters over their own
+window and the identity ledger:
+
+1. **The offer was taken:** the brokers' received rate is at least 99% of the offered
+   rate (`OFFER_TAKEN`; the same line says whether the drivers sent the offer).
+2. **Nothing was lost:** the ledger closes — nothing missing, unexpected or
+   unacknowledged — and no broker dropped a message.
+3. **The latency is green:** the consumers' end-to-end p99 plus the clocks'
+   uncertainty is ≤ 1 s. YELLOW (≤ 5 s) and RED (above) are carried, not certified,
+   as in the 2026-09-27 amendment.
+
+A lost message is **FAILED**, as before, and nothing else fails a rung. An offer the
+brokers did not take (`OFFER NOT TAKEN`), a publish they never acknowledged
+(`UNACKNOWLEDGED`) and the remaining broker-side gates (unsettled or unreset
+population, not durable, queue growth, pause incomplete) are **NOT CARRIED**. The
+ladder's stop rule keeps the 2026-09-27 reading: it climbs through GREEN and YELLOW
+and counts RED, FAILED and NOT CARRIED — a RED rung is past the latency the ladder
+reports, so it is part of the knee.
+
+**What stays harness-side: it can only void a rung.** A voided rung is neither
+certified nor failed, and the stop rule (`lane_e_fails_after`) counts it as neither:
+
+- **HARNESS-LIMITED:** the brokers did not take the offer because the generator did
+  not offer it — the drivers sent less than 99% of it and either a driver CPU gate
+  tripped (a core saturated in the window, or `pinned-drivers.txt`) or the brokers
+  acknowledged inside the publisher's slot (PUBACK p99 ≤ the slot), so their ack time
+  cannot have held the synchronous publishers back. When PUBACK p99 is past the slot
+  and no CPU gate tripped, the shortfall is the brokers' backpressure and the rung is
+  OFFER NOT TAKEN. A pinned driver also voids a rung that took its offer but graded
+  outside GREEN: the consumers' timestamps are the driver's. **A rung whose drivers
+  sent the full offer is never harness-limited for being late.**
+- **LATENCY UNREADABLE:** a clock past its bound (`clock-invalid.txt`, or the clock
+  evidence refused) voids the p99 alone. The rung cannot be certified, but its
+  throughput and loss still count: lost messages FAIL it and an offer not taken still
+  counts toward the stop rule; with neither, it is neutral.
+- **INVALID EVIDENCE:** a broker-side input is missing — the brokers' counters or
+  window, their own scrape brackets past 2% of the window, the identity ledger, or the
+  crossing certificate.
+
+Everything else the harness observes is a **diagnostic**, printed with the rung as a
+`NOTE:` flag and gating nothing: publishers behind schedule (with the share), the
+steady-state result, a refused driver certificate (scrape-window uncertainty), the
+latency floor, the drivers' own sent rate. The publishers' PUBACK p99 — the brokers'
+ack time as a synchronous client sees it — is reported beside the end-to-end p99 on
+every rung.
+
+Scope: the rule needs the identity ledger, so it applies to audited QoS 1 rungs. QoS 0
+and QoS 2 rungs, and QoS 1 without the audit driver, keep the driver-side gates.
+Results published before this amendment keep their verdicts; re-grading a run is
+`summarize-curve.py` on its retained raw results.

@@ -370,6 +370,25 @@ Two campaigns on the 1.2.0 release commit (2026-10-12, an unreleased candidate b
 (durable QoS 1 on the default store, with a sizing estimate and the cross-node traffic
 of both). Both publish rungs the rig did not certify, labelled as such.
 
+**How a lane E rung is certified** (ADR 0048, amended 2026-10-25: certification reads
+the broker only). An audited QoS 1 rung (the audit driver, an identity ledger) is
+**GREEN, certified** when, read from the brokers' own counters and the ledger: the
+brokers received at least 99% of the offered rate over their own window
+(`OFFER_TAKEN`), the ledger closes and no broker dropped anything, and the consumers'
+p99 plus the clock uncertainty is at or below 1 s. YELLOW (≤ 5 s) and RED are carried,
+not certified. A lost message is **FAILED**. The verdict is NOT CARRIED and counts
+toward the ladder's stop rule when the brokers did not take the offer (`OFFER NOT
+TAKEN`), withheld a PUBACK (`UNACKNOWLEDGED`), or a broker-side gate held (unsettled,
+unreset, not durable, queue growth, pause incomplete). The harness can only **void** a
+rung, which the stop rule (`lane_e_fails_after`) counts as neither pass nor fail:
+`HARNESS-LIMITED` (the drivers sent less than the offer and either a driver CPU gate
+tripped or the brokers acknowledged inside the publisher's slot), `LATENCY UNREADABLE`
+(a clock breach; the rung's offer and loss still count) and `INVALID EVIDENCE` (a
+broker-side input missing). Publishers behind schedule, the steady-state gate, driver
+scrape uncertainty and the latency floor are `NOTE:` diagnostics, and the table prints
+the PUBACK p99 and late share beside every rung. QoS 0/2 and unaudited QoS 1 rungs keep
+the older driver-side gates (offer met on schedule, steady, `PUBLISHERS LATE` past 5%).
+
 `summarize-curve.py` reads a lane E rung twice and never merges the two. Its verdict
 column is the rig's certification. Under "Reading from the brokers' counters" it asserts
 the rung from the brokers' own counters: the rung **holds** if no message was lost (the

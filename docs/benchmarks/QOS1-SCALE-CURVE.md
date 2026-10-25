@@ -39,6 +39,13 @@ handling** — mqttd's own hot path had ~2× headroom at the knee. See
   lost a message or left GREEN:** every knee here is backpressure (late
   publishers, i.e. slow acks), never latency. Rungs recorded as FAIL before the
   amendment are relabelled NOT CARRIED below.
+- **Since 2026-10-25 certification reads the broker only**
+  ([ADR 0048](../adr/0048-comparative-benchmarking.md#amendment-2026-10-25-certification-reads-the-broker-only)).
+  An audited rung is GREEN when the brokers received ≥ 99% of the offer, the ledger
+  closed with no broker drop, and p99 ≤ 1 s. Late publishers, the steady-state gate
+  and driver scrape uncertainty are diagnostics; the harness can only void a rung
+  (HARNESS-LIMITED, LATENCY UNREADABLE, INVALID EVIDENCE). The verdicts below were
+  given under the earlier gates and are kept as recorded.
 
 ## The curve
 

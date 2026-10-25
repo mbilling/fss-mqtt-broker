@@ -233,9 +233,15 @@ class Evidence(unittest.TestCase):
     def test_drain_and_steady_gate(self):
         f = self.p / "rung.txt"
         original = f.read_text()
-        for token in ["drained", "steady", "settled", "reset"]:
+        for token in ["settled", "reset"]:
             f.write_text(original.replace(token + "=yes", token + "=no"))
             self.assertFalse(S.lane_e_rung(self.p)["pass"])
+        # Certification reads the brokers (ADR 0048, 2026-10-25): with the ledger
+        # closed, the drain deadline and the steady-state gate are diagnostics.
+        for token in ["drained", "steady"]:
+            f.write_text(original.replace(token + "=yes", token + "=no"))
+            r = S.lane_e_rung(self.p)
+            self.assertTrue(r["pass"], r["flags"])
         f.write_text(original)
 
     def telemetry_fixture(self):
