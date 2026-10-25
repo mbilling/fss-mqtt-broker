@@ -92,9 +92,12 @@ mod mesh;
 /// work stays removed.
 #[cfg(test)]
 mod probe;
+/// Quarantine of a durable session that stays unreadable (issue #1049).
+mod quarantine;
 /// The pure settle-gate ack rule a gated publish passes through (issue #613
 /// item 2.1).
 mod settle;
+pub use quarantine::QUARANTINE_LISTED;
 
 /// Maximum number of queued messages replayed to a reconnecting session at once.
 const REPLAY_LIMIT: usize = 10_000;
@@ -1988,6 +1991,10 @@ pub enum HubCommand {
         /// first few, and how many in all.
         unread: Vec<(ClientId, String)>,
         unread_total: usize,
+        /// Whether the store could enumerate its keys at all. `false` = the scan
+        /// failed outright: it read nothing, names no session (`unread` holds a
+        /// placeholder), and can never be completed by quarantine (issue #1049).
+        enumerated: bool,
     },
     /// Liveness probe (the health endpoint): the hub replies as soon as the actor
     /// loop dequeues this command, proving the loop is draining and not wedged.
@@ -2753,10 +2760,26 @@ pub struct Hub {
     /// missing sessions it owns, and a gated ack must not conclude "nobody is
     /// owed this" no matter how many window ticks have elapsed. The settle
     /// window closes on this OBSERVABLE state, never on time alone.
+    ///
+    /// "Saw everything" counts a QUARANTINED session as seen (issue #1049): a
+    /// scan whose only unread sessions are quarantined, that named every one of
+    /// them and whose enumeration did not fail is complete here — see
+    /// `hub/quarantine.rs` for the rule and what it costs. Every reader
+    /// (`routing_unsettled`, `cannot_say_who_is_here`, the `scan-incomplete`
+    /// gauge, the interest-authoritative transition) reads this one value.
     last_scan_complete: bool,
-    /// Consecutive session scans that landed incomplete (issue #1049), for the warnings
-    /// that name what they could not read and say when they complete again.
+    /// Consecutive session scans that landed incomplete in the STORE's sense
+    /// (issue #1049), quarantine or not, for the warnings that name what they
+    /// could not read and say when they complete again.
     incomplete_scans: u32,
+    /// Per client, the scans in a row that could not read it (issue #1049).
+    unread_streaks: HashMap<ClientId, quarantine::UnreadStreak>,
+    /// The durable sessions this node owns, could not read for long enough, and
+    /// no longer lets hold its scans incomplete, each with its last error (issue
+    /// #1049).
+    quarantined_sessions: BTreeMap<ClientId, String>,
+    /// The `/statusz` mirror of [`quarantined_sessions`](Self::quarantined_sessions).
+    quarantine_status: Option<Arc<crate::health::SessionQuarantine>>,
     /// Whether peer networking is configured (set at startup, before `run`):
     /// the stable half of [`clustered`](Self::clustered) — a restarted cluster
     /// node must not be mistaken for a standalone broker while SWIM re-learns
@@ -3264,6 +3287,9 @@ impl Hub {
                 interest_suppressed_ticks: 0,
                 last_scan_complete: false,
                 incomplete_scans: 0,
+                unread_streaks: HashMap::new(),
+                quarantined_sessions: BTreeMap::new(),
+                quarantine_status: None,
                 cluster_configured: false,
                 // A boot window (like the post-PeerDead takeover window): a
                 // restarted or newly-joined node may already own groups with
@@ -4395,9 +4421,11 @@ impl Hub {
                 complete,
                 unread,
                 unread_total,
+                enumerated,
             } => {
-                self.report_scan(complete, &unread, unread_total);
-                self.inherit_sessions(sessions, complete);
+                let counted = self.account_unread(complete, enumerated, &unread, unread_total);
+                self.report_scan(complete, counted, &unread, unread_total);
+                self.inherit_sessions(sessions, counted);
             }
             HubCommand::Flush { reply } => {
                 let _ = reply.send(());
@@ -6898,7 +6926,7 @@ impl Hub {
         if self.takeover_reconcile_ticks > 0 {
             self.takeover_reconcile_ticks -= 1;
             self.spawn_inherited_session_scan();
-        } else if (self.durable_plane.is_some() || self.routing_unsettled())
+        } else if self.periodic_scan_wanted()
             && self.expiry_reconcile_tick % EXPIRY_RECONCILE_EVERY == 0
         {
             // The `routing_unsettled()` half is the LIVENESS condition item 2.2
@@ -7006,6 +7034,18 @@ impl Hub {
         self.gossip_interest();
     }
 
+    /// Whether the periodic session scan runs (see its call site in
+    /// [`sweep_expired_sessions`](Self::sweep_expired_sessions) for the durable and
+    /// unsettled halves). The quarantine half (issue #1049): a scan that counts as
+    /// complete because a session is quarantined settles routing, and only another
+    /// scan can see that session read again and lift its quarantine. Under a
+    /// durable plane the scan runs on this cadence anyway.
+    fn periodic_scan_wanted(&self) -> bool {
+        self.durable_plane.is_some()
+            || self.routing_unsettled()
+            || !self.quarantined_sessions.is_empty()
+    }
+
     /// Start the off-loop inherited-session scan (ADR 0042 T9, exhibit ⑥): enumerate
     /// every stored session with its subscriptions and expiry deadline, and post the
     /// result back to the loop as [`HubCommand::InheritedSessions`]. Off-loop because
@@ -7079,11 +7119,15 @@ impl Hub {
         let tx = self.self_tx.clone();
         debug!("inherited-session scan started");
         self.spawn_owned(async move {
+            let mut enumerated = true;
             let scan = match store.all_sessions().await {
                 Ok(v) => v,
                 Err(e) => {
+                    enumerated = false;
                     debug!(error = %e, "inherited-session scan failed; retried next tick");
-                    // A failed enumeration saw nothing — emphatically not complete.
+                    // A failed enumeration saw nothing — emphatically not complete,
+                    // and the placeholder below is not a client: it is never
+                    // quarantined (`enumerated` says so, not the name).
                     mqtt_storage::SessionScan {
                         sessions: Vec::new(),
                         complete: false,
@@ -7102,6 +7146,7 @@ impl Hub {
                 complete: scan.complete,
                 unread: scan.unread,
                 unread_total: scan.unread_total,
+                enumerated,
             });
         });
     }
@@ -7113,8 +7158,18 @@ impl Hub {
     /// and their errors (the first [`SessionScan::UNREAD_KEPT`], with the total), and
     /// once more when the scans complete again.
     ///
+    /// `complete` is the store's answer, `counted` the hub's (quarantine included,
+    /// see `hub/quarantine.rs`): a scan the store calls incomplete that counts as
+    /// complete only because of quarantine is reported as such, on the same cadence.
+    ///
     /// [`SessionScan::UNREAD_KEPT`]: mqtt_storage::SessionScan::UNREAD_KEPT
-    fn report_scan(&mut self, complete: bool, unread: &[(ClientId, String)], unread_total: usize) {
+    fn report_scan(
+        &mut self,
+        complete: bool,
+        counted: bool,
+        unread: &[(ClientId, String)],
+        unread_total: usize,
+    ) {
         if complete {
             if self.incomplete_scans > 0 {
                 warn!(
@@ -7131,14 +7186,25 @@ impl Hub {
                 .iter()
                 .map(|(c, e)| format!("{}: {e}", c.0))
                 .collect();
-            warn!(
-                scans = self.incomplete_scans,
-                unread = unread_total,
-                named = named.len(),
-                sessions = ?named,
-                "session scan incomplete: these sessions could not be read, so routing \
-                 stays unsettled and gated publishes no session matches keep their acks"
-            );
+            if counted {
+                warn!(
+                    scans = self.incomplete_scans,
+                    unread = unread_total,
+                    sessions = ?named,
+                    "session scan complete except for QUARANTINED sessions: these \
+                     sessions still cannot be read, and routing no longer waits for them \
+                     (issue #1049)"
+                );
+            } else {
+                warn!(
+                    scans = self.incomplete_scans,
+                    unread = unread_total,
+                    named = named.len(),
+                    sessions = ?named,
+                    "session scan incomplete: these sessions could not be read, so routing \
+                     stays unsettled and gated publishes no session matches keep their acks"
+                );
+            }
         }
     }
 
@@ -8073,6 +8139,8 @@ impl Hub {
         m.set_routing_unsettled("takeover", clustered && self.takeover_reconcile_ticks > 0);
         m.set_routing_unsettled("scan", clustered && self.inherited_scan_inflight);
         m.set_routing_unsettled("scan-incomplete", clustered && !self.last_scan_complete);
+        // Issue #1049: what a complete-with-quarantine scan stopped waiting for.
+        m.set_sessions_quarantined(self.quarantined_sessions.len());
         m.set_routing_unsettled("interest", clustered && !self.interest_authoritative);
         m.set_routing_unsettled("mesh", clustered && !self.mesh_settled());
         // The settle window's share of the pending ledger (issue #613 items

@@ -427,6 +427,8 @@ async fn main() -> Result<(), StartupError> {
     // Shared operator-state snapshots (ADR 0054): the hub flips brownout, the store
     // watcher fills sizes, /statusz reads both.
     let brownout_status = Arc::new(mqttd::health::BrownoutStatus::default());
+    // The hub's quarantined sessions (issue #1049), named on /statusz.
+    let session_quarantine = Arc::new(mqttd::health::SessionQuarantine::default());
     // Ingress credit for client publishes (ADR 0082 T3), shared by every connection
     // (which acquires it) and the hub (which releases it and exports its gauges).
     let ingress = ingress_from_config(&config);
@@ -582,6 +584,7 @@ async fn main() -> Result<(), StartupError> {
         &placement,
         &metrics,
         &brownout_status,
+        &session_quarantine,
         &ingress,
     )
     .await?;
@@ -726,6 +729,7 @@ async fn main() -> Result<(), StartupError> {
         &node_id,
         &cluster_identity,
         &brownout_status,
+        &session_quarantine,
         &store_snapshot,
         &config_stamp,
         &swim_key_fps,
@@ -2178,6 +2182,7 @@ async fn start_hub(
     placement: &Arc<RwLock<Placement>>,
     metrics: &Arc<mqtt_observability::metrics::Metrics>,
     brownout_status: &Arc<mqttd::health::BrownoutStatus>,
+    session_quarantine: &Arc<mqttd::health::SessionQuarantine>,
     ingress: &Arc<mqttd::ingress::IngressCredit>,
 ) -> Result<HubHandle, Box<dyn std::error::Error>> {
     // Claim the data directory for this node (ADR 0018 phase 5): refuse to open another
@@ -2361,7 +2366,14 @@ async fn start_hub(
             hub.attach_retained_store(retained.clone());
             retained_handle = Some(retained);
         }
-        wire_hub(&mut hub, config, metrics, brownout_status, ingress)?;
+        wire_hub(
+            &mut hub,
+            config,
+            metrics,
+            brownout_status,
+            session_quarantine,
+            ingress,
+        )?;
         tokio::spawn(hub.run());
         Ok((
             hub_tx,
@@ -2398,7 +2410,14 @@ async fn start_hub(
         // because this arm returns the retained handle for the backup exporter (#249).
         let retained = persistent_retained(&dir)?; // ADR 0018 phase 4
         hub.attach_retained_store(retained.clone());
-        wire_hub(&mut hub, config, metrics, brownout_status, ingress)?;
+        wire_hub(
+            &mut hub,
+            config,
+            metrics,
+            brownout_status,
+            session_quarantine,
+            ingress,
+        )?;
         tokio::spawn(hub.run());
         Ok((hub_tx, store, Some(retained), None, None))
     } else {
@@ -2413,7 +2432,14 @@ async fn start_hub(
         if cluster_configured {
             hub.set_cluster_configured();
         }
-        wire_hub(&mut hub, config, metrics, brownout_status, ingress)?;
+        wire_hub(
+            &mut hub,
+            config,
+            metrics,
+            brownout_status,
+            session_quarantine,
+            ingress,
+        )?;
         tokio::spawn(hub.run());
         Ok((hub_tx, store, None, None, None))
     }
@@ -2719,6 +2745,7 @@ async fn start_health(
     node_id: &NodeId,
     cluster_identity: &Arc<mqtt_cluster::cluster_identity::ClusterIdentity>,
     brownout_status: &Arc<mqttd::health::BrownoutStatus>,
+    session_quarantine: &Arc<mqttd::health::SessionQuarantine>,
     store_snapshot: &Arc<mqttd::store_watch::StoreSnapshot>,
     config_stamp: &Arc<mqttd::reload::ConfigStamp>,
     swim_key_fps: &Arc<std::sync::OnceLock<Vec<String>>>,
@@ -2784,7 +2811,9 @@ async fn start_health(
         Some(flag) => state.with_swim_isolated(flag),
         None => state,
     };
-    let state = state.with_cordon(cordon);
+    let state = state
+        .with_cordon(cordon)
+        .with_session_quarantine(session_quarantine.clone());
     // The state is built even with neither server bound: the admin API (ADR 0081)
     // answers `/admin/v1/node` from it, and the caller's shutdown path reads its handles.
     let draining = state.draining_handle();
@@ -3133,11 +3162,13 @@ fn wire_hub(
     config: &Config,
     metrics: &Arc<mqtt_observability::metrics::Metrics>,
     brownout_status: &Arc<mqttd::health::BrownoutStatus>,
+    session_quarantine: &Arc<mqttd::health::SessionQuarantine>,
     ingress: &Arc<mqttd::ingress::IngressCredit>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     hub.attach_metrics(metrics.clone());
     hub.attach_ingress(ingress.clone());
     hub.attach_brownout_status(brownout_status.clone());
+    hub.attach_session_quarantine(session_quarantine.clone());
     hub.set_subscriber_limits(subscriber_limits_from_config(config)?);
     // ADR 0072: per-message durability tiers, only under the operator's opt-in.
     hub.set_allow_relaxed_publish(config.durable.allow_relaxed_publish);

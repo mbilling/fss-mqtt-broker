@@ -316,6 +316,7 @@ struct OtelInstruments {
     ingress_credit_bytes: OtelGauge<i64>,
     routing_unsettled: OtelGauge<i64>,
     pending_publishes_awaiting_settle: OtelGauge<i64>,
+    sessions_quarantined: OtelGauge<i64>,
     publish_held_for_unreachable: OtelGauge<i64>,
     shared_selected: OtelCounter<u64>,
     append_lane_jobs: OtelGauge<i64>,
@@ -477,6 +478,7 @@ impl OtelInstruments {
             ingress_paused_seconds: meter.f64_histogram("ingress_paused_seconds").build(),
             ingress_credit_bytes: meter.i64_gauge("ingress_credit_bytes").build(),
             routing_unsettled: meter.i64_gauge("routing_unsettled").build(),
+            sessions_quarantined: meter.i64_gauge("sessions_quarantined").build(),
             pending_publishes_awaiting_settle: meter
                 .i64_gauge("pending_publishes_awaiting_settle")
                 .build(),
@@ -632,6 +634,9 @@ pub struct Metrics {
     /// them emitted every scrape so a disappearing series is never read as 0.
     routing_unsettled: Family<ReasonLabel, Gauge>,
     pending_publishes_awaiting_settle: Gauge,
+    /// Durable sessions this node owns and has quarantined as unreadable (issue
+    /// #1049).
+    sessions_quarantined: Gauge,
     /// Gated publishes with a forward owed to a node that has no link.
     publish_held_for_unreachable: Gauge,
     /// Issue #613 item 3.5: shared selections by locality, incremented exactly
@@ -1039,6 +1044,15 @@ impl Metrics {
              scan-incomplete, interest, mesh. Every series is emitted on every \
              scrape, so an absent series means the broker is not reporting rather \
              than that the term is false",
+        );
+        let sessions_quarantined = register_gauge(
+            &mut registry,
+            "sessions_quarantined",
+            "Durable sessions this node owns but has not been able to read for two \
+             minutes of session scans, which no longer hold its scans incomplete \
+             (issue #1049). Above 0, publishes to subscriptions of these sessions the \
+             node never read are acked and not stored for them; /statusz \
+             session_quarantine names them",
         );
         let pending_publishes_awaiting_settle = register_gauge(
             &mut registry,
@@ -1870,6 +1884,7 @@ impl Metrics {
             ingress_credit_bytes,
             routing_unsettled,
             pending_publishes_awaiting_settle,
+            sessions_quarantined,
             publish_held_for_unreachable,
             shared_selected_total,
             append_lane_jobs,
@@ -2302,6 +2317,13 @@ impl Metrics {
         self.otel
             .pending_publishes_awaiting_settle
             .record(clamp_gauge(n), &[]);
+    }
+
+    /// Set how many durable sessions this node has quarantined as unreadable
+    /// (issue #1049).
+    pub fn set_sessions_quarantined(&self, n: usize) {
+        self.sessions_quarantined.set(clamp_gauge(n));
+        self.otel.sessions_quarantined.record(clamp_gauge(n), &[]);
     }
 
     /// Set how many publishes are held for a peer this node cannot reach: gated
@@ -4053,6 +4075,7 @@ mod tests {
         }
         m.set_pending_publishes(40, 4096);
         m.set_pending_publishes_awaiting_settle(3);
+        m.set_sessions_quarantined(1);
         m.set_publish_held_for_unreachable(2);
         m.shared_selected("local");
         m.shared_selected("local");
@@ -4102,6 +4125,10 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("mqttd_pending_publishes 40"), "{out}");
+        assert!(
+            out.contains("mqttd_sessions_quarantined 1"),
+            "sessions_quarantined"
+        );
         assert!(
             out.contains("mqttd_pending_publishes_awaiting_settle 3"),
             "{out}"

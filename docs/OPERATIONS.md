@@ -1667,6 +1667,30 @@ up pays nothing for a longer window, because a held delivery is discharged at it
   ineligible. Typical causes are a session with a write in flight on the same topic, a full
   receive quota, or QoS 2 (never held).
 
+## Session scans and quarantined sessions
+
+A clustered node re-reads the durable sessions it owns on a scan: at boot, during a
+takeover, and every 30 s while its routing view is unsettled (always, with durable
+sessions). While a scan has not read everything, the node holds the PUBACK of each QoS 1
+publish that matches no session it knows. One session it owns but cannot read would
+otherwise hold those acks for as long as it stays unreadable (issue #1049), so a session
+unread for two minutes of scans is **quarantined**:
+
+| signal | reading |
+|---|---|
+| `session scan incomplete` (WARN) | the first incomplete scan and every tenth, naming the sessions and errors |
+| `durable session QUARANTINED` (WARN) | a session is no longer waited for, with its client id and error |
+| `quarantine lifted` (WARN) | it read again |
+| `mqttd_sessions_quarantined` | how many are quarantined now |
+| `/statusz` → `session_quarantine` | `count`, and `sessions` (`client`, `error`) for the first 64 |
+| `mqttd_routing_unsettled{reason="scan-incomplete"}` | `1` while the scans hold acks; `0` once every unread session is quarantined |
+
+While a session is quarantined, a publish whose only match is a subscription of it the
+node never read is acked and not stored for it. One that matches a subscription the node
+knows is still withheld. `/readyz` does not change. See
+[TROUBLESHOOTING](TROUBLESHOOTING.md#one-node-never-acknowledges-qos-1-publishes-session-scan-incomplete)
+for the procedure.
+
 ## Monitoring for the operator (and humans)
 
 The signals the future controller will reconcile on
