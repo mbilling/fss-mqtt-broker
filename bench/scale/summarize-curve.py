@@ -24,9 +24,15 @@ Honesty mechanics, enforced here rather than remembered:
   - Broker-side counter deltas cross-check driver-reported totals; a mismatch
     beyond ±2% is flagged on the row.
   - durable_bench's own verdicts (violations/caveats) are carried verbatim.
+  - An audited lane E QoS 1 rung is CERTIFIED from the brokers alone (ADR 0048, amended
+    2026-10-25; `audited_grade`): the brokers' received counters took >= OFFER_TAKEN of
+    the offer, the identity ledger closes with no broker drop, and the consumers' p99 is
+    GREEN. Loss FAILS. The harness can only VOID a rung (HARNESS-LIMITED, LATENCY
+    UNREADABLE, INVALID EVIDENCE — neutral for the ladder's stop rule); publishers
+    behind schedule, the steady-state gate and driver scrape uncertainty are NOTE
+    diagnostics. Legacy rungs (QoS 0/2, unaudited QoS 1) keep the driver-side gates.
   - A lane E rung is read TWICE, and the two are never merged. The verdict column is
-    the rig's certification (GREEN / NOT CARRIED and its reasons), from the drivers'
-    audited evidence. Beside it, `broker_reading` asserts the rung from the BROKERS'
+    the rig's certification (GREEN / NOT CARRIED and its reasons). Beside it, `broker_reading` asserts the rung from the BROKERS'
     own counters over their own window: it HOLDS if no message was lost (the identity
     ledger closes and no broker dropped anything) and p99 is within 1 s. The delivered
     rate printed first is the brokers'; the drivers' is the labelled column beside it,
@@ -48,8 +54,30 @@ from pathlib import Path
 TOLERANCE = 0.02  # counter cross-check band
 DRIVER_OK = 0.97  # a rung counts only if the offered rate was actually reached
 CORE_SAT_SHARE = 0.5  # share of in-window samples a driver core may spend >=95% busy
-DELIVERED_OFFER = 0.99  # brokers delivered at least this share of the offer: "the offer", not "N% of it"
-LATE_OK = 0.05  # share of publishes behind their own schedule before a rung is flagged
+# OFFER TAKEN (ADR 0048, amended 2026-10-25): an audited rung took its offer when the
+# BROKERS' own received counters, over their own window, reach this share of it — and
+# the drivers "sent the offer" by the same line. Tighter than DRIVER_OK (0.97), which
+# absorbs the drivers' log-sampled rate; the brokers' counters are exact and their
+# window band is ~±0.02% on this rig, so 1% is ~50x that band. A synchronous
+# publisher on an absolute schedule catches up on its own slots, so a cluster that
+# keeps up takes all of the offer: 1% short over a 60 s window is 0.6 s behind.
+# Also the reading's "of the offer" line (reading_text).
+OFFER_TAKEN = 0.99
+# Share of publishes behind their own schedule before a rung is flagged. A gate on
+# legacy (unaudited) rungs only; on an audited QoS 1 rung it is a diagnostic: there
+# a "late" publish is a PUBACK slower than the publisher's slot.
+LATE_OK = 0.05
+# Verdict flags that VOID a rung (harness conditions, missing inputs): never a
+# failure, never a certification, and neutral for run-curve.sh's stop rule
+# (lane_e_fails_after). Diagnostic flags start with NOTE and gate nothing.
+NEUTRAL_FLAGS = ("INVALID EVIDENCE", "HARNESS-LIMITED", "LATENCY UNREADABLE")
+NOTE = "NOTE: "
+# On an audited rung: the flags lane_e_rung raises that stay gates (facts about the
+# cluster or the rung's population, not the load generator), and those that become
+# diagnostics.
+AUDITED_GATES = ("UNSETTLED", "UNRESET", "PAUSE INCOMPLETE", "NOT DURABLE", "QOS DOWNGRADE",
+                 "QOS2 COMPLETION", "QUEUE GROWTH")
+AUDITED_NOTES = ("NOT STEADY", "LATENCY FLOOR", "WINDOW CONTAMINATED", "BROKER BOUND REACHED")
 # Zero loss: a rung that drained and still owes a single message FAILED. Loss is
 # the only thing a rung can fail on; latency is graded (GREEN_MS / YELLOW_MS).
 KNEE_OK = 1.0  # delivered/sent ratio a carried rung must reach
@@ -1196,6 +1224,7 @@ def self_test() -> None:
             failures.append(f"an in-flight rung was not reported as incomplete: {r}")
 
     failures += reading_self_test()
+    failures += certify_self_test()
     if failures:
         for f in failures:
             print(f"FAIL {f}", file=sys.stderr)
@@ -1236,6 +1265,219 @@ def self_test() -> None:
     )
 
 
+def audited_fixture(root: Path, name: str, *, offered: int = 100, nodes: int = 1) -> Path:
+    """One audited QoS 1 rung on `nodes` brokers — 6,000 identities in a 60 s window,
+    100 msg/s from one publisher (a 10 ms slot), two consumers, a closed ledger and
+    every histogram in <=1 ms. Each self-test case then breaks one thing."""
+    import base64
+    N = 6_000
+    d = root / name / f"nodes={nodes}" / "laneE" / "sites-1"
+    d.mkdir(parents=True)
+    subs = ["sub-s0-0", "sub-s0-1"]
+    eps = [{"name": "pub-s0-0", "driver": 0, "site": "0", "role": "pub", "clients": 1}] + [
+        {"name": n, "driver": 0, "site": "0", "role": "sub", "clients": 1} for n in subs]
+    (d / "manifest.json").write_text(json.dumps({"nodes": nodes, "drivers": 1, "window_secs": 60, "endpoints": eps}))
+    (d / "rung.txt").write_text(
+        f"sites=1 offered={offered} publishers=1 consumers=2 per_consumer=50 qos=1 sub_qos=1 window_secs=60 "
+        "window=aligned cpu_window=missing settled=yes reset=yes steady=yes drained=yes p99_budget_ms=1000\n")
+    (d / "window.tsv").write_text(
+        "host\tphase\tstart_ms\tend_ms\tmain_pid\n"
+        + "".join(f"broker{i}\topen\t100000\t100010\t42\nbroker{i}\tclose\t160000\t160010\t42\n" for i in range(nodes))
+        + "driver0\topen\t100000\t100010\t\ndriver0\tclose\t160000\t160010\t\n")
+    for phase, n in (("before", 0), ("window-open", 0), ("window-close", N), ("drain", N), ("after", N)):
+        for i in range(nodes):
+            (d / f"metrics-{phase}-broker{i}.prom").write_text(
+                f'mqttd_publish_received_total{{qos="1"}} {n // nodes}\n'
+                f'mqttd_publish_delivered_total{{qos="1"}} {n // nodes}\n'
+                f"mqttd_peer_links {nodes - 1}\n# EOF\n")
+    for name in ["pub-s0-0"] + subs:
+        pub = name.startswith("pub")
+        for suffix, final in (("-base", False), ("", True), ("-terminal", True)):
+            n = (N if pub else N // 2) if final else 0
+            family = "puback_latency" if pub else "e2e_latency"
+            text = (f"audit_sent {n}\naudit_acked {n}\naudit_paused_workers {1 if final else 0}\npub_overrun 0\n"
+                    if pub else f"recv {n}\n")
+            text += f'{family}_bucket{{le="1"}} {n}\n{family}_bucket{{le="+Inf"}} {n}\n{family}_count {n}\n'
+            if pub:
+                text += f"{family}_sum {n * 0.5}\n"
+            (d / f"{name}{suffix}.prom").write_text(text + "# EOF\n")
+        bits = (1 << N) - 1 if pub else sum(1 << i for i in range(subs.index(name), N, 2))
+        topic = base64.b64encode(b"site/0/1").decode()
+        (d / f"{name}.ledger").write_text("".join(
+            f"{kind}\t{topic}\t<0.1.0>\t{bits.bit_count()}\t{bits:X}\n"
+            for kind in (["sent", "acked"] if pub else ["received"])) + "# EOF\n")
+    return d
+
+
+def _rewrite(path: Path, old: str, new: str) -> None:
+    text = path.read_text()
+    if old not in text:
+        raise AssertionError(f"{path.name}: {old!r} not found")
+    path.write_text(text.replace(old, new))
+
+
+def audited_case(root: Path, name: str, *, offered: int = 100, late: int = 0, puback_le: str | None = None,
+                 e2e_le: str | None = None, broker_recv: int | None = None, cpu: bool = False,
+                 clock: bool = False, steady: str = "yes", missing: bool = False, drop: int = 0,
+                 unacked: bool = False) -> Path:
+    """audited_fixture with the one condition a certification case is about.
+
+      late        publishes behind schedule in the window (pub_overrun)
+      puback_le   every PUBACK in the window lands in this bucket (ms)
+      e2e_le      every consumer receipt lands in this bucket (ms)
+      broker_recv the brokers' received count over the window (6,000 = the offer at 100/s)
+      cpu         a pinned driver (pinned-drivers.txt, run-curve.sh's CPU gate)
+      clock       a clock past its bound (clock-invalid.txt)
+      missing     one identity never received; drop: a broker drop; unacked: one never acked
+    """
+    N = 6_000
+    d = audited_fixture(root, name, offered=offered)
+    if late:
+        for suffix in ("", "-terminal"):
+            _rewrite(d / f"pub-s0-0{suffix}.prom", "pub_overrun 0", f"pub_overrun {late}")
+    if puback_le:
+        for suffix, n in (("", N), ("-terminal", N)):
+            _rewrite(d / f"pub-s0-0{suffix}.prom", f'puback_latency_bucket{{le="1"}} {n}',
+                     f'puback_latency_bucket{{le="1"}} 0\npuback_latency_bucket{{le="{puback_le}"}} {n}')
+            _rewrite(d / f"pub-s0-0{suffix}.prom", f"puback_latency_sum {n * 0.5}",
+                     f"puback_latency_sum {n * float(puback_le)}")
+        _rewrite(d / "pub-s0-0-base.prom", 'puback_latency_bucket{le="1"} 0',
+                 f'puback_latency_bucket{{le="1"}} 0\npuback_latency_bucket{{le="{puback_le}"}} 0')
+    if e2e_le:
+        for sub in ("sub-s0-0", "sub-s0-1"):
+            for suffix, n in (("-base", 0), ("", N // 2), ("-terminal", N // 2)):
+                (d / f"{sub}{suffix}.prom").write_text(
+                    f'recv {n}\ne2e_latency_bucket{{le="1"}} 0\ne2e_latency_bucket{{le="{e2e_le}"}} {n}\n'
+                    f'e2e_latency_bucket{{le="+Inf"}} {n}\ne2e_latency_count {n}\n# EOF\n')
+    if broker_recv is not None:
+        _rewrite(d / "metrics-window-close-broker0.prom", f'received_total{{qos="1"}} {N}',
+                 f'received_total{{qos="1"}} {broker_recv}')
+    if cpu:
+        (d / "pinned-drivers.txt").write_text("0\n")
+    if clock:
+        (d / "clock-invalid.txt").write_text("close: broker0 error bound 5.812 ms > 5 ms; root dispersion\n")
+    if steady != "yes":
+        _rewrite(d / "rung.txt", "steady=yes", f"steady={steady} steady_reason=behind")
+    if missing:
+        led = (d / "sub-s0-0.ledger").read_text().split("\t")
+        bits = int(led[4].split("\n")[0], 16) & ~1
+        (d / "sub-s0-0.ledger").write_text("\t".join(led[:3] + [str(bits.bit_count()), f"{bits:X}\n# EOF\n"]))
+        _rewrite(d / "sub-s0-0-terminal.prom", f"recv {N // 2}", f"recv {N // 2 - 1}")
+    if unacked:
+        lines = (d / "pub-s0-0.ledger").read_text().splitlines()
+        k, t, pid, _, _ = lines[1].split("\t")
+        bits = ((1 << N) - 1) & ~1
+        lines[1] = "\t".join([k, t, pid, str(bits.bit_count()), f"{bits:X}"])
+        (d / "pub-s0-0.ledger").write_text("\n".join(lines) + "\n")
+        _rewrite(d / "pub-s0-0-terminal.prom", f"audit_acked {N}", f"audit_acked {N - 1}")
+    if drop:
+        for phase in ("drain", "after"):
+            _rewrite(d / f"metrics-{phase}-broker0.prom", "# EOF",
+                     f'mqttd_publish_dropped_total{{reason="queue-full"}} {drop}\n# EOF')
+    return d
+
+
+def certify_self_test() -> list[str]:
+    """Certification reads the broker only (ADR 0048, amended 2026-10-25).
+
+    Each case is one audited rung with one condition, and pins its verdict: what
+    certifies, what FAILS (loss only), what counts against the ladder (an offer the
+    brokers did not take, RED), and what the harness can only VOID.
+    """
+    import tempfile
+
+    failures: list[str] = []
+
+    def neutral(v: str) -> bool:
+        """The stop rule's reading of a verdict (run-curve.sh lane_e_fails_after)."""
+        if not v.startswith("NOT CARRIED: "):
+            return False
+        flags = [f.strip() for f in v[len("NOT CARRIED: "):].split(";")]
+        gating = [f for f in flags if not f.startswith(NOTE)]
+        return bool(gating) and all(f.startswith(NEUTRAL_FLAGS) for f in gating)
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+
+        def grade(name: str, **kw) -> tuple[dict, str]:
+            r = lane_e_rung(audited_case(root, name, **kw))
+            return r, rung_verdict(r)
+
+        # 1. The 2026-10-25 RC case: the brokers took the whole offer with nothing
+        #    lost, p99 inside 1 s — and 10% of publishes ran behind their 10 ms slot
+        #    because the brokers acked at <=500 ms, and the window never read steady.
+        #    Under the old gates NOT CARRIED: PUBLISHERS LATE. It is certified; the
+        #    lateness, the steadiness and the PUBACK time are reported beside it.
+        r, v = grade("late", late=600, puback_le="500", e2e_le="500", steady="no")
+        if not (r["pass"] and v.startswith("GREEN; ") and "NOTE: PUBLISHERS LATE (10.0%" in v
+                and "NOTE: NOT STEADY" in v and r["puback_p99"] == "<=500ms"):
+            failures.append(f"full offer taken with late publishers was not certified GREEN: {v} {r['puback_p99']}")
+
+        # 2. Loss FAILS, whatever else holds: one identity missing, or one broker drop
+        #    — even on a rung whose latency is unreadable.
+        for name, kw in (("lost", {"missing": True}), ("dropped", {"drop": 1}),
+                         ("dropped-clock", {"drop": 1, "clock": True})):
+            r, v = grade(name, **kw)
+            if not r["failed"] or r["pass"] or not v.startswith("FAILED: LOSS"):
+                failures.append(f"{name}: loss was not FAILED: {v}")
+
+        # 3. HARNESS-LIMITED: the drivers sent 67% of a 150/s offer on a pinned
+        #    driver. Void and neutral — even with slow acks, the generator is the
+        #    first suspect once its CPU gate tripped.
+        r, v = grade("cpu-short", offered=150, cpu=True, puback_le="500")
+        if r["pass"] or r["failed"] or not v.startswith("NOT CARRIED: HARNESS-LIMITED") or not neutral(v):
+            failures.append(f"drivers short of the offer on a pinned driver was not a neutral HARNESS-LIMITED: {v}")
+        # ... and without a CPU gate, acks inside the 7 ms slot do not explain it: still the harness.
+        r, v = grade("fast-short", offered=150)
+        if not v.startswith("NOT CARRIED: HARNESS-LIMITED") or not neutral(v):
+            failures.append(f"drivers short with PUBACKs inside the slot was not HARNESS-LIMITED: {v}")
+        # ... but PUBACKs past the slot held synchronous publishers back: the brokers
+        #     did not take the offer, and that counts against the ladder.
+        r, v = grade("ack-short", offered=150, puback_le="500")
+        if not v.startswith("NOT CARRIED: OFFER NOT TAKEN") or neutral(v) or r["failed"]:
+            failures.append(f"drivers held back by PUBACKs past the slot was not OFFER NOT TAKEN: {v}")
+
+        # 4. A clock breach voids the p99 only: not certified, not failed, neutral —
+        #    and an offer the brokers did not take still counts beside it.
+        r, v = grade("clock", clock=True)
+        if (r["pass"] or r["carried"] or r["failed"] or not v.startswith("NOT CARRIED: LATENCY UNREADABLE (clock health")
+                or "5.812 ms" not in v or not neutral(v)):
+            failures.append(f"a clock breach was not LATENCY UNREADABLE alone and neutral: {v}")
+        r, v = grade("clock-short", clock=True, offered=150, puback_le="500")
+        if "LATENCY UNREADABLE" not in v or "OFFER NOT TAKEN" not in v or neutral(v):
+            failures.append(f"a clock breach hid an offer the brokers did not take: {v}")
+
+        # 5. The brokers received 98% while the drivers sent all of it: NOT TAKEN.
+        r, v = grade("broker-short", broker_recv=5_880)
+        if r["pass"] or r["failed"] or not v.startswith("NOT CARRIED: OFFER NOT TAKEN (the brokers received 98.0%") \
+                or "the drivers sent 100.0%" not in v or neutral(v):
+            failures.append(f"brokers short of a fully sent offer were not OFFER NOT TAKEN: {v}")
+
+        # 6. Bands: the clean rung at 1 s is GREEN, 2.5 s YELLOW, 10 s RED; carried,
+        #    never failed, only GREEN certified.
+        for le, band in (("1000", "green"), ("2500", "yellow"), ("10000", "red")):
+            r, v = grade(f"band-{le}", e2e_le=le)
+            if r["band"] != band or not r["carried"] or r["failed"] or r["pass"] != (band == "green") \
+                    or v != band.upper():
+                failures.append(f"p99 <={le}ms was not carried {band.upper()}: {v} band={r['band']}")
+
+        # 7. A pinned driver beside a GREEN rung that took its offer is a note; beside
+        #    a YELLOW one it voids the grade (the consumers' stamps were the driver's).
+        r, v = grade("cpu-green", cpu=True)
+        if not r["pass"] or "NOTE: PINNED DRIVERS" not in v:
+            failures.append(f"a pinned driver voided a GREEN rung that took its offer: {v}")
+        r, v = grade("cpu-yellow", cpu=True, e2e_le="2500")
+        if r["carried"] or not v.startswith("NOT CARRIED: HARNESS-LIMITED (p99") or not neutral(v):
+            failures.append(f"a pinned driver beside a YELLOW p99 did not void it: {v}")
+
+        # 8. A publish the brokers never acknowledged, with nothing missing: the
+        #    ledger does not close, so not certified, and not loss.
+        r, v = grade("unacked", unacked=True)
+        if r["pass"] or r["failed"] or not v.startswith("NOT CARRIED: UNACKNOWLEDGED (the ledger does not close: 1 sent") or neutral(v):
+            failures.append(f"an unacknowledged publish was not NOT CARRIED: UNACKNOWLEDGED: {v}")
+    return failures
+
+
 def reading_self_test() -> list[str]:
     """The broker-counter reading, on synthesized rungs (no cluster, no cost).
 
@@ -1251,41 +1493,7 @@ def reading_self_test() -> list[str]:
     failures: list[str] = []
     N = 6_000
 
-    def rung(root: Path, name: str, *, offered: int = 100, nodes: int = 1) -> Path:
-        d = root / name / f"nodes={nodes}" / "laneE" / "sites-1"
-        d.mkdir(parents=True)
-        subs = ["sub-s0-0", "sub-s0-1"]
-        eps = [{"name": "pub-s0-0", "driver": 0, "site": "0", "role": "pub", "clients": 1}] + [
-            {"name": n, "driver": 0, "site": "0", "role": "sub", "clients": 1} for n in subs]
-        (d / "manifest.json").write_text(json.dumps({"nodes": nodes, "drivers": 1, "window_secs": 60, "endpoints": eps}))
-        (d / "rung.txt").write_text(
-            f"sites=1 offered={offered} publishers=1 consumers=2 per_consumer=50 qos=1 sub_qos=1 window_secs=60 "
-            "window=aligned cpu_window=missing settled=yes reset=yes steady=yes drained=yes p99_budget_ms=1000\n")
-        (d / "window.tsv").write_text(
-            "host\tphase\tstart_ms\tend_ms\tmain_pid\n"
-            + "".join(f"broker{i}\topen\t100000\t100010\t42\nbroker{i}\tclose\t160000\t160010\t42\n" for i in range(nodes))
-            + "driver0\topen\t100000\t100010\t\ndriver0\tclose\t160000\t160010\t\n")
-        for phase, n in (("before", 0), ("window-open", 0), ("window-close", N), ("drain", N), ("after", N)):
-            for i in range(nodes):
-                (d / f"metrics-{phase}-broker{i}.prom").write_text(
-                    f'mqttd_publish_received_total{{qos="1"}} {n // nodes}\n'
-                    f'mqttd_publish_delivered_total{{qos="1"}} {n // nodes}\n'
-                    f"mqttd_peer_links {nodes - 1}\n# EOF\n")
-        for name in ["pub-s0-0"] + subs:
-            pub = name.startswith("pub")
-            for suffix, final in (("-base", False), ("", True), ("-terminal", True)):
-                n = (N if pub else N // 2) if final else 0
-                family = "puback_latency" if pub else "e2e_latency"
-                text = (f"audit_sent {n}\naudit_acked {n}\naudit_paused_workers {1 if final else 0}\npub_overrun 0\n"
-                        if pub else f"recv {n}\n")
-                text += f'{family}_bucket{{le="1"}} {n}\n{family}_bucket{{le="+Inf"}} {n}\n{family}_count {n}\n'
-                (d / f"{name}{suffix}.prom").write_text(text + "# EOF\n")
-            bits = (1 << N) - 1 if pub else sum(1 << i for i in range(subs.index(name), N, 2))
-            topic = base64.b64encode(b"site/0/1").decode()
-            (d / f"{name}.ledger").write_text("".join(
-                f"{kind}\t{topic}\t<0.1.0>\t{bits.bit_count()}\t{bits:X}\n"
-                for kind in (["sent", "acked"] if pub else ["received"])) + "# EOF\n")
-        return d
+    rung = audited_fixture
 
     def read(d: Path) -> tuple[dict, dict, str]:
         r = lane_e_rung(d)
@@ -1322,20 +1530,22 @@ def reading_self_test() -> list[str]:
 
         # 2. The 2026-10-12 case: the audited evidence is refused, the fallback read of
         #    the drivers' logs is 4% low, and every broker counter shows the full offer.
-        #    The rig does NOT certify it. The reading holds at the BROKERS' rate, and
-        #    the gap is printed as a disagreement, not folded into either number.
+        #    Certification reads the brokers (2026-10-25), so the refused driver
+        #    certificate is a diagnostic and the rung is certified. The reading holds
+        #    at the BROKERS' rate, and the gap is printed as a disagreement, not
+        #    folded into either number.
         d = rung(root, "disagree")
         (d / "pub-s0-0-base.prom").unlink()
         driver_logs(d, 48)
         r, b, text = read(d)
-        if not rung_verdict(r).startswith("NOT CARRIED: INVALID EVIDENCE"):
-            failures.append(f"a rung with refused driver evidence was not NOT CARRIED: {rung_verdict(r)}")
+        if not rung_verdict(r).startswith("GREEN; NOTE: DRIVER EVIDENCE REFUSED"):
+            failures.append(f"a rung with refused driver evidence and a clean broker reading was not GREEN: {rung_verdict(r)}")
         if abs(r["recv_rate"] - 96) > 1e-9 or abs(b["deliv_rate"] - 100) > 1e-9 or text != "HOLDS at 100/s":
             failures.append(f"the asserted rate is not the brokers': drivers {r['recv_rate']}, brokers {b['deliv_rate']}, {text!r}")
         if "READINGS DISAGREE: drivers 96/s (subscriber logs" not in b["disagree"] or "brokers 100/s" not in b["disagree"]:
             failures.append(f"a 4% gap between the drivers' and the brokers' rate was not reported: {b['disagree']!r}")
         table = render_broker_reading([r])
-        if "READINGS DISAGREE" not in table or "| HOLDS at 100/s | NOT CARRIED |" not in table:
+        if "READINGS DISAGREE" not in table or "| HOLDS at 100/s | GREEN |" not in table:
             failures.append(f"the reading table does not show the holds reading beside the rig's verdict:\n{table}")
         # Inside the tolerance the two readings are one reading: no note.
         d = rung(root, "agree")
@@ -1406,9 +1616,11 @@ def reading_self_test() -> list[str]:
             failures.append(f"the rig certified a rung whose window scrape was 5% of the window: {rung_verdict(r)}")
 
         # 9. Offered more than was carried: it holds AT THE RATE THE BROKERS CARRIED,
-        #    and says what share of the offer that was. The rig does not carry it.
+        #    and says what share of the offer that was. The rig does not carry it:
+        #    the drivers sent 67% too while the brokers acked inside the slot, so the
+        #    generator did not offer it — HARNESS-LIMITED.
         r, b, text = read(rung(root, "over-offer", offered=150))
-        if text != "HOLDS at 100/s (67% of the offer)" or not any("OFFER NOT MET" in f for f in r["flags"]):
+        if text != "HOLDS at 100/s (67% of the offer)" or not rung_verdict(r).startswith("NOT CARRIED: HARNESS-LIMITED"):
             failures.append(f"a rung offered 150/s that carried 100/s did not read as holding at 67%: {text!r} {r['flags']}")
 
         # 10. The reading does not hang on the crossing certificate. Two brokers whose
@@ -1991,7 +2203,24 @@ def lane_e_rung(rdir: Path) -> dict:
     carried = not failed and pause_ok and not any(f.startswith(("NOT DURABLE", "INVALID EVIDENCE")) for f in flags) and _lane_e_carried(
         offer_met, delivered, late_share, settled_ok, reset_ok, core_ok, steady, qos, sub_qos,
         completed, bounds, dropped, deliv_by_qos, evidence, drained, recv_rate, offered, sites)
+    # An AUDITED QoS 1 rung (the identity ledger exists) is certified from the
+    # brokers, not by the gates above: audited_grade. A legacy rung — QoS 0/2, or
+    # QoS 1 without the audit driver — keeps them; it has no ledger to judge by.
+    cert = None
+    if qos == "1" and (rdir / "manifest.json").exists():
+        cert = audited_grade(rdir, meta, offered, flags, evidence_error, budget)
+        flags, failed, carried = cert["flags"], cert["failed"], cert["carried"]
+        band = cert["band"] or "none"
+        p99 = cert["p99"]
+        w = cert["window"]
+        if w["sent_rate"] is not None:
+            sent_rate = w["sent_rate"]
+        if w["late_share"] is not None:
+            late_share = w["late_share"]
+        if w["e2e_buckets"]:
+            buckets, count = w["e2e_buckets"], w["e2e_count"]
     return {
+        "cert": cert,
         "sites": sites,
         "rep": rep,
         "offered": offered,
@@ -2015,7 +2244,12 @@ def lane_e_rung(rdir: Path) -> dict:
         # An UNRESOLVED rung is not a pass, and it is not a broker finding either.
         # It rides beside `pass` so a reader — and report_html — can tell "the
         # broker lost traffic" from "the rig stopped watching too early".
-        "unresolved": unresolved,
+        "unresolved": unresolved if cert is None else any(f.startswith("UNRESOLVED") for f in flags),
+        # How long the brokers took to acknowledge, as the synchronous publishers saw
+        # it (the audit driver's puback_latency histogram over the window). Reported,
+        # never gated: it is the broker ack time a "late" publisher measures.
+        "puback_p99": cert["puback_p99"] if cert else "—",
+        "puback_mean_ms": cert["window"]["puback_mean_ms"] if cert else None,
         "p50": bucket_pct(buckets, count, 0.50),
         "p95": bucket_pct(buckets, count, 0.95),
         "p99": p99,
@@ -2023,7 +2257,9 @@ def lane_e_rung(rdir: Path) -> dict:
         # Three verdicts, kept apart because they answer different questions:
         #   failed   the broker LOST messages — the only way a rung fails
         #   carried  every gate below held except latency: the load was offered,
-        #            on schedule, measured cleanly, and delivered in full
+        #            on schedule, measured cleanly, and delivered in full. On an
+        #            audited QoS 1 rung: the brokers took the offer, nothing was
+        #            lost and the latency is readable (audited_grade)
         #   band     green / yellow / red p99 (latency_band)
         # `pass` is carried AND green: the certified rung the headline knee uses.
         # A carried yellow or red rung is reported with its latency, not failed.
@@ -2179,7 +2415,7 @@ def reading_text(b: dict) -> str:
     if not b["holds"]:
         return "DOES NOT HOLD: " + "; ".join(b["why"])
     text = f"HOLDS at {b['deliv_rate']:,.0f}/s"
-    if b["of_offer"] is not None and b["of_offer"] < DELIVERED_OFFER:
+    if b["of_offer"] is not None and b["of_offer"] < OFFER_TAKEN:
         text += f" ({b['of_offer'] * 100:.0f}% of the offer)"
     return text
 
@@ -2244,11 +2480,207 @@ def render_broker_reading(rungs: list[dict]) -> str:
         "\n> This is a READING, not a certification. The rate is each broker's own counters over its own window "
         "(extract-lane-e.py), `band` is what the brokers' scrape brackets leave on it, and `of offer` is that rate "
         "against the rung's offer. No loss is the identity ledger closing with zero broker drops; p99 is the "
-        "consumers' histogram (brokers cannot time a delivery end to end). A rung can HOLD here and be NOT CARRIED "
-        "above: the rig's verdict also needs the offer met on schedule, a steady window, a load generator with "
-        "headroom and valid driver evidence, and only that verdict certifies a rung."
+        "consumers' histogram (brokers cannot time a delivery end to end). On an audited QoS 1 rung the verdict "
+        "certifies from the same broker-side inputs (ADR 0048, amended 2026-10-25: the brokers took >= "
+        f"{OFFER_TAKEN:.0%} of the offer, nothing was lost, p99 GREEN), so the two differ only where the harness "
+        "voided the rung (INVALID EVIDENCE, HARNESS-LIMITED, LATENCY UNREADABLE) or a broker-side gate held it "
+        "(an offer not taken, an unacknowledged publish, an unsettled or unreset population, a non-durable rung)."
     )
     return "\n".join(out)
+
+
+def note(text: str) -> str:
+    """A diagnostic flag. `;` separates the flags of a verdict, so none may sit inside one."""
+    return NOTE + text.replace(";", ",")
+
+
+def audited_grade(rdir: Path, meta: dict, offered: float, legacy: list[str], evidence_error: str | None,
+                  green_ms: float) -> dict:
+    """An audited QoS 1 rung, graded from the BROKERS (ADR 0048, amended 2026-10-25).
+
+    A rung is CERTIFIED (`pass`) when, read from the brokers' own counters over
+    their own window and from the identity ledger:
+
+      1. OFFER TAKEN    the brokers received >= OFFER_TAKEN of the offered rate
+      2. NOTHING LOST   the ledger closes (nothing missing, unexpected or
+                        unacknowledged) and no broker dropped anything
+      3. LATENCY        the consumers' end-to-end p99, plus the clocks'
+                        uncertainty, is GREEN (<= 1 s); YELLOW (<= 5 s) and RED
+                        (above) are carried, not certified
+
+    Loss is FAILED and nothing else is. A missed offer, an unacknowledged publish
+    and the broker-side gates in AUDITED_GATES are NOT CARRIED and count toward
+    the ladder's stop rule, as RED does.
+
+    The harness can only VOID a rung, never fail or certify it (NEUTRAL_FLAGS;
+    neutral for the stop rule):
+
+      HARNESS-LIMITED     the brokers did not take the offer because the
+                          generator did not offer it: the drivers sent less than
+                          OFFER_TAKEN of it and a driver CPU gate tripped (a core
+                          saturated, or a pinned driver), or the brokers
+                          acknowledged inside the publisher's slot (PUBACK p99 <=
+                          slot), so their ack time cannot have held synchronous
+                          publishers back. A driver CPU gate also voids a rung
+                          that took the offer but graded outside GREEN: a
+                          generator without headroom delays the consumers'
+                          timestamps. A rung whose drivers sent the full offer is
+                          never harness-limited for being "late".
+      LATENCY UNREADABLE  the clock evidence was refused (clock-invalid.txt, or
+                          its bound broken / samples missing), or the consumers'
+                          histogram cannot be read. Only the p99 is void: loss
+                          still FAILS and an untaken offer still counts; with
+                          neither, the rung is uncertified and neutral.
+      INVALID EVIDENCE    a broker-side input is missing: the brokers' counters
+                          or window, the ledger, or the crossing certificate.
+
+    Everything else the harness sees is a diagnostic (NOTE flags): publishers
+    behind schedule, the steady-state gate, driver scrape uncertainty (a refused
+    driver certificate), the latency floor, the drivers' own sent rate.
+    """
+    ev = load_lane_e_evidence()
+    extractor = load_lane_e_extractor()
+    errors = (ValueError, OSError, KeyError, IndexError)
+    gates: list[str] = []
+    voids: list[str] = []
+    notes: list[str] = []
+    w = ev.window_reading(rdir)
+    out = {"window": w, "broker_recv_rate": None, "offer_share": None, "sent_share": None,
+           "ledger": None, "drops": {}, "p99": "—", "band": None, "margin_ms": 0.0,
+           "puback_p99": "—", "slot_ms": None}
+
+    x = None
+    try:
+        x = extractor.extract_rung(rdir, require_cert=False)
+        if x["recv_rate"] is None:
+            voids.append("INVALID EVIDENCE (no aligned broker window)")
+            x = None
+    except errors as exc:
+        voids.append(f"INVALID EVIDENCE (broker counters unreadable: {exc})".replace(";", ","))
+    if x is not None and x["cert_error"]:
+        voids.append(f"INVALID EVIDENCE (crossing not certified: {x['cert_error']})".replace(";", ","))
+    ledger = None
+    try:
+        ledger = ev.identity_ledger(rdir)
+        out["ledger"] = ledger
+    except errors as exc:
+        voids.append(f"INVALID EVIDENCE (no identity ledger: {exc or type(exc).__name__})".replace(";", ","))
+
+    # ── 2. NOTHING LOST ─────────────────────────────────────────────────────
+    drops = x["lifetime_drops"] if x else {}
+    out["drops"] = drops
+    if ledger is not None:
+        if ledger["missing"] and meta.get("drained") == "no" and not (ledger["unexpected"] or ledger["unexpected_acks"]):
+            gates.append(f"UNRESOLVED ({ledger['missing']:,} identities still undelivered when the "
+                         f"{meta.get('drain_deadline_s', '?')}s drain deadline expired — pending or dropped, "
+                         "and this rung cannot tell which)")
+        elif ledger["missing"] or ledger["unexpected"] or ledger["unexpected_acks"]:
+            gates.append("LOSS (the identity ledger does not close: " + ", ".join(
+                f"{k.replace('_', ' ')} {ledger[k]:,}" for k in ("missing", "unexpected", "unexpected_acks") if ledger[k])
+                + ")")
+        elif not ledger["sent"]:
+            voids.append("INVALID EVIDENCE (empty identity ledger)")
+        if ledger["unacked"]:
+            gates.append(f"UNACKNOWLEDGED (the ledger does not close: {ledger['unacked']:,} sent and never "
+                         "acknowledged — the brokers withheld PUBACKs)")
+        if ledger["duplicates"]:
+            notes.append(f"REDELIVERY at QoS 1 ({ledger['duplicates']:,} duplicate receipts in the ledger, "
+                         f"{ledger['duplicates'] / max(ledger['received'], 1) * 100:.2f}% — legal at least-once)")
+    else:
+        # No ledger: a shortfall the drivers' totals show after a drain is still loss.
+        gates += [f for f in legacy if f.startswith(("LOSS", "UNRESOLVED", "UNCONFIRMED LOSS"))
+                  and "the broker dropped" not in f]
+    if drops:
+        gates.append("LOSS (the brokers dropped " + ", ".join(
+            f"{k or 'unlabelled'} {v:,.0f}" for k, v in sorted(drops.items())) + ")")
+
+    # The broker-side gates lane_e_rung raised; the diagnostics it raised.
+    gates += [f for f in legacy if f.startswith(AUDITED_GATES)]
+    notes += [f for f in legacy if f.startswith(AUDITED_NOTES)]
+    clock_note = rdir / "clock-invalid.txt"
+    # The driver certificate's refusal, unless it refused for what a gate above
+    # already reports (the ledger, an unacknowledged send) or for the clock.
+    if (evidence_error and not clock_note.exists() and not (w["clock_error"] and w["clock_error"] in evidence_error)
+            and not any(k in evidence_error for k in ("ledger", "unacknowledged", "not fully paused"))):
+        notes.append(f"DRIVER EVIDENCE REFUSED ({evidence_error})")
+    cpu = [f for f in legacy if f.startswith("DRIVER CORE SATURATED")]
+    pinned = rdir / "pinned-drivers.txt"
+    if pinned.exists():
+        cpu.append(f"PINNED DRIVERS ({pinned.read_text().strip() or '?'} — hottest core at the softirq gate)")
+
+    # ── PUBACK: how long the brokers took to acknowledge ───────────────────
+    publishers = w["publishers"] or int(meta.get("publishers", 0) or 0)
+    slot = 1000.0 * publishers / offered if offered and publishers else None
+    out["slot_ms"] = slot
+    if w["puback_buckets"]:
+        out["puback_p99"] = bucket_pct(w["puback_buckets"], w["puback_count"], 0.99)
+    if w["late_share"] is not None and w["late_share"] > LATE_OK:
+        notes.append(f"PUBLISHERS LATE ({w['late_share'] * 100:.1f}% of publishes behind their "
+                     f"{slot or 0:.0f} ms slot, PUBACK p99 {out['puback_p99']})")
+
+    # ── 1. OFFER TAKEN ──────────────────────────────────────────────────────
+    taken = None
+    sent_share = w["sent_rate"] / offered if offered and w["sent_rate"] is not None else None
+    out["sent_share"] = sent_share
+    if x is not None and offered:
+        out["broker_recv_rate"] = x["recv_rate"]
+        out["offer_share"] = share = x["recv_rate"] / offered
+        if x["broker_bracket_ms"] > extractor.BRACKET_SHARE * x["window_s"] * 1000:
+            voids.append(f"INVALID EVIDENCE (the brokers' own scrape brackets span {x['broker_bracket_ms']:,.0f} ms "
+                         f"of a {x['window_s']:.0f} s window, past {extractor.BRACKET_SHARE:.0%})")
+        else:
+            taken = share >= OFFER_TAKEN
+    sent_txt = "unreadable" if sent_share is None else f"{sent_share * 100:.1f}%"
+    if taken is False:
+        recv_txt = f"the brokers received {out['offer_share'] * 100:.1f}% of the offer"
+        if sent_share is not None and sent_share >= OFFER_TAKEN:
+            gates.append(f"OFFER NOT TAKEN ({recv_txt}, below {OFFER_TAKEN:.0%}, while the drivers sent {sent_txt})")
+        elif cpu:
+            voids.append(f"HARNESS-LIMITED (the drivers sent {sent_txt} of the offer and {recv_txt} — "
+                         + ", ".join(cpu).replace(";", ",") + ")")
+            cpu = []
+        elif sent_share is None:
+            voids.append(f"HARNESS-LIMITED ({recv_txt}, and the drivers' sent rate is unreadable: {w['drivers_error']})")
+        elif out["puback_p99"] == "—":
+            voids.append(f"HARNESS-LIMITED (the drivers sent {sent_txt} of the offer and {recv_txt}; no PUBACK "
+                         "histogram, so the shortfall cannot be put on the brokers' acknowledgements)".replace(";", ","))
+        elif slot is not None and p99_ms(out["puback_p99"]) <= slot:
+            voids.append(f"HARNESS-LIMITED (the drivers sent {sent_txt} of the offer and {recv_txt}, but the brokers "
+                         f"acknowledged inside the {slot:.0f} ms publisher slot, PUBACK p99 {out['puback_p99']}, so "
+                         "their ack time does not explain the shortfall)")
+        else:
+            gates.append(f"OFFER NOT TAKEN ({recv_txt} and the drivers sent {sent_txt}: synchronous publishers held "
+                         f"back by the brokers' acknowledgements, PUBACK p99 {out['puback_p99']} past the "
+                         f"{slot or 0:.0f} ms slot)")
+    elif taken and sent_share is not None and sent_share < OFFER_TAKEN:
+        notes.append(f"DRIVERS SHORT (the drivers' own window read {sent_txt} of the offer sent, the brokers "
+                     f"{out['offer_share'] * 100:.1f}% received)")
+
+    # ── 3. LATENCY ──────────────────────────────────────────────────────────
+    if clock_note.exists() or w["clock_error"]:
+        why = (" / ".join(l for l in clock_note.read_text().splitlines() if l.strip()) if clock_note.exists()
+               else w["clock_error"]) or "no detail"
+        voids.append(f"LATENCY UNREADABLE (clock health failed: {why})".replace(";", ","))
+    elif w["e2e_error"]:
+        voids.append(f"LATENCY UNREADABLE (consumer histogram: {w['e2e_error']})".replace(";", ","))
+    else:
+        out["margin_ms"] = (w["clock"] or {}).get("latency_uncertainty_ms", 0.0)
+        out["p99"] = bucket_pct(w["e2e_buckets"], w["e2e_count"], 0.99)
+        out["band"] = latency_band(out["p99"], out["margin_ms"], green_ms)
+    if cpu:
+        if taken and out["band"] not in (None, "green"):
+            voids.append(f"HARNESS-LIMITED (p99 {out['p99']} is {out['band'].upper()} on a generator without headroom: "
+                         + ", ".join(cpu).replace(";", ",") + ")")
+        else:
+            notes += cpu
+
+    failed = any(g.startswith("LOSS") for g in gates)
+    carried = not failed and taken is True and not gates and not voids and out["band"] is not None
+    out.update(
+        failed=failed, carried=carried, taken=taken,
+        flags=gates + voids + [note(n) for n in notes],
+    )
+    return out
 
 
 def _lane_e_carried(offer_met, delivered, late_share, settled_ok, reset_ok, core_ok, steady,
@@ -2561,12 +2993,14 @@ def main() -> None:
             # Two delivered columns: the brokers' own counters first, because that is
             # the figure the reading below asserts; the drivers' beside it, labelled,
             # because it is the one the verdict in the last column was graded on.
-            head = ("| sites | offered msg/s | delivered/s (brokers) | delivered/s (drivers) | per consumer "
-                    "| caught up in | p50 | p95 | p99 | verdict |")
+            # PUBACK p99 and the late share are the publishers' view of the brokers'
+            # ack time: reported, never gated on an audited rung (audited_grade).
+            head = ("| sites | offered msg/s | received/s (brokers) | delivered/s (brokers) | delivered/s (drivers) "
+                    "| per consumer | caught up in | p50 | p95 | p99 | PUBACK p99 | late | verdict |")
             if repeated:
                 head = head.replace("| sites |", "| sites | run |", 1)
             print(head)
-            print("|---|---|---|---|---|---|---|---|---|---|" + ("---|" if repeated else ""))
+            print("|---|---|---|---|---|---|---|---|---|---|---|---|---|" + ("---|" if repeated else ""))
             for r in rungs:
                 verdict = rung_verdict(r)
                 run_col = f" {r.get('rep', 1)} |" if repeated else ""
@@ -2576,9 +3010,13 @@ def main() -> None:
                     caught = "NEVER"
                 else:
                     caught = "—"  # a run directory from before the gate existed
+                rd = r.get("reading") or {}
+                recv_b = "—" if rd.get("recv_rate") is None else f"{rd['recv_rate']:,.0f}"
+                late = f"{r['late_share'] * 100:.1f}%" if "late_share" in r else "—"
                 print(
-                    f"| {r['sites']} |{run_col} {r['offered']:,.0f} | {broker_rate_cell(r.get('reading'))} | {r['recv_rate']:,.0f} | "
-                    f"{r['per_consumer']:,.0f} | {caught} | {r.get('p50', '—')} | {r.get('p95', '—')} | {r['p99']} | {verdict} |"
+                    f"| {r['sites']} |{run_col} {r['offered']:,.0f} | {recv_b} | {broker_rate_cell(r.get('reading'))} | {r['recv_rate']:,.0f} | "
+                    f"{r['per_consumer']:,.0f} | {caught} | {r.get('p50', '—')} | {r.get('p95', '—')} | {r['p99']} | "
+                    f"{r.get('puback_p99', '—')} | {late} | {verdict} |"
                 )
             # ── message accounting (#534, acceptance 3) ──────────────────
             # One row per rung, so a shortfall can be attributed instead of

@@ -129,6 +129,56 @@ class FailsAfterTests(unittest.TestCase):
         self.check(["RED", "YELLOW; LATENCY FLOOR (x)", "FAILED: LOSS (0.01%)", "GREEN", "NOT CARRIED: OFFER NOT MET",
                     "NOT CARRIED: verdict unavailable"], [1, 0, 1, 0, 1, 2], True)
 
+    def test_harness_limited_and_latency_unreadable_are_neutral(self):
+        # ADR 0048, amended 2026-10-25: the harness can only VOID a rung.
+        harness = ("NOT CARRIED: HARNESS-LIMITED (the drivers sent 60.0% of the offer and the brokers received "
+                   "60.1% of the offer — DRIVER CORE SATURATED (driver7 core 1)); NOTE: PUBLISHERS LATE (32.0%)")
+        clock = "NOT CARRIED: LATENCY UNREADABLE (clock health failed: close: broker3 error bound 6.758 ms > 5 ms)"
+        self.check(["RED", harness, clock, "RED"], [1, 1, 1, 2], True)
+
+    def test_note_flags_never_count(self):
+        self.check(["RED", "NOT CARRIED: INVALID EVIDENCE (x); NOTE: NOT STEADY (y, z); NOTE: PUBLISHERS LATE (9%)"],
+                   [1, 1], False)
+
+    def test_an_offer_the_brokers_did_not_take_counts(self):
+        self.check(["NOT CARRIED: OFFER NOT TAKEN (the brokers received 97.2% of the offer); NOTE: PUBLISHERS LATE (32%)",
+                    "NOT CARRIED: OFFER NOT TAKEN (x); LATENCY UNREADABLE (clock health failed: y)"], [1, 2], True)
+
+    def test_notes_alone_do_not_make_a_rung_neutral(self):
+        self.check(["NOT CARRIED: NOTE: PUBLISHERS LATE (9%)"], [1], False)
+
+    def test_late_publishers_beside_a_certified_rung_reset(self):
+        self.check(["RED", "GREEN; NOTE: PUBLISHERS LATE (5.7% of publishes behind their 100 ms slot, PUBACK p99 <=500ms)"],
+                   [1, 0], False)
+
+
+class GradedVerdictTests(unittest.TestCase):
+    """The verdicts summarize-curve.py actually prints for audited rungs, folded
+    through the shell's stop rule: the two must agree on what is neutral."""
+
+    def test_summarizer_verdicts_through_the_stop_rule(self):
+        import importlib.util
+        import tempfile
+        spec = importlib.util.spec_from_file_location("summarize_curve", SCALE / "summarize-curve.py")
+        sc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sc)
+        cases = [  # (fixture, the count after it, starting from 1)
+            (dict(late=600, puback_le="500"), 0),                  # GREEN with late publishers: resets
+            (dict(offered=150, cpu=True), 1),                       # HARNESS-LIMITED: neutral
+            (dict(clock=True), 1),                                  # LATENCY UNREADABLE: neutral
+            (dict(offered=150, puback_le="500"), 2),                # OFFER NOT TAKEN: counts
+            (dict(broker_recv=5_880), 2),                           # OFFER NOT TAKEN: counts
+            (dict(missing=True), 2),                                # FAILED: counts
+            (dict(e2e_le="10000"), 2),                              # RED: counts
+            (dict(e2e_le="2500"), 0),                               # YELLOW: resets
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            for i, (kw, want) in enumerate(cases):
+                v = sc.rung_verdict(sc.lane_e_rung(sc.audited_case(Path(td), f"c{i}", **kw)))
+                got, _, r = fold(["RED", v], stop_after=99)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(got[-1], want, f"{kw}: {v}")
+
 
 if __name__ == "__main__":
     unittest.main()

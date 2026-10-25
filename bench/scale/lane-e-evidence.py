@@ -220,6 +220,110 @@ def identity_ledger(rdir):
     return v
 
 
+def window_reading(rdir):
+    """The audited window, read piece by piece: each piece fails on its own.
+
+    `validate` is all-or-nothing, as an evidence certificate must be: one driver
+    scrape whose bracket is a little wide refuses the whole rung. Certification
+    (summarize-curve.py, ADR 0048 as amended 2026-10-25) reads the BROKER, so a
+    harness imperfection may cost it a diagnostic but never the broker's own
+    figures. This returns, each with its own error instead of raising:
+
+      drivers     the publishers' sent rate (audit_sent over each endpoint's own
+                  window, its scrape stamps' midpoint where it has them) and the
+                  share of publishes behind their schedule (pub_overrun)
+      e2e         the consumers' end-to-end histogram over the window, checked
+                  against their receipts (histogram + negatives == recv, within
+                  the scrape tolerance) — the one latency the brokers cannot time
+      puback      the publishers' PUBACK histogram over the window and its mean:
+                  how long the brokers took to acknowledge, as the synchronous
+                  publisher saw it
+      clock       the clock evidence and its latency margin (`clock_evidence`);
+                  a refusal makes the latency unreadable, nothing else
+    """
+    rdir = Path(rdir)
+    manifest = json.loads((rdir / "manifest.json").read_text())
+    x = load_extractor()
+    out = {"sent_rate": None, "late_share": None, "drivers_error": None,
+           "e2e_buckets": None, "e2e_count": None, "e2e_error": None,
+           "puback_buckets": None, "puback_count": None, "puback_mean_ms": None, "puback_error": None,
+           "clock": None, "clock_error": None,
+           "publishers": sum(e["clients"] for e in manifest["endpoints"] if e["role"] == "pub")}
+    try:
+        window = x.load_window(rdir, manifest["nodes"])
+    except (ValueError, OSError, KeyError, IndexError) as exc:
+        window = None
+        out["drivers_error"] = out["e2e_error"] = out["puback_error"] = f"no window ({exc})"
+
+    def secs(ep):
+        if manifest.get("endpoint_timestamps"):
+            before = endpoint_stamps((rdir / f"{ep['name']}-base.prom").read_text())
+            after = endpoint_stamps((rdir / f"{ep['name']}.prom").read_text())
+            # The midpoint of what the stamps allow; how wide that is, is a
+            # diagnostic of the harness (validate refuses past 2%), not a reason
+            # to lose the reading.
+            return ((after[0] - before[1]) + (after[1] - before[0])) / 2000
+        return x.window_seconds(window["hosts"][f"driver{ep['driver']}"])
+
+    def pair(ep):
+        return metric(rdir / f"{ep['name']}-base.prom"), metric(rdir / f"{ep['name']}.prom")
+
+    errors = (ValueError, OSError, KeyError, IndexError, ZeroDivisionError)
+    pubs = [e for e in manifest["endpoints"] if e["role"] == "pub"]
+    subs = [e for e in manifest["endpoints"] if e["role"] == "sub"]
+    if window is not None:
+        try:
+            sent = late = rate = 0.0
+            for ep in pubs:
+                a, b = pair(ep)
+                s = delta(a, b, "audit_sent")
+                sent += s
+                late += delta(a, b, "pub_overrun")
+                rate += s / secs(ep)
+            out["sent_rate"], out["late_share"] = rate, (late / sent if sent else 0.0)
+        except errors as exc:
+            out["drivers_error"] = str(exc) or type(exc).__name__
+        try:
+            buckets, count, total_ms, summed = {}, 0, 0.0, True
+            for ep in pubs:
+                a, b = pair(ep)
+                h, n = histogram(a, b, "puback_latency")
+                count += n
+                for k, v in h.items():
+                    buckets[k] = buckets.get(k, 0) + v
+                if ("puback_latency_sum", "") in a and ("puback_latency_sum", "") in b:
+                    total_ms += delta(a, b, "puback_latency_sum")
+                else:
+                    summed = False
+            out["puback_buckets"], out["puback_count"] = buckets, count
+            out["puback_mean_ms"] = total_ms / count if count and summed else None
+        except errors as exc:
+            out["puback_error"] = str(exc) or type(exc).__name__
+        try:
+            buckets, count = {}, 0
+            for ep in subs:
+                a, b = pair(ep)
+                h, n = histogram(a, b, "e2e_latency")
+                if buckets and set(buckets) != set(h):
+                    raise ValueError("subscriber histogram schemas differ")
+                excluded = delta(a, b, "audit_negative_latency") if manifest.get("negative_latency_counter") else 0
+                if abs(n + excluded - delta(a, b, "recv")) > max(1, n * 0.02):
+                    raise ValueError(f"{ep['name']} histogram+negatives/received mismatch beyond scrape uncertainty")
+                count += n
+                for k, v in h.items():
+                    buckets[k] = buckets.get(k, 0) + v
+            if not count:
+                raise ValueError("empty consumer histogram")
+            out["e2e_buckets"], out["e2e_count"] = buckets, count
+        except errors as exc:
+            out["e2e_error"] = str(exc) or type(exc).__name__
+    try:
+        out["clock"] = clock_evidence(rdir, manifest)
+    except errors as exc:
+        out["clock_error"] = str(exc) or type(exc).__name__
+    return out
+
+
 def load_extractor():
     spec = importlib.util.spec_from_file_location(
         "lane_e_extract", Path(__file__).with_name("extract-lane-e.py")
