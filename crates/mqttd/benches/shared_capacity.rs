@@ -87,6 +87,7 @@ impl Rig {
                     cert_not_after: None,
                     protocol: ProtocolVersion::V311,
                     source: None,
+                    relay: None,
                 }),
                 conn_id: 1,
                 clean_start: true,

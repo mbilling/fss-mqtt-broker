@@ -192,14 +192,40 @@ members stay reachable. `INFO moving a peer link to renewed certificates
 - **The end stays strict:** a link that could not be moved still ends at the old
   certificate's end, as above.
 
+**Relayed sessions reconnect once per renewal.** A persistent session that lands on a
+node other than its owner is relayed to the owner over the cluster bus (ADR 0005), on a
+connection made with both nodes' cluster certificates. That relay stream is held to them
+as a link is, on both nodes and with no setting: it ends within a second of the earlier
+`notAfter` (`WARN relay stream ended: a certificate it was admitted under has expired`,
+`mqttd_revocation_evictions_total{reason="relay-peer-cert-expired"}` or
+`reason="relay-own-cert-expired"`), and a reload whose cluster CRL revokes the other
+node's certificate ends it at once (`reason="relay-peer-revoked"`). A relay stream cannot
+move under a live client, so ending it disconnects the client (v5: DISCONNECT `0x9C`); it
+reconnects, is relayed again on the certificates the nodes hold then, and its Will is
+published, as on any broker-initiated close. So **a renewal costs each relayed client one
+reconnect**, spread rather than all in the old certificate's last second:
+
+- after a node's reload commits a renewed certificate, the streams its old certificate
+  holds the end of are ended at random moments over the next few minutes (at most five);
+- a stream whose two certificates end together (nodes minted together), or whose other
+  node renewed, is ended at a random moment of a five-minute window that closes a minute
+  before the end, if it was made at least twenty minutes before that end;
+- `INFO relay streams ended ahead of their certificate's end, so their clients reconnect
+  on renewed certificates` says how many, per second that ends any. These are not counted
+  as evictions.
+
+Clients with a Will that matters, or that reconnect slowly, see this once per rotation; a
+daily rotation (O5) means once a day. Clients connected to their session's owner are not
+relayed and are not affected.
+
 **Client certificates** are checked at the handshake, and a session that outlives its
 certificate is left alone unless `tls.end_sessions_at_cert_expiry`
 (`MQTTD_TLS_END_SESSIONS_AT_CERT_EXPIRY`) is on: then the session is ended within a second
 of its certificate's `notAfter`, as a revoked one is (v5 clients get DISCONNECT `0x87`),
 counted as `mqttd_revocation_evictions_total{reason="cert-expired"}`. Off by default
 because devices with long sessions and short certificates exist (O2). A session relayed
-to another node (ADR 0005) is not covered: the node serving it does not hold the TLS
-session.
+to another node (ADR 0005) is not covered: the node serving it does not hold the client's
+TLS session. (The relay stream itself is held to the cluster certificates, above.)
 
 A revocation list past its `nextUpdate` still loads and is enforced as it is; revocations
 published since are not in it. The gauges, the warning and the alerts report; expiry

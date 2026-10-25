@@ -228,6 +228,14 @@ pub struct ProxyContext {
     /// Behind a `watch` (ADR 0040 T4): read per relocation dial, so a reload's
     /// rebuilt connector (rotated cluster cert) is used on the next proxy.
     pub connector: Option<tokio::sync::watch::Receiver<TlsConnector>>,
+    /// The live cluster CRL (ADR 0040 T4), the slot the peer links' admission reads: the
+    /// connection to the owner is admitted as a dialed peer link is, and the relay sweep
+    /// ends it when a reload revokes the owner's certificate. `None` = none configured.
+    pub cluster_crl: Option<crate::reload::SwimCrlSlot>,
+    /// This node's own cluster-bus certificate's end (ADR 0088 D4), as the peer links read
+    /// it: no relay is dialed past it, and one dialed before it ends at it (issue #1016).
+    /// `None` = not tracked.
+    pub own_cert_end: Option<crate::peer::OwnCertEnd>,
 }
 
 impl std::fmt::Debug for ProxyContext {
@@ -1059,6 +1067,7 @@ where
         None,
         auth_failed,
         watch,
+        None,
     )
     .await
 }
@@ -1247,6 +1256,8 @@ async fn run_framed<R, W>(
     auth_failed: &std::sync::atomic::AtomicBool,
     // Sees the client hang up while serve has paused reading (#825).
     watch: Option<&PeerClosedWatch>,
+    // A relocated session's relay stream's admission (ADR 0005, issue #1016).
+    relay: Option<crate::hub::LinkCert>,
 ) -> Result<(), NetError>
 where
     R: AsyncRead + Unpin,
@@ -1363,7 +1374,7 @@ where
         relocation_target(policy, &client, allow_proxy, session_expiry != 0)
     {
         info!(client = %client.0, owner = %owner.0, "relocating persistent session to its owner (ADR 0005)");
-        return proxy_to_owner(reader, writer, &connect, &principal, proxy, &addr).await;
+        return proxy_to_owner(reader, writer, &connect, &principal, proxy, &addr, &hub).await;
     }
 
     // A will is a deferred publish: authorize it at CONNECT, not at the moment of
@@ -1414,6 +1425,7 @@ where
                 cert_serial: cert.and_then(|c| c.serial),
                 protocol: connect.protocol,
                 source: peer,
+                relay: relay.map(Box::new),
             }),
             conn_id,
             clean_start,
@@ -1636,6 +1648,7 @@ async fn proxy_to_owner<R, W>(
     principal: &Identity,
     proxy: &ProxyContext,
     addr: &str,
+    hub: &mpsc::UnboundedSender<HubCommand>,
 ) -> Result<(), NetError>
 where
     R: AsyncRead + Unpin,
@@ -1667,7 +1680,39 @@ where
         let tcp = TcpStream::connect(addr).await?;
         let _ = tcp.set_nodelay(true);
         let owner = connector.connect(name, tcp).await?;
-        splice(client_rh, client_wh, prelude, owner).await
+        // Admitted as a dialed peer link is (ADR 0040 T4, ADR 0088 D4), and held to what it
+        // was admitted under: the hub ends the splice at the earlier end of the two
+        // certificates, or when the cluster CRL revokes the owner's (issue #1016).
+        let Ok(cert) = crate::peer::admit_relay(
+            owner.get_ref().1,
+            proxy.cluster_crl.as_ref(),
+            proxy.own_cert_end.as_ref(),
+        ) else {
+            warn!(%addr, "relocation refused: the owner's connection failed peer admission");
+            return Ok(());
+        };
+        let id = CONN_ID.fetch_add(1, Ordering::Relaxed);
+        let (close_tx, close_rx) = oneshot::channel();
+        let held = !cert.is_empty()
+            && hub
+                .send(HubCommand::RelayOpened {
+                    id,
+                    cert,
+                    close: close_tx,
+                })
+                .is_ok();
+        let result = tokio::select! {
+            result = splice(client_rh, client_wh, prelude, owner) => result,
+            // The hub ended it, or is gone (with it the node).
+            _ = close_rx, if held => {
+                debug!(%addr, "relay stream ended with the certificates it was admitted under");
+                Ok(())
+            }
+        };
+        if held {
+            let _ = hub.send(HubCommand::RelayClosed { id });
+        }
+        result
     } else {
         let owner = TcpStream::connect(addr).await?;
         let _ = owner.set_nodelay(true);
@@ -1720,6 +1765,7 @@ pub async fn serve_proxied<R, W>(
     hub: mpsc::UnboundedSender<HubCommand>,
     prefix: bytes::BytesMut,
     via: Option<String>,
+    relay: Option<crate::hub::LinkCert>,
 ) where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -1753,6 +1799,8 @@ pub async fn serve_proxied<R, W>(
         &auth_failed,
         // The stream is the relaying node's peer link, not the client's socket.
         None,
+        // What the stream was admitted under: the session ends with it (issue #1016).
+        relay,
     )
     .await
     {
@@ -5186,6 +5234,7 @@ mod tests {
             hub_tx,
             bytes::BytesMut::new(),
             Some("node-a".to_string()),
+            None,
         ));
 
         // Drive the proxied client's persistent CONNECT; the owner answers CONNACK.
@@ -5257,6 +5306,7 @@ mod tests {
                 hub_tx,
                 bytes::BytesMut::new(),
                 via.clone(),
+                None,
             ));
             let (client_read, client_write) = tokio::io::split(client);
             let mut reader: Reader = FrameReader::new(client_read, V4);

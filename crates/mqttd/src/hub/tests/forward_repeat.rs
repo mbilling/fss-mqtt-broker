@@ -280,7 +280,7 @@ fn seq_of(frame: &PeerMessage) -> u64 {
 /// Fails before the fix: the session's queue holds the message twice.
 #[tokio::test]
 async fn a_retransmission_after_the_answer_is_re_answered_not_stored_twice() {
-    let mut rig = Rig::new().await;
+    let mut rig = Box::pin(Rig::new()).await;
     let (id, mut ack, first, again) = rig.forward_and_retransmit();
     let seq = seq_of(&first);
 
@@ -328,7 +328,7 @@ async fn a_retransmission_after_the_answer_is_re_answered_not_stored_twice() {
 /// aggregate but still appended, so the queue holds the message twice.
 #[tokio::test]
 async fn a_retransmission_during_the_append_is_dropped_and_answered_once() {
-    let mut rig = Rig::new().await;
+    let mut rig = Box::pin(Rig::new()).await;
     let (_id, _ack, first, again) = rig.forward_and_retransmit();
     let seq = seq_of(&first);
 
@@ -360,7 +360,7 @@ async fn a_retransmission_during_the_append_is_dropped_and_answered_once() {
 /// `(origin, seq)`, same named member, same content.
 #[tokio::test]
 async fn a_repeated_shared_delivery_is_re_answered_not_delivered_twice() {
-    let mut rig = Rig::new().await;
+    let mut rig = Box::pin(Rig::new()).await;
     let shared = |seq| HubCommand::RemoteSharedDeliverAcked {
         node: origin(),
         seq,
@@ -394,7 +394,7 @@ async fn a_repeated_shared_delivery_is_re_answered_not_delivered_twice() {
 #[tokio::test]
 async fn a_forward_retransmitted_across_a_dead_verdict_is_applied_once() {
     for qos in [QoS::AtLeastOnce, QoS::ExactlyOnce] {
-        let mut rig = Rig::new().await;
+        let mut rig = Box::pin(Rig::new()).await;
         let forward = || HubCommand::RemotePublishAcked {
             node: origin(),
             seq: 9,
@@ -454,7 +454,7 @@ async fn a_forward_retransmitted_across_a_dead_verdict_is_applied_once() {
 /// not at the verdict (ADR 0087 D6), but when membership confirms it gone (D4, D2).
 #[tokio::test]
 async fn a_re_used_seq_with_new_content_is_applied_and_a_dead_origin_is_forgotten() {
-    let mut rig = Rig::new().await;
+    let mut rig = Box::pin(Rig::new()).await;
     let forward = |payload: &'static [u8]| HubCommand::RemotePublishAcked {
         node: origin(),
         seq: 1,

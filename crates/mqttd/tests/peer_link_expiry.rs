@@ -347,13 +347,13 @@ async fn an_expired_node_is_out_and_stays_out() {
 // A persistent session that lands on a node other than its placement owner is relocated:
 // the landing node dials the owner's PEER listener, presents its own peer certificate,
 // sends a `ProxyHello` and splices the client's bytes onto that connection (`conn.rs`
-// `proxy_to_owner`). The owner admits the connection with `admit_peer_link` — the CRL
-// and both certificates' ends are checked once, at its handshake — and then serves it as
-// a client session (`peer.rs` `handle`, the `ProxyHello` arm, `conn::serve_proxied`). It
-// is never registered with the hub as a peer, and the `LinkCert` admission returned is
-// dropped, so neither the expiry sweep (ADR 0088 D3) nor ADR 0040's peer sweep can end
-// it: a relay stream outlives the certificate it was admitted under, and its revocation.
-// ADR 0088's amendment for #1016 records it as "not covered".
+// `proxy_to_owner`). The owner admits the connection with `admit_peer_link` and serves it
+// as a client session (`peer.rs` `handle`, the `ProxyHello` arm, `conn::serve_proxied`).
+// Before the fix the `LinkCert` that admission returned was dropped and the stream was
+// never seen by either sweep: it outlived the certificate it was admitted under, and its
+// revocation. Now the owner's hub holds the relocated session to that `LinkCert`, and the
+// landing node's hub holds its splice to the one its own dial was admitted under
+// (`hub::relays`).
 //
 // The two tests below assert what D3 and ADR 0040 T4 ask of every connection on the
 // peer listener, as they ask it of a peer link: it ends when a certificate it was admitted
@@ -421,15 +421,13 @@ async fn await_closed(
     );
 }
 
-/// Known defect #1016 (relay streams): a relay stream admitted under `b`'s certificate is
-/// ended when that certificate passes its `notAfter`, as `b`'s peer link is (ADR 0088 D3:
-/// a connection is not kept past its certificate's end; within a minute).
+/// Issue #1016 (relay streams): a relay stream admitted under `b`'s certificate is ended
+/// when that certificate passes its `notAfter`, as `b`'s peer link is (ADR 0088 D3: a
+/// connection is not kept past its certificate's end; within a minute).
 ///
-/// On main the peer link ends 1 to 3 seconds after `b`'s `notAfter` and the relay stream
-/// does not end at all: the client on `b` is still served by `a` a minute later, over a
-/// connection whose certificate has expired.
+/// Before the fix the peer link ended 1 to 3 seconds after `b`'s `notAfter` and the relay
+/// stream did not end at all: the client on `b` was still served by `a` a minute later.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "known defect #1016: a relay stream (ADR 0005 ProxyHello) outlives the expiry of the peer certificate it was admitted under"]
 async fn a_relay_stream_ends_when_the_certificate_it_was_admitted_under_expires() {
     let root = tempfile::tempdir().unwrap();
     let (mut nodes, _pki, b_ends) = build_pair(
@@ -463,18 +461,25 @@ async fn a_relay_stream_ends_when_the_certificate_it_was_admitted_under_expires(
     )
     .await;
     eprintln!("the relay stream ended {waited:?} after the peer link");
+    // Whichever side looked first: a on b's certificate, or b on its own.
+    let by_a = ended_for(&nodes[0], "relay-peer-cert-expired").await;
+    let by_b = ended_for(&nodes[1], "relay-own-cert-expired").await;
+    assert!(
+        by_a + by_b >= 1,
+        "the relay stream was ended for expiry (a: {by_a}, b: {by_b})\n{}",
+        dump(&nodes)
+    );
 }
 
-/// Known defect #1016 (relay streams): a relay stream whose peer certificate the cluster
-/// CRL revokes is ended by the reload that publishes the CRL, as the peer link is
-/// (ADR 0040 T4: a reload's sweep re-evaluates every established peer connection against
-/// the list it just loaded).
+/// Issue #1016 (relay streams): a relay stream whose peer certificate the cluster CRL
+/// revokes is ended by the reload that publishes the CRL, as the peer link is (ADR 0040
+/// T4: a reload's sweep re-evaluates every established peer connection against the list
+/// it just loaded).
 ///
-/// On main the reload's sweep ends `b`'s peer link at once and `b` is refused when it
-/// redials, but the relay stream admitted under the same certificate keeps serving the
-/// client.
+/// Before the fix the reload's sweep ended `b`'s peer link at once and `b` was refused
+/// when it redialed, but the relay stream admitted under the same certificate kept serving
+/// the client.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "known defect #1016: a relay stream (ADR 0005 ProxyHello) is not ended when the cluster CRL revokes the peer certificate it was admitted under"]
 async fn a_relay_stream_ends_when_the_crl_revokes_the_certificate_it_was_admitted_under() {
     let root = tempfile::tempdir().unwrap();
     let (mut nodes, pki, b_ends) = build_pair(
@@ -528,6 +533,13 @@ async fn a_relay_stream_ends_when_the_crl_revokes_the_certificate_it_was_admitte
     )
     .await;
     eprintln!("the relay stream ended {waited:?} after the peer link");
+    let revoked = ended_for(&nodes[0], "relay-peer-revoked").await;
+    assert_eq!(
+        revoked,
+        1,
+        "a's reload ended the one relay stream, for revocation\n{}",
+        dump(&nodes)
+    );
 }
 
 // ---- Renewal: the links move before the old end (issue #1016) ----

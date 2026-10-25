@@ -1472,7 +1472,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 862 test(s)
+## `crates/mqttd/src/lib.rs` — 875 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1748,6 +1748,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::mesh::tests::a_moved_membership_invalidates_a_positive_answer`
 - `hub::mesh::tests::an_unstamped_cache_is_never_whole_on_a_cluster`
 - `hub::mesh::tests::standalone_reads_true_from_an_untouched_cache`
+- `hub::relays::tests::a_closed_stream_is_not_ended_and_a_moved_due_is_not_taken_twice`
+- `hub::relays::tests::a_long_lived_stream_ends_in_its_end_window_not_at_the_end`
+- `hub::relays::tests::a_plaintext_stream_is_not_held`
+- `hub::relays::tests::a_revoked_serial_takes_its_streams_and_no_other`
+- `hub::relays::tests::a_short_lived_stream_ends_the_second_after_its_earlier_end_and_says_whose`
+- `hub::relays::tests::a_stream_remade_inside_the_window_is_held_to_the_hard_end_only`
+- `hub::relays::tests::the_relays_of_one_renewal_day_endpread_over_minutes`
+- `hub::relays::tests::this_nodes_renewal_ends_the_streams_its_old_certificate_holds_soon_and_spread`
 - `hub::settle::tests::a_matched_fan_out_never_waits_for_settle`
 - `hub::settle::tests::a_settled_view_never_holds`
 - `hub::settle::tests::a_shared_placement_is_evidence`
@@ -1915,9 +1923,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::cert_expiry::a_link_ends_when_this_nodes_own_certificate_does`
 - `hub::tests::cert_expiry::a_link_whose_peer_certificate_ends_is_lost_and_the_peer_is_held_not_erased`
 - `hub::tests::cert_expiry::a_plaintext_link_has_no_end`
+- `hub::tests::cert_expiry::a_relay_streams_end_does_not_end_the_session_that_took_it_over`
+- `hub::tests::cert_expiry::a_relayed_session_ends_with_its_relay_streams_certificate_always`
+- `hub::tests::cert_expiry::a_renewal_ends_the_relay_streams_it_renews_soon_after_and_ahead_of_the_end`
 - `hub::tests::cert_expiry::a_replaced_link_is_retired_quietly_not_lost`
 - `hub::tests::cert_expiry::a_replaced_sessions_certificate_end_does_not_end_its_successor`
 - `hub::tests::cert_expiry::a_retired_link_still_ends_at_its_certificates_end`
+- `hub::tests::cert_expiry::a_revoked_relay_stream_is_ended_by_the_reloads_sweep`
+- `hub::tests::cert_expiry::a_splice_ends_at_the_landing_nodes_own_end_and_is_let_go_when_it_closes`
 - `hub::tests::clean_session_attach_wipes_prior_persistent_state`
 - `hub::tests::commands_sort_into_the_control_and_data_lanes`
 - `hub::tests::durable_failure_reasons_are_bounded`
@@ -2704,8 +2717,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd/tests/peer_link_expiry.rs` — 6 test(s)
 
 - `a_peer_link_ends_within_a_minute_of_its_peers_certificate`
-- `a_relay_stream_ends_when_the_certificate_it_was_admitted_under_expires` — `#[ignore]`d
-- `a_relay_stream_ends_when_the_crl_revokes_the_certificate_it_was_admitted_under` — `#[ignore]`d
+- `a_relay_stream_ends_when_the_certificate_it_was_admitted_under_expires`
+- `a_relay_stream_ends_when_the_crl_revokes_the_certificate_it_was_admitted_under`
 - `an_expired_node_is_out_and_stays_out`
 - `renewed_nodes_move_their_links_before_the_old_end_without_a_gap`
 - `renewed_nodes_move_their_links_without_an_election`

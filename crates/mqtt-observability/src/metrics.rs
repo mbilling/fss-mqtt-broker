@@ -1397,7 +1397,9 @@ impl Metrics {
             "Live state revoked by a policy-reload sweep (ADR 0040), by kind \
              (cert-revoked, user-removed, connect-denied, grant-revoked, peer-revoked), or \
              ended at a certificate's expiry (ADR 0088: peer-cert-expired, own-cert-expired, \
-             cert-expired)",
+             cert-expired), or a relay stream (ADR 0005) ended with the certificates it was \
+             admitted under (relay-peer-cert-expired, relay-own-cert-expired, \
+             relay-peer-revoked)",
         );
         let session_rehomes_total = register_family(
             &mut registry,

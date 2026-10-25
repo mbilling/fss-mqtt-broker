@@ -72,15 +72,7 @@ fn peer_leaf(state: &tokio_rustls::rustls::CommonState) -> Option<&[u8]> {
     Some(state.peer_certificates()?.first()?.as_ref())
 }
 
-/// What a peer link was admitted under: the remote leaf's serial — the fact a cluster
-/// CRL names, recorded with the link so a revocation sweep can re-check it (ADR 0040
-/// T4) — and when the certificates of the handshake end, so the link is ended then
-/// (ADR 0088 D3). Empty on a plaintext mesh.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct LinkCert {
-    serial: Option<Vec<u8>>,
-    ends: crate::hub::LinkCertEnds,
-}
+pub(crate) use crate::hub::LinkCert;
 
 /// This node's own cluster-bus certificate's `notAfter`, Unix seconds — `i64::MAX` when
 /// unknown. Set at startup and by every reload that commits a new peer certificate
@@ -189,6 +181,20 @@ fn admit_peer_link(
         crate::hub::LinkCertEnds::default()
     };
     Ok(LinkCert { serial, ends })
+}
+
+/// [`admit_peer_link`] for the landing node's connection to a session's owner (ADR 0005):
+/// a relay stream is a connection on the cluster bus, dialed under this node's
+/// certificate, and is admitted and held to its certificates as a dialed link is
+/// (issue #1016). `None` for the CRL: none configured; for the own end: not tracked.
+pub(crate) fn admit_relay(
+    state: &tokio_rustls::rustls::CommonState,
+    crl: Option<&crate::reload::SwimCrlSlot>,
+    own_end: Option<&OwnCertEnd>,
+) -> Result<LinkCert, ()> {
+    let no_crl = crate::reload::SwimCrlSlot::default();
+    let unknown = unknown_cert_end();
+    admit_peer_link(state, crl.unwrap_or(&no_crl), own_end.unwrap_or(&unknown))
 }
 
 /// The cluster bus mTLS context, built once from the cluster CA + node cert and
@@ -645,7 +651,7 @@ fn held_dead(target: Option<&mut DialTarget>) -> bool {
 }
 
 /// The most the moves of one renewal's links are spread over (issue #1016).
-const MOVE_SPREAD_MAX_MS: i64 = 5 * 60 * 1000;
+pub(crate) const MOVE_SPREAD_MAX_MS: i64 = 5 * 60 * 1000;
 /// The most a link's last planned move keeps clear of its end: O3's minute of clock
 /// difference, since the peer ends the link by its own clock.
 const MOVE_MARGIN_MAX_MS: i64 = 60 * 1000;
@@ -674,11 +680,11 @@ const MOVE_MARGIN_MAX_MS: i64 = 60 * 1000;
 /// A try that does not get certificates ending later than the link's is closed before
 /// the peer handshake, and nothing changes. The hard end of ADR 0088 D3 stays the backstop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MovePlan {
+pub(crate) struct MovePlan {
     /// The earliest end of the link's certificates, Unix milliseconds.
-    end_ms: i64,
+    pub(crate) end_ms: i64,
     /// When the link was made, Unix milliseconds.
-    made_ms: i64,
+    pub(crate) made_ms: i64,
 }
 
 impl MovePlan {
@@ -698,13 +704,13 @@ impl MovePlan {
     }
 
     /// The first try in the end window, `jitter` in `[0, 1)` placing it.
-    fn in_end_window(self, jitter: f64) -> i64 {
+    pub(crate) fn in_end_window(self, jitter: f64) -> i64 {
         let (spread, _) = self.window();
         self.window_opens() + scale(spread, jitter)
     }
 
     /// The try after a renewal of this node's certificate seen at `now`.
-    fn after_renewal(self, now: i64, jitter: f64) -> i64 {
+    pub(crate) fn after_renewal(self, now: i64, jitter: f64) -> i64 {
         let (_, margin) = self.window();
         let room = self.end_ms - margin - now;
         if room <= 0 {
@@ -732,7 +738,7 @@ fn scale(span: i64, jitter: f64) -> i64 {
 
 /// A uniformly random number in `[0, 1)`, from the process's hasher keys.
 #[allow(clippy::cast_precision_loss)] // 53 bits, exactly
-fn jitter() -> f64 {
+pub(crate) fn jitter() -> f64 {
     use std::hash::BuildHasher;
     static DRAWS: AtomicU64 = AtomicU64::new(0);
     let bits = std::hash::RandomState::new().hash_one(DRAWS.fetch_add(1, Ordering::Relaxed));
@@ -1311,7 +1317,11 @@ where
                     subject,
                     groups: Vec::new(),
                 });
-                crate::conn::serve_proxied(rh, wh, None, identity, policy, hub, buf, via).await;
+                // Held to the certificates this connection was admitted under, as a peer
+                // link is: at their end and at revocation (issue #1016).
+                let relay = Some(cert).filter(|c| !c.is_empty());
+                crate::conn::serve_proxied(rh, wh, None, identity, policy, hub, buf, via, relay)
+                    .await;
                 return Ok(LinkOutcome::Closed);
             }
             Some(PeerMessage::Hello {
