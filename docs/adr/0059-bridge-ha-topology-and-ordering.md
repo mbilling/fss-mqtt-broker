@@ -100,6 +100,13 @@ a bounded, documented window, tracked with the durability work in ADR 0060). Und
 ordering is explicitly **not** preserved. Both are stated in the bridge docs and the ADR 0025
 Consequences amendment.
 
+> **Update (#1100):** the connect-flip window is closed. The router's live-or-spool decision and
+> the supervisor's connect handoff (drain the spool, queue the replay, open the live path) now
+> run under one per-side lock, so a racing forward is either spooled before the drain, and
+> replayed in order with the rest, or sent live behind the replay. Before the fix such a message
+> could also be pushed into the spool just after the drain and wait there, already acknowledged
+> to its source, until the next reconnect.
+
 ## Consequences
 
 - **Good:** inbound HA no longer duplicates; per-topic ordering holds for all directions under

@@ -262,7 +262,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_full_spool_must_not_shed_a_message_the_bridge_already_accepted`
 - `a_live_retained_publish_crosses_the_boundary_retained`
 - `a_local_message_fans_out_to_multiple_upstreams`
-- `a_message_spooled_while_its_side_connects_is_not_stranded_in_the_spool` — `#[ignore]`d
+- `a_message_spooled_while_its_side_connects_is_not_stranded_in_the_spool`
 - `a_no_remap_both_rule_loop_is_bounded_by_the_hop_limit`
 - `a_one_way_out_rule_forwards_to_the_upstream_and_never_leaks_back`
 - `a_remap_ping_pong_within_one_bridge_is_stopped_by_no_local`
