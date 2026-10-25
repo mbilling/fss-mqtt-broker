@@ -133,7 +133,7 @@ A release confirmation goes from about €20 to about €3.
   measurements (the maintainer, 2026-10-25).
 - **A tool of our own** needs its calibration published (D2), or competitor comparisons lose
   credibility.
-- **1.3.0 ships on the old rig**, re-graded from the broker's side ([ADR 0048](0048-comparative-benchmarking.md),
+- **1.3.0 ships with figures from the lane E rig**, re-graded from the broker's side ([ADR 0048](0048-comparative-benchmarking.md),
   amendment of 2026-10-25). Its PUBACK latency per rung is reported from the driver's
   existing histogram.
 
