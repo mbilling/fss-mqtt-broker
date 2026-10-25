@@ -127,10 +127,10 @@ A release confirmation goes from about €20 to about €3.
   pass it.
 - **The 100 ms artefact and the clock gate disappear.** End-to-end latency becomes exact,
   not an upper bound.
-- **Comparisons break with the past.** The generator, the workload shape and the method all
-  change, so figures from the new rig are not comparable with the lane E history. The first
-  release measured on it (1.3.1) re-baselines; the README and EVIDENCE say which rig each
-  figure comes from.
+- **Everything is measured again on this rig, and those figures replace the published ones.**
+  The generator, the workload shape and the method all change, so the README, EVIDENCE and
+  the release notes report only this rig's figures, with no side-by-side against earlier
+  measurements (the maintainer, 2026-10-25).
 - **A tool of our own** needs its calibration published (D2), or competitor comparisons lose
   credibility.
 - **1.3.0 ships on the old rig**, re-graded from the broker's side ([ADR 0048](0048-comparative-benchmarking.md),

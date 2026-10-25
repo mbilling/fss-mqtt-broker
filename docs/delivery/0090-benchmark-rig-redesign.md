@@ -34,10 +34,10 @@ tasks:
     issue: 1109
     notes: "Size S-M."
   - id: 0090-T7
-    title: "Re-baseline: 1.3.1 measured on the new rig at 3 and 10 nodes; README and EVIDENCE say which rig each figure comes from"
+    title: "Measure everything again on this rig (3 and 10 nodes, durable and clean QoS 1, QoS 0) and replace the published figures in the README, EVIDENCE and the release notes"
     status: planned
     issue: 1109
-    notes: "Size S plus rig time (about EUR 3 a release confirmation)."
+    notes: "Size S plus rig time (about EUR 3 a release confirmation). Only this rig's figures are reported; no comparison with earlier measurements."
 ---
 
 # Delivery 0090 — the benchmark rig redesign
@@ -58,7 +58,7 @@ above; the table below is generated from it.
 | 0090-T4 | ⬜ planned | [#1109](https://github.com/mbilling/fss-mqtt-broker/issues/1109) | — | "Size M." |
 | 0090-T5 | ⬜ planned | [#1109](https://github.com/mbilling/fss-mqtt-broker/issues/1109) | — | "Size M. Hetzner snapshot built by a script in the tree; the broker binary is still fetched per run and checked by sha256." |
 | 0090-T6 | ⬜ planned | [#1109](https://github.com/mbilling/fss-mqtt-broker/issues/1109) | — | "Size S-M." |
-| 0090-T7 | ⬜ planned | [#1109](https://github.com/mbilling/fss-mqtt-broker/issues/1109) | — | "Size S plus rig time (about EUR 3 a release confirmation)." |
+| 0090-T7 | ⬜ planned | [#1109](https://github.com/mbilling/fss-mqtt-broker/issues/1109) | — | "Size S plus rig time (about EUR 3 a release confirmation). Only this rig's figures are reported; no comparison with earlier measurements." |
 <!-- /status-table:0090 -->
 
 ## Changelog
