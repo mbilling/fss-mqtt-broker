@@ -701,6 +701,9 @@ jobs:
       # cluster needed. The kind/k3d runtime smoke (T5) lives in the nightly tier.
       - name: helm lint
         run: helm lint deploy/helm/mqttd
+      # The operator example names only what bootstrap.sh creates (the documented path).
+      - name: Operator example names only Secrets bootstrap.sh creates
+        run: scripts/k8s/check-operator-example.sh
       - name: helm template + kubeconform (defaults)
         run: |
           helm template mqttd deploy/helm/mqttd | tee /tmp/rendered.yaml | \
