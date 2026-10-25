@@ -71,6 +71,15 @@ Fixed in this change: lane E now reads `pub_overrun`, flags `PUBLISHERS LATE`,
 and — because a flag nobody acts on is decoration — includes it in the rung's
 `pass` verdict alongside offer, delivery and latency budget.
 
+> **2026-10-25:** on an audited QoS 1 rung `PUBLISHERS LATE` no longer gates. With
+> synchronous publishers a late publish is a PUBACK slower than the 100 ms slot, so
+> the flag measured the brokers' ack time against a fixed budget; it is now a
+> diagnostic, PUBACK p99 is reported beside it, and certification reads the brokers'
+> counters and the identity ledger
+> ([ADR 0048, amendment 2026-10-25](../adr/0048-comparative-benchmarking.md#amendment-2026-10-25-certification-reads-the-broker-only)).
+> It still gates QoS 0 lane E rungs and lane B, where a late publish is the
+> generator's.
+
 ## 3. At QoS 2 the driver returns on PUBREC — NOT on PUBCOMP
 
 `emqtt.erl:552-573` — `publish_via/3` is synchronous: it issues an async publish

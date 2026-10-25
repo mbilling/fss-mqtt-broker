@@ -77,6 +77,19 @@ the pinned, dedicated, disclosed environment of phases 3–4.
 
 ## Changelog
 
+- **2026-10-25 (certification reads the broker only)** — ADR 0048 amended. An
+  audited lane E QoS 1 rung is certified from the brokers' own counters and the
+  identity ledger: the brokers received ≥ 99% of the offer (`OFFER_TAKEN`), the
+  ledger closed with no broker drop, p99 ≤ 1 s. Harness conditions can only void a
+  rung (HARNESS-LIMITED, LATENCY UNREADABLE, INVALID EVIDENCE; neutral for the
+  ladder's stop rule); late publishers, the steady-state gate and driver scrape
+  uncertainty are diagnostics, and PUBACK p99 is reported. In
+  `bench/scale/summarize-curve.py` (`audited_grade`), `lane-e-evidence.py`
+  (`window_reading`) and `run-curve.sh` (`lane_e_fails_after`), with self-tests.
+  Re-grading the 2026-10-23 10-node run and the 2026-10-25 1.3.0 RC run certifies
+  the 45-site rung of the RC run (NOT CARRIED: PUBLISHERS LATE before) and the
+  50- and 53-site rungs of 2026-10-23. Not tracked as a task: no open issue covers it.
+
 - **2026-09-08 (harness evidence repairs, #593–#595)** — the orchestrator
   checks every requested shape before provisioning, documents the balanced
   four-driver standard recipe and replaces stale cost promises with dated hourly
