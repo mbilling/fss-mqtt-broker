@@ -250,3 +250,87 @@ pick_openssl() {
 	done
 	die "no real OpenSSL found — brew install openssl@3 (macOS LibreSSL cannot mint the PKI)"
 }
+
+# await_fleet: every host of $INVENTORY has finished cloud-init (one clean+reboot
+# retry each), carries its private address, and reaches every other host's private
+# address. Factored out of run.sh so bench/scale/rig2/run.sh brings hosts up the
+# same way; RUN and INVENTORY must be set.
+await_fleet() {
+	# cloud-init must have finished everywhere (it verifies the release binary's
+	# checksum; a failure there surfaces here, loudly).
+	# Exit 2 = "degraded done": recoverable warnings only — and Hetzner's own
+	# vendor-data trips deprecation warnings on every boot, so 2 is the NORMAL
+	# outcome here. Exit 1 (error) is a real failure — most often the private-net
+	# attach race (cloud-init's init-local boots while the network attachment is
+	# still settling and Tracebacks on the half-written metadata). A reboot after
+	# `cloud-init clean` re-runs everything against settled metadata, so each
+	# host gets exactly one such retry before the run gives up.
+	# True once <ip> presents a kernel boot id that is non-empty and differs
+	# from <old> — i.e. the machine has verifiably completed its reboot. Probes
+	# use a THROWAWAY known_hosts: a poll that lands in the pre-reboot window
+	# would re-record the old host key and poison every post-reboot connect.
+	boot_id_changed() {
+		local now
+		now=$(ssh "${SSH_OPTS[@]}" -o UserKnownHostsFile=/dev/null \
+			"root@$1" "cat /proc/sys/kernel/random/boot_id" 2>/dev/null) || return 1
+		[ -n "$now" ] && [ "$now" != "$2" ]
+	}
+	for pair in $(jq -r '(.brokers[], .drivers[]) | "\(.public_ip)=\(.private_ip)"' "$INVENTORY"); do
+		ip="${pair%%=*}" priv="${pair##*=}"
+		wait_for "ssh on $ip" 300 rssh "$ip" "true"
+		ci_rc=0
+		cloud_init_rc "$ip" || ci_rc=$?
+		if [ "$ci_rc" -ne 0 ]; then
+			warn "cloud-init errored on $ip (exit $ci_rc) — one clean+reboot retry (private-net attach race)"
+			OLD_BOOT=$(rssh "$ip" "cat /proc/sys/kernel/random/boot_id" 2>/dev/null || echo unknown)
+			rssh "$ip" "cloud-init clean --logs; reboot" || true
+			# cloud-init clean makes the next boot regenerate SSH HOST KEYS; drop
+			# the stale entry or every reconnect is refused as a key mismatch.
+			ssh-keygen -R "$ip" -f "$RUN/known_hosts" >/dev/null 2>&1 || true
+			# The reboot takes seconds to sever ssh — a fast reconnect reaches the
+			# OLD boot and reads its error status as the retry's verdict. Nothing
+			# counts until the kernel boot id has actually changed.
+			wait_for "reboot of $ip (new boot id)" 300 boot_id_changed "$ip" "$OLD_BOOT"
+			# Drop whatever key a pre-reboot poll may have re-recorded; the next
+			# rssh accepts the NEW boot's key fresh.
+			ssh-keygen -R "$ip" -f "$RUN/known_hosts" >/dev/null 2>&1 || true
+			ci_rc=0
+			cloud_init_rc "$ip" || ci_rc=$?
+			[ "$ci_rc" -eq 0 ] ||
+				die "cloud-init failed on $ip even after a clean reboot (exit $ci_rc) — check /var/log/cloud-init-output.log there"
+		fi
+		# The lanes ride the private network; do not proceed until this host's
+		# private address is actually configured.
+		wait_for "private ip $priv on $ip" 180 rssh "$ip" "ip -4 addr show | grep -qF $priv"
+	done
+
+	# Private-net truth gate (issue #368): an address can be PRESENT while the
+	# interface is ONE-WAY — outbound dead, inbound fine — the shape that let a
+	# cleanly-formed cluster evict one node minutes later on three separate
+	# runs (always the host whose private-net attach raced; the address check
+	# above cannot see it). Verify actual pairwise reachability from every
+	# host, heal the SOURCE host (outbound is the broken side) with the same
+	# clean+reboot retry once, and fail the run fast if it stays one-way —
+	# minutes here instead of an unmeasurable hour later.
+	ALL_PRIVS=$(jq -r '[(.brokers[], .drivers[]) | .private_ip] | join(" ")' "$INVENTORY")
+	mesh_ok() { # mesh_ok <public-ip> — prints the first unreachable private ip
+		rssh "$1" "for t in $ALL_PRIVS; do ping -c1 -W2 \$t >/dev/null 2>&1 || { echo \$t; exit 1; }; done"
+	}
+	for ip in $(jq -r '(.brokers[], .drivers[]) | .public_ip' "$INVENTORY"); do
+		if ! BAD=$(mesh_ok "$ip"); then
+			warn "private-net mesh FAILED from $ip (cannot reach ${BAD:-?}) — one clean+reboot retry (one-way attach, issue #368)"
+			OLD_BOOT=$(rssh "$ip" "cat /proc/sys/kernel/random/boot_id" 2>/dev/null || echo unknown)
+			rssh "$ip" "cloud-init clean --logs; reboot" || true
+			ssh-keygen -R "$ip" -f "$RUN/known_hosts" >/dev/null 2>&1 || true
+			wait_for "reboot of $ip (new boot id)" 300 boot_id_changed "$ip" "$OLD_BOOT"
+			ssh-keygen -R "$ip" -f "$RUN/known_hosts" >/dev/null 2>&1 || true
+			ci_rc=0
+			cloud_init_rc "$ip" || ci_rc=$?
+			[ "$ci_rc" -eq 0 ] ||
+				die "cloud-init failed on $ip after the mesh-retry reboot (exit $ci_rc) — check /var/log/cloud-init-output.log there"
+			BAD=$(mesh_ok "$ip") ||
+				die "private-net STILL one-way from $ip (cannot reach ${BAD:-?}) after a clean reboot — Hetzner attach fault; tear down and re-apply"
+		fi
+	done
+	say "private-net mesh verified: every host reaches every private address"
+}
