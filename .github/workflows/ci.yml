@@ -703,7 +703,7 @@ jobs:
         run: helm lint deploy/helm/mqttd
       # The operator example names only what bootstrap.sh creates (the documented path).
       - name: Operator example names only Secrets bootstrap.sh creates
-        run: scripts/k8s/check-operator-example.sh
+        run: python3 scripts/k8s/check-operator-example.py
       - name: helm template + kubeconform (defaults)
         run: |
           helm template mqttd deploy/helm/mqttd | tee /tmp/rendered.yaml | \
