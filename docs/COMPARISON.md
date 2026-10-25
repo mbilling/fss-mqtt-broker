@@ -167,8 +167,8 @@ Neither is in the benchmark set (ADR 0048 compares self-hostable, like-for-like 
 but they are the names most evaluations start from, so their shape belongs here. Claims
 below are limited to each vendor's own published positioning. Their **published cluster
 benchmark figures** (HiveMQ's 1M msg/s on 40 nodes; EMQX's 1M msg/s on 23 × 64 cores) are
-quoted — **not reproduced**, with every workload difference beside them — in the README's
-[Against published cluster benchmarks](../README.md#against-published-cluster-benchmarks).
+quoted — **not reproduced**, with every workload difference beside them — in
+[EVIDENCE.md § Against published cluster benchmarks](benchmarks/EVIDENCE.md#against-published-cluster-benchmarks).
 
 - **HiveMQ** is an enterprise MQTT platform: full MQTT 5, mature tooling, and clustering —
   in the **commercial** edition. The Apache-2.0 HiveMQ Community Edition is single-node
