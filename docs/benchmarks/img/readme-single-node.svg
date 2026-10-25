@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 384" width="900" height="384" role="img" aria-labelledby="t d">
+<title id="t">One 4-vCPU node: 75,000 msg/s, 1.7× Mosquitto and EMQX, 2.5× HiveMQ CE</title><desc id="d">mqttd 1.0.17: 75,000 msg/s, p99 ≤ 500 ms; Mosquitto 2.0.20: 45,000 msg/s, p99 ≤ 100 ms; EMQX 5.8.6: 45,000 msg/s, p99 ≤ 500 ms; HiveMQ CE 2024.3: 30,000 msg/s, p99 ≤ 100 ms</desc>
+<style>text{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-kerning:normal}.num{font-variant-numeric:tabular-nums}.f-surface{fill:#fcfcfb}.k-surface{stroke:#fcfcfb}.f-border{fill:#e1e0d9}.k-border{stroke:#e1e0d9}.f-ink{fill:#0b0b0b}.k-ink{stroke:#0b0b0b}.f-ink2{fill:#52514e}.k-ink2{stroke:#52514e}.f-muted{fill:#898781}.k-muted{stroke:#898781}.f-grid{fill:#eceae4}.k-grid{stroke:#eceae4}.f-axis{fill:#c3c2b7}.k-axis{stroke:#c3c2b7}.f-good{fill:#0ca30c}.k-good{stroke:#0ca30c}.f-warn{fill:#fab219}.k-warn{stroke:#fab219}.f-crit{fill:#d03b3b}.k-crit{stroke:#d03b3b}.f-ghost{fill:#898781}.k-ghost{stroke:#898781}.f-s1{fill:#2a78d6}.k-s1{stroke:#2a78d6}.f-s2{fill:#eb6834}.k-s2{stroke:#eb6834}.f-s3{fill:#1baf7a}.k-s3{stroke:#1baf7a}.f-s4{fill:#4a3aa7}.k-s4{stroke:#4a3aa7}@media (prefers-color-scheme:dark){.f-surface{fill:#1a1a19}.k-surface{stroke:#1a1a19}.f-border{fill:#2c2c2a}.k-border{stroke:#2c2c2a}.f-ink{fill:#ffffff}.k-ink{stroke:#ffffff}.f-ink2{fill:#c3c2b7}.k-ink2{stroke:#c3c2b7}.f-muted{fill:#898781}.k-muted{stroke:#898781}.f-grid{fill:#262624}.k-grid{stroke:#262624}.f-axis{fill:#383835}.k-axis{stroke:#383835}.f-good{fill:#0ca30c}.k-good{stroke:#0ca30c}.f-warn{fill:#fab219}.k-warn{stroke:#fab219}.f-crit{fill:#d03b3b}.k-crit{stroke:#d03b3b}.f-ghost{fill:#6f6e69}.k-ghost{stroke:#6f6e69}.f-s1{fill:#3987e5}.k-s1{stroke:#3987e5}.f-s2{fill:#d95926}.k-s2{stroke:#d95926}.f-s3{fill:#199e70}.k-s3{stroke:#199e70}.f-s4{fill:#9085e9}.k-s4{stroke:#9085e9}}</style>
+<rect x="0.5" y="0.5" width="899" height="383" rx="14" class="f-surface k-border"/>
+<text x="32" y="42" font-size="20" font-weight="650" class="f-ink">One 4-vCPU node: 75,000 msg/s, 1.7× Mosquitto and EMQX, 2.5× HiveMQ CE</text>
+<text x="32" y="64" font-size="13" class="f-ink2">highest GREEN rung (p99 ≤ 1 s) · 1:1 QoS 0, 200 B · one Hetzner CCX23, brokers in sequence, untuned · 2026-09-16</text>
+<text x="256.0" y="118.0" font-size="13" font-weight="600" text-anchor="end" class="f-ink">mqttd 1.0.17</text>
+<text x="256.0" y="134.0" font-size="11" text-anchor="end" class="f-muted">durable sessions off</text>
+<rect x="270" y="108.0" width="360.0" height="22" rx="4" class="f-s1"/>
+<text x="640.0" y="119.0" font-size="14" font-weight="650" text-anchor="start" class="f-ink num">75,000 msg/s</text>
+<text x="640.0" y="134.0" font-size="11" text-anchor="start" class="f-ink2 num">p99 ≤ 500 ms at the knee</text>
+<text x="256.0" y="172.0" font-size="13" font-weight="600" text-anchor="end" class="f-ink">Mosquitto 2.0.20</text>
+<text x="256.0" y="188.0" font-size="11" text-anchor="end" class="f-muted">single-threaded</text>
+<rect x="270" y="162.0" width="216.0" height="22" rx="4" class="f-s2"/>
+<text x="496.0" y="173.0" font-size="14" font-weight="650" text-anchor="start" class="f-ink num">45,000 msg/s</text>
+<text x="496.0" y="188.0" font-size="11" text-anchor="start" class="f-ink2 num">p99 ≤ 100 ms at the knee</text>
+<text x="256.0" y="226.0" font-size="13" font-weight="600" text-anchor="end" class="f-ink">EMQX 5.8.6</text>
+<text x="256.0" y="242.0" font-size="11" text-anchor="end" class="f-muted">documented minimum config</text>
+<rect x="270" y="216.0" width="216.0" height="22" rx="4" class="f-s3"/>
+<text x="496.0" y="227.0" font-size="14" font-weight="650" text-anchor="start" class="f-ink num">45,000 msg/s</text>
+<text x="496.0" y="242.0" font-size="11" text-anchor="start" class="f-ink2 num">p99 ≤ 500 ms at the knee</text>
+<text x="256.0" y="280.0" font-size="13" font-weight="600" text-anchor="end" class="f-ink">HiveMQ CE 2024.3</text>
+<text x="256.0" y="296.0" font-size="11" text-anchor="end" class="f-muted">documented minimum config</text>
+<rect x="270" y="270.0" width="144.0" height="22" rx="4" class="f-s4"/>
+<text x="424.0" y="281.0" font-size="14" font-weight="650" text-anchor="start" class="f-ink num">30,000 msg/s</text>
+<text x="424.0" y="296.0" font-size="11" text-anchor="start" class="f-ink2 num">p99 ≤ 100 ms at the knee</text>
+<text x="32.0" y="348.0" font-size="11" text-anchor="start" class="f-muted">emqtt-bench 0.6.3 (EMQX's load tool), driver-side measurement · ladder steps of 15,000 msg/s · knees qualified at ≥ 99% delivered, before the zero-loss rule</text>
+<text x="32.0" y="366.0" font-size="11" text-anchor="start" class="f-muted">source: docs/benchmarks/data/headline.csv → docs/benchmarks/SINGLE-NODE-COMPARISON.md</text>
+</svg>
