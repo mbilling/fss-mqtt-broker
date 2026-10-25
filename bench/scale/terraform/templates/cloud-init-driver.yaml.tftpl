@@ -19,7 +19,9 @@ packages:
   - jq
   - chrony
   - sysstat
+%{ if emqtt_bench ~}
   - docker.io
+%{ endif ~}
   - git
   - build-essential
   - pkg-config
@@ -50,8 +52,10 @@ runcmd:
       echo "no unconfigured NIC appeared for the private network (${private_ip})" >&2
     fi
   - sysctl --system
+%{ if emqtt_bench ~}
   - systemctl enable --now docker
   - docker pull emqx/emqtt-bench:0.6.3
+%{ endif ~}
 %{ if build_bench ~}
   - |
     nohup bash -c '

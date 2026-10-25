@@ -157,3 +157,9 @@ variable "build_bench" {
   default     = true
   description = "Build lane A driver; disable for lane E-only campaigns."
 }
+
+variable "driver_emqtt_bench" {
+  type        = bool
+  default     = true
+  description = "Install Docker and pull the emqtt-bench image on the driver hosts (lanes B/C/E). bench/scale/rig2 turns it off: its generator is the static mqtt-load binary, shipped over SSH, and skipping Docker shortens bring-up (ADR 0090 T5)."
+}
