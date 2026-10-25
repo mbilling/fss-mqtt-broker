@@ -10,6 +10,11 @@ number in the prose quietly becomes false. The README claimed "44 ADRs" while
 This checks only facts with a mechanical source of truth. Prose stays a human
 judgement; a wrong *number* is now a failed build.
 
+Since 2026-10-25 the README is a short front page: its numbers sections live in
+docs/benchmarks/EVIDENCE.md and its crate table in docs/ARCHITECTURE.md, and the
+checks on them moved along. The figures the README itself states are held to
+docs/benchmarks/data/headline.csv, and that file to the cards it cites.
+
 Usage: scripts/check-readme-facts.py
 """
 
@@ -23,6 +28,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 README = ROOT / "README.md"
 COMPARISON = ROOT / "docs" / "COMPARISON.md"
+EVIDENCE = ROOT / "docs" / "benchmarks" / "EVIDENCE.md"
+ARCHITECTURE = ROOT / "docs" / "ARCHITECTURE.md"
+HEADLINE = ROOT / "docs" / "benchmarks" / "data" / "headline.csv"
 
 
 def tracked_files() -> set[str]:
@@ -57,6 +65,59 @@ def github_anchor(heading: str) -> str:
     text = heading.strip().lower()
     text = re.sub(r"[^\w\s-]", "", text)
     return re.sub(r"\s", "-", text)
+
+
+def anchors_of(doc: Path) -> set[str]:
+    """Every fragment GitHub generates for a file's headings, duplicates suffixed -1, -2."""
+    body = re.sub(r"^```.*?^```", "", doc.read_text(encoding="utf-8"), flags=re.MULTILINE | re.DOTALL)
+    seen: dict[str, int] = {}
+    out = set()
+    for h in re.findall(r"^#{1,6}\s+(.+?)\s*#*\s*$", body, re.MULTILINE):
+        a = github_anchor(re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", h).replace("`", ""))
+        n = seen.get(a, 0)
+        out.add(a if n == 0 else f"{a}-{n}")
+        seen[a] = n + 1
+    return out
+
+
+def digits(text: str) -> set[int]:
+    """Every integer a text states, with thousands written as 1,234 or 1 234 or plain."""
+    out = set()
+    for m in re.findall(r"(?<![\d.])\d{1,3}(?:[,\u202f ]\d{3})+(?![\d])|(?<![\d.,])\d+(?![\d,])", text):
+        out.add(int(re.sub(r"[,\u202f ]", "", m)))
+    return out
+
+
+def headline_rows() -> list[dict]:
+    import csv
+
+    with HEADLINE.open(encoding="utf-8") as f:
+        return list(csv.DictReader(line for line in f if not line.startswith("#")))
+
+
+def compact(v: float) -> str:
+    """chart_style.compact: 90003 -> 90k, 1140000 -> 1.14M."""
+    if v >= 1_000_000:
+        return f"{v / 1e6:.2f}".rstrip("0").rstrip(".") + "M"
+    return f"{v / 1000:.0f}k" if v >= 1000 else f"{v:.0f}"
+
+
+def headline_figures(rows: list[dict]) -> set[str]:
+    """Every way the README may write a headline.csv figure: 90,003 · 90k · 30.0k per node
+    · 7,500 per vCPU · and the ratios the charts print (2.7×, 1.7×)."""
+    out: set[str] = set()
+    by_chart: dict[str, dict[str, float]] = {}
+    for r in rows:
+        v, n, vcpu = int(r["msg_per_s"]), int(r["nodes"]), int(r["vcpu"])
+        pn = v / n
+        out |= {f"{v:,}", compact(v), f"{pn / 1000:.1f}k", f"{pn / 1000:.0f}k", f"{v / vcpu:,.0f}"}
+        by_chart.setdefault(r["chart"], {})[r["series"]] = v / vcpu if r["chart"] == "durable-per-vcpu" else v
+    for vals in by_chart.values():
+        for a in vals.values():
+            for b in vals.values():
+                if a > b:
+                    out.add(f"{a / b:.1f}×")
+    return out
 
 
 def scale_figures(text: str) -> set[str]:
@@ -97,10 +158,12 @@ def main() -> int:
             "the '(N ADRs, per-task status)' phrase is gone — this guard cannot "
             "check the count any more; restore it or update this script"
         )
-    elif int(match.group(1)) != len(adrs):
-        problems.append(
-            f"claims {match.group(1)} ADRs; docs/adr/ holds {len(adrs)}"
-        )
+    for doc in (README, ARCHITECTURE):
+        for stated_adrs in re.findall(r"\((\d+) ADRs, per-task status\)", doc.read_text(encoding="utf-8")):
+            if int(stated_adrs) != len(adrs):
+                problems.append(
+                    f"{doc.relative_to(ROOT)} claims {stated_adrs} ADRs; docs/adr/ holds {len(adrs)}"
+                )
 
     # --- runnable-script count -------------------------------------------
     # "There are N runnable scripts here" must match the mqttui manifest, which
@@ -121,18 +184,27 @@ def main() -> int:
         )
 
     # --- crate table -----------------------------------------------------
-    # Every workspace crate must appear in the Workspace layout table. A crate
-    # nobody mentions is one nobody can evaluate.
+    # Every workspace crate must appear in docs/ARCHITECTURE.md's Workspace crates
+    # table (the README's crate table moved there on 2026-10-25). A crate nobody
+    # mentions is one nobody can evaluate.
     crates = sorted(
         p.name for p in (ROOT / "crates").iterdir() if (p / "Cargo.toml").exists()
     )
-    listed = set(re.findall(r"^\| `([a-z0-9-]+)` \|", text, re.MULTILINE))
+    arch = ARCHITECTURE.read_text(encoding="utf-8")
+    crate_section = re.search(r"^## Workspace crates\n(.*?)(?=^## )", arch, re.MULTILINE | re.DOTALL)
+    if not crate_section:
+        problems.append(
+            "docs/ARCHITECTURE.md's '## Workspace crates' section is gone — restore it "
+            "or update this script"
+        )
+    listed = set(re.findall(r"^\| `([a-z0-9-]+)` \|",
+                            crate_section.group(1) if crate_section else "", re.MULTILINE))
     for crate in crates:
         if crate not in listed:
-            problems.append(f"crate `{crate}` is missing from the Workspace layout table")
+            problems.append(f"crate `{crate}` is missing from docs/ARCHITECTURE.md's Workspace crates table")
     for name in sorted(listed - set(crates)):
         problems.append(
-            f"the Workspace layout table lists `{name}`, which is not a crate in crates/"
+            f"docs/ARCHITECTURE.md's Workspace crates table lists `{name}`, which is not a crate in crates/"
         )
 
     # --- intra-document anchors ------------------------------------------
@@ -140,11 +212,24 @@ def main() -> int:
     # silently does nothing — the reader clicks and stays put. The README now
     # leans on them (a jump list, and the Status paragraph pointing at
     # Limitations), so they are worth holding to the same standard as the counts.
-    headings = re.findall(r"^#{2,6}\s+(.+?)\s*$", text, re.MULTILINE)
-    anchors = {github_anchor(h) for h in headings}
-    for link in sorted(set(re.findall(r"\]\(#([^)]+)\)", text))):
-        if link not in anchors:
-            problems.append(f"link to #{link} matches no heading in README.md")
+    # Held for the README and for docs/benchmarks/EVIDENCE.md (which took the README's
+    # numbers sections and their anchors), both for `#section` links inside the file
+    # and for `other.md#section` links into another tracked markdown file.
+    import posixpath
+
+    anchor_count = 0
+    for doc in (README, EVIDENCE):
+        doc_text = doc.read_text(encoding="utf-8")
+        rel = doc.relative_to(ROOT).as_posix()
+        own = anchors_of(doc)
+        anchor_count += len(own)
+        for link in sorted(set(re.findall(r"\]\(#([^)]+)\)", doc_text))):
+            if link not in own:
+                problems.append(f"link to #{link} matches no heading in {rel}")
+        for target, frag in sorted(set(re.findall(r"\]\(([^)#\s:]+\.md)#([^)\s]+)\)", doc_text))):
+            path = ROOT / posixpath.normpath(posixpath.join(doc.parent.relative_to(ROOT).as_posix(), target))
+            if path.is_file() and frag not in anchors_of(path):
+                problems.append(f"{rel} links to {target}#{frag}, which matches no heading there")
 
     # --- evidence citations resolve to TRACKED files (issues #253, #244) --
     # COMPARISON.md is the document that promises trust-through-checkability, and
@@ -308,14 +393,17 @@ def main() -> int:
     # counts (`233,716,926`), per-node rates (`20.7–20.9k`) and percentages
     # (`13–17%`) — with a range kept whole, so neither end can drift. Prose numbers
     # (node counts, dates, `p99 ≤ 500 ms`) are left to the reader.
+    # The section moved from the README to docs/benchmarks/EVIDENCE.md on 2026-10-25,
+    # and this check moved with it.
+    evidence_text = EVIDENCE.read_text(encoding="utf-8")
     section = re.search(
         r"^### Scale: what we measured on 1\.2\.0\n(.*?)(?=^#{2,3} )",
-        text, re.MULTILINE | re.DOTALL)
+        evidence_text, re.MULTILINE | re.DOTALL)
     figure_count = 0
     if not section:
         problems.append(
-            "the '### Scale: what we measured on 1.2.0' section is gone — "
-            "restore it or update this script"
+            "docs/benchmarks/EVIDENCE.md's '### Scale: what we measured on 1.2.0' section "
+            "is gone — restore it or update this script"
         )
     else:
         cards = [ROOT / "bench" / "scale" / n
@@ -329,20 +417,72 @@ def main() -> int:
         figure_count = len(quoted)
         for figure in sorted(quoted - stated):
             problems.append(
-                f"the README's 1.2.0-candidate scale section says {figure}, which none of "
+                f"EVIDENCE.md's 1.2.0 scale section says {figure}, which none of "
                 + ", ".join(f"bench/scale/{c.name}" for c in cards) + " states"
             )
         if not quoted:
-            problems.append("the README's 1.2.0-candidate scale section quotes no figure at all")
+            problems.append("EVIDENCE.md's 1.2.0 scale section quotes no figure at all")
+
+    # --- the README's evidence figures are headline.csv's, and its rows are their cards' --
+    # The README's header, Why mqttd and Evidence sections quote throughput figures
+    # (90,003 · 270k · 27.0k · 7,500 · 2.7×). Each must be one headline.csv derives,
+    # so a number edited in the prose alone fails; and each CSV row's msg_per_s must be
+    # stated in the card it cites, so the CSV cannot drift from the record either. The
+    # charts drawn from the CSV must match what is committed.
+    rows = headline_rows()
+    allowed = headline_figures(rows)
+    front = re.split(r"^## Feature matrix", text, maxsplit=1, flags=re.MULTILINE)[0]
+    stated_front = set(re.findall(r"(?<![\w.,])\d{1,3}(?:,\d{3})+(?![\d,])", front))
+    stated_front |= set(re.findall(r"(?<![\w.,])\d+(?:\.\d+)?[kM](?![\w])", front))
+    stated_front |= set(re.findall(r"(?<![\w.,])\d+(?:\.\d+)?×", front))
+    headline_count = len(stated_front)
+    for figure in sorted(stated_front - allowed):
+        problems.append(
+            f"the README states {figure} before its Feature matrix, which "
+            "docs/benchmarks/data/headline.csv does not derive — add the row (citing its card) "
+            "or correct the figure"
+        )
+    import csv as _csv
+
+    per_vcpu_rows = list(_csv.DictReader(
+        line for line in (ROOT / "docs/benchmarks/data/per-vcpu.csv").open(encoding="utf-8")
+        if not line.startswith("#")))
+    for r in rows:
+        src = ROOT / r["source"]
+        if not src.is_file():
+            problems.append(f"headline.csv row {r['label']!r} cites {r['source']}, which does not exist")
+            continue
+        if src.suffix == ".csv":
+            ok = any(p["class"] == r["section"] and p["broker"] + " " + p["version"] in r["label"]
+                     and int(p["msg_per_s"]) == int(r["msg_per_s"]) and int(p["vcpu"]) == int(r["vcpu"])
+                     for p in per_vcpu_rows)
+        else:
+            ok = int(r["msg_per_s"]) in digits(src.read_text(encoding="utf-8"))
+        if not ok:
+            problems.append(
+                f"headline.csv row {r['label']!r} ({r['nodes']} nodes) says {int(r['msg_per_s']):,} msg/s, "
+                f"which {r['source']} ({r['section']}) does not state"
+            )
+    import runpy
+
+    chart = runpy.run_path(str(ROOT / "bench/scale/chart-readme.py"))
+    for name, fn in chart["CHARTS"].items():
+        committed = ROOT / "docs/benchmarks/img" / name
+        if not committed.is_file() or committed.read_text(encoding="utf-8") != fn(chart["load"]()):
+            problems.append(
+                f"docs/benchmarks/img/{name} is not what bench/scale/chart-readme.py draws from "
+                "headline.csv — run it and commit the result"
+            )
 
     if problems:
         fail(problems)
 
     print(
         f"README facts check: {len(adrs)} ADRs, {len(crates)} crates, "
-        f"{task_count} scripts, {len(anchors)} anchors, "
+        f"{task_count} scripts, {anchor_count} anchors (README + EVIDENCE.md), "
         f"{citation_count} evidence citations across {len(cited_docs)} cited docs, "
-        f"{figure_count} candidate scale figures found in their cards, "
+        f"{figure_count} 1.2.0 scale figures found in their cards, "
+        f"{headline_count} README evidence figures and {len(rows)} headline.csv rows checked, "
         f"dates in sync — all match."
     )
     return 0
