@@ -141,6 +141,9 @@ fn signed_auth(cn: &str) -> SwimAuth {
 enum Flavor {
     /// This tree: the real [`Gossip`] endpoint, default configuration.
     Current,
+    /// v1.2.0: the real [`Gossip`] endpoint (its driver is this tree's), with the
+    /// detector's rules as they were in that release ([`v1_2_cfg`]).
+    V1_2,
     /// v1.1.0, re-stated: its driver's seal/open rules and its state-machine rules.
     V1_1,
     /// v1.1.0 plus exactly one of this change's four mechanisms — for measuring what
@@ -165,13 +168,24 @@ const OTHER_REJECT: u64 = 1 << 32;
 
 /// v1.1.0's state-machine rules: what has been added since is off — the two rules of
 /// issue #971, the last direct probe before `Dead` (issue #975), and the probe period
-/// kept to its schedule (issue #1002).
+/// kept to its schedule (issue #1002) — and the rules v1.2.0 shared with it are as
+/// they were then ([`v1_2_cfg`]).
 fn v1_1_cfg() -> Config {
     Config {
         reprime_on_rescued_probe: false,
         greet_pruned: false,
         confirm_before_dead: false,
         period_from_schedule: false,
+        ..v1_2_cfg()
+    }
+}
+
+/// v1.2.0's state-machine rules: what 0087-T10b changed is as it was — a relayed
+/// `Dead` adopted unchecked, and the window's floor at 1.5 s.
+fn v1_2_cfg() -> Config {
+    Config {
+        check_relayed_dead: false,
+        suspicion_min_timeout_ms: 1500,
         ..Config::default()
     }
 }
@@ -200,7 +214,7 @@ enum Emit {
 impl Endpoint {
     fn new(swim: Swim, auth: SwimAuth, flavor: Flavor) -> Self {
         match flavor {
-            Flavor::Current => {
+            Flavor::Current | Flavor::V1_2 => {
                 let cert_miss = Arc::new(AtomicU64::new(0));
                 let counter = cert_miss.clone();
                 let gossip = Gossip::new(swim, Some(auth), None).with_reject_counter(Some(
@@ -233,6 +247,7 @@ impl Endpoint {
     fn cfg(flavor: Flavor) -> Config {
         match flavor {
             Flavor::Current => Config::default(),
+            Flavor::V1_2 => v1_2_cfg(),
             Flavor::V1_1Plus(Fix::ReprimeOnRescuedProbe) => Config {
                 reprime_on_rescued_probe: true,
                 ..v1_1_cfg()
@@ -495,6 +510,25 @@ fn one_upgraded(i: usize, n: usize) -> Flavor {
         Flavor::Current
     } else {
         Flavor::V1_1
+    }
+}
+fn all_v1_2(_: usize, _: usize) -> Flavor {
+    Flavor::V1_2
+}
+/// The rolling upgrade from v1.2.0 half done: odd nodes still on v1.2.0.
+fn half_upgraded_from_v1_2(i: usize, _: usize) -> Flavor {
+    if i % 2 == 1 {
+        Flavor::V1_2
+    } else {
+        Flavor::Current
+    }
+}
+/// The rolling upgrade from v1.2.0's last step: one node still on v1.2.0.
+fn one_left_on_v1_2(i: usize, n: usize) -> Flavor {
+    if i == n / 2 {
+        Flavor::V1_2
+    } else {
+        Flavor::Current
     }
 }
 
@@ -784,7 +818,8 @@ impl Sim {
         self.nodes[i] = Some(Node {
             endpoint: Endpoint::new(swim, auth, flavor),
             started: self.now,
-            shell: if flavor == Flavor::Current {
+            // v1.2.0's driver loop is this tree's.
+            shell: if matches!(flavor, Flavor::Current | Flavor::V1_2) {
                 self.variant.shell
             } else {
                 Shell::TickFirst
@@ -1443,7 +1478,11 @@ fn the_v1_1_rules_reproduce_the_formation_storm_and_preshared_certificates_remov
 /// A member falsely declared `Dead` is re-admitted in bounded time, whichever side
 /// would have had to make the first move. One member of a formed cluster is cut off
 /// for 8 s: everyone buries it, and it buries the members it probed meanwhile — so
-/// some pairs have evicted EACH OTHER and neither probes the other again. No node may
+/// some pairs have evicted EACH OTHER and neither probes the other again. (Those
+/// verdicts are all reached during the cut. Until 0087-T10b the member's verdicts
+/// about the others were also adopted by third parties after the cut, which is what
+/// this test used to count; now each is checked with the member that was declared,
+/// which answers.) No node may
 /// hold a healthy peer out for longer than the tombstone (30 s, plus the round trip of
 /// the parting greeting), and every view must be whole again within 90 s (worst
 /// observed: 59 s). On v1.1.0 the mutual evictions never heal: at 5 nodes, 13 of 16
@@ -1456,8 +1495,8 @@ fn a_member_falsely_declared_dead_is_readmitted_within_the_tombstone_ttl() {
         for (seed, o) in runs.iter().enumerate() {
             let ctx = format!("N={n} seed {seed}");
             assert!(
-                o.total_deads() > 0,
-                "{ctx}: the cut must produce false deaths"
+                o.deads_during_cut > 0 && o.longest_eviction > 0,
+                "{ctx}: the cut must produce false deaths that outlast it"
             );
             assert!(
                 o.evicted_at_deadline.is_empty(),
@@ -1542,39 +1581,59 @@ fn a_formation_run_is_reproducible_from_its_seed() {
 /// against it. Each is a function of the default configuration.
 type Detector = (&'static str, fn(Config) -> Config);
 
-/// The default: 4 s for one suspecter, 1.5 s for three, whatever the cluster's size,
-/// and one last direct probe of the suspect before it is declared dead.
-const DEFAULT: Detector = ("default: 4 s / 1.5 s, last direct probe", |cfg| cfg);
-/// The default without the last probe: the rule of v1.1.0, and of every release up to
-/// ADR 0016's amendment of 2026-10-13.
+/// The default: 4 s for one suspecter, 2.5 s for three, whatever the cluster's size;
+/// one last direct probe of the suspect before it is declared dead; and a `Dead`
+/// relayed by another node checked with the same probe before it is adopted
+/// (0087-T10b).
+const DEFAULT: Detector = (
+    "default: 4 s / 2.5 s, last probe, relayed DEAD checked",
+    |cfg| cfg,
+);
+/// v1.2.0's detector: the last direct probe, the window's floor at 1.5 s, and a
+/// relayed `Dead` adopted unchecked ([`v1_2_cfg`]).
+const V1_2: Detector = ("v1.2.0: 4 s / 1.5 s, last probe", |cfg| Config {
+    check_relayed_dead: false,
+    suspicion_min_timeout_ms: 1500,
+    ..cfg
+});
+/// The default with the floor at 1.5 s: what the check of a relayed `Dead` does alone.
+const CHECK_ONLY: Detector = ("v1.2.0 + relayed DEAD checked", |cfg| Config {
+    suspicion_min_timeout_ms: 1500,
+    ..cfg
+});
+/// The default with a relayed `Dead` adopted unchecked: what the 2.5 s floor does alone.
+const FLOOR_ONLY: Detector = ("v1.2.0 + 2.5 s floor", |cfg| Config {
+    check_relayed_dead: false,
+    ..cfg
+});
+/// v1.2.0 without the last probe: the rule of v1.1.0, and of every release up to ADR
+/// 0016's amendment of 2026-10-13. The rows below it are alternatives to that rule, as
+/// #975's tables measured them.
 const NO_PROBE: Detector = ("no last probe (v1.1.0's rule)", |cfg| Config {
     confirm_before_dead: false,
-    ..cfg
+    ..(V1_2.1)(cfg)
 });
 /// The SWIM paper's rule applied to the window, no last probe: both ends ×
 /// `max(1, log10 N)`.
 const LOG_N: Detector = ("no last probe, x log10(N)", |cfg| Config {
-    confirm_before_dead: false,
     suspicion_scales_with_log_n: true,
-    ..cfg
+    ..(NO_PROBE.1)(cfg)
 });
 /// memberlist's LAN defaults (Lifeguard's dynamic suspicion), no last probe: the floor
 /// is `4 × max(1, log10 N)` protocol periods, the ceiling six times the floor.
 const MEMBERLIST: Detector = ("no last probe, memberlist: 4 log10(N) s, x6", |cfg| {
     Config {
-        confirm_before_dead: false,
         suspicion_min_timeout_ms: 4000,
         suspicion_timeout_ms: 24_000,
         suspicion_scales_with_log_n: true,
-        ..cfg
+        ..(NO_PROBE.1)(cfg)
     }
 });
 /// The window simply doubled, no last probe, as a control for "is it only about length".
 const DOUBLED: Detector = ("no last probe, doubled: 8 s / 3 s", |cfg| Config {
-    confirm_before_dead: false,
     suspicion_timeout_ms: 8000,
     suspicion_min_timeout_ms: 3000,
-    ..cfg
+    ..(NO_PROBE.1)(cfg)
 });
 /// The default with the scaled window as well.
 const LAST_PROBE_LOG_N: Detector = ("default, x log10(N)", |cfg| Config {
@@ -1737,9 +1796,11 @@ fn last_probe_bound_ms(cfg: &Config) -> u64 {
 /// by no node. Printed when the bound test fails, which it does when a timeout or the
 /// tick is changed.
 const BOUND_DERIVATION: &str = "\
-A node declares a member Dead on its own account only when a last direct probe of it
-runs out unanswered; so if every last probe is sent after the cut has ended, the member
-answers each, and there is no Dead for anyone to adopt. The cut begins at c.
+A node turns a member Dead only when a last direct probe of its own runs out unanswered:
+the one at the end of its suspicion window, or the one with which it checks a Dead
+another node relayed (which that node reached the same way). So if every last probe is
+sent after the cut has ended, the member answers each, and there is no Dead at all. The
+first last probe is a window's; the cut begins at c.
 
   1. The earliest probe the cut leaves unanswered started at c - 2 x latency (its Ping
      arrived just before c and its Ack just after).
@@ -1750,14 +1811,15 @@ answers each, and there is no Dead for anyone to adopt. The cut begins at c.
   3. The suspicion window is never shorter than its floor (three suspecters), and local
      health only lengthens it. So no last probe is sent before
          start + 2 x roundup(ack timeout, tick) + window floor.
-  4. With the defaults: 2 x roundup(250, 100) + 1500 - 2 x 1 = 2098 ms after c.
+  4. With the defaults: 2 x roundup(250, 100) + 2500 - 2 x 1 = 3098 ms after c.
 
-A cut of up to 2098 ms has therefore ended before the first last probe is sent — ON THE
+A cut of up to 3098 ms has therefore ended before the first last probe is sent — ON THE
 SIMULATION'S GRID, where every tick lands exactly 100 ms after the one before. The 98 ms
-over a 2000 ms cut is all the tick, and a broker cannot count on it: a tick that comes
+over a 3000 ms cut is all the tick, and a broker cannot count on it: a tick that comes
 50 ms late acts on a 250 ms deadline at 250 ms, not 300. Whatever the ticks do, a
 deadline is not acted on before it, so what always holds is
-    2 x 250 + 1500 - 2 x latency = 2 s less twice the latency (1998 ms here).
+    2 x 250 + 2500 - 2 x latency = 3 s less twice the latency (2998 ms here).
+(v1.2.0's floor was 1.5 s: 2098 ms on the grid, 2 s less twice the latency.)
 (The member's own suspicions of others need no line: it hears nobody, so it is the only
 suspecter, and its window is the full 4 s.)";
 
@@ -1824,9 +1886,12 @@ fn burial_under(
 }
 
 const CUT_SIZES: [usize; 5] = [3, 5, 10, 14, 30];
-/// 2 s and 2.5 s sit either side of where the last probe's bound ends
-/// ([`last_probe_bound_ms`]: 2098 ms).
-const CUTS_MS: [u64; 7] = [500, 1000, 1500, 2000, 2500, 3000, 5000];
+/// The clean-cut table's sizes: [`CUT_SIZES`] and the 16 nodes of #975's test.
+const TABLE_SIZES: [usize; 6] = [3, 5, 10, 14, 16, 30];
+/// 2 s and 2.5 s sit either side of where the bound ended with v1.2.0's 1.5 s floor
+/// (2098 ms on the simulation's grid); 3 s and 3.5 s either side of where it ends with
+/// the default's 2.5 s ([`last_probe_bound_ms`]: 3098 ms).
+const CUTS_MS: [u64; 8] = [500, 1000, 1500, 2000, 2500, 3000, 3500, 5000];
 
 /// One cell of a report: `runs with any DEAD / runs with a DEAD after the fault ended
 /// [DEAD transitions median..worst; SUSPECT median; longest eviction, s; unsettled]`.
@@ -1861,6 +1926,9 @@ fn false_dead_report() {
     let seeds = 32;
     let detectors = [
         DEFAULT,
+        V1_2,
+        CHECK_ONLY,
+        FLOOR_ONLY,
         NO_PROBE,
         LOG_N,
         DOUBLED,
@@ -1872,7 +1940,7 @@ fn false_dead_report() {
     let mut probes = Vec::new();
     for detector in detectors {
         println!("\n{}", detector.0);
-        for n in CUT_SIZES {
+        for n in TABLE_SIZES {
             let mut line = format!("  N={n:<3}");
             let mut counts = format!("  N={n:<3}");
             for for_ms in CUTS_MS {
@@ -1896,14 +1964,19 @@ fn false_dead_report() {
     for line in probes {
         println!("{line}");
     }
-    // A rolling upgrade: only the upgraded nodes probe a suspect once more; a v1.1.0
-    // node is probed and answers as it always has, and declares as it always has.
-    println!("\nthe default in a cluster part-way through the upgrade from v1.1.0, N=14");
+    // A rolling upgrade: only the upgraded nodes check a relayed `Dead` and wait out the
+    // longer floor; a v1.2.0 node declares on its own floor and adopts unchecked, and a
+    // v1.1.0 node does not even ask a suspect once more. Each is probed and answers as it
+    // always has.
+    println!("\nthe default in a cluster part-way through the upgrade from v1.2.0 or v1.1.0, N=14");
     for (label, flavor) in [
         (
             "every node upgraded",
             all_current as fn(usize, usize) -> Flavor,
         ),
+        ("one node left on v1.2.0", one_left_on_v1_2),
+        ("half the nodes on v1.2.0", half_upgraded_from_v1_2),
+        ("every node on v1.2.0", all_v1_2),
         ("one node left on v1.1.0", one_left_on_v1_1),
         ("half the nodes on v1.1.0", half_upgraded),
         ("one node upgraded", one_upgraded),
@@ -1920,7 +1993,7 @@ fn false_dead_report() {
         "\na member that really died: ms until the last survivor holds it DEAD, median / worst"
     );
     for detector in detectors {
-        let cells: Vec<String> = CUT_SIZES
+        let cells: Vec<String> = TABLE_SIZES
             .into_iter()
             .map(|n| format!("N={n} {}", burial_ms(detector, n, 16)))
             .collect();
@@ -1929,22 +2002,22 @@ fn false_dead_report() {
 }
 
 /// The measurement behind ADR 0016's amendments of 2026-10-13, beyond a clean cut on a
-/// lossless network: the default and the same detector without its last probe, under
-/// packet loss, a member reachable one way only, one link lost one way, a member whose
-/// datagrams arrive late, and a node that was itself stalled — as a member and as the
-/// prober whose last probe is out. Each pair of rows runs the same seeds, and under
+/// lossless network: the default, v1.2.0's detector, and that without its last probe,
+/// under packet loss, a member reachable one way only, one link lost one way, a member
+/// whose datagrams arrive late, and a node that was itself stalled — as a member and as
+/// the prober whose last probe is out. Each set of rows runs the same seeds, and under
 /// loss the same network ([`Sim::lost`]). Not an assertion —
 /// `cargo test -p mqtt-cluster --release --test swim_formation_sim fault_shapes_report -- --ignored --nocapture`.
 #[test]
 #[ignore = "measurement report for issue #975; run with --ignored --nocapture"]
 fn fault_shapes_report() {
     let seeds = 32;
-    let pair = [DEFAULT, NO_PROBE];
+    let compared = [DEFAULT, V1_2, NO_PROBE];
     let losses = [50, 100, 200];
     println!("{seeds} seeds per cell: {CELL_LEGEND}");
 
     println!("\nno member at fault; every datagram lost with the given probability");
-    for detector in pair {
+    for detector in compared {
         println!("  {}", detector.0);
         let columns = losses.map(|loss| (format!("{}%", loss / 10), loss_under(detector, loss)));
         print_grid(&columns, seeds);
@@ -1954,7 +2027,7 @@ fn fault_shapes_report() {
         "\none member cut off for 1.5 s on a network that has that loss from the moment of \
          the cut"
     );
-    for detector in pair {
+    for detector in compared {
         println!("  {}", detector.0);
         let columns = losses.map(|loss| {
             (
@@ -1969,7 +2042,7 @@ fn fault_shapes_report() {
         "\na member that really died, on a network that has that loss from the moment it \
          does: ms until the last survivor holds it DEAD, median / worst of 16"
     );
-    for detector in pair {
+    for detector in compared {
         println!("  {}", detector.0);
         for loss in losses {
             let cells = burials(detector, Fault::Cut, loss);
@@ -1985,7 +2058,7 @@ fn fault_shapes_report() {
         ("deaf (hears nothing, is heard)", Fault::Deaf),
         ("mute (hears, is not heard)", Fault::Mute),
     ] {
-        for detector in pair {
+        for detector in compared {
             let cells = burials(detector, shape, 0);
             println!("  {label:<31} {:<40} | {cells}", detector.0);
         }
@@ -1993,7 +2066,7 @@ fn fault_shapes_report() {
 
     println!("\na member reachable one way only, for a while");
     for (label, shape) in [("deaf", Fault::Deaf), ("mute", Fault::Mute)] {
-        for detector in pair {
+        for detector in compared {
             println!("  {label}, {}", detector.0);
             let columns = [1500, 2000, 3000]
                 .map(|for_ms| (seconds(for_ms), fault_under(detector, shape, for_ms, 0)));
@@ -2005,7 +2078,7 @@ fn fault_shapes_report() {
         "\none link lost one way (what the founder sends one member never arrives), for a \
          minute and for good"
     );
-    for detector in pair {
+    for detector in compared {
         println!("  {}", detector.0);
         let columns = [("60s", 60_000), ("for good", FOREVER_MS)].map(|(label, for_ms)| {
             (
@@ -2017,7 +2090,7 @@ fn fault_shapes_report() {
     }
 
     println!("\none member's datagrams arrive late, for 20 s");
-    for detector in pair {
+    for detector in compared {
         println!("  {}", detector.0);
         let columns = [200, 300, 600, 1000, 2000].map(|late| {
             (
@@ -2038,6 +2111,7 @@ fn fault_shapes_report() {
 fn report_stalled_nodes(seeds: u64) {
     let stalled_rows = [
         (DEFAULT.0, DEFAULT, Shell::Current),
+        (V1_2.0, V1_2, Shell::Current),
         (
             "default, on the driver loop before this change",
             DEFAULT,
@@ -2093,7 +2167,7 @@ fn report_stalled_probers(seeds: u64) {
                 let variant = Variant {
                     shell,
                     stall_prober_ms: Some(stall),
-                    ..cut_under(DEFAULT, PROMISED_CUT_MS)
+                    ..cut_under(DEFAULT, TWO_SECONDS_MS)
                 };
                 let c = cut_cell_of(&variant, n, seeds);
                 let _ = write!(
@@ -2140,34 +2214,38 @@ fn burials(detector: Detector, shape: Fault, loss_permille: u64) -> String {
         .join(" | ")
 }
 
-/// The two seconds of the reports' "2 s" column: a cut the simulation's grid spares,
-/// and two milliseconds more than a broker is promised.
-const PROMISED_CUT_MS: u64 = 2000;
+/// The three seconds of the reports' "3 s" column: a cut the simulation's grid spares,
+/// and two milliseconds more than a broker is promised (0087-T10b).
+const PROMISED_CUT_MS: u64 = 3000;
 /// Where the bound ends on the simulation's exact tick grid, as the documents give it
-/// (ADR 0016's amendment for issue #1002, ADR 0087 §7).
-const GRID_BOUND_MS: u64 = 2098;
-/// What the documents promise of a broker: two seconds less twice the network's
+/// (ADR 0016's amendment for issue #1002 and its successor for 0087-T10b, ADR 0087 §7).
+const GRID_BOUND_MS: u64 = 3098;
+/// What the documents promise of a broker: three seconds less twice the network's
 /// latency, which at this simulation's latency is this.
-const DOCUMENTED_FLOOR_MS: u64 = 1998;
+const DOCUMENTED_FLOOR_MS: u64 = 2998;
+/// The two-second cut the tests of a stalled prober, a stopped node and the rules of
+/// v1.1.0 were written around: inside the bound, and long enough that a last probe is
+/// sent in some runs.
+const TWO_SECONDS_MS: u64 = 2000;
 
 /// The bound the default detector keeps ON THE SIMULATION'S TICK GRID (ADR 0016's
-/// amendments of 2026-10-13 for issues #975 and #1002, ADR 0087 T10): a member of a
-/// formed cluster that is cut off — nothing in, nothing out — for up to 2 s is
-/// declared `Dead` by no node, and not suspected for long either: every view is whole
-/// again within the window. What a broker is promised, whose ticks are on no grid, is
-/// the next test's.
+/// amendments of 2026-10-13 for issues #975 and #1002 and of 2026-10-25 for 0087-T10b,
+/// ADR 0087 T10 and T10b): a member of a formed cluster that is cut off — nothing in,
+/// nothing out — for up to 3 s is declared `Dead` by no node, and not suspected for
+/// long either: every view is whole again within the window. What a broker is
+/// promised, whose ticks are on no grid, is the next test's.
 ///
 /// The bound is arithmetic ([`BOUND_DERIVATION`]), so it is tested as arithmetic: the
-/// figure is computed from the broker's own timeouts and tick, must cover two
+/// figure is computed from the broker's own timeouts and tick, must cover three
 /// seconds, and must be the figure the documents give for the grid; and a cut of
 /// exactly that length — to the millisecond the last one the argument covers — ends
 /// in no `Dead` at 5, 14 and 30 nodes. Change a timeout or the tick and this fails
-/// with the derivation. Past the bound nothing is promised: the report's 2.5 s column
+/// with the derivation. Past the bound nothing is promised: the report's 3.5 s column
 /// is not zero.
 ///
-/// A member that really died is still buried by every survivor, one ack timeout later.
+/// A member that really died is still buried by every survivor.
 #[test]
-fn a_member_cut_off_for_up_to_two_seconds_is_not_declared_dead() {
+fn a_member_cut_off_for_up_to_three_seconds_is_not_declared_dead() {
     let cfg = Config::default();
     let bound = last_probe_bound_ms(&cfg);
     let timings = format!(
@@ -2187,8 +2265,8 @@ fn a_member_cut_off_for_up_to_two_seconds_is_not_declared_dead() {
     // A handful of runs per size: this is every tier's test, and the 32-seed table is
     // the report's.
     for (n, cuts) in [
-        (5, &[1500, PROMISED_CUT_MS, bound][..]),
-        (14, &[500, PROMISED_CUT_MS, bound]),
+        (5, &[1500, TWO_SECONDS_MS, PROMISED_CUT_MS, bound][..]),
+        (14, &[500, TWO_SECONDS_MS, PROMISED_CUT_MS, bound]),
         (30, &[bound]),
     ] {
         for &for_ms in cuts {
@@ -2239,11 +2317,12 @@ fn half_ticks(variant: &Variant) -> Variant {
     }
 }
 
-/// What a BROKER is promised (ADR 0016's amendment for issue #1002): its ticks are on
-/// no grid — the timer fires late, the loop is scheduled late, and a late tick shifts
-/// every one after it — so the tick's rounding is a margin it cannot count on. With
-/// every node's ticks late by a different amount each time, a member cut off for two
-/// seconds less twice the network's latency is declared `Dead` by no node: no
+/// What a BROKER is promised (ADR 0016's amendment for issue #1002, with 0087-T10b's
+/// floor): its ticks are on no grid — the timer fires late, the loop is scheduled late,
+/// and a late tick shifts every one after it — so the tick's rounding is a margin it
+/// cannot count on. With every node's ticks late by a different amount each time, a
+/// member cut off for three seconds less twice the network's latency is declared
+/// `Dead` by no node: no
 /// deadline is acted on before it falls due, so no node suspects the member sooner
 /// than two ack timeouts into the cut, nor asks it the last time sooner than the
 /// window's floor after that. Arithmetic again, and pinned as arithmetic.
@@ -2251,12 +2330,13 @@ fn half_ticks(variant: &Variant) -> Variant {
 /// The same on a 50 ms grid, where a tick lands exactly on each 250 ms deadline — the
 /// schedule the grid's margin does not survive.
 ///
-/// Between that and the grid's 2098 ms a verdict needs a schedule in which a
+/// Between that and the grid's 3098 ms a verdict needs a schedule in which a
 /// prober's ticks land on its deadlines and two more nodes suspect in step. The
-/// report sweeps both ways of leaving the grid, 32 seeds a cell, and finds none up
-/// to 2.2 s: what is promised is the arithmetic, not the sweep.
+/// report sweeps both ways of leaving the grid, 32 seeds a cell: with ticks late it
+/// finds none up to 3.2 s; on the 50 ms grid, one run at 5 nodes from 3050 ms. What is
+/// promised is the arithmetic, not the sweep.
 #[test]
-fn with_ticks_on_no_grid_a_cut_of_two_seconds_less_twice_the_latency_ends_in_no_dead() {
+fn with_ticks_on_no_grid_a_cut_of_three_seconds_less_twice_the_latency_ends_in_no_dead() {
     let cfg = Config::default();
     let floor = last_probe_floor_ms(&cfg);
     assert_eq!(
@@ -2389,7 +2469,7 @@ fn a_prober_stalled_on_its_last_probe_declares_nobody_dead() {
     let stalled = |shell| Variant {
         shell,
         stall_prober_ms: Some(4 * Config::default().ack_timeout_ms),
-        ..cut_under(DEFAULT, PROMISED_CUT_MS)
+        ..cut_under(DEFAULT, TWO_SECONDS_MS)
     };
     let now = cut_cell_of(&stalled(Shell::Current), n, 12);
     assert!(
@@ -2436,7 +2516,7 @@ fn a_prober_stalled_on_its_last_probe_declares_nobody_dead() {
 fn a_node_stopped_for_two_seconds_neither_dies_nor_declares() {
     for n in [5, 14] {
         let c = cut_cell_of(
-            &fault_under(DEFAULT, Fault::Stall, PROMISED_CUT_MS, 0),
+            &fault_under(DEFAULT, Fault::Stall, TWO_SECONDS_MS, 0),
             n,
             seeds(n),
         );
@@ -2459,7 +2539,7 @@ fn a_node_stopped_for_two_seconds_neither_dies_nor_declares() {
 /// seeds at all: `a_member_cut_off_for_up_to_two_seconds_is_not_declared_dead`.)
 #[test]
 fn without_the_last_probe_a_short_cut_ends_in_a_false_dead() {
-    let c = cut_cell(NO_PROBE, 14, PROMISED_CUT_MS, 12);
+    let c = cut_cell(NO_PROBE, 14, TWO_SECONDS_MS, 12);
     assert!(
         c.dead_after_cut >= 1,
         "no run of {} turned a reachable member DEAD",
@@ -2472,7 +2552,7 @@ fn without_the_last_probe_a_short_cut_ends_in_a_false_dead() {
     );
     assert_eq!(c.unsettled, 0, "and is then healed (issue #971)");
     // The v1.1.0 model is the same rule: a cluster of v1.1.0 nodes sees it too.
-    let c = cut_cell_of(&cut_under_mixed(DEFAULT, all_v1_1, PROMISED_CUT_MS), 14, 12);
+    let c = cut_cell_of(&cut_under_mixed(DEFAULT, all_v1_1, TWO_SECONDS_MS), 14, 12);
     assert!(
         c.dead_after_cut >= 1,
         "v1.1.0: no run of {} turned a reachable member DEAD",
@@ -2492,7 +2572,7 @@ fn without_the_last_probe_a_short_cut_ends_in_a_false_dead() {
 #[test]
 fn a_v1_1_node_still_declares_what_the_last_probe_would_have_spared() {
     let c = cut_cell_of(
-        &cut_under_mixed(DEFAULT, half_upgraded, PROMISED_CUT_MS),
+        &cut_under_mixed(DEFAULT, half_upgraded, TWO_SECONDS_MS),
         14,
         16,
     );
@@ -2505,45 +2585,40 @@ fn a_v1_1_node_still_declares_what_the_last_probe_would_have_spared() {
 }
 
 /// Cut lengths of issue #975's tables that are shorter than the suspicion window and
-/// past the last probe's bound: 2.5 s and 3 s.
+/// past the bound v1.2.0's floor kept (2098 ms on the grid): 2.5 s and 3 s.
 const SHORT_OF_THE_WINDOW_MS: [u64; 2] = [2500, 3000];
 
-/// **Known defect #975**, asserted as the issue states the correct behaviour, so it
-/// fails on main by design: a member of a formed cluster that is unreachable for LESS
+/// Issue #975 (0087-T10b): a member of a formed cluster that is unreachable for LESS
 /// than the suspicion window is not turned `Dead` by any node once it is reachable
 /// again.
 ///
 /// "The suspicion window" is `Config::suspicion_timeout_ms`, 4 s by default: how long a
 /// member is held `Suspect` before it is declared `Dead` when one node suspects it
 /// (ADR 0016 §3; the field's own doc calls it the maximum window). The window shrinks
-/// to its floor, `suspicion_min_timeout_ms` (1.5 s), only once three distinct nodes
-/// suspect the same member, and that floor is by design: ADR 0016 §3 lets independent
-/// suspicion fast-track `Dead`. What the ADRs promise for a clean cut is narrower than
-/// this test: 2 s less twice the latency in a broker, 2098 ms on the simulation's
-/// grid (ADR 0016's amendment for #1002, ADR 0087 §7 "As hardened"; pinned by
-/// `a_member_cut_off_for_up_to_two_seconds_is_not_declared_dead`). Past that the
-/// ADRs leave the bound open and give it to 0087-T10b ("What this does not change":
-/// a `Dead` a node is told about is adopted unchecked, including about a member it can
-/// reach, which is where the 3 s cells come from; and whether the window grows with
-/// the cluster).
+/// to its floor, `suspicion_min_timeout_ms`, only once three distinct nodes suspect the
+/// same member: ADR 0016 §3 lets independent suspicion fast-track `Dead`.
 ///
-/// So this asserts the WEAKEST form of what the issue says is wrong, not a bound the
-/// ADRs have decided: for cuts of 2.5 s and 3 s (both shorter than the 4 s window,
-/// both past the 2098 ms bound) at 10, 14 and 16 nodes, over the report's 32 seeds,
-/// no node turns the member `Dead` AFTER the cut has ended — when it is reachable
-/// again, by declaring it then or by adopting a `Dead` declared during the cut. A `Dead`
-/// declared during the cut by a node whose window had reached its 1.5 s floor is NOT
-/// counted here: the member really was silent then, and §3 allows it. (In every run
-/// on main that has a `Dead` at all, some node also turns the member `Dead` after the
-/// cut; so the weaker and the stronger form fail on the same seeds.) If T10b decides
-/// that the floor and an unchecked adoption stand, this test is wrong and goes with
-/// the issue; if it decides the window scales or a relayed `Dead` is checked, this is
-/// the property the fix must have.
+/// Before T10b this failed, deterministically, at 10, 14 and 16 nodes (1, 1, 3 runs of
+/// 32 with a 2.5 s cut; 3, 8, 5 with a 3 s cut), in two ways:
 ///
-/// The simulation is a pure function of `(n, seed, variant)`: on main the failing
-/// seeds are the same every run.
+/// - a `Dead` declared DURING the cut by a node whose window had reached v1.2.0's
+///   1.5 s floor — the member really was silent then — was adopted from gossip AFTER
+///   it, unchecked, by nodes that would have reached the member at once;
+/// - a last probe sent during the cut ran out just after it, and was declared: no
+///   check of finite length can tell a member that is back from one that is not when
+///   its question was asked before the member was back.
+///
+/// T10b's two rules answer one each: a relayed `Dead` is checked with a last probe of
+/// this node's own before it is adopted (`Config::check_relayed_dead`), and the floor is
+/// 2.5 s, so that no last probe is sent sooner than 3 s less twice the latency into a
+/// cut (`a_member_cut_off_for_up_to_three_seconds_is_not_declared_dead` pins the
+/// arithmetic). Over the report's 32 seeds this asserts the weaker form of the claim —
+/// no `Dead` after the cut has ended; a `Dead` during the cut would be allowed by §3 —
+/// and, for these cuts, the stronger form as well, which the arithmetic gives: no
+/// `Dead` at all.
+///
+/// The simulation is a pure function of `(n, seed, variant)`.
 #[test]
-#[ignore = "known defect #975: a member cut off for less than the 4 s suspicion window is still turned DEAD after the cut by some node at 10+ nodes"]
 fn a_member_cut_off_for_less_than_the_suspicion_window_is_not_dead_once_reachable() {
     let cfg = Config::default();
     let seeds = 32;
@@ -2551,10 +2626,10 @@ fn a_member_cut_off_for_less_than_the_suspicion_window_is_not_dead_once_reachabl
     for n in [10, 14, 16] {
         for for_ms in SHORT_OF_THE_WINDOW_MS {
             assert!(
-                last_probe_bound_ms(&cfg) < for_ms && for_ms < cfg.suspicion_timeout_ms,
-                "cut {for_ms} ms is meant to lie past the last probe's bound ({} ms) and \
+                last_probe_bound_ms(&v1_2_cfg()) < for_ms && for_ms < cfg.suspicion_timeout_ms,
+                "cut {for_ms} ms is meant to lie past the bound v1.2.0 kept ({} ms) and \
                  short of the suspicion window ({} ms)",
-                last_probe_bound_ms(&cfg),
+                last_probe_bound_ms(&v1_2_cfg()),
                 cfg.suspicion_timeout_ms,
             );
             let runs = sweep(n, seeds, &cut_under(DEFAULT, for_ms), 75_000);
@@ -2571,7 +2646,7 @@ fn a_member_cut_off_for_less_than_the_suspicion_window_is_not_dead_once_reachabl
                 .map(|(seed, _)| seed)
                 .collect();
             let longest = runs.iter().map(|o| o.longest_eviction).max().unwrap_or(0);
-            if !after.is_empty() {
+            if !after.is_empty() || !during.is_empty() {
                 failures.push(format!(
                     "N={n}, cut {for_ms} ms: {} of {seeds} runs turned the member DEAD after \
                      the cut had ended (seeds {after:?}; a DEAD during the cut in seeds \
@@ -2583,8 +2658,7 @@ fn a_member_cut_off_for_less_than_the_suspicion_window_is_not_dead_once_reachabl
     }
     assert!(
         failures.is_empty(),
-        "a member unreachable for less than the {} ms suspicion window was held DEAD \
-         once reachable again:\n  {}",
+        "a member unreachable for less than the {} ms suspicion window was turned DEAD:\n  {}",
         cfg.suspicion_timeout_ms,
         failures.join("\n  ")
     );
@@ -2676,7 +2750,7 @@ fn packet_loss_neither_keeps_a_dead_member_nor_adds_false_verdicts() {
 
 /// The part of [`fault_shapes_report`] about nodes that are LATE (issue #1002's
 /// review): a member that really died while every survivor is persistently late, and
-/// where the two-second bound ends when no tick is on a grid.
+/// where the three-second bound ends when no tick is on a grid.
 fn report_late_nodes(seeds: u64) {
     println!(
         "\na member that really died: ms until the last survivor holds it DEAD, median / \
@@ -2703,7 +2777,7 @@ fn report_late_nodes(seeds: u64) {
         "\nevery node's ticks 0-99 ms late, each time, for the whole run (no tick on a \
          grid): one member cut off"
     );
-    let cuts = [1900, 1998, 2000, 2050, 2098, 2200, 2500];
+    let cuts = [2900, 2998, 3000, 3050, 3098, 3200, 3500];
     let columns = cuts.map(|for_ms| {
         (
             format!("{for_ms}ms"),

@@ -1404,10 +1404,14 @@ mod cert_request_tests {
             "c:1",
             10,
         );
+        // a asks b before it adopts the relayed verdict (`check_relayed_dead`), and
+        // the probe is lost: b is declared dead when it runs out.
+        let dead_at = 10 + cfg().ack_timeout_ms;
+        tick(&mut a, dead_at);
         assert_eq!(a.view("b"), Some(MemberState::Dead));
         // The tombstone is pruned. (Its parting greeting to b is lost: this is UDP,
         // and the test is about what is left when it is.)
-        tick(&mut a, 10 + cfg().dead_ttl_ms);
+        tick(&mut a, dead_at + cfg().dead_ttl_ms);
         assert_eq!(a.view("b"), None, "a has pruned b");
 
         // b holds a and c alive, with their certificates; its Sync replies are lost.

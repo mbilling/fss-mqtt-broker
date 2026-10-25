@@ -274,7 +274,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 420 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 428 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -575,8 +575,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `swim::tests::a_fully_removed_member_is_readmitted_on_direct_contact_and_a_refutation_sticks`
 - `swim::tests::a_gracefully_left_node_is_readmitted_when_it_restarts`
 - `swim::tests::a_greeting_carries_only_our_own_claim_and_leaves_the_gossip_queue_alone`
+- `swim::tests::a_leave_an_unknown_member_and_the_1_2_rule_adopt_a_dead_at_once`
 - `swim::tests::a_leaving_node_does_not_refute_its_own_dead`
 - `swim::tests::a_member_pruned_without_a_greeting_is_confirmed_gone_at_the_prune`
+- `swim::tests::a_member_that_acks_a_relayed_dead_without_refuting_is_kept_and_asked`
 - `swim::tests::a_members_new_life_is_reported_to_the_driver_exactly_once`
 - `swim::tests::a_new_generation_confirms_the_old_one_gone_before_its_own_state_change`
 - `swim::tests::a_node_advertises_its_own_domain_on_outgoing_gossip`
@@ -591,6 +593,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `swim::tests::a_receiver_learns_a_peers_gossiped_failure_domain`
 - `swim::tests::a_reflected_datagram_from_ourselves_is_ignored`
 - `swim::tests::a_relay_poisoned_record_heals_on_first_direct_contact`
+- `swim::tests::a_relayed_dead_about_a_member_that_answers_is_not_adopted`
+- `swim::tests::a_relayed_dead_about_a_silent_member_is_adopted_when_its_probe_runs_out`
+- `swim::tests::a_relayed_dead_about_a_suspect_is_checked_by_one_probe`
+- `swim::tests::a_relayed_dead_at_a_higher_incarnation_is_checked_and_declared_at_it`
+- `swim::tests::a_relayed_dead_refuted_while_it_is_checked_is_dropped`
 - `swim::tests::a_restarted_node_is_not_re_killed_by_its_previous_lifes_dead_claim`
 - `swim::tests::a_run_of_unanswered_probe_rounds_marks_the_node_isolated_while_gossip_keeps_the_view_fresh`
 - `swim::tests::a_single_ack_of_our_probe_clears_isolation`
@@ -611,6 +618,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `swim::tests::awareness_is_capped_at_awareness_max`
 - `swim::tests::awareness_rises_on_self_refutation_and_decays_on_a_clean_probe`
 - `swim::tests::awareness_scales_the_suspicion_timeout`
+- `swim::tests::by_default_a_relayed_dead_is_checked_and_the_floor_is_two_and_a_half_seconds`
 - `swim::tests::by_default_a_suspect_is_asked_before_it_is_declared_dead`
 - `swim::tests::claims_about_a_previous_life_are_ignored_whatever_they_say`
 - `swim::tests::dead_members_are_not_probed`
@@ -726,8 +734,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `a_cluster_part_way_through_the_upgrade_from_v1_1_forms`
 - `a_formation_run_is_reproducible_from_its_seed`
-- `a_member_cut_off_for_less_than_the_suspicion_window_is_not_dead_once_reachable` — `#[ignore]`d
-- `a_member_cut_off_for_up_to_two_seconds_is_not_declared_dead`
+- `a_member_cut_off_for_less_than_the_suspicion_window_is_not_dead_once_reachable`
+- `a_member_cut_off_for_up_to_three_seconds_is_not_declared_dead`
 - `a_member_falsely_declared_dead_is_readmitted_within_the_tombstone_ttl`
 - `a_member_that_cannot_complete_a_round_trip_is_declared_dead_as_before`
 - `a_node_stopped_for_two_seconds_neither_dies_nor_declares`
@@ -741,7 +749,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `one_link_lost_one_way_raises_no_verdict`
 - `packet_loss_neither_keeps_a_dead_member_nor_adds_false_verdicts`
 - `the_v1_1_rules_reproduce_the_formation_storm_and_preshared_certificates_remove_it`
-- `with_ticks_on_no_grid_a_cut_of_two_seconds_less_twice_the_latency_ends_in_no_dead`
+- `with_ticks_on_no_grid_a_cut_of_three_seconds_less_twice_the_latency_ends_in_no_dead`
 - `without_the_last_probe_a_short_cut_ends_in_a_false_dead`
 
 ## `crates/mqtt-cluster/tests/swim_sim.rs` — 6 test(s)
