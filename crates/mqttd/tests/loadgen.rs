@@ -142,6 +142,25 @@ async fn qos1_durable_share_run_closes_its_ledger() {
     assert_eq!(e2e, l.received);
     assert!(s.totals.ack_latency.p50_us > 0);
     assert!(s.windows.iter().filter(|w| w.agg.sent > 0).count() >= 3);
+    // Schema v2: the measured span's histograms travel as buckets (for merging across
+    // generator processes), and the schedule start is stamped on the wall clock.
+    let buckets = |h: &Option<mqtt_load::hist::HistogramExport>| -> u64 {
+        h.as_ref()
+            .expect("totals carry buckets")
+            .buckets
+            .iter()
+            .map(|[_, c]| c)
+            .sum()
+    };
+    assert_eq!(buckets(&s.totals.ack_histogram), s.totals.ack_latency.count);
+    assert_eq!(buckets(&s.totals.e2e_histogram), s.totals.e2e_latency.count);
+    assert_eq!(
+        buckets(&s.phases[0].agg.ack_histogram),
+        s.phases[0].agg.ack_latency.count
+    );
+    assert!(s.windows.iter().all(|w| w.agg.ack_histogram.is_none()));
+    assert!(s.schedule_start_unix_ms >= s.started_unix_ms);
+    assert_eq!(s.schema, "mqtt-load.summary.v2");
 }
 
 /// Clean-session `QoS` 0 fan-out: no acks to count, every subscriber gets every message.

@@ -1,4 +1,4 @@
-//! The final JSON summary — schema `mqtt-load.summary.v1`, documented in
+//! The final JSON summary — schema `mqtt-load.summary.v2`, documented in
 //! `crates/mqtt-load/README.md`. Fields are only ever added within a schema version;
 //! a removal or a change of meaning bumps the version.
 
@@ -6,11 +6,16 @@ use serde::Serialize;
 
 use crate::config::{Sessions, Shape, Thresholds};
 use crate::ctx::ErrorCounts;
-use crate::hist::LatencySummary;
+use crate::hist::{HistogramExport, LatencySummary};
 use crate::ledger::LedgerReport;
 
 /// The schema identifier.
-pub const SCHEMA: &str = "mqtt-load.summary.v1";
+///
+/// v2 (2026-10-26) added `schedule_start_unix_ms` and the bucket exports
+/// `ack_histogram` / `e2e_histogram` on phases and totals, so that a rig running several
+/// generator processes can merge their latency histograms exactly. Every v1 field is
+/// unchanged.
+pub const SCHEMA: &str = "mqtt-load.summary.v2";
 
 /// The whole run.
 #[derive(Debug, Clone, Serialize)]
@@ -24,6 +29,10 @@ pub struct Summary {
     /// Wall-clock start, Unix ms (for correlation with broker metrics only; no figure
     /// in this summary is computed from wall-clock time).
     pub started_unix_ms: u64,
+    /// Wall-clock time the schedule started (offset 0 of every window's `start_s`),
+    /// Unix ms: `started_unix_ms` plus the process clock's reading from then to the
+    /// schedule start. For lining windows up with broker scrapes only.
+    pub schedule_start_unix_ms: u64,
     /// The workload as run.
     pub workload: Workload,
     /// What was connected.
@@ -177,6 +186,12 @@ pub struct Aggregate {
     pub sched_lag: LatencySummary,
     /// Due → written, every send (includes waiting for credit or the socket).
     pub send_delay: LatencySummary,
+    /// The ack-latency histogram's buckets (phases and totals only; absent on windows).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ack_histogram: Option<HistogramExport>,
+    /// The end-to-end-latency histogram's buckets (phases and totals only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub e2e_histogram: Option<HistogramExport>,
 }
 
 /// One window.

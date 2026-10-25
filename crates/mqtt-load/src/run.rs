@@ -106,7 +106,7 @@ fn plan(cfg: &Config, sched: &Schedule) -> Vec<PlannedWindow> {
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn aggregate(dur_ns: u64, offered: u64, c: &Counters, h: &Histos) -> Aggregate {
+fn aggregate(dur_ns: u64, offered: u64, c: &Counters, h: &Histos, buckets: bool) -> Aggregate {
     let secs = dur_ns as f64 / NS;
     let rate = |n: u64| {
         if secs > 0.0 {
@@ -129,6 +129,8 @@ fn aggregate(dur_ns: u64, offered: u64, c: &Counters, h: &Histos) -> Aggregate {
         e2e_latency: h.e2e.summary(),
         sched_lag: h.sched_lag.summary(),
         send_delay: h.send_delay.summary(),
+        ack_histogram: buckets.then(|| h.ack.export()),
+        e2e_histogram: buckets.then(|| h.e2e.export()),
     }
 }
 
@@ -281,6 +283,7 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
     clock::init();
     cfg.validate().map_err(RunError::Config)?;
     let run = run_id();
+    let started_ns = now_ns();
     let started_unix_ms = u64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -544,7 +547,7 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
             start_s: rel(pw.start),
             end_s: rel(pw.end),
             target_rate: target,
-            agg: aggregate(dur, offered, &delta, cur),
+            agg: aggregate(dur, offered, &delta, cur, false),
             health,
         };
         if col.ctx.cfg.progress {
@@ -651,6 +654,7 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
                 phase_counts[j].1,
                 &phase_counts[j].2,
                 &phase_hist[j],
+                true,
             ),
             saturated: phase_saturated[j],
         })
@@ -696,6 +700,7 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
         },
         run_id: format!("{run:08x}"),
         started_unix_ms,
+        schedule_start_unix_ms: started_unix_ms + start.saturating_sub(started_ns) / 1_000_000,
         workload: Workload {
             phases: cfg
                 .phases
@@ -738,7 +743,7 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
         },
         windows,
         phases,
-        totals: aggregate(tot_d, tot_o, &tot_c, &tot_h),
+        totals: aggregate(tot_d, tot_o, &tot_c, &tot_h, true),
         drain: DrainReport {
             duration_s: (drain_end.saturating_sub(drain_start)) as f64 / NS,
             ended_by,

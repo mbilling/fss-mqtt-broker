@@ -4,7 +4,10 @@ use hdrhistogram::Histogram;
 use serde::Serialize;
 
 /// The largest recordable latency, µs (ten minutes). Larger values saturate here.
-const MAX_US: u64 = 600_000_000;
+pub const MAX_US: u64 = 600_000_000;
+
+/// Significant figures every [`Latency`] keeps.
+pub const SIGFIG: u8 = 3;
 
 /// A latency histogram in microseconds.
 #[derive(Debug, Clone)]
@@ -29,6 +32,25 @@ pub struct LatencySummary {
     pub max_us: u64,
 }
 
+/// A histogram's recorded buckets, so that histograms from several generator processes
+/// can be merged exactly outside the process (schema `mqtt-load.summary.v2`).
+///
+/// Every [`Latency`] has the same bounds and precision, so two exports merge by adding
+/// the counts of equal `value_us`. A quantile of the merge is the first bucket whose
+/// cumulative count reaches `ceil(q * total)` — what `hdrhistogram` itself reports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HistogramExport {
+    /// Always `us`.
+    pub unit: &'static str,
+    /// [`SIGFIG`].
+    pub significant_figures: u8,
+    /// [`MAX_US`]; larger samples were recorded here.
+    pub highest_trackable_us: u64,
+    /// `[value_us, count]` for every bucket with samples, ascending. `value_us` is the
+    /// highest value equivalent to the bucket, the figure a percentile reports.
+    pub buckets: Vec<[u64; 2]>,
+}
+
 impl Default for Latency {
     fn default() -> Self {
         Self::new()
@@ -42,7 +64,7 @@ impl Latency {
     /// Never: the bounds are constants hdrhistogram accepts.
     #[must_use]
     pub fn new() -> Self {
-        Self(Histogram::new_with_bounds(1, MAX_US, 3).expect("valid histogram bounds"))
+        Self(Histogram::new_with_bounds(1, MAX_US, SIGFIG).expect("valid histogram bounds"))
     }
 
     /// Record a latency given in nanoseconds (rounded to the nearest µs).
@@ -93,6 +115,31 @@ impl Latency {
         self.0.mean() * self.0.len() as f64
     }
 
+    /// Every recorded bucket, for merging outside the process.
+    #[must_use]
+    pub fn export(&self) -> HistogramExport {
+        HistogramExport {
+            unit: "us",
+            significant_figures: SIGFIG,
+            highest_trackable_us: MAX_US,
+            buckets: self
+                .0
+                .iter_recorded()
+                .map(|v| [v.value_iterated_to(), v.count_at_value()])
+                .collect(),
+        }
+    }
+
+    /// Rebuild a histogram from an export (the inverse of [`Latency::export`]).
+    #[must_use]
+    pub fn from_export(e: &HistogramExport) -> Self {
+        let mut h = Self::new();
+        for [v, c] in &e.buckets {
+            h.0.saturating_record_n(*v, *c);
+        }
+        h
+    }
+
     /// Summary statistics.
     #[must_use]
     pub fn summary(&self) -> LatencySummary {
@@ -130,6 +177,36 @@ mod tests {
         assert!(near(s.p999_us, 999_000), "{s:?}");
         assert!(near(s.max_us, 1_000_000), "{s:?}");
         assert!((s.mean_us - 500_500.0).abs() < 600.0, "{s:?}");
+    }
+
+    #[test]
+    fn export_round_trips_and_merges_by_bucket() {
+        let mut a = Latency::new();
+        let mut b = Latency::new();
+        for i in 1..=5000u64 {
+            a.record_ns(i * 7_919_000 % 3_000_000_000);
+            b.record_ns(i * 104_729 % 40_000_000);
+        }
+        a.record_ns(u64::MAX);
+        let ea = a.export();
+        assert_eq!(ea.unit, "us");
+        assert_eq!(ea.buckets.iter().map(|[_, c]| c).sum::<u64>(), a.count());
+        assert!(ea.buckets.windows(2).all(|w| w[0][0] < w[1][0]));
+        // Lossless: the rebuilt histogram reports exactly the same figures.
+        assert_eq!(Latency::from_export(&ea).summary(), a.summary());
+        // Merging exports bucket-wise is merging the histograms.
+        let mut merged = std::collections::BTreeMap::<u64, u64>::new();
+        for [v, c] in ea.buckets.iter().chain(b.export().buckets.iter()) {
+            *merged.entry(*v).or_default() += c;
+        }
+        let me = HistogramExport {
+            buckets: merged.into_iter().map(|(v, c)| [v, c]).collect(),
+            ..ea.clone()
+        };
+        let mut ab = a.clone();
+        ab.add(&b);
+        assert_eq!(Latency::from_export(&me).summary(), ab.summary());
+        assert_eq!(me, ab.export());
     }
 
     #[test]

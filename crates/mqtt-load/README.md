@@ -181,15 +181,20 @@ All series are prefixed `mqload_`:
 The text is re-rendered once a second by the collector, so a scrape never touches the
 measurement path.
 
-## JSON summary: schema `mqtt-load.summary.v1`
+## JSON summary: schema `mqtt-load.summary.v2`
 
 Fields are only added within a version. A removal or a change of meaning bumps the version.
+v2 adds `schedule_start_unix_ms` and the histogram bucket exports (`ack_histogram`,
+`e2e_histogram`) on phases and totals; every v1 field is unchanged.
 
 ```text
-schema            "mqtt-load.summary.v1"
+schema            "mqtt-load.summary.v2"
 tool              {name, version}
 run_id            hex string; also in every payload and in the default client ids
 started_unix_ms   wall clock, only for correlating with broker metrics
+schedule_start_unix_ms
+                  wall clock at the schedule's start (offset 0 of every start_s/end_s),
+                  only for lining windows up with broker scrapes
 workload          {phases: [{rate, warmup_s, measure_s}], window_s, publishers, inflight,
                    qos, payload_bytes, topics, topic_prefix, shape, consumers, groups,
                    sessions, session_expiry_s, deliveries_per_message, brokers}
@@ -210,8 +215,11 @@ outcome           ok | loss | void | error
 
 <aggregate> = {duration_s, offered, sent, acked, received,
                offered_rate, sent_rate, acked_rate, received_rate,
-               ack_latency, e2e_latency, sched_lag, send_delay}
+               ack_latency, e2e_latency, sched_lag, send_delay,
+               ack_histogram, e2e_histogram}   (the two histograms: phases and totals only)
 latency     = {count, mean_us, p50_us, p90_us, p99_us, p999_us, max_us}
+histogram   = {unit: "us", significant_figures: 3, highest_trackable_us,
+               buckets: [[value_us, count], ...]}   ascending, recorded buckets only
 health      = {cpu_cores, cpu_fraction, busiest_worker (null off Linux),
                credit_stall_fraction, socket_blocked, socket_blocked_fraction,
                backlog, saturated, reasons[]: cpu|worker_thread|sched_lag}
@@ -226,6 +234,12 @@ Notes on the fields:
   was written in, an ack or a delivery to the window it was read in. Collection runs on a
   1 s tick, so a window's edges are accurate to a few milliseconds.
 - `ledger` covers the whole run, warm-up and drain included.
+- **Merging histograms.** Every histogram has the same bounds and precision, and
+  `value_us` is the highest value equivalent to its bucket. Histograms from several
+  generator processes therefore merge exactly by adding the counts of equal `value_us`.
+  A quantile `q` of the merge is the `value_us` of the first bucket at which the
+  cumulative count reaches `max(1, ceil(q * total))`, which is what `hdrhistogram`
+  reports for `*_latency.p99_us` and the like. `bench/scale/rig2/verdict.py` does this.
 
 ## Measured on a developer machine
 
