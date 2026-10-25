@@ -454,6 +454,8 @@ jobs:
       # read below it.
       - name: The scale-out chart never draws an uncertified rung as a certified one
         run: python3 bench/scale/chart-scale-out.py --self-test
+      - name: The README's evidence charts draw every bar from headline.csv in its tier
+        run: python3 bench/scale/chart-readme.py --self-test
 
   interop:
     name: foreign-client interop (mosquitto + paho)
