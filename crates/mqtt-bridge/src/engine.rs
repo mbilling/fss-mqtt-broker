@@ -9,7 +9,7 @@
 //! and this layer is just plumbing.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -23,13 +23,89 @@ use crate::client::{Command, ConnectOptions, MqttClient, Transport};
 use crate::config::{BridgeConfig, Endpoint, HaMode};
 use crate::forward::{owns, plan_forwards, read_hop_count, set_hop_count, Side};
 use crate::metrics::{BridgeMetrics, CrossDirection};
-use crate::spool::{Overflow, Spool, SpooledMessage};
+use crate::spool::{Overflow, Spool, SpoolError, SpooledMessage};
 
 /// A fixed keepalive (seconds) for every bridge connection; the client pings at half this.
 const KEEP_ALIVE: u16 = 30;
 /// Reconnect backoff bounds.
 const BACKOFF_START: Duration = Duration::from_millis(200);
 const BACKOFF_MAX: Duration = Duration::from_secs(10);
+
+/// One side's handoff between the live path and its spool (issue #1100).
+///
+/// The router decides, per forward, whether the destination is up (send it live) or down
+/// (spool it). The supervisor flips that answer when the side connects (drain the spool,
+/// queue the replay, open the live path) and when it disconnects. Both run under `gate`, so a
+/// forward is decided either wholly before a connect handoff (it is spooled and then drained
+/// with the rest) or wholly after it (it goes live, behind the replay on the same channel).
+///
+/// Without the gate a router could read "down", lose the CPU while the supervisor drained,
+/// then push into the just-emptied spool: the message sat there until the next reconnect,
+/// already acknowledged to its source.
+///
+/// `gate` is a `std` mutex and is never held across an `.await`: everything done under it is
+/// synchronous (a spool push or drain, and sends on an unbounded channel).
+#[derive(Debug)]
+struct Handoff {
+    gate: Mutex<()>,
+    /// Whether the side's connection is up. Written only under `gate`; the metrics read it
+    /// without the gate (a gauge needs no ordering against the router).
+    connected: Arc<AtomicBool>,
+    spool: Arc<Spool>,
+}
+
+impl Handoff {
+    fn new(spool: Arc<Spool>) -> Self {
+        Self {
+            gate: Mutex::new(()),
+            connected: Arc::new(AtomicBool::new(false)),
+            spool,
+        }
+    }
+
+    /// The side just connected: replay everything spooled while it was down onto its
+    /// command channel, oldest first, and only then open the live path, all under the gate.
+    /// A forward waiting on the gate therefore lands after the replay, never in the spool.
+    fn open(&self, self_tx: &mpsc::UnboundedSender<Command>, side: Side) {
+        let _gate = self.gate.lock().unwrap_or_else(PoisonError::into_inner);
+        replay_spool(&self.spool, self_tx, side);
+        self.connected.store(true, Ordering::SeqCst);
+    }
+
+    /// The side's connection ended: from here on, forwards to it are spooled.
+    ///
+    /// A forward sent live before this point is already on the side's command channel,
+    /// which outlives the connection, so the next connection writes it ahead of its
+    /// subscribes and its replay.
+    fn close(&self) {
+        let _gate = self.gate.lock().unwrap_or_else(PoisonError::into_inner);
+        self.connected.store(false, Ordering::SeqCst);
+    }
+
+    /// Route one forward `msg`: as `live(msg)` onto the side's channel when it is up, else
+    /// as `spooled(msg)` into its spool. Only the chosen conversion runs.
+    ///
+    /// # Errors
+    /// The spool's refusal (full under [`Overflow::Refuse`]) or disk failure: the message was
+    /// **not** accepted, so the caller withholds the source ack (ADR 0060 T2).
+    fn forward<M>(
+        &self,
+        tx: &mpsc::UnboundedSender<Command>,
+        msg: M,
+        live: impl FnOnce(M) -> Command,
+        spooled: impl FnOnce(M) -> SpooledMessage,
+    ) -> Result<(), SpoolError> {
+        let _gate = self.gate.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.connected.load(Ordering::SeqCst) {
+            // Fast path: the destination is up — the run loop assigns the packet id.
+            let _ = tx.send(live(msg));
+            Ok(())
+        } else {
+            // The destination is down: spool it (bounded) for replay on reconnect (§7).
+            self.spool.push(&spooled(msg))
+        }
+    }
+}
 
 /// A running bridge. Dropping it (or calling [`Bridge::shutdown`]) stops every connection.
 #[derive(Debug)]
@@ -64,16 +140,14 @@ impl Bridge {
         // One inbound channel into the router, tagged with the originating side.
         let (in_tx, in_rx) = mpsc::unbounded_channel::<(Side, Publish)>();
 
-        // Per-side store-and-forward spool + a connected flag the router consults: a forward
-        // to a connected side goes straight to its channel; a forward to a disconnected side
-        // is spooled (bounded) and replayed when the supervisor reconnects (§7).
-        let mut spools = Vec::with_capacity(n_sides);
-        let mut connected = Vec::with_capacity(n_sides);
-        spools.push(build_spool(&cfg, Side::Local));
-        connected.push(Arc::new(AtomicBool::new(false)));
+        // Per-side store-and-forward spool + a connected flag, behind one handoff gate the
+        // router and the supervisor share: a forward to a connected side goes straight to its
+        // channel; a forward to a disconnected side is spooled (bounded) and replayed when the
+        // supervisor reconnects (§7, #1100).
+        let mut handoffs = Vec::with_capacity(n_sides);
+        handoffs.push(Arc::new(Handoff::new(build_spool(&cfg, Side::Local))));
         for i in 0..cfg.upstreams.len() {
-            spools.push(build_spool(&cfg, Side::Upstream(i)));
-            connected.push(Arc::new(AtomicBool::new(false)));
+            handoffs.push(Arc::new(Handoff::new(build_spool(&cfg, Side::Upstream(i)))));
         }
 
         let mut tasks = Vec::new();
@@ -86,8 +160,7 @@ impl Bridge {
             cmd_tx[0].clone(),
             in_tx.clone(),
             metrics.clone(),
-            spools[0].clone(),
-            connected[0].clone(),
+            handoffs[0].clone(),
         ));
         // Upstream supervisors. `cmd_rx.remove(0)` keeps popping the front as sides advance.
         for i in 0..cfg.upstreams.len() {
@@ -98,8 +171,7 @@ impl Bridge {
                 cmd_tx[i + 1].clone(),
                 in_tx.clone(),
                 metrics.clone(),
-                spools[i + 1].clone(),
-                connected[i + 1].clone(),
+                handoffs[i + 1].clone(),
             ));
         }
 
@@ -111,16 +183,13 @@ impl Bridge {
         for u in &cfg.upstreams {
             side_names.push(u.name.clone());
         }
-        metrics.register_sides(side_names, connected.clone(), spools.clone());
+        metrics.register_sides(
+            side_names,
+            handoffs.iter().map(|h| h.connected.clone()).collect(),
+            handoffs.iter().map(|h| h.spool.clone()).collect(),
+        );
 
-        tasks.push(spawn_router(
-            cfg,
-            cmd_tx,
-            in_rx,
-            metrics.clone(),
-            spools,
-            connected,
-        ));
+        tasks.push(spawn_router(cfg, cmd_tx, in_rx, metrics.clone(), handoffs));
         Self { tasks, metrics }
     }
 
@@ -139,7 +208,6 @@ impl Bridge {
 }
 
 /// The per-side connection supervisor: (re)connect, subscribe, pump, backoff.
-#[allow(clippy::too_many_arguments)] // a supervisor wires together one side's channels + state
 fn spawn_supervisor(
     side: Side,
     cfg: Arc<BridgeConfig>,
@@ -147,8 +215,7 @@ fn spawn_supervisor(
     self_tx: mpsc::UnboundedSender<Command>,
     inbound_central: mpsc::UnboundedSender<(Side, Publish)>,
     metrics: Arc<BridgeMetrics>,
-    spool: Arc<Spool>,
-    connected: Arc<AtomicBool>,
+    handoff: Arc<Handoff>,
 ) -> JoinHandle<()> {
     // Tag each inbound PUBLISH with this side before it reaches the router.
     let (in_tx, mut in_rx) = mpsc::unbounded_channel::<Publish>();
@@ -195,11 +262,11 @@ fn spawn_supervisor(
                         pkid = pkid.wrapping_add(1).max(1);
                     }
                     // Replay anything spooled while this side was down (§7), oldest first,
-                    // before opening the live fast path so order is preserved.
-                    replay_spool(&spool, &self_tx, side);
-                    connected.store(true, Ordering::SeqCst);
+                    // before opening the live fast path so order is preserved — atomically
+                    // with the router's live-or-spool decision (#1100).
+                    handoff.open(&self_tx, side);
                     let err = client.run(&mut commands, &in_tx, KEEP_ALIVE).await;
-                    connected.store(false, Ordering::SeqCst);
+                    handoff.close();
                     warn!(?side, error = %err, "bridge side disconnected; reconnecting");
                 }
                 Err(e) => warn!(?side, addr = %opts.addr, error = %e, "bridge connect failed"),
@@ -215,8 +282,7 @@ fn spawn_router(
     cmd_tx: Vec<mpsc::UnboundedSender<Command>>,
     mut inbound: mpsc::UnboundedReceiver<(Side, Publish)>,
     metrics: Arc<BridgeMetrics>,
-    spools: Vec<Arc<Spool>>,
-    connected: Vec<Arc<AtomicBool>>,
+    handoffs: Vec<Arc<Handoff>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some((side, publish)) = inbound.recv().await {
@@ -260,41 +326,39 @@ fn spawn_router(
                 let properties = set_hop_count(&publish.properties, hop + 1);
                 // Preserve the source retain bit unless the rule opts out (issue #189).
                 let retain = publish.retain && f.retain_ok;
-                if connected[idx].load(Ordering::SeqCst) {
-                    // Fast path: the destination is up — the run loop assigns the packet id.
-                    let _ = cmd_tx[idx].send(Command::Publish {
-                        topic: f.topic,
-                        payload: publish.payload.clone(),
-                        qos: qos_from_u8(f.qos),
-                        retain,
-                        pkid: None,
-                        properties,
-                    });
-                } else {
-                    // The destination is down: spool it (bounded) for replay on reconnect (§7).
+                let qos = f.qos;
+                let live = |(topic, properties)| Command::Publish {
+                    topic,
+                    payload: publish.payload.clone(),
+                    qos: qos_from_u8(qos),
+                    retain,
+                    pkid: None,
+                    properties,
+                };
+                let spooled = |(topic, properties): (String, mqtt_codec::Properties)| {
                     let user_properties = properties
                         .0
-                        .iter()
+                        .into_iter()
                         .filter_map(|p| match p {
-                            mqtt_codec::Property::UserProperty(k, v) => {
-                                Some((k.clone(), v.clone()))
-                            }
+                            mqtt_codec::Property::UserProperty(k, v) => Some((k, v)),
                             _ => None,
                         })
                         .collect();
-                    let spooled = SpooledMessage {
-                        topic: f.topic,
+                    SpooledMessage {
+                        topic,
                         payload: publish.payload.to_vec(),
-                        qos: f.qos,
+                        qos,
                         retain,
                         user_properties,
-                    };
-                    if let Err(e) = spools[idx].push(&spooled) {
-                        // Not durably accepted: withhold the source ack (ADR 0060 T2) so the
-                        // source redelivers, rather than acking a message we just lost.
-                        warn!(dest = idx, error = %e, "failed to spool a message for a down side");
-                        durably_accepted = false;
                     }
+                };
+                if let Err(e) =
+                    handoffs[idx].forward(&cmd_tx[idx], (f.topic, properties), live, spooled)
+                {
+                    // Not durably accepted: withhold the source ack (ADR 0060 T2) so the
+                    // source redelivers, rather than acking a message we just lost.
+                    warn!(dest = idx, error = %e, "failed to spool a message for a down side");
+                    durably_accepted = false;
                 }
             }
             // Acknowledge the source only now. A message with no matching rule (or one dropped

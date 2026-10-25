@@ -1478,7 +1478,7 @@ async fn a_remap_ping_pong_within_one_bridge_is_stopped_by_no_local() {
 }
 
 /// Issue #1100, the real mechanism: a message the router forwards toward a side **while
-/// that side is connecting** can be stranded in the side's spool for as long as the
+/// that side is connecting** could be stranded in the side's spool for as long as the
 /// connection then stays up. The supervisor connects, drains the spool (`replay_spool`),
 /// and only then sets the side's `connected` flag; the router reads that flag and, on
 /// `false`, pushes into the same spool. A router that read `false` before the flag was set
@@ -1510,8 +1510,11 @@ async fn a_remap_ping_pong_within_one_bridge_is_stopped_by_no_local() {
 /// is connected and the stream has stopped, its spool empties. A message accepted for a
 /// connected side is either sent or still sent later; it never waits for a reconnect
 /// that may not come.
+///
+/// The fix puts the router's live-or-spool decision and the supervisor's connect handoff
+/// (drain, queue the replay, set the flag) under one per-side lock (`Handoff` in
+/// `engine.rs`), so a forward lands wholly before the drain or wholly after the flag.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "known defect #1100: a forward that races the local side's connect is stranded in its spool until the next reconnect"]
 async fn a_message_spooled_while_its_side_connects_is_not_stranded_in_the_spool() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
