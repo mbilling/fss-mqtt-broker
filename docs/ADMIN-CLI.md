@@ -15,6 +15,7 @@ broker does — including the distroless container image, which has no shell and
 kubectl exec mqttd-0 -- mqttd --admin cluster
 ```
 
+- [At a glance](#at-a-glance)
 - [Before you start](#before-you-start)
 - [Connecting](#connecting)
 - [Output and exit codes](#output-and-exit-codes)
@@ -27,6 +28,31 @@ kubectl exec mqttd-0 -- mqttd --admin cluster
 - [Recipes](#recipes)
 - [Other `mqttd` commands for operators](#other-mqttd-commands-for-operators)
 - [Try it without a deployment](#try-it-without-a-deployment)
+
+## At a glance
+
+The README's Admin API & CLI section until 2026-10-25:
+
+An authenticated admin API — its own mTLS listener, `viewer` and `operator` roles, every
+request audited — answers what metrics cannot, and `mqttd --admin` drives it from the same
+binary (so it works in the distroless image). Off until `admin.bind` is set. It writes no
+configuration, except the rules file for a subject listed in `[rules] admin_writers` (empty,
+so off, by default; ADR 0084).
+
+```sh
+mqttd --admin cluster                        # every node, from any node: ready, version, lag, agreement
+mqttd --admin clients --prefix sensor-       # who is connected, from where
+mqttd --admin session sensor-7               # subscriptions, in flight, backlog, owner
+mqttd --admin authz device-7 publish plant/7/temp   # allowed? which ACL rule decided?
+mqttd --admin reload                         # re-read the config file; says what changed or why not
+mqttd --admin kick sensor-7                  # operator: disconnect (MQTT 5 reason 0x98), from any node
+mqttd --admin cordon                         # operator: stop new connections without draining
+mqttd --admin rules                          # every rule on this node: counts, last error
+```
+
+Try it on a local three-node cluster: `scripts/admin-e2e.sh up`. Reference:
+[this page](#verbs) (every command) · [ADMIN-API.md](ADMIN-API.md) (every
+endpoint, roles, errors).
 
 ## Before you start
 

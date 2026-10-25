@@ -9,6 +9,39 @@ Human workflow is [CONTRIBUTING.md](../CONTRIBUTING.md). Agent sessions also
 read [CONTRIBUTING-agent.md](CONTRIBUTING-agent.md). Live task status is the
 [delivery dashboard](delivery/STATUS.md).
 
+## The picture
+
+The README's Architecture section until 2026-10-25: one node, the mesh, the durable plane.
+
+```text
+        MQTT clients  (TCP · TLS 1.3 · WebSocket · QUIC)
+              │  identity: mTLS-CN / password / JWT / OIDC
+              ▼        ↓ deny-by-default topic ACL
+       ┌──────────────────────────────────────────┐
+       │  node                                    │
+       │   listeners → per-connection tasks       │
+       │                    ▼                     │
+       │            hub (routing actor)           │   one hub per node;
+       │        subscriptions · retained · queues │   no lock on the hot path
+       └────────────────────┼─────────────────────┘
+   ┌────────────────────────┼────────────────────────┐
+   │ SWIM gossip            │ peer links (mTLS)      │  one trust domain =
+   │ membership, interest   │ interest-based forward │  one logical broker
+   └────────────────────────┼────────────────────────┘
+                            ▼
+              durable plane — openraft lease group
+              epoch-fenced quorum replication
+```
+
+- shared-nothing nodes; one routing actor per node; cross-node traffic is just another command
+- durable write **before** the wire send → "acked" means "replicated"; clean sessions and QoS 0 skip it
+- consensus for control (epochs, ownership), small replica sets for data
+- refuse at the edge: reason code or backpressure, never a silent drop
+- bridge is a separate process and failure domain
+- decisions: [`docs/adr/`](adr/) (89 ADRs, per-task status) · tour: this page · [THREAT-MODEL.md](THREAT-MODEL.md)
+
+The crates are in [Workspace crates](#workspace-crates) below.
+
 ## What process owns what
 
 `mqttd` is a thin binary over the `mqttd` library. The binary loads
@@ -33,17 +66,19 @@ source feeding the same hub ([ADR 0001](adr/0001-session-durability.md)).
 | Crate | Owns |
 |---|---|
 | `mqtt-codec` | MQTT 3.1.1 + 5.0 wire encode/decode. Fuzzed. |
-| `mqtt-core` | Subscription tables (plain + shared), topic matching, message types. |
-| `mqtt-net` | Listeners (TCP/TLS/WebSocket/QUIC), connection lifecycle. |
-| `mqtt-auth` | `Authenticator` / `Authorizer` traits and built-in providers. |
-| `mqtt-storage` | `SessionStore` / `RetainedStore` and the replicated log. |
-| `mqtt-cluster` | SWIM, peer frames, placement, durable plane. |
+| `mqtt-core` | Sessions, subscription tables (plain + shared), topic matching, ACL relations, message types. |
+| `mqtt-net` | Listeners (TCP/TLS/WebSocket/QUIC), connection lifecycle; the one audited TLS module. |
+| `mqtt-auth` | `Authenticator` / `Authorizer` traits and built-in providers: mTLS-CN, Argon2id, JWT, OIDC, ACL. |
+| `mqtt-storage` | `SessionStore` / `RetainedStore`, the replicated log, redb. |
+| `mqtt-cluster` | SWIM, gossip auth, HRW placement, peer frames (the peer wire), durable plane. |
 | `mqtt-observability` | Prometheus/OTLP metrics, hash-chained audit. |
-| `mqtt-config` | Typed config; `ENV_VARS` is the overlay inventory. |
-| `mqtt-rules` | The rule engine: EMQX rule SQL parser, evaluator, functions, templates, actions; `edit` changes one rule of a rules file's text in place (ADR 0084). Pure (no I/O, no broker state). Fuzzed (ADR 0083). |
-| `mqttd` | Binary + hub + conn — this page. |
-| `mqtt-bridge` | Zone-crossing MQTT client (not a cluster member). |
-| `mqttd-operator` | `MqttdCluster` reconciler. |
+| `mqtt-config` | Typed config, secure defaults; `ENV_VARS` is the overlay inventory. |
+| `mqtt-rules` | The rule engine: EMQX rule SQL parser, evaluator, functions, templates, actions (republish/console); `edit` changes one rule of a rules file's text in place (ADR 0084). Pure (no I/O, no broker state). Fuzzed (ADR 0083). |
+| `mqtt-wasm-sandbox` | ADR 0086: rule functions as WebAssembly modules in a sandbox (wasmtime); runs the rule engine's `jq`, the real jq, where `rules.jq` switches it on. |
+| `mqttd` | Binary + hub + conn + peer mesh — this page. |
+| `mqtt-bridge` | Zone-crossing MQTT client (not a cluster member): spool, QoS 1 replay. |
+| `mqttd-operator` | `MqttdCluster` reconciler: the Kubernetes operator. |
+| `history-check` | Independent checker of recorded client-visible histories. |
 
 ## `mqttd` library modules (`crates/mqttd/src/lib.rs`)
 
