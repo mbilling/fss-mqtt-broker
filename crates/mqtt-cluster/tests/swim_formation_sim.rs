@@ -2504,6 +2504,92 @@ fn a_v1_1_node_still_declares_what_the_last_probe_would_have_spared() {
     assert_eq!(c.unsettled, 0);
 }
 
+/// Cut lengths of issue #975's tables that are shorter than the suspicion window and
+/// past the last probe's bound: 2.5 s and 3 s.
+const SHORT_OF_THE_WINDOW_MS: [u64; 2] = [2500, 3000];
+
+/// **Known defect #975**, asserted as the issue states the correct behaviour, so it
+/// fails on main by design: a member of a formed cluster that is unreachable for LESS
+/// than the suspicion window is not turned `Dead` by any node once it is reachable
+/// again.
+///
+/// "The suspicion window" is `Config::suspicion_timeout_ms`, 4 s by default: how long a
+/// member is held `Suspect` before it is declared `Dead` when one node suspects it
+/// (ADR 0016 §3; the field's own doc calls it the maximum window). The window shrinks
+/// to its floor, `suspicion_min_timeout_ms` (1.5 s), only once three distinct nodes
+/// suspect the same member, and that floor is by design: ADR 0016 §3 lets independent
+/// suspicion fast-track `Dead`. What the ADRs promise for a clean cut is narrower than
+/// this test: 2 s less twice the latency in a broker, 2098 ms on the simulation's
+/// grid (ADR 0016's amendment for #1002, ADR 0087 §7 "As hardened"; pinned by
+/// `a_member_cut_off_for_up_to_two_seconds_is_not_declared_dead`). Past that the
+/// ADRs leave the bound open and give it to 0087-T10b ("What this does not change":
+/// a `Dead` a node is told about is adopted unchecked, including about a member it can
+/// reach, which is where the 3 s cells come from; and whether the window grows with
+/// the cluster).
+///
+/// So this asserts the WEAKEST form of what the issue says is wrong, not a bound the
+/// ADRs have decided: for cuts of 2.5 s and 3 s (both shorter than the 4 s window,
+/// both past the 2098 ms bound) at 10, 14 and 16 nodes, over the report's 32 seeds,
+/// no node turns the member `Dead` AFTER the cut has ended — when it is reachable
+/// again, by declaring it then or by adopting a `Dead` declared during the cut. A `Dead`
+/// declared during the cut by a node whose window had reached its 1.5 s floor is NOT
+/// counted here: the member really was silent then, and §3 allows it. (In every run
+/// on main that has a `Dead` at all, some node also turns the member `Dead` after the
+/// cut; so the weaker and the stronger form fail on the same seeds.) If T10b decides
+/// that the floor and an unchecked adoption stand, this test is wrong and goes with
+/// the issue; if it decides the window scales or a relayed `Dead` is checked, this is
+/// the property the fix must have.
+///
+/// The simulation is a pure function of `(n, seed, variant)`: on main the failing
+/// seeds are the same every run.
+#[test]
+#[ignore = "known defect #975: a member cut off for less than the 4 s suspicion window is still turned DEAD after the cut by some node at 10+ nodes"]
+fn a_member_cut_off_for_less_than_the_suspicion_window_is_not_dead_once_reachable() {
+    let cfg = Config::default();
+    let seeds = 32;
+    let mut failures = Vec::new();
+    for n in [10, 14, 16] {
+        for for_ms in SHORT_OF_THE_WINDOW_MS {
+            assert!(
+                last_probe_bound_ms(&cfg) < for_ms && for_ms < cfg.suspicion_timeout_ms,
+                "cut {for_ms} ms is meant to lie past the last probe's bound ({} ms) and \
+                 short of the suspicion window ({} ms)",
+                last_probe_bound_ms(&cfg),
+                cfg.suspicion_timeout_ms,
+            );
+            let runs = sweep(n, seeds, &cut_under(DEFAULT, for_ms), 75_000);
+            let after: Vec<usize> = runs
+                .iter()
+                .enumerate()
+                .filter(|(_, o)| o.total_deads() > 0)
+                .map(|(seed, _)| seed)
+                .collect();
+            let during: Vec<usize> = runs
+                .iter()
+                .enumerate()
+                .filter(|(_, o)| o.deads_during_cut > 0)
+                .map(|(seed, _)| seed)
+                .collect();
+            let longest = runs.iter().map(|o| o.longest_eviction).max().unwrap_or(0);
+            if !after.is_empty() {
+                failures.push(format!(
+                    "N={n}, cut {for_ms} ms: {} of {seeds} runs turned the member DEAD after \
+                     the cut had ended (seeds {after:?}; a DEAD during the cut in seeds \
+                     {during:?}); longest eviction {longest} ms",
+                    after.len(),
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "a member unreachable for less than the {} ms suspicion window was held DEAD \
+         once reachable again:\n  {}",
+        cfg.suspicion_timeout_ms,
+        failures.join("\n  ")
+    );
+}
+
 /// The last probe spares a suspect only on a round trip between the prober and the
 /// suspect, so it keeps no member that cannot be reached: one that is gone, one that
 /// hears nothing (its own datagrams still arriving — acks to nothing, probes of its

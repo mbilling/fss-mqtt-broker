@@ -45,7 +45,11 @@ impl Pki {
         let ca_key = rcgen::KeyPair::generate().unwrap();
         let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+        // CrlSign: the relay-stream tests publish a cluster CRL signed by it.
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
         let ca = rcgen::CertifiedIssuer::self_signed(params, ca_key).unwrap();
         std::fs::write(dir.join("ca.pem"), ca.pem()).unwrap();
         Self {
@@ -57,11 +61,23 @@ impl Pki {
     /// The peer-bus environment for node `cn`, its leaf valid from a minute ago (as
     /// `gen-certs.sh` mints) until `not_after`.
     fn env_for(&self, cn: &str, not_after: SystemTime) -> Vec<(String, String)> {
+        self.env_with_serial(cn, not_after, None)
+    }
+
+    /// [`env_for`](Self::env_for), with the leaf's serial chosen — the fact a CRL names
+    /// (ADR 0040 T4) — where `serial` is given, and random otherwise.
+    fn env_with_serial(
+        &self,
+        cn: &str,
+        not_after: SystemTime,
+        serial: Option<u64>,
+    ) -> Vec<(String, String)> {
         let key = rcgen::KeyPair::generate().unwrap();
         let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, cn);
+        params.serial_number = serial.map(rcgen::SerialNumber::from);
         params.extended_key_usages = vec![
             rcgen::ExtendedKeyUsagePurpose::ServerAuth,
             rcgen::ExtendedKeyUsagePurpose::ClientAuth,
@@ -80,16 +96,53 @@ impl Pki {
             ("MQTTD_PEER_TLS_KEY".into(), path(&key_path)),
         ]
     }
+
+    /// Write the cluster CRL, CA-signed, revoking `serials`, and return its path.
+    fn write_crl(&self, serials: &[u64]) -> PathBuf {
+        let params = rcgen::CertificateRevocationListParams {
+            this_update: rcgen::date_time_ymd(2020, 1, 1),
+            next_update: rcgen::date_time_ymd(2099, 1, 1),
+            crl_number: rcgen::SerialNumber::from(serials.len() as u64 + 1),
+            issuing_distribution_point: None,
+            revoked_certs: serials
+                .iter()
+                .map(|serial| rcgen::RevokedCertParams {
+                    serial_number: rcgen::SerialNumber::from(*serial),
+                    revocation_time: rcgen::date_time_ymd(2020, 1, 2),
+                    reason_code: Some(rcgen::RevocationReason::KeyCompromise),
+                    invalidity_date: None,
+                })
+                .collect(),
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        };
+        let crl = params.signed_by(&self.ca).unwrap();
+        let path = self.dir.join("crl.pem");
+        std::fs::write(&path, crl.pem().unwrap()).unwrap();
+        path
+    }
 }
 
 /// Two nodes, `a` and `b`, each seeded with the other. `b`'s certificate ends at the
 /// returned instant; `a`'s in a week. `extra` is added to both nodes' environment.
 async fn build(root: &Path, extra: &[(&str, &str)]) -> (Vec<ProcNode>, SystemTime) {
+    let (nodes, _, b_ends) = build_pair(root, extra, SHORT_LIFETIME, None).await;
+    (nodes, b_ends)
+}
+
+/// [`build`], with `b`'s certificate living `b_lifetime` and, where `crl` is given, `b`'s
+/// leaf minted with serial `crl.0` and `a` started with a cluster CRL (`crl.1`, which
+/// must not name it yet). Returns the PKI as well, to rewrite that CRL.
+async fn build_pair(
+    root: &Path,
+    extra: &[(&str, &str)],
+    b_lifetime: Duration,
+    crl: Option<(u64, &[u64])>,
+) -> (Vec<ProcNode>, Pki, SystemTime) {
     let pki = Pki::new(root);
     let swim: Vec<String> = (0..2)
         .map(|_| format!("127.0.0.1:{}", free_udp_port()))
         .collect();
-    let b_ends = SystemTime::now() + SHORT_LIFETIME;
+    let b_ends = SystemTime::now() + b_lifetime;
     let mut nodes = Vec::new();
     for (i, name) in ["a", "b"].into_iter().enumerate() {
         let id = format!("exp{}-{name}", std::process::id());
@@ -102,7 +155,15 @@ async fn build(root: &Path, extra: &[(&str, &str)]) -> (Vec<ProcNode>, SystemTim
         } else {
             SystemTime::now() + Duration::from_hours(24 * 7)
         };
-        let mut extra_env = pki.env_for(&id, not_after);
+        let serial = crl.filter(|_| i == 1).map(|(serial, _)| serial);
+        let mut extra_env = pki.env_with_serial(&id, not_after, serial);
+        if let Some((_, revoked)) = crl.filter(|_| i == 0) {
+            let path = pki.write_crl(revoked);
+            extra_env.push((
+                "MQTTD_PEER_TLS_CRL".into(),
+                path.to_string_lossy().into_owned(),
+            ));
+        }
         extra_env.push(("MQTTD_DURABLE_SESSIONS".into(), "0".into()));
         extra_env.extend(extra.iter().map(|(k, v)| ((*k).into(), (*v).into())));
         nodes.push(ProcNode {
@@ -123,7 +184,7 @@ async fn build(root: &Path, extra: &[(&str, &str)]) -> (Vec<ProcNode>, SystemTim
             binary: PathBuf::from(env!("CARGO_BIN_EXE_mqttd")),
         });
     }
-    (nodes, b_ends)
+    (nodes, pki, b_ends)
 }
 
 /// `(members, peer links)` of each node; `None` where `/metrics` did not answer.
@@ -279,6 +340,194 @@ async fn an_expired_node_is_out_and_stays_out() {
         "a link to the expired node formed again; (members, links) = {view:?}\n{}",
         dump(&nodes)
     );
+}
+
+// ---- Relay streams (ADR 0005): the part of issue #1016 that #1018 left open ----
+//
+// A persistent session that lands on a node other than its placement owner is relocated:
+// the landing node dials the owner's PEER listener, presents its own peer certificate,
+// sends a `ProxyHello` and splices the client's bytes onto that connection (`conn.rs`
+// `proxy_to_owner`). The owner admits the connection with `admit_peer_link` — the CRL
+// and both certificates' ends are checked once, at its handshake — and then serves it as
+// a client session (`peer.rs` `handle`, the `ProxyHello` arm, `conn::serve_proxied`). It
+// is never registered with the hub as a peer, and the `LinkCert` admission returned is
+// dropped, so neither the expiry sweep (ADR 0088 D3) nor ADR 0040's peer sweep can end
+// it: a relay stream outlives the certificate it was admitted under, and its revocation.
+// ADR 0088's amendment for #1016 records it as "not covered".
+//
+// The two tests below assert what D3 and ADR 0040 T4 ask of every connection on the
+// peer listener, as they ask it of a peer link: it ends when a certificate it was admitted
+// under expires, or is revoked. Gossip is unsigned in both, so membership never notices
+// `b` (an expired or revoked signer's datagrams would be dropped and `b` declared dead):
+// the session's owner stays `a` throughout, and the only thing that may end the stream
+// is the check under test. In each the peer link between the two ends first, as the
+// control: the sweep did run, and ended what it covers.
+
+/// `b`'s leaf serial in the relay-stream tests, for the CRL to name.
+const B_SERIAL: u64 = 0x1016;
+/// An unrelated serial, so `a` starts with a CRL that is loaded and names nobody here.
+const UNRELATED_SERIAL: u64 = 0x0975;
+
+/// A persistent session of a client connected to `b` and relocated by `b` to its owner
+/// `a` (ADR 0005), live through the relay. Client ids are tried until one is owned by
+/// `a`, which `b`'s log says when it relocates the session.
+async fn relayed_client(nodes: &[ProcNode]) -> (common::Client, String) {
+    for k in 0..64 {
+        let id = format!("relay{}-{k}x", std::process::id());
+        let mark = log_len(&nodes[1]);
+        let (mut client, _) = common::Client::connect_v311(nodes[1].client_addr, &id, false).await;
+        // The CONNACK came from the owner when the session was relocated; b logged that
+        // before it dialed.
+        let relocated = log_since(&nodes[1], mark)
+            .lines()
+            .any(|l| l.contains("relocating persistent session") && l.contains(&id));
+        if relocated {
+            client.send(&mqtt_codec::Packet::PingReq).await;
+            assert_eq!(
+                client.recv().await,
+                mqtt_codec::Packet::PingResp,
+                "the relayed session does not answer"
+            );
+            return (client, id);
+        }
+        client.disconnect().await;
+    }
+    panic!(
+        "no client id of 64 was owned by a; placement never relocated a session from b\n{}",
+        dump(nodes)
+    );
+}
+
+/// Wait until `client`'s connection is closed, at most until `deadline`. On the deadline,
+/// fail, saying whether the session still answers through the relay.
+async fn await_closed(
+    client: &mut common::Client,
+    deadline: SystemTime,
+    what: &str,
+    nodes: &[ProcNode],
+) -> Duration {
+    let from = SystemTime::now();
+    while SystemTime::now() < deadline {
+        match client.recv_bounded(Duration::from_millis(500)).await {
+            common::Recv::Closed => return from.elapsed().unwrap_or_default(),
+            common::Recv::Quiet | common::Recv::Packet(_) => {}
+        }
+    }
+    client.send(&mqtt_codec::Packet::PingReq).await;
+    let answer = client.recv_bounded(Duration::from_secs(5)).await;
+    panic!(
+        "{what}; the relayed session, asked a PINGREQ now, answered {answer:?}\n{}",
+        dump(nodes)
+    );
+}
+
+/// Known defect #1016 (relay streams): a relay stream admitted under `b`'s certificate is
+/// ended when that certificate passes its `notAfter`, as `b`'s peer link is (ADR 0088 D3:
+/// a connection is not kept past its certificate's end; within a minute).
+///
+/// On main the peer link ends 1 to 3 seconds after `b`'s `notAfter` and the relay stream
+/// does not end at all: the client on `b` is still served by `a` a minute later, over a
+/// connection whose certificate has expired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "known defect #1016: a relay stream (ADR 0005 ProxyHello) outlives the expiry of the peer certificate it was admitted under"]
+async fn a_relay_stream_ends_when_the_certificate_it_was_admitted_under_expires() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut nodes, _pki, b_ends) = build_pair(
+        root.path(),
+        &[("MQTTD_SWIM_SIGNED", "off")],
+        SHORT_LIFETIME,
+        None,
+    )
+    .await;
+    form(&mut nodes, b_ends).await;
+    let (mut client, id) = relayed_client(&nodes).await;
+    assert!(
+        SystemTime::now() < b_ends,
+        "the session was relocated only after b's certificate had ended; the runner is too \
+         slow for SHORT_LIFETIME ({}s)",
+        SHORT_LIFETIME.as_secs()
+    );
+
+    // The control: the peer link between the same two nodes ends at that expiry.
+    let late = await_unlinked(&mut nodes, b_ends).await;
+    eprintln!("the peer link ended {late:?} after b's notAfter");
+
+    let waited = await_closed(
+        &mut client,
+        b_ends + WITHIN,
+        &format!(
+            "the relay stream carrying {id} outlived b's certificate by more than a minute \
+             (ADR 0088 D3), while the peer link ended {late:?} after it"
+        ),
+        &nodes,
+    )
+    .await;
+    eprintln!("the relay stream ended {waited:?} after the peer link");
+}
+
+/// Known defect #1016 (relay streams): a relay stream whose peer certificate the cluster
+/// CRL revokes is ended by the reload that publishes the CRL, as the peer link is
+/// (ADR 0040 T4: a reload's sweep re-evaluates every established peer connection against
+/// the list it just loaded).
+///
+/// On main the reload's sweep ends `b`'s peer link at once and `b` is refused when it
+/// redials, but the relay stream admitted under the same certificate keeps serving the
+/// client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "known defect #1016: a relay stream (ADR 0005 ProxyHello) is not ended when the cluster CRL revokes the peer certificate it was admitted under"]
+async fn a_relay_stream_ends_when_the_crl_revokes_the_certificate_it_was_admitted_under() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut nodes, pki, b_ends) = build_pair(
+        root.path(),
+        &[("MQTTD_SWIM_SIGNED", "off")],
+        Duration::from_hours(24 * 7),
+        Some((B_SERIAL, &[UNRELATED_SERIAL])),
+    )
+    .await;
+    form(&mut nodes, b_ends).await;
+    let (mut client, id) = relayed_client(&nodes).await;
+
+    // Revoke b's certificate and reload a.
+    pki.write_crl(&[UNRELATED_SERIAL, B_SERIAL]);
+    let revoked_at = SystemTime::now();
+    let process = nodes[0].pid().expect("running").to_string();
+    let sent = std::process::Command::new("kill")
+        .args(["-HUP", &process])
+        .status()
+        .expect("run kill");
+    assert!(sent.success());
+
+    // The control: a's sweep ends the peer link, for revocation.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let revoked = ended_for(&nodes[0], "peer-revoked").await;
+        let links = nodes[0].metric("mqttd_peer_links").await;
+        if revoked >= 1 && links == Some(0) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a's reload did not end b's peer link (peer-revoked {revoked}, links {links:?})\n{}",
+            dump(&nodes)
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let late = revoked_at.elapsed().unwrap_or_default();
+    eprintln!("the peer link ended {late:?} after the reload");
+
+    // The sweep is one pass over the hub's state; ten seconds is generous for a stream it
+    // ends in the same pass.
+    let waited = await_closed(
+        &mut client,
+        SystemTime::now() + Duration::from_secs(10),
+        &format!(
+            "the relay stream carrying {id} outlived the revocation of b's certificate by \
+             more than ten seconds after the peer link ended (ADR 0040 T4)"
+        ),
+        &nodes,
+    )
+    .await;
+    eprintln!("the relay stream ended {waited:?} after the peer link");
 }
 
 // ---- Renewal: the links move before the old end (issue #1016) ----

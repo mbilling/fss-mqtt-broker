@@ -9521,6 +9521,7 @@ mod tests {
     mod share_obligations;
     mod shared_capacity;
     mod truncate_flusher;
+    mod unreadable_session;
     /// A committed retained snapshot entry with no application properties — the
     /// common test shape (props-bearing cases build the struct directly).
     fn snap(topic: &str, payload: &[u8], epoch: u64, offset: u64) -> RetainedWireEntry {

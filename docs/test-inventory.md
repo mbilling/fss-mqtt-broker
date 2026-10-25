@@ -256,12 +256,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `connect_refused_surfaces_as_an_error`
 - `the_client_connects_subscribes_and_round_trips_a_publish`
 
-## `crates/mqtt-bridge/tests/engine.rs` — 14 test(s)
+## `crates/mqtt-bridge/tests/engine.rs` — 15 test(s)
 
 - `a_bidirectional_pair_delivers_exactly_one_copy_per_side`
 - `a_full_spool_must_not_shed_a_message_the_bridge_already_accepted`
 - `a_live_retained_publish_crosses_the_boundary_retained`
 - `a_local_message_fans_out_to_multiple_upstreams`
+- `a_message_spooled_while_its_side_connects_is_not_stranded_in_the_spool` — `#[ignore]`d
 - `a_no_remap_both_rule_loop_is_bounded_by_the_hop_limit`
 - `a_one_way_out_rule_forwards_to_the_upstream_and_never_leaks_back`
 - `a_remap_ping_pong_within_one_bridge_is_stopped_by_no_local`
@@ -721,10 +722,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `three_nodes_converge_then_detect_failure`
 - `two_nodes_discover_each_other`
 
-## `crates/mqtt-cluster/tests/swim_formation_sim.rs` — 18 test(s)
+## `crates/mqtt-cluster/tests/swim_formation_sim.rs` — 19 test(s)
 
 - `a_cluster_part_way_through_the_upgrade_from_v1_1_forms`
 - `a_formation_run_is_reproducible_from_its_seed`
+- `a_member_cut_off_for_less_than_the_suspicion_window_is_not_dead_once_reachable` — `#[ignore]`d
 - `a_member_cut_off_for_up_to_two_seconds_is_not_declared_dead`
 - `a_member_falsely_declared_dead_is_readmitted_within_the_tombstone_ttl`
 - `a_member_that_cannot_complete_a_round_trip_is_declared_dead_as_before`
@@ -1470,7 +1472,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 854 test(s)
+## `crates/mqttd/src/lib.rs` — 857 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -2111,6 +2113,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::truncate_flusher::every_busy_session_is_flushed_in_turn`
 - `hub::tests::two_groups_on_one_filter_rotate_independently`
 - `hub::tests::two_publishes_to_one_offline_subscriber_append_in_arrival_order`
+- `hub::tests::unreadable_session::a_held_ack_is_released_once_the_stuck_session_reads_again`
+- `hub::tests::unreadable_session::a_stuck_session_does_not_hold_the_ack_of_a_publish_no_session_matches` — `#[ignore]`d
+- `hub::tests::unreadable_session::a_stuck_session_does_not_hold_the_ack_of_a_publish_that_reached_a_live_subscriber`
 - `hub::tests::while_draining_a_rule_derived_forward_holds_the_barrier_until_the_peer_answers`
 - `hub::tests::without_no_local_a_publisher_receives_its_own_delivery`
 - `ingress::tests::credit_is_returned_when_the_permit_drops_and_the_cap_bounds_one_connection`
@@ -2613,11 +2618,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `publish_reaches_matching_subscriber`
 - `qos1_publish_is_acked_and_downgraded`
 
-## `crates/mqttd/tests/false_dead_delivery.rs` — 12 test(s)
+## `crates/mqttd/tests/false_dead_delivery.rs` — 15 test(s)
 
 - `durable_a_follower_evictor_dials_and_a_durable_session_is_served`
 - `durable_a_leader_evictor_dials_the_lease_moves_and_sessions_follow_it`
+- `durable_a_new_subscription_elsewhere_does_not_take_what_a_peer_held_dead_is_owed` — `#[ignore]`d
 - `durable_a_peer_out_of_reach_is_answered_at_the_countdown_and_counted`
+- `durable_a_publish_held_past_the_countdown_is_delivered_when_the_link_returns` — `#[ignore]`d
+- `durable_a_publish_in_flight_at_a_verdict_is_delivered_when_the_link_returns`
 - `durable_an_owner_that_dies_holds_its_publishers_for_the_failover_not_for_confirmation`
 - `durable_the_evicted_peer_dials_the_link_returns_and_sessions_follow_the_lease`
 - `plain_a_false_verdict_keeps_publish_order_for_every_subscriber`
@@ -2688,9 +2696,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `plaintext_mesh_without_binding_still_routes`
 - `the_node_holding_a_peer_dead_keeps_dialing_it_and_serves_the_link`
 
-## `crates/mqttd/tests/peer_link_expiry.rs` — 4 test(s)
+## `crates/mqttd/tests/peer_link_expiry.rs` — 6 test(s)
 
 - `a_peer_link_ends_within_a_minute_of_its_peers_certificate`
+- `a_relay_stream_ends_when_the_certificate_it_was_admitted_under_expires` — `#[ignore]`d
+- `a_relay_stream_ends_when_the_crl_revokes_the_certificate_it_was_admitted_under` — `#[ignore]`d
 - `an_expired_node_is_out_and_stays_out`
 - `renewed_nodes_move_their_links_before_the_old_end_without_a_gap`
 - `renewed_nodes_move_their_links_without_an_election`

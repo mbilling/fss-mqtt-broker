@@ -34,6 +34,7 @@ caller changes this file and the gate fails until it is regenerated and re-read.
 | site | test | slug | wait | reach |
 | --- | --- | --- | --- | --- |
 | `crates/mqtt-bridge/tests/engine.rs` | `a_full_spool_must_not_shed_a_message_the_bridge_already_accepted` | `bridge-spool-refusal` | 20ms | in the test itself |
+| `crates/mqtt-bridge/tests/engine.rs` | `a_message_spooled_while_its_side_connects_is_not_stranded_in_the_spool` | `bridge-connect-stream` | 1ms | in the test itself |
 | `crates/mqtt-cluster/src/cluster_log.rs` | `deliver` | `local-tier-slow-followers` | 400ms | helper, 17 call site(s) |
 | `crates/mqtt-cluster/src/cluster_log.rs` | `pipelined_appends_overlap_and_commit_in_offset_order` | `pipelined-commit-holdback` | 100ms | in the test itself |
 | `crates/mqtt-cluster/src/cluster_log.rs` | `overlap_starts_the_fan_out_before_the_local_write_is_durable` | `serial-fan-out` | 100ms | in the test itself |
@@ -59,6 +60,7 @@ caller changes this file and the gate fails until it is regenerated and re-read.
 | `crates/mqttd/tests/false_dead_delivery.rs` | `relay_one_way` | `peer-announcement-held-back` | ANNOUNCEMENT_DELAY | helper, 2 call site(s) |
 | `crates/mqttd/tests/false_dead_delivery.rs` | `episode_under` | `false-dead-verdict-withdrawn-early` | ? | helper, 2 call site(s) |
 | `crates/mqttd/tests/false_dead_delivery.rs` | `plain_a_peer_really_dead_is_answered_at_confirmation_and_counted` | `really-dead-unconfirmed-hold` | UNCONFIRMED_FOR | in the test itself |
+| `crates/mqttd/tests/false_dead_delivery.rs` | `durable_a_publish_held_past_the_countdown_is_delivered_when_the_link_returns` | `partition-outlasts-the-countdown` | UNCONFIRMED_FOR | in the test itself |
 | `crates/mqttd/tests/http_auth.rs` | `stub_hook` | `http-auth-hang-stub` | 60s | helper, 6 call site(s) |
 | `crates/mqttd/tests/keepalive_lwt.rs` | `pinging_client_stays_connected_past_keepalive` | `keepalive-ping-cadence` | 500ms | in the test itself |
 | `crates/mqttd/tests/keepalive_lwt.rs` | `zero_keepalive_is_never_idle_disconnected` | `keepalive-zero-idle-window` | 2500ms | in the test itself |

@@ -2386,6 +2386,59 @@ IGNORE_ALLOWLIST: dict[str, tuple[str, str | None]] = {
         "asserted by `the_sweep_retransmits_only_overdue_forwards`, which every tier runs",
         None,
     ),
+    # A known defect, asserted as the behaviour its fix must have, so it fails on main by
+    # design. No tier runs it until the fix lands; the fix removes the `#[ignore]` and this
+    # entry together. Its two controls in the same file pass and run in every tier.
+    "crates/mqttd/src/lib.rs::hub::tests::unreadable_session::a_stuck_session_does_not_hold_the_ack_of_a_publish_no_session_matches": (
+        "known defect #1049: one durable session the node owns and cannot read (NoQuorum on "
+        "every read) keeps every session scan incomplete, and the node holds the PUBACK of "
+        "every QoS 1 publish no known session matches for as long as that key stays stuck",
+        None,
+    ),
+    # A known defect, asserted as the behaviour its fix must have, so it fails on main by
+    # design. No tier runs it until the fix lands; the fix removes the `#[ignore]` and this
+    # entry together.
+    "crates/mqtt-bridge/tests/engine.rs::a_message_spooled_while_its_side_connects_is_not_stranded_in_the_spool": (
+        "known defect #1100: a message the router forwards toward a side while that side is "
+        "connecting can be spooled after the supervisor's connect-time drain and before it sets "
+        "the side connected, and then waits in the spool, already acked to its source, until "
+        "the next reconnect",
+        None,
+    ),
+    # Two known defects of the same issue, asserted as the behaviour its fix must have, so
+    # they fail on main by design. No tier runs them until the fix lands; the fix removes the
+    # `#[ignore]`s and these entries together. Each has its control in the same test (the
+    # peer link between the same two nodes ends), and the file's other tests run in every
+    # tier.
+    "crates/mqttd/tests/peer_link_expiry.rs::a_relay_stream_ends_when_the_certificate_it_was_admitted_under_expires": (
+        "known defect #1016: a relay stream (ADR 0005 `ProxyHello`) is admitted on the peer "
+        "listener under the landing node's peer certificate and never registered as a peer, so "
+        "the expiry sweep does not end it: the relayed session is still served a minute after "
+        "that certificate's notAfter, while the peer link ended within three seconds",
+        None,
+    ),
+    "crates/mqttd/tests/peer_link_expiry.rs::a_relay_stream_ends_when_the_crl_revokes_the_certificate_it_was_admitted_under": (
+        "known defect #1016: a relay stream (ADR 0005 `ProxyHello`) is not ended by the "
+        "reload's peer sweep when the cluster CRL revokes the certificate it was admitted under; "
+        "the peer link is ended at once and the relayed session keeps being served",
+        None,
+    ),
+    # Two known defects of the same issue, asserted as the behaviour its fix (0087-T5, D8)
+    # must have, so they fail on main by design. No tier runs them until the fix lands;
+    # the fix removes the `#[ignore]`s and these entries together. The control of the
+    # second, in the same file, passes and runs in every tier.
+    "crates/mqttd/tests/false_dead_delivery.rs::durable_a_publish_held_past_the_countdown_is_delivered_when_the_link_returns": (
+        "known defect #973: in durable mode a node that holds a live member dead and cannot "
+        "reach it for eight sweep ticks acknowledges the QoS 1 publishes it holds for that "
+        "member's subscribers (`hold-expired`), and when the link returns they are not delivered",
+        None,
+    ),
+    "crates/mqttd/tests/false_dead_delivery.rs::durable_a_new_subscription_elsewhere_does_not_take_what_a_peer_held_dead_is_owed": (
+        "known defect #973: in durable mode any subscription matching the topic that appears "
+        "on another node discharges what a member wrongly held dead is owed, so the publisher "
+        "is acknowledged and the member's subscriber never receives the publish",
+        None,
+    ),
     "crates/mqtt-cluster/tests/swim_formation_sim.rs::formation_report": (
         "measurement, not a pass/fail: it prints what a signed-gossip formation does at seven "
         "sizes on v1.1.0's rules, with each cause removed in turn, on this tree and in mixed "
@@ -2420,6 +2473,17 @@ IGNORE_ALLOWLIST: dict[str, tuple[str, str | None]] = {
         "`a_real_death_is_seen_on_time_by_survivors_that_are_all_late` and "
         "`with_ticks_on_no_grid_a_cut_of_two_seconds_less_twice_the_latency_ends_in_no_dead`, "
         "which every tier runs",
+        None,
+    ),
+    # A known defect, asserted as the behaviour the issue states is correct, so it fails on
+    # main by design (deterministically: the simulation is a pure function of its seed). No
+    # tier runs it until 0087-T10b decides the bound; the fix removes the `#[ignore]` and
+    # this entry together, or T10b's decision removes both with the issue.
+    "crates/mqtt-cluster/tests/swim_formation_sim.rs::a_member_cut_off_for_less_than_the_suspicion_window_is_not_dead_once_reachable": (
+        "known defect #975: a member of a formed cluster cut off for 2.5 s or 3 s, less than "
+        "the 4 s suspicion window, is turned DEAD by some node after the cut has ended in 1 to "
+        "8 of 32 seeded runs at 10, 14 and 16 nodes (a relayed DEAD is adopted unchecked, and "
+        "the window does not grow with the cluster)",
         None,
     ),
     "crates/mqttd/tests/swim_formation_proc.rs::a_broker_stopped_for_two_seconds_is_declared_dead_by_no_one": (

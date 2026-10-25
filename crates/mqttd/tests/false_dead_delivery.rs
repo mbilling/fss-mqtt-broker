@@ -40,7 +40,13 @@
 //! What these episodes still show and the design has not reached: in durable mode
 //! the first `QoS` 2 publish after the verdict can be answered by closing the
 //! connection (ADR 0087 D4 records it as unchanged), and a false verdict at the lease
-//! leader moves the session's lease (T5, D8). Nothing here is `#[ignore]`d.
+//! leader moves the session's lease (T5, D8).
+//!
+//! Two tests at the end assert what T5 must deliver and fail on main, `#[ignore]`d
+//! as known defect #973 until it lands: in durable mode a publish held past the
+//! eight-tick countdown for a member held dead is acknowledged and never delivered,
+//! and one in flight at the verdict is taken by any new matching subscription
+//! elsewhere and never reaches the member's subscriber. Nothing else is ignored.
 
 mod common;
 
@@ -150,6 +156,10 @@ struct Node {
     /// Whether the relay in front of this node's peer listener carries links
     /// ([`relay_peer_links`]); `false` cuts the ones it has and refuses new ones.
     links_carried: watch::Sender<bool>,
+    /// `true` makes the relay stop moving bytes on the links it has, keeping their
+    /// sockets open: a link gone silent, whose writes still succeed on the sending
+    /// side and arrive nowhere ([`relay_peer_links`]).
+    links_stalled: watch::Sender<bool>,
 }
 
 /// A TCP relay in front of a node's peer listener, at the address the node gossips
@@ -169,16 +179,23 @@ struct Node {
 /// held for the peer), and at that width they would meet the instant only by luck.
 /// So the relay passes each side's `Hello` at once and holds what follows it for
 /// [`ANNOUNCEMENT_DELAY`], once per connection, in both directions.
-async fn relay_peer_links(to: SocketAddr) -> (String, watch::Sender<bool>) {
+///
+/// While `stalled` is true the links it has stop moving bytes in either direction
+/// and stay open — what a sender sees of a link that has gone silent: its writes
+/// succeed and arrive nowhere. Whatever was written meanwhile is lost when the link
+/// is then cut. Off unless a test sets it.
+async fn relay_peer_links(to: SocketAddr) -> (String, watch::Sender<bool>, watch::Sender<bool>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let (carried_tx, carried) = watch::channel(true);
+    let (stalled_tx, stalled) = watch::channel(false);
     tokio::spawn(async move {
         loop {
             let Ok((mut dialer, _)) = listener.accept().await else {
                 return;
             };
             let mut carried = carried.clone();
+            let mut stalled = stalled.clone();
             if !*carried.borrow_and_update() {
                 continue;
             }
@@ -191,15 +208,21 @@ async fn relay_peer_links(to: SocketAddr) -> (String, watch::Sender<bool>) {
                 let (from_dialer, to_dialer) = dialer.split();
                 let (from_listener, to_listener) = listener_side.split();
                 // Either direction ending ends the link, as a closed socket does.
-                tokio::select! {
-                    () = relay_one_way(from_dialer, to_listener) => {}
-                    () = relay_one_way(from_listener, to_dialer) => {}
-                    _ = carried.wait_for(|carried| !*carried) => {}
+                let stall = tokio::select! {
+                    () = relay_one_way(from_dialer, to_listener) => false,
+                    () = relay_one_way(from_listener, to_dialer) => false,
+                    _ = carried.wait_for(|carried| !*carried) => false,
+                    _ = stalled.wait_for(|stalled| *stalled) => true,
+                };
+                if stall {
+                    // Both sockets stay open and nobody reads them, until the cut.
+                    let _ = carried.wait_for(|carried| !*carried).await;
                 }
+                drop((dialer, listener_side));
             });
         }
     });
-    (addr, carried_tx)
+    (addr, carried_tx, stalled_tx)
 }
 
 /// How long the relay holds what a node says after its `Hello`: ten of the numbered
@@ -345,7 +368,8 @@ async fn start_node(id: &str, seeds: Vec<String>, mode: Mode) -> Node {
 
     let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     // What the node gossips as its routing address is the relay in front of it.
-    let (peer_addr, links_carried) = relay_peer_links(peer_listener.local_addr().unwrap()).await;
+    let (peer_addr, links_carried, links_stalled) =
+        relay_peer_links(peer_listener.local_addr().unwrap()).await;
     tokio::spawn(mqttd::peer::serve_listener(
         peer_listener,
         node_id.clone(),
@@ -439,6 +463,7 @@ async fn start_node(id: &str, seeds: Vec<String>, mode: Mode) -> Node {
         hub: hub_tx,
         verdicts_handed_to_the_hub,
         links_carried,
+        links_stalled,
     }
 }
 
@@ -652,6 +677,15 @@ impl Cluster {
             &self.b.links_carried
         } else {
             &self.a.links_carried
+        }
+    }
+
+    /// The relay's stall switch for the A–B link ([`relay_peer_links`]).
+    fn stall_between_a_and_b(&self) -> &watch::Sender<bool> {
+        if self.a.id.0 < self.b.id.0 {
+            &self.b.links_stalled
+        } else {
+            &self.a.links_stalled
         }
     }
 
@@ -2834,5 +2868,310 @@ async fn durable_an_owner_that_dies_holds_its_publishers_for_the_failover_not_fo
         !moved_on_a
             .contains_key("mqttd_publish_resolved_undeliverable_total{reason=\"hold-expired\"}"),
         "the publish was answered by the new owner, not resolved undeliverable: {moved_on_a:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------
+// Known defect #973, what 0087-T5 (D8) is to close: asserted as the behaviour the
+// fix must have, so these FAIL on main and are `#[ignore]`d until it lands
+// ---------------------------------------------------------------------------------
+//
+// ADR 0087's rule: an obligation toward a peer is discharged only by evidence from
+// the node that owns the subscriber — its answer, the committed owner's for a
+// session the lease plane owns, its own statement that the subscriber is gone, or
+// confirmation that it is gone. In durable mode two things still discharge one with
+// no such evidence, and each acknowledges a `QoS` 1 publish its subscriber never
+// receives: the eight-tick countdown (`REROUTE_GRACE_TICKS`, `reason="hold-expired"`)
+// and the re-route to any peer that newly announces a matching filter. Both are kept
+// on purpose until interest says whether the lease plane owns it (D8; the amendment
+// of 2026-10-14), and both are listed in the 1.2.0 release notes' known limits.
+//
+// The subscriber in both is a CLEAN session on B: it is owed to B and to nobody
+// else, whatever the lease plane does, so the only correct ends of the hold are
+// B's answer or B confirmed gone — and neither test confirms B gone. B is alive
+// throughout and its subscriber connected to it; only A's link to it is cut and A
+// holds it `Dead`. The invariant asserted: **acknowledged ⇒ delivered**, and the
+// acknowledgement not given before the node that owns the subscriber could answer.
+
+/// The link between A and B is carried again and A's membership withdraws the
+/// verdict (the `Alive` a first-hand refutation raises). Returns the instant.
+fn restore_the_link_and_withdraw_the_verdict(cluster: &Cluster) -> Instant {
+    let at = Instant::now();
+    *cluster.restored.lock().unwrap() = Some(at);
+    cluster.link_between_a_and_b().send_replace(true);
+    cluster.heal();
+    at
+}
+
+/// Read `sub` until it has received `topic`, or `bound` has passed; every topic it
+/// received meanwhile.
+async fn read_until_received(sub: &mut Sub, topic: &str, bound: Duration) -> Vec<String> {
+    let deadline = Instant::now() + bound;
+    let mut got = Vec::new();
+    while !got.iter().any(|t| t == topic) && Instant::now() < deadline {
+        got.extend(sub.drain(Duration::from_millis(250), false).await);
+    }
+    got
+}
+
+/// How long the subscriber on B is read for the held publish once the link is back:
+/// a redial (the dialer's delay is at most 5 s under a verdict), the handshake, B's
+/// interest snapshot, the flush — with a wide margin for a loaded runner.
+const DELIVERED_WITHIN: Duration = Duration::from_secs(20);
+
+/// What the two tests below assert about one held publish.
+#[track_caller]
+fn expect_acked_only_once_delivered(
+    answer: Answer,
+    acked_at: Option<Instant>,
+    verdict: Instant,
+    restored: Instant,
+    received_on_b: &[String],
+) {
+    let delivered = received_on_b.iter().any(|t| t == "fd/clean/first");
+    let acked_after = acked_at.map(|at| at.duration_since(verdict));
+    assert!(
+        !answer.acked_ok() || delivered,
+        "ACKNOWLEDGED AND LOST (#973): the publisher was acknowledged {acked_after:?} after \
+         A's verdict and B's clean-session subscriber — connected to B throughout, B alive \
+         — never received the publish, not even after the link returned {:?} after the \
+         verdict; it received {received_on_b:?}",
+        restored.duration_since(verdict)
+    );
+    assert!(
+        delivered,
+        "the publish is delivered to B's subscriber once the link is back: {answer:?}, \
+         received {received_on_b:?}"
+    );
+    assert!(answer.acked_ok(), "and then acknowledged: {answer:?}");
+    let acked_at = acked_at.expect("acknowledged");
+    assert!(
+        acked_at >= restored,
+        "acknowledged {:?} BEFORE B's link returned: nothing B owns had answered",
+        restored.duration_since(acked_at)
+    );
+}
+
+/// KNOWN DEFECT #973 (the hold-expired limit): in durable mode a node that holds a
+/// member dead and cannot reach it for eight sweep ticks acknowledges, without
+/// delivering, the `QoS` 1 publishes it holds for that member's subscribers.
+///
+/// B is alive and out of A's reach for 12 s — longer than the countdown — and then
+/// the link returns. Nobody confirms B gone, so per ADR 0087 D2 and D8 the publish
+/// for B's clean-session subscriber stays owed to B, the publisher waits, and when
+/// the link returns it is delivered and then acknowledged. On main the countdown
+/// erases B's routing state at the eighth tick (`sweep_verdict_holds` →
+/// `erase_peer(.., HoldExpired)`), the publisher is acknowledged ~8 s after the
+/// verdict, and when B's link returns nothing is owed to it any more.
+///
+/// The counterpart that pins today's behaviour is
+/// `durable_a_peer_out_of_reach_is_answered_at_the_countdown_and_counted`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "known defect #973: in durable mode a publish held 8 s for a member held dead and out of reach is acked and never delivered (hold-expired)"]
+async fn durable_a_publish_held_past_the_countdown_is_delivered_when_the_link_returns() {
+    let cluster = Cluster::start(Mode::Durable, Link::EvictorDials, Founder::Bystander).await;
+    let q1 = QoS::AtLeastOnce;
+    let mut clean = Flow::new(
+        &cluster,
+        "clean",
+        On::A,
+        "fd/clean",
+        q1,
+        vec![Sub::connect(&cluster, On::B, "sub-clean", true, "fd/clean/#", q1).await],
+    )
+    .await;
+    clean.warm().await;
+    b_dies_as_a_sees_it(&cluster).await;
+    let verdict = Instant::now();
+    let before = series(&cluster.a);
+
+    let restore = async {
+        // SETTLE(partition-outlasts-the-countdown): not a wait for a state — the time
+        // IS the stimulus. The defect is what the countdown does at its eighth tick,
+        // so B must stay out of reach past it before the link may return.
+        tokio::time::sleep(UNCONFIRMED_FOR).await;
+        restore_the_link_and_withdraw_the_verdict(&cluster)
+    };
+    let (answer, restored) = tokio::join!(clean.publish("first", ACK_BOUND), restore);
+    let acked_at = clean.publisher.last_acked_at;
+    let received_on_b =
+        read_until_received(&mut clean.subs[0], "fd/clean/first", DELIVERED_WITHIN).await;
+    let moved_on_a = moved(&before, &series(&cluster.a));
+    cluster.membership_moved_only_as_injected();
+    println!(
+        "  clean: {answer:?}, acked {:?} after the verdict, link back {:?} after it; B's \
+         subscriber received {received_on_b:?}; moved on A: {moved_on_a:?}",
+        acked_at.map(|at| at.duration_since(verdict)),
+        restored.duration_since(verdict)
+    );
+
+    expect_acked_only_once_delivered(answer, acked_at, verdict, restored, &received_on_b);
+}
+
+/// What became of a publish in flight at the verdict, in [`in_flight_at_the_verdict`].
+struct InFlight {
+    answer: Answer,
+    acked_at: Option<Instant>,
+    verdict: Instant,
+    restored: Instant,
+    received_on_b: Vec<String>,
+}
+
+/// A publish IN FLIGHT at a false verdict — the likeliest shape of one: the A–B link
+/// goes silent (the relay stops moving bytes and keeps the sockets open), a publish
+/// for B's clean-session subscriber is forwarded on it and never arrives, then the
+/// link is cut and A holds B `Dead`. B is alive throughout, its subscriber connected
+/// to it. With `monitor`, a client then subscribes to `#` on C. The link returns
+/// well inside the eight-tick countdown, so the countdown plays no part.
+async fn in_flight_at_the_verdict(monitor: bool) -> InFlight {
+    let cluster = Cluster::start(Mode::Durable, Link::EvictorDials, Founder::Bystander).await;
+    let q1 = QoS::AtLeastOnce;
+    let mut clean = Flow::new(
+        &cluster,
+        "clean",
+        On::A,
+        "fd/clean",
+        q1,
+        vec![Sub::connect(&cluster, On::B, "sub-clean", true, "fd/clean/#", q1).await],
+    )
+    .await;
+    clean.warm().await;
+    // The publish must be made on a SETTLED view — as one is in a cluster past its
+    // formation — or the settle pass keeps it and re-routes it to B at B's
+    // announcement whatever was discharged. A freshly formed cluster's view stays
+    // unsettled for some seconds after its first routes work (#1011).
+    let a = &cluster.a;
+    wait_until(
+        "A's routing view is settled and nothing is pending on it",
+        Duration::from_mins(1),
+        || {
+            series(a).iter().all(|(name, value)| {
+                !(name.starts_with("mqttd_routing_unsettled") || name == "mqttd_pending_publishes")
+                    || *value == 0.0
+            })
+        },
+    )
+    .await;
+    let before = series(a);
+    cluster.stall_between_a_and_b().send_replace(true);
+
+    let elsewhere = async {
+        let pending_on_a = || {
+            series(a)
+                .get("mqttd_pending_publishes")
+                .copied()
+                .unwrap_or(0.0)
+        };
+        wait_until(
+            "A has forwarded the publish to B on the silent link and waits for B's answer",
+            Duration::from_secs(10),
+            || pending_on_a() >= 1.0,
+        )
+        .await;
+        b_dies_as_a_sees_it(&cluster).await;
+        cluster.stall_between_a_and_b().send_replace(false);
+        let verdict = Instant::now();
+        let mut monitor_got = Vec::new();
+        if monitor {
+            let mut monitor = Sub::connect(&cluster, On::C, "monitor", true, "#", q1).await;
+            monitor_got =
+                read_until_received(&mut monitor, "fd/clean/first", Duration::from_secs(3)).await;
+        }
+        // Until A has nothing left pending — on main, C's new interest took the
+        // publish and its answer retired the entry — or until a bound well inside
+        // the countdown, so that the entry a fix keeps does not make the countdown
+        // what ends the hold.
+        let retire_by = verdict + Duration::from_secs(5);
+        while Instant::now() < retire_by && pending_on_a() >= 1.0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        (
+            verdict,
+            monitor_got,
+            restore_the_link_and_withdraw_the_verdict(&cluster),
+        )
+    };
+    let (answer, (verdict, monitor_got, restored)) =
+        tokio::join!(clean.publish("first", ACK_BOUND), elsewhere);
+    let acked_at = clean.publisher.last_acked_at;
+    let received_on_b =
+        read_until_received(&mut clean.subs[0], "fd/clean/first", DELIVERED_WITHIN).await;
+    let moved_on_a = moved(&before, &series(a));
+    cluster.membership_moved_only_as_injected();
+    println!(
+        "  clean: {answer:?}, acked {:?} after the verdict, link back {:?} after it; C's \
+         monitor received {monitor_got:?}; B's subscriber received {received_on_b:?}; \
+         moved on A: {moved_on_a:?}",
+        acked_at.map(|at| at.checked_duration_since(verdict)),
+        restored.duration_since(verdict)
+    );
+    assert!(
+        restored.duration_since(verdict) < Duration::from_secs(7),
+        "VOID EPISODE: the link returned {:?} after the verdict, so the eight-tick \
+         countdown may have ended the hold",
+        restored.duration_since(verdict)
+    );
+    InFlight {
+        answer,
+        acked_at,
+        verdict,
+        restored,
+        received_on_b,
+    }
+}
+
+/// The control for the test below, and passing on main (0087-T2: obligations in
+/// flight at a verdict are kept): with nobody else subscribing, the forward lost on
+/// the silent link is sent to B again when the link returns, B's subscriber
+/// receives it, and only then is the publisher acknowledged. So what the test below
+/// adds — one subscription on C — is all that loses the publish there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn durable_a_publish_in_flight_at_a_verdict_is_delivered_when_the_link_returns() {
+    let e = in_flight_at_the_verdict(false).await;
+    expect_acked_only_once_delivered(
+        e.answer,
+        e.acked_at,
+        e.verdict,
+        e.restored,
+        &e.received_on_b,
+    );
+}
+
+/// KNOWN DEFECT #973 (gap 4 of the 2026-10-13 read-through on the issue; the 1.2.0
+/// release notes' "a subscriber on a member wrongly held dead loses a publish if
+/// another subscription to its topic appears before the link returns"): in durable
+/// mode the re-route that lets a successor stand in for what an unreachable peer is
+/// owed matches on the TOPIC, so ANY newly matching subscription elsewhere
+/// discharges it.
+///
+/// [`in_flight_at_the_verdict`] with a monitor subscribing to `#` on C. Correct
+/// (ADR 0087 D8): C's monitor is not B's subscriber and its answer discharges
+/// nothing B is owed, so when the link is back the forward is sent to B again
+/// under its seq, B's subscriber receives it, and only then is the publisher
+/// acknowledged — as in the control above. On main C's interest makes C a re-route
+/// candidate (`reroute_candidates`), `reroute` → `discharge_unreachable` drops B's
+/// obligation, C's `Reached` acknowledges the publisher and retires the entry (it
+/// was made on a settled view, so nothing keeps it for the settle pass), and B's
+/// subscriber never gets it.
+///
+/// (A publish made AFTER the verdict is lost the same way only once the countdown
+/// is gone: today it is made inside the verdict's eight-tick takeover window, kept
+/// for the settle pass, and re-routed to B at B's announcement if the link returns
+/// within the window — and erased by the countdown if it does not, the test
+/// above's defect.)
+///
+/// The hub-level counterpart that pins today's behaviour is
+/// `a_successor_that_announces_the_interest_discharges_what_the_unreachable_peer_was_owed`
+/// (hub/forwarding.rs).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "known defect #973: in durable mode a new matching subscription on another node takes a publish owed to a member wrongly held dead, which never gets it"]
+async fn durable_a_new_subscription_elsewhere_does_not_take_what_a_peer_held_dead_is_owed() {
+    let e = in_flight_at_the_verdict(true).await;
+    expect_acked_only_once_delivered(
+        e.answer,
+        e.acked_at,
+        e.verdict,
+        e.restored,
+        &e.received_on_b,
     );
 }
