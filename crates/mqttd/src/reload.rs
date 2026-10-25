@@ -754,6 +754,10 @@ impl Reloader {
                                 _ => RevocationList::default(),
                             },
                             peer_revoked,
+                            own_cert_end: self.peer_tls.as_ref().and_then(|(_, _, own)| {
+                                Some(own.load(std::sync::atomic::Ordering::Relaxed))
+                                    .filter(|end| *end != i64::MAX)
+                            }),
                             trigger: trigger.to_string(),
                             audit: self.audit.clone(),
                         },

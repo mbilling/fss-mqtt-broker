@@ -764,6 +764,8 @@ async fn main() -> Result<(), StartupError> {
         node: node_id.clone(),
         placement: placement.clone(),
         connector: peer_tls.as_ref().map(|t| t.connector.clone()),
+        cluster_crl: peer_tls.as_ref().map(|t| t.gossip_crl.clone()),
+        own_cert_end: peer_tls.as_ref().map(|t| t.own_cert_end.clone()),
     };
     let (policy, mut reloader, trace_rx) = client_policy(
         &live_config,

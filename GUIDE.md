@@ -1393,11 +1393,14 @@ may read* revoked ends the flow:
   stays connected; its next SUBSCRIBE is denied;
 - an established **peer link** whose remote certificate the new cluster CRL
   (`MQTTD_PEER_TLS_CRL`) revokes is torn down, and the revoked node cannot re-handshake in
-  either direction. The mesh reacts as to any link loss.
+  either direction. The mesh reacts as to any link loss. So is every **relayed session**
+  (ADR 0005) running on a connection made under that certificate, on the owner and on the
+  landing node: its client is disconnected (MQTT 5: `DISCONNECT 0x9C`) and reconnects.
 
 An unchanged policy evicts no one (the sweep re-derives each admission verdict, so only
 differences act). Each action emits a `security.evict` audit event with its reason
-(`cert-revoked`, `user-removed`, `connect-denied`, `grant-revoked`, `peer-revoked`) and
+(`cert-revoked`, `user-removed`, `connect-denied`, `grant-revoked`, `peer-revoked`,
+`relay-peer-revoked`) and
 increments `mqttd_revocation_evictions_total{reason}`; every sweep leaves one
 `security.sweep` summary record with the counts. Durable session *state* of a removed user
 is not destroyed — it is unreachable (resume fails at authentication; a different subject is

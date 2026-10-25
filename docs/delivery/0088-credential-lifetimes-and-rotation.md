@@ -91,6 +91,14 @@ Each task has its own issue; #984 tracks the record as a whole.
 
 ## Changelog
 
+- **2026-10-25** — T3 follow-up (issue #1016, relay streams): an ADR 0005 relay stream is
+  held to the certificates it was admitted under, on the owner (the relocated session)
+  and on the landing node (the splice, whose dial is now admitted as a peer link's is).
+  It ends the second after the earlier end and in the reload sweep that revokes the
+  other node (`relay-peer-cert-expired`, `relay-own-cert-expired`, `relay-peer-revoked`),
+  and ahead of the end, jittered, after this node's renewal or in its end window. Each
+  relayed client reconnects once per renewal; a live move is not built (ADR amendment
+  of 2026-10-14, relay streams).
 - **2026-10-14** — T3 follow-up (issue #1016): a renewal no longer ends every link made
   before it in the same second. The dialing side of each link makes a new link on the
   renewed certificates alongside the old one and lets the old one go quietly, at a

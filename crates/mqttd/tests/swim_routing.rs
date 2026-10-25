@@ -306,6 +306,8 @@ async fn start_proxy_node(
             node: node_id.clone(),
             placement: placement.clone(),
             connector: None, // plaintext mesh
+            cluster_crl: None,
+            own_cert_end: None,
         }),
         node: Some(node_id.clone()),
         store: None,

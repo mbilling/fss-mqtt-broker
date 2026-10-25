@@ -528,13 +528,66 @@ From the same review:
   sessions that have gone are dropped as they surface, and the heap is rebuilt when they
   outnumber the online sessions.
 
-Not covered, and left open on issue #1016: **ADR 0005 relay streams.** A session relocated
-to its owning node arrives on the peer listener as a `ProxyHello` connection, passes
-`admit_peer_link`, and is then served as a client session, not registered as a peer. So
-neither the expiry sweep nor ADR 0040's revocation sweep ends it, and it outlives the
-certificates of the connection it runs on. Ending it at that end would disconnect every
-relayed client at each renewal; it needs a move of its own (the landing node re-proxying
-on its renewed certificate), which is not built.
+**ADR 0005 relay streams** (the rest of issue #1016). A session relocated to its owning
+node runs on a relay stream: the landing node dials the owner's peer listener under its
+own cluster certificate, sends a `ProxyHello` and splices the client's bytes through. Both
+ends passed `admit_peer_link`, but the stream was never a hub peer, so neither the expiry
+sweep nor ADR 0040's revocation sweep ended it: it outlived the certificates of the
+connection it ran on, and their revocation. Now:
+
+- **Each side holds its end to what it was admitted under** (`hub::relays`). The owner
+  carries the `LinkCert` of the accepted connection into the relocated session's
+  admission; the landing node admits its dial to the owner as a dialed peer link is (the
+  live CRL and both ends, which it did not check before) and registers the splice with its
+  hub. Unconditionally: these are cluster credentials, so D3 and D4 apply, not O2's
+  setting.
+- **At the end:** the once-a-second sweep ends a stream the first second after the earlier
+  end of its handshake's certificates, on whichever side looks first.
+  `WARN relay stream ended: a certificate it was admitted under has expired`, counted as
+  `mqttd_revocation_evictions_total{reason="relay-peer-cert-expired"}` or
+  `reason="relay-own-cert-expired"`. They are labels of their own because a relay stream is
+  one per relayed client, not one per peer: mixed with the links' labels, a count would no
+  longer say how many links ended.
+- **At revocation:** a reload's sweep ends every stream whose remote serial the cluster CRL
+  names, `reason="relay-peer-revoked"`, with a `security.evict` audit record per session
+  on the owner and `relays=N` in the sweep's summary record.
+- **How a stream is ended:** the owner closes the session as the rehome pass does (v5
+  clients get DISCONNECT `0x9C`, "use another server": the client did nothing wrong, the
+  path it was served over has ended); the landing node closes the splice. The client
+  reconnects to the node it uses and is relayed again on the certificates the two nodes
+  hold then. The Will is published, as for every broker-initiated close (#265).
+- **A renewal costs each relayed client one reconnect.** A relay stream cannot move under a
+  live client as a link does: the client's bytes are on one TLS session to the owner, and
+  nothing re-splices them onto another without losing or reordering what is in flight.
+  What is built is that the reconnects are spread instead of all landing in the old
+  certificate's last second, with the links' timing (`MovePlan`):
+  - after this node's own reload commits a renewed certificate, a stream whose end is held
+    by this node's old certificate (strictly earlier than the peer's) is ended at a random
+    moment within half the time left before the margin, at most five minutes;
+  - a stream made at least twenty minutes before its end is ended at a random moment of its
+    end window (a quarter of its life, at most five minutes, closing a minute before the
+    end). That is what moves streams whose two certificates end together (nodes minted
+    together), which neither side's renewal alone makes any later, and a stream whose
+    peer renewed out of this node's sight. A stream made inside the last twenty minutes
+    (the reconnect of one ended in the window when nobody renewed) is held to the hard end
+    only, so it is not ended over and over as the end approaches;
+  - `INFO relay streams ended ahead of their certificate's end, so their clients reconnect
+    on renewed certificates`, with the count, once per sweep tick that ends any; these are
+    not counted as evictions.
+- **Tests:** `peer_link_expiry.rs` `a_relay_stream_ends_when_the_certificate_it_was_admitted_under_expires`
+  (the relayed client is found closed as soon as the peer link is seen to end, 1.6 to
+  2.7 s after `notAfter`, in four runs) and
+  `a_relay_stream_ends_when_the_crl_revokes_the_certificate_it_was_admitted_under` (in
+  the reload's sweep, with the link, under a second after the SIGHUP); `hub::relays` unit
+  tests for the plan.
+
+Still open: moving a live relay stream without disconnecting its client (no mechanism is
+specified; it would need the owner to take the session over on a second stream with
+nothing in flight lost); the spread of a renewal's reconnects is planned, not measured; a
+relayed session's **client** certificate is still checked only by the landing node at the
+handshake (O2 and ADR 0040's client-CRL sweep do not reach it, since the owner never sees
+the client's TLS session); and against a landing node on older code, which neither admits
+its dial nor ends its splice, only the owner's side holds the stream to its certificates.
 
 ## Not verified
 

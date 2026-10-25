@@ -112,6 +112,7 @@ fn admission(subject: &str) -> Admission {
         cert_not_after: None,
         protocol: ProtocolVersion::V311,
         source: None,
+        relay: None,
     }
 }
 

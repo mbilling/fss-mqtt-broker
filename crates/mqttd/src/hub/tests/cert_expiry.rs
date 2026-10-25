@@ -344,3 +344,247 @@ async fn a_replaced_sessions_certificate_end_does_not_end_its_successor() {
     assert!(!hub.online.contains_key(&ClientId("device".into())));
     assert!(hub.client_cert_ends.is_empty());
 }
+
+// ---- Relay streams (ADR 0005, issue #1016) ----
+
+/// What a relay stream from or to the other node was admitted under: its serial `0x16`.
+fn relay_cert(peer: i64, own: i64) -> crate::hub::LinkCert {
+    crate::hub::LinkCert {
+        serial: Some(vec![0x16]),
+        ends: LinkCertEnds {
+            peer: Some(peer),
+            own: Some(own),
+        },
+    }
+}
+
+/// A hub on a clock the test moves, with metrics.
+fn relay_hub() -> (
+    Hub,
+    super::TestClock,
+    Arc<mqtt_observability::metrics::Metrics>,
+) {
+    let (mut hub, _) = Hub::with_config(
+        NodeId("ce-relay".into()),
+        Arc::new(MemorySessionStore::new()),
+    );
+    let clock = super::TestClock::new(1_000);
+    hub.attach_clock(Arc::new(clock.clone()));
+    let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("t"));
+    hub.attach_metrics(metrics.clone());
+    (hub, clock, metrics)
+}
+
+/// Attach v5 session `id` on connection `conn_id`, relocated here over a relay stream
+/// admitted under `cert` (the owner's side).
+async fn attach_relayed(
+    hub: &mut Hub,
+    id: &str,
+    conn_id: u64,
+    cert: crate::hub::LinkCert,
+) -> crate::hub::OutboundRx {
+    let (otx, orx) = mpsc::unbounded_channel::<Box<Outgoing>>();
+    let (reply, wait) = oneshot::channel();
+    let mut admission = admission(id);
+    admission.protocol = ProtocolVersion::V5;
+    admission.relay = Some(Box::new(cert));
+    hub.dispatch(HubCommand::Attach {
+        client: ClientId(id.into()),
+        admission: Box::new(admission),
+        conn_id,
+        clean_start: true,
+        session_expiry: 0,
+        receive_maximum: u16::MAX,
+        will: None,
+        outbound: Outbound::new(otx).0,
+        reply,
+    })
+    .await;
+    quiesce(hub).await;
+    assert!(wait.await.is_ok());
+    orx
+}
+
+/// The landing node's side: a splice registered with the hub. Returns what fires when the
+/// hub ends it.
+async fn open_splice(hub: &mut Hub, id: u64, cert: crate::hub::LinkCert) -> oneshot::Receiver<()> {
+    let (close, closed) = oneshot::channel();
+    hub.dispatch(HubCommand::RelayOpened { id, cert, close })
+        .await;
+    quiesce(hub).await;
+    closed
+}
+
+fn counted(metrics: &mqtt_observability::metrics::Metrics, reason: &str) -> bool {
+    metrics.render().contains(&format!(
+        "mqttd_revocation_evictions_total{{reason=\"{reason}\"}} 1"
+    ))
+}
+
+/// The owner's side: a relocated session ends the second after the earlier end of the
+/// relay stream's certificates — with the client-certificate setting off, since these are
+/// cluster credentials (ADR 0088 D3) — and is told to reconnect.
+#[tokio::test]
+async fn a_relayed_session_ends_with_its_relay_streams_certificate_always() {
+    let (mut hub, _clock, metrics) = relay_hub();
+    assert!(!hub.end_sessions_at_cert_expiry);
+    let mut out = attach_relayed(&mut hub, "relayed", 7, relay_cert(1_040, 9_000)).await;
+    let _direct = attach_with_cert(&mut hub, "direct", 1_040).await;
+    assert_eq!(hub.next_cert_end, 1_040, "the sweep knows when to look");
+
+    hub.end_expired_credentials(1_040).await;
+    assert!(
+        hub.online.contains_key(&ClientId("relayed".into())),
+        "the last second is served"
+    );
+    hub.end_expired_credentials(1_041).await;
+    assert!(!hub.online.contains_key(&ClientId("relayed".into())));
+    assert!(
+        hub.online.contains_key(&ClientId("direct".into())),
+        "a client certificate is O2's, off by default"
+    );
+    let mut told = None;
+    while let Ok(boxed) = out.try_recv() {
+        if let Some(Packet::Disconnect(d)) = boxed.into_packet() {
+            told = Some(d.reason);
+        }
+    }
+    assert_eq!(told, Some(mqtt_codec::reason::USE_ANOTHER_SERVER));
+    assert!(counted(&metrics, "relay-peer-cert-expired"));
+}
+
+/// The landing node's side: the splice ends at this node's own certificate's end, and a
+/// splice that ended by itself is let go.
+#[tokio::test]
+async fn a_splice_ends_at_the_landing_nodes_own_end_and_is_let_go_when_it_closes() {
+    let (mut hub, _clock, metrics) = relay_hub();
+    let mut ending = open_splice(&mut hub, 100, relay_cert(9_000, 1_040)).await;
+    let mut gone = open_splice(&mut hub, 101, relay_cert(9_000, 1_040)).await;
+    hub.dispatch(HubCommand::RelayClosed { id: 101 }).await;
+    quiesce(&mut hub).await;
+    assert!(
+        matches!(gone.try_recv(), Err(oneshot::error::TryRecvError::Closed)),
+        "let go, not ended"
+    );
+
+    hub.end_expired_credentials(1_040).await;
+    assert!(ending.try_recv().is_err(), "the last second is served");
+    hub.end_expired_credentials(1_041).await;
+    assert_eq!(ending.try_recv(), Ok(()), "ended by the hub");
+    assert!(counted(&metrics, "relay-own-cert-expired"));
+    assert_eq!(hub.next_cert_end, i64::MAX);
+}
+
+/// ADR 0040 T4 for relay streams: a reload whose cluster CRL names the other node's serial
+/// ends every stream admitted under it, on both sides, and no other.
+#[tokio::test]
+async fn a_revoked_relay_stream_is_ended_by_the_reloads_sweep() {
+    let (mut hub, _clock, metrics) = relay_hub();
+    let _session = attach_relayed(&mut hub, "relayed", 7, relay_cert(9_000, 9_000)).await;
+    let mut splice = open_splice(&mut hub, 100, relay_cert(9_000, 9_000)).await;
+    let other = crate::hub::LinkCert {
+        serial: Some(vec![0x99]),
+        ..relay_cert(9_000, 9_000)
+    };
+    let mut kept = open_splice(&mut hub, 101, other).await;
+
+    let audit = Arc::new(mqtt_observability::RecordingAuditSink::default());
+    hub.dispatch(HubCommand::SweepIdentities(crate::hub::SweepPolicy {
+        authorizer: Arc::new(mqtt_auth::AllowAll),
+        authenticator: Arc::new(mqtt_auth::basic::BasicAuthenticator {
+            allow_anonymous: true,
+        }),
+        revoked: mqtt_auth::signed_gossip::RevocationList::default(),
+        peer_revoked: mqtt_auth::signed_gossip::RevocationList::from_serials([vec![0x16]]),
+        own_cert_end: None,
+        trigger: "signal".into(),
+        audit: audit.clone(),
+    }))
+    .await;
+    quiesce(&mut hub).await;
+    assert!(!hub.online.contains_key(&ClientId("relayed".into())));
+    assert_eq!(splice.try_recv(), Ok(()));
+    assert!(
+        kept.try_recv().is_err(),
+        "another node's stream is untouched"
+    );
+    assert!(metrics
+        .render()
+        .contains("mqttd_revocation_evictions_total{reason=\"relay-peer-revoked\"} 2"));
+    let events = audit.events();
+    assert!(events
+        .iter()
+        .any(|e| e.kind == "security.evict" && e.detail.starts_with("relay-peer-revoked")));
+    assert!(events
+        .iter()
+        .any(|e| e.kind == "security.sweep" && e.detail.contains("relays=2")));
+}
+
+/// After this node's renewal is committed, the streams its old certificate holds the end of
+/// end within five minutes, ahead of that end and not counted as evictions; one whose end
+/// the other node's certificate holds is left to its window.
+#[tokio::test]
+async fn a_renewal_ends_the_relay_streams_it_renews_soon_after_and_ahead_of_the_end() {
+    let (mut hub, clock, metrics) = relay_hub();
+    let day = 24 * 3600;
+    let own = 1_000 + day;
+    let mut renewed = open_splice(&mut hub, 100, relay_cert(own + day, own)).await;
+    let mut peer_held = open_splice(&mut hub, 101, relay_cert(own - 3600, own)).await;
+
+    clock.advance(3600);
+    hub.dispatch(HubCommand::SweepIdentities(crate::hub::SweepPolicy {
+        authorizer: Arc::new(mqtt_auth::AllowAll),
+        authenticator: Arc::new(mqtt_auth::basic::BasicAuthenticator {
+            allow_anonymous: true,
+        }),
+        revoked: mqtt_auth::signed_gossip::RevocationList::default(),
+        peer_revoked: mqtt_auth::signed_gossip::RevocationList::default(),
+        own_cert_end: Some(own + 30 * day),
+        trigger: "signal".into(),
+        audit: Arc::new(mqtt_observability::RecordingAuditSink::default()),
+    }))
+    .await;
+    quiesce(&mut hub).await;
+    let now = 1_000 + 3600;
+    assert!(
+        hub.next_cert_end <= now + 300,
+        "looked at within five minutes"
+    );
+    hub.end_expired_credentials(now + 301).await;
+    assert_eq!(renewed.try_recv(), Ok(()), "ended soon after the renewal");
+    assert!(
+        peer_held.try_recv().is_err(),
+        "the peer's end holds this one"
+    );
+    let rendered = metrics.render();
+    assert!(
+        !rendered.contains("reason=\"relay-"),
+        "a planned end is not an eviction: {rendered}"
+    );
+}
+
+/// A relocated session taken over by a connection of its own is not ended by the relay
+/// stream its predecessor ran on, whose detach has not arrived yet.
+#[tokio::test]
+async fn a_relay_streams_end_does_not_end_the_session_that_took_it_over() {
+    let (mut hub, _clock, _metrics) = relay_hub();
+    let _old = attach_relayed(&mut hub, "device", 7, relay_cert(1_040, 9_000)).await;
+    let (otx, _orx) = mpsc::unbounded_channel::<Box<Outgoing>>();
+    let (reply, wait) = oneshot::channel();
+    hub.dispatch(HubCommand::Attach {
+        client: ClientId("device".into()),
+        admission: Box::new(admission("device")),
+        conn_id: 8,
+        clean_start: true,
+        session_expiry: 0,
+        receive_maximum: u16::MAX,
+        will: None,
+        outbound: Outbound::new(otx).0,
+        reply,
+    })
+    .await;
+    quiesce(&mut hub).await;
+    assert!(wait.await.is_ok());
+    hub.end_expired_credentials(1_041).await;
+    assert_eq!(hub.online[&ClientId("device".into())].conn_id, 8);
+}

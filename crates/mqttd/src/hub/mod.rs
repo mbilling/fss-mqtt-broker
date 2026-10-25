@@ -84,6 +84,9 @@ pub use lanes::{AppendJob, AppendThen, LaneJob, LaneOutcome, LaneWork};
 pub use qos2::{Qos2LaneOp, Qos2OpOutcome};
 mod policy;
 pub use policy::BrownoutAxis;
+/// Relay streams (ADR 0005) held to the certificates they were admitted under (#1016).
+mod relays;
+use relays::{RelayEnd, RelayHolder, Relays};
 mod retained;
 use retained::{retained_value_id, RetainedMutation, RetainedWindow};
 /// Cached mesh-wholeness answers and their staleness rule (issue #613 item 1.1).
@@ -635,6 +638,12 @@ pub enum AuthMethod {
     Enhanced,
 }
 
+/// The [`next_cert_end`](Hub::next_cert_end) for a relay stream due at `due_ms`: the sweep
+/// looks once `now` (whole seconds) passes it, which is the first second at or after the due.
+fn relay_look(due_ms: i64) -> i64 {
+    (due_ms.saturating_add(999) / 1000).saturating_sub(1)
+}
+
 /// When the certificates a peer link was admitted under end
 /// ([ADR 0088](../../../../docs/adr/0088-credential-lifetimes-and-rotation.md) D3): the
 /// peer's, read from the leaf it presented, and this node's own, as loaded when the link
@@ -675,6 +684,28 @@ impl LinkCertEnds {
     }
 }
 
+/// What a connection on the cluster bus was admitted under: the remote leaf's serial —
+/// the fact a cluster CRL names, recorded so a revocation sweep can re-check it (ADR 0040
+/// T4) — and when the certificates of the handshake end, so the connection is ended then
+/// (ADR 0088 D3). Recorded for a peer link and for a relay stream (ADR 0005, issue #1016)
+/// alike. Empty on a plaintext mesh.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinkCert {
+    /// The remote leaf's serial number (big-endian bytes as encoded in the certificate).
+    pub serial: Option<Vec<u8>>,
+    /// When the handshake's certificates end.
+    pub ends: LinkCertEnds,
+}
+
+impl LinkCert {
+    /// Whether there is anything to hold the connection to: a serial or an end. A
+    /// plaintext mesh's connections have neither.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.serial.is_none() && self.ends.earliest().is_none()
+    }
+}
+
 /// The server-side revocable facts a connection was admitted under (ADR 0040 T1):
 /// what a policy-reload sweep re-evaluates against the new policy. Recorded at
 /// CONNECT and kept with the online entry — the broker retains *facts about* the
@@ -705,6 +736,13 @@ pub struct Admission {
     /// and for transports without one. Reported and filtered on by the admin API
     /// (ADR 0081 T4); never used for a policy decision.
     pub source: Option<std::net::SocketAddr>,
+    /// For a session relocated here (ADR 0005): what the relay stream it runs on was
+    /// admitted under on the peer listener — the relaying node's certificate serial and
+    /// the ends of both certificates of that handshake. The session is ended with the
+    /// stream: at the earlier end, and when the cluster CRL revokes the serial (issue
+    /// #1016). `None` for a session served on its own connection, and on a plaintext mesh.
+    /// Boxed: most sessions have none, and an admission is carried in large futures.
+    pub relay: Option<Box<LinkCert>>,
 }
 
 /// The new policy a successful security reload published, handed to the hub for
@@ -721,6 +759,11 @@ pub struct SweepPolicy {
     /// The cluster CRL's revoked serials (ADR 0040 T4; empty when none is
     /// configured) — the peer sweep tears down established links these name.
     pub peer_revoked: mqtt_auth::signed_gossip::RevocationList,
+    /// This node's own cluster-bus certificate's end (`notAfter`, Unix seconds) after the
+    /// reload, `None` when unknown or plaintext: a later end than a relay stream was
+    /// admitted under is a renewal, and the stream is ended soon after, spread, so its
+    /// client reconnects on the renewed certificate (issue #1016).
+    pub own_cert_end: Option<i64>,
     /// What fired the reload (`signal` / `watch`), for the audit trail.
     pub trigger: String,
     /// Audit sink for the per-eviction `security.evict` records.
@@ -1628,6 +1671,23 @@ pub enum HubCommand {
     /// permission-level tightening removes subscription grants. Sent by the
     /// [`Reloader`](crate::reload::Reloader) after the swap.
     SweepIdentities(SweepPolicy),
+    /// The landing node's side of a relay stream (ADR 0005) is up: a splice to the
+    /// session's owner, dialed under `cert` (issue #1016). The hub ends it — by firing
+    /// `close` — at the earlier end of the handshake's certificates, when the cluster CRL
+    /// revokes the owner's serial, or ahead of the end after a renewal.
+    RelayOpened {
+        /// The splice's id, from the connection-id counter.
+        id: u64,
+        /// What the connection to the owner was admitted under.
+        cert: LinkCert,
+        /// Ends the splice.
+        close: oneshot::Sender<()>,
+    },
+    /// A relay stream's splice has ended by itself.
+    RelayClosed {
+        /// The id it was opened with.
+        id: u64,
+    },
     /// Hand the hub the live authorizer handle (ADR 0040 T3), consulted when a
     /// persistent session resumes: restored subscriptions are re-authorized under
     /// the resuming principal's full identity, so an offline session's tightened
@@ -2095,6 +2155,8 @@ impl HubCommand {
             | Self::SessionRecovered { .. }
             | Self::Detach { .. }
             | Self::Evict { .. }
+            | Self::RelayOpened { .. }
+            | Self::RelayClosed { .. }
             | Self::Subscribe { .. }
             | Self::Unsubscribe { .. }
             | Self::SetQuotas(_)
@@ -2143,6 +2205,8 @@ impl HubCommand {
             | Self::SetBrownout { .. }
             | Self::Detach { .. }
             | Self::Evict { .. }
+            | Self::RelayOpened { .. }
+            | Self::RelayClosed { .. }
             | Self::SweepIdentities(_)
             | Self::AttachAuthorizer(_)
             | Self::AttachRules(_)
@@ -2580,6 +2644,12 @@ pub struct Hub {
     /// consensus RPC, a replication ack, a forward's answer — rather than being lost
     /// with the socket. See [`RetiringLink`].
     retiring_links: Vec<RetiringLink>,
+    /// The relay streams (ADR 0005) this node holds an end of — a relocated session it
+    /// owns, or a splice it lands — with when each is to end (issue #1016): at the earlier
+    /// end of its handshake's certificates, on revocation, or ahead of the end so a
+    /// renewal's reconnects are spread. See [`Relays`]. Boxed: rarely touched, and the
+    /// hub's futures are large enough already.
+    relays: Box<Relays>,
     /// `MQTTD_SHARED_PREFER_LOCAL`: prefer a local member in shared selection.
     shared_prefer_local: bool,
     /// `MQTTD_SHARED_LOCAL_BIAS`: how often the local preference fires, per mille
@@ -3244,6 +3314,7 @@ impl Hub {
                 next_cert_end: i64::MAX,
                 client_cert_ends: std::collections::BinaryHeap::new(),
                 retiring_links: Vec::new(),
+                relays: Box::default(),
                 shared_prefer_local: false,
                 // 1000, not 0: `shared_prefer_local` already defaults to false,
                 // so the bias is unconsulted until something turns prefer-local
@@ -3921,16 +3992,24 @@ impl Hub {
                 let identities = self.sweep_identities(&policy).await;
                 let grants = self.sweep_grants(&policy).await;
                 let peers = self.sweep_peers(&policy);
+                let relays = self.sweep_relays(&policy).await;
                 // One summary record per sweep (ADR 0040 T5), zeros included — the
                 // proof the sweep ran is as valuable as what it did.
                 policy.audit.record(
                     "security.sweep",
                     None,
                     &format!(
-                        "identities={identities} grants={grants} peers={peers}                          (trigger={})",
+                        "identities={identities} grants={grants} peers={peers} \
+                         relays={relays} (trigger={})",
                         policy.trigger
                     ),
                 );
+            }
+            HubCommand::RelayOpened { id, cert, close } => {
+                self.open_relay(id, cert, RelayHolder::Splice(close));
+            }
+            HubCommand::RelayClosed { id } => {
+                self.relays.close(id);
             }
             HubCommand::AttachAuthorizer(watch) => {
                 self.authz = Some(watch);
@@ -5295,6 +5374,8 @@ impl Hub {
         let cert_end = admission
             .cert_not_after
             .filter(|_| self.end_sessions_at_cert_expiry);
+        // A relocated session ends with the relay stream it runs on (issue #1016).
+        let relay = admission.relay.clone();
         self.online.insert(
             client.clone(),
             Online {
@@ -5311,6 +5392,9 @@ impl Hub {
             self.client_cert_ends
                 .push(std::cmp::Reverse((end, client.clone(), conn_id)));
             self.compact_client_cert_ends();
+        }
+        if let Some(relay) = relay {
+            self.open_relay(conn_id, *relay, RelayHolder::Session(client.clone()));
         }
         // Its groups' online prefixes must include it from here on (ADR 0015).
         self.shared.set_client_online(&client, true);
@@ -6275,6 +6359,33 @@ impl Hub {
                 self.evict(&client, "cert-expired").await;
             }
         }
+        // Relay streams (ADR 0005), always: they run on cluster-bus certificates, which
+        // no setting keeps past their end (D3, D4). Some are ended ahead of it, spread,
+        // so a renewal's reconnects do not all come in one second.
+        let mut moved = 0usize;
+        for (key, holder, why) in self.relays.take_due(now.saturating_mul(1000), now) {
+            match why {
+                RelayEnd::Expired(reason) => {
+                    warn!(
+                        reason,
+                        "relay stream ended: a certificate it was admitted under has \
+                         expired (ADR 0088, ADR 0005)"
+                    );
+                    if let Some(m) = &self.metrics {
+                        m.revocation_eviction(reason);
+                    }
+                }
+                RelayEnd::Moved => moved += 1,
+            }
+            self.end_relay(key, holder).await;
+        }
+        if moved > 0 {
+            info!(
+                relays = moved,
+                "relay streams ended ahead of their certificate's end, so their clients \
+                 reconnect on renewed certificates (issue #1016)"
+            );
+        }
         // What is left: the next moment worth looking.
         let peer_ends = self.peers.values().filter_map(|p| p.cert_ends.earliest());
         let retiring_ends = self
@@ -6285,11 +6396,93 @@ impl Hub {
             .client_cert_ends
             .peek()
             .map(|std::cmp::Reverse((end, _, _))| *end);
+        let relay_due = self.relays.next_due_ms().map(relay_look);
         self.next_cert_end = peer_ends
             .chain(retiring_ends)
             .chain(client_end)
+            .chain(relay_due)
             .min()
             .unwrap_or(i64::MAX);
+    }
+
+    /// Hold relay stream `key`, admitted under `cert`, to its certificates (issue #1016).
+    fn open_relay(&mut self, key: u64, cert: LinkCert, holder: RelayHolder) {
+        let now_ms = i64::try_from(self.clock.now_epoch_secs())
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1000);
+        if let Some(due) = self
+            .relays
+            .open(key, cert, holder, now_ms, crate::peer::jitter())
+        {
+            self.next_cert_end = self.next_cert_end.min(relay_look(due));
+        }
+    }
+
+    /// End relay stream `key`: the owner closes the relocated session — told, on MQTT 5,
+    /// to reconnect (`0x9C`; the client did nothing wrong, the path it was served over has
+    /// ended) — and the landing node ends its splice. Either way the client reconnects and
+    /// is relayed again on the certificates the two nodes hold now. The session's Will is
+    /// published, as for every broker-initiated close (#265).
+    async fn end_relay(&mut self, key: u64, holder: RelayHolder) {
+        match holder {
+            RelayHolder::Splice(close) => {
+                let _ = close.send(());
+            }
+            RelayHolder::Session(client) => {
+                let Some(online) = self.online.get(&client).filter(|o| o.conn_id == key) else {
+                    return;
+                };
+                online.tx.closing(HubClose::UseAnotherServer);
+                if online.admission.protocol == ProtocolVersion::V5 {
+                    let _ = online.tx.send(Packet::Disconnect(Disconnect {
+                        reason: mqtt_codec::reason::USE_ANOTHER_SERVER,
+                        properties: mqtt_codec::Properties::new(),
+                    }));
+                }
+                debug!(client = %client.0, "relayed session ended with its relay stream (issue #1016)");
+                self.detach(&client, key, false, None).await;
+            }
+        }
+    }
+
+    /// The relay sweep (ADR 0040 T4, issue #1016): end the relay streams whose remote
+    /// certificate the freshly-reloaded cluster CRL revokes, as [`sweep_peers`](Self::sweep_peers)
+    /// ends the peer links; and, when the reload renewed this node's own certificate, plan
+    /// the streams its old one holds to end soon after, spread ([`Relays::own_renewed`]).
+    async fn sweep_relays(&mut self, policy: &SweepPolicy) -> usize {
+        let revoked = self.relays.take_revoked(&policy.peer_revoked);
+        let ended = revoked.len();
+        if ended > 0 {
+            warn!(
+                relays = ended,
+                trigger = %policy.trigger,
+                "relay sweep: cluster CRL revokes the certificate of established relay \
+                 streams (ADR 0040, ADR 0005)"
+            );
+        }
+        for (key, holder) in revoked {
+            if let Some(m) = &self.metrics {
+                m.revocation_eviction("relay-peer-revoked");
+            }
+            if let RelayHolder::Session(client) = &holder {
+                policy.audit.record(
+                    "security.evict",
+                    Some(&client.0),
+                    &format!("relay-peer-revoked (trigger={})", policy.trigger),
+                );
+            }
+            self.end_relay(key, holder).await;
+        }
+        if let Some(own) = policy.own_cert_end {
+            let now_ms = i64::try_from(self.clock.now_epoch_secs())
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1000);
+            self.relays.own_renewed(own, now_ms, crate::peer::jitter);
+            if let Some(due) = self.relays.next_due_ms() {
+                self.next_cert_end = self.next_cert_end.min(relay_look(due));
+            }
+        }
+        ended
     }
 
     /// Count down the replaced links kept open for their last frames ([`RetiringLink`]),
@@ -6393,6 +6586,9 @@ impl Hub {
         graceful: bool,
         session_expiry_override: Option<u32>,
     ) {
+        // The connection has ended: whatever relay stream it ran on is no longer held
+        // (issue #1016). Its id is the connection's alone, taken over or not.
+        self.relays.close(conn_id);
         // Only act if this is still the current connection; a stale detach from a
         // connection that was already taken over must not disturb the new one.
         // Issue #504: the connection may already have been reaped because its
@@ -9717,6 +9913,7 @@ mod tests {
             cert_not_after: None,
             protocol: ProtocolVersion::V311,
             source: None,
+            relay: None,
         }
     }
 
@@ -11016,6 +11213,7 @@ mod tests {
                 cert_not_after: None,
                 protocol: ProtocolVersion::V5,
                 source: None,
+                relay: None,
             }),
             conn_id: 2,
             clean_start: true,
@@ -11158,6 +11356,7 @@ mod tests {
             cert_not_after: None,
             protocol: ProtocolVersion::V311,
             source: None,
+            relay: None,
         };
         let mut revoked_cert = attach_as("by-cert", cert_admission, 1).await;
         let mut removed_user = attach_as("by-user", admission("bob"), 2).await;
@@ -11171,6 +11370,7 @@ mod tests {
             authenticator: Arc::new(UserGone("bob")),
             revoked: RevocationList::from_serials([vec![0x42]]),
             peer_revoked: RevocationList::default(),
+            own_cert_end: None,
             trigger: "signal".into(),
             audit: audit.clone(),
         }))
@@ -11247,6 +11447,7 @@ mod tests {
             }),
             revoked: RevocationList::default(),
             peer_revoked: RevocationList::default(),
+            own_cert_end: None,
             trigger: "signal".into(),
             audit: audit.clone(),
         }))
@@ -19948,6 +20149,7 @@ mod tests {
                 cert_not_after: None,
                 protocol: ProtocolVersion::V5,
                 source: None,
+                relay: None,
             }),
             conn_id,
             clean_start: false,
