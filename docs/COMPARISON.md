@@ -52,6 +52,115 @@ against that last, honestly disqualifying-for-some fact is verifiability: reprod
 builds, signed artifacts, SBOM, continuous fuzzing, and conformance CI against foreign
 clients — trust that can be checked instead of assumed.
 
+## The matrix at a glance
+
+One row per capability, six brokers, HiveMQ Community Edition among them. This was the
+README's feature matrix until 2026-10-25; the README now shows a subset of these rows
+and links here. The sections below carry the notes, sources and the version detail each
+cell stands for. The HiveMQ CE column has no table of its own below: 💰 there marks a feature
+HiveMQ sells in its commercial edition, as
+[the HiveMQ section](#the-two-names-newcomers-ask-about-hivemq-and-aws-iot-core) describes.
+
+✅ open build · 💰 **paid edition only** · ⚠️ partial · ✖ absent · n/v not verified. Sources and notes: the sections below.
+
+| Feature | mqttd | Mosquitto 2.x | EMQX 6.x | HiveMQ CE | VerneMQ 2.1 | NanoMQ 0.25 |
+|---|---|---|---|---|---|---|
+| **Protocol** | | | | | | |
+| MQTT 3.1.1 + 5.0 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| QoS 0/1/2, retained, LWT | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Shared subscriptions | ✅ cluster-wide | ✅ node | ✅ | ✅ node | ⚠️ | ⚠️ |
+| WebSocket | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| QUIC | ✅ | ✖ | ✅ | ✖ | ✖ | ⚠️ |
+| MQTT-SN gateway | ✖ | ✖ | ✅ | ✖ | ✖ | ✖ |
+| CoAP gateway | ✖ | ✖ | ✅ | ✖ | ✖ | ✖ |
+| **Security** | | | | | | |
+| TLS 1.3 by default | ✅ | ⚠️ | ⚠️ | n/v | ⚠️ | ⚠️ |
+| mTLS | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| JWT client auth | ✅ | ✖ | ✅ | 💰 | ✖ | ✖ |
+| OIDC (JWKS discovery) | ✅ | ✖ | ⚠️ JWKS URL | 💰 | ✖ | ✖ |
+| Hot reload: policy + certs | ✅ | ⚠️ certs from 2.1 | ✅ | ⚠️ certs only | ✅ | ⚠️ no TLS |
+| Revocation reaches live sessions | ✅ | ⚠️ dynsec only | n/v | ✖ | ✖ | n/v |
+| Tamper-evident audit | ✅ | ✖ | n/v | n/v | ✖ | ✖ |
+| **Clustering & durability** | | | | | | |
+| Clustering | ✅ | ✖ | 💰 BSL | 💰 | ✅ (💰 binaries) | ✖ |
+| Replicated sessions | ✅ default | n/a | ⚠️ opt-in | 💰 | ✖ | ✖ |
+| Acked msg survives node loss | ✅ proven | n/a | n/v | 💰 | ✖ | ✖ |
+| Data-safe resize | ✅ | n/a | n/v | 💰 | ⚠️ | n/a |
+| Online backup/restore | ✅ | ⚠️ | n/v | 💰 | n/v | n/v |
+| **Operations** | | | | | | |
+| Prometheus metrics | ✅ (+ opt-in rule stats on `$SYS`) | ✖ `$SYS` only | ✅ | ✅ free extension | ✅ | ✅ |
+| OpenTelemetry export | ✅ | ✖ | ✅ | 💰 | ✖ | ✖ |
+| Helm chart | ✅ | ✖ | ✅ | 💰 | ✅ | ✖ |
+| Kubernetes operator | ✅ | ✖ | ✅ | 💰 | ⚠️ unmaintained | ✖ |
+| Admin API | ✅ mTLS, roles, audited | ⚠️ 2.1: experimental, no auth | ✅ | 💰 | ✅ | ✅ |
+| Admin CLI | ✅ `mqttd --admin` | ⚠️ `mosquitto_ctrl`: security config | ✅ `emqx ctl` | ✖ | ✅ `vmq-admin` | ⚠️ start/reload |
+| Admin dashboard | ✖ by design | ⚠️ 2.1: experimental | ✅ | 💰 | ⚠️ status page | ✖ |
+| **Integration** | | | | | | |
+| Bridge | ✅ | ✅ | ✅ | ✖ | ✅ | ✅ |
+| Rule engine | ✅ EMQX rule SQL, no sinks | ✖ | ✅ | ✖ | ✖ | ✅ |
+| **Build & licence** | | | | | | |
+| Signed reproducible builds + SBOM | ✅ | ✖ | n/v | n/v | ✖ | ✖ |
+| FIPS variant | ✅ | ✖ | n/v | 💰 | ✖ | ✖ |
+| Language | Rust | C | Erlang | Java | Erlang | C |
+| **License** | **Apache-2.0** | EPL/EDL | BSL 1.1 | Apache-2.0 | Apache src / EULA bin | MIT |
+
+## mqttd's feature list
+
+What one mqttd build contains, by area. This was the README's Features section until
+2026-10-25.
+
+| Protocol | |
+|---|---|
+| Versions | MQTT 3.1.1 + 5.0, full semantics; CI-conformant against Mosquitto CLI + Paho |
+| QoS | 0 / 1 / 2; QoS 2 handshake resumes under the same packet id across a crash |
+| Retained | durable, single-owner, consensus-ordered — no wall-clock in correctness |
+| Shared subscriptions | `$share/<group>/<filter>`, **cluster-wide** |
+| MQTT 5 | session/message expiry, topic aliases, flow control, user properties, subscription ids, request/response, enhanced `AUTH`, reason codes |
+| Transports | TCP · TLS 1.3 · WebSocket (ws/wss) · **QUIC** (multi-stream) |
+
+| Security | |
+|---|---|
+| TLS | 1.3 default (rustls / aws-lc-rs); hardened 1.2 opt-in; fleet-sized resumption cache |
+| Identity | mTLS (CN/SAN, CRL) · Argon2id passwords · JWT · **OIDC** with JWKS rotation · fail-closed HTTP auth hook |
+| Authorization | deny-by-default TOML ACL, `%i` / `%c` substitution, `0x87` on denied v5 publish |
+| Session binding | a session cannot be resumed by a different principal |
+| Hot reload | `SIGHUP` / file watch; validate-before-swap; **sweeps live sessions, grants, peer links** |
+| Cluster | mTLS bus, one cert per node; signed, replay-protected gossip |
+| Audit | hash-chained, SIEM schema, offline verifier |
+| Code | Rust, `#![forbid(unsafe_code)]`, every parser fuzzed |
+
+| Scale & HA | |
+|---|---|
+| Mesh | masterless; SWIM membership; auto mTLS peer links; interest-based routing; HRW placement |
+| Durability | openraft lease group + epoch-fenced quorum replication + on-disk redb — **default** |
+| Resize | grow / shrink (`SIGUSR1` drain) / replace with zero acked loss, verified under SIGKILL + partition |
+| Partition | CP: minority serves committed state, retained writes queue until heal |
+| Upgrades | adjacent-release skew (N ↔ N+1), nightly-tested both directions |
+| Backup | online per-node export/restore, window measured |
+
+| Operations | |
+|---|---|
+| Metrics | Prometheus `GET /metrics` + OTLP push; bounded labels |
+| Health | `/livez` · `/readyz` · `/statusz` · `mqttd --probe` |
+| Governance | connection caps (global, per-IP), auth penalty box, quotas, rate limit by backpressure, retained cap, disk/memory watermarks → brownout (refuse, never silent-drop) |
+| Admin | signals + files + `--check-config`; an mTLS admin API and CLI (`mqttd --admin`); **no dashboard, by design** |
+| Packaging | Helm chart · Kubernetes operator (`MqttdCluster` CRD) · Compose · hardened systemd |
+
+| Integrations | |
+|---|---|
+| Bridge | `mqtt-bridge`: separate signed binary/image, deny-by-default directional rules, loop prevention, bounded spool, HA pairs |
+| Rule engine | EMQX-compatible rule SQL: filter, transform and re-route at QoS 0/1/2, evaluated once per message on the node it arrived at; opt-in per-rule statistics and trace on `$SYS`, rules editable through the admin API; EMQX's `jq` function (the real jq, in a WebAssembly sandbox, off unless switched on) and functions of your own as WebAssembly modules pinned by hash; rules that remember, experimental until durable (a keyed, bounded, expiring in-memory store read and written from SQL: duration, change, counts with idempotency keys, silence as an event, distinct counts; per node or replicated to every node; EMQX's `kv_store_*` and `proc_dict_*`); since 1.2.0, rule state experimental ([RULES.md](RULES.md), [cookbook](RULES-COOKBOOK.md), [live demo](../demo/rules-live/README.md)) |
+| Kafka / webhook / DB | `$share` consumer group on durable sessions ([INTEGRATION.md](INTEGRATION.md)); the rule engine has no sinks, by design |
+| Migration | converters for Mosquitto, EMQX, HiveMQ configs + ACLs → reviewed draft ([MIGRATION.md](MIGRATION.md)) |
+| Plugins | HTTP auth hook; `Authenticator` / `Authorizer` traits; no dynamic loader |
+
+### Open == Enterprise
+
+- **One build.** Clustering, quorum durability, mTLS/OIDC, live eviction, audit chain, metrics, Helm, operator, bridge, FIPS variant — all in it.
+- **License:** [Apache-2.0](../LICENSE), binaries and images included. Commercial use, modification, embedding, redistribution: yes.
+- **Paid, ever:** support, SLAs, certified builds. **Never features.**
+- **Procurement:** [SUPPORT.md](../SUPPORT.md) · [compliance/](compliance/) (EU CRA, IEC 62443, SOC 2 / ISO 27001) · SBOM + [VEX](../security/vex/) + SLSA per release.
+
 ## Protocol: MQTT 3.1.1 + 5.0
 
 All five serve MQTT 3.1.1 and 5.0. The differences are in the v5 details:
@@ -223,6 +332,10 @@ not as absent. This file is re-checked at every cross-broker benchmark re-run
 
 ## Changelog
 
+- 2026-10-25 — The README's feature matrix (with its HiveMQ CE column), its feature list and
+  its Open == Enterprise section moved here unchanged, as *The matrix at a glance* and
+  *mqttd's feature list*; the README keeps a subset of the matrix rows. No cell changed, so
+  the date above stays.
 - 2026-10-12 — `v1.2.0` is the first release with the rule engine: the Rule engine row's
   "unreleased" marker is dropped. Nothing else in the row changed.
 - 2026-10-08 — ADR 0084: the Metrics, Admin API, Admin dashboard and Rule engine rows say

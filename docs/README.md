@@ -6,8 +6,9 @@ is listed here with its stakeholder and one line. An unlisted file fails CI
 progress live under [`adr/`](adr/) and [`delivery/`](delivery/) — they are the
 *source* these pages distill, never the thing an external reader is sent to.
 
-The front door is the repository [README](../README.md): numbers first, quick
-start, features, then links. The long-form [GUIDE](../GUIDE.md) keeps the
+The front door is the repository [README](../README.md): why, the evidence in three
+charts, a feature matrix, getting started, then links. Every number it states is in
+[benchmarks/EVIDENCE.md](benchmarks/EVIDENCE.md) with its method. The long-form [GUIDE](../GUIDE.md) keeps the
 "Start here" persona fork: *evaluate it · run it · build against it · secure and
 audit it · contribute*.
 
@@ -27,6 +28,7 @@ audit it · contribute*.
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Operator / SRE | First-deployment failure modes and how to read them. |
 | [KUBERNETES.md](KUBERNETES.md) | Kubernetes user | Helm chart READMEs, values reference, `MqttdCluster` CRD. |
 | [MIGRATION.md](MIGRATION.md) | Migrator | Per-source entry points (Mosquitto, EMQX, HiveMQ) plus the dual-run cutover. |
+| [ROADMAP.md](ROADMAP.md) | Evaluator / contributor | What is planned next and what is not planned, by decision; status lives on the delivery dashboard. |
 | [THREAT-MODEL.md](THREAT-MODEL.md) | Security architect | STRIDE over five trust surfaces; every mitigation names the ADR that decided it. |
 | [HARDENING.md](HARDENING.md) | Auditor | Checkable L1/L2 baseline: control, knob, default, auditor-runnable verification. |
 | [AUDIT-SCHEMA.md](AUDIT-SCHEMA.md) | Auditor / SIEM | Hash-chained audit export: record format, kinds, boundary invariant, verifier. |
@@ -43,6 +45,23 @@ audit it · contribute*.
 | [REVIEW-PANEL.md](REVIEW-PANEL.md) | Maintainer | Method for external-style documentation review panels. |
 | [CAPABILITY-PLAN.md](CAPABILITY-PLAN.md) | Historical | v0.1 mission/principles; live status is the [delivery dashboard](delivery/STATUS.md). |
 
+## By goal
+
+The README's documentation table until 2026-10-25.
+
+| goal | doc |
+|---|---|
+| Everything, long form | [GUIDE.md](../GUIDE.md) — walkthroughs, Limitations, resizing, upgrades, hot reload |
+| Evaluate | [EVALUATION.md](EVALUATION.md) · [COMPARISON.md](COMPARISON.md) |
+| Deploy | [SECURED-CLUSTER-TUTORIAL.md](SECURED-CLUSTER-TUTORIAL.md) · [KUBERNETES.md](KUBERNETES.md) |
+| Build clients | [CLIENT-GUIDE.md](CLIENT-GUIDE.md) |
+| Filter, transform, re-route messages | [RULES.md](RULES.md) · [RULES-COOKBOOK.md](RULES-COOKBOOK.md) |
+| Operate | [OPERATIONS.md](OPERATIONS.md) · [ADMIN-CLI.md](ADMIN-CLI.md) · [ADMIN-API.md](ADMIN-API.md) · [SIZING.md](SIZING.md) · [TROUBLESHOOTING.md](TROUBLESHOOTING.md) |
+| Audit | [THREAT-MODEL.md](THREAT-MODEL.md) · [HARDENING.md](HARDENING.md) · [compliance/](compliance/) |
+| Migrate | [MIGRATION.md](MIGRATION.md) |
+| Decisions | [adr/](adr/) · [delivery dashboard](delivery/STATUS.md) |
+| Terms | [GLOSSARY.md](GLOSSARY.md) |
+
 ## Generated catalogues (not stakeholder primaries)
 
 | Document | Stakeholder | One line |
@@ -56,7 +75,7 @@ audit it · contribute*.
 |---|---|---|
 | [`adr/`](adr/) | Contributor (internal) | Why a decision was made. Frozen once Accepted. |
 | [`delivery/`](delivery/) | Contributor (internal) | How it is built and where each task stands. [STATUS.md](delivery/STATUS.md) is generated. |
-| [`benchmarks/`](benchmarks/) | Evaluator / operator | Published numbers with method, limits, and dated caveats. |
+| [`benchmarks/`](benchmarks/) | Evaluator / operator | Published numbers with method, limits, and dated caveats. Start at [EVIDENCE.md](benchmarks/EVIDENCE.md): every figure the README states, its method and where competitors win. |
 | [`compliance/`](compliance/) | Compliance / procurement | ADR 0067 mappings (EU CRA, IEC 62443, SOC 2/ISO 27001, crypto policy, OpenSSF). |
 | [`postmortems/`](postmortems/) | Operator / contributor | Incident write-ups. |
 | [`review-panels/`](review-panels/) | Maintainer | Dated panel runs. |
