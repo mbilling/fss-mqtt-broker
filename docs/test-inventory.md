@@ -722,10 +722,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `three_nodes_converge_then_detect_failure`
 - `two_nodes_discover_each_other`
 
-## `crates/mqtt-cluster/tests/swim_formation_sim.rs` — 18 test(s)
+## `crates/mqtt-cluster/tests/swim_formation_sim.rs` — 19 test(s)
 
 - `a_cluster_part_way_through_the_upgrade_from_v1_1_forms`
 - `a_formation_run_is_reproducible_from_its_seed`
+- `a_member_cut_off_for_less_than_the_suspicion_window_is_not_dead_once_reachable` — `#[ignore]`d
 - `a_member_cut_off_for_up_to_two_seconds_is_not_declared_dead`
 - `a_member_falsely_declared_dead_is_readmitted_within_the_tombstone_ttl`
 - `a_member_that_cannot_complete_a_round_trip_is_declared_dead_as_before`

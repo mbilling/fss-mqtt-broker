@@ -2457,6 +2457,17 @@ IGNORE_ALLOWLIST: dict[str, tuple[str, str | None]] = {
         "which every tier runs",
         None,
     ),
+    # A known defect, asserted as the behaviour the issue states is correct, so it fails on
+    # main by design (deterministically: the simulation is a pure function of its seed). No
+    # tier runs it until 0087-T10b decides the bound; the fix removes the `#[ignore]` and
+    # this entry together, or T10b's decision removes both with the issue.
+    "crates/mqtt-cluster/tests/swim_formation_sim.rs::a_member_cut_off_for_less_than_the_suspicion_window_is_not_dead_once_reachable": (
+        "known defect #975: a member of a formed cluster cut off for 2.5 s or 3 s, less than "
+        "the 4 s suspicion window, is turned DEAD by some node after the cut has ended in 1 to "
+        "8 of 32 seeded runs at 10, 14 and 16 nodes (a relayed DEAD is adopted unchecked, and "
+        "the window does not grow with the cluster)",
+        None,
+    ),
     "crates/mqttd/tests/swim_formation_proc.rs::a_broker_stopped_for_two_seconds_is_declared_dead_by_no_one": (
         "twelve spawned brokers, one stopped (SIGSTOP) for two seconds eight times, "
         "asserting that no broker declares it DEAD (issue #975): a verdict is a matter of "
