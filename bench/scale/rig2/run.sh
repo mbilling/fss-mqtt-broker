@@ -15,6 +15,12 @@
 #
 # Teardown (bench/scale/teardown.sh: tofu destroy, then the label audit) is trapped on
 # EXIT/INT/TERM. KEEP_INFRA=1 skips it and says so. Hetzner only (CLOUD=hcloud).
+# Every long child (tofu, the bootstrap, each ladder) runs in the background under `wait`
+# (run_fg), so a TERM or Ctrl-C reaches the trap at once: bash defers a trap until a
+# FOREGROUND child returns, and on the first 10-node run (2026-10-26) a TERM sat
+# unhandled behind a ladder until the fleet was killed and torn down by hand. The trap
+# stops this run's children first, then tears down; a second INT/TERM does not cut the
+# teardown short.
 #
 # Live Grafana is ON by default (OBSERVE=0 disables): bench/scale/observe.sh runs
 # Grafana, Prometheus and Alloy in Docker on THIS machine; generator host 0 runs the old
@@ -117,6 +123,52 @@ phase() { # phase <name> [detail]: the run's phase on the dashboards; best-effor
 	"$SCALE_DIR/observe.sh" phase "$1" "${2:-}" 2>/dev/null || true
 }
 
+# ── signals: the trap must run while a child is still working ───────────────────────
+# run_fg <cmd...>: run <cmd> (a command or a function) as a background job and wait for
+# it. `wait` returns as soon as a trapped signal arrives, so the trap runs at once; a
+# foreground child would hold the trap back until it exits. Never inside $(...): the
+# shell then waits for the substitution, which is just as deaf.
+run_fg() {
+	"$@" &
+	local pid=$! rc=0
+	wait "$pid" || rc=$?
+	return "$rc"
+}
+descendants() { # descendants <pid>: every process below <pid>, parents first
+	local c
+	for c in $(pgrep -P "$1" 2>/dev/null); do
+		echo "$c"
+		descendants "$c"
+	done
+}
+# stop_children: TERM every process this run started (ladders, generators, ssh, tofu),
+# wait up to CHILD_GRACE s for them to go (a TERMed tofu writes its state before it
+# exits, and the destroy that follows needs that state and its lock), then KILL. The
+# keep-awake assertion stays: the teardown is exactly when the laptop must not sleep.
+CHILD_GRACE="${CHILD_GRACE:-60}"
+stop_children() {
+	local pids="" p t alive
+	for p in $(descendants $$); do
+		[ "$p" != "${BENCH_KEEP_AWAKE_PID:-}" ] || continue
+		kill -0 "$p" 2>/dev/null && pids="$pids $p"
+	done
+	[ -n "$pids" ] || return 0
+	# shellcheck disable=SC2086 # a list of pids
+	kill -TERM $pids 2>/dev/null || true
+	for ((t = 0; t < CHILD_GRACE * 5; t++)); do
+		alive=0
+		for p in $pids; do
+			# A child already gone but not yet reaped is a zombie: gone.
+			case "$(ps -o stat= -p "$p" 2>/dev/null)" in "" | Z*) ;; *) alive=1 ;; esac
+		done
+		[ "$alive" = 1 ] || return 0
+		sleep 0.2
+	done
+	warn "children still running after ${CHILD_GRACE}s — killing them"
+	# shellcheck disable=SC2086
+	kill -KILL $pids 2>/dev/null || true
+}
+
 for w in $WORKLOADS; do
 	[ -f "$RIG2/workloads/$w.env" ] || die "no workload $w (have: $(cd "$RIG2/workloads" && ls ./*.env | sed 's|./||; s|\.env||' | tr '\n' ' '))"
 done
@@ -172,16 +224,28 @@ if [ "$TIER" = local ]; then
 	BINARY_DESC="local build $MQTTD_BIN ($("$MQTTD_BIN" --version 2>/dev/null | head -1), git $(git -C "$REPO_ROOT" rev-parse --short HEAD))"
 	stop_local() {
 		local rc=$?
-		trap - EXIT INT TERM
+		trap - EXIT
+		trap '' INT TERM
+		[ "$rc" -eq 0 ] || say "stopping (trap; exit code was $rc): this run's processes, then the local cluster"
+		stop_children
+		# A step's scrape loops are detached (nohup), so no child of this run: stop them by
+		# their pid files (in the cloud they go with the hosts).
+		# Only a pid that still is a scrape loop: a stopped one's pid may be reused.
+		local pidf pid
+		for pidf in "$RUN"/hosts/broker-*/steps/*/scrape.pid; do
+			[ -f "$pidf" ] || continue
+			pid=$(cat "$pidf")
+			ps -o command= -p "$pid" 2>/dev/null | grep -q scrape-loop.py && kill "$pid" 2>/dev/null || true
+		done
 		phase idle "local run ended"
 		MQTTD_BIN="$MQTTD_BIN" "$RIG2/local-cluster.sh" stop "$RUN/local" || true
 		exit "$rc"
 	}
 	trap stop_local EXIT INT TERM
-	MQTTD_BIN="$MQTTD_BIN" "$RIG2/local-cluster.sh" start "$RUN/local" "$BROKERS"
+	MQTTD_BIN="$MQTTD_BIN" run_fg "$RIG2/local-cluster.sh" start "$RUN/local" "$BROKERS"
 	ENDPOINTS=$(cut -f2 "$RUN/local/brokers.tsv" | paste -sd, -)
 	if [ "$OBSERVE" = 1 ]; then
-		"$SCALE_DIR/observe.sh" attach-local "$RUN" "$RUN/local/brokers.tsv" "$(gen_metrics_addr 0)" ||
+		run_fg "$SCALE_DIR/observe.sh" attach-local "$RUN" "$RUN/local/brokers.tsv" "$(gen_metrics_addr 0)" ||
 			warn "observe attach failed (is Docker running?) — continuing unobserved; OBSERVE=0 skips it"
 	fi
 	for i in $(seq 0 $((BROKERS - 1))); do mkdir -p "$(host_dir "broker-$i")"; cp "$RIG2/scrape-loop.py" "$(host_dir "broker-$i")/"; done
@@ -211,7 +275,8 @@ else
 	fi
 	LOAD_BIN="${MQTT_LOAD_BIN:-}"
 	if [ -z "$LOAD_BIN" ]; then
-		LOAD_BIN=$("$RIG2/build-mqtt-load.sh" | tail -1)
+		run_fg "$RIG2/build-mqtt-load.sh" >"$RUN/mqtt-load-path"
+		LOAD_BIN=$(tail -1 "$RUN/mqtt-load-path")
 	fi
 	file "$LOAD_BIN" 2>/dev/null | grep -q "x86-64" || die "$LOAD_BIN is not an x86-64 binary (build-mqtt-load.sh builds one)"
 	if [ -t 0 ] && [ "${RIG2_YES:-0}" != 1 ]; then
@@ -222,7 +287,10 @@ else
 	fi
 	cloud_teardown() {
 		local rc=$?
-		trap - EXIT INT TERM
+		trap - EXIT
+		# The fleet must go even if the operator presses Ctrl-C again.
+		trap '' INT TERM
+		stop_children
 		# The tunnel is a local ssh process; the bridge dies with generator host 0.
 		[ "$OBSERVE" != 1 ] || "$SCALE_DIR/observe.sh" detach 2>/dev/null || true
 		phase teardown "rig2 $TIER"
@@ -242,7 +310,8 @@ else
 		exit "$rc"
 	}
 	trap cloud_teardown EXIT INT TERM
-	(cd "$TFDIR" && "$TF" init -input=false >"$RUN/tf-init.log" 2>&1) || { cat "$RUN/tf-init.log" >&2; die "tofu init failed"; }
+	tf() { cd "$TFDIR" && "$TF" "$@"; } # run under run_fg: a background job, so the cd stays there
+	run_fg tf init -input=false >"$RUN/tf-init.log" 2>&1 || { cat "$RUN/tf-init.log" >&2; die "tofu init failed"; }
 	TF_APPLY_ARGS=(-var node_count="$BROKERS" -var driver_count="$GENERATORS"
 		-var broker_server_type="$BROKER_TYPE" -var driver_server_type="$GEN_TYPE"
 		-var run_label="rig2-$STAMP" -var mqttd_version="$MQTTD_VERSION"
@@ -253,19 +322,20 @@ else
 	declare -p TF_APPLY_ARGS >"$RUN/tf-apply-args.sh"
 	phase provisioning "rig2 $TIER: $BROKERS x $BROKER_TYPE + $GENERATORS x $GEN_TYPE"
 	say "provisioning $BROKERS x $BROKER_TYPE + $GENERATORS x $GEN_TYPE"
-	(cd "$TFDIR" && "$TF" apply -auto-approve -input=false "${TF_APPLY_ARGS[@]}" >"$RUN/tf-apply.log" 2>&1) ||
+	run_fg tf apply -auto-approve -input=false "${TF_APPLY_ARGS[@]}" >"$RUN/tf-apply.log" 2>&1 ||
 		{ tail -30 "$RUN/tf-apply.log" >&2; die "tofu apply failed"; }
 	INVENTORY="$RUN/inventory.json"
-	(cd "$TFDIR" && "$TF" output -json inventory) >"$INVENTORY"
+	run_fg tf output -json inventory >"$INVENTORY"
 	: >"$RUN/known_hosts"
-	await_fleet
+	run_fg await_fleet
 	phase bootstrapping "rig2 $TIER: $BROKERS nodes"
-	"$SCALE_DIR/bootstrap-cluster.sh" "$RUN" "$INVENTORY" durable
+	run_fg "$SCALE_DIR/bootstrap-cluster.sh" "$RUN" "$INVENTORY" durable
 	if [ "$OBSERVE" = 1 ]; then
-		OBSERVE_GEN_METRICS_PORT="$LOAD_METRICS_PORT" "$SCALE_DIR/observe.sh" attach "$RUN" "$INVENTORY" ||
+		OBSERVE_GEN_METRICS_PORT="$LOAD_METRICS_PORT" run_fg "$SCALE_DIR/observe.sh" attach "$RUN" "$INVENTORY" ||
 			warn "observe attach failed — continuing unobserved (OBSERVE=0 skips it)"
 	fi
 	ENDPOINTS=$(jq -r '[.brokers[].mqtt_plain] | join(",")' "$INVENTORY")
+	mapfile -t BROKER_PRIV < <(jq -r '.brokers[].private_ip' "$INVENTORY")
 	for i in $(seq 0 $((BROKERS - 1))); do
 		on_broker "$i" 'mkdir -p $H'
 		rscp "$RIG2/scrape-loop.py" "root@$(broker_pub_ip "$i"):$REMOTE_H/"
@@ -290,48 +360,174 @@ json.dump({"tier": "$TIER", "brokers": $BROKERS, "broker_type": "$BROKER_TYPE" i
 PY
 
 # ── one step ────────────────────────────────────────────────────────────────────────
-scrape_once_all() { # scrape_once_all <dir>: one /metrics per broker into <dir>/broker-<i>.prom
-	local d="$1" i
-	mkdir -p "$d"
-	for ((i = 0; i < BROKERS; i++)); do
-		if [ "$TIER" = local ]; then
-			curl -s -m 10 "$(broker_metrics_url "$i")" >"$d/broker-$i.prom" || return 1
-		else
-			rssh "$(broker_pub_ip "$i")" "curl -s -m 10 http://localhost:8080/metrics" >"$d/broker-$i.prom" || return 1
-		fi
+# Fan-out to the brokers: at most SSH_PAR ssh sessions at once (sshd's MaxSessions and
+# MaxStartups, and this machine's fd limit, which an earlier run hit), every call tried
+# up to SSH_TRIES times. A settle scrape is one pass over every broker: in the cloud ONE
+# ssh to generator host 0, which curls every broker's /metrics over the private network
+# in parallel (the health port is private-only); a broker that pass misses is asked
+# again directly over its own ssh. Ten scrapes in a row from the laptop took 10-15 s a
+# pass on the first 10-node run, and one failure reset the whole settle.
+SSH_PAR="${SSH_PAR:-5}"
+SSH_TRIES="${SSH_TRIES:-2}"
+SCRAPE_TRIES="${SCRAPE_TRIES:-2}"
+SETTLE_POLL="${SETTLE_POLL:-5}"
+for_brokers() { # for_brokers <fn> [broker...]: <fn> <i> for each broker (default: all), SSH_PAR at a time, each tried SSH_TRIES times; prints the brokers that failed every try
+	local fn="$1" k n i t
+	shift
+	local -a list=("$@") failed=() pids who
+	[ "${#list[@]}" -gt 0 ] || for ((i = 0; i < BROKERS; i++)); do list+=("$i"); done
+	for ((k = 0; k < ${#list[@]}; k += SSH_PAR)); do
+		pids=() who=()
+		for i in "${list[@]:k:SSH_PAR}"; do
+			(
+				for ((t = 1; t <= SSH_TRIES; t++)); do
+					"$fn" "$i" >/dev/null && exit 0
+					[ "$t" -ge "$SSH_TRIES" ] || sleep 1
+				done
+				exit 1
+			) &
+			pids+=($!) who+=("$i")
+		done
+		for n in "${!pids[@]}"; do wait "${pids[n]}" || failed+=("${who[n]}"); done
 	done
+	echo "${failed[*]-}"
 }
 
-await_idle() { # await_idle <step-dir> <budget-s> <quiet-s>: settle, then print the record as JSON
-	local d="$1/pre" budget="$2" quiet="$3" waited=0 state since=-1 prev="" ok
-	while :; do
-		state="" ok=0
-		if scrape_once_all "$d"; then
-			state=$(python3 "$RIG2/verdict.py" idle --floor "$IDLE_FLOOR" --baseline-sessions "$BASELINE_SESSIONS" \
-				${prev:+--prev "$prev"} "$d"/broker-*.prom) && ok=1
+prom_complete() { [ -s "$1" ] && [ "$(tail -n 1 "$1")" = "# EOF" ]; } # mqttd ends every exposition with # EOF
+
+# Fetchers: broker <i>'s /metrics into $SCRAPE_TMP/broker-<i>.prom (a .part file renamed
+# when complete, so nobody ever reads half of one).
+fetch_direct() {
+	local out="$SCRAPE_TMP/broker-$1.prom"
+	if [ "$TIER" = local ]; then
+		curl -sf -m 10 "$(broker_metrics_url "$1")" -o "$out.part" || { rm -f "$out.part"; return 1; }
+	else
+		run_bounded 30 rssh "$(broker_pub_ip "$1")" "curl -sf -m 10 http://localhost:8080/metrics" >"$out.part" 2>/dev/null ||
+			{ rm -f "$out.part"; return 1; }
+	fi
+	prom_complete "$out.part" && mv -f "$out.part" "$out" || { rm -f "$out.part"; return 1; }
+}
+fetch_via_gen0() { # fetch_via_gen0 <broker...>: one ssh to generator host 0 for all of them
+	local s='t=$(mktemp -d) || exit 1; ' i
+	for i; do
+		s+="(curl -sf -m 10 http://${BROKER_PRIV[i]}:8080/metrics -o \$t/broker-$i.prom || rm -f \$t/broker-$i.prom) & "
+	done
+	s+='wait; tar -C "$t" -cf - . ; rm -rf "$t"'
+	run_bounded 30 rssh "$(driver_pub_ip 0)" "$s" 2>/dev/null | tar -xf - -C "$SCRAPE_TMP" 2>/dev/null || true
+}
+
+# scrape_once_all <dir>: one pass, every broker's /metrics into <dir>/broker-<i>.prom.
+# 0 when every broker answered: the files are then all from this pass, each renamed
+# into place. 1 when some did not after SCRAPE_TRIES rounds: <dir> keeps the previous
+# complete pass, and <dir>/.missing names the brokers this one missed.
+scrape_once_all() {
+	local d="$1" i try
+	local -a missing=() still
+	mkdir -p "$d"
+	SCRAPE_TMP="$d/.pass"
+	rm -rf "$SCRAPE_TMP"
+	mkdir -p "$SCRAPE_TMP"
+	for ((i = 0; i < BROKERS; i++)); do missing+=("$i"); done
+	for ((try = 1; try <= SCRAPE_TRIES && ${#missing[@]} > 0; try++)); do
+		if [ "$TIER" != local ] && [ "$try" = 1 ]; then
+			fetch_via_gen0 "${missing[@]}"
+		else
+			SSH_TRIES=1 for_brokers fetch_direct "${missing[@]}" >/dev/null
 		fi
-		if [ "$ok" = 1 ]; then
-			[ "$since" -ge 0 ] || since=$waited
-			if [ $((waited - since)) -ge "$quiet" ]; then
-				echo "{\"idle\": true, \"waited_s\": $waited, \"quiet_s\": $quiet, \"budget_s\": $budget, \"state\": $state}"
-				return 0
+		still=()
+		for i in "${missing[@]}"; do
+			prom_complete "$SCRAPE_TMP/broker-$i.prom" || { rm -f "$SCRAPE_TMP/broker-$i.prom"; still+=("$i"); }
+		done
+		missing=(${still[@]+"${still[@]}"})
+	done
+	if [ "${#missing[@]}" -gt 0 ]; then
+		echo "${missing[*]}" >"$d/.missing"
+		rm -rf "$SCRAPE_TMP"
+		return 1
+	fi
+	for ((i = 0; i < BROKERS; i++)); do mv -f "$SCRAPE_TMP/broker-$i.prom" "$d/broker-$i.prom"; done
+	rm -rf "$SCRAPE_TMP" "$d/.missing"
+}
+
+# await_idle <step-dir> <budget-s> <quiet-s>: settle, then print the record as JSON.
+# Budget and quiet are wall-clock seconds since the call. A pass that missed a broker
+# is UNKNOWN: it neither confirms the quiet period nor restarts it, and the next
+# complete pass is compared with the last complete one, so a counter that moved in
+# between still shows. Only a complete pass that is not idle restarts the quiet period.
+# A broker that never answered within the budget is named in the VOID's reasons.
+await_idle() {
+	local d="$1/pre" budget="$2" quiet="$3" t0=$SECONDS t state since=-1 prev="" rc i passes=0 unknown=0
+	local -a answered=() missed=()
+	for ((i = 0; i < BROKERS; i++)); do answered+=(0) missed+=(0); done
+	mkdir -p "$d"
+	while :; do
+		t=$((SECONDS - t0))
+		passes=$((passes + 1))
+		state=""
+		if scrape_once_all "$d"; then
+			for ((i = 0; i < BROKERS; i++)); do answered[i]=1; done
+			rc=0
+			state=$(python3 "$RIG2/verdict.py" idle --floor "$IDLE_FLOOR" --baseline-sessions "$BASELINE_SESSIONS" \
+				${prev:+--prev "$prev"} "$d"/broker-*.prom) || rc=$?
+			if [ -z "$state" ]; then
+				warn "verdict.py idle printed nothing (exit $rc) — this pass counts as unknown"
+				unknown=$((unknown + 1))
+			else
+				if [ "$rc" = 0 ]; then
+					[ "$since" -ge 0 ] || since=$t
+				else
+					since=-1
+				fi
+				prev="$d/state.json"
+				printf '%s\n' "$state" >"$prev.tmp" && mv -f "$prev.tmp" "$prev"
 			fi
 		else
-			since=-1
+			unknown=$((unknown + 1))
+			for i in $(cat "$d/.missing"); do missed[i]=$((missed[i] + 1)); done
+			for ((i = 0; i < BROKERS; i++)); do
+				case " $(cat "$d/.missing") " in *" $i "*) ;; *) answered[i]=1 ;; esac
+			done
 		fi
-		prev=""
-		if [ -n "$state" ]; then
-			prev="$d/state.json"
-			printf '%s\n' "$state" >"$prev"
-		fi
-		if [ "$waited" -ge "$budget" ]; then
-			warn "cluster not settled after ${budget}s: $( [ -n "$prev" ] && python3 -c 'import json,sys; print("; ".join(json.load(open(sys.argv[1])).get("why_not") or []))' "$prev" 2>/dev/null || echo "scrapes unreadable") — the step will be VOID (unreset)"
-			echo "{\"idle\": false, \"waited_s\": $waited, \"quiet_s\": $quiet, \"budget_s\": $budget, \"state\": ${state:-null}}"
+		if [ -n "$state" ] && [ "$since" -ge 0 ] && [ $((t - since)) -ge "$quiet" ]; then
+			settle_record true "$((SECONDS - t0))" "$quiet" "$budget" "$passes" "$unknown" "$prev" "${answered[*]}" "${missed[*]}"
 			return 0
 		fi
-		sleep 5
-		waited=$((waited + 5))
+		if [ $((SECONDS - t0)) -ge "$budget" ]; then
+			state=$(settle_record false "$((SECONDS - t0))" "$quiet" "$budget" "$passes" "$unknown" "$prev" "${answered[*]}" "${missed[*]}")
+			warn "cluster not settled after $((SECONDS - t0))s (budget ${budget}s): $(python3 -c 'import json,sys; print("; ".join(json.loads(sys.argv[1])["state"]["why_not"]))' "$state") — the step will be VOID (unreset)"
+			echo "$state"
+			return 0
+		fi
+		sleep "$SETTLE_POLL"
 	done
+}
+settle_record() { # settle_record <idle> <waited> <quiet> <budget> <passes> <unknown> <state-file|""> <answered...> <missed...>: the JSON await_idle prints
+	python3 - "$@" <<'PY'
+import json, sys
+idle, waited, quiet, budget, passes, unknown, state_file, answered, missed = sys.argv[1:10]
+answered, missed = [int(x) for x in answered.split()], [int(x) for x in missed.split()]
+state = None
+if state_file:
+    try:
+        state = json.load(open(state_file))
+    except (OSError, ValueError):
+        state = None
+rec = {"idle": idle == "true", "waited_s": int(waited), "quiet_s": int(quiet), "budget_s": int(budget),
+       "passes": int(passes), "unknown_passes": int(unknown),
+       "scrape_misses": {f"broker-{i}": n for i, n in enumerate(missed) if n}, "state": state}
+if not rec["idle"]:
+    why = list((state or {}).get("why_not") or [])
+    never = [f"broker-{i}" for i, a in enumerate(answered) if not a]
+    if never:
+        why.append(f"no scrape of {', '.join(never)} answered in {waited} s")
+    elif not why and int(unknown):
+        why.append(f"{unknown} of {passes} scrape passes incomplete ("
+                   + ", ".join(f"{b} missed {n}" for b, n in rec["scrape_misses"].items()) + ")")
+    if state is None:
+        state = rec["state"] = {}
+    state["why_not"] = why
+print(json.dumps(rec))
+PY
 }
 
 launch_gens() { # launch_gens <local-dir> <host-id> <per-gen rate> <warmup> <measure>: one mqtt-load per generator, together
@@ -372,8 +568,20 @@ prime_ladder() { # prime_ladder <ladder-dir>: unmeasured load at the start rate 
 	launch_gens "$ladder/prime" "$ARM-$WORKLOAD-prime" "$per_gen" $((PRIME_SECS - WINDOW)) "$WINDOW"
 }
 
+# A step's scrape loop on broker <i>, for the step $hid (run_step's): started (any loop
+# left by an earlier try of the same start is stopped first), stopped, fetched.
+scrape_loop_start() {
+	on_broker "$1" "[ -f \$H/steps/$hid/scrape.pid ] && kill \$(cat \$H/steps/$hid/scrape.pid) 2>/dev/null; rm -rf \$H/steps/$hid; mkdir -p \$H/steps/$hid; nohup python3 \$H/scrape-loop.py --url '$(broker_metrics_url "$1")' \
+		--out \$H/steps/$hid/scrapes --interval $SCRAPE_INTERVAL --max-secs 1800 >/dev/null 2>&1 </dev/null & echo \$! >\$H/steps/$hid/scrape.pid"
+}
+scrape_loop_stop() { on_broker "$1" "kill \$(cat \$H/steps/$hid/scrape.pid) 2>/dev/null; true"; }
+scrape_loop_fetch() {
+	rm -rf "$step/scrapes/broker-$1"
+	get_broker "$1" "steps/$hid/scrapes" "$step/scrapes/broker-$1"
+}
+
 run_step() { # run_step <ladder-dir> <index> <rate> <why the ramp chose it>
-	local ladder="$1" idx="$2" rate="$3" why="$4" id hid step i per_gen idle attempt prev_v budget quiet
+	local ladder="$1" idx="$2" rate="$3" why="$4" id hid step i per_gen idle attempt prev_v budget quiet failed
 	attempt=$(find "$ladder/steps" -maxdepth 1 \( -name "[0-9]*-$rate" -o -name "[0-9]*-$rate-a*" \) 2>/dev/null | wc -l | tr -d ' ')
 	attempt=$((attempt + 1))
 	id=$(printf '%02d-%s' "$idx" "$rate")
@@ -403,24 +611,23 @@ json.dump({"index": $idx, "id": "$id", "rate": float($rate), "attempt": $attempt
 PY
 	say "[$WORKLOAD] step $id: $rate msg/s offered ($GENERATORS generator(s) x $per_gen)"
 	phase running "$WORKLOAD step $id: $rate msg/s"
-	for ((i = 0; i < BROKERS; i++)); do
-		on_broker "$i" "rm -rf \$H/steps/$hid; mkdir -p \$H/steps/$hid; nohup python3 \$H/scrape-loop.py --url '$(broker_metrics_url "$i")' \
-			--out \$H/steps/$hid/scrapes --interval $SCRAPE_INTERVAL --max-secs 1800 >/dev/null 2>&1 </dev/null & echo \$! >\$H/steps/$hid/scrape.pid"
-	done
+	# In parallel (SSH_PAR at a time) and retried: a broker whose loop did not start, or
+	# whose scrapes did not come back, leaves the judge short of that broker (VOID), not
+	# the run dead under set -e.
+	failed=$(for_brokers scrape_loop_start)
+	[ -z "$failed" ] || warn "scrape loop did not start on broker(s) $failed"
 	sleep "$SCRAPE_INTERVAL"
 	launch_gens "$step" "$hid" "$per_gen" "$WARMUP" "$MEASURE"
 	sleep "$SCRAPE_INTERVAL"
-	for ((i = 0; i < BROKERS; i++)); do
-		on_broker "$i" "kill \$(cat \$H/steps/$hid/scrape.pid) 2>/dev/null; true"
-	done
+	failed=$(for_brokers scrape_loop_stop)
+	[ -z "$failed" ] || warn "could not stop the scrape loop on broker(s) $failed (it stops itself after 1800 s)"
 	sleep 1
-	for ((i = 0; i < BROKERS; i++)); do
-		get_broker "$i" "steps/$hid/scrapes" "$step/scrapes/broker-$i" || warn "could not fetch broker $i's scrapes"
-	done
+	failed=$(for_brokers scrape_loop_fetch)
+	[ -z "$failed" ] || warn "could not fetch the scrapes of broker(s) $failed"
 	python3 "$RIG2/verdict.py" judge "$step" | while IFS= read -r line; do say "  $line"; done
 }
 
-run_ladder() { # run_ladder <workload>, in a subshell so one workload's values never leak into the next
+run_ladder() { # run_ladder <workload>, as a background job (run_fg): its own subshell
 	WORKLOAD="$1"
 	# shellcheck disable=SC1090
 	. "$RIG2/workloads/$WORKLOAD.env"
@@ -465,7 +672,9 @@ fi
 say "baseline: $BASELINE_SESSIONS session(s) on the fresh cluster"
 
 for w in $WORKLOADS; do
-	(run_ladder "$w")
+	# A background job (its own subshell: one workload's values never leak into the
+	# next) under `wait`, so a TERM reaches the trap mid-ladder.
+	run_fg run_ladder "$w"
 done
 
 phase collecting "rig2 report"
