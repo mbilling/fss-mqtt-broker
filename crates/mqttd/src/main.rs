@@ -766,6 +766,7 @@ async fn main() -> Result<(), StartupError> {
         connector: peer_tls.as_ref().map(|t| t.connector.clone()),
         cluster_crl: peer_tls.as_ref().map(|t| t.gossip_crl.clone()),
         own_cert_end: peer_tls.as_ref().map(|t| t.own_cert_end.clone()),
+        durable: durable_plane.is_some(),
     };
     let (policy, mut reloader, trace_rx) = client_policy(
         &live_config,

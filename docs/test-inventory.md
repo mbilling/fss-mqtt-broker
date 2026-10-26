@@ -1527,7 +1527,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 879 test(s)
+## `crates/mqttd/src/lib.rs` — 884 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1640,6 +1640,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `config_watch::tests::no_change_does_not_reload`
 - `conn::peer_closed::tests::a_fin_behind_unread_data_is_seen_without_consuming_the_data_or_spinning`
 - `conn::peer_closed::tests::a_reset_behind_unread_data_is_seen`
+- `conn::relocation_tests::a_durable_node_places_by_the_committed_lease`
+- `conn::relocation_tests::a_node_without_the_durable_plane_places_by_the_ring`
+- `conn::relocation_tests::a_persistent_connect_waits_for_its_owner_during_startup`
+- `conn::relocation_tests::every_resume_and_every_retained_session_is_served_by_its_owner`
+- `conn::relocation_tests::the_wait_for_an_owner_is_bounded`
 - `conn::tests::a_client_cannot_size_the_outbound_alias_table_by_asking_for_more`
 - `conn::tests::a_client_disconnect_is_still_reported_as_graceful`
 - `conn::tests::a_denied_qos0_publish_stays_a_silent_drop_in_both_versions`
@@ -2908,6 +2913,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd/tests/resource_limits.rs` — 1 test(s)
 
 - `offline_queue_drops_oldest_past_the_cap`
+
+## `crates/mqttd/tests/resume_expiry_zero_proc.rs` — 1 test(s)
+
+- `a_resume_with_session_expiry_zero_is_served_by_every_node`
 
 ## `crates/mqttd/tests/retained.rs` — 6 test(s)
 

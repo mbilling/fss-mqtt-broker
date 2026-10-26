@@ -260,6 +260,11 @@ pub struct ProxyContext {
     /// it: no relay is dialed past it, and one dialed before it ends at it (issue #1016).
     /// `None` = not tracked.
     pub own_cert_end: Option<crate::peer::OwnCertEnd>,
+    /// Whether this node runs the durable plane, so a session's owner is the holder of
+    /// its group's COMMITTED lease and only that node can recover it (issue #1119). A
+    /// persistent CONNECT then waits, bounded, for the lease to be known instead of
+    /// recovering locally on a node that cannot. `false` = the HRW owner is the answer.
+    pub durable: bool,
 }
 
 impl std::fmt::Debug for ProxyContext {
@@ -1176,11 +1181,67 @@ fn session_policy(connect: &Connect) -> (bool, u32) {
     (clean_start, session_expiry)
 }
 
+/// Whether a CONNECT is served by its session's owner (ADR 0005 §1): every one that
+/// may resume a stored session or leave one behind — `clean_start = false` whatever its
+/// expiry, or any non-zero expiry (issue #1119).
+///
+/// A `clean_start = false` CONNECT with Session Expiry 0 (MQTT 5 §3.1.2.4, §3.1.2.11.2)
+/// resumes the session a previous connection with a non-zero expiry left, if there is
+/// one, and the hub recovers that from the durable store for every `!clean_start` attach.
+/// Only the owner can: on any other node of a durable cluster the reads are refused until
+/// the attach gives up (`ATTACH_RECOVERY_TIMEOUT`) and answers `0x88`.
+fn served_by_owner(clean_start: bool, session_expiry: u32) -> bool {
+    !clean_start || session_expiry != 0
+}
+
+/// How long a persistent CONNECT on a durable node waits for its session's group to have
+/// a committed, reachable owner (issue #1119): the first seconds after a cluster starts,
+/// before the lease assigner has run, and a lease failover. The same bound as the hub's
+/// own recovery wait; past it the CONNECT is placed as before the wait existed.
+const OWNER_WAIT: Duration = Duration::from_secs(5);
+/// How often that wait re-reads the placement ring.
+const OWNER_POLL: Duration = Duration::from_millis(50);
+
+/// Where the placement ring puts a session right now.
+#[derive(Debug, PartialEq, Eq)]
+enum Placed {
+    /// Serve it here: this node owns it, or (§5, degrade) nothing better is known.
+    Local,
+    /// Relocate it to this owner, at this peer-link address.
+    Remote(NodeId, String),
+    /// A durable node that cannot name a reachable owner yet: no committed lease for the
+    /// group, or a committed owner whose address is not known.
+    Unsettled,
+}
+
+fn placed(p: &Placement, client: &ClientId, durable: bool) -> Placed {
+    if let Some((owner, addr)) = p.owner_route(&client.0) {
+        // With a committed lease this is its holder; without one, the HRW owner,
+        // which on a durable node is only a guess until the lease lands.
+        if !durable || p.committed_session_owner(&client.0).is_some() {
+            return Placed::Remote(owner, addr);
+        }
+        return Placed::Unsettled;
+    }
+    if !durable {
+        return Placed::Local;
+    }
+    match p.committed_session_owner(&client.0) {
+        Some(owner) if &owner == p.local() => Placed::Local,
+        // A committed remote owner with no known address, or no lease at all.
+        _ => Placed::Unsettled,
+    }
+}
+
 /// Resolve whether a CONNECT should be relocated to another node (ADR 0005):
-/// `Some((proxy, owner, addr))` when proxying is allowed, the session is retained
-/// (survives disconnect), this node has a `ProxyContext`, and the placement ring names
-/// a remote owner whose address is known. `None` keeps the session local.
-fn relocation_target<'a>(
+/// `Some((proxy, owner, addr))` when proxying is allowed, the session is served by its
+/// owner ([`served_by_owner`]), this node has a `ProxyContext`, and the placement ring
+/// names a remote owner whose address is known. `None` keeps the session local.
+///
+/// On a durable node a placement that cannot name a reachable committed owner yet is
+/// waited out for up to [`OWNER_WAIT`], since a local recovery there cannot succeed;
+/// after that the ring's best answer stands (ADR 0005 §5, degrade, don't refuse).
+async fn relocation_target<'a>(
     policy: &'a ConnPolicy,
     client: &ClientId,
     allow_proxy: bool,
@@ -1190,12 +1251,35 @@ fn relocation_target<'a>(
         return None;
     }
     let proxy = policy.proxy.as_ref()?;
-    let (owner, addr) = proxy
-        .placement
-        .read()
-        .ok()
-        .and_then(|p| p.owner_route(&client.0))?;
-    Some((proxy, owner, addr))
+    let deadline = Instant::now() + OWNER_WAIT;
+    let mut waited = false;
+    loop {
+        let now = {
+            let p = proxy.placement.read().ok()?;
+            placed(&p, client, proxy.durable)
+        };
+        match now {
+            Placed::Local => return None,
+            Placed::Remote(owner, addr) => return Some((proxy, owner, addr)),
+            Placed::Unsettled if Instant::now() >= deadline => {
+                warn!(
+                    client = %client.0,
+                    waited_s = OWNER_WAIT.as_secs(),
+                    "no committed, reachable owner for this session's group; placing it \
+                     on the ring's best guess (ADR 0005 §5, issue #1119)"
+                );
+                let route = proxy.placement.read().ok()?.owner_route(&client.0)?;
+                return Some((proxy, route.0, route.1));
+            }
+            Placed::Unsettled => {
+                if !waited {
+                    debug!(client = %client.0, "waiting for this session's owner to be known");
+                    waited = true;
+                }
+                tokio::time::sleep(OWNER_POLL).await;
+            }
+        }
+    }
 }
 
 /// If the CONNECT carries a will whose topic the client may not publish to, send the
@@ -1391,11 +1475,17 @@ where
     // Version-agnostic session policy (ADR 0009): clean-start + retention interval.
     let (clean_start, session_expiry) = session_policy(&connect);
 
-    // Session affinity (ADR 0005): a retained session whose placement owner is another
-    // node is relocated there. The owner serves it (CONNACK onward); this node only
-    // relays. Non-retained sessions and owner-is-self stay local.
-    if let Some((proxy, owner, addr)) =
-        relocation_target(policy, &client, allow_proxy, session_expiry != 0)
+    // Session affinity (ADR 0005): a session that may resume or outlive this connection,
+    // whose placement owner is another node, is relocated there. The owner serves it
+    // (CONNACK onward); this node only relays. Clean, non-retained sessions and
+    // owner-is-self stay local.
+    if let Some((proxy, owner, addr)) = relocation_target(
+        policy,
+        &client,
+        allow_proxy,
+        served_by_owner(clean_start, session_expiry),
+    )
+    .await
     {
         info!(client = %client.0, owner = %owner.0, "relocating persistent session to its owner (ADR 0005)");
         return proxy_to_owner(reader, writer, &connect, &principal, proxy, &addr, &hub).await;
@@ -7536,4 +7626,195 @@ mod tests {
     }
 
     mod ingress_credit;
+}
+
+/// Issue #1119: which CONNECTs are served by their session's owner, and where the ring
+/// places one while a durable cluster's ownership is still settling.
+#[cfg(test)]
+mod relocation_tests {
+    use super::{
+        placed, relocation_target, served_by_owner, ConnPolicy, Placed, ProxyContext,
+        DEFAULT_CONNECT_TIMEOUT, OWNER_WAIT,
+    };
+    use mqtt_cluster::placement::{group_of, Placement, DEFAULT_REPLICAS};
+    use mqtt_cluster::swim::MemberState;
+    use mqtt_cluster::NodeId;
+    use mqtt_core::ClientId;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, RwLock};
+    use std::time::Duration;
+
+    fn node(s: &str) -> NodeId {
+        NodeId(s.into())
+    }
+
+    /// Node `a` in a ring of a, b, c, every peer's address known.
+    fn ring() -> Placement {
+        let mut p = Placement::new(node("a"), DEFAULT_REPLICAS);
+        for n in ["b", "c"] {
+            p.observe(&node(n), MemberState::Alive, &format!("{n}:7000"), None);
+        }
+        p
+    }
+
+    /// A client id whose HRW owner in [`ring`] is `owner`.
+    fn owned_by(owner: &str) -> ClientId {
+        let p = ring();
+        let id = (0..10_000)
+            .map(|i| format!("c-{i}"))
+            .find(|c| p.owner(c) == node(owner))
+            .expect("some id hashes to that owner");
+        ClientId(id.into())
+    }
+
+    fn commit(p: &mut Placement, client: &ClientId, holder: &str) {
+        p.set_lease_owners(BTreeMap::from([(group_of(&client.0), node(holder))]));
+    }
+
+    /// MQTT 5 §3.1.2.4 / §3.1.2.11.2: `clean_start = false` with expiry 0 resumes a
+    /// stored session if there is one, so it is the owner's to serve like any other
+    /// resume. Only a clean start that leaves nothing behind stays where it landed.
+    #[test]
+    fn every_resume_and_every_retained_session_is_served_by_its_owner() {
+        assert!(served_by_owner(false, 0), "a resume with expiry 0");
+        assert!(served_by_owner(false, 30));
+        assert!(served_by_owner(false, u32::MAX), "v3.1.1 clean_session = 0");
+        assert!(
+            served_by_owner(true, 30),
+            "a new session that outlives the connection"
+        );
+        assert!(
+            !served_by_owner(true, 0),
+            "a clean session, gone at disconnect"
+        );
+    }
+
+    /// Without a durable plane the HRW ring is the answer, as before.
+    #[test]
+    fn a_node_without_the_durable_plane_places_by_the_ring() {
+        let p = ring();
+        let remote = owned_by("b");
+        assert_eq!(
+            placed(&p, &remote, false),
+            Placed::Remote(node("b"), "b:7000".into())
+        );
+        assert_eq!(placed(&p, &owned_by("a"), false), Placed::Local);
+    }
+
+    /// On a durable node the committed lease decides, and a group without one — the
+    /// first seconds of a cluster — is unsettled whoever the ring would guess.
+    #[test]
+    fn a_durable_node_places_by_the_committed_lease() {
+        let client = owned_by("b");
+        let mut p = ring();
+        assert_eq!(placed(&p, &client, true), Placed::Unsettled, "no lease yet");
+        assert_eq!(
+            placed(&p, &owned_by("a"), true),
+            Placed::Unsettled,
+            "not even when the ring's guess is this node"
+        );
+        commit(&mut p, &client, "c");
+        assert_eq!(
+            placed(&p, &client, true),
+            Placed::Remote(node("c"), "c:7000".into()),
+            "the lease holder, not the ring's guess"
+        );
+        commit(&mut p, &client, "a");
+        assert_eq!(placed(&p, &client, true), Placed::Local);
+
+        // A committed owner whose address is not known yet is waited for too.
+        let mut q = Placement::new(node("a"), DEFAULT_REPLICAS);
+        q.observe(&node("b"), MemberState::Alive, "", None);
+        commit(&mut q, &client, "b");
+        assert_eq!(placed(&q, &client, true), Placed::Unsettled);
+    }
+
+    fn policy_over(placement: Arc<RwLock<Placement>>, durable: bool) -> ConnPolicy {
+        ConnPolicy {
+            anonymous: None,
+            auth: super::auth_handle(Arc::new(mqtt_auth::basic::BasicAuthenticator {
+                allow_anonymous: true,
+            })),
+            authz: super::authz_handle(Arc::new(mqtt_auth::AllowAll)),
+            identity_source: mqtt_auth::mtls::IdentitySource::default(),
+            audit: Arc::new(mqtt_observability::AuditLog::new()),
+            proxy: Some(ProxyContext {
+                node: node("a"),
+                placement,
+                connector: None,
+                cluster_crl: None,
+                own_cert_end: None,
+                durable,
+            }),
+            node: Some(node("a")),
+            store: None,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            enhanced: None,
+            shutdown: None,
+            metrics: None,
+            ingress: None,
+            rules: None,
+        }
+    }
+
+    /// The startup case: a persistent CONNECT reaching a durable node before its group's
+    /// lease is committed waits for the lease and is relocated to its holder, instead of
+    /// recovering locally on a node that cannot (and answering 0x88 five seconds later).
+    #[tokio::test(start_paused = true)]
+    async fn a_persistent_connect_waits_for_its_owner_during_startup() {
+        let client = owned_by("b");
+        let placement = Arc::new(RwLock::new(ring()));
+        let policy = policy_over(placement.clone(), true);
+        let commits = {
+            let placement = placement.clone();
+            let client = client.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                commit(&mut placement.write().unwrap(), &client, "c");
+            })
+        };
+        let started = tokio::time::Instant::now();
+        let target = relocation_target(&policy, &client, true, true).await;
+        let (_, owner, addr) = target.expect("relocated once the lease landed");
+        assert_eq!((owner, addr.as_str()), (node("c"), "c:7000"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        commits.await.unwrap();
+
+        // A clean session is never relocated and never waits.
+        let started = tokio::time::Instant::now();
+        let policy = policy_for(ring());
+        assert!(relocation_target(&policy, &client, true, false)
+            .await
+            .is_none());
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    fn policy_for(p: Placement) -> ConnPolicy {
+        policy_over(Arc::new(RwLock::new(p)), true)
+    }
+
+    /// The wait is bounded: a lease that never lands leaves the ring's best guess, which
+    /// is what the CONNECT got before the wait existed (ADR 0005 §5).
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_for_an_owner_is_bounded() {
+        let started = tokio::time::Instant::now();
+        let remote = owned_by("b");
+        let policy = policy_for(ring());
+        let (_, owner, _) = relocation_target(&policy, &remote, true, true)
+            .await
+            .expect("the ring's guess, a remote node");
+        assert_eq!(owner, node("b"));
+        assert!(started.elapsed() >= OWNER_WAIT);
+        assert!(relocation_target(&policy, &owned_by("a"), true, true)
+            .await
+            .is_none());
+
+        // Without the durable plane nothing waits.
+        let started = tokio::time::Instant::now();
+        let plain = policy_over(Arc::new(RwLock::new(ring())), false);
+        assert!(relocation_target(&plain, &remote, true, true)
+            .await
+            .is_some());
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
 }
