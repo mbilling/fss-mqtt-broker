@@ -402,6 +402,11 @@ def drain_figures(gens: list, bf: dict | None) -> dict:
                     "quiet_s": d.get("quiet_s"), "outstanding_deliveries": d.get("outstanding_deliveries"),
                     "outstanding_acks": d.get("outstanding_acks")})
     missing = sum(s["ledger"]["missing"] for _, s, _ in gens)
+    # Of the missing, those whose publish was positively acknowledged: the broker took
+    # responsibility and the message never arrived, which is loss. The rest were never
+    # acknowledged, which QoS 1 lets the publisher resend (None: an older generator).
+    acked_parts = [s["ledger"].get("missing_acked") for _, s, _ in gens]
+    missing_acked = None if any(a is None for a in acked_parts) else sum(acked_parts)
     unacked = sum(s["ledger"]["unacked"] for _, s, _ in gens)
     unexpected = sum(s["ledger"]["unexpected"] for _, s, _ in gens)
     cut = any(p["ended_by"] not in (None, "complete") for p in per)
@@ -412,12 +417,18 @@ def drain_figures(gens: list, bf: dict | None) -> dict:
     queued = min(residual, held_msgs) if cut else 0.0
     out = {"generators": per, "cut_off": cut, "missing": missing, "loss_drops": lost,
            "queued_at_cutoff": queued, "unexplained": residual - queued if cut else 0.0,
-           "held_at_cutoff": held, "still_queued": False, "reconciled": None}
+           "held_at_cutoff": held, "still_queued": False, "reconciled": None,
+           "missing_acked": missing_acked,
+           "missing_unacked": None if missing_acked is None else missing - missing_acked,
+           # Acknowledged loss that neither a drop counter nor a broker queue explains.
+           "unexplained_acked": None if missing_acked is None else max(0.0, missing_acked - lost - queued)}
     if not cut or (missing == 0 and unacked == 0):
         return out
     how = ", ".join(sorted({f"{p['ended_by']} after {p['duration_s']:.1f} s" for p in per
                             if p["ended_by"] not in (None, "complete") and p["duration_s"] is not None}))
     parts = [f"broker loss drops {lost:,.0f}"]
+    if missing_acked is not None:
+        parts.insert(0, f"(acknowledged {missing_acked:,} + never acknowledged {missing - missing_acked:,})")
     if queued:
         parts.append(f"{queued:,.0f} still queued on the brokers at the cut-off")
     if out["unexplained"]:
@@ -766,6 +777,9 @@ def render_ladder_md(r: dict) -> list[str]:
             loss += f", queued at cut-off {int(dr['queued_at_cutoff'])}"
         if dr.get("unexplained"):
             loss += f", unexplained {int(dr['unexplained'])}"
+        if dr.get("missing_acked") is not None and (dr.get("missing") or 0):
+            loss += (f" (of the missing: acknowledged {int(dr['missing_acked'])}, "
+                     f"never acknowledged {int(dr['missing_unacked'])})")
         why = "; ".join(s["failures"] + s["voids"] + s["notes"])
         m = s.get("retry")
         tag = ""

@@ -88,6 +88,20 @@ impl AtomicBitset {
             .sum()
     }
 
+    /// Bits set here and in `also`, and clear in `not`.
+    #[must_use]
+    pub fn count_and_and_not(&self, also: &AtomicBitset, not: &AtomicBitset) -> u64 {
+        self.words
+            .iter()
+            .enumerate()
+            .map(|(i, w)| {
+                let a = also.words.get(i).map_or(0, |o| o.load(Ordering::Relaxed));
+                let n = not.words.get(i).map_or(0, |o| o.load(Ordering::Relaxed));
+                u64::from((w.load(Ordering::Relaxed) & a & !n).count_ones())
+            })
+            .sum()
+    }
+
     /// Bits set here and clear in `other`.
     #[must_use]
     pub fn count_and_not(&self, other: &AtomicBitset) -> u64 {
@@ -165,6 +179,12 @@ pub struct LedgerReport {
     pub expected: u64,
     /// Expected and not delivered.
     pub missing: u64,
+    /// The part of `missing` whose publish was positively acknowledged (`QoS` 1): the
+    /// broker took responsibility for it and it never arrived. This is loss. The rest
+    /// of `missing` was never acknowledged, which `QoS` 1 lets the publisher resend
+    /// (for example on a connection the broker closed under overload). Always 0 at
+    /// `QoS` 0, where nothing is acknowledged.
+    pub missing_acked: u64,
     /// Delivered and never sent to that stream.
     pub unexpected: u64,
     /// Sent at `QoS` 1 and not positively acknowledged.
@@ -336,6 +356,9 @@ impl Ledger {
                 r.expected += p.sent.count();
                 r.unique_received += recv.count();
                 r.missing += p.sent.count_and_not(recv);
+                if qos1 {
+                    r.missing_acked += p.sent.count_and_and_not(&p.acked, recv);
+                }
                 r.unexpected += recv.count_and_not(&p.sent);
             }
         }
@@ -501,6 +524,33 @@ mod tests {
             assert_eq!(r.missing, 0);
             assert!(!r.closed);
         }
+    }
+
+    #[test]
+    fn missing_acked_counts_only_acknowledged_identities_that_never_arrived() {
+        // Publisher 0 publishes to topic 0, which streams 0 and 2 both receive.
+        let l = ledger();
+        for seq in 0..10 {
+            let _ = l.publishers[0].sent.set(seq);
+        }
+        for seq in 0..6 {
+            let _ = l.publishers[0].acked.set(seq);
+        }
+        for stream in [0, 2] {
+            for seq in (0..3).chain(6..8) {
+                let _ = l.receive(stream, 0, seq);
+            }
+        }
+        let r = l.report(true);
+        // Each stream misses 3, 4, 5 (acknowledged: loss) and 8, 9 (never acknowledged).
+        assert_eq!(r.missing, 10, "{r:?}");
+        assert_eq!(r.missing_acked, 6, "{r:?}");
+        assert_eq!(r.unacked, 4, "{r:?}");
+        assert_eq!(
+            l.report(false).missing_acked,
+            0,
+            "QoS 0 acknowledges nothing"
+        );
     }
 
     #[test]

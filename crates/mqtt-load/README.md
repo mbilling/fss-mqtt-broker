@@ -75,6 +75,10 @@ The schedule fixes every publisher's message count in advance, so the bitsets ar
 once and loss is exact. After the drain:
 
 - `missing`: sent, and not received on a stream that should have had it.
+- `missing_acked`: the part of `missing` whose publish was positively acknowledged (QoS 1).
+  The broker took responsibility for it and it never arrived, so this is loss. The rest of
+  `missing` was never acknowledged, which QoS 1 lets the publisher resend, for example on a
+  connection the broker closed under overload. Always 0 at QoS 0.
 - `unexpected`: received, and never sent to that stream.
 - `unacked`: sent at QoS 1 and not positively acknowledged. A PUBACK with a reason code of
   0x80 or more is also counted in `negative_acks`.
@@ -207,7 +211,7 @@ totals            <aggregate> over every measured window
 drain             {duration_s, ended_by: complete|quiet|timeout, quiet_s, outstanding_deliveries,
                    outstanding_acks, since_progress_s}: quiet_s is the window applied;
                   outstanding_* what was still owed when the drain ended (0 when complete)
-ledger            {sent, acked, received, unique_received, expected, missing, unexpected,
+ledger            {sent, acked, received, unique_received, expected, missing, missing_acked, unexpected,
                    unacked, unexpected_acks, negative_acks, duplicates, other_run, foreign, closed}
 generator         {saturated, saturated_windows[], thresholds{cpu_fraction, thread_fraction,
                    sched_lag_p99_us}, worker_threads, per_thread_cpu, cpu_cores_max,

@@ -943,7 +943,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_reserved_tree_is_exactly_sys_and_below`
 - `tests::topic_name_validity_rejects_wildcards_and_emptiness`
 
-## `crates/mqtt-load/src/lib.rs` — 33 test(s)
+## `crates/mqtt-load/src/lib.rs` — 34 test(s)
 
 - `client::tests::fixed_packets_decode_as_themselves`
 - `clock::tests::clock_is_monotonic_and_maps_back_to_instants`
@@ -961,6 +961,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `ledger::tests::a_complete_run_closes`
 - `ledger::tests::bitset_marks_new_again_and_out_of_range`
 - `ledger::tests::duplicates_are_counted_and_do_not_open_the_ledger`
+- `ledger::tests::missing_acked_counts_only_acknowledged_identities_that_never_arrived`
 - `ledger::tests::missing_is_exact_and_per_stream`
 - `ledger::tests::missing_sample_names_each_missing_identity_and_whether_it_is_a_gap`
 - `ledger::tests::nothing_sent_is_not_a_closed_ledger`

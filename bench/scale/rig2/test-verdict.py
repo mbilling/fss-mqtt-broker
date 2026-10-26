@@ -32,7 +32,8 @@ def hist(samples_us: dict[int, int]) -> dict:
 
 
 def summary(rate, *, p99_us=50_000, saturated=False, missing=0, outcome=None, start_shift_s=0.0,
-            measure_s=60.0, warmup_s=20.0, errors=None, drain="complete", unexpected=0):
+            measure_s=60.0, warmup_s=20.0, errors=None, drain="complete", unexpected=0,
+            missing_acked=None, unacked=0):
     """A minimal mqtt-load.summary.v2 with one phase: `rate` msg/s offered; ack and e2e
     histograms whose p99 is `p99_us` (98 % at 1 ms, 1.5 % at p99, 0.5 % at 2 x p99)."""
     n = int(rate * measure_s)
@@ -58,7 +59,9 @@ def summary(rate, *, p99_us=50_000, saturated=False, missing=0, outcome=None, st
         "phases": [{"index": 0, "target_rate": rate, "offered_rate": rate, "sent_rate": rate, "received_rate": rate,
                     "ack_histogram": h, "e2e_histogram": h, "saturated": saturated}],
         "ledger": {"sent": n, "acked": n, "received": n - missing, "missing": missing, "unexpected": unexpected,
-                   "unacked": 0, "unexpected_acks": 0, "closed": closed and not unexpected},
+                   "unacked": unacked, "unexpected_acks": 0,
+                   "closed": closed and not unexpected and not unacked,
+                   **({} if missing_acked is None else {"missing_acked": missing_acked})},
         "drain": {"duration_s": 0.05 if drain == "complete" else 10.0, "ended_by": drain, "quiet_s": 10.0,
                   "outstanding_deliveries": missing, "outstanding_acks": 0, "since_progress_s": 10.0},
         "errors": errors or {"connect": 0, "disconnects": 0, "server_disconnects": 0, "protocol": 0, "write": 0},
@@ -253,6 +256,23 @@ class Verdicts(unittest.TestCase):
         self.assertTrue(any("missing 1,000 = broker loss drops 700 + 300 still queued on the brokers at the cut-off; "
                             "the brokers then held 900 unacked deliveries, 0 pending publishes and 2.0 MB" in n
                             for n in v["notes"]), v["notes"])
+
+    def test_missing_is_split_into_acknowledged_loss_and_never_acknowledged(self):
+        # The repeatability run's durable 114,200 step: the brokers closed publishers under
+        # overload (append-backlog-full); what they never acknowledged is not loss.
+        v = verdict_of(make_step(self.root, 30000, [summary(30000, missing=1228, missing_acked=0, unacked=3298,
+                                                            drain="quiet")],
+                                 drops={"append-backlog-full": 723}))
+        self.assertEqual(v["verdict"], V.FAILED, v)
+        self.assertEqual(v["drain"]["missing_acked"], 0)
+        self.assertEqual(v["drain"]["missing_unacked"], 1228)
+        self.assertEqual(v["drain"]["unexplained_acked"], 0)
+        self.assertTrue(any("(acknowledged 0 + never acknowledged 1,228)" in n for n in v["notes"]), v["notes"])
+        # Acknowledged loss beyond what the brokers counted is reported as such.
+        v = verdict_of(make_step(self.root, 30000, [summary(30000, missing=1228, missing_acked=900, unacked=10,
+                                                            drain="quiet")],
+                                 drops={"append-backlog-full": 723}))
+        self.assertEqual(v["drain"]["unexplained_acked"], 177)
 
     def test_a_drain_cut_off_with_nothing_held_is_loss(self):
         # Nothing on the brokers' gauges accounts for the missing: the ledger's loss stands.
