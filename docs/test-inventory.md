@@ -943,7 +943,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_reserved_tree_is_exactly_sys_and_below`
 - `tests::topic_name_validity_rejects_wildcards_and_emptiness`
 
-## `crates/mqtt-load/src/lib.rs` — 29 test(s)
+## `crates/mqtt-load/src/lib.rs` — 32 test(s)
 
 - `client::tests::fixed_packets_decode_as_themselves`
 - `clock::tests::clock_is_monotonic_and_maps_back_to_instants`
@@ -954,12 +954,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `health::tests::ps_time_formats`
 - `health::tests::this_platform_can_be_sampled`
 - `health::tests::utilisation_is_cpu_over_wall`
+- `hist::tests::export_round_trips_and_merges_by_bucket`
 - `hist::tests::percentiles_are_within_a_tenth_of_a_percent`
 - `hist::tests::rounding_saturation_merge_and_reset`
 - `ledger::tests::a_complete_run_closes`
 - `ledger::tests::bitset_marks_new_again_and_out_of_range`
 - `ledger::tests::duplicates_are_counted_and_do_not_open_the_ledger`
 - `ledger::tests::missing_is_exact_and_per_stream`
+- `ledger::tests::missing_sample_names_each_missing_identity_and_whether_it_is_a_gap`
 - `ledger::tests::nothing_sent_is_not_a_closed_ledger`
 - `ledger::tests::unacked_counts_only_at_qos1`
 - `ledger::tests::unexpected_acks_open_the_ledger`
@@ -974,6 +976,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `schedule::tests::rate_is_split_evenly_and_interleaved`
 - `schedule::tests::step_changes_rate_per_publisher_without_changing_publishers`
 - `stats::tests::drain_moves_histograms_and_sums_counters`
+- `subscriber::tests::packet_ids_follow_in_order_and_skip_zero`
 
 ## `crates/mqtt-load/src/main.rs` — 0 test(s)
 
