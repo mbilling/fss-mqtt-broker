@@ -977,6 +977,16 @@ pub struct Limits {
     /// Distinct from `receive_maximum`, which is the **inbound** grant the broker
     /// advertises to publishers.
     pub max_inflight_messages: Option<u16>,
+    /// Keepalive periods a client may accept **no bytes** while the broker has bytes for
+    /// it before the broker closes it (`MQTTD_WRITE_STALL_KEEPALIVES`, issue #1117).
+    /// Default 2; at least 1. The connection keeps reading such a client meanwhile, so
+    /// its PUBACKs and PINGREQs still count; this ends one that never reads again, which
+    /// would otherwise pin every message in flight to it. Counted as
+    /// `mqttd_connection_errors_total{reason="write-stall"}`.
+    pub write_stall_keepalives: Option<u16>,
+    /// The same bound, in seconds, for a client with keepalive 0, which has no period to
+    /// multiply (`MQTTD_WRITE_STALL_TIMEOUT`, issue #1117). Default 120; at least 1.
+    pub write_stall_timeout_secs: Option<u64>,
     /// Global retained-message cap (`MQTTD_MAX_RETAINED_MESSAGES`).
     pub max_retained_messages: Option<u64>,
     /// Global session cap (`MQTTD_MAX_SESSIONS`).
@@ -1052,6 +1062,8 @@ impl Default for Limits {
             max_backlog_bytes: None,
             max_outbound_bytes: None,
             max_inflight_messages: None,
+            write_stall_keepalives: None,
+            write_stall_timeout_secs: None,
             max_retained_messages: None,
             max_sessions: None,
             max_subscriptions_per_client: None,
@@ -1690,6 +1702,12 @@ impl Config {
         on!("MQTTD_MAX_INFLIGHT_MESSAGES", v, {
             self.limits.max_inflight_messages = Some(num("MQTTD_MAX_INFLIGHT_MESSAGES", &v)?);
         });
+        on!("MQTTD_WRITE_STALL_KEEPALIVES", v, {
+            self.limits.write_stall_keepalives = Some(num("MQTTD_WRITE_STALL_KEEPALIVES", &v)?);
+        });
+        on!("MQTTD_WRITE_STALL_TIMEOUT", v, {
+            self.limits.write_stall_timeout_secs = Some(num("MQTTD_WRITE_STALL_TIMEOUT", &v)?);
+        });
         on!("MQTTD_MAX_RETAINED_MESSAGES", v, {
             self.limits.max_retained_messages = Some(num("MQTTD_MAX_RETAINED_MESSAGES", &v)?);
         });
@@ -2201,6 +2219,16 @@ impl Config {
                     .to_string(),
             );
         }
+        if self.limits.write_stall_keepalives == Some(0)
+            || self.limits.write_stall_timeout_secs == Some(0)
+        {
+            return Err(
+                "limits.write_stall_keepalives and limits.write_stall_timeout_secs must be at \
+                 least 1 (0 would close a client the moment the broker has bytes for it; \
+                 there is no setting that never closes a client that stopped reading)"
+                    .to_string(),
+            );
+        }
         Ok(())
     }
 }
@@ -2516,6 +2544,8 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_MAX_BACKLOG_BYTES",
     "MQTTD_MAX_OUTBOUND_BYTES",
     "MQTTD_MAX_INFLIGHT_MESSAGES",
+    "MQTTD_WRITE_STALL_KEEPALIVES",
+    "MQTTD_WRITE_STALL_TIMEOUT",
     "MQTTD_MAX_RETAINED_MESSAGES",
     "MQTTD_MAX_SESSIONS",
     "MQTTD_MAX_SUBSCRIPTIONS_PER_CLIENT",
@@ -3167,6 +3197,23 @@ mod tests {
     /// precheck all covered by construction (they each run `validate()`; there is
     /// deliberately no separate startup-only check).
     #[test]
+    fn a_zero_write_stall_bound_is_refused() {
+        // Issue #1117: 0 would close a client the moment the broker had a byte for it.
+        let base =
+            || Config::from_toml("[durable]\nallow_ephemeral = true\n").expect("base parses");
+        let mut c = base();
+        c.limits.write_stall_keepalives = Some(0);
+        assert!(c.validate().is_err());
+        let mut c = base();
+        c.limits.write_stall_timeout_secs = Some(0);
+        assert!(c.validate().is_err());
+        let mut c = base();
+        c.limits.write_stall_keepalives = Some(1);
+        c.limits.write_stall_timeout_secs = Some(1);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
     fn the_new_per_subscriber_bounds_are_refused_out_of_range() {
         let cfg = |body: &str| {
             let mut c =
@@ -3682,6 +3729,8 @@ mod tests {
             | "MQTTD_MAX_PUBLISH_RATE"
             | "MQTTD_MAX_QUEUED_MESSAGES"
             | "MQTTD_MAX_INFLIGHT_MESSAGES"
+            | "MQTTD_WRITE_STALL_KEEPALIVES"
+            | "MQTTD_WRITE_STALL_TIMEOUT"
             | "MQTTD_MAX_BACKLOG_MESSAGES"
             | "MQTTD_MAX_RETAINED_MESSAGES"
             | "MQTTD_MAX_SESSIONS"
@@ -3930,8 +3979,9 @@ mod tests {
             // plus MQTTD_RULES_FUNCTION_MAX_MS (ADR 0086, the ceiling on one call),
             // plus MQTTD_TLS_EXPIRY_WARN_PERMILLE (ADR 0088 D2),
             // plus MQTTD_TLS_END_SESSIONS_AT_CERT_EXPIRY (ADR 0088 O2),
-            // plus MQTTD_DURABLE_WRITE_ELISION_MS (ADR 0089).
-            127,
+            // plus MQTTD_DURABLE_WRITE_ELISION_MS (ADR 0089),
+            // plus MQTTD_WRITE_STALL_KEEPALIVES and MQTTD_WRITE_STALL_TIMEOUT (#1117).
+            129,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never

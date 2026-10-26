@@ -280,6 +280,11 @@ queue_overflow = "drop-oldest"       # or "reject-newest"
 # (unset = off, minimum 4096). The fixed 10 000-PACKET cap applies either way, and only the
 # at-most-once class is shed — control packets and QoS 1/2 always flow.
 # max_outbound_bytes = 33554432      # 32 MiB
+# A client that accepts NO bytes for this many keepalive periods while the broker has bytes
+# for it is closed (issue #1117), counted as connection_errors{reason="write-stall"}; the
+# broker keeps reading it meanwhile. write_stall_timeout_secs is the bound for keepalive 0.
+# write_stall_keepalives = 2
+# write_stall_timeout_secs = 120
 # receive_maximum = 256              # v5 Receive Maximum (default 256, floor 1)
 # topic_alias_max = 16               # v5 Topic Alias Maximum (default 16; 0 disables)
 # Process-memory high-water mark, bytes (ADR 0041 T8). Above it the broker enters BROWNOUT:

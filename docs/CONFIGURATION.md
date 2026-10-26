@@ -6,7 +6,7 @@ Source of truth: `mqtt_config::ENV_VARS` and `Config::overlay_from` in `crates/m
 
 The annotated template is [`mqttd.example.toml`](mqttd.example.toml). Capacity arithmetic lives in [SIZING.md](SIZING.md); day-2 procedures in [OPERATIONS.md](OPERATIONS.md). This page is the inventory of knobs, not the runbook.
 
-Documented overlay variables: **127** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) and any experimental side-channel knobs below.
+Documented overlay variables: **129** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) and any experimental side-channel knobs below.
 
 ## Node identity
 
@@ -126,6 +126,8 @@ Documented overlay variables: **127** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) 
 | `MQTTD_MAX_BACKLOG_BYTES` | `limits.max_backlog_bytes` | Accounted bytes one online subscriber's in-memory flow-control backlog may hold before drop-oldest evicts (`MQTTD_MAX_BACKLOG_BYTES`, issue #241). Unset = **off**, which is exactly the pre-#241 behaviour; if set, at least 4096. Bounds RAM, per subscriber, per node — never disk. The eviction sheds messages that were already stored and already acked, so a value below `max_packet_size` makes that shed routine rather than exceptional (startup warns). `max_inflight_messages` is the loss-free lever. |
 | `MQTTD_MAX_OUTBOUND_BYTES` | `limits.max_outbound_bytes` | Accounted bytes that may sit unwritten in one client's **outbound socket channel** before `QoS` 0 is shed (`MQTTD_MAX_OUTBOUND_BYTES`, issue #241). Unset = off; if set, at least 4096. The fixed 10 000-packet cap applies either way. Only the at-most-once class is shed — control packets and `QoS` 1/2 always flow. Bounds RAM. |
 | `MQTTD_MAX_INFLIGHT_MESSAGES` | `limits.max_inflight_messages` | A ceiling on the **effective outbound Receive Maximum** (`MQTTD_MAX_INFLIGHT_MESSAGES`, issue #241): the broker keeps at most `min(client Receive Maximum, this)` unacked `QoS` > 0 publishes per subscriber. Unset = the client's own value verbatim, i.e. 65 535 for every v3.1.1 client and any v5 client that sends no property. Range `1..=65_535`. A pure GATE: the surplus waits in the flow-control backlog, nothing is dropped — so this is the loss-free way to bound per-subscriber RAM. It costs throughput for a fast subscriber that legitimately keeps thousands in flight, and the deferred traffic lands in the backlog, so set it deliberately. Distinct from `receive_maximum`, which is the **inbound** grant the broker advertises to publishers. |
+| `MQTTD_WRITE_STALL_KEEPALIVES` | `limits.write_stall_keepalives` | Keepalive periods a client may accept **no bytes** while the broker has bytes for it before the broker closes it (`MQTTD_WRITE_STALL_KEEPALIVES`, issue #1117). Default 2; at least 1. The connection keeps reading such a client meanwhile, so its PUBACKs and PINGREQs still count; this ends one that never reads again, which would otherwise pin every message in flight to it. Counted as `mqttd_connection_errors_total{reason="write-stall"}`. |
+| `MQTTD_WRITE_STALL_TIMEOUT` | `limits.write_stall_timeout_secs` | The same bound, in seconds, for a client with keepalive 0, which has no period to multiply (`MQTTD_WRITE_STALL_TIMEOUT`, issue #1117). Default 120; at least 1. |
 | `MQTTD_MAX_RETAINED_MESSAGES` | `limits.max_retained_messages` | Global retained-message cap (`MQTTD_MAX_RETAINED_MESSAGES`). |
 | `MQTTD_MAX_SESSIONS` | `limits.max_sessions` | Global session cap (`MQTTD_MAX_SESSIONS`). |
 | `MQTTD_MAX_SUBSCRIPTIONS_PER_CLIENT` | `limits.max_subscriptions_per_client` | Per-client subscription cap (`MQTTD_MAX_SUBSCRIPTIONS_PER_CLIENT`). |

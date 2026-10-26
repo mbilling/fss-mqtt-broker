@@ -830,7 +830,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `publish_codec_round_trip_clears_the_floor`
 
-## `crates/mqtt-config/src/lib.rs` — 51 test(s)
+## `crates/mqtt-config/src/lib.rs` — 52 test(s)
 
 - `tests::a_backup_dir_inside_the_data_dir_is_a_config_error`
 - `tests::a_bad_enum_value_is_rejected`
@@ -841,6 +841,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::a_rule_written_into_the_config_is_refused_with_where_rules_go`
 - `tests::a_swim_bind_requires_a_peer_bind`
 - `tests::a_type_mismatch_is_rejected`
+- `tests::a_zero_write_stall_bound_is_refused`
 - `tests::an_unknown_key_is_rejected`
 - `tests::an_unknown_mtls_identity_source_is_rejected_rather_than_defaulted`
 - `tests::an_unknown_top_level_table_is_rejected`
@@ -983,8 +984,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqtt-load/src/main.rs` — 0 test(s)
 
 
-## `crates/mqtt-net/src/lib.rs` — 28 test(s)
+## `crates/mqtt-net/src/lib.rs` — 30 test(s)
 
+- `frame::tests::a_cancelled_flush_resumes_without_losing_or_repeating_a_byte`
 - `frame::tests::a_drain_grows_the_buffer_once_and_keeps_it`
 - `frame::tests::a_new_reader_takes_the_named_read_buffer`
 - `frame::tests::a_new_writer_allocates_no_encode_buffer`
@@ -992,6 +994,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `frame::tests::next_raw_frame_returns_whole_decodable_packets`
 - `frame::tests::oversized_packet_is_rejected_not_buffered`
 - `frame::tests::the_first_queued_packet_takes_a_control_sized_buffer`
+- `frame::tests::truncation_stops_at_what_was_written`
 - `frame::tests::write_then_read_roundtrip_over_duplex`
 - `quic::tests::publish_topic_extracts_topic_across_varint_lengths`
 - `quic::tests::publish_topic_ignores_non_publish_packets`
@@ -2751,6 +2754,12 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `an_rss_over_the_watermark_browns_out_and_refuses_new_sessions`
 - `without_a_watermark_the_same_broker_accepts_sessions`
 
+## `crates/mqttd/tests/outbound_ack_deadlock.rs` — 3 test(s)
+
+- `a_subscriber_that_acks_before_reading_again_receives_its_whole_window`
+- `over_tls_a_subscriber_that_acks_before_reading_again_receives_its_whole_window`
+- `over_websocket_a_subscriber_that_acks_before_reading_again_receives_its_whole_window`
+
 ## `crates/mqttd/tests/outbound_batch.rs` — 1 test(s)
 
 - `a_subscriber_behind_by_more_than_a_write_batch_gets_every_acked_qos1_message`
@@ -3282,6 +3291,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `three_packets_in_one_segment_are_all_processed_in_order`
 - `v311_unsuback_stays_two_bytes_with_no_reason_codes`
 - `v5_unsuback_answers_one_reason_code_per_filter_in_order`
+
+## `crates/mqttd/tests/write_stall.rs` — 5 test(s)
+
+- `a_client_overrunning_receive_maximum_reads_its_disconnect_while_still_acking`
+- `a_peer_that_stops_reading_is_closed_after_the_write_stall_bound_and_counted`
+- `a_reading_client_sees_acks_and_deliveries_in_order`
+- `pings_are_read_and_answered_while_the_broker_is_blocked_writing`
+- `the_keepalive_still_closes_a_silent_peer_the_broker_is_blocked_writing_to`
 
 ## `crates/mqttd/tests/ws.rs` — 3 test(s)
 

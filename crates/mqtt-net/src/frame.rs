@@ -9,6 +9,7 @@ use crate::NetError;
 use bytes::{Bytes, BytesMut};
 use mqtt_codec::{Packet, ProtocolVersion};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::time::Instant;
 
 /// A cap on the read buffer to bound memory from a slow or hostile peer.
 ///
@@ -215,6 +216,18 @@ pub struct FrameWriter<W> {
     /// high-water mark on the first batch and keeps it there, because
     /// [`flush_queued`](FrameWriter::flush_queued) clears without shrinking.
     scratch: Vec<u8>,
+    /// How much of `scratch`, from the front, the transport has already taken. A
+    /// flush that was cancelled part-way resumes from here, so
+    /// [`flush_queued`](FrameWriter::flush_queued) can sit in a `select!` beside
+    /// the connection's reads without losing or repeating a byte (issue #1117).
+    written: usize,
+    /// Every queued byte was written but the transport's flush has not finished
+    /// (TLS records or WebSocket frames still to send).
+    unflushed: bool,
+    /// When the peer last made room for us: the transport took bytes, a flush
+    /// finished, or bytes were queued onto an empty buffer. A connection that has
+    /// had bytes pending since long before this is a peer that stopped reading.
+    last_progress: Instant,
 }
 
 /// What a reader reserves for inbound framing, eagerly, per connection.
@@ -251,6 +264,9 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
             inner,
             version,
             scratch: Vec::new(),
+            written: 0,
+            unflushed: false,
+            last_progress: Instant::now(),
         }
     }
 
@@ -281,8 +297,50 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         if self.scratch.capacity() == 0 {
             self.scratch.reserve(SCRATCH_FIRST_USE);
         }
+        if !self.has_pending() {
+            // The stall clock starts when there is something to write, not at the
+            // last write of a connection that has been idle since.
+            self.last_progress = Instant::now();
+        }
         packet.encode(&mut self.scratch, self.version)?;
         Ok(())
+    }
+
+    /// Whether anything queued has not yet reached the transport, or reached it
+    /// and still waits for its flush. While this is true the caller must keep
+    /// polling [`flush_queued`](Self::flush_queued) for the bytes to go out.
+    #[must_use]
+    pub fn has_pending(&self) -> bool {
+        self.written < self.scratch.len() || self.unflushed
+    }
+
+    /// Queued bytes the transport has not taken yet.
+    #[must_use]
+    pub fn pending_len(&self) -> usize {
+        self.scratch.len() - self.written
+    }
+
+    /// When the peer last made room for us (see the field). With
+    /// [`has_pending`](Self::has_pending) true, the time since is how long the
+    /// peer has accepted nothing.
+    #[must_use]
+    pub fn last_progress(&self) -> Instant {
+        self.last_progress
+    }
+
+    /// Restart the stall clock without any byte moving: for a caller that itself
+    /// stopped the peer (by not reading it) and must not blame the peer for the
+    /// writes that stopped meanwhile.
+    pub fn restart_stall_clock(&mut self) {
+        self.last_progress = Instant::now();
+    }
+
+    /// Drop everything queued and not yet written, for a connection being closed
+    /// because its peer stopped reading: nothing more will be written to it.
+    pub fn discard_queued(&mut self) {
+        self.scratch.clear();
+        self.written = 0;
+        self.unflushed = false;
     }
 
     /// Bytes currently queued but not yet flushed — the offset a caller records
@@ -296,23 +354,55 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
     }
 
     /// Drop everything queued past `len` (an offset from [`queued_len`](Self::queued_len)).
+    ///
+    /// Never below what the transport has already taken.
     pub fn truncate_queued(&mut self, len: usize) {
-        self.scratch.truncate(len);
+        self.scratch.truncate(len.max(self.written));
     }
 
-    /// Write everything queued in one `write_all` + `flush`, then clear the
-    /// buffer. A no-op when nothing is queued, so a drain that dropped every
-    /// packet costs no syscall.
+    /// Write everything queued, then flush the transport, then clear the buffer.
+    /// A no-op when nothing is pending, so a drain that dropped every packet costs
+    /// no syscall. Usually one write: the whole batch goes to the socket at once
+    /// (issue #443).
+    ///
+    /// **Cancel-safe** (issue #1117): progress is recorded after every write the
+    /// transport completes, and a cancelled write or flush has taken nothing, so
+    /// dropping this future part-way and calling it again later resumes exactly
+    /// where it stopped. That is what lets a connection poll it in a `select!`
+    /// next to its reads, instead of awaiting it while nothing reads the peer.
+    ///
+    /// # Errors
+    /// [`NetError::Io`] on a transport error, or a transport that takes zero bytes.
+    pub async fn flush_queued(&mut self) -> Result<(), NetError> {
+        while self.written < self.scratch.len() {
+            let n = self.inner.write(&self.scratch[self.written..]).await?;
+            if n == 0 {
+                return Err(NetError::Io(std::io::ErrorKind::WriteZero.into()));
+            }
+            self.written += n;
+            self.unflushed = true;
+            self.last_progress = Instant::now();
+        }
+        if self.unflushed {
+            self.inner.flush().await?;
+            self.unflushed = false;
+            self.last_progress = Instant::now();
+        }
+        self.scratch.clear();
+        self.written = 0;
+        Ok(())
+    }
+
+    /// End the stream's write side (TCP FIN, TLS `close_notify`, WebSocket Close)
+    /// once everything queued is written, keeping the read side open: a connection
+    /// closing on its own last word reads what the peer still sends, instead of
+    /// resetting it with those bytes unread (issue #1117).
     ///
     /// # Errors
     /// [`NetError::Io`] on a transport error.
-    pub async fn flush_queued(&mut self) -> Result<(), NetError> {
-        if self.scratch.is_empty() {
-            return Ok(());
-        }
-        self.inner.write_all(&self.scratch).await?;
-        self.inner.flush().await?;
-        self.scratch.clear();
+    pub async fn shutdown(&mut self) -> Result<(), NetError> {
+        self.flush_queued().await?;
+        self.inner.shutdown().await?;
         Ok(())
     }
 
@@ -400,6 +490,80 @@ mod tests {
             grown,
             "flushing clears without shrinking, so the next batch reuses the buffer"
         );
+    }
+
+    /// Issue #1117: a flush cancelled while the peer is not reading resumes exactly where
+    /// it stopped — no byte lost, none written twice — so a connection can poll it in a
+    /// `select!` beside its reads instead of awaiting it while nothing reads the peer.
+    #[tokio::test]
+    async fn a_cancelled_flush_resumes_without_losing_or_repeating_a_byte() {
+        let (client, server) = tokio::io::duplex(256);
+        let mut w = FrameWriter::new(client, V4);
+        let sent: Vec<Packet> = (0..64u8)
+            .map(|i| {
+                Packet::Publish(mqtt_codec::packet::Publish {
+                    properties: mqtt_codec::Properties::new(),
+                    dup: false,
+                    qos: mqtt_codec::QoS::AtMostOnce,
+                    retain: false,
+                    topic: "t/x".into(),
+                    pkid: None,
+                    payload: bytes::Bytes::from(vec![i; 40]),
+                })
+            })
+            .collect();
+        for p in &sent {
+            w.queue(p).unwrap();
+        }
+        let total = w.pending_len();
+        let queued_at = w.last_progress();
+
+        // The peer reads nothing, so the flush cannot finish; it is dropped part-way.
+        let cut = tokio::time::timeout(std::time::Duration::from_millis(20), w.flush_queued());
+        assert!(
+            cut.await.is_err(),
+            "the flush cannot finish while nothing reads"
+        );
+        assert!(w.has_pending());
+        assert!(
+            w.pending_len() < total && w.pending_len() > 0,
+            "the transport took part of the buffer: {} of {total} left",
+            w.pending_len()
+        );
+        assert!(w.last_progress() >= queued_at, "taking bytes is progress");
+
+        let reader = tokio::spawn(async move {
+            let mut r = FrameReader::new(server, V4);
+            let mut got = Vec::new();
+            while let Some(p) = r.next_packet().await.unwrap() {
+                got.push(p);
+            }
+            got
+        });
+        w.flush_queued().await.unwrap();
+        assert!(!w.has_pending());
+        drop(w);
+        assert_eq!(reader.await.unwrap(), sent, "every packet once, in order");
+    }
+
+    /// Truncating a packet decided against (issue #443 5b) never reaches into bytes
+    /// the transport already took: those are on the wire.
+    #[tokio::test]
+    async fn truncation_stops_at_what_was_written() {
+        let (client, _server) = tokio::io::duplex(8);
+        let mut w = FrameWriter::new(client, V4);
+        for _ in 0..8 {
+            w.queue(&Packet::PingReq).unwrap();
+        }
+        let cut = tokio::time::timeout(std::time::Duration::from_millis(20), w.flush_queued());
+        assert!(cut.await.is_err());
+        let left = w.pending_len();
+        assert_eq!(left, 16 - 8, "the 8-byte pipe took 8 bytes");
+        w.truncate_queued(0);
+        assert_eq!(w.queued_len(), 8, "the written 8 bytes stay accounted");
+        assert_eq!(w.pending_len(), 0);
+        w.discard_queued();
+        assert!(!w.has_pending());
     }
 
     /// The reader's buffer IS eager, and deliberately so: every connection reads.

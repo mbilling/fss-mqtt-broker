@@ -60,6 +60,8 @@ RSS ≈ base (~15 MiB idle + ~24 KiB per idle connection — see the note below)
         in-flight window:      min(client Receive Maximum, max_inflight_messages) × avg_msg
                                [65 535 × avg_msg when the ceiling is unset]
         outbound channel:      max_outbound_bytes, else up to 10 000 packets × avg_msg
+        write buffer:          one drain (≤ 1 024 packets × avg_msg), plus at most 1 MiB of
+                               replies a peer asked for and has not read (issue #1117)
 ```
 
 Rule functions in the WebAssembly sandbox add to this only where they are used
