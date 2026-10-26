@@ -60,6 +60,54 @@ knee is):
 | n3 | ~32 min, EUR 0.42 prorated (EUR 0.79 per started hour) | ~69 min, EUR 0.92 (EUR 1.59) |
 | n10 | ~36 min, EUR 1.52 prorated (EUR 2.55 per started hour) | ~73 min, EUR 3.12 (EUR 5.11) |
 
+### Live Grafana (OBSERVE, on by default)
+
+Every run attaches the old rig's live observation stack (`../observe.sh`); `OBSERVE=0`
+skips it. Nothing new runs in the cloud and nothing needs Docker there:
+
+```
+operator's machine: docker compose in bench/scale/observe/
+   Grafana :3000 (every interface, anonymous admin) + Prometheus :9090 + Alloy + Pushgateway
+      │  ssh -N -L 8096:localhost:8096 root@<generator host 0>   (opened by observe.sh)
+      ▼
+generator host 0: curl bridge (systemd-run units: a curl loop + python3 -m http.server 8096)
+   every 2 s, over the private network: each broker's /metrics, and each generator's
+   mqtt-load --metrics (<private_ip>:9464, LOAD_METRICS_PORT)
+```
+
+Why this shape and not Alloy on a generator host: the stack has run on the operator's
+machine since 2026-09 (it outlives the cluster, so a teardown loses no history), and the
+bridge needs only curl and python3, which the stock image has, so `driver_emqtt_bench=false`
+hosts carry it as they are. Bring-up adds one `scp` and one `ssh` after the cluster
+bootstrap; there is no extra provisioning and no Docker install.
+
+At bring-up the runner prints the URLs and the tunnel:
+
+```
+observe: live at http://localhost:3000 — dashboards: mqttd (bench) http://localhost:3000/d/mqttd-overview-bench, mqtt-load (bench) http://localhost:3000/d/mqtt-load-bench
+observe: the tunnel is this run's ssh -N -L 8096:localhost:8096 root@<ip> (pid N); ...
+```
+
+Two dashboards: the broker overview (`deploy/observability/grafana/mqttd.json`, derived
+with the run-phase strip) and **mqtt-load (bench)**: offered, sent, acked and received
+msg/s, the brokers' received rate beside the generators' sent rate, ack and end-to-end
+p50/p99/p99.9, generator CPU, saturation, scheduling lag, in-flight and backlog, error
+and ledger-anomaly rates, and broker drops by reason. Its quantiles come from mqtt-load's
+16 Prometheus buckets and are coarse; the report's are the exact HDR merge. Each step is
+its own mqtt-load process, so the generator panels go blank between steps (the bridge
+deletes a generator's file when nothing answers). The run-phase strip names the ladder,
+step and msg/s. Both dashboards are written by `../observe/build-bench-dashboards.py`.
+
+`TIER=local` uses the same stack without a bridge or tunnel: Alloy scrapes the local
+brokers and mqtt-load (127.0.0.1:9464) directly (`observe.sh attach-local`). Without
+Docker the attach warns and the run goes on unobserved.
+
+Teardown is unchanged: the bridge lives and dies with generator host 0, the tunnel is a
+local ssh process that the exit trap closes (`observe.sh detach`), and no cloud resource
+is added, so `../teardown.sh`'s destroy and its `purpose=mqttd-bench-scale` audit cover
+everything. The local stack keeps running after the run, as for the old rig;
+`bench/scale/observe.sh stop` stops it.
+
 ### The generator binary
 
 The generator hosts get a static x86_64 Linux build of mqtt-load, shipped over SSH (no

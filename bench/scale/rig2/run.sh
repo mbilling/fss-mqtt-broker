@@ -15,6 +15,12 @@
 #
 # Teardown (bench/scale/teardown.sh: tofu destroy, then the label audit) is trapped on
 # EXIT/INT/TERM. KEEP_INFRA=1 skips it and says so. Hetzner only (CLOUD=hcloud).
+#
+# Live Grafana is ON by default (OBSERVE=0 disables): bench/scale/observe.sh runs
+# Grafana, Prometheus and Alloy in Docker on THIS machine; generator host 0 runs the old
+# rig's curl bridge (curl + python3 only, no Docker) over every broker's /metrics and
+# every generator's mqtt-load --metrics, reached through an ssh tunnel.
+# http://localhost:3000 — see the README's "Live Grafana".
 
 set -euo pipefail
 RIG2="$(cd "$(dirname "$0")" && pwd)"
@@ -76,6 +82,16 @@ RESET_BUDGET="${RESET_BUDGET:-120}"
 # For the price quote: steps a ladder is expected to take (coarse climb + bisection).
 EST_STEPS="${EST_STEPS:-9}"
 
+# Live Grafana (bench/scale/observe.sh). mqtt-load serves its --metrics on this port: on
+# 127.0.0.1 locally, on the generator's private address in the cloud (the public
+# interface admits SSH only), where generator host 0's bridge reads it.
+OBSERVE="${OBSERVE:-1}"
+LOAD_METRICS_PORT="${LOAD_METRICS_PORT:-9464}"
+phase() { # phase <name> [detail]: the run's phase on the dashboards; best-effort
+	[ "$OBSERVE" = 1 ] || return 0
+	"$SCALE_DIR/observe.sh" phase "$1" "${2:-}" 2>/dev/null || true
+}
+
 for w in $WORKLOADS; do
 	[ -f "$RIG2/workloads/$w.env" ] || die "no workload $w (have: $(cd "$RIG2/workloads" && ls ./*.env | sed 's|./||; s|\.env||' | tr '\n' ' '))"
 done
@@ -107,6 +123,7 @@ if [ "$TIER" = local ]; then
 	get_gen() { cp -R "$(host_dir "gen-$1")/$2" "$3"; }
 	get_broker() { cp -R "$(host_dir "broker-$1")/$2" "$3"; }
 	broker_metrics_url() { echo "http://$(sed -n "$(($1 + 1))p" "$RUN/local/brokers.tsv" | cut -f3)/metrics"; }
+	gen_metrics_addr() { echo "127.0.0.1:$LOAD_METRICS_PORT"; }
 else
 	REMOTE_H=/root/rig2
 	on_gen() { rssh "$(driver_pub_ip "$1")" "H=$REMOTE_H; $2"; }
@@ -114,6 +131,7 @@ else
 	get_gen() { rscp -r "root@$(driver_pub_ip "$1"):$REMOTE_H/$2" "$3"; }
 	get_broker() { rscp -r "root@$(broker_pub_ip "$1"):$REMOTE_H/$2" "$3"; }
 	broker_metrics_url() { echo "http://localhost:8080/metrics"; }
+	gen_metrics_addr() { echo "$(driver_priv_ip "$1"):$LOAD_METRICS_PORT"; }
 fi
 
 # ── bring-up ────────────────────────────────────────────────────────────────────────
@@ -130,12 +148,17 @@ if [ "$TIER" = local ]; then
 	stop_local() {
 		local rc=$?
 		trap - EXIT INT TERM
+		phase idle "local run ended"
 		MQTTD_BIN="$MQTTD_BIN" "$RIG2/local-cluster.sh" stop "$RUN/local" || true
 		exit "$rc"
 	}
 	trap stop_local EXIT INT TERM
 	MQTTD_BIN="$MQTTD_BIN" "$RIG2/local-cluster.sh" start "$RUN/local" "$BROKERS"
 	ENDPOINTS=$(cut -f2 "$RUN/local/brokers.tsv" | paste -sd, -)
+	if [ "$OBSERVE" = 1 ]; then
+		"$SCALE_DIR/observe.sh" attach-local "$RUN" "$RUN/local/brokers.tsv" "$(gen_metrics_addr 0)" ||
+			warn "observe attach failed (is Docker running?) — continuing unobserved; OBSERVE=0 skips it"
+	fi
 	for i in $(seq 0 $((BROKERS - 1))); do mkdir -p "$(host_dir "broker-$i")"; cp "$RIG2/scrape-loop.py" "$(host_dir "broker-$i")/"; done
 	mkdir -p "$(host_dir gen-0)"
 	cp "$LOAD_BIN" "$(host_dir gen-0)/mqtt-load"
@@ -175,6 +198,9 @@ else
 	cloud_teardown() {
 		local rc=$?
 		trap - EXIT INT TERM
+		# The tunnel is a local ssh process; the bridge dies with generator host 0.
+		[ "$OBSERVE" != 1 ] || "$SCALE_DIR/observe.sh" detach 2>/dev/null || true
+		phase teardown "rig2 $TIER"
 		if [ "${KEEP_INFRA:-0}" = 1 ]; then
 			printf '\033[1;31m!! KEEP_INFRA=1 — PAID SERVERS ARE STILL RUNNING. Destroy with: bench/scale/teardown.sh\033[0m\n' >&2
 			exit "$rc"
@@ -200,6 +226,7 @@ else
 	[ -z "${MQTTD_SHA256:-}" ] || TF_APPLY_ARGS+=(-var mqttd_sha256="$MQTTD_SHA256")
 	TF_APPLY_ARGS+=(${TOFU_SSH_PUBKEY_ARGS[@]+"${TOFU_SSH_PUBKEY_ARGS[@]}"})
 	declare -p TF_APPLY_ARGS >"$RUN/tf-apply-args.sh"
+	phase provisioning "rig2 $TIER: $BROKERS x $BROKER_TYPE + $GENERATORS x $GEN_TYPE"
 	say "provisioning $BROKERS x $BROKER_TYPE + $GENERATORS x $GEN_TYPE"
 	(cd "$TFDIR" && "$TF" apply -auto-approve -input=false "${TF_APPLY_ARGS[@]}" >"$RUN/tf-apply.log" 2>&1) ||
 		{ tail -30 "$RUN/tf-apply.log" >&2; die "tofu apply failed"; }
@@ -207,7 +234,12 @@ else
 	(cd "$TFDIR" && "$TF" output -json inventory) >"$INVENTORY"
 	: >"$RUN/known_hosts"
 	await_fleet
+	phase bootstrapping "rig2 $TIER: $BROKERS nodes"
 	"$SCALE_DIR/bootstrap-cluster.sh" "$RUN" "$INVENTORY" durable
+	if [ "$OBSERVE" = 1 ]; then
+		OBSERVE_GEN_METRICS_PORT="$LOAD_METRICS_PORT" "$SCALE_DIR/observe.sh" attach "$RUN" "$INVENTORY" ||
+			warn "observe attach failed — continuing unobserved (OBSERVE=0 skips it)"
+	fi
 	ENDPOINTS=$(jq -r '[.brokers[].mqtt_plain] | join(",")' "$INVENTORY")
 	for i in $(seq 0 $((BROKERS - 1))); do
 		on_broker "$i" 'mkdir -p $H'
@@ -226,6 +258,7 @@ json.dump({"tier": "$TIER", "brokers": $BROKERS, "broker_type": "$BROKER_TYPE" i
            "generators": $GENERATORS, "gen_type": "$GEN_TYPE" if "$TIER" != "local" else "local",
            "binary": """$BINARY_DESC""", "unreleased": bool("${MQTTD_URL:-}"), "workloads": "$WORKLOADS".split(),
            "started_utc": "$STAMP", "warmup_s": $WARMUP, "measure_s": $MEASURE, "window_s": $WINDOW,
+           "observe": "$OBSERVE" == "1",
            "git": "$(git -C "$REPO_ROOT" rev-parse HEAD)"}, open(sys.argv[1], "w"), indent=2)
 PY
 
@@ -260,7 +293,7 @@ await_idle() { # await_idle <step-dir>: prints the idle record as JSON
 }
 
 run_step() { # run_step <ladder-dir> <index> <rate>
-	local ladder="$1" idx="$2" rate="$3" id hid step g i per_gen idle bound pids=() attempt
+	local ladder="$1" idx="$2" rate="$3" id hid step g i per_gen idle bound pids=() attempt metrics
 	attempt=$(find "$ladder/steps" -maxdepth 1 \( -name "[0-9]*-$rate" -o -name "[0-9]*-$rate-a*" \) 2>/dev/null | wc -l | tr -d ' ')
 	attempt=$((attempt + 1))
 	id=$(printf '%02d-%s' "$idx" "$rate")
@@ -280,6 +313,7 @@ json.dump({"index": $idx, "id": "$id", "rate": float($rate), "attempt": $attempt
           open(sys.argv[1], "w"), indent=2)
 PY
 	say "[$WORKLOAD] step $id: $rate msg/s offered ($GENERATORS generator(s) x $per_gen)"
+	phase running "$WORKLOAD step $id: $rate msg/s"
 	for ((i = 0; i < BROKERS; i++)); do
 		on_broker "$i" "rm -rf \$H/steps/$hid; mkdir -p \$H/steps/$hid; nohup python3 \$H/scrape-loop.py --url '$(broker_metrics_url "$i")' \
 			--out \$H/steps/$hid/scrapes --interval $SCRAPE_INTERVAL --max-secs 1800 >/dev/null 2>&1 </dev/null & echo \$! >\$H/steps/$hid/scrape.pid"
@@ -292,8 +326,10 @@ PY
 	[ "$SESSIONS" != durable ] || args+=(--session-expiry "$SESSION_EXPIRY")
 	bound=$((WARMUP + MEASURE + DRAIN_TIMEOUT + 180))
 	for ((g = 0; g < GENERATORS; g++)); do
+		metrics=""
+		[ "$OBSERVE" != 1 ] || metrics="--metrics $(gen_metrics_addr "$g")"
 		run_bounded "$bound" on_gen "$g" "mkdir -p \$H/steps/$hid && cd \$H && { ulimit -n 262144 2>/dev/null || ulimit -n \$(ulimit -Hn); } 2>/dev/null; ./mqtt-load ${args[*]@Q} \
-			--topic-prefix rig2/$hid/g$g --client-prefix r2-$hid-g$g --out steps/$hid/gen.json \
+			--topic-prefix rig2/$hid/g$g --client-prefix r2-$hid-g$g --out steps/$hid/gen.json $metrics \
 			2>steps/$hid/gen.stderr; echo \$? >steps/$hid/gen.exit" &
 		pids+=($!)
 	done
@@ -349,6 +385,7 @@ for w in $WORKLOADS; do
 	(run_ladder "$w")
 done
 
+phase collecting "rig2 report"
 python3 "$RIG2/verdict.py" report "$RUN" >/dev/null
 say "report: $RUN/report.md"
 cat "$RUN/report.md" >&2

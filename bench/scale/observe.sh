@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# observe.sh attach <run-dir> <inventory.json> | detach | stop | phase <name> [detail]
+# observe.sh attach <run-dir> <inventory.json> | attach-local <run-dir> <brokers.tsv> [gen-metrics-addr]
+#            | detach | stop | phase <name> [detail]
 #
-# Live Grafana for a bench/scale run (opt-in; run.sh calls this with OBSERVE=1):
+# Live Grafana for a bench/scale run (on by default; run.sh and rig2/run.sh call this
+# unless OBSERVE=0):
 #
 #   laptop: docker compose (Grafana :3000 + Prometheus :9090 + Alloy)
 #      │ forward SSH tunnel  (laptop's :8096 → driver-1's :8096)
@@ -17,10 +19,18 @@
 #
 #   attach  start local stack (once), start the bridge on driver-1, rewrite
 #           Alloy's targets and restart it, open the tunnel
+#   attach-local  the same stack for rig2's TIER=local: no bridge and no tunnel, Alloy
+#           scrapes the local brokers (and mqtt-load) on the operator's loopback
 #   detach  close the tunnel (the bridge dies with its server; Alloy idles on)
 #   stop    detach + stop the local docker compose stack
 #
-# Watch at http://localhost:3000 (anonymous admin, demo mqttd dashboards).
+# OBSERVE_GEN_METRICS_PORT=<port> (rig2): the bridge also curls every generator host's
+# mqtt-load --metrics endpoint at <private_ip>:<port> into gen-<g>.prom, deleting the
+# file when no mqtt-load is running (between steps), so a stale exposition never
+# looks live; Alloy scrapes them as job "mqtt-load", instance gen-<g>.
+#
+# Watch at http://localhost:3000 (anonymous admin, demo mqttd dashboards; rig2 adds
+# "mqtt-load (bench)").
 
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
@@ -37,10 +47,7 @@ stop_tunnel() {
 	fi
 }
 
-case "$cmd" in
-attach)
-	RUN="${2:?run-dir}"
-	INVENTORY="${3:?inventory.json}"
+start_stack() {
 	command -v docker >/dev/null || die "docker is not running locally (needed for the Grafana/Prometheus stack)"
 
 	# The per-run Alloy config is GENERATED into the compose mount below, so it is
@@ -58,6 +65,68 @@ attach)
 		die "could not create the observe_prom-data docker volume"
 	say "observe: starting local Grafana(:3000) + Prometheus(:9090)"
 	(cd "$OBS_DIR" && docker compose up -d --quiet-pull 2>/dev/null || docker compose up -d)
+}
+
+# Where Alloy finds the operator's loopback. Alloy runs with host networking (see the
+# compose file), which on Linux IS the operator's network, so 127.0.0.1 reaches the ssh
+# tunnel. On Docker Desktop (macOS) "host" is the Docker VM's network: ports Docker
+# publishes (Prometheus :9090, the phase gateway :9091) are there, but the tunnel is an
+# ssh process on the Mac and is not — every broker scrape failed (up=0 for a whole run
+# on 2026-10-03; the dashboards stayed empty while the phase marker, a Docker port,
+# worked). host.docker.internal reaches the Mac from that network (measured: 200 vs no
+# answer).
+loopback_host() {
+	case "$(uname -s)" in
+	Darwin) echo host.docker.internal ;;
+	*) echo 127.0.0.1 ;;
+	esac
+}
+
+# scrape_block <component> <address> <path> <instance> [job]
+scrape_block() {
+	echo "prometheus.scrape \"$1\" {"
+	if [ -n "${5:-}" ]; then
+		echo "  targets         = [{ __address__ = \"$2\", instance = \"$4\", job = \"$5\" }]"
+	else
+		echo "  targets         = [{ __address__ = \"$2\", instance = \"$4\" }]"
+	fi
+	echo "  metrics_path    = \"$3\""
+	echo '  scrape_interval = "2s"'
+	echo '  scrape_timeout  = "2s"'
+	echo '  forward_to      = [prometheus.remote_write.local.receiver]'
+	echo '}'
+}
+
+# The phase heartbeat and the remote write: the tail of every generated config.
+alloy_tail() {
+	echo 'prometheus.scrape "bench_phase" {'
+	echo '  targets         = [{ __address__ = "127.0.0.1:9091" }]'
+	echo '  scrape_interval = "5s"'
+	# Alloy's default scrape_timeout (10s) is refused against a 5s interval.
+	echo '  scrape_timeout  = "3s"'
+	echo '  honor_labels    = true'
+	echo '  forward_to      = [prometheus.remote_write.local.receiver]'
+	echo '}'
+	echo 'prometheus.remote_write "local" {'
+	echo '  endpoint { url = "http://127.0.0.1:9090/api/v1/write" }'
+	echo '}'
+}
+
+restart_alloy() {
+	(cd "$OBS_DIR" && docker compose restart alloy >/dev/null 2>&1) ||
+		warn "observe: could not restart the local Alloy container"
+}
+
+live_banner() {
+	say "observe: live at http://localhost:3000 — dashboards: mqttd (bench) http://localhost:3000/d/mqttd-overview-bench${1:+, mqtt-load (bench) http://localhost:3000/d/mqtt-load-bench}"
+}
+
+case "$cmd" in
+attach)
+	RUN="${2:?run-dir}"
+	INVENTORY="${3:?inventory.json}"
+	GEN_PORT="${OBSERVE_GEN_METRICS_PORT:-}"
+	start_stack
 
 	DRIVER_IP=$(driver_pub_ip 0)
 
@@ -72,6 +141,10 @@ attach)
 		echo 'mkdir -p /var/lib/bench-prom'
 		echo 'while true; do'
 		jq -r '.brokers[] | "  curl -sf --max-time 2 http://\(.health)/metrics -o /var/lib/bench-prom/\(.node_id).tmp && mv /var/lib/bench-prom/\(.node_id).tmp /var/lib/bench-prom/\(.node_id).prom"' "$INVENTORY"
+		# A generator's endpoint exists only while its mqtt-load runs: no file then.
+		if [ -n "$GEN_PORT" ]; then
+			jq -r --arg port "$GEN_PORT" '.drivers | to_entries[] | "  curl -sf --max-time 2 http://\(.value.private_ip):\($port)/metrics -o /var/lib/bench-prom/gen-\(.key).tmp && mv /var/lib/bench-prom/gen-\(.key).tmp /var/lib/bench-prom/gen-\(.key).prom || rm -f /var/lib/bench-prom/gen-\(.key).prom"' "$INVENTORY"
+		fi
 		echo '  sleep 2'
 		echo 'done'
 	} >"$BRIDGE"
@@ -88,41 +161,20 @@ attach)
 	# operator's loopback. Written into the compose mount (a copy is kept in the
 	# run dir for the archive) and picked up by a restart.
 	ALLOY_CFG="$OBS_DIR/alloy/config.alloy"
-	# Where Alloy finds the tunnel. Alloy runs with host networking (see the compose file),
-	# which on Linux IS the operator's network, so 127.0.0.1 reaches the ssh tunnel. On
-	# Docker Desktop (macOS) "host" is the Docker VM's network: ports Docker publishes
-	# (Prometheus :9090, the phase gateway :9091) are there, but the tunnel is an ssh
-	# process on the Mac and is not — every broker scrape failed (up=0 for a whole run on
-	# 2026-10-03; the dashboards stayed empty while the phase marker, a Docker port, worked).
-	# host.docker.internal reaches the Mac from that network (measured: 200 vs no answer).
-	case "$(uname -s)" in
-	Darwin) TUNNEL_HOST=host.docker.internal ;;
-	*) TUNNEL_HOST=127.0.0.1 ;;
-	esac
+	TUNNEL_HOST=$(loopback_host)
 	{
 		echo "// Generated by observe.sh for run $(basename "$RUN") — do not edit by hand."
 		i=0
 		while IFS=$'\t' read -r node_id; do
-			echo "prometheus.scrape \"broker_$i\" {"
-			echo "  targets         = [{ __address__ = \"$TUNNEL_HOST:8096\", instance = \"$node_id\" }]"
-			echo "  metrics_path    = \"/$node_id.prom\""
-			echo '  scrape_interval = "2s"'
-			echo '  scrape_timeout  = "2s"'
-			echo '  forward_to      = [prometheus.remote_write.local.receiver]'
-			echo '}'
+			scrape_block "broker_$i" "$TUNNEL_HOST:8096" "/$node_id.prom" "$node_id"
 			i=$((i + 1))
 		done < <(jq -r '.brokers[].node_id' "$INVENTORY")
-		echo 'prometheus.scrape "bench_phase" {'
-		echo '  targets         = [{ __address__ = "127.0.0.1:9091" }]'
-		echo '  scrape_interval = "5s"'
-		# Alloy's default scrape_timeout (10s) is refused against a 5s interval.
-		echo '  scrape_timeout  = "3s"'
-		echo '  honor_labels    = true'
-		echo '  forward_to      = [prometheus.remote_write.local.receiver]'
-		echo '}'
-		echo 'prometheus.remote_write "local" {'
-		echo '  endpoint { url = "http://127.0.0.1:9090/api/v1/write" }'
-		echo '}'
+		if [ -n "$GEN_PORT" ]; then
+			for ((g = 0; g < $(jq -r '.drivers | length' "$INVENTORY"); g++)); do
+				scrape_block "mqtt_load_$g" "$TUNNEL_HOST:8096" "/gen-$g.prom" "gen-$g" mqtt-load
+			done
+		fi
+		alloy_tail
 	} >"$ALLOY_CFG"
 	cp "$ALLOY_CFG" "$RUN/alloy-config.alloy"
 
@@ -134,10 +186,33 @@ attach)
 		-N -L 8096:localhost:8096 "root@$DRIVER_IP" &
 	echo $! >"$TUNNEL_PID_FILE"
 
-	say "observe: pointing local Alloy at $(jq -r '.brokers | length' "$INVENTORY") broker(s)"
-	(cd "$OBS_DIR" && docker compose restart alloy >/dev/null 2>&1) || \
-		warn "observe: could not restart the local Alloy container"
-	say "observe: live at http://localhost:3000 (dashboards: mqttd)"
+	say "observe: pointing local Alloy at $(jq -r '.brokers | length' "$INVENTORY") broker(s)${GEN_PORT:+ and $(jq -r '.drivers | length' "$INVENTORY") generator(s)}"
+	restart_alloy
+	live_banner "$GEN_PORT"
+	say "observe: the tunnel is this run's ssh -N -L 8096:localhost:8096 root@$DRIVER_IP (pid $(cat "$TUNNEL_PID_FILE")); Grafana listens on every interface of this machine (:3000)"
+	;;
+attach-local)
+	# rig2 TIER=local: the brokers and mqtt-load run on this machine, so Alloy scrapes
+	# them directly (no bridge, no tunnel). <brokers.tsv> is local-cluster.sh's: index,
+	# mqtt address, health address.
+	RUN="${2:?run-dir}"
+	TSV="${3:?brokers.tsv}"
+	GEN_ADDR="${4:-}"
+	start_stack
+	ALLOY_CFG="$OBS_DIR/alloy/config.alloy"
+	HOST=$(loopback_host)
+	{
+		echo "// Generated by observe.sh attach-local for run $(basename "$RUN") — do not edit by hand."
+		while IFS=$'\t' read -r idx _ health; do
+			scrape_block "broker_$idx" "$HOST:${health##*:}" "/metrics" "local-$idx"
+		done <"$TSV"
+		[ -z "$GEN_ADDR" ] || scrape_block "mqtt_load_0" "$HOST:${GEN_ADDR##*:}" "/metrics" "gen-0" mqtt-load
+		alloy_tail
+	} >"$ALLOY_CFG"
+	cp "$ALLOY_CFG" "$RUN/alloy-config.alloy"
+	say "observe: pointing local Alloy at $(wc -l <"$TSV" | tr -d ' ') local broker(s)${GEN_ADDR:+ and mqtt-load at $GEN_ADDR}"
+	restart_alloy
+	live_banner "$GEN_ADDR"
 	;;
 phase)
 	# Push the run's current phase so a blank dashboard is never ambiguous.
