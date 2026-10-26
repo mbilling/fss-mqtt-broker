@@ -258,7 +258,7 @@ impl Fix {
         for c in clients {
             let id = ClientId((*c).into());
             let subs = self.store.subscriptions(&id).await.unwrap();
-            sessions.push((id, subs, None));
+            sessions.push(mqtt_storage::ScannedSession::new(id, subs, None));
         }
         self.dispatch(HubCommand::InheritedSessions {
             sessions,

@@ -284,8 +284,8 @@ pub enum SessionClaim {
 /// the whole truth).
 #[derive(Debug)]
 pub struct SessionScan {
-    /// Each readable session: `(client, subscriptions, expiry deadline)`.
-    pub sessions: Vec<(ClientId, Vec<Subscription>, Option<u64>)>,
+    /// Each readable session.
+    pub sessions: Vec<ScannedSession>,
     /// Whether every stored key was either read or cleanly foreign.
     pub complete: bool,
     /// The sessions that made it incomplete, each with its error, at most
@@ -302,12 +302,44 @@ impl SessionScan {
 
     /// A complete scan over `sessions`.
     #[must_use]
-    pub fn complete(sessions: Vec<(ClientId, Vec<Subscription>, Option<u64>)>) -> Self {
+    pub fn complete(sessions: Vec<ScannedSession>) -> Self {
         Self {
             sessions,
             complete: true,
             unread: Vec::new(),
             unread_total: 0,
+        }
+    }
+}
+
+/// One stored session as [`SessionStore::all_sessions`] reads it: what a new owner needs
+/// to materialise it and to expire it on time (ADR 0009 §3, ADR 0042 T9).
+#[derive(Debug, Clone)]
+pub struct ScannedSession {
+    /// The session's client id.
+    pub client: ClientId,
+    /// The persisted subscription set.
+    pub subscriptions: Vec<Subscription>,
+    /// The absolute expiry deadline (Unix epoch seconds), written when the session's
+    /// last connection detached; `None` while connected, for a never-expiring session,
+    /// and for a connection that ended without a detach (a crash, a refused write).
+    pub expiry_at: Option<u64>,
+    /// The Session Expiry Interval of the session's last connection, in seconds
+    /// (`u32::MAX` = never expires), or `None` when the record predates the field
+    /// (written by 1.2.0 or earlier) — issue #1118. It is what lets a new owner expire a
+    /// session that carries no deadline.
+    pub expiry_interval: Option<u32>,
+}
+
+impl ScannedSession {
+    /// A session with no recorded expiry interval.
+    #[must_use]
+    pub fn new(client: ClientId, subscriptions: Vec<Subscription>, expiry_at: Option<u64>) -> Self {
+        Self {
+            client,
+            subscriptions,
+            expiry_at,
+            expiry_interval: None,
         }
     }
 }
@@ -630,6 +662,24 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         Ok(())
     }
 
+    /// [`set_session_expiry`](Self::set_session_expiry), recording in the same write the
+    /// session's Session Expiry **interval** in seconds (`u32::MAX` = never expires).
+    ///
+    /// The deadline exists only once a connection detached; the interval is written at
+    /// connect, so a session whose connection ended WITHOUT a detach (a crash while
+    /// connected, a deadline write the store refused) still tells its next owner how long
+    /// to keep it (issue #1118). Default: the deadline alone (stores without durable
+    /// metadata, and wrappers that forward only `set_session_expiry`).
+    async fn set_session_lifetime(
+        &self,
+        client: &ClientId,
+        interval: u32,
+        deadline: Option<u64>,
+    ) -> Result<(), StorageError> {
+        let _ = interval;
+        self.set_session_expiry(client, deadline).await
+    }
+
     /// Every session this store currently holds with a persisted expiry deadline, as
     /// `(client, deadline epoch secs)`. A new owner reads this after a takeover to
     /// schedule the expiry sweep for sessions it inherited (ADR 0009 §3). Default: empty.
@@ -785,6 +835,8 @@ struct SessionEntry {
     /// Absolute expiry deadline (Unix epoch secs) for a disconnected session, or `None`
     /// while connected / never-expiring (ADR 0009 §3).
     session_expiry_at: Option<u64>,
+    /// The Session Expiry Interval of the last connection (issue #1118), as on disk.
+    session_expiry_interval: Option<u32>,
     /// The authenticated identity that owns this session (ADR 0031). `None` only for a
     /// legacy entry created before owner binding; the next claim adopts it.
     owner: Option<String>,
@@ -1083,6 +1135,19 @@ impl SessionStore for MemorySessionStore {
         Ok(())
     }
 
+    async fn set_session_lifetime(
+        &self,
+        client: &ClientId,
+        interval: u32,
+        deadline: Option<u64>,
+    ) -> Result<(), StorageError> {
+        if let Some(entry) = self.lock().get_mut(client) {
+            entry.session_expiry_at = deadline;
+            entry.session_expiry_interval = Some(interval);
+        }
+        Ok(())
+    }
+
     async fn expiring_sessions(&self) -> Result<Vec<(ClientId, u64)>, StorageError> {
         Ok(self
             .lock()
@@ -1095,7 +1160,12 @@ impl SessionStore for MemorySessionStore {
         Ok(SessionScan::complete(
             self.lock()
                 .iter()
-                .map(|(c, e)| (c.clone(), e.subscriptions.clone(), e.session_expiry_at))
+                .map(|(c, e)| ScannedSession {
+                    client: c.clone(),
+                    subscriptions: e.subscriptions.clone(),
+                    expiry_at: e.session_expiry_at,
+                    expiry_interval: e.session_expiry_interval,
+                })
                 .collect(),
         ))
     }

@@ -206,6 +206,12 @@ const PKID_BLOCK: u16 = 1024;
 /// `clean_session=0` maps to this.
 const SESSION_EXPIRY_NEVER: u32 = u32::MAX;
 
+/// What a clustered node adds to an inherited session's interval when the record carries
+/// no deadline (issue #1118): the session may still be connected at the old owner until
+/// the rehome closes it (`MISPLACED_GRACE_TICKS` sweeps) and the client reconnects here,
+/// and a short interval must not expire a session that is only moving.
+const INHERITED_EXPIRY_GRACE: Duration = Duration::from_secs(10);
+
 /// How long a persistent attach waits for the durable store to give an *authoritative*
 /// session answer before rejecting the CONNECT with Server-unavailable (ADR 0017).
 /// Comfortably above the observed lease-handoff (~1s) after a takeover, below a typical
@@ -2041,8 +2047,8 @@ pub enum HubCommand {
     /// the routing table so a publish arriving before the client's first re-attach
     /// enqueues instead of routing to nothing.
     InheritedSessions {
-        /// `(client, subscriptions, expiry deadline)` per stored session.
-        sessions: Vec<(ClientId, Vec<Subscription>, Option<u64>)>,
+        /// Each stored session, with its expiry deadline and interval.
+        sessions: Vec<mqtt_storage::ScannedSession>,
         /// Whether the scan saw everything (0043-P4 exhibit ②): `false` when a
         /// key was skipped for a transient reason — the view may be missing
         /// sessions, so it must not settle the interest-authoritative flag.
@@ -5314,7 +5320,14 @@ impl Hub {
             // restart-while-connected from inheriting a stale deadline and wrongly expiring an
             // active session. Only for a persistent session — a clean session has no durable
             // metadata, and writing a cleared deadline would wrongly materialize one.
-            let _ = self.store.set_session_expiry(&client, None).await;
+            //
+            // The same write records the INTERVAL (issue #1118): the deadline is written only
+            // at detach, so a connection that ends without one (a crash, a refused write)
+            // would otherwise leave a record its next owner could never expire.
+            let _ = self
+                .store
+                .set_session_lifetime(&client, session_expiry, None)
+                .await;
         }
 
         // Adopt this connection's outbound Receive Maximum quota (ADR 0012). A
@@ -6607,6 +6620,7 @@ impl Hub {
                         self.session_expiry.remove(client);
                     } else {
                         self.session_expiry.insert(client.clone(), secs);
+                        self.persist_never_expiring(client, secs).await;
                     }
                 }
             }
@@ -6644,6 +6658,7 @@ impl Hub {
                 self.session_expiry.remove(client);
             } else {
                 self.session_expiry.insert(client.clone(), secs);
+                self.persist_never_expiring(client, secs).await;
             }
         }
         // Any end other than a clean DISCONNECT publishes the will
@@ -6677,7 +6692,7 @@ impl Hub {
                 // session at the right time after a takeover instead of restarting the clock
                 // (ADR 0009 §3).
                 let deadline = self.clock.now_epoch_secs() + u64::from(secs);
-                self.persist_detach_deadline(client, deadline).await;
+                self.persist_detach_deadline(client, secs, deadline).await;
                 self.expiring.insert(client.clone(), deadline);
                 info!(client = %client.0, expires_in_s = secs, "client detached (session expiring)");
             }
@@ -6790,7 +6805,10 @@ impl Hub {
                     let client = client.clone();
                     let metrics = self.metrics.clone();
                     self.spawn_owned(async move {
-                        if let Err(e) = store.set_session_expiry(&client, Some(deadline)).await {
+                        if let Err(e) = store
+                            .set_session_lifetime(&client, secs, Some(deadline))
+                            .await
+                        {
                             warn!(
                                 client = %client.0,
                                 deadline,
@@ -6859,7 +6877,13 @@ impl Hub {
     /// every takeover of an ONLINE session (the deadline is cleared while connected, so a
     /// dead owner's successor inherits none); the named follow-up — persist the interval
     /// alongside the deadline — closes both at once.
-    async fn persist_detach_deadline(&self, client: &ClientId, deadline: u64) {
+    ///
+    /// **Closed by issue #1118.** The interval is now persisted at connect (and again here,
+    /// beside the deadline), so a successor that inherits a record with no deadline arms
+    /// `now + interval` itself ([`inherit_sessions`](Self::inherit_sessions)): the skipped
+    /// or refused write below delays the expiry by at most the time until the new owner's
+    /// scan, never forever.
+    async fn persist_detach_deadline(&self, client: &ClientId, interval: u32, deadline: u64) {
         if self.durable_plane.is_some() && self.clustered() && !self.owns_session(client) {
             warn!(
                 client = %client.0,
@@ -6874,17 +6898,44 @@ impl Hub {
             }
             return;
         }
-        if let Err(e) = self.store.set_session_expiry(client, Some(deadline)).await {
+        if let Err(e) = self
+            .store
+            .set_session_lifetime(client, interval, Some(deadline))
+            .await
+        {
             warn!(
                 client = %client.0,
                 deadline,
                 error = %e,
-                "failed to persist the session expiry deadline (ADR 0009 §3); the session \
-                 may outlive its stated interval if its owner changes"
+                "failed to persist the session expiry deadline (ADR 0009 §3); a new owner \
+                 expires the session from the interval recorded at connect instead (#1118)"
             );
             if let Some(m) = &self.metrics {
                 m.session_expiry_unpersisted("error");
             }
+        }
+    }
+
+    /// A DISCONNECT that revises a session to never expire (§3.14.2.2.2): record the new
+    /// interval, since the one written at connect is finite and a record without a
+    /// deadline is expired from it after a restart or takeover (issue #1118). Rare — only
+    /// the revision to `u32::MAX` needs it; a finite revision is written with its deadline.
+    async fn persist_never_expiring(&self, client: &ClientId, secs: u32) {
+        if secs != SESSION_EXPIRY_NEVER
+            || (self.durable_plane.is_some() && self.clustered() && !self.owns_session(client))
+        {
+            return;
+        }
+        if let Err(e) = self
+            .store
+            .set_session_lifetime(client, SESSION_EXPIRY_NEVER, None)
+            .await
+        {
+            warn!(
+                client = %client.0,
+                error = %e,
+                "failed to persist a never-expiring Session Expiry Interval from DISCONNECT"
+            );
         }
     }
 
@@ -7412,11 +7463,12 @@ impl Hub {
     /// which an orphaned session would never expire on the new owner). A later
     /// real attach takes over cleanly: registration is idempotent and
     /// `finish_attach` overwrites the placeholder expiry interval.
-    fn inherit_sessions(
-        &mut self,
-        sessions: Vec<(ClientId, Vec<Subscription>, Option<u64>)>,
-        complete: bool,
-    ) {
+    ///
+    /// A record with NO deadline but a known finite interval is a session whose last
+    /// connection ended without a detach — a crash, a refused or skipped deadline write
+    /// (issue #1118). Its clock is armed here, see
+    /// [`inherited_deadline`](Self::inherited_deadline).
+    fn inherit_sessions(&mut self, sessions: Vec<mqtt_storage::ScannedSession>, complete: bool) {
         self.inherited_scan_inflight = false;
         self.last_scan_complete = complete;
         // The interest-authoritative transition (0043-P4 exhibit ②): once one
@@ -7428,7 +7480,13 @@ impl Hub {
             debug!("interest gossip authoritative: first complete whole-mesh session scan landed");
         }
         let mut registered = false;
-        for (client, subs, deadline) in sessions {
+        for mqtt_storage::ScannedSession {
+            client,
+            subscriptions: subs,
+            expiry_at: deadline,
+            expiry_interval,
+        } in sessions
+        {
             // Skip ones already handled (online or attaching here) and ones this
             // node does not own (a replica held for another node — its owner
             // materializes it).
@@ -7439,6 +7497,7 @@ impl Hub {
                 debug!(client = %client.0, "inherited-session scan: skipped (online/attaching/unowned)");
                 continue;
             }
+            let deadline = deadline.or_else(|| self.inherited_deadline(&client, expiry_interval));
             if let Some(d) = deadline {
                 self.expiring.entry(client.clone()).or_insert(d);
             }
@@ -7473,11 +7532,12 @@ impl Hub {
                     ));
             }
             // Persistent from the routing path's point of view (offline enqueue).
-            // The placeholder interval is corrected by the next real attach; the
-            // inherited absolute deadline above still bounds the session's life.
+            // The recorded interval when there is one (issue #1118); the placeholder
+            // `u32::MAX` only for a record written before it was. The next real attach
+            // overwrites either, and the deadline above bounds the session's life.
             self.session_expiry
                 .entry(client.clone())
-                .or_insert(u32::MAX);
+                .or_insert(expiry_interval.unwrap_or(SESSION_EXPIRY_NEVER));
             debug!(client = %client.0, "inherited session materialized before re-attach (ADR 0042 T9)");
             registered = true;
         }
@@ -7496,6 +7556,38 @@ impl Hub {
             self.note_scan_landed(self.scan_started.0);
         }
         self.settle_passes();
+    }
+
+    /// The deadline to arm for an inherited session whose record carries none (issue
+    /// #1118): `now + interval` when its last connection named a finite interval.
+    ///
+    /// The spec's clock starts when the network connection closes (MQTT 5 §3.1.2.11.2).
+    /// No detach recorded when that was, but it was no later than now — after a restart,
+    /// the old process is gone; after a takeover, the old owner can no longer hold the
+    /// session — so `now + interval` is a valid upper bound. In a cluster the session may
+    /// in fact still be connected at the old owner until the rehome closes it and the
+    /// client reconnects here (`MISPLACED_GRACE_TICKS` and a reconnect), so a cluster
+    /// adds [`INHERITED_EXPIRY_GRACE`] rather than expire a session that is moving.
+    ///
+    /// `None` — never expire, today's behaviour — for `u32::MAX` (v3.1.1
+    /// `clean_session=0`, ADR 0009) and for a record written before the interval was
+    /// (1.2.0 and earlier: its interval is unknown, and expiring a session the client
+    /// asked to keep forever would be the worse error).
+    fn inherited_deadline(&self, client: &ClientId, interval: Option<u32>) -> Option<u64> {
+        let secs = interval.filter(|s| *s != SESSION_EXPIRY_NEVER)?;
+        let grace = if self.clustered() {
+            INHERITED_EXPIRY_GRACE.as_secs()
+        } else {
+            0
+        };
+        let deadline = self.clock.now_epoch_secs() + u64::from(secs) + grace;
+        info!(
+            client = %client.0,
+            expires_in_s = u64::from(secs) + grace,
+            "inherited session carries no expiry deadline (its connection ended without a \
+             detach); expiring it from its recorded interval (#1118)"
+        );
+        Some(deadline)
     }
 
     /// The mirror of [`inherit_sessions`] for a ring that GREW (ADR 0043 P2):
@@ -19393,6 +19485,148 @@ mod tests {
         );
     }
 
+    /// A fresh hub (a restart, or a new owner) over `store`, its wall clock at `now`,
+    /// left long enough for its inherited-session scan to land.
+    async fn successor_hub(store: &Arc<MemorySessionStore>, now: u64) -> TestClock {
+        let clock = TestClock::new(now);
+        let (mut hub, _tx) = Hub::with_config(NodeId("successor".into()), store.clone());
+        hub.attach_clock(Arc::new(clock.clone()));
+        tokio::spawn(hub.run());
+        // SETTLE(successor-scan-cadence): virtual time (`start_paused`) past one reconcile
+        // cadence, so the successor's inherited-session scan has run; nothing outside the
+        // spawned hub shows that it landed, and the same wait in
+        // `inherited_session_expiry_is_swept_after_takeover` is the precedent.
+        tokio::time::sleep(Duration::from_secs(u64::from(EXPIRY_RECONCILE_EVERY + 2))).await;
+        clock
+    }
+
+    /// Issue #1118: a session whose connection ended WITHOUT a detach — the hub that
+    /// held it is gone, so no deadline was ever written — is expired by its successor
+    /// from the interval its CONNECT recorded, counted from the inherit.
+    #[tokio::test(start_paused = true)]
+    async fn a_session_that_never_detached_expires_from_its_recorded_interval() {
+        let store = Arc::new(MemorySessionStore::new());
+        let (mut first, tx) = Hub::with_config(NodeId("first".into()), store.clone());
+        first.attach_clock(Arc::new(TestClock::new(1_000_000)));
+        let first = tokio::spawn(first.run());
+        let (_rx, _) = attach_v5(&tx, "crashed", 1, false, 30).await;
+        subscribe(&tx, "crashed", "c/t");
+        ping(&tx).await;
+        first.abort(); // the crash: no Detach ever reaches a hub
+        let _ = first.await;
+
+        let client = ClientId("crashed".into());
+        let scan = store.all_sessions().await.unwrap();
+        assert_eq!(scan.sessions.len(), 1);
+        assert_eq!(
+            scan.sessions[0].expiry_at, None,
+            "no detach wrote a deadline"
+        );
+        assert_eq!(scan.sessions[0].expiry_interval, Some(30));
+
+        let clock = successor_hub(&store, 2_000_000).await;
+        clock.advance(20);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            store.subscriptions(&client).await.unwrap().len(),
+            1,
+            "kept within its interval of the inherit"
+        );
+        clock.advance(15);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            store.subscriptions(&client).await.unwrap().is_empty(),
+            "a session with a 30 s interval and no deadline must expire 30 s after the \
+             inherit, not live forever under the u32::MAX placeholder"
+        );
+    }
+
+    /// The other side of #1118's rule: a v3.1.1 `clean_session=0` session (ADR 0009: the
+    /// never-expiring interval) records `u32::MAX`, and a successor keeps it however long
+    /// it waits.
+    #[tokio::test(start_paused = true)]
+    async fn a_never_expiring_session_that_never_detached_is_kept() {
+        let store = Arc::new(MemorySessionStore::new());
+        let (first, tx) = Hub::with_config(NodeId("first".into()), store.clone());
+        let first = tokio::spawn(first.run());
+        let (_rx, _) = attach(&tx, "v311", 1, false).await;
+        subscribe(&tx, "v311", "k/t");
+        ping(&tx).await;
+        first.abort();
+        let _ = first.await;
+        assert_eq!(
+            store.all_sessions().await.unwrap().sessions[0].expiry_interval,
+            Some(u32::MAX)
+        );
+
+        let clock = successor_hub(&store, 2_000_000).await;
+        clock.advance(10 * 365 * 24 * 3600);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            store
+                .subscriptions(&ClientId("v311".into()))
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a never-expiring session must never be expired"
+        );
+    }
+
+    /// A record written before the interval was (1.2.0 and earlier, a rolling upgrade)
+    /// carries no interval and no deadline: its expiry is unknown, and the successor
+    /// keeps today's behaviour — never expire — rather than guess.
+    #[tokio::test(start_paused = true)]
+    async fn a_session_record_without_an_interval_keeps_todays_behaviour() {
+        let store = Arc::new(MemorySessionStore::new());
+        let client = ClientId("legacy".into());
+        store.ensure_session(&client).await.unwrap();
+        store
+            .set_subscriptions(
+                &client,
+                &[mqtt_core::Subscription {
+                    filter: "l/t".into(),
+                    max_qos: QoS::AtLeastOnce,
+                    no_local: false,
+                    sub_id: None,
+                }],
+            )
+            .await
+            .unwrap();
+        store.set_session_expiry(&client, None).await.unwrap();
+        assert_eq!(
+            store.all_sessions().await.unwrap().sessions[0].expiry_interval,
+            None
+        );
+
+        let clock = successor_hub(&store, 2_000_000).await;
+        clock.advance(10 * 365 * 24 * 3600);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(store.subscriptions(&client).await.unwrap().len(), 1);
+    }
+
+    /// A DISCONNECT that revises the interval to never-expire (§3.14.2.2.2) records it,
+    /// so a successor does not expire the session from the finite interval of its CONNECT.
+    #[tokio::test(start_paused = true)]
+    async fn a_disconnect_revising_to_never_expire_is_recorded() {
+        let store = Arc::new(MemorySessionStore::new());
+        let (hub, tx) = Hub::with_config(NodeId("first".into()), store.clone());
+        tokio::spawn(hub.run());
+        let (_rx, _) = attach_v5(&tx, "revised", 1, false, 30).await;
+        subscribe(&tx, "revised", "r/t");
+        tx.send(HubCommand::Detach {
+            client: ClientId("revised".into()),
+            conn_id: 1,
+            graceful: true,
+            session_expiry_override: Some(u32::MAX),
+        })
+        .unwrap();
+        ping(&tx).await;
+        let scan = store.all_sessions().await.unwrap();
+        assert_eq!(scan.sessions[0].expiry_at, None);
+        assert_eq!(scan.sessions[0].expiry_interval, Some(u32::MAX));
+    }
+
     /// ADR 0043 P2: when the ring GROWS and a materialized offline session's group
     /// moves to the joiner, the old owner **releases** its local routing for it —
     /// observable as re-gossiped interest without the moved filter — instead of
@@ -19934,6 +20168,20 @@ mod tests {
                 return Err(mqtt_storage::StorageError::NotOwner);
             }
             self.inner.set_session_expiry(client, deadline).await
+        }
+
+        async fn set_session_lifetime(
+            &self,
+            client: &ClientId,
+            interval: u32,
+            deadline: Option<u64>,
+        ) -> Result<(), mqtt_storage::StorageError> {
+            if !self.owns(client) {
+                return Err(mqtt_storage::StorageError::NotOwner);
+            }
+            self.inner
+                .set_session_lifetime(client, interval, deadline)
+                .await
         }
 
         async fn expiring_sessions(

@@ -1399,6 +1399,18 @@ impl mqtt_storage::SessionStore for FlakyStore {
         self.inner.set_session_expiry(client, deadline).await
     }
 
+    async fn set_session_lifetime(
+        &self,
+        client: &mqtt_core::ClientId,
+        interval: u32,
+        deadline: Option<u64>,
+    ) -> Result<(), mqtt_storage::StorageError> {
+        self.check_write()?;
+        self.inner
+            .set_session_lifetime(client, interval, deadline)
+            .await
+    }
+
     async fn expiring_sessions(
         &self,
     ) -> Result<Vec<(mqtt_core::ClientId, u64)>, mqtt_storage::StorageError> {

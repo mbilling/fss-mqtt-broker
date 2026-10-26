@@ -1336,12 +1336,16 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `value::tests::json_strings_escape_as_jiffy_escapes_them`
 - `value::tests::numbers_compare_across_int_and_float`
 
-## `crates/mqtt-storage/src/lib.rs` — 91 test(s)
+## `crates/mqtt-storage/src/lib.rs` — 95 test(s)
 
 - `app_props::tests::converts_to_and_from_core_properties_losslessly`
 - `app_props::tests::encode_decode_roundtrips_and_fails_closed`
 - `data_dir::tests::creates_a_missing_directory`
 - `data_dir::tests::stamps_on_first_use_and_rejects_a_foreign_node`
+- `logged::compat_1_2_0::a_1_2_0_record_reads_with_the_interval_unknown`
+- `logged::compat_1_2_0::a_record_with_the_expiry_interval_decodes_under_1_2_0`
+- `logged::compat_1_2_0::a_record_without_the_interval_is_byte_identical_to_1_2_0`
+- `logged::compat_1_2_0::the_expiry_interval_reaches_the_session_scan`
 - `logged::export_order_tests::the_queue_is_read_before_the_metadata_that_covers_it`
 - `logged::metadata_concurrency::clearing_one_id_cannot_erase_a_concurrent_delivery_identity`
 - `logged::metadata_concurrency::metadata_lock_pruning_and_waiter_cancellation_preserve_exclusion`
@@ -1523,7 +1527,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 875 test(s)
+## `crates/mqttd/src/lib.rs` — 879 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1839,6 +1843,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_discard_with_an_inflight_append_leaves_no_ghost_queue`
 - `hub::tests::a_discharge_clears_the_missed_windows`
 - `hub::tests::a_discharged_tombstone_is_reaped_after_the_roster_converges`
+- `hub::tests::a_disconnect_revising_to_never_expire_is_recorded`
 - `hub::tests::a_divergent_retained_value_is_detected_and_counted`
 - `hub::tests::a_drain_gated_message_is_not_handed_to_a_member_whose_node_was_declared_dead`
 - `hub::tests::a_dropped_replay_entry_does_not_pin_the_log`
@@ -1878,6 +1883,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_missed_retained_fan_out_is_healed_by_periodic_anti_entropy`
 - `hub::tests::a_moved_lease_owner_nacks_a_routed_commit`
 - `hub::tests::a_nacked_handoff_re_routes_once_placement_catches_up`
+- `hub::tests::a_never_expiring_session_that_never_detached_is_kept`
 - `hub::tests::a_node_draining_in_a_brownout_still_sends_its_shutdown_events_live`
 - `hub::tests::a_panicking_truncate_flush_does_not_strand_its_session`
 - `hub::tests::a_parked_qos2_truncate_does_not_stall_unrelated_sessions`
@@ -1918,8 +1924,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_retained_publish_refused_by_brownout_leaves_the_previous_retained_value_intact`
 - `hub::tests::a_retained_replay_carries_the_remaining_expiry_interval`
 - `hub::tests::a_retained_sys_value_is_never_replayed`
+- `hub::tests::a_session_record_without_an_interval_keeps_todays_behaviour`
 - `hub::tests::a_session_that_becomes_misplaced_by_attaching_is_rehomed`
 - `hub::tests::a_session_that_keeps_missing_the_window_is_written_directly`
+- `hub::tests::a_session_that_never_detached_expires_from_its_recorded_interval`
 - `hub::tests::a_shared_group_refusing_every_drain_gated_delivery_still_gets_it_plainly`
 - `hub::tests::a_shared_group_whose_last_candidate_died_still_gets_a_drain_gated_message`
 - `hub::tests::a_single_axis_still_toggles_brownout_on_its_own`
@@ -3167,6 +3175,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `the_trace_queue_is_bounded_in_bytes`
 - `the_trace_task_holds_the_node_ceiling`
 - `trace_records_show_the_trigger_and_what_the_rule_rendered`
+
+## `crates/mqttd/tests/session_expiry_restart.rs` — 2 test(s)
+
+- `a_session_that_disconnected_before_a_crash_expires_after_restart`
+- `a_session_whose_connection_ended_in_a_crash_expires_after_restart`
 
 ## `crates/mqttd/tests/shared_membership.rs` — 6 test(s)
 

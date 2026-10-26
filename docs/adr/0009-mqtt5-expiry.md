@@ -98,6 +98,30 @@ frame carries a session's deadline. The same hole is pre-existing for every take
 owner's successor inherits none). The follow-up that closes both at once is to persist the
 interval alongside the deadline in the durable session record.
 
+**As delivered — the interval is persisted (2026-10-26, issue #1118).** The follow-up
+above is delivered, and it closes a third case the residual did not name: a crash or kill
+of a node while the client is connected (the deadline was cleared at connect and no
+detach wrote it again, so even a single node's restart kept the session forever). The
+CONNECT of a persistent session now writes its Session Expiry Interval into the session's
+metadata snapshot in the same write that clears the deadline, and every deadline write
+carries it too. A node that inherits a record with **no deadline and a known finite
+interval** (its boot scan, or a takeover's) arms `now + interval`: the spec's clock starts
+when the connection closes, which was no later than the inherit, so this is a valid upper
+bound. A clustered node adds a 10 s grace, because the session may still be connected at
+the old owner until the rehome closes it and the client reconnects to the new owner; a
+short interval must not expire a session that is only moving. `u32::MAX` (v3.1.1
+`clean_session=0`) still never expires.
+
+*Compatibility (ADR 0039, ADR 0058).* The interval is the snapshot's last tail, written
+only when known, with the two conditional tails before it forced present (counts may be
+0) so the read order stays deterministic. A 1.2.0 decoder reads those empty tails as what
+they mean and ignores the trailing four bytes; a record 1.2.0 wrote reads as "interval
+unknown", and such a session keeps the earlier behaviour (no deadline = never expires)
+until its client connects to an upgraded node. A 1.2.0 node that rewrites a record drops
+the interval, with the same fallback. The guard is a verbatim copy of 1.2.0's decoder in
+`mqtt-storage`'s tests. A backup (ADR 0062) does not carry the interval yet: a restored
+session without a deadline is kept until its client connects.
+
 ### 3. Message expiry rides in the stored queue entry; the deadline is absolute
 
 A queued message carries an **absolute expiry deadline** (not the original interval),
