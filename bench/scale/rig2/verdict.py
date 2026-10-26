@@ -325,7 +325,11 @@ def judge(step: Path, cfg: dict | None = None) -> dict:
         verdict = FAILED
         out["failures"].append("ledger did not close: " + "; ".join(
             f"generator {x['generator']}: missing={x['ledger']['missing']} unexpected={x['ledger']['unexpected']} "
-            f"unacked={x['ledger']['unacked']} unexpected_acks={x['ledger']['unexpected_acks']}" for x in ledger_open))
+            f"unacked={x['ledger']['unacked']} unexpected_acks={x['ledger']['unexpected_acks']}"
+            # Deliveries whose packet id skipped on their connection: as many as are
+            # missing places the loss on the broker, after it allocated the id.
+            + (f" pkid_gaps={x['ledger']['pkid_gaps']}" if x['ledger'].get('pkid_gaps') else "")
+            for x in ledger_open))
     elif out["received_share"] is None or out["received_share"] < OFFER_TAKEN:
         verdict = NOT_TAKEN
     elif gate_p99 is None:

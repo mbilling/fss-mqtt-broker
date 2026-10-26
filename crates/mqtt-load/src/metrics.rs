@@ -129,6 +129,12 @@ pub fn render(v: &View<'_>) -> String {
         "PUBACKs for nothing in flight.",
         v.ledger.unexpected_acks,
     );
+    counter(
+        &mut o,
+        "mqload_pkid_gaps_total",
+        "QoS 1 deliveries whose packet id skipped on their connection.",
+        v.ledger.pkid_gaps,
+    );
     let _ = writeln!(
         o,
         "# HELP mqload_errors_total Connection failures by kind.\n# TYPE mqload_errors_total counter"

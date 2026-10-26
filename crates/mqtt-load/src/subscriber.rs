@@ -19,13 +19,24 @@ use crate::payload::{Decoded, Header};
 /// What one batch of deliveries did, before it is recorded.
 #[derive(Debug, Default)]
 struct Batch {
+    /// The connection's previous `QoS` 1 packet id.
+    last_pkid: Option<u16>,
     e2e: Vec<u64>,
     acks: Vec<u8>,
     received: u64,
 }
 
+/// The packet id a broker allocating sequentially uses after `last` (0 is not an id).
+fn next_pkid(last: u16) -> u16 {
+    last.checked_add(1).unwrap_or(1)
+}
+
 fn on_publish(ctx: &Ctx, stream: usize, p: &Publish, now: u64, batch: &mut Batch) {
     if let Some(pkid) = p.pkid {
+        if batch.last_pkid.is_some_and(|last| pkid != next_pkid(last)) {
+            ctx.ledger.pkid_gaps.fetch_add(1, Ordering::Relaxed);
+        }
+        batch.last_pkid = Some(pkid);
         batch.acks.extend_from_slice(&client::puback(pkid));
     }
     match Header::decode(&p.payload, ctx.run) {
@@ -131,5 +142,17 @@ pub async fn consumer(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packet_ids_follow_in_order_and_skip_zero() {
+        assert_eq!(next_pkid(1), 2);
+        assert_eq!(next_pkid(1024), 1025);
+        assert_eq!(next_pkid(u16::MAX), 1);
     }
 }

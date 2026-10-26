@@ -204,6 +204,7 @@ fn live_ledger(l: &Ledger) -> crate::ledger::LedgerReport {
             .sum(),
         negative_acks: l.negative_acks.load(Ordering::Relaxed),
         unexpected_acks: l.unexpected_acks.load(Ordering::Relaxed),
+        pkid_gaps: l.pkid_gaps.load(Ordering::Relaxed),
         ..Default::default()
     }
 }
@@ -630,6 +631,11 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
 
     // Reconcile before closing anything, so the end of the run cannot change it.
     let ledger = ctx.ledger.report(cfg.qos == 1);
+    let missing_sample = if ledger.missing > 0 {
+        ctx.ledger.missing_sample(cfg.report_missing)
+    } else {
+        Vec::new()
+    };
     ctx.stopping.store(true, Ordering::Relaxed);
     let _ = stop_tx.send(true);
     for p in pubs {
@@ -749,6 +755,7 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
             ended_by,
         },
         ledger,
+        missing_sample,
         generator: GeneratorReport {
             saturated,
             saturated_windows,

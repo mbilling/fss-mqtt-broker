@@ -145,6 +145,9 @@ pub struct Ledger {
     pub other_run: AtomicU64,
     /// Deliveries that are not generator payloads.
     pub foreign: AtomicU64,
+    /// `QoS` 1 deliveries whose packet id was not the previous one's successor on their
+    /// connection.
+    pub pkid_gaps: AtomicU64,
 }
 
 /// The ledger at the end of a run.
@@ -177,8 +180,34 @@ pub struct LedgerReport {
     pub other_run: u64,
     /// Deliveries that were not generator payloads.
     pub foreign: u64,
+    /// `QoS` 1 deliveries whose packet id skipped on their connection. Diagnostic,
+    /// not loss by itself (a broker may skip an id still in flight, and a resumed
+    /// session's redeliveries reuse old ids), and it does not open the ledger; but a
+    /// broker that allocates ids in order and lost a PUBLISH after allocating its id
+    /// shows each lost message here, so `missing` with as many `pkid_gaps` locates
+    /// the loss on the broker's side of the subscriber's socket.
+    pub pkid_gaps: u64,
     /// Nothing missing, unexpected, unacked, or acked unexpectedly; and something sent.
     pub closed: bool,
+}
+
+/// One missing identity, for diagnosis: where it should have arrived and what its
+/// publisher's other messages did on that stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MissingId {
+    /// The stream that should have received it.
+    pub stream: usize,
+    /// The stream's topic index.
+    pub topic: usize,
+    /// Publisher id.
+    pub publisher: u32,
+    /// Sequence number.
+    pub seq: u64,
+    /// Messages this publisher sent.
+    pub publisher_sent: u64,
+    /// Whether the stream received a later message from the same publisher (a gap,
+    /// not a tail still in transit).
+    pub later_received: bool,
 }
 
 impl Ledger {
@@ -223,6 +252,7 @@ impl Ledger {
             negative_acks: AtomicU64::new(0),
             other_run: AtomicU64::new(0),
             foreign: AtomicU64::new(0),
+            pkid_gaps: AtomicU64::new(0),
         }
     }
 
@@ -248,6 +278,39 @@ impl Ledger {
             Mark::OutOfRange => s.unexpected.fetch_add(1, Ordering::Relaxed),
         };
         mark
+    }
+
+    /// Up to `limit` missing identities, in (stream, publisher, seq) order.
+    #[must_use]
+    pub fn missing_sample(&self, limit: usize) -> Vec<MissingId> {
+        let mut out = Vec::new();
+        for (si, s) in self.streams.iter().enumerate() {
+            for (k, recv) in s.received.iter().enumerate() {
+                let pi = s.topic + k * self.topics;
+                let p = &self.publishers[pi];
+                if p.sent.count_and_not(recv) == 0 {
+                    continue;
+                }
+                let sent = p.sent.count();
+                let last_recv = (0..p.sent.bits).rev().find(|&q| recv.get(q));
+                for seq in 0..p.sent.bits {
+                    if out.len() >= limit {
+                        return out;
+                    }
+                    if p.sent.get(seq) && !recv.get(seq) {
+                        out.push(MissingId {
+                            stream: si,
+                            topic: s.topic,
+                            publisher: u32::try_from(pi).unwrap_or(u32::MAX),
+                            seq,
+                            publisher_sent: sent,
+                            later_received: last_recv.is_some_and(|l| l > seq),
+                        });
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Reconcile. `qos1` decides whether unacked identities count.
@@ -280,6 +343,7 @@ impl Ledger {
         r.negative_acks = self.negative_acks.load(Ordering::Relaxed);
         r.other_run = self.other_run.load(Ordering::Relaxed);
         r.foreign = self.foreign.load(Ordering::Relaxed);
+        r.pkid_gaps = self.pkid_gaps.load(Ordering::Relaxed);
         r.closed = r.sent > 0
             && r.missing == 0
             && r.unexpected == 0
@@ -372,6 +436,36 @@ mod tests {
         assert_eq!(r.missing, 2);
         assert!(!r.closed);
         assert!(l.report(true).closed);
+    }
+
+    #[test]
+    fn missing_sample_names_each_missing_identity_and_whether_it_is_a_gap() {
+        let l = ledger();
+        send_all(&l, 10, true);
+        for (i, s) in l.streams.iter().enumerate() {
+            for p in (s.topic..4).step_by(2) {
+                for seq in 0..10 {
+                    // Stream 1 lost publisher 3's seq 4 (a gap: 5..9 arrived) and seq 9
+                    // (the tail).
+                    if (i, p) == (1, 3) && (seq == 4 || seq == 9) {
+                        continue;
+                    }
+                    l.receive(i, u32::try_from(p).unwrap(), seq);
+                }
+            }
+        }
+        let m = l.missing_sample(10);
+        assert_eq!(m.len(), 2, "{m:?}");
+        assert_eq!(
+            (m[0].stream, m[0].topic, m[0].publisher, m[0].seq),
+            (1, 1, 3, 4)
+        );
+        assert!(m[0].later_received);
+        assert_eq!(m[0].publisher_sent, 10);
+        assert_eq!((m[1].publisher, m[1].seq), (3, 9));
+        assert!(!m[1].later_received);
+        assert_eq!(l.missing_sample(1).len(), 1, "bounded");
+        assert_eq!(l.report(true).missing, 2);
     }
 
     #[test]

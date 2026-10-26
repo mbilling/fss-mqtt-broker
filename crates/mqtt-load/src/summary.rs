@@ -7,7 +7,7 @@ use serde::Serialize;
 use crate::config::{Sessions, Shape, Thresholds};
 use crate::ctx::ErrorCounts;
 use crate::hist::{HistogramExport, LatencySummary};
-use crate::ledger::LedgerReport;
+use crate::ledger::{LedgerReport, MissingId};
 
 /// The schema identifier.
 ///
@@ -47,6 +47,9 @@ pub struct Summary {
     pub drain: DrainReport,
     /// The identity ledger.
     pub ledger: LedgerReport,
+    /// The first missing identities (`--report-missing`), for diagnosis.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub missing_sample: Vec<MissingId>,
     /// The generator's own health.
     pub generator: GeneratorReport,
     /// Connection failures.

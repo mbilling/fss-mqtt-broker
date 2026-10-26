@@ -109,6 +109,8 @@ pub struct Config {
     pub drain_timeout_ns: u64,
     /// The drain also ends when nothing was acked or delivered for this long, ns.
     pub drain_quiet_ns: u64,
+    /// List up to this many missing identities in the summary.
+    pub report_missing: usize,
     /// Connections being established at once.
     pub connect_concurrency: usize,
     /// Per-connection CONNECT/SUBSCRIBE timeout, ns.
@@ -154,6 +156,7 @@ impl Config {
             password: None,
             drain_timeout_ns: 30_000_000_000,
             drain_quiet_ns: 5_000_000_000,
+            report_missing: 32,
             connect_concurrency: 128,
             connect_timeout_ns: 10_000_000_000,
             thresholds: Thresholds::default(),

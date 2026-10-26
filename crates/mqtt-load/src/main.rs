@@ -130,6 +130,11 @@ struct Cli {
     #[arg(long, default_value_t = 5.0)]
     drain_quiet: f64,
 
+    /// List up to this many missing identities (stream, publisher, seq) in the
+    /// summary's missing_sample.
+    #[arg(long, default_value_t = 32)]
+    report_missing: usize,
+
     /// Connections being established at once.
     #[arg(long, default_value_t = 128)]
     connect_concurrency: usize,
@@ -233,6 +238,7 @@ fn config(cli: Cli, threads: usize) -> Result<(Config, Option<PathBuf>), String>
     c.password = cli.password;
     c.drain_timeout_ns = secs_ns(cli.drain_timeout)?;
     c.drain_quiet_ns = secs_ns(cli.drain_quiet)?;
+    c.report_missing = cli.report_missing;
     c.connect_concurrency = cli.connect_concurrency;
     c.connect_timeout_ns = secs_ns(cli.connect_timeout)?;
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -302,7 +308,7 @@ fn main() -> ExitCode {
     let t = &summary.totals;
     let l = &summary.ledger;
     eprintln!(
-        "mqtt-load: {:?}: offered {:.1}/s sent {:.1}/s acked {:.1}/s received {:.1}/s; ack p50/p99/p999 {}/{}/{} us; e2e p50/p99/p999 {}/{}/{} us; ledger sent {} missing {} unexpected {} unacked {} duplicates {}; generator max {:.2} cores, {} msg/s per core{}",
+        "mqtt-load: {:?}: offered {:.1}/s sent {:.1}/s acked {:.1}/s received {:.1}/s; ack p50/p99/p999 {}/{}/{} us; e2e p50/p99/p999 {}/{}/{} us; ledger sent {} missing {} unexpected {} unacked {} duplicates {} pkid gaps {}; generator max {:.2} cores, {} msg/s per core{}",
         summary.outcome,
         t.offered_rate,
         t.sent_rate,
@@ -319,6 +325,7 @@ fn main() -> ExitCode {
         l.unexpected,
         l.unacked,
         l.duplicates,
+        l.pkid_gaps,
         summary.generator.cpu_cores_max,
         summary.generator.sent_per_cpu_second,
         if summary.generator.saturated { " (SATURATED: run is VOID)" } else { "" },
