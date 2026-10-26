@@ -15,8 +15,9 @@
 //! * `s` counts down from [`Shape::spin`], thirty-two steps to the count, and then
 //!   returns the answer;
 //! * `c` clears the flag at [`CANCEL_FLAG_AT`], waits for it to be set, and then fails
-//!   with status 7 and the message `nope`: a call that ends by itself when it is asked
-//!   to stop ([`Shape::cancel`]);
+//!   with status 7 and the message `nope`: a call that would end by itself if it were
+//!   asked to stop ([`Shape::cancel`]). The host no longer asks, so it runs to its
+//!   deadline;
 //! * anything else returns the answer ([`Shape::answer`]: a tagged value).
 
 use crate::ABI_VERSION;
@@ -129,8 +130,9 @@ pub struct Shape {
     /// has no start function).
     pub slow_start: u32,
     /// `Some((slot, value))`: the module exports `mqttd_cancel_slot`, which answers
-    /// `slot`, and holds `value` at [`CANCEL_SLOT_AT`] from the start. A module that
-    /// can be asked properly answers `CANCEL_SLOT_AT` and holds `CANCEL_FLAG_AT`.
+    /// `slot`, and holds `value` at [`CANCEL_SLOT_AT`] from the start. A slot that
+    /// would be followed properly answers `CANCEL_SLOT_AT` and holds `CANCEL_FLAG_AT`;
+    /// the host reads neither.
     pub cancel: Option<(u32, u32)>,
 }
 

@@ -1271,3 +1271,39 @@ the tests that showed a timed-out program ending at its next step with its insta
 its compiled programs whole pass again unchanged, and the sandbox's own tests now show
 the flag being set, a slot pointing outside memory ending the call at its deadline, and a
 slot holding 0 keeping the grace.
+
+### 2026-10-26 — A call past its deadline is ended there; the stop flag is no longer set
+
+wasmtime 50 (#1124) hands the deadline callback a `StoreHookState` instead of a
+`StoreContextMut`: the host's own data may be changed there, and nothing the module can
+see (bytecodealliance/wasmtime#14386, "Scope the 'power' of epoch/call hooks", closing
+#14048). The callback runs between two of the module's instructions, and "it is a semantic
+specification violation for any guest-visible state in the store to get mutated between
+wasm instructions"; upstream names such writes as a contributing factor in security
+vulnerabilities, and the change fixed two soundness bugs found that way (a collection and
+a thrown exception from inside a hook). The amendment of 2026-10-15 did exactly that: it
+stored 1 at the module's stop flag from the callback.
+
+No sanctioned way to keep it exists without changing the module. A raw pointer into the
+memory, kept from before the call, would do through `unsafe` what the runtime now forbids
+by type. The code that polls the call cannot write either: while the call is suspended its
+store is lent to it, and the module is just as much between two instructions. Memory the
+host may write at any moment is a shared memory, which needs the threads proposal, and
+with it `memory.atomic.wait`, a blocking wait inside an asynchronous call — the concern of
+RUSTSEC-2026-0362 again — and growth the store's memory cap does not see. The sanctioned
+place to change the module's memory mid-call is an import the module calls; jq's
+interpreter reads its flag at every step and calls no import, so that would mean changing
+jqc's `execute.c` and the module's hash.
+
+So at a call's deadline it is now ended by a trap and its instance dropped, as a module
+that could not be asked always was. `Limits::cancel_grace` is gone, and with it the 2 ms
+in the margin of the 2026-10-11 amendment. `mqttd_cancel_slot` stays a legal export, which
+the host neither calls nor follows, so `jq.wasm` and its hash do not change; its
+`execute_cancel.c` and the shim's slot are now dead and can go with the module's next
+change. The time bound is unchanged or tighter: a call ends at its deadline, not up to
+2 ms after. What a timed-out `jq` program costs is no longer the same: its instance and
+the programs compiled in it (the next call makes an instance and compiles its program
+again, about a millisecond together on the measurements in §4), counted in
+`mqttd_rule_module_instances_replaced_total{module="jq"}`. The error a rule sees is
+EMQX's timeout text, as before. The §4 rows on time, and the amendment of 2026-10-15, are
+of their date.
