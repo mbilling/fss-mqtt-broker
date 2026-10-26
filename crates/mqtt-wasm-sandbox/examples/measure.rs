@@ -221,8 +221,8 @@ fn limits(sandbox: &Sandbox) {
         ("def f: f; f", 10),
         ("def f: f; f", 1),
         ("\"a\" * 40 | test(\"(a*)*b\")", 100),
-        // One regex match over eight megabytes: a single C call, which cannot be asked
-        // to stop and is cut off after the grace.
+        // One regex match over eight megabytes: a single C call, cut off at the
+        // deadline like every other program here.
         ("\"a\" * 8000000 | test(\"a+b\")", 30),
     ] {
         let made = jq.instances;

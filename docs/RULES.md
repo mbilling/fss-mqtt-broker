@@ -1962,11 +1962,11 @@ turns into "no result", so a `WHERE` is never passed because a call was cut off.
 | Output | What is left of the message's 1 MiB build budget, which all function calls of one message share. A call's output is charged whole, so `jq('.', payload)` on a 600 KB payload passes once in a statement and fails the second time | `jq(): sandbox_limit (output): jq output is larger than the limit` | `output` |
 | Stack | 4 MiB of call stack, and 1 MiB of C stack inside the module's memory. `reduce range(20000) as $i (null; [.]) \| 1`, which ends an EMQX 6.3.1 node, returns `[1]`; at 300,000 deep the call fails | `jq(): sandbox_limit (stack): …`, or, when it is the C stack that runs out, `jq(): jq_err_system: the module trapped: … out of bounds memory access` | `stack`, `trap` |
 
-After a timeout the program is asked to stop and usually does within the same instance.
-After a memory or stack error, a trap, or a program that did not stop within 2 ms of being
-asked (one long regular expression match), the instance is dropped and the next call gets
-a new one, counted in `mqttd_rule_module_instances_replaced_total{module="jq"}`. The call
-that follows a dropped instance pays for a new instance and for compiling its program
+After a timeout, a memory or stack error, or a trap, the call is stopped where it is, the
+instance is dropped and the next call gets a new one (EMQX asks a timed-out program to
+stop and keeps its instance; the runtime this broker uses lets nothing change a module's
+memory in the middle of a call, so the program cannot be asked), counted in
+`mqttd_rule_module_instances_replaced_total{module="jq"}`. The call that follows a dropped instance pays for a new instance and for compiling its program
 again, about a millisecond together.
 
 The other kinds are jq's own answers, not limits: `compile`, `parse`, `process` and
@@ -2268,7 +2268,7 @@ linear memory as `memory`, and:
 | `mqttd_free(address)` | Gives back what `mqttd_alloc` returned, and each result once it has been read |
 | `mqttd_describe(ret)` | Called once at load. The module leaves JSON at `ret`: `{"module":"geo","version":"0.1.0","functions":[{"name":"geo_distance","min_args":4,"max_args":4}]}`. Unknown keys are ignored. The arities are what a rule's call is checked against when the rules are loaded |
 | `mqttd_call(name, name_len, args, args_len, max_out, ret) -> status` | One call of the function `name`. Status `0`: the result at `ret` is the value. Any other status fails the rule, with the bytes at `ret` as its message (counted as `module`). A result longer than `max_out` bytes is refused unread (counted as `output`) |
-| `mqttd_cancel_slot() -> address` | Optional. Called once per instance, after `_initialize`. The answer is the address of the module's cancel slot: a little-endian `u32` holding the address of a stop flag, or 0. At a call's deadline the broker reads the slot and, when it is not 0, stores the little-endian `i32` 1 at the address it holds; none of the module's code runs for it, so the module looks at its flag between steps, as at a signal. A call still running 2 ms later is stopped and its instance dropped. A slot or a flag that does not lie inside the module's memory stops the call at its deadline. Without the export the call is stopped at its deadline |
+| `mqttd_cancel_slot() -> address` | Optional, and not used: a module may export it, and the broker neither calls it nor reads or writes what it points at. A call still running at its deadline is stopped there and its instance dropped, with or without the export. (Until wasmtime 50 the broker set the stop flag the slot named at the deadline; the runtime no longer lets the host change a module's memory in the middle of a call.) |
 
 `ret` is the address of two little-endian `u32`: the module writes there the address and
 the length of the bytes it answers with, and the broker reads them and frees them with

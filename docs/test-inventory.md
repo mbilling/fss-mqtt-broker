@@ -1434,20 +1434,18 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_no_wildcard_fast_path_returns_exactly_the_named_topic`
 - `tests::unacked_messages_survive_for_replay`
 
-## `crates/mqtt-wasm-sandbox/src/lib.rs` — 41 test(s)
+## `crates/mqtt-wasm-sandbox/src/lib.rs` — 38 test(s)
 
-- `tests::a_call_asked_to_stop_ends_by_itself_and_keeps_its_instance`
 - `tests::a_call_is_held_to_its_own_bound_on_the_result`
+- `tests::a_call_past_its_deadline_is_ended_there_whatever_its_cancel_slot`
 - `tests::a_call_returns_the_modules_value`
 - `tests::a_call_runs_the_same_interpreted`
 - `tests::a_call_that_outlasts_its_first_slice_goes_on_inside_the_hand_off`
-- `tests::a_cancel_slot_that_points_outside_memory_ends_the_call_at_its_deadline`
 - `tests::a_fuel_bound_stops_the_same_work_at_the_same_point_every_time`
 - `tests::a_hand_off_that_misbehaves_does_not_lose_or_repeat_the_call`
 - `tests::a_module_pool_holds_a_call_to_the_modules_ceiling_whatever_timeout_it_is_given`
 - `tests::a_module_pool_keeps_warm_instances_and_replaces_one_a_call_stopped`
 - `tests::a_module_pool_told_to_keeps_no_instance_between_calls`
-- `tests::a_module_without_a_cancel_slot_ends_at_its_deadline_whatever_the_grace`
 - `tests::a_module_without_the_abi_is_refused_at_load`
 - `tests::a_modules_own_error_is_its_status_and_message_and_the_instance_lives_on`
 - `tests::a_pool_compiles_on_first_use_and_shares_warm_instances`
@@ -1456,7 +1454,6 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::a_result_larger_than_the_limit_is_refused_unread`
 - `tests::a_small_fuel_bound_still_loads_and_runs_a_module`
 - `tests::a_trap_ends_the_call`
-- `tests::an_empty_cancel_slot_still_leaves_the_call_its_grace`
 - `tests::an_endless_loop_stops_at_the_deadline_and_poisons_only_its_instance`
 - `tests::an_import_on_the_list_is_provided`
 - `tests::an_import_outside_the_list_is_refused_at_load`

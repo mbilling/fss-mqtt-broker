@@ -19,7 +19,7 @@ build = "build.rs"
 # No component model, no WASI, no garbage collector, no threads, no on-disk code cache,
 # no profiling or debugger hooks, no text format, no parallel compilation (rayon), no
 # backtraces.
-wasmtime = { version = "49.0.4", default-features = false, features = ["runtime", "cranelift", "async", "pulley", "std"] }
+wasmtime = { version = "50.0.0", default-features = false, features = ["runtime", "cranelift", "async", "pulley", "std"] }
 
 [build-dependencies]
 # build.rs compares the jq module it embeds with `jq-module/jq.wasm.sha256`. Already

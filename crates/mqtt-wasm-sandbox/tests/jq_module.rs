@@ -321,24 +321,18 @@ fn values_cross_as_a_rule_passes_them() {
 }
 
 /// The timeout of `jq/3`: a program that never ends is stopped within a millisecond or
-/// two of it, with EMQX's error, and the caller's next call is served as if nothing
-/// had happened.
+/// two of it, with EMQX's error, and the caller's next call is served, by a fresh
+/// instance: the host cannot set the program's cancel flag during the call, so the
+/// call is ended by a trap and its instance dropped.
 #[test]
 fn a_runaway_program_stops_at_the_timeout_and_the_next_call_is_unaffected() {
-    // The grace a program has to end by itself once asked is two milliseconds by
-    // default, which a thread that loses its processor on a busy machine can sleep
-    // through. Here it is long, so that what is counted below (which programs cost
-    // their instance) does not depend on the machine's load.
-    let patient = Limits {
-        cancel_grace: Duration::from_secs(30),
-        ..Limits::default()
-    };
     let grants = Grants {
         clock: true,
         environment: oracle::environment(),
     };
-    let mut jq =
-        Jq::from_sandbox(Sandbox::load(&module(), patient, grants).expect("the module loads"));
+    let mut jq = Jq::from_sandbox(
+        Sandbox::load(&module(), Limits::default(), grants).expect("the module loads"),
+    );
     assert_eq!(text(jq.eval(b". + 1", Arg::Binary(b"1"), None)), "[2]");
     for (program, ms) in [
         ("def f: f; f", 100),
@@ -372,9 +366,8 @@ fn a_runaway_program_stops_at_the_timeout_and_the_next_call_is_unaffected() {
             "after {program}"
         );
     }
-    // A program that reaches its next step ends by itself and keeps the instance; only
-    // `[repeat(.)]`, which had grown the memory past the recycling mark, cost one.
-    assert!(jq.instances <= 2, "{} instances", jq.instances);
+    // The first instance, and one more after each of the five programs.
+    assert_eq!(jq.instances, 6);
     // `jq/3` with a timeout of 0 still runs what is quick, as in EMQX.
     assert_eq!(
         text(jq.eval(b".", Arg::Binary(b"1"), Some(Duration::ZERO))),
@@ -382,21 +375,14 @@ fn a_runaway_program_stops_at_the_timeout_and_the_next_call_is_unaffected() {
     );
 }
 
-/// The two ways a call ends at its deadline. A program between two of its steps sees
-/// the cancel flag and ends by itself: the NIF's timeout status, the instance whole.
-/// A program inside one long C call — here one regex match over eight megabytes,
-/// which EMQX cannot stop at all — never looks at the flag: its fuel is cut off and
-/// the instance is gone.
+/// The two kinds of program a deadline meets end the same way. A program between two of
+/// its steps, which EMQX stops through its cancel flag, and a program inside one long C
+/// call — here one regex match over eight megabytes, which EMQX cannot stop at all — are
+/// both stopped by a trap at the deadline, and the instance is gone.
 #[test]
 fn a_program_that_cannot_be_asked_to_stop_is_stopped_anyway() {
-    let load = |limits| Sandbox::load(&module(), limits, Grants::default()).expect("it loads");
-    let hasty = load(Limits::default());
-    // For the program that does end by itself, a grace no busy machine outlasts.
-    let patient = load(Limits {
-        cancel_grace: Duration::from_secs(30),
-        ..Limits::default()
-    });
-    let run = |sandbox: &Sandbox, program: &[u8]| {
+    let sandbox = Sandbox::load(&module(), Limits::default(), Grants::default()).expect("it loads");
+    let run = |program: &[u8]| {
         let mut instance = sandbox.instantiate().expect("an instance");
         instance
             .call("jq_compile", &[Arg::Binary(program)], None)
@@ -409,16 +395,12 @@ fn a_program_that_cannot_be_asked_to_stop_is_stopped_anyway() {
         );
         (outcome, instance.is_poisoned())
     };
-    let (outcome, poisoned) = run(&patient, b"def f: f; f");
-    assert!(
-        matches!(outcome, Err(CallError::Module { status: 7, .. })),
-        "{outcome:?}"
-    );
-    assert!(!poisoned);
     let stuck = br#""a" * 8000000 | test("a+b")"#;
-    let (outcome, poisoned) = run(&hasty, stuck);
-    assert_eq!(outcome, Err(CallError::Timeout));
-    assert!(poisoned);
+    for program in [&b"def f: f; f"[..], &stuck[..]] {
+        let (outcome, poisoned) = run(program);
+        assert_eq!(outcome, Err(CallError::Timeout));
+        assert!(poisoned);
+    }
     // Through the function it is EMQX's timeout either way, and the next call is served.
     let mut jq = jq();
     let started = Instant::now();

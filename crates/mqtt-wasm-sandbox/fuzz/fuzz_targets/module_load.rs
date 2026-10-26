@@ -66,9 +66,9 @@ fn name(text: &str, out: &mut Vec<u8>) {
 /// Functions 0 to 6 are imports: `clock_time_get`, `environ_sizes_get`,
 /// `environ_get`, `fd_fdstat_get`, `fd_read`, `fd_write`, `proc_exit`. Function 11 is
 /// `mqttd_call` itself. Memory holds `{}` at 16 and `jtrue` at 32; global 0 is the
-/// allocator's next address. The cancel slot (function 12, `mqttd_cancel_slot`) is at
-/// address 0, which the body may fill with anything: the host follows whatever it
-/// holds at a deadline, and must stay inside the module's memory doing it.
+/// allocator's next address. The module also exports a cancel slot (function 12,
+/// `mqttd_cancel_slot`) at address 0, which the body may fill with anything; the host
+/// no longer reads it, and a module that has it must load and run as one without it.
 fn around(body: &[u8]) -> Vec<u8> {
     const I32: u8 = 0x7f;
     const I64: u8 = 0x7e;
@@ -185,7 +185,6 @@ fuzz_target!(|data: &[u8]| {
         max_output_bytes: MAX_OUTPUT,
         max_stack_bytes: 256 * 1024,
         min_run: Duration::from_micros(100),
-        cancel_grace: Duration::from_millis(1),
         init_timeout: Duration::from_millis(20),
         max_fuel: (how & 4 == 0).then_some(20_000),
         first_slice: Duration::from_micros(200),

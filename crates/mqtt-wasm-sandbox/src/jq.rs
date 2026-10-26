@@ -10,7 +10,10 @@
 //! * an error fails the call, and outputs produced before it are gone;
 //! * the timeout stops a running program. It does not cover compiling one: EMQX
 //!   looks at the cancel flag only between a program's steps. Here compiling runs
-//!   under a bound of its own instead ([`COMPILE_TIMEOUT`]).
+//!   under a bound of its own instead ([`COMPILE_TIMEOUT`]). Unlike EMQX, a program
+//!   stopped at its timeout costs its instance and the programs compiled in it: the
+//!   host cannot set the module's cancel flag during a call (see `at_epoch` in the
+//!   sandbox), so the call is ended by a trap.
 //!
 //! Not EMQX's: a module loaded with [`Limits::max_call`] holds every call to that
 //! ceiling, whatever timeout the call names. The call runs under the shorter of the
@@ -397,7 +400,8 @@ fn error(e: CallError, timeout: Option<Duration>) -> JqError {
     let (tag, kind, message) = match e {
         CallError::Module { status, message } => {
             let (tag, kind) = match status {
-                // The program saw the cancel flag and ended by itself.
+                // The program saw its cancel flag and ended by itself. The host no
+                // longer sets it, but a module's answer is still read as the NIF's.
                 7 => return error(CallError::Timeout, timeout),
                 4 => (Tag::Compile, "compile"),
                 5 => (Tag::Parse, "parse"),
