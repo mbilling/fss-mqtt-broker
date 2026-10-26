@@ -2880,7 +2880,13 @@ where
                 // selects is read once per batch; with none, a PUBLISH is written
                 // exactly as before.
                 let events = rule_conn.message_wants();
-                for _ in 0..OUTBOUND_BATCH_MAX {
+                // `batched` counts the packets taken this drain. The next one is pulled
+                // only while there is room for it: pulling it on the last turn and then
+                // leaving the loop dropped it unwritten — one packet in every 1025 for a
+                // connection more than a batch behind, an acked QoS 1 message counted as
+                // delivered (issue #1114).
+                let mut batched = 1;
+                loop {
                     // Metered on the packet AS RECEIVED — before the topic-alias
                     // rewrite below, which only shrinks it: add and subtract are
                     // then the same pure function of the same packet, which is
@@ -2892,6 +2898,10 @@ where
                         // write.
                         crate::hub::Outgoing::Note(note) => {
                             rule_conn.note(note, client, hub);
+                            if batched == OUTBOUND_BATCH_MAX {
+                                break;
+                            }
+                            batched += 1;
                             match out_rx.try_recv() {
                                 Ok(next) => out = next,
                                 Err(_) => break,
@@ -2943,6 +2953,10 @@ where
                     if let Some((sent, pkid)) = sent {
                         rule_conn.sent(sent, pkid, too_large, events, client, hub);
                     }
+                    if batched == OUTBOUND_BATCH_MAX {
+                        break;
+                    }
+                    batched += 1;
                     match out_rx.try_recv() {
                         Ok(next) => out = next,
                         Err(_) => break,
