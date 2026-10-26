@@ -1598,7 +1598,7 @@ where
         .properties
         .authentication_method()
         .map(str::to_string);
-    let result = serve(
+    let (result, linger) = serve(
         &mut reader,
         &mut writer,
         &hub,
@@ -1656,7 +1656,38 @@ where
             &hub,
         );
     }
+    if linger {
+        linger_close(&mut reader, &mut writer).await;
+    }
     result.map(|_| ())
+}
+
+/// How long a connection that ended with something said to the peer (a DISCONNECT,
+/// the last acks) keeps reading after it, before it lets the socket go.
+const LINGER_MAX: Duration = Duration::from_secs(2);
+
+/// Close a connection the broker had the last word on without resetting it: send the
+/// transport's end (TCP FIN, TLS `close_notify`, a WebSocket Close), then read and
+/// discard what the peer still sends until it closes too, or for [`LINGER_MAX`].
+///
+/// Closing a socket with unread bytes in its receive buffer makes the kernel send a
+/// RST, and a RST discards what the peer has not read yet, the DISCONNECT included. A
+/// peer that was still answering, such as one sending PUBRELs for PUBRECs written in
+/// the same batch as a DISCONNECT 0x93, then never sees why it was closed (issue
+/// #1117: the paho.mqtt.testing `test_flow_control2` oracle). Called after the session
+/// is detached, so it delays nothing but the socket's release.
+async fn linger_close<R, W>(reader: &mut FrameReader<R>, writer: &mut FrameWriter<W>)
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let _ = tokio::time::timeout(LINGER_MAX, async {
+        if writer.shutdown().await.is_err() {
+            return;
+        }
+        while let Ok(Some(_)) = reader.next_packet().await {}
+    })
+    .await;
 }
 
 /// Relocate an authenticated persistent session to its owner (ADR 0005): open a
@@ -2673,6 +2704,9 @@ const CLOSE_FLUSH_MAX: Duration = Duration::from_secs(5);
 /// DISCONNECT, still to go; before, every write had finished before the next
 /// packet was read. A loop that ended on a transport error, or because the peer
 /// stopped reading or went silent, leaves nothing (it discards what it held).
+///
+/// Also returns whether that final write happened, so the caller lingers on the close
+/// (`linger_close`) once the session is detached.
 #[allow(clippy::too_many_arguments)]
 async fn serve<R, W>(
     reader: &mut FrameReader<R>,
@@ -2693,7 +2727,7 @@ async fn serve<R, W>(
     session_expiry_override: &mut Option<u32>,
     watch: Option<&PeerClosedWatch>,
     rule_conn: &RuleConn<'_>,
-) -> Result<bool, NetError>
+) -> (Result<bool, NetError>, bool)
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -2719,11 +2753,15 @@ where
         rule_conn,
     )
     .await;
+    // Whether the connection ends with the broker's last word written, and so should
+    // linger rather than reset (see `linger_close`).
+    let mut linger = false;
     if result.is_ok() && writer.has_pending() {
         // Best-effort, as the DISCONNECT always was: the peer may already be gone.
-        let _ = tokio::time::timeout(CLOSE_FLUSH_MAX, writer.flush_queued()).await;
+        let flushed = tokio::time::timeout(CLOSE_FLUSH_MAX, writer.flush_queued()).await;
+        linger = matches!(flushed, Ok(Ok(())));
     }
-    result
+    (result, linger)
 }
 
 // The connection's one event loop: keepalive, inbound, outbound, the socket

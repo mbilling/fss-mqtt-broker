@@ -393,6 +393,19 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         Ok(())
     }
 
+    /// End the stream's write side (TCP FIN, TLS `close_notify`, WebSocket Close)
+    /// once everything queued is written, keeping the read side open: a connection
+    /// closing on its own last word reads what the peer still sends, instead of
+    /// resetting it with those bytes unread (issue #1117).
+    ///
+    /// # Errors
+    /// [`NetError::Io`] on a transport error.
+    pub async fn shutdown(&mut self) -> Result<(), NetError> {
+        self.flush_queued().await?;
+        self.inner.shutdown().await?;
+        Ok(())
+    }
+
     /// Encode and send a single packet, flushing the stream. Convenience for
     /// control packets (CONNACK/AUTH/…) written outside the batched drain.
     ///

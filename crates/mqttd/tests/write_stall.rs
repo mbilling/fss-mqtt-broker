@@ -462,3 +462,100 @@ async fn a_reading_client_sees_acks_and_deliveries_in_order() {
         "deliveries in publish order"
     );
 }
+
+/// Read exactly one packet, a read per header byte and one for the body, the way the
+/// paho.mqtt.testing client does: nothing past it is taken from the socket.
+async fn read_one(stream: &mut TcpStream) -> std::io::Result<Packet> {
+    let mut frame = vec![0u8; 1];
+    stream.read_exact(&mut frame).await?;
+    let mut len = 0usize;
+    let mut shift = 0;
+    loop {
+        let mut b = [0u8; 1];
+        stream.read_exact(&mut b).await?;
+        frame.push(b[0]);
+        len |= usize::from(b[0] & 0x7f) << shift;
+        shift += 7;
+        if b[0] & 0x80 == 0 {
+            break;
+        }
+    }
+    let start = frame.len();
+    frame.resize(start + len, 0);
+    stream.read_exact(&mut frame[start..]).await?;
+    Ok(Packet::decode(&mut BytesMut::from(&frame[..]), V5)
+        .unwrap()
+        .expect("one whole packet"))
+}
+
+/// A client that overruns the broker's Receive Maximum with `QoS` 2 publishes, and
+/// answers every PUBREC with a PUBREL as it reads them one packet at a time, still
+/// reads the DISCONNECT 0x93 that ends it (modelled on paho.mqtt.testing's
+/// `test_flow_control2`).
+///
+/// The broker writes the PUBRECs and the DISCONNECT together and closes. The client
+/// keeps sending PUBRELs for PUBRECs it has not read yet, so a broker that let the
+/// socket go with those bytes unread made the kernel reset the connection, which
+/// discards the DISCONNECT the client had not read yet: `Connection reset by peer`
+/// before the client learns why. The broker now ends its write side and reads on
+/// until the client closes (`linger_close`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_overrunning_receive_maximum_reads_its_disconnect_while_still_acking() {
+    let broker = start_broker().await;
+    let mut c = TcpStream::connect(broker.addr).await.unwrap();
+    send(
+        &mut c,
+        &Packet::Connect(Connect {
+            protocol: V5,
+            clean_session: true,
+            keep_alive: 60,
+            client_id: "overrun".into(),
+            last_will: None,
+            username: None,
+            password: None,
+            properties: Properties::new(),
+        }),
+    )
+    .await;
+    let receive_maximum = match read_one(&mut c).await.unwrap() {
+        Packet::ConnAck(a) if a.code == 0 => a.properties.receive_maximum().unwrap_or(u16::MAX),
+        other => panic!("expected a successful CONNACK, got {other:?}"),
+    };
+    assert!(
+        receive_maximum < 1000,
+        "the default grant is small: {receive_maximum}"
+    );
+
+    // One more QoS 2 publish than the broker grants, none of them released yet.
+    let mut out = Vec::new();
+    for i in 1..=u32::from(receive_maximum) + 1 {
+        let Packet::Publish(mut p) = publish("overrun/t", i) else {
+            unreachable!()
+        };
+        p.qos = QoS::ExactlyOnce;
+        p.pkid = Some(u16::try_from(i).unwrap());
+        out.extend(encode(&Packet::Publish(p)));
+    }
+    c.write_all(&out).await.unwrap();
+
+    let reason = tokio::time::timeout(IO_TIMEOUT, async {
+        loop {
+            match read_one(&mut c).await {
+                Ok(Packet::PubRec(rec)) => {
+                    // Answered at once, one write per PUBREL, before reading on.
+                    let rel = encode(&Packet::PubRel(Ack::new(rec.pkid)));
+                    if let Err(e) = c.write_all(&rel).await {
+                        panic!("the PUBREL for {} was refused: {e}", rec.pkid);
+                    }
+                }
+                Ok(Packet::PubComp(_)) => {}
+                Ok(Packet::Disconnect(d)) => return d.reason,
+                Ok(other) => panic!("expected PUBREC, PUBCOMP or DISCONNECT, got {other:?}"),
+                Err(e) => panic!("the connection ended before its DISCONNECT was read: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("a DISCONNECT within the timeout");
+    assert_eq!(reason, 0x93, "Receive Maximum exceeded");
+}
