@@ -160,6 +160,31 @@ its cancellation to survive the client reconnecting on a different node, which n
 frame or durable record expresses today. That is the named follow-up, not a local
 `graceful = true`.
 
+### As delivered (2026-10-26, issue #1119): what "persistent" means for relocation
+
+§1 scopes relocation to `clean_session=0`, but the code tested "the session outlives the
+connection" (`session_expiry != 0`). The two disagree on one MQTT 5 shape:
+`clean_start = false` with Session Expiry 0, which resumes a stored session if there is
+one and ends it at disconnect (§3.1.2.4, §3.1.2.11.2). It stayed on the landing node,
+where the hub's durable recovery (run for every `!clean_start` attach) read a group this
+node does not own until it gave up and answered `0x88`, after 5 s, on every non-owner. As
+delivered, a CONNECT is relocated whenever it may resume a session or leave one behind:
+`!clean_start || session_expiry != 0`. Only a clean start that leaves nothing behind is
+served where it landed.
+
+The same refusal met any persistent CONNECT in a durable cluster's first seconds, before
+the lease assigner had committed the group's lease: the ring's HRW guess named this node
+or a node that would not hold the lease, and the recovery could not succeed there either.
+On a node running the durable plane, the owner is now the holder of the **committed**
+lease. A CONNECT whose group has none yet, or whose committed owner has no known address,
+waits for one (polled every 50 ms, at most 5 s, the same bound as the hub's recovery)
+before it is placed. Past the bound it is placed on the ring's guess as before: §5 still
+holds, degrade, don't refuse. A node without the durable plane places by the HRW ring
+exactly as before and never waits. The relay itself is unchanged: one hop, the owner
+never re-proxies, and the relay stream stays bound to the certificates it was made with
+(issue #1016). A v5 Server Reference was not used: placement still holds only peer-bus
+addresses.
+
 ## Consequences
 
 - **Sharded session capacity** — the workstream-C scalability milestone — and

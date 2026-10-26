@@ -71,6 +71,12 @@ which has since landed (durable-by-default, ADR 0029); P2d is closed on its evid
 
 ## Changelog
 
+- **2026-10-26** — Issue #1119 (a bug, no new task): a `clean_start = false` CONNECT is
+  relocated to its owner whatever its Session Expiry, and on a durable node a persistent
+  CONNECT waits (at most 5 s) for its group's committed lease instead of recovering
+  locally on a node that cannot. Tests
+  `resume_expiry_zero_proc::a_resume_with_session_expiry_zero_is_served_by_every_node` and
+  `conn::relocation_tests`.
 - **2026-07-02** — P2d closed by **verification**, not new code: the durable workstream it
   was deferred to (ADR 0006/0007, durable-by-default per ADR 0029) delivers durability
   across owner loss for relocated sessions — the connection drops when the owner dies (the
