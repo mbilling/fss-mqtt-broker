@@ -1,0 +1,34 @@
+[package]
+name = "mqtt-load"
+description = "Paced open-loop MQTT load generator: ack and end-to-end latency on one clock, and an identity ledger (ADR 0090)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "mqtt-load"
+path = "src/main.rs"
+
+[lib]
+name = "mqtt_load"
+path = "src/lib.rs"
+
+[dependencies]
+mqtt-codec = { path = "../mqtt-codec", version = "1.0.0" }
+tokio.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+mimalloc.workspace = true
+# Already in the tree through openraft (mqtt-cluster), derive included: no new crates.
+clap = { version = "4.6", features = ["derive", "env"] }
+# HDR latency histograms (ADR 0090 D2). Default features off: the serialisation and
+# sync helpers pull in flate2/nom/crossbeam; the core needs only num-traits, already
+# in the tree.
+hdrhistogram = { version = "7.5", default-features = false }
+
+[lints]
+workspace = true

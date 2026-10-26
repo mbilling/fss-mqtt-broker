@@ -782,6 +782,7 @@ endpoint, roles, errors).
 | `mqttd` | the broker binary: hub, connections, peer mesh |
 | `mqttd-operator` | Kubernetes operator for `MqttdCluster` |
 | `history-check` | independent checker of recorded client-visible histories |
+| `mqtt-load` | the benchmark rig's load generator (ADR 0090): paced msg/s, ack and end-to-end latency on one clock, identity ledger |
 
 ---
 
@@ -849,7 +850,7 @@ Tracked on the [delivery dashboard](docs/delivery/STATUS.md).
 ```sh
 cargo build && cargo test && cargo clippy --all-targets && cargo deny check
 ./scripts/interop/run.sh     # foreign-client conformance
-mqttui --list                # There are 144 runnable scripts here: demos, smokes, migrations, benches
+mqttui --list                # There are 151 runnable scripts here: demos, smokes, migrations, benches
 ```
 
 ---

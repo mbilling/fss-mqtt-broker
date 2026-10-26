@@ -943,6 +943,46 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_reserved_tree_is_exactly_sys_and_below`
 - `tests::topic_name_validity_rejects_wildcards_and_emptiness`
 
+## `crates/mqtt-load/src/lib.rs` — 34 test(s)
+
+- `client::tests::fixed_packets_decode_as_themselves`
+- `clock::tests::clock_is_monotonic_and_maps_back_to_instants`
+- `config::tests::fanout_shape_is_one_stream_per_subscriber`
+- `config::tests::share_shape_is_one_stream_per_group_and_topic`
+- `config::tests::the_drain_quiet_window_follows_the_slowest_p99_between_floor_and_timeout`
+- `config::tests::validation_catches_unrunnable_workloads`
+- `health::tests::proc_stat_fields_survive_odd_command_names`
+- `health::tests::ps_time_formats`
+- `health::tests::this_platform_can_be_sampled`
+- `health::tests::utilisation_is_cpu_over_wall`
+- `hist::tests::export_round_trips_and_merges_by_bucket`
+- `hist::tests::percentiles_are_within_a_tenth_of_a_percent`
+- `hist::tests::rounding_saturation_merge_and_reset`
+- `ledger::tests::a_complete_run_closes`
+- `ledger::tests::bitset_marks_new_again_and_out_of_range`
+- `ledger::tests::duplicates_are_counted_and_do_not_open_the_ledger`
+- `ledger::tests::missing_acked_counts_only_acknowledged_identities_that_never_arrived`
+- `ledger::tests::missing_is_exact_and_per_stream`
+- `ledger::tests::missing_sample_names_each_missing_identity_and_whether_it_is_a_gap`
+- `ledger::tests::nothing_sent_is_not_a_closed_ledger`
+- `ledger::tests::unacked_counts_only_at_qos1`
+- `ledger::tests::unexpected_acks_open_the_ledger`
+- `ledger::tests::unexpected_deliveries_open_the_ledger`
+- `metrics::tests::rendering_has_counters_and_cumulative_buckets`
+- `payload::tests::publish_round_trips_through_the_codec`
+- `payload::tests::short_or_alien_payloads_are_foreign`
+- `publisher::tests::inflight_window_hands_out_and_takes_back_packet_ids`
+- `schedule::tests::cursor_yields_exactly_the_offered_count`
+- `schedule::tests::low_rates_with_many_publishers_send_nothing_rather_than_too_much`
+- `schedule::tests::offered_total_matches_rate_times_time`
+- `schedule::tests::rate_is_split_evenly_and_interleaved`
+- `schedule::tests::step_changes_rate_per_publisher_without_changing_publishers`
+- `stats::tests::drain_moves_histograms_and_sums_counters`
+- `subscriber::tests::packet_ids_follow_in_order_and_skip_zero`
+
+## `crates/mqtt-load/src/main.rs` — 0 test(s)
+
+
 ## `crates/mqtt-net/src/lib.rs` — 28 test(s)
 
 - `frame::tests::a_drain_grows_the_buffer_once_and_keeps_it`
@@ -2697,6 +2737,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `pinging_client_stays_connected_past_keepalive`
 - `session_takeover_publishes_will`
 - `zero_keepalive_is_never_idle_disconnected`
+
+## `crates/mqttd/tests/loadgen.rs` — 4 test(s)
+
+- `a_lost_consumer_opens_the_ledger`
+- `measured_latency_reflects_an_injected_delay`
+- `qos0_clean_fanout_run_closes_its_ledger`
+- `qos1_durable_share_run_closes_its_ledger`
 
 ## `crates/mqttd/tests/memory_watermark.rs` — 3 test(s) — the whole file is `cfg(target_os = "linux")`
 

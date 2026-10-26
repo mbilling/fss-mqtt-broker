@@ -454,6 +454,12 @@ jobs:
       # read below it.
       - name: The scale-out chart never draws an uncertified rung as a certified one
         run: python3 bench/scale/chart-scale-out.py --self-test
+      # ADR 0090 T3: the msg/s ramp judges a step on the broker only. Synthesized steps
+      # (loss FAILS, a saturated generator VOIDS, 98% received is OFFER NOT TAKEN), the
+      # capacity bands, the ramp's next step, and the latency merge, whose quantiles must
+      # equal mqtt-load's own on a real summary.
+      - name: The rig2 ramp's verdicts, capacity lines and histogram merge (offline)
+        run: python3 bench/scale/rig2/test-verdict.py
 
   interop:
     name: foreign-client interop (mosquitto + paho)

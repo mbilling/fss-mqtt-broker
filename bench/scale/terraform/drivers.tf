@@ -26,6 +26,7 @@ resource "hcloud_server" "driver" {
     ssh_public_key = trimspace(file(pathexpand(var.ssh_public_key_path)))
     private_ip     = local.driver_ips[count.index]
     build_bench    = var.build_bench && count.index == 0
+    emqtt_bench    = var.driver_emqtt_bench
     bench_git_ref  = var.bench_git_ref
     sysctl_conf    = file("${path.module}/files/sysctl-driver.conf")
   })

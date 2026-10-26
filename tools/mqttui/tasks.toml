@@ -1626,6 +1626,94 @@ requires = ["python3"]
 duration = "n/a — imported, not run"
 
 [[task]]
+id = "rig2-ramp"
+group = "Benchmark"
+name = "Run the msg/s ramp on the local, 3-node or 10-node tier (n3/n10 PAID)"
+script = "bench/scale/rig2/run.sh"
+about = """
+The ADR 0090 rig: a msg/s ramp per workload (durable-qos1, clean-qos1, qos0), one
+mqtt-load process per generator host per step, judged on the broker only. Loss FAILS a
+step, a saturated generator VOIDS it, the brokers must receive 99% of the offer, and
+capacity is the highest carried step at ack p99 <= 1 s (also <= 250 ms, <= 100 ms).
+TIER=local runs three local nodes for free; TIER=n3 and TIER=n10 provision Hetzner hosts
+through bench/scale/terraform, print the price first and tear down with the leak audit.
+PRICE_ONLY=1 prints the quote and stops. Read bench/scale/rig2/README.md first.
+"""
+requires = ["python3", "curl"]
+optional = ["tofu", "jq", "ssh", "docker"]
+duration = "~2-5m local; ~30-75m n3/n10"
+caution = "TIER=n3 or n10 creates PAID servers (it asks first). Ctrl-C tears down; kill -9 does not. Recover with bench/scale/teardown.sh."
+
+[[task]]
+id = "rig2-local-cluster"
+group = "Benchmark"
+name = "Start or stop the rig2 local 3-node cluster"
+script = "bench/scale/rig2/local-cluster.sh"
+about = """
+N mqttd processes on this machine, durable, plaintext on 127.0.0.1, founder first, used by
+`run.sh` for TIER=local: `local-cluster.sh start|stop <state-dir> [nodes]`.
+"""
+requires = ["curl", "python3"]
+hidden = true
+
+[[task]]
+id = "rig2-build-mqtt-load"
+group = "Benchmark"
+name = "Build the static linux/amd64 mqtt-load for the rig2 generator hosts"
+script = "bench/scale/rig2/build-mqtt-load.sh"
+about = """
+Builds mqtt-load for x86_64-unknown-linux-musl in Docker (linux/amd64), with the release
+recipe's static-CRT flags, and prints the binary's path. run.sh calls it before a cloud run.
+"""
+requires = ["docker"]
+duration = "~1m warm, several minutes cold"
+hidden = true
+
+[[task]]
+id = "rig2-scrape-loop"
+group = "Benchmark"
+name = "Scrape one broker's /metrics on a tick (runs on the broker host)"
+script = "bench/scale/rig2/scrape-loop.py"
+about = "Copied to every broker host by rig2/run.sh; writes one timestamped file per complete exposition for the whole step."
+requires = ["python3"]
+hidden = true
+
+[[task]]
+id = "rig2-verdict"
+group = "Benchmark"
+name = "Judge rig2 steps, pick the next step, and render the report"
+script = "bench/scale/rig2/verdict.py"
+about = """
+`verdict.py judge|next|report|idle|cost`: the step verdicts (FAILED, VOID, DISCONNECTED,
+OFFER NOT TAKEN, CARRIED), the ramp's next msg/s, report.md/report.json from a run dir's
+raw evidence, the between-steps idle check, and a tier's price quote.
+"""
+requires = ["python3"]
+duration = "~1s"
+
+[[task]]
+id = "rig2-chart"
+group = "Benchmark"
+name = "Draw a rig2 run's latency charts from its report.json"
+script = "bench/scale/rig2/chart-ramp.py"
+about = """
+`chart-ramp.py <run-dir>` writes report-<workload>.svg per ladder: offered msg/s against
+ack p99/p50 (QoS 0: end-to-end) on a log scale over the GREEN/YELLOW/RED bands, the
+maximum lossless step labelled. verdict.py report calls it; `--self-test` checks it.
+"""
+requires = ["python3"]
+duration = "~1s"
+
+[[task]]
+id = "rig2-verdict-tests"
+group = "Benchmark"
+name = "Offline tests of the rig2 verdicts and histogram merge"
+script = "bench/scale/rig2/test-verdict.py"
+about = "Synthesized steps and a real mqtt-load summary; no cluster. Invoked by CI with python3."
+requires = ["python3"]
+hidden = true
+
+[[task]]
 id = "scale-teardown"
 group = "Benchmark"
 name = "Destroy any leftover scale-curve cloud resources"
