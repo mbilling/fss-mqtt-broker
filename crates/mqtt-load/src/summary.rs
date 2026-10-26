@@ -275,8 +275,19 @@ pub struct DrainReport {
     /// Seconds from the schedule's end.
     pub duration_s: f64,
     /// `complete` (nothing in flight, every expected delivery seen), `quiet` (nothing
-    /// acked or delivered for the quiet period) or `timeout`.
+    /// acked or delivered for `quiet_s`; deliveries may still be owed, see
+    /// `outstanding_deliveries`) or `timeout` (deliveries were still arriving).
     pub ended_by: &'static str,
+    /// The quiet window this drain applied, seconds: `--drain-quiet`, or
+    /// `--drain-quiet-factor` times the slowest measured p99 if longer, capped by the
+    /// timeout.
+    pub quiet_s: f64,
+    /// Expected deliveries not yet seen when the drain ended (0 when `complete`).
+    pub outstanding_deliveries: u64,
+    /// `QoS` 1 publishes still unacknowledged when the drain ended.
+    pub outstanding_acks: u64,
+    /// Seconds between the last ack or delivery read and the drain's end.
+    pub since_progress_s: f64,
 }
 
 /// The generator's health over the run.

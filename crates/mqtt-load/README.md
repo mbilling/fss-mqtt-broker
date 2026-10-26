@@ -149,7 +149,7 @@ run (derived from the highest step), so the rate per publisher steps with the to
 | `--consumers`, `--groups`, `--group-prefix` | 2, 1, `g` | consumers per topic (per group for `share`); groups per topic |
 | `--sessions`, `--session-expiry`, `--keep-sessions` | `durable`, 300 s | consumer sessions |
 | `--client-prefix` | `mqload-<run id>` | client id prefix |
-| `--drain-timeout`, `--drain-quiet` | 30 s, 5 s | the drain ends when nothing is in flight and every expected delivery has arrived, when nothing moves for the quiet period, or at the timeout |
+| `--drain-timeout`, `--drain-quiet`, `--drain-quiet-factor` | 30 s, 5 s, 2 | the drain ends when nothing is in flight and every expected delivery has arrived, when nothing moves for the quiet window, or at the timeout. The quiet window is `--drain-quiet`, or `--drain-quiet-factor` times the slowest measured window's ack or end-to-end p99 if that is longer (never past the timeout): deliveries running 10 s behind are not over after 5 s of silence |
 | `--metrics` | off | Prometheus endpoint during the run |
 | `--threads` | available parallelism | tokio worker threads (the denominator of the CPU fraction) |
 | `--out` | stdout | JSON summary path |
@@ -204,7 +204,9 @@ windows[]         one per warm-up, measured window and drain, in time order:
                    <aggregate>, health}
 phases[]          per phase over its measured windows: {index, target_rate, <aggregate>, saturated}
 totals            <aggregate> over every measured window
-drain             {duration_s, ended_by: complete|quiet|timeout}
+drain             {duration_s, ended_by: complete|quiet|timeout, quiet_s, outstanding_deliveries,
+                   outstanding_acks, since_progress_s}: quiet_s is the window applied;
+                  outstanding_* what was still owed when the drain ended (0 when complete)
 ledger            {sent, acked, received, unique_received, expected, missing, unexpected,
                    unacked, unexpected_acks, negative_acks, duplicates, other_run, foreign, closed}
 generator         {saturated, saturated_windows[], thresholds{cpu_fraction, thread_fraction,

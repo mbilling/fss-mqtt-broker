@@ -943,12 +943,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_reserved_tree_is_exactly_sys_and_below`
 - `tests::topic_name_validity_rejects_wildcards_and_emptiness`
 
-## `crates/mqtt-load/src/lib.rs` — 32 test(s)
+## `crates/mqtt-load/src/lib.rs` — 33 test(s)
 
 - `client::tests::fixed_packets_decode_as_themselves`
 - `clock::tests::clock_is_monotonic_and_maps_back_to_instants`
 - `config::tests::fanout_shape_is_one_stream_per_subscriber`
 - `config::tests::share_shape_is_one_stream_per_group_and_topic`
+- `config::tests::the_drain_quiet_window_follows_the_slowest_p99_between_floor_and_timeout`
 - `config::tests::validation_catches_unrunnable_workloads`
 - `health::tests::proc_stat_fields_survive_odd_command_names`
 - `health::tests::ps_time_formats`

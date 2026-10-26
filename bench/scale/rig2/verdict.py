@@ -23,6 +23,13 @@ Everything is judged from the broker's side (D1):
 - **DISCONNECTED**: connections were lost during the step (mqtt-load outcome `error`).
   mqtt-load does not reconnect, so its ledger cannot be read after that: not carried,
   and not by itself a loss finding (a broker drop still makes it FAILED).
+- **NOT DRAINED**: the ledger misses deliveries, no broker dropped any as loss, and the
+  drain ended (quiet or timeout) while the brokers' own gauges still held at least as
+  many messages for the generator's clients (`mqttd_inflight_messages` +
+  `mqttd_pending_publishes` at the first scrape after the drain's end). The missing
+  messages were still queued, not lost: not carried, not loss. With broker loss drops
+  the step is FAILED, and its missing count is reconciled as loss drops + still queued
+  at the cut-off.
 - **OFFER NOT TAKEN**: the brokers' received counters took less than OFFER_TAKEN of the
   offered msg/s over the window (the constant and its meaning are
   bench/scale/summarize-curve.py's, ADR 0048 amendment of 2026-10-25).
@@ -35,10 +42,16 @@ whose ack p99 is at most 1 s, 250 ms and 100 ms. A QoS 0 workload has no acks; i
 apply to the end-to-end p99 (the workload's LATENCY_GATE says which).
 
 The ramp (D4) climbs by a factor on every CARRIED step — a lossless step at ack p99 2 s
-still climbs — until the first FAILED, OFFER NOT TAKEN or DISCONNECTED step, then bisects
-between the last CARRIED and that step until their gap is at most GAP_PCT percent of the
-carried one. VOID steps are rerun. It stops at a FAILED step (unless bisect_on_fail),
-after a step stays VOID through its retries, or at the ladder's ceiling.
+still climbs — until the first FAILED, OFFER NOT TAKEN, DISCONNECTED or NOT DRAINED step,
+then bisects between the last CARRIED and that step until their gap is at most GAP_PCT
+percent of the carried one. VOID steps are rerun. It stops at a FAILED step (unless
+bisect_on_fail), after a step stays VOID through its retries, or at the ladder's ceiling.
+
+A bad step is retried once, after a full settle, when the carried step just below it
+showed no sign of the knee: gated p99 (ack; QoS 0: end-to-end) under retry_p99_ms (50 ms).
+Only a retry that is bad too counts; a retry that carries makes the ladder climb on, and
+the first attempt is reported "retried: transient". At most retry_max (2) per ladder, so a
+real cliff cannot loop (retry_marks).
 """
 from __future__ import annotations
 
@@ -82,6 +95,13 @@ TIERS = {
 }
 
 CARRIED, FAILED, VOID, NOT_TAKEN, DISCONNECTED = "CARRIED", "FAILED", "VOID", "OFFER NOT TAKEN", "DISCONNECTED"
+NOT_DRAINED = "NOT DRAINED"
+# Not carried and not the harness's fault: above the knee for the ramp.
+BAD = (FAILED, NOT_TAKEN, DISCONNECTED, NOT_DRAINED)
+# The ramp's transient-retry rule (see the module docstring): the carried step below a bad
+# step must have had its gated p99 under this, and a ladder retries at most this often.
+RETRY_P99_MS = 50.0
+RETRY_MAX = 2
 
 # Every `mqttd_publish_dropped_total{reason}` the broker can report, classified ONCE: is
 # it the loss of a message the broker took and still owed to a subscriber that exists
@@ -182,18 +202,26 @@ def load_samples(d: Path) -> tuple[list[tuple[int, dict]], int]:
     return out, bad
 
 
-def broker_figures(step: Path, lo_ms: float, hi_ms: float, margin_ms: float, min_cover: float) -> dict:
+HELD_GAUGES = ("mqttd_inflight_messages", "mqttd_pending_publishes", "mqttd_backlog_bytes")
+
+
+def broker_figures(step: Path, lo_ms: float, hi_ms: float, margin_ms: float, min_cover: float,
+                   cutoff_ms: float | None = None) -> dict:
     """The brokers' own counters over [lo, hi] (wall ms), and their drops over the step.
 
     Per broker: the first and last scrape inside the window shrunk by `margin_ms` at each
     edge (absorbs scrape spacing and any small offset between host clocks; the rates use
     only the broker host's own timestamps). Drops and restarts are read across EVERY
     scrape of the step, warm-up and drain included: a message dropped at any point is loss.
+
+    `held_at_cutoff`: what the brokers still held for clients (HELD_GAUGES, summed) at
+    each broker's first scrape at or after `cutoff_ms`, the generators' drain end.
     """
     root = step / "scrapes"
     brokers = sorted((p for p in root.glob("broker-*") if p.is_dir()), key=lambda p: int(p.name.split("-")[1]))
     res = {"brokers": [], "received_rate": 0.0, "delivered_rate": 0.0, "dropped": 0.0, "dropped_by_reason": {},
-           "lost": 0.0, "lost_by_reason": {}, "not_lost_by_reason": {}, "restarted": [], "problems": []}
+           "lost": 0.0, "lost_by_reason": {}, "not_lost_by_reason": {}, "restarted": [], "problems": [],
+           "held_at_cutoff": None}
     if not brokers:
         res["problems"].append("no broker scrapes")
         return res
@@ -217,6 +245,13 @@ def broker_figures(step: Path, lo_ms: float, hi_ms: float, margin_ms: float, min
         res["dropped"] += sum(drops.values())
         res["lost"] += sum(v for k, v in drops.items() if drop_is_loss(k))
         row["dropped"] = sum(drops.values())
+        if cutoff_ms is not None:
+            after = [p for t, p in samples if t >= cutoff_ms]
+            if after:
+                held = res["held_at_cutoff"] or {g: 0.0 for g in HELD_GAUGES}
+                for g in HELD_GAUGES:
+                    held[g] += E.sum_family(after[0], g)
+                res["held_at_cutoff"] = held
         inside = [s for s in samples if lo_ms + margin_ms <= s[0] <= hi_ms - margin_ms]
         if len(inside) < 2 or inside[-1][0] - inside[0][0] < want:
             span = (inside[-1][0] - inside[0][0]) / 1000 if len(inside) >= 2 else 0.0
@@ -237,28 +272,83 @@ def broker_figures(step: Path, lo_ms: float, hi_ms: float, margin_ms: float, min
 
 
 IDLE_GAUGES = ("mqttd_connections_active", "mqttd_sessions", "mqttd_pending_publishes")
-
+# Work still in the brokers' pipes (cluster sums; every one is 0 on an idle cluster):
+# durable appends admitted and not completed (the warning before append-backlog-full),
+# acks still gated on durability or the settle window or an unreachable peer, unacked
+# deliveries and flow-control backlog owed to clients, and frames queued on peer links.
+BUSY_GAUGES = ("mqttd_append_lane_jobs", "mqttd_pending_publishes_awaiting_settle",
+               "mqttd_publish_held_for_unreachable", "mqttd_inflight_messages", "mqttd_backlog_bytes",
+               "mqttd_peer_forwards_in_flight")
+# The hub's command queue: one or two commands at idle (the /livez ping, a sweep).
+HUB_QUEUE_IDLE = 8
+# Counters that move only with work: unchanged across the quiet period means nothing is
+# still being received, delivered, forwarded or written (session cleanup and replication
+# catch-up write through the durable writer).
+QUIET_COUNTERS = ("mqttd_publish_received_total", "mqttd_publish_delivered_total",
+                  "mqttd_publish_forwarded_total", "mqttd_durable_writer_ops_total")
 
 
 def idle_state(paths: list[Path]) -> dict:
-    """Cluster sums of the residue gauges, and the brokers whose placement groups hold
-    fewer copies than desired (mqttd_replication_min_actual < _desired): a cluster still
-    re-replicating after formation or a previous step is not ready for the next one."""
-    tot: dict = {g: 0.0 for g in IDLE_GAUGES}
-    tot["under_replicated"] = []
-    for i, p in enumerate(paths):
+    """Cluster sums of the residue and busy gauges and of the quiet counters, the hub
+    queue, and per broker: placement groups holding fewer copies than desired
+    (mqttd_replication_min_actual < _desired), replication lag in groups
+    (mqttd_replica_groups_tracked - _current) and a routing view still settling
+    (any mqttd_routing_unsettled term at 1). A cluster still re-replicating, catching up
+    or settling after formation or a previous step is not ready for the next one."""
+    tot: dict = {g: 0.0 for g in IDLE_GAUGES + BUSY_GAUGES + QUIET_COUNTERS}
+    tot["mqttd_hub_queue_depth"] = 0.0
+    tot["under_replicated"], tot["routing_unsettled"], tot["replication_lag"] = [], [], {}
+    for p in paths:
         parsed = E.parse_prom(p)
-        for g in IDLE_GAUGES:
+        for g in (*IDLE_GAUGES, *BUSY_GAUGES, *QUIET_COUNTERS, "mqttd_hub_queue_depth"):
             tot[g] += E.sum_family(parsed, g)
         want, have = parsed.get(("mqttd_replication_desired", "")), parsed.get(("mqttd_replication_min_actual", ""))
         if want is not None and have is not None and have < want:
             tot["under_replicated"].append(p.stem)
+        tracked, current = parsed.get(("mqttd_replica_groups_tracked", "")), parsed.get(("mqttd_replica_groups_current", ""))
+        if tracked is not None and current is not None and current < tracked:
+            tot["replication_lag"][p.stem] = tracked - current
+        if E.sum_family(parsed, "mqttd_routing_unsettled") > 0:
+            tot["routing_unsettled"].append(p.stem)
     return tot
 
 
-def is_idle(state: dict, floor: float) -> bool:
-    return (state["mqttd_connections_active"] <= floor and state["mqttd_sessions"] <= floor
-            and state["mqttd_pending_publishes"] == 0 and not state.get("under_replicated"))
+def not_idle(state: dict, floor: float, baseline_sessions: float = 0.0, prev: dict | None = None) -> list[str]:
+    """Why the cluster is not settled (empty when it is). `baseline_sessions` is the
+    session count the run started with; `prev`, the state of the previous scrape, makes
+    any movement of the QUIET_COUNTERS since then a reason.
+
+    Replication lag (groups tracked but not caught up) holds the settle while it moves:
+    without `prev`, or when it differs from `prev`'s. A lag that stood still since the
+    previous scrape is not catching up with anything and is left to the record (a local
+    3-node cluster held 72 groups behind on one node, at idle, for minutes)."""
+    why = []
+    if state["mqttd_connections_active"] > floor:
+        why.append(f"connections {state['mqttd_connections_active']:.0f} > {floor:g}")
+    if state["mqttd_sessions"] > max(floor, baseline_sessions):
+        why.append(f"sessions {state['mqttd_sessions']:.0f} > baseline {max(floor, baseline_sessions):g}")
+    if state["mqttd_pending_publishes"] != 0:
+        why.append(f"pending publishes {state['mqttd_pending_publishes']:.0f}")
+    for g in BUSY_GAUGES:
+        if state.get(g, 0.0) != 0:
+            why.append(f"{g.removeprefix('mqttd_')} {state[g]:.0f}")
+    if state.get("mqttd_hub_queue_depth", 0.0) > HUB_QUEUE_IDLE:
+        why.append(f"hub queue {state['mqttd_hub_queue_depth']:.0f}")
+    for k, txt in (("under_replicated", "under-replicated"), ("routing_unsettled", "routing unsettled")):
+        if state.get(k):
+            why.append(f"{txt}: {', '.join(state[k])}")
+    lag = state.get("replication_lag") or {}
+    if lag and (prev is None or (prev.get("replication_lag") or {}) != lag):
+        why.append("replication catching up: " + ", ".join(f"{b} {n:.0f} groups behind" for b, n in sorted(lag.items())))
+    if prev is not None:
+        moved = [g.removeprefix("mqttd_") for g in QUIET_COUNTERS if state.get(g, 0.0) != prev.get(g, 0.0)]
+        if moved:
+            why.append("not quiet: " + ", ".join(moved) + " moved")
+    return why
+
+
+def is_idle(state: dict, floor: float, baseline_sessions: float = 0.0, prev: dict | None = None) -> bool:
+    return not not_idle(state, floor, baseline_sessions, prev)
 
 
 # ── one step ────────────────────────────────────────────────────────────────────────
@@ -288,6 +378,60 @@ def generator_health(s: dict) -> dict:
     }
 
 
+def drain_end_ms(s: dict) -> float:
+    """A generator summary's drain end, wall ms (its last window's end)."""
+    return s["schedule_start_unix_ms"] + max(w["end_s"] for w in s["windows"]) * 1000
+
+
+def drain_figures(gens: list, bf: dict | None) -> dict:
+    """How the generators' drains ended, and the ledger's missing count reconciled with
+    the brokers' own figures when a drain ended before it was complete:
+
+        missing = broker loss drops + still queued at the cut-off + unexplained
+
+    `queued_at_cutoff` is what the brokers' gauges account for (unacked deliveries and
+    pending publishes at their first scrape after the drain's end, at most the missing
+    beyond the drops); `unexplained` is the rest: missing that no drop counter and no
+    broker queue accounts for. `still_queued` is true when the gauges account for every
+    message missing beyond the drops (and every unacked publish) and nothing unexpected
+    arrived: the drain gave up on messages the brokers still held."""
+    per = []
+    for g, s, _ in gens:
+        d = s.get("drain", {})
+        per.append({"generator": g, "ended_by": d.get("ended_by"), "duration_s": d.get("duration_s"),
+                    "quiet_s": d.get("quiet_s"), "outstanding_deliveries": d.get("outstanding_deliveries"),
+                    "outstanding_acks": d.get("outstanding_acks")})
+    missing = sum(s["ledger"]["missing"] for _, s, _ in gens)
+    unacked = sum(s["ledger"]["unacked"] for _, s, _ in gens)
+    unexpected = sum(s["ledger"]["unexpected"] for _, s, _ in gens)
+    cut = any(p["ended_by"] not in (None, "complete") for p in per)
+    lost = bf["lost"] if bf else 0.0
+    held = bf.get("held_at_cutoff") if bf else None
+    held_msgs = 0.0 if held is None else held["mqttd_inflight_messages"] + held["mqttd_pending_publishes"]
+    residual = max(0.0, missing - lost)
+    queued = min(residual, held_msgs) if cut else 0.0
+    out = {"generators": per, "cut_off": cut, "missing": missing, "loss_drops": lost,
+           "queued_at_cutoff": queued, "unexplained": residual - queued if cut else 0.0,
+           "held_at_cutoff": held, "still_queued": False, "reconciled": None}
+    if not cut or (missing == 0 and unacked == 0):
+        return out
+    how = ", ".join(sorted({f"{p['ended_by']} after {p['duration_s']:.1f} s" for p in per
+                            if p["ended_by"] not in (None, "complete") and p["duration_s"] is not None}))
+    parts = [f"broker loss drops {lost:,.0f}"]
+    if queued:
+        parts.append(f"{queued:,.0f} still queued on the brokers at the cut-off")
+    if out["unexplained"]:
+        parts.append(f"{out['unexplained']:,.0f} that no broker drop counter or queue accounts for")
+    held_txt = ("; the brokers' gauges were not read after it" if held is None else
+                f"; the brokers then held {held['mqttd_inflight_messages']:,.0f} unacked deliveries, "
+                f"{held['mqttd_pending_publishes']:,.0f} pending publishes and "
+                f"{held['mqttd_backlog_bytes'] / 1e6:,.1f} MB of backlog")
+    out["reconciled"] = f"drain cut off ({how}): missing {missing:,} = " + " + ".join(parts) + held_txt
+    out["still_queued"] = bool(held is not None and unexpected == 0 and residual > 0
+                               and held_msgs >= residual + unacked)
+    return out
+
+
 def judge(step: Path, cfg: dict | None = None) -> dict:
     """The verdict of one step directory (see the module docstring for the layout)."""
     meta = json.loads((step / "step.json").read_text())
@@ -298,7 +442,7 @@ def judge(step: Path, cfg: dict | None = None) -> dict:
     floor = float(cfg.get("idle_floor", 0))
     gate = cfg.get("latency_gate", "ack")
     out = {"step": meta["index"], "rate": meta["rate"], "attempt": meta.get("attempt", 1), "voids": [],
-           "failures": [], "notes": []}
+           "failures": [], "notes": [], "ramp_reason": meta.get("ramp_reason")}
     gens = []
     for g in range(int(meta["generators"])):
         p = step / f"gen-{g}.json"
@@ -314,7 +458,10 @@ def judge(step: Path, cfg: dict | None = None) -> dict:
         gens.append((g, s, code))
     idle = meta.get("idle_before")
     if idle is not None and not idle.get("idle", False):
-        out["voids"].append(f"the cluster was not idle when the step started ({idle.get('state')})")
+        st_ = idle.get("state") or {}
+        why = "; ".join(st_.get("why_not") or []) if isinstance(st_, dict) else ""
+        out["voids"].append(f"the cluster was not settled when the step started, after {idle.get('waited_s', '?')} s "
+                            f"({why or st_})")
 
     out["generators"] = []
     for g, s, code in gens:
@@ -337,7 +484,7 @@ def judge(step: Path, cfg: dict | None = None) -> dict:
         if hi - lo < min_overlap * shortest:
             out["voids"].append(f"generator measured windows overlap {max(0.0, hi - lo) / 1000:.1f} s of {shortest / 1000:.1f} s")
         else:
-            bf = broker_figures(step, lo, hi, margin_ms, min_cover)
+            bf = broker_figures(step, lo, hi, margin_ms, min_cover, cutoff_ms=max(drain_end_ms(s) for _, s, _ in gens))
             out["brokers"] = bf
             out["voids"].extend(f"broker evidence: {p}" for p in bf["problems"])
             if bf["lost"] > 0:
@@ -353,6 +500,9 @@ def judge(step: Path, cfg: dict | None = None) -> dict:
             out["voids"].append(f"generator {x['generator']} saturated ({', '.join(x['reasons']) or 'see summary'})")
     disconnected = [x for x in out["generators"] if x["outcome"] == "error"]
     ledger_open = [x for x in out["generators"] if not x["ledger"]["closed"]]
+    out["drain"] = drain = drain_figures(gens, bf)
+    if drain.get("reconciled"):
+        out["notes"].append(drain["reconciled"])
 
     acks = merge_histograms([s["phases"][0].get("ack_histogram") for _, s, _ in gens])
     e2e = merge_histograms([s["phases"][0].get("e2e_histogram") for _, s, _ in gens])
@@ -372,6 +522,10 @@ def judge(step: Path, cfg: dict | None = None) -> dict:
     elif disconnected:
         verdict = DISCONNECTED
         out["notes"].append("connections lost: " + "; ".join(f"generator {x['generator']}: {x['errors']}" for x in disconnected))
+    elif ledger_open and drain["still_queued"]:
+        # Nothing the broker counts as loss, and its own gauges hold at least what the
+        # ledger misses: the drain gave up while those messages were still queued.
+        verdict = NOT_DRAINED
     elif ledger_open:
         verdict = FAILED
         out["failures"].append("ledger did not close: " + "; ".join(
@@ -402,9 +556,54 @@ def nice(rate: float, granularity: float) -> float:
     return max(granularity, math.floor(rate / granularity + 0.5) * granularity)
 
 
+def retry_marks(steps: list[dict], cfg: dict) -> list[dict | None]:
+    """The transient-retry rule, per step in run order: None, or a dict whose `mark` is
+
+    - `pending`: a bad step eligible for a retry that has not run yet;
+    - `transient`: a bad step whose retry carried: it does not count;
+    - `confirmed`: a bad step whose retry was bad too: it counts;
+    - `retry`: this step is the retry of step `of`;
+    - `not-retried`: eligible, but the ladder went on without a retry (a run judged
+      before the rule existed).
+
+    Eligible: a FAILED, OFFER NOT TAKEN, DISCONNECTED or NOT DRAINED step that is not
+    itself a retry, while the ladder has used fewer than retry_max retries, and whose
+    nearest carried step below it (the highest carried rate under it, run before it) had
+    a gated p99 under retry_p99_ms. VOID steps are transparent: the retry is the next
+    judged step, and it must be at the same rate."""
+    thr_us = float(cfg.get("retry_p99_ms", RETRY_P99_MS)) * 1000
+    cap = int(cfg.get("retry_max", RETRY_MAX))
+    marks: list[dict | None] = [None] * len(steps)
+    used, waiting = 0, None
+    for i, s in enumerate(steps):
+        if s["verdict"] == VOID:
+            continue
+        if waiting is not None:
+            j, waiting = waiting, None
+            if s["rate"] == steps[j]["rate"]:
+                marks[j]["mark"] = "transient" if s["verdict"] == CARRIED else "confirmed"
+                marks[j]["retry_step"] = s.get("step", i + 1)
+                marks[i] = {"mark": "retry", "of": steps[j].get("step", j + 1)}
+                continue  # a retry is never retried
+            marks[j]["mark"] = "not-retried"
+        if s["verdict"] not in BAD or used >= cap:
+            continue
+        below = [p for p in steps[:i] if p["verdict"] == CARRIED and p["rate"] < s["rate"]
+                 and p.get("gate_p99_us") is not None]
+        if not below:
+            continue
+        ref = max(below, key=lambda p: p["rate"])
+        if ref["gate_p99_us"] < thr_us:
+            used += 1
+            marks[i] = {"mark": "pending", "n": used, "of_max": cap, "ref_rate": ref["rate"],
+                        "ref_step": ref.get("step"), "ref_p99_us": ref["gate_p99_us"], "threshold_ms": thr_us / 1000}
+            waiting = i
+    return marks
+
+
 def next_rate(steps: list[dict], cfg: dict) -> tuple[float | None, str]:
     """The next step's msg/s, or (None, why the ladder is done). `steps` in run order,
-    each a verdict (rate, verdict, good)."""
+    each a verdict (rate, verdict, gate_p99_us)."""
     start, factor = float(cfg["start_rate"]), float(cfg.get("factor", 1.5))
     gap = float(cfg.get("gap_pct", 3.0)) / 100
     gran = float(cfg.get("granularity", 100))
@@ -413,6 +612,12 @@ def next_rate(steps: list[dict], cfg: dict) -> tuple[float | None, str]:
     if not steps:
         return nice(start, gran), "first step"
     last = steps[-1]
+    marks = retry_marks(steps, cfg)
+    if marks[-1] and marks[-1]["mark"] == "pending":
+        m = marks[-1]
+        return last["rate"], (f"retry of the {last['verdict']} step at {last['rate']:g} msg/s after a full settle: the "
+                              f"carried step below it ({m['ref_rate']:g} msg/s) had p99 {m['ref_p99_us'] / 1000:.1f} ms "
+                              f"< {m['threshold_ms']:g} ms, no sign of the knee (retry {m['n']} of at most {m['of_max']})")
     if last["verdict"] == FAILED and not cfg.get("bisect_on_fail", False):
         return None, f"FAILED at {last['rate']:g} msg/s (loss stops the ladder)"
     if last["verdict"] == VOID:
@@ -427,7 +632,8 @@ def next_rate(steps: list[dict], cfg: dict) -> tuple[float | None, str]:
     # Carried is good, whatever its latency (a lossless step at ack p99 2 s still climbs);
     # FAILED, OFFER NOT TAKEN and DISCONNECTED are bad. The verdict decides, not the
     # stored `good`, so a ladder judged before 2026-10-26 replays the same way.
-    judged = [s for s in steps if s["verdict"] != VOID]
+    # A bad step whose retry carried was transient: it does not bracket the knee.
+    judged = [s for s, m in zip(steps, marks) if s["verdict"] != VOID and not (m and m["mark"] == "transient")]
     goods = [s["rate"] for s in judged if s["verdict"] == CARRIED]
     lo = max(goods) if goods else None
     bads = [s["rate"] for s in judged if s["verdict"] != CARRIED and (lo is None or s["rate"] > lo)]
@@ -519,6 +725,8 @@ def fmt_health(s: dict) -> str:
 def ladder_report(ladder: Path) -> dict:
     meta = json.loads((ladder / "ladder.json").read_text())
     steps = ladder_steps(ladder)
+    for st_, m in zip(steps, retry_marks(steps, meta["ramp"])):
+        st_["retry"] = m
     nxt, why = next_rate(steps, meta["ramp"]) if steps else (None, "no steps")
     return {"workload": meta["workload"], "arm": meta.get("arm", "A"), "latency_gate": meta["ramp"].get("latency_gate", "ack"),
             "ramp": meta["ramp"], "mqtt_load": meta.get("mqtt_load", {}), "steps": steps, "capacity": capacity(steps),
@@ -553,13 +761,26 @@ def render_ladder_md(r: dict) -> list[str]:
         b = s.get("brokers", {})
         drops = b.get("lost", b.get("dropped"))
         loss = fmt_ledger(s) + ("" if not drops else f", drops {int(drops)}")
+        dr = s.get("drain") or {}
+        if dr.get("queued_at_cutoff"):
+            loss += f", queued at cut-off {int(dr['queued_at_cutoff'])}"
+        if dr.get("unexplained"):
+            loss += f", unexplained {int(dr['unexplained'])}"
         why = "; ".join(s["failures"] + s["voids"] + s["notes"])
+        m = s.get("retry")
+        tag = ""
+        if m:
+            tag = {"pending": " (retry pending)",
+                   "transient": f" (retried: transient, step {m.get('retry_step')} carried)",
+                   "confirmed": f" (retried: bad again at step {m.get('retry_step')}, counts)",
+                   "retry": f" (retry of step {m.get('of')})",
+                   "not-retried": " (retry-eligible, not retried in this run)"}[m["mark"]]
         lines.append(
             f"| {s['step']} | {fmt_rate(s['offered_rate'])} | {fmt_rate(s['received_rate'])} | "
             f"{fmt_rate(s['delivered_rate'])} | {share} | {loss} | "
             f"{fmt_us(a['p50_us'])} / {fmt_us(a['p99_us'])} / {fmt_us(a['p999_us'])} | "
             f"{fmt_us(e['p50_us'])} / {fmt_us(e['p99_us'])} / {fmt_us(e['p999_us'])} | {fmt_health(s)} | "
-            f"**{s['verdict']}**{(' — ' + why) if why else ''} |")
+            f"**{s['verdict']}**{tag}{(' — ' + why) if why else ''} |")
     lines.append("")
     return lines
 
@@ -587,7 +808,9 @@ def report(run: Path) -> dict:
         md.append("")
     md += ["Judged on the broker only (ADR 0090 D1): loss FAILS a step, a saturated generator VOIDS it, the brokers "
            f"must receive ≥ {OFFER_TAKEN:.0%} of the offer, and latency is the exact merge of every generator's "
-           "histogram. The ramp climbs on every carried step, whatever its latency. **Maximum lossless** is the "
+           "histogram. The ramp climbs on every carried step, whatever its latency; a bad step right above a carried "
+           f"step with p99 < {RETRY_P99_MS:g} ms is retried once after a full settle, and counts only if the retry "
+           "is bad too (\"retried: transient\" otherwise). **Maximum lossless** is the "
            "highest carried step; the lines below it are the highest carried step within each ack p99 band "
            "(QoS 0: end-to-end p99).", ""]
     for r in data["ladders"]:
@@ -631,6 +854,8 @@ def main(argv: list[str]) -> int:
     r.add_argument("run")
     i = sub.add_parser("idle")
     i.add_argument("--floor", type=float, default=0)
+    i.add_argument("--baseline-sessions", type=float, default=0)
+    i.add_argument("--prev", help="the previous scrape's state (JSON, as this prints): the quiet counters must not have moved")
     i.add_argument("scrapes", nargs="+")
     c = sub.add_parser("cost")
     c.add_argument("--tier", required=True, choices=sorted(TIERS))
@@ -666,8 +891,15 @@ def main(argv: list[str]) -> int:
         return 0
     if a.cmd == "idle":
         st = idle_state([Path(p) for p in a.scrapes])
+        prev = None
+        if a.prev:
+            try:
+                prev = json.loads(Path(a.prev).read_text())
+            except (OSError, ValueError):
+                prev = None
+        st["why_not"] = not_idle(st, a.floor, a.baseline_sessions, prev)
         print(json.dumps(st))
-        return 0 if is_idle(st, a.floor) else 1
+        return 0 if not st["why_not"] else 1
     if a.cmd == "cost":
         prices = {}
         for kv in a.price:

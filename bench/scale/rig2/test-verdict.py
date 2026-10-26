@@ -32,7 +32,7 @@ def hist(samples_us: dict[int, int]) -> dict:
 
 
 def summary(rate, *, p99_us=50_000, saturated=False, missing=0, outcome=None, start_shift_s=0.0,
-            measure_s=60.0, warmup_s=20.0, errors=None):
+            measure_s=60.0, warmup_s=20.0, errors=None, drain="complete", unexpected=0):
     """A minimal mqtt-load.summary.v2 with one phase: `rate` msg/s offered; ack and e2e
     histograms whose p99 is `p99_us` (98 % at 1 ms, 1.5 % at p99, 0.5 % at 2 x p99)."""
     n = int(rate * measure_s)
@@ -57,26 +57,29 @@ def summary(rate, *, p99_us=50_000, saturated=False, missing=0, outcome=None, st
         "windows": windows,
         "phases": [{"index": 0, "target_rate": rate, "offered_rate": rate, "sent_rate": rate, "received_rate": rate,
                     "ack_histogram": h, "e2e_histogram": h, "saturated": saturated}],
-        "ledger": {"sent": n, "acked": n, "received": n - missing, "missing": missing, "unexpected": 0, "unacked": 0,
-                   "unexpected_acks": 0, "closed": closed},
+        "ledger": {"sent": n, "acked": n, "received": n - missing, "missing": missing, "unexpected": unexpected,
+                   "unacked": 0, "unexpected_acks": 0, "closed": closed and not unexpected},
+        "drain": {"duration_s": 0.05 if drain == "complete" else 10.0, "ended_by": drain, "quiet_s": 10.0,
+                  "outstanding_deliveries": missing, "outstanding_acks": 0, "since_progress_s": 10.0},
         "errors": errors or {"connect": 0, "disconnects": 0, "server_disconnects": 0, "protocol": 0, "write": 0},
         "generator": {"saturated": saturated, "sent_per_cpu_second": 40000.0},
         "outcome": outcome or ("void" if saturated else ("ok" if closed else "loss")),
     }
 
 
-def prom(received, delivered, dropped=None, start=1700000000.0):
+def prom(received, delivered, dropped=None, start=1700000000.0, gauges=None):
     lines = [f'mqttd_publish_received_total{{qos="1"}} {received}',
              f'mqttd_publish_delivered_total{{qos="1"}} {delivered}',
              f"process_start_time_seconds {start}",
              "mqttd_connections_active 0", "mqttd_sessions 0", "mqttd_pending_publishes 0"]
+    lines += [f"{k} {v}" for k, v in (gauges or {}).items()]
     for reason, v in (dropped or {}).items():
         lines.append(f'mqttd_publish_dropped_total{{reason="{reason}"}} {v}')
     return "\n".join(lines) + "\n# EOF\n"
 
 
 def make_step(root: Path, rate, gens, *, brokers=3, received_share=1.0, drops=None, idle=True, gate="ack",
-              restart=False, coverage_s=None):
+              restart=False, coverage_s=None, held=None):
     """A step directory: `gens` summaries, and brokers whose received counters grew at
     received_share x rate in total over the measured window (scrapes every 2 s)."""
     step = root / f"{len(list(root.iterdir())) + 1:02d}-{rate}"
@@ -99,7 +102,9 @@ def make_step(root: Path, rate, gens, *, brokers=3, received_share=1.0, drops=No
             secs = max(0.0, (t - first) / 1000)
             dropped = {k: (v if t == stamps[-1] else 0) for k, v in (drops or {}).items()} if b == 0 else None
             st = 1700000001.0 if (restart and b == 1 and t == stamps[-1]) else 1700000000.0
-            (d / f"{t}.prom").write_text(prom(per_broker * secs, per_broker * secs, dropped, st))
+            # `held`: what broker 0's gauges hold from the generators' drain end (80 s) on.
+            g = held if (held and b == 0 and t >= T0 + 80_000) else None
+            (d / f"{t}.prom").write_text(prom(per_broker * secs, per_broker * secs, dropped, st, g))
     return step
 
 
@@ -222,6 +227,46 @@ class Verdicts(unittest.TestCase):
         self.assertEqual(v["verdict"], V.FAILED)
         self.assertIn("a-reason-from-the-future=1", v["failures"][0])
 
+    def test_a_drain_cut_off_with_the_missing_still_queued_is_not_drained_not_loss(self):
+        # No broker drop, the drain went quiet, and broker 0 still holds more unacked
+        # deliveries than the ledger misses: the messages were queued, not lost.
+        v = verdict_of(make_step(self.root, 30000, [summary(30000, missing=500, drain="quiet")],
+                                 held={"mqttd_inflight_messages": 700}))
+        self.assertEqual(v["verdict"], V.NOT_DRAINED, v)
+        self.assertFalse(v["good"])
+        self.assertEqual(v["failures"], [])
+        self.assertTrue(v["drain"]["still_queued"])
+        self.assertEqual(v["drain"]["queued_at_cutoff"], 500)
+        self.assertIn("missing 500 = broker loss drops 0 + 500 still queued on the brokers at the cut-off", v["notes"][0])
+        # For the ramp it is above the knee, like OFFER NOT TAKEN.
+        self.assertIn(V.NOT_DRAINED, V.BAD)
+
+    def test_a_drain_cut_off_with_drops_fails_and_reconciles_missing(self):
+        # Run 2's clean-qos1 152,000: missing = loss drops + what the brokers still held.
+        v = verdict_of(make_step(self.root, 30000, [summary(30000, missing=1000, drain="quiet")],
+                                 drops={"backlog-overflow": 700}, held={"mqttd_inflight_messages": 900,
+                                                                         "mqttd_backlog_bytes": 2_000_000}))
+        self.assertEqual(v["verdict"], V.FAILED, v)
+        self.assertEqual(v["drain"]["loss_drops"], 700)
+        self.assertEqual(v["drain"]["queued_at_cutoff"], 300)
+        self.assertEqual(v["drain"]["unexplained"], 0)
+        self.assertTrue(any("missing 1,000 = broker loss drops 700 + 300 still queued on the brokers at the cut-off; "
+                            "the brokers then held 900 unacked deliveries, 0 pending publishes and 2.0 MB" in n
+                            for n in v["notes"]), v["notes"])
+
+    def test_a_drain_cut_off_with_nothing_held_is_loss(self):
+        # Nothing on the brokers' gauges accounts for the missing: the ledger's loss stands.
+        v = verdict_of(make_step(self.root, 30000, [summary(30000, missing=40, drain="quiet")],
+                                 held={"mqttd_inflight_messages": 10}))
+        self.assertEqual(v["verdict"], V.FAILED, v)
+        self.assertEqual(v["drain"]["queued_at_cutoff"], 10)
+        self.assertEqual(v["drain"]["unexplained"], 30)
+        self.assertIn("missing=40", v["failures"][0])
+        # A complete drain has nothing to reconcile.
+        v = verdict_of(make_step(self.root, 30000, [summary(30000)]))
+        self.assertFalse(v["drain"]["cut_off"])
+        self.assertIsNone(v["drain"]["reconciled"])
+
     def test_capacity_lines_by_p99_band(self):
         steps = []
         for rate, p99 in ((10000, 80_000), (15000, 200_000), (22000, 900_000), (33000, 2_000_000)):
@@ -264,6 +309,27 @@ class Verdicts(unittest.TestCase):
         self.assertIn("15,000 msg/s lossless", (run / "report-durable-qos1.svg").read_text())
         self.assertIn("](report-durable-qos1.svg)", (run / "report.md").read_text())
         self.assertEqual(json.loads((run / "report.json").read_text())["ladders"][0]["capacity"]["lossless"]["offered_rate"], 15000)
+
+
+class RetryReport(unittest.TestCase):
+    def test_both_attempts_are_in_the_report_and_the_first_is_transient(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d)
+            lad = run / "A" / "durable-qos1"
+            (lad / "steps").mkdir(parents=True)
+            for rate, missing in ((22500, 0), (33800, 9), (33800, 0)):
+                verdict_of(make_step(lad / "steps", rate, [summary(rate, p99_us=1_500, missing=missing)]))
+            (lad / "ladder.json").write_text(json.dumps({"workload": "durable-qos1", "arm": "A",
+                                                         "ramp": {"start_rate": 22500}}))
+            (run / "run.json").write_text(json.dumps({"tier": "n3", "workloads": ["durable-qos1"]}))
+            data = V.report(run)
+            md = (run / "report.md").read_text()
+            self.assertIn("**FAILED** (retried: transient, step 3 carried)", md)
+            self.assertIn("**CARRIED** (retry of step 2)", md)
+            lad_r = data["ladders"][0]
+            self.assertEqual(lad_r["capacity"]["lossless"]["offered_rate"], 33800)
+            self.assertIn("incomplete (next would be 50700", lad_r["ended"])
+            self.assertIn("retried: transient", (run / "report-durable-qos1.svg").read_text())
 
 
 class DropReasons(unittest.TestCase):
@@ -332,8 +398,10 @@ class Histograms(unittest.TestCase):
                 self.assertEqual(b[-1][0], ref["max_us"])
 
 
-def st(rate, verdict, good=None):
-    return {"rate": float(rate), "verdict": verdict, "good": verdict == V.CARRIED if good is None else good}
+def st(rate, verdict, good=None, p99_us=None):
+    """A judged step for the ramp; p99_us None (no latency) never makes a retry eligible."""
+    return {"rate": float(rate), "verdict": verdict, "good": verdict == V.CARRIED if good is None else good,
+            "gate_p99_us": p99_us}
 
 
 class Ramp(unittest.TestCase):
@@ -390,6 +458,74 @@ class Ramp(unittest.TestCase):
         self.assertIsNone(rate)
         self.assertIn("VOID 2 times", why)
 
+    def test_a_failure_right_above_a_flat_step_is_retried_and_a_carried_retry_climbs_on(self):
+        # Run 2's durable-qos1: 22,500 carried at ack p99 1.5 ms, 33,800 FAILED.
+        steps = [st(10000, V.CARRIED), st(15000, V.CARRIED), st(22500, V.CARRIED, p99_us=1_500),
+                 st(33800, V.FAILED, p99_us=15_000)]
+        rate, why = self.nxt(steps)
+        self.assertEqual(rate, 33800)
+        self.assertIn("retry of the FAILED step at 33800 msg/s after a full settle", why)
+        self.assertIn("1.5 ms < 50 ms", why)
+        self.assertIn("retry 1 of at most 2", why)
+        steps.append(st(33800, V.CARRIED))
+        self.assertEqual(self.nxt(steps), (50700, "coarse step up"))
+        marks = V.retry_marks(steps, self.CFG)
+        self.assertEqual(marks[3]["mark"], "transient")
+        self.assertEqual(marks[4]["mark"], "retry")
+
+    def test_a_retry_that_fails_again_counts(self):
+        steps = [st(15000, V.CARRIED), st(22500, V.CARRIED, p99_us=1_500), st(33800, V.FAILED),
+                 st(33800, V.FAILED)]
+        rate, why = self.nxt(steps)
+        self.assertIsNone(rate)
+        self.assertIn("FAILED at 33800", why)
+        self.assertEqual(V.retry_marks(steps, self.CFG)[2]["mark"], "confirmed")
+        # With bisect_on_fail, it brackets the knee as any bad step does; never a second retry.
+        self.assertEqual(self.nxt(steps, bisect_on_fail=True)[0], 28200)
+
+    def test_no_retry_when_the_step_below_already_showed_the_knee(self):
+        # Run 1's durable-qos1: 76,100 carried at ack p99 66 ms, then 114,200 failed.
+        steps = [st(50700, V.CARRIED, p99_us=4_000), st(76100, V.CARRIED, p99_us=65_800), st(114200, V.FAILED)]
+        rate, why = self.nxt(steps, bisect_on_fail=True)
+        self.assertEqual(rate, 95200)
+        self.assertIn("bisect", why)
+        self.assertIsNone(V.retry_marks(steps, self.CFG)[2])
+        self.assertIsNone(self.nxt(steps)[0])
+        # The threshold is a ramp setting.
+        self.assertEqual(self.nxt(steps, retry_p99_ms=100)[0], 114200)
+
+    def test_offer_not_taken_and_qos0_gates_are_retried_too(self):
+        # QoS 0: gate_p99_us is the end-to-end p99 (run 2's qos0: 112,500 at e2e p99 30.1 ms).
+        steps = [st(75000, V.CARRIED, p99_us=3_500), st(112500, V.CARRIED, p99_us=30_100), st(168800, V.NOT_TAKEN)]
+        self.assertEqual(self.nxt(steps)[0], 168800)
+        steps.append(st(168800, V.NOT_TAKEN))
+        self.assertEqual(self.nxt(steps)[0], 140700)  # confirmed: bisect
+
+    def test_retries_are_capped_per_ladder(self):
+        cfg = {"bisect_on_fail": True}
+        flat = 2_000
+        steps = [st(10000, V.CARRIED, p99_us=flat), st(15000, V.FAILED), st(15000, V.CARRIED, p99_us=flat),  # retry 1
+                 st(22500, V.FAILED), st(22500, V.CARRIED, p99_us=flat),                                     # retry 2
+                 st(33800, V.FAILED)]                                                   # cap reached: counts
+        rate, why = self.nxt(steps, **cfg)
+        self.assertEqual(rate, 28200)
+        self.assertIn("bisect between 22500 and 33800", why)
+        self.assertIsNone(V.retry_marks(steps, self.CFG)[5])
+        self.assertEqual(self.nxt(steps, retry_max=3, **cfg)[0], 33800)
+
+    def test_a_void_retry_is_rerun_and_still_settles_the_first_attempt(self):
+        steps = [st(22500, V.CARRIED, p99_us=2_000), st(33800, V.DISCONNECTED), st(33800, V.VOID)]
+        rate, why = self.nxt(steps)
+        self.assertEqual(rate, 33800)
+        self.assertIn("rerun of a VOID step", why)
+        steps.append(st(33800, V.CARRIED))
+        self.assertEqual(self.nxt(steps)[0], 50700)
+        self.assertEqual(V.retry_marks(steps, self.CFG)[1]["mark"], "transient")
+
+    def test_a_ladder_judged_before_the_rule_marks_what_would_have_been_retried(self):
+        steps = [st(22500, V.CARRIED, p99_us=1_500), st(33800, V.FAILED), st(28200, V.CARRIED)]
+        self.assertEqual(V.retry_marks(steps, {"bisect_on_fail": True})[1]["mark"], "not-retried")
+
     def test_a_bad_first_step_steps_down(self):
         self.assertEqual(self.nxt([st(10000, V.NOT_TAKEN)])[0], 6700)
         rate, why = self.nxt([st(100, V.NOT_TAKEN)])
@@ -420,6 +556,58 @@ class IdleAndCost(unittest.TestCase):
             self.assertFalse(V.is_idle(V.idle_state([p]), 32))
             p.write_text(prom(1, 1).replace("# EOF", "mqttd_replication_desired 3\nmqttd_replication_min_actual 3\n# EOF"))
             self.assertTrue(V.is_idle(V.idle_state([p]), 0))
+
+    def test_the_settle_waits_for_lanes_replication_routing_sessions_and_quiet(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "b.prom"
+
+            def state(**gauges):
+                p.write_text(prom(1, 1, gauges=gauges))
+                return V.idle_state([p])
+
+            self.assertEqual(V.not_idle(state(), 0), [])
+            for g, v, why in (("mqttd_append_lane_jobs", 245, "append_lane_jobs 245"),
+                              ("mqttd_inflight_messages", 3679, "inflight_messages 3679"),
+                              ("mqttd_backlog_bytes", 68390000, "backlog_bytes 68390000"),
+                              ("mqttd_peer_forwards_in_flight", 4, "peer_forwards_in_flight 4"),
+                              ("mqttd_publish_held_for_unreachable", 1, "publish_held_for_unreachable 1"),
+                              ("mqttd_hub_queue_depth", 300, "hub queue 300")):
+                self.assertEqual(V.not_idle(state(**{g: v}), 0), [why])
+            # A command or two in the hub queue is idle.
+            self.assertEqual(V.not_idle(state(mqttd_hub_queue_depth=1), 0), [])
+            # Replication lag (groups tracked but not caught up) holds the settle while it moves.
+            behind = state(mqttd_replica_groups_tracked=179, mqttd_replica_groups_current=170)
+            self.assertEqual(V.not_idle(behind, 0), ["replication catching up: b 9 groups behind"])
+            closer = state(mqttd_replica_groups_tracked=179, mqttd_replica_groups_current=175)
+            self.assertEqual(V.not_idle(closer, 0, prev=behind), ["replication catching up: b 4 groups behind"])
+            # A lag that stood still since the last scrape is not catching up: recorded, not waited for.
+            self.assertEqual(V.not_idle(closer, 0, prev=closer), [])
+            self.assertEqual(closer["replication_lag"], {"b": 4})
+            self.assertEqual(V.not_idle(state(mqttd_replica_groups_tracked=179, mqttd_replica_groups_current=179), 0), [])
+            p.write_text(prom(1, 1).replace("# EOF", 'mqttd_routing_unsettled{reason="scan"} 1\n'
+                                                      'mqttd_routing_unsettled{reason="mesh"} 0\n# EOF'))
+            self.assertEqual(V.not_idle(V.idle_state([p]), 0), ["routing unsettled: b"])
+            # Sessions back to the run's baseline, not below it.
+            p.write_text(prom(1, 1).replace("mqttd_sessions 0", "mqttd_sessions 3"))
+            self.assertTrue(V.not_idle(V.idle_state([p]), 0))
+            self.assertEqual(V.not_idle(V.idle_state([p]), 0, baseline_sessions=3), [])
+            # Quiet: the traffic and durable-writer counters stood still since the last scrape.
+            before = state(mqttd_durable_writer_ops_total=340254)
+            self.assertEqual(V.not_idle(state(mqttd_durable_writer_ops_total=340254), 0, prev=before), [])
+            self.assertEqual(V.not_idle(state(mqttd_durable_writer_ops_total=340910), 0, prev=before),
+                             ["not quiet: durable_writer_ops_total moved"])
+
+    def test_the_idle_command_reports_why_not(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "broker-0.prom"
+            p.write_text(prom(1, 1, gauges={"mqttd_append_lane_jobs": 3}))
+            import contextlib
+            import io
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = V.main(["idle", str(p)])
+            self.assertEqual(rc, 1)
+            self.assertEqual(json.loads(buf.getvalue())["why_not"], ["append_lane_jobs 3"])
 
     def test_tier_prices(self):
         n3 = V.cost("n3")

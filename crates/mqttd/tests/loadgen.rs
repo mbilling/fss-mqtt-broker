@@ -113,6 +113,7 @@ fn assert_closed(s: &Summary, broker: &Broker) {
     assert_eq!(l.sent, offered, "{}", ctx());
     assert_eq!(l.unique_received, l.expected, "{}", ctx());
     assert_eq!(s.drain.ended_by, "complete", "{}", ctx());
+    assert_eq!(s.drain.outstanding_deliveries, 0, "{}", ctx());
 }
 
 /// Durable `QoS` 1 through `$share` groups: the ledger closes and the latencies are
@@ -285,6 +286,12 @@ async fn a_lost_consumer_opens_the_ledger() {
     assert!(l.missing > 0, "{}", report());
     assert_eq!(l.missing, l.expected - l.unique_received, "{}", report());
     assert_eq!(l.unacked, 0, "the publishers were not cut: {}", report());
+    // The drain says what it gave up on: every missing delivery was still owed when it
+    // went quiet, and nothing was left unacknowledged.
+    assert_ne!(s.drain.ended_by, "complete", "{}", report());
+    assert_eq!(s.drain.outstanding_deliveries, l.missing, "{}", report());
+    assert_eq!(s.drain.outstanding_acks, 0, "{}", report());
+    assert!(s.drain.quiet_s >= 2.0, "{}", report());
     assert!(s.errors.disconnects >= 1, "{}", report());
     assert_eq!(s.outcome, Outcome::Error, "{}", report());
 }

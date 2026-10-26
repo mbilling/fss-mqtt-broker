@@ -107,8 +107,13 @@ pub struct Config {
     pub password: Option<String>,
     /// Longest the drain may take after the schedule ends, ns.
     pub drain_timeout_ns: u64,
-    /// The drain also ends when nothing was acked or delivered for this long, ns.
+    /// The drain also ends when nothing was acked or delivered for this long, ns: the
+    /// floor of the quiet window.
     pub drain_quiet_ns: u64,
+    /// The quiet window grows to this many times the slowest measured window's ack or
+    /// end-to-end p99 (capped by the timeout): a step whose deliveries ran 10 s behind
+    /// is not over after 5 s of silence. 0 keeps the floor alone.
+    pub drain_quiet_factor: f64,
     /// List up to this many missing identities in the summary.
     pub report_missing: usize,
     /// Connections being established at once.
@@ -156,6 +161,7 @@ impl Config {
             password: None,
             drain_timeout_ns: 30_000_000_000,
             drain_quiet_ns: 5_000_000_000,
+            drain_quiet_factor: 2.0,
             report_missing: 32,
             connect_concurrency: 128,
             connect_timeout_ns: 10_000_000_000,
@@ -214,7 +220,25 @@ impl Config {
         if self.window_ns == 0 {
             return Err("window must be > 0".into());
         }
+        if !(self.drain_quiet_factor.is_finite() && self.drain_quiet_factor >= 0.0) {
+            return Err("drain quiet factor must be finite and >= 0".into());
+        }
         Ok(())
+    }
+
+    /// The drain's quiet window, ns: the floor, or `drain_quiet_factor` times the
+    /// slowest measured p99 (`slowest_p99_us`) if that is longer, never past the timeout.
+    #[must_use]
+    pub fn drain_quiet_window_ns(&self, slowest_p99_us: u64) -> u64 {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let scaled = (slowest_p99_us as f64 * 1000.0 * self.drain_quiet_factor) as u64;
+        self.drain_quiet_ns
+            .max(scaled)
+            .min(self.drain_timeout_ns.max(self.drain_quiet_ns))
     }
 
     /// Topic `t`'s name.
@@ -278,6 +302,25 @@ mod tests {
 
     fn cfg() -> Config {
         Config::new(vec!["127.0.0.1:1883".parse().unwrap()], 100.0, 6)
+    }
+
+    #[test]
+    fn the_drain_quiet_window_follows_the_slowest_p99_between_floor_and_timeout() {
+        let mut c = cfg();
+        c.drain_quiet_ns = 10_000_000_000;
+        c.drain_timeout_ns = 120_000_000_000;
+        c.drain_quiet_factor = 2.0;
+        // Fast steps keep the floor.
+        assert_eq!(c.drain_quiet_window_ns(2_000), 10_000_000_000);
+        // Deliveries 17.9 s behind: 35.8 s of silence before the drain calls it quiet.
+        assert_eq!(c.drain_quiet_window_ns(17_900_000), 35_800_000_000);
+        // Never past the timeout.
+        assert_eq!(c.drain_quiet_window_ns(90_000_000), 120_000_000_000);
+        // Factor 0: the floor alone.
+        c.drain_quiet_factor = 0.0;
+        assert_eq!(c.drain_quiet_window_ns(17_900_000), 10_000_000_000);
+        c.drain_quiet_factor = f64::NAN;
+        assert!(c.validate().is_err());
     }
 
     #[test]

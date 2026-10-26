@@ -37,15 +37,15 @@ ARM="${ARM:-A}"
 case "$TIER" in
 local)
 	BROKERS="${BROKERS:-3}" GENERATORS=1
-	DEF_WARMUP=5 DEF_MEASURE=10 DEF_WINDOW=5 DEF_SCRAPE=1 DEF_MARGIN=0.5 DEF_MAX_STEPS=3
+	DEF_WARMUP=5 DEF_MEASURE=10 DEF_WINDOW=5 DEF_SCRAPE=1 DEF_MARGIN=0.5 DEF_MAX_STEPS=3 DEF_PRIME=0
 	;;
 n3)
 	BROKERS="${BROKERS:-3}" GENERATORS="${GENERATORS:-1}"
-	DEF_WARMUP=20 DEF_MEASURE=60 DEF_WINDOW=10 DEF_SCRAPE=2 DEF_MARGIN=1 DEF_MAX_STEPS=14
+	DEF_WARMUP=20 DEF_MEASURE=60 DEF_WINDOW=10 DEF_SCRAPE=2 DEF_MARGIN=1 DEF_MAX_STEPS=14 DEF_PRIME=90
 	;;
 n10)
 	BROKERS="${BROKERS:-10}" GENERATORS="${GENERATORS:-3}"
-	DEF_WARMUP=20 DEF_MEASURE=60 DEF_WINDOW=10 DEF_SCRAPE=2 DEF_MARGIN=1 DEF_MAX_STEPS=14
+	DEF_WARMUP=20 DEF_MEASURE=60 DEF_WINDOW=10 DEF_SCRAPE=2 DEF_MARGIN=1 DEF_MAX_STEPS=14 DEF_PRIME=90
 	;;
 *) die "TIER must be local, n3 or n10, not '$TIER'" ;;
 esac
@@ -57,9 +57,20 @@ GEN_TYPE="${GEN_TYPE:-ccx33}"
 WARMUP="${WARMUP:-$DEF_WARMUP}"
 MEASURE="${MEASURE:-$DEF_MEASURE}"
 WINDOW="${WINDOW:-$DEF_WINDOW}"
-DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-30}"
+# Before a ladder's first step: PRIME_SECS s of unmeasured load at the start rate (its own
+# mqtt-load process, never judged), then the full settle. Run 2 (2026-10-26) showed the
+# first steps' latency excursions 70-80 s into the step, so a longer warm-up inside the
+# step would have measured them; a separate priming run keeps them out. 0 skips it.
+PRIME_SECS="${PRIME_SECS:-$DEF_PRIME}"
+# The drain: it ends when every expected delivery and ack is in, or after a quiet window
+# with nothing arriving: DRAIN_QUIET s, or DRAIN_QUIET_FACTOR x the slowest measured p99
+# if longer (mqtt-load --drain-quiet-factor), or at the hard DRAIN_TIMEOUT. A step whose
+# deliveries ran 17.9 s behind was cut off after 5 s of silence in run 2.
+DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-120}"
+DRAIN_QUIET="${DRAIN_QUIET:-10}"
+DRAIN_QUIET_FACTOR="${DRAIN_QUIET_FACTOR:-2}"
 # Coarse steps multiply by FACTOR while steps are CARRIED (lossless, whatever their
-# latency); after the first FAILED / OFFER NOT TAKEN / DISCONNECTED step, bisection until
+# latency); after the first FAILED / OFFER NOT TAKEN / DISCONNECTED / NOT DRAINED step, bisection until
 # the gap between the last carried and the first bad step is <= GAP_PCT %.
 FACTOR="${FACTOR:-1.5}"
 GAP_PCT="${GAP_PCT:-3}"
@@ -71,14 +82,28 @@ MAX_STEPS="${MAX_STEPS:-$DEF_MAX_STEPS}"
 VOID_RETRIES="${VOID_RETRIES:-1}"
 # A FAILED step (loss) ends the ladder; BISECT_ON_FAIL=1 keeps bisecting below it.
 BISECT_ON_FAIL="${BISECT_ON_FAIL:-0}"
+# A FAILED / OFFER NOT TAKEN / DISCONNECTED / NOT DRAINED step whose nearest carried step
+# below had its gated p99 under RETRY_P99_MS is retried once after a full settle; only a
+# second bad attempt counts. At most RETRY_MAX per ladder (verdict.py retry_marks).
+RETRY_P99_MS="${RETRY_P99_MS:-50}"
+RETRY_MAX="${RETRY_MAX:-2}"
 # Broker scrapes: every SCRAPE_INTERVAL s on the broker's host; the window edges shrink
 # by MARGIN_S each side before the first/last scrape inside them is taken.
 SCRAPE_INTERVAL="${SCRAPE_INTERVAL:-$DEF_SCRAPE}"
 MARGIN_S="${MARGIN_S:-$DEF_MARGIN}"
-# Between steps: every broker's connections and sessions <= IDLE_FLOOR and no pending
-# publish, within RESET_BUDGET s, or the next step is VOID (unreset).
+# Between steps, the settle (verdict.py idle): no connections (<= IDLE_FLOOR), sessions
+# back to the run's baseline, nothing in the append lanes, the pending-publish table,
+# the delivery inflight or backlog, or on the peer links, no placement group under-
+# replicated, replication not still catching up, routing settled; then SETTLE_QUIET s more of the same with the
+# traffic and durable-writer counters standing still. Within RESET_BUDGET s, or the step
+# is VOID (unreset) and the reasons are recorded. After a step that was not carried, and
+# before a ladder's first step, the budget is SETTLE_BUDGET_LONG and the quiet period
+# SETTLE_QUIET_LONG (sessions expiring, replication catching up).
 IDLE_FLOOR="${IDLE_FLOOR:-0}"
 RESET_BUDGET="${RESET_BUDGET:-120}"
+SETTLE_QUIET="${SETTLE_QUIET:-10}"
+SETTLE_BUDGET_LONG="${SETTLE_BUDGET_LONG:-300}"
+SETTLE_QUIET_LONG="${SETTLE_QUIET_LONG:-30}"
 # For the price quote: steps a ladder is expected to take (coarse climb + bisection).
 EST_STEPS="${EST_STEPS:-9}"
 
@@ -96,12 +121,12 @@ for w in $WORKLOADS; do
 	[ -f "$RIG2/workloads/$w.env" ] || die "no workload $w (have: $(cd "$RIG2/workloads" && ls ./*.env | sed 's|./||; s|\.env||' | tr '\n' ' '))"
 done
 NWORK=$(wc -w <<<"$WORKLOADS" | tr -d ' ')
-STEP_SECS=$((WARMUP + MEASURE + 45))
+STEP_SECS=$((WARMUP + MEASURE + 55))
 
 # ── the quote, before anything is provisioned ───────────────────────────────────────
 if [ "$TIER" != local ]; then
 	say "$(python3 "$RIG2/verdict.py" cost --tier "$TIER" --brokers "$BROKERS" --generators "$GENERATORS" \
-		--broker-type "$BROKER_TYPE" --gen-type "$GEN_TYPE" --workloads "$NWORK" --steps "$EST_STEPS" \
+		--broker-type "$BROKER_TYPE" --gen-type "$GEN_TYPE" --workloads "$NWORK" --steps "$((EST_STEPS + 1))" \
 		--step-secs "$STEP_SECS")"
 	[ "${PRICE_ONLY:-0}" != 1 ] || exit 0
 fi
@@ -258,6 +283,8 @@ json.dump({"tier": "$TIER", "brokers": $BROKERS, "broker_type": "$BROKER_TYPE" i
            "generators": $GENERATORS, "gen_type": "$GEN_TYPE" if "$TIER" != "local" else "local",
            "binary": """$BINARY_DESC""", "unreleased": bool("${MQTTD_URL:-}"), "workloads": "$WORKLOADS".split(),
            "started_utc": "$STAMP", "warmup_s": $WARMUP, "measure_s": $MEASURE, "window_s": $WINDOW,
+           "prime_s": $PRIME_SECS, "drain_timeout_s": $DRAIN_TIMEOUT, "drain_quiet_s": $DRAIN_QUIET,
+           "settle_quiet_s": $SETTLE_QUIET,
            "observe": "$OBSERVE" == "1",
            "git": "$(git -C "$REPO_ROOT" rev-parse HEAD)"}, open(sys.argv[1], "w"), indent=2)
 PY
@@ -275,16 +302,31 @@ scrape_once_all() { # scrape_once_all <dir>: one /metrics per broker into <dir>/
 	done
 }
 
-await_idle() { # await_idle <step-dir>: prints the idle record as JSON
-	local d="$1/pre" waited=0 state
+await_idle() { # await_idle <step-dir> <budget-s> <quiet-s>: settle, then print the record as JSON
+	local d="$1/pre" budget="$2" quiet="$3" waited=0 state since=-1 prev="" ok
 	while :; do
-		if scrape_once_all "$d" && state=$(python3 "$RIG2/verdict.py" idle --floor "$IDLE_FLOOR" "$d"/broker-*.prom); then
-			echo "{\"idle\": true, \"waited_s\": $waited, \"state\": $state}"
-			return 0
+		state="" ok=0
+		if scrape_once_all "$d"; then
+			state=$(python3 "$RIG2/verdict.py" idle --floor "$IDLE_FLOOR" --baseline-sessions "$BASELINE_SESSIONS" \
+				${prev:+--prev "$prev"} "$d"/broker-*.prom) && ok=1
 		fi
-		if [ "$waited" -ge "$RESET_BUDGET" ]; then
-			warn "cluster not idle after ${RESET_BUDGET}s: ${state:-unreadable} — the step will be VOID (unreset)"
-			echo "{\"idle\": false, \"waited_s\": $waited, \"state\": ${state:-null}}"
+		if [ "$ok" = 1 ]; then
+			[ "$since" -ge 0 ] || since=$waited
+			if [ $((waited - since)) -ge "$quiet" ]; then
+				echo "{\"idle\": true, \"waited_s\": $waited, \"quiet_s\": $quiet, \"budget_s\": $budget, \"state\": $state}"
+				return 0
+			fi
+		else
+			since=-1
+		fi
+		prev=""
+		if [ -n "$state" ]; then
+			prev="$d/state.json"
+			printf '%s\n' "$state" >"$prev"
+		fi
+		if [ "$waited" -ge "$budget" ]; then
+			warn "cluster not settled after ${budget}s: $( [ -n "$prev" ] && python3 -c 'import json,sys; print("; ".join(json.load(open(sys.argv[1])).get("why_not") or []))' "$prev" 2>/dev/null || echo "scrapes unreadable") — the step will be VOID (unreset)"
+			echo "{\"idle\": false, \"waited_s\": $waited, \"quiet_s\": $quiet, \"budget_s\": $budget, \"state\": ${state:-null}}"
 			return 0
 		fi
 		sleep 5
@@ -292,8 +334,46 @@ await_idle() { # await_idle <step-dir>: prints the idle record as JSON
 	done
 }
 
-run_step() { # run_step <ladder-dir> <index> <rate>
-	local ladder="$1" idx="$2" rate="$3" id hid step g i per_gen idle bound pids=() attempt metrics
+launch_gens() { # launch_gens <local-dir> <host-id> <per-gen rate> <warmup> <measure>: one mqtt-load per generator, together
+	local dir="$1" hid="$2" per_gen="$3" warmup="$4" measure="$5" g bound metrics pids=()
+	local -a args=(--broker "$ENDPOINTS" --rate "$per_gen" --qos "$QOS" --payload "$PAYLOAD"
+		--topics "$TOPICS" --shape "$SHAPE" --consumers "$CONSUMERS_N" --groups "$SHARE_GROUPS"
+		--sessions "$SESSIONS" --rate-per-publisher "$RATE_PER_PUBLISHER" --inflight "$INFLIGHT"
+		--warmup "$warmup" --duration "$measure" --window "$WINDOW" --drain-timeout "$DRAIN_TIMEOUT"
+		--drain-quiet "$DRAIN_QUIET" --drain-quiet-factor "$DRAIN_QUIET_FACTOR" --quiet)
+	[ "$SESSIONS" != durable ] || args+=(--session-expiry "$SESSION_EXPIRY")
+	bound=$((warmup + measure + DRAIN_TIMEOUT + 180))
+	for ((g = 0; g < GENERATORS; g++)); do
+		metrics=""
+		[ "$OBSERVE" != 1 ] || metrics="--metrics $(gen_metrics_addr "$g")"
+		run_bounded "$bound" on_gen "$g" "mkdir -p \$H/steps/$hid && cd \$H && { ulimit -n 262144 2>/dev/null || ulimit -n \$(ulimit -Hn); } 2>/dev/null; ./mqtt-load ${args[*]@Q} \
+			--topic-prefix rig2/$hid/g$g --client-prefix r2-$hid-g$g --out steps/$hid/gen.json $metrics \
+			2>steps/$hid/gen.stderr; echo \$? >steps/$hid/gen.exit" &
+		pids+=($!)
+	done
+	for pid in "${pids[@]}"; do wait "$pid" || warn "a generator session ended with $? (its exit code is in gen-*.exit)"; done
+	for ((g = 0; g < GENERATORS; g++)); do
+		get_gen "$g" "steps/$hid/gen.json" "$dir/gen-$g.json" || warn "generator $g left no summary"
+		get_gen "$g" "steps/$hid/gen.stderr" "$dir/gen-$g.stderr" || true
+		get_gen "$g" "steps/$hid/gen.exit" "$dir/gen-$g.exit" || true
+	done
+}
+
+prime_ladder() { # prime_ladder <ladder-dir>: unmeasured load at the start rate before the first step
+	local ladder="$1" per_gen
+	[ "${PRIME_SECS%.*}" -gt "$WINDOW" ] 2>/dev/null || return 0
+	mkdir -p "$ladder/prime"
+	# The same full settle as before a first step: the prime must not start on residue
+	# either (a prime started on a cluster seconds old was refused with 0x88 locally).
+	await_idle "$ladder/prime" "$SETTLE_BUDGET_LONG" "$SETTLE_QUIET_LONG" >"$ladder/prime/idle_before.json"
+	per_gen=$(python3 -c "print(f'{$START_RATE / $GENERATORS:.3f}')")
+	say "[$WORKLOAD] priming: ${PRIME_SECS}s at $START_RATE msg/s, not measured"
+	phase running "$WORKLOAD priming: $START_RATE msg/s"
+	launch_gens "$ladder/prime" "$ARM-$WORKLOAD-prime" "$per_gen" $((PRIME_SECS - WINDOW)) "$WINDOW"
+}
+
+run_step() { # run_step <ladder-dir> <index> <rate> <why the ramp chose it>
+	local ladder="$1" idx="$2" rate="$3" why="$4" id hid step i per_gen idle attempt prev_v budget quiet
 	attempt=$(find "$ladder/steps" -maxdepth 1 \( -name "[0-9]*-$rate" -o -name "[0-9]*-$rate-a*" \) 2>/dev/null | wc -l | tr -d ' ')
 	attempt=$((attempt + 1))
 	id=$(printf '%02d-%s' "$idx" "$rate")
@@ -302,13 +382,22 @@ run_step() { # run_step <ladder-dir> <index> <rate>
 	# Unique on the hosts across arms and ladders: step ids repeat between workloads.
 	hid="$ARM-$WORKLOAD-$id"
 	mkdir -p "$step/scrapes"
-	idle=$(await_idle "$step")
+	# The full settle before a ladder's first step and after any step that was not carried.
+	prev_v=$(python3 - "$ladder" <<'PY'
+import json, sys
+from pathlib import Path
+vs = sorted(Path(sys.argv[1], "steps").glob("*/verdict.json"))
+print(json.loads(vs[-1].read_text())["verdict"] if vs else "none")
+PY
+)
+	if [ "$prev_v" = CARRIED ]; then budget=$RESET_BUDGET quiet=$SETTLE_QUIET; else budget=$SETTLE_BUDGET_LONG quiet=$SETTLE_QUIET_LONG; fi
+	idle=$(await_idle "$step" "$budget" "$quiet")
 	per_gen=$(python3 -c "print(f'{$rate / $GENERATORS:.3f}')")
 	python3 - "$step/step.json" <<PY
 import json, sys
 json.dump({"index": $idx, "id": "$id", "rate": float($rate), "attempt": $attempt, "generators": $GENERATORS,
            "per_generator_rate": float($per_gen), "workload": "$WORKLOAD", "arm": "$ARM",
-           "idle_before": json.loads(r"""$idle"""),
+           "idle_before": json.loads(r"""$idle"""), "after": "$prev_v", "ramp_reason": r"""$why""",
            "judge": {"margin_s": $MARGIN_S, "latency_gate": "$LATENCY_GATE", "idle_floor": $IDLE_FLOOR}},
           open(sys.argv[1], "w"), indent=2)
 PY
@@ -319,21 +408,7 @@ PY
 			--out \$H/steps/$hid/scrapes --interval $SCRAPE_INTERVAL --max-secs 1800 >/dev/null 2>&1 </dev/null & echo \$! >\$H/steps/$hid/scrape.pid"
 	done
 	sleep "$SCRAPE_INTERVAL"
-	local -a args=(--broker "$ENDPOINTS" --rate "$per_gen" --qos "$QOS" --payload "$PAYLOAD"
-		--topics "$TOPICS" --shape "$SHAPE" --consumers "$CONSUMERS_N" --groups "$SHARE_GROUPS"
-		--sessions "$SESSIONS" --rate-per-publisher "$RATE_PER_PUBLISHER" --inflight "$INFLIGHT"
-		--warmup "$WARMUP" --duration "$MEASURE" --window "$WINDOW" --drain-timeout "$DRAIN_TIMEOUT" --quiet)
-	[ "$SESSIONS" != durable ] || args+=(--session-expiry "$SESSION_EXPIRY")
-	bound=$((WARMUP + MEASURE + DRAIN_TIMEOUT + 180))
-	for ((g = 0; g < GENERATORS; g++)); do
-		metrics=""
-		[ "$OBSERVE" != 1 ] || metrics="--metrics $(gen_metrics_addr "$g")"
-		run_bounded "$bound" on_gen "$g" "mkdir -p \$H/steps/$hid && cd \$H && { ulimit -n 262144 2>/dev/null || ulimit -n \$(ulimit -Hn); } 2>/dev/null; ./mqtt-load ${args[*]@Q} \
-			--topic-prefix rig2/$hid/g$g --client-prefix r2-$hid-g$g --out steps/$hid/gen.json $metrics \
-			2>steps/$hid/gen.stderr; echo \$? >steps/$hid/gen.exit" &
-		pids+=($!)
-	done
-	for pid in "${pids[@]}"; do wait "$pid" || warn "a generator session ended with $? (its exit code is in gen-*.exit)"; done
+	launch_gens "$step" "$hid" "$per_gen" "$WARMUP" "$MEASURE"
 	sleep "$SCRAPE_INTERVAL"
 	for ((i = 0; i < BROKERS; i++)); do
 		on_broker "$i" "kill \$(cat \$H/steps/$hid/scrape.pid) 2>/dev/null; true"
@@ -341,11 +416,6 @@ PY
 	sleep 1
 	for ((i = 0; i < BROKERS; i++)); do
 		get_broker "$i" "steps/$hid/scrapes" "$step/scrapes/broker-$i" || warn "could not fetch broker $i's scrapes"
-	done
-	for ((g = 0; g < GENERATORS; g++)); do
-		get_gen "$g" "steps/$hid/gen.json" "$step/gen-$g.json" || warn "generator $g left no summary"
-		get_gen "$g" "steps/$hid/gen.stderr" "$step/gen-$g.stderr" || true
-		get_gen "$g" "steps/$hid/gen.exit" "$step/gen-$g.exit" || true
 	done
 	python3 "$RIG2/verdict.py" judge "$step" | while IFS= read -r line; do say "  $line"; done
 }
@@ -363,23 +433,36 @@ import json, sys
 json.dump({"workload": "$WORKLOAD", "arm": "$ARM", "binary": """$BINARY_DESC""",
            "ramp": {"start_rate": $START_RATE, "factor": $FACTOR, "gap_pct": $GAP_PCT, "granularity": $GRANULARITY,
                     "min_rate": $MIN_RATE, "max_rate": $MAX_RATE, "void_retries": $VOID_RETRIES,
-                    "bisect_on_fail": bool($BISECT_ON_FAIL), "latency_gate": "$LATENCY_GATE"},
+                    "bisect_on_fail": bool($BISECT_ON_FAIL), "latency_gate": "$LATENCY_GATE",
+                    "retry_p99_ms": $RETRY_P99_MS, "retry_max": $RETRY_MAX},
            "mqtt_load": {"qos": $QOS, "shape": "$SHAPE", "sessions": "$SESSIONS", "session_expiry_s": $SESSION_EXPIRY,
                          "payload": $PAYLOAD, "topics_per_generator": $TOPICS, "consumers": $CONSUMERS_N,
                          "groups": $SHARE_GROUPS, "rate_per_publisher": $RATE_PER_PUBLISHER, "inflight": $INFLIGHT,
-                         "warmup_s": $WARMUP, "measure_s": $MEASURE, "window_s": $WINDOW, "drain_timeout_s": $DRAIN_TIMEOUT}},
+                         "warmup_s": $WARMUP, "measure_s": $MEASURE, "window_s": $WINDOW, "drain_timeout_s": $DRAIN_TIMEOUT,
+                         "drain_quiet_s": $DRAIN_QUIET, "drain_quiet_factor": $DRAIN_QUIET_FACTOR, "prime_s": $PRIME_SECS}},
           open(sys.argv[1], "w"), indent=2)
 PY
 	say "════ ladder: $WORKLOAD (start $START_RATE msg/s, x$FACTOR, bisect to $GAP_PCT%) ════"
+	prime_ladder "$ladder"
 	while [ "$idx" -lt "$MAX_STEPS" ]; do
 		rate=$(python3 "$RIG2/verdict.py" next "$ladder" 2>"$ladder/next.log")
 		say "  next: $(cat "$ladder/next.log")"
 		[ -n "$rate" ] || break
 		idx=$((idx + 1))
-		run_step "$ladder" "$idx" "$rate"
+		run_step "$ladder" "$idx" "$rate" "$(cat "$ladder/next.log")"
 	done
 	[ "$idx" -lt "$MAX_STEPS" ] || warn "[$WORKLOAD] stopped at MAX_STEPS=$MAX_STEPS"
 }
+
+# The run's baseline: what the fresh cluster holds before any step (normally no sessions).
+# Every settle waits for the session count to be back to it.
+mkdir -p "$RUN/baseline"
+BASELINE_SESSIONS=0
+if scrape_once_all "$RUN/baseline"; then
+	python3 "$RIG2/verdict.py" idle "$RUN/baseline"/broker-*.prom >"$RUN/baseline/state.json" || true
+	BASELINE_SESSIONS=$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["mqttd_sessions"]))' "$RUN/baseline/state.json" 2>/dev/null || echo 0)
+fi
+say "baseline: $BASELINE_SESSIONS session(s) on the fresh cluster"
 
 for w in $WORKLOADS; do
 	(run_ladder "$w")

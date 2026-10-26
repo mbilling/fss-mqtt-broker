@@ -126,9 +126,15 @@ struct Cli {
     #[arg(long, default_value_t = 30.0)]
     drain_timeout: f64,
 
-    /// The drain also ends after this many seconds with nothing acked or delivered.
+    /// The drain also ends after this many seconds with nothing acked or delivered
+    /// (the floor of the quiet window).
     #[arg(long, default_value_t = 5.0)]
     drain_quiet: f64,
+
+    /// The quiet window grows to this many times the slowest measured window's ack or
+    /// end-to-end p99, capped by --drain-timeout; 0 keeps --drain-quiet alone.
+    #[arg(long, default_value_t = 2.0)]
+    drain_quiet_factor: f64,
 
     /// List up to this many missing identities (stream, publisher, seq) in the
     /// summary's missing_sample.
@@ -238,6 +244,7 @@ fn config(cli: Cli, threads: usize) -> Result<(Config, Option<PathBuf>), String>
     c.password = cli.password;
     c.drain_timeout_ns = secs_ns(cli.drain_timeout)?;
     c.drain_quiet_ns = secs_ns(cli.drain_quiet)?;
+    c.drain_quiet_factor = cli.drain_quiet_factor;
     c.report_missing = cli.report_missing;
     c.connect_concurrency = cli.connect_concurrency;
     c.connect_timeout_ns = secs_ns(cli.connect_timeout)?;

@@ -9,9 +9,10 @@ verdict.py report calls this too, so a re-rendered report always has its charts.
 x is the offered msg/s of every step, sorted; y is the gated p99 (ack; QoS 0:
 end-to-end) on a log scale, with the p50 lighter below it. The background carries the
 latency bands of ADR 0048 (2026-09-27): GREEN p99 <= 1 s, YELLOW <= 5 s, RED above.
-A CARRIED step (no loss, offer taken) is a filled point; a FAILED, OFFER NOT TAKEN or
-DISCONNECTED step a hollow red ring; a VOID step (the harness's fault) a dashed grey
-ring. The maximum lossless step is labelled. The palette and card are
+A CARRIED step (no loss, offer taken) is a filled point; a FAILED, OFFER NOT TAKEN,
+DISCONNECTED or NOT DRAINED step a hollow red ring; a VOID step (the harness's fault) and
+a bad step whose retry carried ("retried: transient") a dashed grey ring. The maximum
+lossless step is labelled. The palette and card are
 bench/scale/chart_style.py's, shared with the README charts.
 """
 from __future__ import annotations
@@ -30,6 +31,11 @@ X0, X1 = 92.0, 928.0     # plot area
 Y0, Y1 = 104.0, 462.0
 CARRIED, VOID = "CARRIED", "VOID"
 WORKLOAD_NAME = {"durable-qos1": "Durable QoS 1", "clean-qos1": "Clean QoS 1", "qos0": "QoS 0"}
+
+
+def transient(s: dict) -> bool:
+    """A bad step whose retry carried (verdict.py retry_marks): it does not count."""
+    return (s.get("retry") or {}).get("mark") == "transient"
 
 
 def fmt_lat(us: float | None) -> str:
@@ -145,7 +151,8 @@ def render(ladder: dict, run: dict) -> str:
     for s in steps:
         g = gated(s, gate)
         cx = x(s["offered_rate"])
-        tip = (f"step {s['step']}: {s['offered_rate']:,.0f} msg/s offered, {s['verdict']}; "
+        tip = (f"step {s['step']}: {s['offered_rate']:,.0f} msg/s offered, {s['verdict']}"
+               f"{' (retried: transient)' if transient(s) else ''}; "
                f"{label} p50 {fmt_lat(g['p50_us'])}, p99 {fmt_lat(g['p99_us'])}")
         for key, r, op in (("p50_us", 3.5, 0.45), ("p99_us", 5, 1.0)):
             cy = y(g[key]) if g[key] is not None else None
@@ -154,7 +161,7 @@ def render(ladder: dict, run: dict) -> str:
             if s["verdict"] == CARRIED:
                 mark = (f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r}" class="f-s1 k-surface" stroke-width="2"'
                         f'{"" if op == 1 else f" fill-opacity={chr(34)}{op}{chr(34)}"}>')
-            elif s["verdict"] == VOID:
+            elif s["verdict"] == VOID or transient(s):
                 mark = (f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r}" fill="none" class="k-ghost" '
                         f'stroke-width="1.5" stroke-dasharray="2 2">')
             else:
@@ -187,11 +194,13 @@ def render(ladder: dict, run: dict) -> str:
         (f'<circle cx="{lx + 6:.1f}" cy="{ly - 4:.1f}" r="5" class="f-s1"/>', f"carried: {label} p99"),
         (f'<circle cx="{0:.1f}" cy="{ly - 4:.1f}" r="3.5" class="f-s1" fill-opacity="0.45"/>', f"{label} p50"),
         (f'<circle cx="{0:.1f}" cy="{ly - 4:.1f}" r="5" fill="none" class="k-crit" stroke-width="2"/>',
-         "failed, offer not taken or disconnected"),
+         "not carried"),
     ]
-    if any(s["verdict"] == VOID for s in steps):
+    if any(s["verdict"] == VOID or transient(s) for s in steps):
+        what = " / ".join(w for w, on in (("void (rerun)", any(s["verdict"] == VOID for s in steps)),
+                                          ("retried: transient", any(transient(s) for s in steps))) if on)
         entries.append((f'<circle cx="{0:.1f}" cy="{ly - 4:.1f}" r="5" fill="none" class="k-ghost" '
-                        'stroke-width="1.5" stroke-dasharray="2 2"/>', "void (rerun)"))
+                        'stroke-width="1.5" stroke-dasharray="2 2"/>', what))
     for mark, txt in entries:
         mark = mark.replace(f'cx="{0:.1f}"', f'cx="{lx + 6:.1f}"')
         out.append(mark)

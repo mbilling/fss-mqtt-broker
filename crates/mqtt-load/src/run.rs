@@ -588,7 +588,16 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
     }
 
     // Drain: until nothing is in flight and every expected delivery has arrived, or
-    // nothing moved for the quiet period, or the timeout.
+    // nothing moved for the quiet window, or the timeout. The quiet window scales with
+    // the slowest measured p99: after a step whose deliveries ran seconds behind, a few
+    // seconds of silence do not mean the brokers hold nothing more for us.
+    let slowest_p99_us = windows
+        .iter()
+        .filter(|w| w.kind == WindowKind::Measure)
+        .map(|w| w.agg.ack_latency.p99_us.max(w.agg.e2e_latency.p99_us))
+        .max()
+        .unwrap_or(0);
+    let quiet_ns = cfg.drain_quiet_window_ns(slowest_p99_us);
     let drain_start = sched.end_ns();
     let mut cur = Histos::default();
     let mut last_tick = now_ns();
@@ -608,7 +617,7 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
             .last_progress_ns
             .load(Ordering::Relaxed)
             .max(drain_start);
-        if writers_done && now.saturating_sub(last) >= cfg.drain_quiet_ns {
+        if writers_done && now.saturating_sub(last) >= quiet_ns {
             break "quiet";
         }
         if now.saturating_sub(drain_start) >= cfg.drain_timeout_ns {
@@ -620,6 +629,20 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
         }
     };
     let drain_end = now_ns();
+    let outstanding_deliveries = ctx
+        .expected_deliveries()
+        .saturating_sub(ctx.unique_deliveries());
+    let outstanding_acks: u64 = col
+        .pubs
+        .iter()
+        .filter(|p| !p.is_closed())
+        .map(|p| p.outstanding() as u64)
+        .sum();
+    let since_progress_ns = drain_end.saturating_sub(
+        ctx.last_progress_ns
+            .load(Ordering::Relaxed)
+            .max(drain_start),
+    );
     let c = col.tick(&mut cur, num_phases - 1, 0.0, false);
     let drain_pw = PlannedWindow {
         phase: num_phases - 1,
@@ -647,8 +670,11 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
         }
         p.reader.abort();
     }
+    // One deadline for all of them: a consumer whose broker stopped reading its socket
+    // cannot hold the exit for 5 s each (60 stuck consumers were 5 minutes).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     for t in consumer_tasks {
-        let _ = tokio::time::timeout(Duration::from_secs(5), t).await;
+        let _ = tokio::time::timeout_at(deadline, t).await;
     }
 
     let phases: Vec<PhaseReport> = (0..num_phases)
@@ -753,6 +779,10 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
         drain: DrainReport {
             duration_s: (drain_end.saturating_sub(drain_start)) as f64 / NS,
             ended_by,
+            quiet_s: quiet_ns as f64 / NS,
+            outstanding_deliveries,
+            outstanding_acks,
+            since_progress_s: since_progress_ns as f64 / NS,
         },
         ledger,
         missing_sample,

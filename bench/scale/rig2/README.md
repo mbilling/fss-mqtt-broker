@@ -51,14 +51,14 @@ old rig. `KEEP_INFRA=1` skips the teardown and says so; destroy later with
 `bench/scale/teardown.sh`. The runner refuses to apply while `../terraform`'s state still
 tracks servers (another run, or a leak).
 
-Expected duration and price (estimate: about 9 steps per ladder at about 125 s each,
-10 to 14 minutes of bring-up, 3 of teardown; the real step count depends on where the
-knee is):
+Expected duration and price (estimate: about 9 steps per ladder at about 135 s each plus
+the priming run, 10 to 14 minutes of bring-up, 3 of teardown; the real step count
+depends on where the knee is, on transient retries and on how long the settles take):
 
 | tier | one workload | three workloads |
 |---|---|---|
-| n3 | ~32 min, EUR 0.42 prorated (EUR 0.79 per started hour) | ~69 min, EUR 0.92 (EUR 1.59) |
-| n10 | ~36 min, EUR 1.52 prorated (EUR 2.55 per started hour) | ~73 min, EUR 3.12 (EUR 5.11) |
+| n3 | ~36 min, EUR 0.47 prorated (EUR 0.79 per started hour) | ~80 min, EUR 1.07 (EUR 1.59) |
+| n10 | ~40 min, EUR 1.68 prorated (EUR 2.55 per started hour) | ~84 min, EUR 3.60 (EUR 5.11) |
 
 ### Live Grafana (OBSERVE, on by default)
 
@@ -139,20 +139,55 @@ Each generator process publishes under its own topic prefix
 process and one clock. Publishers send 50 msg/s each (QoS 0: 100) with 128 messages in
 flight, which holds the offer through 2.56 s of ack latency, past the 1 s band.
 
+## A ladder
+
+Before its first step, a ladder **primes** the cluster: `PRIME_SECS` (90 s on n3 and n10,
+0 locally) of load at the start rate in its own mqtt-load process, kept in
+`<ladder>/prime/` and never judged, then the full settle. Run 2 (2026-10-26) showed the
+first steps' latency excursions 70 to 80 s into the step (durable 10,000: ack p99 14 ms
+against 2.2 ms on the next step, all of it in the last measured window; clean 30,000:
+148 ms), so a longer warm-up inside the step would have measured them, and a separate
+run keeps them out.
+
 ## A step
 
-1. **Idle check.** Every broker is scraped once. The step starts when the cluster holds no
-   connections, no sessions, no pending publish, and no placement group under-replicated
-   (`mqttd_replication_min_actual < mqttd_replication_desired`), within `RESET_BUDGET`
-   (120 s). Otherwise the step is VOID (unreset). mqtt-load ends its durable sessions with
-   session expiry 0, so a clean step leaves nothing behind.
+1. **The settle.** Every broker is scraped every 5 s (`verdict.py idle`). The step starts
+   when the cluster holds no connections (`IDLE_FLOOR`), its session count is back to the
+   run's baseline (scraped on the fresh cluster before the first ladder; mqtt-load ends its
+   durable sessions with expiry 0, so a clean step leaves none), and nothing is in the
+   brokers' pipes: `mqttd_pending_publishes`, `_pending_publishes_awaiting_settle`,
+   `_publish_held_for_unreachable`, `_append_lane_jobs`, `_inflight_messages`,
+   `_backlog_bytes` and `_peer_forwards_in_flight` all 0, `mqttd_hub_queue_depth` at most
+   8; no placement group under-replicated (`mqttd_replication_min_actual < _desired`), no
+   routing view unsettled (`mqttd_routing_unsettled`), and the replication lag
+   (`mqttd_replica_groups_tracked - _current`) not moving (a lag that stands still between
+   two scrapes is recorded, not waited for: a local cluster held 72 groups behind at idle
+   for minutes). Then it must stay so for a quiet period with the traffic and durable-writer
+   counters (`mqttd_publish_received_total`, `_delivered_total`, `_forwarded_total`,
+   `mqttd_durable_writer_ops_total`) standing still: `SETTLE_QUIET` (10 s) within
+   `RESET_BUDGET` (120 s) after a carried step; `SETTLE_QUIET_LONG` (30 s) within
+   `SETTLE_BUDGET_LONG` (300 s) before a ladder's first step and after any step that was
+   not carried. Otherwise the step runs but is VOID (unreset), and `step.json`'s
+   `idle_before.state.why_not` and the verdict say what had not settled. These are the
+   lane E rig's UNRESET gauges (connections, sessions) and the residue its `run-curve.sh`
+   compared against a baseline, plus the pipes. In run 2 every step started with all of
+   them idle: the excursions of clean-qos1's first steps were not visible on any broker
+   gauge.
 2. **Broker scrapes.** `scrape-loop.py` starts on every broker host and scrapes
    `/metrics` every `SCRAPE_INTERVAL` (2 s) on the broker's own clock for the whole step.
 3. **Load.** One mqtt-load process per generator host, started together, each offering
    `rate / GENERATORS` msg/s: `WARMUP` (20 s) of warm-up, then `MEASURE` (60 s) measured in
-   `WINDOW` (10 s) windows, then the drain (at most `DRAIN_TIMEOUT`, 30 s). Each step has its
-   own process, so each has its own ledger.
-4. **Judgment** (`verdict.py judge`). The brokers' window is the overlap of every
+   `WINDOW` (10 s) windows, then the drain. Each step has its own process, so each has its
+   own ledger.
+4. **The drain** ends when every expected delivery and ack is in (`complete`), after a
+   quiet window with nothing arriving (`quiet`), or at `DRAIN_TIMEOUT` (120 s, `timeout`).
+   The quiet window is `DRAIN_QUIET` (10 s) or `DRAIN_QUIET_FACTOR` (2) times the slowest
+   measured window's ack or end-to-end p99, whichever is longer (mqtt-load
+   `--drain-quiet-factor`): run 2's clean-qos1 152,000 step, its deliveries 17.9 s behind,
+   was cut off after 5 s of silence. The summary's `drain` says how it ended, the quiet
+   window it applied, and what was still owed (`outstanding_deliveries`,
+   `outstanding_acks`).
+5. **Judgment** (`verdict.py judge`). The brokers' window is the overlap of every
    generator's measured span (on the wall clock, from the summary's
    `schedule_start_unix_ms`). For each broker, the first and last scrape inside it (less
    `MARGIN_S` at each edge) give its received and delivered msg/s. Drops are read over the
@@ -160,8 +195,9 @@ flight, which holds the offer through 2.56 s of ack latency, past the 1 s band.
 
 Raw evidence per step: `<run>/<arm>/<workload>/steps/<NN>-<rate>/` holds `step.json`,
 `gen-<g>.json` (the mqtt-load summary, schema `mqtt-load.summary.v2`), `.stderr`,
-`.exit`, `pre/` (the idle scrapes), `scrapes/broker-<i>/<unix_ms>.prom`, and
-`verdict.json`.
+`.exit`, `pre/` (the last settle scrapes and their state), `scrapes/broker-<i>/<unix_ms>.prom`,
+and `verdict.json`. A retried step has its own directory, `<NN>-<rate>-a2`, beside the
+first attempt's.
 
 ## The verdict
 
@@ -172,11 +208,22 @@ Judged on the broker only (ADR 0090 D1). In order:
 | **FAILED** | a generator's ledger did not close (missing, unexpected, unacked), a broker dropped a message by a reason that is loss (`mqttd_publish_dropped_total`, see below), or a broker restarted | stops the ladder (`BISECT_ON_FAIL=1` keeps bisecting below it) |
 | **VOID** | a generator saturated in a measured window, a generator left no summary, the generators' windows overlap less than 90%, the scrapes do not cover the window, or the cluster was not idle | rerun (`VOID_RETRIES`, 1); never counted against the broker |
 | **DISCONNECTED** | connections were lost during the step. mqtt-load does not reconnect, so its ledger cannot be read after that | not carried; the ramp treats it as above the knee |
+| **NOT DRAINED** | the ledger misses deliveries, no broker dropped any as loss, the drain ended before it was complete, and the brokers' own gauges at their first scrape after the drain (`mqttd_inflight_messages` + `mqttd_pending_publishes`) hold at least what the ledger misses: the messages were still queued, not lost | not carried, not loss; above the knee |
 | **OFFER NOT TAKEN** | the brokers received less than 99% of the offered msg/s (`OFFER_TAKEN` from `../summarize-curve.py`) | above the knee |
 | **CARRIED** | none of the above | at or below the knee, whatever its latency |
 
 A broker drop that is loss fails a step even when the generator's ledger closes. A VOID
 ledger loss (the generator saturated) is not counted.
+
+**The missing count, reconciled.** When a drain ended before it was complete, the verdict
+(`drain` in `verdict.json`, a note in the report) splits the ledger's missing count:
+broker loss drops + still queued on the brokers at the cut-off (their unacked deliveries
+and pending publishes, at most the rest) + unexplained (no drop counter and no broker
+queue accounts for it). Run 2's clean-qos1 152,000: missing 7,511,964 = loss drops
+5,933,730 (`backlog-overflow`) + 1,578,234 still queued (the brokers held 3,080,145 unacked
+deliveries and 230 MB of backlog after the drain, and still did when mqtt-load exited
+200 s later: those consumers' deliveries had stopped). FAILED either way; the loss column
+shows both.
 
 **Which drops are loss.** `verdict.py`'s `DROP_IS_LOSS` classifies every reason the broker
 documents or increments (`crates/mqtt-observability/src/metrics.rs`, the call sites in
@@ -203,10 +250,25 @@ Below it, the highest CARRIED step with **ack p99 ≤ 1 s**, ≤ 250 ms and ≤ 
 
 The first step is the workload's `START_RATE_<tier>`. Coarse steps multiply by `FACTOR`
 (1.5) on every CARRIED step, whatever its latency, until the first FAILED, OFFER NOT
-TAKEN or DISCONNECTED step. Then the ramp bisects between the last carried and that
+TAKEN, DISCONNECTED or NOT DRAINED step. Then the ramp bisects between the last carried and that
 step until their gap is at most `GAP_PCT` (3%) of the carried one. A VOID step is rerun. Rates are rounded to `GRANULARITY` (100 msg/s). A step that is not carried at the
 first rate steps down by the factor instead. `MAX_STEPS` (14; local 3) and `MAX_RATE`
 bound a ladder.
+
+**Transient retries.** One bad step must not cap a ladder when nothing below it pointed at
+the knee. A FAILED, OFFER NOT TAKEN, DISCONNECTED or NOT DRAINED step whose nearest carried
+step below it had its gated p99 (ack; QoS 0: end-to-end) under `RETRY_P99_MS` (50 ms) is
+rerun once at the same rate, after the full settle. Only a second bad attempt counts; a
+retry that carries makes the ladder climb on, and the first attempt is reported
+"retried: transient" (and drawn as a dashed grey ring). A retry is never retried, and a
+ladder retries at most `RETRY_MAX` (2) times, so a real cliff cannot loop. Why 50 ms: on
+these hosts a flat, healthy step's p99 is 1 to 4 ms (durable and clean QoS 1, QoS 0
+end-to-end below 75,000 msg/s); every carried step that preceded a real knee in runs 1
+and 2 had already risen past it (durable 76,100: 66 ms, clean 101,300: 638 ms) or close to
+it (QoS 0 112,500: 30 to 41 ms, retried and decided by the retry); 50 ms is half the
+lowest reported band. Run 2's durable-qos1 had 32,400 and 33,100 carried at ack p99
+1.7 to 1.8 ms, and 33,800 FAILED (290 `append-backlog-full`, 41 publisher disconnects) above
+22,500 at 1.5 ms, where run 1 carried up to 90,500: under this rule 33,800 is retried.
 
 ## Output
 
