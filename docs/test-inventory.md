@@ -2704,6 +2704,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `an_rss_over_the_watermark_browns_out_and_refuses_new_sessions`
 - `without_a_watermark_the_same_broker_accepts_sessions`
 
+## `crates/mqttd/tests/outbound_batch.rs` — 1 test(s)
+
+- `a_subscriber_behind_by_more_than_a_write_batch_gets_every_acked_qos1_message`
+
 ## `crates/mqttd/tests/password_cli.rs` — 3 test(s)
 
 - `a_cli_generated_line_authenticates_against_the_running_broker`
