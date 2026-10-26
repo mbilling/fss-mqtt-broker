@@ -1692,6 +1692,19 @@ requires = ["python3"]
 duration = "~1s"
 
 [[task]]
+id = "rig2-chart"
+group = "Benchmark"
+name = "Draw a rig2 run's latency charts from its report.json"
+script = "bench/scale/rig2/chart-ramp.py"
+about = """
+`chart-ramp.py <run-dir>` writes report-<workload>.svg per ladder: offered msg/s against
+ack p99/p50 (QoS 0: end-to-end) on a log scale over the GREEN/YELLOW/RED bands, the
+maximum lossless step labelled. verdict.py report calls it; `--self-test` checks it.
+"""
+requires = ["python3"]
+duration = "~1s"
+
+[[task]]
 id = "rig2-verdict-tests"
 group = "Benchmark"
 name = "Offline tests of the rig2 verdicts and histogram merge"

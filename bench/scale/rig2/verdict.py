@@ -9,9 +9,12 @@
 
 Everything is judged from the broker's side (D1):
 
-- **FAILED**: something was lost. A broker dropped a message (`mqttd_publish_dropped_total`
-  moved, by any reason), a broker restarted, or a generator's identity ledger did not
-  close (missing, unexpected, unacked). Loss stops the ladder.
+- **FAILED**: something was lost. A generator's identity ledger did not close (missing,
+  unexpected, unacked) — the primary judge — or a broker dropped a message by a reason
+  DROP_IS_LOSS classifies as loss (`mqttd_publish_dropped_total`; an unclassified
+  reason is loss), or a broker restarted. A drop that is not loss (an already-acked
+  entry leaving the settle-replay window, a withheld ack) is a note. Loss stops the
+  ladder.
 - **VOID**: the evidence is the harness's, not the broker's. A generator saturated in its
   measured window (mqtt-load `generator.saturated`), a generator produced no summary, the
   generators' measured windows do not overlap, the brokers' scrapes do not cover the
@@ -26,14 +29,16 @@ Everything is judged from the broker's side (D1):
 - **CARRIED**: none of the above. Latency is then the merge of every generator's HDR
   histogram (bucket-wise, exact), never an average of percentiles.
 
-Capacity is the highest CARRIED step whose ack p99 is at most 1 s (the headline), and the
-same at 250 ms and 100 ms. A QoS 0 workload has no acks; its bands apply to the end-to-end
-p99 (the workload's LATENCY_GATE says which).
+The headline is the **maximum lossless** msg/s: the highest CARRIED step, whatever its
+latency, reported with its ack and end-to-end p99. Below it, the highest CARRIED step
+whose ack p99 is at most 1 s, 250 ms and 100 ms. A QoS 0 workload has no acks; its bands
+apply to the end-to-end p99 (the workload's LATENCY_GATE says which).
 
-The ramp (D4) climbs by a factor until the first step that is not carried within 1 s,
-then bisects between the last good and the first bad step until their gap is at most
-GAP_PCT percent of the good one. It stops at a FAILED step, after a step stays VOID
-through its retries, or at the ladder's ceiling.
+The ramp (D4) climbs by a factor on every CARRIED step — a lossless step at ack p99 2 s
+still climbs — until the first FAILED, OFFER NOT TAKEN or DISCONNECTED step, then bisects
+between the last CARRIED and that step until their gap is at most GAP_PCT percent of the
+carried one. VOID steps are rerun. It stops at a FAILED step (unless bisect_on_fail),
+after a step stays VOID through its retries, or at the ladder's ceiling.
 """
 from __future__ import annotations
 
@@ -66,7 +71,6 @@ OFFER_TAKEN = _load("summarize_curve", SCALE / "summarize-curve.py").OFFER_TAKEN
 SCHEMA_REPORT = "mqtt-rig2.report.v1"
 SCHEMAS_ACCEPTED = ("mqtt-load.summary.v2",)
 BANDS_MS = (1000, 250, 100)
-HEADLINE_MS = 1000
 QUANTILES = {"p50": 0.5, "p99": 0.99, "p999": 0.999}
 
 # Hetzner hourly prices (EUR, excl. VAT) for the server types the tiers use. Unknown
@@ -78,6 +82,47 @@ TIERS = {
 }
 
 CARRIED, FAILED, VOID, NOT_TAKEN, DISCONNECTED = "CARRIED", "FAILED", "VOID", "OFFER NOT TAKEN", "DISCONNECTED"
+
+# Every `mqttd_publish_dropped_total{reason}` the broker can report, classified ONCE: is
+# it the loss of a message the broker took and still owed to a subscriber that exists
+# (LOSS, fails the step), or not (counted, reported as a note, never a failure)? Read
+# from the reason table in crates/mqtt-observability/src/metrics.rs (`publish_dropped`)
+# and each increment site in crates/mqttd/src. A reason missing here is LOSS: a new
+# drop reason fails steps until someone reads its site and classifies it. The identity
+# ledger stays the primary loss judge either way; this table only decides whether a
+# broker counter fails a step whose ledger closed.
+DROP_IS_LOSS = {
+    # A QoS 0 or ungated message shed before every subscriber got it.
+    "outbound-full": True,           # hub/delivery.rs: QoS 0 shed at a stalled subscriber's outbound cap
+    "hub-ingress": True,             # conn.rs, rules.rs, hub/mod.rs: QoS 0 shed under shed-qos0 overload
+    "peer-backlog": True,            # hub/forwarding.rs, hub/mod.rs: QoS 0 forward shed at a backlogged peer link
+    "peer-unreachable": True,        # hub/forwarding.rs: ungated forward not sent to an interested peer with no link
+    "no-shared-member": True,        # hub/delivery.rs, hub/mod.rs: a $share group none of whose members was reachable
+    "too-large": True,               # conn.rs: over that subscriber's Maximum Packet Size (per spec, still not delivered)
+    # A message the broker had stored or acknowledged, gone for its subscriber.
+    "queue-overflow": True,          # hub/lanes.rs: durable session queue at its cap (evict-oldest / reject-newest)
+    "backlog-overflow": True,        # hub/delivery.rs, hub/lanes.rs: already-acked backlog entries truncated
+    "append-backlog-full": True,     # hub/lanes.rs, hub/delivery.rs: append lane full; withheld when answerable, a genuine drop otherwise
+    "brownout": True,                # hub/lanes.rs: a durable copy lost above the watermark that nobody was told about
+    "relaxed-post-verdict-append": True,  # hub/lanes.rs: a relaxed forward's durable copy did not land after its early verdict
+    "retained-replay-read-failed": True,  # hub/mod.rs: a new subscriber's retained replay skipped on a store error
+    # Not the loss of an owed message for an existing subscriber.
+    "pending-cap-replay": False,     # hub/forwarding.rs: an ALREADY-ACKED entry evicted from the settle-replay window; only a
+                                     # session materialised during that window misses it (issue #613 item 2.1)
+    "settle-replay": False,          # hub/forwarding.rs: the same replay abandoned for an already-acked publish
+    "settle-replay-refused": False,  # hub/forwarding.rs: the same replay refused (brownout) for an already-acked publish
+    "pending-cap": False,            # hub/forwarding.rs: an UNACKED publish evicted, ack withheld; the publisher still owns
+                                     # it (the ledger counts it unacked if it is never answered)
+    "outbound-id-write-failed": False,  # hub/lanes.rs: a QoS 2 delivery deferred, already durable, back to the backlog front
+    "retained-replay-client-offline": False,  # hub/mod.rs: retained replay for an offline subscriber; the value stays stored
+    "reserved": False,               # hub/mod.rs: a publish into $SYS/ reaching the hub (a bug guard); never acked
+    "no-subscriber": False,          # documented in metrics.rs; nothing matched, so no subscriber exists
+}
+
+
+def drop_is_loss(reason: str) -> bool:
+    """Whether a drop reason fails a step: DROP_IS_LOSS, and LOSS for any reason not in it."""
+    return DROP_IS_LOSS.get(reason, True)
 
 
 # ── histograms ──────────────────────────────────────────────────────────────────────
@@ -148,7 +193,7 @@ def broker_figures(step: Path, lo_ms: float, hi_ms: float, margin_ms: float, min
     root = step / "scrapes"
     brokers = sorted((p for p in root.glob("broker-*") if p.is_dir()), key=lambda p: int(p.name.split("-")[1]))
     res = {"brokers": [], "received_rate": 0.0, "delivered_rate": 0.0, "dropped": 0.0, "dropped_by_reason": {},
-           "restarted": [], "problems": []}
+           "lost": 0.0, "lost_by_reason": {}, "not_lost_by_reason": {}, "restarted": [], "problems": []}
     if not brokers:
         res["problems"].append("no broker scrapes")
         return res
@@ -167,7 +212,10 @@ def broker_figures(step: Path, lo_ms: float, hi_ms: float, margin_ms: float, min
         drops = E.positive_deltas(first, last, E.DROPPED, "reason")
         for k, v in drops.items():
             res["dropped_by_reason"][k] = res["dropped_by_reason"].get(k, 0.0) + v
+            side = "lost_by_reason" if drop_is_loss(k) else "not_lost_by_reason"
+            res[side][k] = res[side].get(k, 0.0) + v
         res["dropped"] += sum(drops.values())
+        res["lost"] += sum(v for k, v in drops.items() if drop_is_loss(k))
         row["dropped"] = sum(drops.values())
         inside = [s for s in samples if lo_ms + margin_ms <= s[0] <= hi_ms - margin_ms]
         if len(inside) < 2 or inside[-1][0] - inside[0][0] < want:
@@ -292,9 +340,12 @@ def judge(step: Path, cfg: dict | None = None) -> dict:
             bf = broker_figures(step, lo, hi, margin_ms, min_cover)
             out["brokers"] = bf
             out["voids"].extend(f"broker evidence: {p}" for p in bf["problems"])
-            if bf["dropped"] > 0:
-                why = ", ".join(f"{k or '?'}={int(v)}" for k, v in sorted(bf["dropped_by_reason"].items()))
-                out["failures"].append(f"brokers dropped {int(bf['dropped'])} messages ({why})")
+            if bf["lost"] > 0:
+                why = ", ".join(f"{k or '?'}={int(v)}" for k, v in sorted(bf["lost_by_reason"].items()))
+                out["failures"].append(f"brokers dropped {int(bf['lost'])} messages ({why})")
+            if bf["not_lost_by_reason"]:
+                why = ", ".join(f"{k}={int(v)}" for k, v in sorted(bf["not_lost_by_reason"].items()))
+                out["notes"].append(f"broker drops that are not loss: {why}")
             if bf["restarted"]:
                 out["failures"].append(f"broker(s) {bf['restarted']} restarted during the step")
     for x in out["generators"]:
@@ -338,7 +389,9 @@ def judge(step: Path, cfg: dict | None = None) -> dict:
     else:
         verdict = CARRIED
     out["verdict"] = verdict
-    out["good"] = verdict == CARRIED and gate_p99 is not None and gate_p99 <= HEADLINE_MS * 1000
+    # Good for the ramp: carried, whatever its latency. A lossless step above 1 s is
+    # still a step the cluster carried; the latency bands are the report's business.
+    out["good"] = verdict == CARRIED
     return out
 
 
@@ -371,10 +424,13 @@ def next_rate(steps: list[dict], cfg: dict) -> tuple[float | None, str]:
         if same <= retries:
             return last["rate"], f"rerun of a VOID step ({same} of {retries + 1} attempts)"
         return None, f"VOID {same} times at {last['rate']:g} msg/s (more generator capacity needed)"
+    # Carried is good, whatever its latency (a lossless step at ack p99 2 s still climbs);
+    # FAILED, OFFER NOT TAKEN and DISCONNECTED are bad. The verdict decides, not the
+    # stored `good`, so a ladder judged before 2026-10-26 replays the same way.
     judged = [s for s in steps if s["verdict"] != VOID]
-    goods = [s["rate"] for s in judged if s["good"]]
+    goods = [s["rate"] for s in judged if s["verdict"] == CARRIED]
     lo = max(goods) if goods else None
-    bads = [s["rate"] for s in judged if not s["good"] and (lo is None or s["rate"] > lo)]
+    bads = [s["rate"] for s in judged if s["verdict"] != CARRIED and (lo is None or s["rate"] > lo)]
     hi = min(bads) if bads else None
     measured = {s["rate"] for s in judged}
     if lo is None and hi is None:
@@ -410,8 +466,15 @@ def ladder_steps(ladder: Path) -> list[dict]:
 
 
 def capacity(steps: list[dict]) -> dict:
-    out = {}
+    """`lossless`: the highest CARRIED step, whatever its latency, with its ack and
+    end-to-end p99. `p99_le_<band>ms`: the highest CARRIED step whose gated p99 (ack;
+    QoS 0: end-to-end) is within the band."""
     carried = [s for s in steps if s["verdict"] == CARRIED and s["gate_p99_us"] is not None]
+    top = max(carried, key=lambda s: s["rate"]) if carried else None
+    out: dict = {"lossless": None if top is None else {
+        "offered_rate": top["offered_rate"], "received_rate": top["received_rate"],
+        "gate_p99_us": top["gate_p99_us"], "ack_p99_us": top["ack_latency"]["p99_us"],
+        "e2e_p99_us": top["e2e_latency"]["p99_us"], "step": top["step"]}}
     for band in BANDS_MS:
         ok = [s for s in carried if s["gate_p99_us"] <= band * 1000]
         best = max(ok, key=lambda s: s["rate"]) if ok else None
@@ -458,7 +521,7 @@ def ladder_report(ladder: Path) -> dict:
     steps = ladder_steps(ladder)
     nxt, why = next_rate(steps, meta["ramp"]) if steps else (None, "no steps")
     return {"workload": meta["workload"], "arm": meta.get("arm", "A"), "latency_gate": meta["ramp"].get("latency_gate", "ack"),
-            "ramp": meta["ramp"], "steps": steps, "capacity": capacity(steps),
+            "ramp": meta["ramp"], "mqtt_load": meta.get("mqtt_load", {}), "steps": steps, "capacity": capacity(steps),
             "ended": why if nxt is None else f"incomplete (next would be {nxt:g} msg/s: {why})"}
 
 
@@ -466,24 +529,29 @@ def render_ladder_md(r: dict) -> list[str]:
     gate = r["latency_gate"]
     lines = [f"## {r['workload']} (arm {r['arm']})", ""]
     cap = r["capacity"]
-    head = cap[f"p99_le_{HEADLINE_MS}ms"]
     label = "ack" if gate == "ack" else "end-to-end"
-    if head:
-        lines.append(f"**Capacity: {fmt_rate(head['offered_rate'])} msg/s** carried with {label} p99 "
-                     f"{fmt_us(head['gate_p99_us'])} (≤ 1 s).")
+    top = cap.get("lossless")
+    if top:
+        lat = (f"ack p99 {fmt_us(top['ack_p99_us'])}, " if gate == "ack" else "") + f"e2e p99 {fmt_us(top['e2e_p99_us'])}"
+        lines.append(f"**Maximum lossless: {fmt_rate(top['offered_rate'])} msg/s** ({lat}).")
     else:
-        lines.append(f"**Capacity: none** — no step was carried with {label} p99 ≤ 1 s.")
-    for band in BANDS_MS[1:]:
+        lines.append("**Maximum lossless: none** — no step was carried.")
+    lines.append("")
+    for band in BANDS_MS:
         c = cap[f"p99_le_{band}ms"]
-        lines.append(f"- {label} p99 ≤ {band} ms: " + (f"{fmt_rate(c['offered_rate'])} msg/s ({fmt_us(c['gate_p99_us'])})" if c else "none"))
+        band_txt = "1 s" if band == 1000 else f"{band} ms"
+        lines.append(f"- {label} p99 ≤ {band_txt}: " + (f"{fmt_rate(c['offered_rate'])} msg/s ({fmt_us(c['gate_p99_us'])})" if c else "none"))
     lines += [f"- ladder ended: {r['ended']}", ""]
+    if r.get("chart"):
+        lines += [f"![{r['workload']}: {label} p99 by offered msg/s]({r['chart']})", ""]
     lines.append("| step | offered msg/s | brokers received | delivered | share | loss | ack p50 / p99 / p999 | "
                  "e2e p50 / p99 / p999 | generator health | verdict |")
     lines.append("|---|---|---|---|---|---|---|---|---|---|")
     for s in r["steps"]:
         a, e = s["ack_latency"], s["e2e_latency"]
         share = "—" if s["received_share"] is None else f"{s['received_share']:.1%}"
-        drops = s.get("brokers", {}).get("dropped")
+        b = s.get("brokers", {})
+        drops = b.get("lost", b.get("dropped"))
         loss = fmt_ledger(s) + ("" if not drops else f", drops {int(drops)}")
         why = "; ".join(s["failures"] + s["voids"] + s["notes"])
         lines.append(
@@ -502,6 +570,10 @@ def report(run: Path) -> dict:
     ladders = sorted((p.parent for p in run.glob("**/ladder.json")),
                      key=lambda d: (d.parent.name, order.get(d.name, len(order)), d.name))
     data = {"schema": SCHEMA_REPORT, "run": meta, "offer_taken": OFFER_TAKEN, "ladders": [ladder_report(p) for p in ladders]}
+    try:
+        _load("chart_ramp", HERE / "chart-ramp.py").write_charts(run, data)
+    except Exception as e:  # a chart must never cost the report
+        print(f"verdict.py: charts not drawn: {e!r}", file=sys.stderr)
     (run / "report.json").write_text(json.dumps(data, indent=2) + "\n")
     md = [f"# mqttd msg/s ramp — {meta.get('tier', '?')}", ""]
     if meta:
@@ -515,7 +587,9 @@ def report(run: Path) -> dict:
         md.append("")
     md += ["Judged on the broker only (ADR 0090 D1): loss FAILS a step, a saturated generator VOIDS it, the brokers "
            f"must receive ≥ {OFFER_TAKEN:.0%} of the offer, and latency is the exact merge of every generator's "
-           "histogram. Capacity is the highest carried step at ack p99 ≤ 1 s (QoS 0: end-to-end p99).", ""]
+           "histogram. The ramp climbs on every carried step, whatever its latency. **Maximum lossless** is the "
+           "highest carried step; the lines below it are the highest carried step within each ack p99 band "
+           "(QoS 0: end-to-end p99).", ""]
     for r in data["ladders"]:
         md += render_ladder_md(r)
     (run / "report.md").write_text("\n".join(md))

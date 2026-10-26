@@ -52,8 +52,9 @@ WARMUP="${WARMUP:-$DEF_WARMUP}"
 MEASURE="${MEASURE:-$DEF_MEASURE}"
 WINDOW="${WINDOW:-$DEF_WINDOW}"
 DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-30}"
-# Coarse steps multiply by FACTOR until the first step not carried within 1 s; then
-# bisection until the gap between the last good and first bad step is <= GAP_PCT %.
+# Coarse steps multiply by FACTOR while steps are CARRIED (lossless, whatever their
+# latency); after the first FAILED / OFFER NOT TAKEN / DISCONNECTED step, bisection until
+# the gap between the last carried and the first bad step is <= GAP_PCT %.
 FACTOR="${FACTOR:-1.5}"
 GAP_PCT="${GAP_PCT:-3}"
 GRANULARITY="${GRANULARITY:-100}"

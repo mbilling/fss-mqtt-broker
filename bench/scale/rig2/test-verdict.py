@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Offline tests for bench/scale/rig2/verdict.py: the step verdicts, the capacity lines,
-the ramp's next step, the histogram merge, the idle check and the price quote.
+"""Offline tests for bench/scale/rig2/verdict.py: the step verdicts, the drop-reason
+classification, the capacity lines, the ramp's next step, the histogram merge, the idle
+check, the price quote, and the report's charts (chart-ramp.py's self-test).
 
     python3 bench/scale/rig2/test-verdict.py
 
@@ -12,6 +13,7 @@ of the exported buckets must equal the percentile mqtt-load itself computed.
 import importlib.util
 import json
 import math
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -197,20 +199,46 @@ class Verdicts(unittest.TestCase):
         v = verdict_of(make_step(self.root, 30000, [summary(30000, p99_us=2_000_000)], gate="e2e"))
         self.assertEqual(v["latency_gate"], "e2e")
         self.assertEqual(v["gate_p99_us"], 2_000_000)
-        self.assertFalse(v["good"])
+        # Lossless and taken: carried, and good for the ramp, at any latency.
+        self.assertEqual(v["verdict"], V.CARRIED)
+        self.assertTrue(v["good"])
+
+    def test_a_drop_that_is_not_loss_is_a_note_not_a_failure(self):
+        v = verdict_of(make_step(self.root, 30000, [summary(30000)],
+                                 drops={"pending-cap-replay": 40, "settle-replay": 2}))
+        self.assertEqual(v["verdict"], V.CARRIED, v)
+        self.assertEqual(v["brokers"]["lost"], 0)
+        self.assertEqual(v["brokers"]["dropped"], 42)
+        self.assertIn("broker drops that are not loss: pending-cap-replay=40, settle-replay=2", v["notes"])
+
+    def test_loss_and_non_loss_drops_together_fail_on_the_loss_only(self):
+        v = verdict_of(make_step(self.root, 30000, [summary(30000)],
+                                 drops={"pending-cap-replay": 40, "outbound-full": 3}))
+        self.assertEqual(v["verdict"], V.FAILED)
+        self.assertEqual(v["failures"], ["brokers dropped 3 messages (outbound-full=3)"])
+
+    def test_an_unknown_drop_reason_is_loss(self):
+        v = verdict_of(make_step(self.root, 30000, [summary(30000)], drops={"a-reason-from-the-future": 1}))
+        self.assertEqual(v["verdict"], V.FAILED)
+        self.assertIn("a-reason-from-the-future=1", v["failures"][0])
 
     def test_capacity_lines_by_p99_band(self):
         steps = []
-        for rate, p99 in ((10000, 80_000), (15000, 200_000), (22000, 900_000), (33000, 1_500_000)):
+        for rate, p99 in ((10000, 80_000), (15000, 200_000), (22000, 900_000), (33000, 2_000_000)):
             steps.append(verdict_of(make_step(self.root, rate, [summary(rate, p99_us=p99)])))
         steps.append(verdict_of(make_step(self.root, 50000, [summary(50000)], received_share=0.9)))
         cap = V.capacity(steps)
+        # The lossless maximum ignores latency: the 2 s step was carried.
+        self.assertEqual(cap["lossless"]["offered_rate"], 33000)
+        self.assertEqual(cap["lossless"]["ack_p99_us"], 2_000_000)
+        self.assertEqual(cap["lossless"]["e2e_p99_us"], 2_000_000)
         self.assertEqual(cap["p99_le_1000ms"]["offered_rate"], 22000)
         self.assertEqual(cap["p99_le_250ms"]["offered_rate"], 15000)
         self.assertEqual(cap["p99_le_100ms"]["offered_rate"], 10000)
         (self.ladder / "ladder.json").write_text(json.dumps({"workload": "durable-qos1", "ramp": {"start_rate": 10000}}))
         lines = "\n".join(V.render_ladder_md(V.ladder_report(self.ladder)))
-        self.assertIn("**Capacity: 22,000 msg/s** carried with ack p99 900.0 ms", lines)
+        self.assertIn("**Maximum lossless: 33,000 msg/s** (ack p99 2000.0 ms, e2e p99 2000.0 ms)", lines)
+        self.assertIn("ack p99 ≤ 1 s: 22,000 msg/s (900.0 ms)", lines)
         self.assertIn("ack p99 ≤ 250 ms: 15,000 msg/s (200.0 ms)", lines)
         self.assertIn("ack p99 ≤ 100 ms: 10,000 msg/s (80.0 ms)", lines)
         self.assertIn("**OFFER NOT TAKEN**", lines)
@@ -219,6 +247,50 @@ class Verdicts(unittest.TestCase):
     def test_no_carried_step_means_no_capacity(self):
         steps = [verdict_of(make_step(self.root, 10000, [summary(10000, missing=1)]))]
         self.assertIsNone(V.capacity(steps)["p99_le_1000ms"])
+        self.assertIsNone(V.capacity(steps)["lossless"])
+
+    def test_the_report_draws_and_links_a_chart_per_ladder(self):
+        run = self.ladder
+        lad = run / "A" / "durable-qos1"
+        (lad / "steps").mkdir(parents=True)
+        for rate, p99 in ((10000, 5_000), (15000, 300_000)):
+            verdict_of(make_step(lad / "steps", rate, [summary(rate, p99_us=p99)]))
+        (lad / "ladder.json").write_text(json.dumps({"workload": "durable-qos1", "arm": "A",
+                                                     "ramp": {"start_rate": 10000}, "mqtt_load": {"payload": 200}}))
+        (run / "run.json").write_text(json.dumps({"tier": "n3", "brokers": 3, "workloads": ["durable-qos1"],
+                                                  "started_utc": "20261026T063123Z"}))
+        data = V.report(run)
+        self.assertEqual(data["ladders"][0]["chart"], "report-durable-qos1.svg")
+        self.assertIn("15,000 msg/s lossless", (run / "report-durable-qos1.svg").read_text())
+        self.assertIn("](report-durable-qos1.svg)", (run / "report.md").read_text())
+        self.assertEqual(json.loads((run / "report.json").read_text())["ladders"][0]["capacity"]["lossless"]["offered_rate"], 15000)
+
+
+class DropReasons(unittest.TestCase):
+    def test_every_reason_the_broker_documents_or_increments_is_classified(self):
+        root = HERE.parents[2]
+        doc = (root / "crates/mqtt-observability/src/metrics.rs").read_text()
+        m = re.search(r'"Messages dropped, by reason \(([^)]*)\)"', doc)
+        self.assertIsNotNone(m, "the publish_dropped help text moved")
+        reasons = {r.strip() for r in m.group(1).split(",")}
+        for p in (root / "crates/mqttd/src").rglob("*.rs"):
+            reasons |= set(re.findall(r'publish_dropped(?:_by)?\(\s*"([a-z0-9-]+)"', p.read_text()))
+        missing = sorted(reasons - set(V.DROP_IS_LOSS))
+        self.assertEqual(missing, [], "classify these in verdict.py's DROP_IS_LOSS")
+
+    def test_the_settle_replay_family_and_withheld_acks_are_not_loss(self):
+        for r in ("pending-cap-replay", "settle-replay", "settle-replay-refused", "pending-cap",
+                  "outbound-id-write-failed"):
+            self.assertFalse(V.drop_is_loss(r), r)
+        for r in ("outbound-full", "append-backlog-full", "queue-overflow", "backlog-overflow", "no-shared-member",
+                  "peer-unreachable", "brownout", "hub-ingress"):
+            self.assertTrue(V.drop_is_loss(r), r)
+        self.assertTrue(V.drop_is_loss("never-heard-of-it"))
+
+
+class Chart(unittest.TestCase):
+    def test_chart_self_test(self):
+        V._load("chart_ramp", HERE / "chart-ramp.py").self_test()
 
 
 class Histograms(unittest.TestCase):
@@ -280,10 +352,10 @@ class Ramp(unittest.TestCase):
         rate, why = self.nxt(steps)
         self.assertEqual(rate, 18800)  # (15000 + 22500) / 2 to the 100 msg/s granularity
         self.assertIn("bisect", why)
-        steps.append(st(18800, V.CARRIED, good=False))  # carried, but ack p99 > 1 s
-        self.assertEqual(self.nxt(steps)[0], 16900)
+        steps.append(st(18800, V.FAILED))
+        self.assertEqual(self.nxt(steps, bisect_on_fail=True)[0], 16900)
         steps.append(st(16900, V.CARRIED))
-        self.assertEqual(self.nxt(steps)[0], 17900)  # 17850 rounds half up
+        self.assertEqual(self.nxt(steps, bisect_on_fail=True)[0], 17900)  # 17850 rounds half up
         steps.append(st(17900, V.CARRIED))
         self.assertEqual(self.nxt(steps)[0], 18400)
         steps.append(st(18400, V.DISCONNECTED))
@@ -291,6 +363,16 @@ class Ramp(unittest.TestCase):
         self.assertIsNone(rate)
         self.assertIn("knee bracketed: good at 17900, not at 18400", why)
         self.assertIn("2.8% gap", why)
+
+    def test_a_lossless_step_above_1_s_keeps_climbing(self):
+        # Carried at ack p99 2 s: no loss, offer taken, so the ramp climbs past it. A
+        # verdict stored with good=False (the pre-2026-10-26 rule) climbs too.
+        steps = [st(10000, V.CARRIED), st(15000, V.CARRIED, good=False)]
+        rate, why = self.nxt(steps)
+        self.assertEqual(rate, 22500)
+        self.assertEqual(why, "coarse step up")
+        steps.append(st(22500, V.NOT_TAKEN))
+        self.assertEqual(self.nxt(steps)[0], 18800)  # bisect from the last CARRIED, 15000
 
     def test_a_failed_step_stops_the_ladder(self):
         rate, why = self.nxt([st(10000, V.CARRIED), st(15000, V.FAILED)])

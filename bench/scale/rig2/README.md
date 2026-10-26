@@ -121,28 +121,42 @@ Judged on the broker only (ADR 0090 D1). In order:
 
 | verdict | when | ramp |
 |---|---|---|
-| **FAILED** | a broker dropped a message (`mqttd_publish_dropped_total`, any reason), a broker restarted, or a generator's ledger did not close (missing, unexpected, unacked) | stops the ladder (`BISECT_ON_FAIL=1` keeps bisecting below it) |
+| **FAILED** | a generator's ledger did not close (missing, unexpected, unacked), a broker dropped a message by a reason that is loss (`mqttd_publish_dropped_total`, see below), or a broker restarted | stops the ladder (`BISECT_ON_FAIL=1` keeps bisecting below it) |
 | **VOID** | a generator saturated in a measured window, a generator left no summary, the generators' windows overlap less than 90%, the scrapes do not cover the window, or the cluster was not idle | rerun (`VOID_RETRIES`, 1); never counted against the broker |
 | **DISCONNECTED** | connections were lost during the step. mqtt-load does not reconnect, so its ledger cannot be read after that | not carried; the ramp treats it as above the knee |
 | **OFFER NOT TAKEN** | the brokers received less than 99% of the offered msg/s (`OFFER_TAKEN` from `../summarize-curve.py`) | above the knee |
-| **CARRIED** | none of the above | at or below the knee if the gated p99 is at most 1 s |
+| **CARRIED** | none of the above | at or below the knee, whatever its latency |
 
-A broker drop fails a step even when the generator's ledger closes. A VOID ledger loss
-(the generator saturated) is not counted.
+A broker drop that is loss fails a step even when the generator's ledger closes. A VOID
+ledger loss (the generator saturated) is not counted.
+
+**Which drops are loss.** `verdict.py`'s `DROP_IS_LOSS` classifies every reason the broker
+documents or increments (`crates/mqtt-observability/src/metrics.rs`, the call sites in
+`crates/mqttd/src`), in one table: loss is a message the broker took and still owed to a
+subscriber that exists (`outbound-full`, `append-backlog-full`, `queue-overflow`,
+`backlog-overflow`, `no-shared-member`, `peer-unreachable`, `brownout`, ...). Not loss,
+reported as a note: `pending-cap-replay`, `settle-replay` and `settle-replay-refused`
+(an already-acknowledged entry leaving the settle-replay window; only a session created
+during that window misses it), `pending-cap` (the ack is withheld, the publisher still
+owns the message), `outbound-id-write-failed` (a deferral), and the retained-replay and
+`$SYS` guards. A reason not in the table is loss. A test fails when the broker gains a
+reason the table does not classify. The identity ledger stays the primary judge.
 
 Latency is the exact merge of every generator's HDR histogram: mqtt-load exports its
 buckets, and `verdict.py` adds the counts of equal buckets and reads the quantile as
 hdrhistogram does. It is never an average of percentiles.
 
-**Capacity** is the highest CARRIED step with **ack p99 ≤ 1 s** (the headline), and the
-same at ≤ 250 ms and ≤ 100 ms. For `qos0` the bands apply to the end-to-end p99.
+**Maximum lossless** (the headline) is the highest CARRIED step, whatever its latency,
+with its ack p99 and end-to-end p99: a step above 1 s that lost nothing still counts.
+Below it, the highest CARRIED step with **ack p99 ≤ 1 s**, ≤ 250 ms and ≤ 100 ms. For
+`qos0` the bands apply to the end-to-end p99.
 
 ## The ramp
 
 The first step is the workload's `START_RATE_<tier>`. Coarse steps multiply by `FACTOR`
-(1.5) until the first step that is not carried within 1 s. Then the ramp bisects between
-the last good and the first bad step until their gap is at most `GAP_PCT` (3%) of the good
-one. Rates are rounded to `GRANULARITY` (100 msg/s). A step that is not carried at the
+(1.5) on every CARRIED step, whatever its latency, until the first FAILED, OFFER NOT
+TAKEN or DISCONNECTED step. Then the ramp bisects between the last carried and that
+step until their gap is at most `GAP_PCT` (3%) of the carried one. A VOID step is rerun. Rates are rounded to `GRANULARITY` (100 msg/s). A step that is not carried at the
 first rate steps down by the factor instead. `MAX_STEPS` (14; local 3) and `MAX_RATE`
 bound a ladder.
 
@@ -151,8 +165,18 @@ bound a ladder.
 `<run>/report.md` and `<run>/report.json` (`mqtt-rig2.report.v1`). Per step: msg/s
 offered, brokers received, delivered, the received share, loss, ack p50/p99/p999,
 end-to-end p50/p99/p999, generator health (worst CPU fraction and scheduling-lag p99,
-saturation) and the verdict with its reasons. Per ladder: the three capacity lines and
-why the ladder ended. `verdict.py report <run>` re-renders them from the raw evidence.
+saturation) and the verdict with its reasons. Per ladder: the maximum lossless msg/s,
+the three latency-band lines (`capacity` in the JSON: `lossless`, `p99_le_1000ms`,
+`p99_le_250ms`, `p99_le_100ms`) and why the ladder ended. `verdict.py report <run>`
+re-renders them from the steps' `verdict.json`.
+
+**Charts.** One SVG per ladder, `<run>/report-<workload>.svg`, linked from report.md
+(`chart-ramp.py`, called by the report; `chart-ramp.py <run>` redraws them from
+report.json). x is the offered msg/s of every step; y the ack p99 (QoS 0: end-to-end) on
+a log scale with the p50 lighter, over the GREEN (≤ 1 s), YELLOW (≤ 5 s) and RED bands.
+Carried steps are filled points, FAILED / OFFER NOT TAKEN / DISCONNECTED hollow red
+rings, VOID dashed grey rings; the maximum lossless step is labelled, and the title
+states it.
 
 ## Not yet
 
@@ -164,4 +188,5 @@ why the ladder ended. `verdict.py report <run>` re-renders them from the raw evi
   the durable_bench build or Docker on the generator hosts.
 - **Calibration against emqtt-bench** is 0090-T2.
 
-Tests: `python3 bench/scale/rig2/test-verdict.py` (offline; CI runs it).
+Tests: `python3 bench/scale/rig2/test-verdict.py` (offline; CI runs it; it includes
+`chart-ramp.py --self-test`).
