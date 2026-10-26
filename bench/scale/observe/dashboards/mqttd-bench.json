@@ -1803,6 +1803,226 @@
         }
       ],
       "description": "Mean fsync'd batch commit time from REAL traffic (ADR 0076). Drift well above the boot figure (\u22481000/boot floor ms) = the volume degraded: noisy neighbor, throttling, or migration onto worse storage."
+    },
+    {
+      "id": 36,
+      "type": "timeseries",
+      "title": "Durable QoS 1 deliveries: kept off the disk vs written /s",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 121
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(mqttd_durable_elided_total{instance=~\"$instance\"}[1m]))",
+          "legendFormat": "kept off the disk (subscriber acked within the window)"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(mqttd_durable_elision_fallback_total{instance=~\"$instance\"}[1m]))",
+          "legendFormat": "written to disk (no ack within the window)"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(mqttd_durable_writer_ops_total{instance=~\"$instance\"}[1m]))",
+          "legendFormat": "durable ops written to disk (all kinds)"
+        }
+      ],
+      "description": "Write elision (ADR 0089): a durable QoS 1 delivery to an online subscriber is sent at once and written only if its PUBACK does not arrive within durable.write_elision_ms. 'Kept off the disk' were acknowledged in time and never written; 'written to disk' fell back to the append. The third line is every durable op the writer committed (deliveries written, session state, acks), so it shows the disk's real work."
+    },
+    {
+      "id": 37,
+      "type": "timeseries",
+      "title": "Share of durable deliveries kept off the disk",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 121
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (instance) (rate(mqttd_durable_elided_total{instance=~\"$instance\"}[1m])) / (sum by (instance) (rate(mqttd_durable_elided_total{instance=~\"$instance\"}[1m])) + sum by (instance) (rate(mqttd_durable_elision_fallback_total{instance=~\"$instance\"}[1m])))",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "description": "Per node: kept off the disk / (kept off + written). Near 100% while subscribers keep up; it falls when they lag the window, when elision backs off for a slow subscriber, or near the memory bound. Empty when nothing durable is delivered or write elision is off (durable.write_elision_ms = 0)."
+    },
+    {
+      "id": 38,
+      "type": "timeseries",
+      "title": "Written to disk after all, by reason /s",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 129
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (reason) (rate(mqttd_durable_elision_fallback_total{instance=~\"$instance\"}[1m]))",
+          "legendFormat": "{{reason}}"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(mqttd_durable_elision_backoff_total{instance=~\"$instance\"}[1m]))",
+          "legendFormat": "backoff started (slow subscriber written directly)"
+        }
+      ],
+      "description": "Why a held delivery was written: the window ran out (timeout), the subscriber left, a brownout or drain, the memory bound, or the head rule. A backoff means a subscriber missed the window repeatedly and is written directly for a while (ADR 0089 A3)."
+    },
+    {
+      "id": 39,
+      "type": "timeseries",
+      "title": "Time a delivery was held before its ack (p50 / p99)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 129
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(mqttd_durable_elision_hold_seconds_bucket{instance=~\"$instance\"}[1m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(mqttd_durable_elision_hold_seconds_bucket{instance=~\"$instance\"}[1m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "description": "How long a held delivery waited for the subscriber's PUBACK before it was discharged without a write. Compare with durable.write_elision_ms (50 ms by default): a p99 close to the window means acks arrive just in time."
     }
   ],
   "description": "Derived from the demo dashboard by bench/scale/observe/build-bench-dashboards.py \u2014 do not edit by hand. Adds the run-phase strip, which only the bench stack can populate."
