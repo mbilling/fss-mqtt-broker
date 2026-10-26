@@ -6062,6 +6062,11 @@ fn wire_limits_from_config(
         publish_rate,
         // The hub's outbound in-flight cap, for the `receive_maximum` rules see.
         max_inflight_messages: l.max_inflight_messages,
+        // The write-stall bound (issue #1117); `validate` refuses 0 for both.
+        write_stall_keepalives: l.write_stall_keepalives.unwrap_or(d.write_stall_keepalives),
+        write_stall_timeout: l
+            .write_stall_timeout_secs
+            .map_or(d.write_stall_timeout, Duration::from_secs),
     })
 }
 

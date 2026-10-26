@@ -126,6 +126,14 @@ pub struct WireLimits {
     /// Maximum (issue #241). Read here only for the `receive_maximum` a rule sees on
     /// `$events/client/connected` (ADR 0083); the hub applies the cap itself.
     pub max_inflight_messages: Option<u16>,
+    /// `limits.write_stall_keepalives` (issue #1117): a client with a keepalive that
+    /// has accepted no bytes for this many keepalive periods while the broker has
+    /// bytes for it is closed, and counted as
+    /// `mqttd_connection_errors_total{reason="write-stall"}`. At least 1.
+    pub write_stall_keepalives: u16,
+    /// `limits.write_stall_timeout_secs` (issue #1117): the same bound for a client
+    /// with keepalive 0, which has no period to multiply.
+    pub write_stall_timeout: Duration,
 }
 
 impl Default for WireLimits {
@@ -137,6 +145,22 @@ impl Default for WireLimits {
             publish_rate: None,
             max_packet_size: 1024 * 1024,
             max_inflight_messages: None,
+            write_stall_keepalives: 2,
+            write_stall_timeout: Duration::from_mins(2),
+        }
+    }
+}
+
+impl WireLimits {
+    /// How long a client negotiating `keep_alive` may accept no bytes while the
+    /// broker has bytes for it before it is closed (issue #1117).
+    #[must_use]
+    pub fn write_stall_bound(&self, keep_alive: u16) -> Duration {
+        if keep_alive == 0 {
+            self.write_stall_timeout
+        } else {
+            Duration::from_secs(u64::from(keep_alive))
+                * u32::from(self.write_stall_keepalives.max(1))
         }
     }
 }
@@ -2208,12 +2232,21 @@ where
                 props
                     .0
                     .push(mqtt_codec::Property::AuthenticationData(Bytes::from(data)));
-                writer
-                    .send(&Packet::Auth(Auth {
-                        reason: AUTH_CONTINUE,
-                        properties: props,
-                    }))
-                    .await?;
+                // Bounded like the reply below: mid-session, this write also carries
+                // whatever the connection had queued, to a peer that may not be reading
+                // (issue #1117).
+                let challenge = Packet::Auth(Auth {
+                    reason: AUTH_CONTINUE,
+                    properties: props,
+                });
+                let sent = writer.send(&challenge);
+                match tokio::time::timeout(wire_limits().auth_round_timeout, sent).await {
+                    Err(_elapsed) => {
+                        warn!(client = %client.0, "enhanced-auth challenge write timed out; aborting");
+                        return Ok(ExchangeResult::Aborted);
+                    }
+                    Ok(sent) => sent?,
+                }
 
                 // The reply must be an AUTH(Continue) keeping the same method, and must
                 // arrive within the per-round auth timeout (ADR 0013 §3) — a stalled round
@@ -2311,17 +2344,17 @@ fn app_properties(props: &mqtt_codec::Properties) -> AppProperties {
     app
 }
 
-/// Send a v5 DISCONNECT with `reason` and no properties.
-async fn disconnect<W: AsyncWrite + Unpin>(
+/// Queue a v5 DISCONNECT with `reason` and no properties. Every caller then ends
+/// the connection, and `serve` writes out what is queued as it closes (bounded by
+/// `CLOSE_FLUSH_MAX`): a peer that is not reading cannot hold the close (#1117).
+fn disconnect<W: AsyncWrite + Unpin>(
     writer: &mut FrameWriter<W>,
     reason: u8,
 ) -> Result<(), NetError> {
-    writer
-        .send(&Packet::Disconnect(Disconnect {
-            reason,
-            properties: mqtt_codec::Properties::new(),
-        }))
-        .await
+    writer.queue(&Packet::Disconnect(Disconnect {
+        reason,
+        properties: mqtt_codec::Properties::new(),
+    }))
 }
 
 /// Handle a client-initiated re-authentication (AUTH `0x19`) on an established
@@ -2352,7 +2385,7 @@ where
     if auth.reason != AUTH_REAUTH {
         warn!(client = %client.0, reason = auth.reason, "unexpected AUTH on established session");
         rule_conn.closing(protocol_error);
-        disconnect(writer, DISCONNECT_PROTOCOL_ERROR).await?;
+        disconnect(writer, DISCONNECT_PROTOCOL_ERROR)?;
         return Ok(false);
     }
     // Re-auth requires that connect used enhanced auth, with the **same** method
@@ -2364,12 +2397,12 @@ where
     else {
         warn!(client = %client.0, "re-auth method missing or changed; disconnecting");
         rule_conn.closing(protocol_error);
-        disconnect(writer, DISCONNECT_PROTOCOL_ERROR).await?;
+        disconnect(writer, DISCONNECT_PROTOCOL_ERROR)?;
         return Ok(false);
     };
     let Some(authenticator) = policy.enhanced.as_ref().filter(|a| a.method() == method) else {
         rule_conn.closing(protocol_error);
-        disconnect(writer, DISCONNECT_PROTOCOL_ERROR).await?;
+        disconnect(writer, DISCONNECT_PROTOCOL_ERROR)?;
         return Ok(false);
     };
 
@@ -2392,12 +2425,10 @@ where
             props.0.push(mqtt_codec::Property::AuthenticationMethod(
                 method.to_string(),
             ));
-            writer
-                .send(&Packet::Auth(Auth {
-                    reason: AUTH_SUCCESS,
-                    properties: props,
-                }))
-                .await?;
+            writer.queue(&Packet::Auth(Auth {
+                reason: AUTH_SUCCESS,
+                properties: props,
+            }))?;
             Ok(true)
         }
         ExchangeResult::Failed => {
@@ -2410,7 +2441,7 @@ where
             let reason = mqtt_rules::disconnect_reason(DISCONNECT_NOT_AUTHORIZED);
             rule_conn.authn_complete(hub, &client.0, reason, false);
             rule_conn.closing(reason);
-            disconnect(writer, DISCONNECT_NOT_AUTHORIZED).await?;
+            disconnect(writer, DISCONNECT_NOT_AUTHORIZED)?;
             Ok(false)
         }
         ExchangeResult::Aborted => Ok(false),
@@ -2585,13 +2616,13 @@ fn apply_publish_outcome(
     }
 }
 
-/// Write every ALREADY-RESOLVED parked ack (ADR 0075), front-first, without
-/// waiting. Called before any outbound packet is written: the hub releases a
-/// publish's ack before it queues the fan-out deliveries, so flushing here
+/// Queue every ALREADY-RESOLVED parked ack (ADR 0075), front-first, without
+/// waiting. Called before any outbound packet is queued: the hub releases a
+/// publish's ack before it queues the fan-out deliveries, so queueing here
 /// keeps the old observable order — a message's own PUBACK still precedes any
 /// delivery that followed from it. Returns `Err` of EMQX's `reason` when the
 /// connection must close (hub gone / v3.1.1 close-no-ack).
-async fn flush_ready_pubacks<W: AsyncWrite + Unpin>(
+fn queue_ready_pubacks<W: AsyncWrite + Unpin>(
     writer: &mut FrameWriter<W>,
     current: &mut Option<PendingPuback>,
     pending: &mut AckQueue,
@@ -2619,15 +2650,94 @@ async fn flush_ready_pubacks<W: AsyncWrite + Unpin>(
         if let Err(reason) = apply_publish_outcome(&mut entry, outcome, is_v5, client) {
             return Ok(Err(reason));
         }
-        writer.send(&Packet::PubAck(entry.ack)).await?;
+        writer.queue(&Packet::PubAck(entry.ack))?;
     }
 }
 
-// The connection's one event loop: keepalive, inbound, outbound, and (since
-// ADR 0075) the ordered puback drain are a single select by design — splitting
-// it would scatter the borrow discipline the drain depends on.
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+/// Inbound replies (PUBACK, PUBREC, PINGRESP, SUBACK, …) a connection queues for a
+/// peer that has not read them before it stops reading that peer (issue #1117). The
+/// reads continue while the peer drains its writes, so this bounds only a peer that
+/// sends requests faster than it reads their answers: past it the broker stops
+/// reading too, and the write-stall bound closes the connection if the peer never
+/// reads again. Far above any honest window: 65 535 PUBACKs are 256 KiB.
+const REPLY_BACKLOG_MAX: usize = 1024 * 1024;
+
+/// How long a closing connection may spend writing what it still holds (a
+/// DISCONNECT, the acks and deliveries before it) to a peer that is slow to read.
+const CLOSE_FLUSH_MAX: Duration = Duration::from_secs(5);
+
+/// Serve the connection (see [`serve_loop`]), then write out what it still holds
+/// for the peer, bounded by [`CLOSE_FLUSH_MAX`]. Writes are queued rather than
+/// awaited inside the loop (issue #1117), so a loop that returned may leave a
+/// DISCONNECT, or the acks and deliveries queued before the client's own
+/// DISCONNECT, still to go; before, every write had finished before the next
+/// packet was read. A loop that ended on a transport error, or because the peer
+/// stopped reading or went silent, leaves nothing (it discards what it held).
+#[allow(clippy::too_many_arguments)]
 async fn serve<R, W>(
+    reader: &mut FrameReader<R>,
+    writer: &mut FrameWriter<W>,
+    hub: &mpsc::UnboundedSender<HubCommand>,
+    client: &ClientId,
+    principal: Identity,
+    auth_method: Option<String>,
+    policy: &ConnPolicy,
+    out_rx: &mut crate::hub::OutboundRx,
+    out_meter: &crate::hub::OutboundMeter,
+    keep_alive: u16,
+    is_v5: bool,
+    client_max_packet: Option<u32>,
+    inbound_aliases: &mut InboundAliases,
+    outbound_aliases: &mut OutboundAliases,
+    session_expiry: u32,
+    session_expiry_override: &mut Option<u32>,
+    watch: Option<&PeerClosedWatch>,
+    rule_conn: &RuleConn<'_>,
+) -> Result<bool, NetError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let result = serve_loop(
+        reader,
+        writer,
+        hub,
+        client,
+        principal,
+        auth_method,
+        policy,
+        out_rx,
+        out_meter,
+        keep_alive,
+        is_v5,
+        client_max_packet,
+        inbound_aliases,
+        outbound_aliases,
+        session_expiry,
+        session_expiry_override,
+        watch,
+        rule_conn,
+    )
+    .await;
+    if result.is_ok() && writer.has_pending() {
+        // Best-effort, as the DISCONNECT always was: the peer may already be gone.
+        let _ = tokio::time::timeout(CLOSE_FLUSH_MAX, writer.flush_queued()).await;
+    }
+    result
+}
+
+// The connection's one event loop: keepalive, inbound, outbound, the socket
+// write, and (since ADR 0075) the ordered puback drain are a single select by
+// design — splitting it would scatter the borrow discipline the drain depends on.
+//
+// Nothing in the loop awaits a write (issue #1117). Every packet is QUEUED on the
+// writer, and the write itself is one more arm (`flush_queued` is cancel-safe), so
+// a peer that is not reading never stops the broker reading it. Awaiting the flush
+// inside the outbound arm deadlocked a subscriber that writes its PUBACKs before it
+// reads again: the broker read about one PUBACK per 1,024-packet batch, the acks
+// filled both directions' buffers, and each side then blocked writing to the other.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+async fn serve_loop<R, W>(
     reader: &mut FrameReader<R>,
     writer: &mut FrameWriter<W>,
     hub: &mpsc::UnboundedSender<HubCommand>,
@@ -2705,13 +2815,27 @@ where
         .as_ref()
         .map(crate::ingress::IngressCredit::connection);
     let mut parked: Option<Parked> = None;
+    // The write-stall bound (issue #1117): a peer that has accepted no bytes for this
+    // long while the broker has bytes for it is closed. Its timer is re-armed only
+    // when it fires, the same discipline as the keepalive timer above: a write moves
+    // `writer.last_progress()`, never the timer.
+    let stall_bound = wire_limits().write_stall_bound(keep_alive);
+    let stall = tokio::time::sleep_until(Instant::now() + stall_bound);
+    tokio::pin!(stall);
+    // Reply bytes queued since the writer was last empty (see `REPLY_BACKLOG_MAX`).
+    let mut reply_bytes: usize = 0;
 
     loop {
         if current.is_none() {
             current = pending_pubacks.pop_front();
         }
+        if !writer.has_pending() {
+            reply_bytes = 0;
+        }
+        // Everything the inbound side queues counts against `REPLY_BACKLOG_MAX`.
+        let queued_before = writer.queued_len();
         tokio::select! {
-            inbound = reader.next_packet(), if parked.is_none() => {
+            inbound = reader.next_packet(), if parked.is_none() && reply_bytes < REPLY_BACKLOG_MAX => {
                 // Any client packet resets the keepalive deadline.
                 deadline = grace.map(|g| Instant::now() + g);
                 // A DECODE failure is told to the client before the close, so an operator
@@ -2734,7 +2858,7 @@ where
                           "malformed packet from client; disconnecting");
                     count_connection_error(policy, "codec");
                     if is_v5 {
-                        let _ = disconnect(writer, reason).await;
+                        let _ = disconnect(writer, reason);
                     }
                     // EMQX's `handle_frame_error/2` closes with the frame error's
                     // kind: `frame_too_large`, else `frame_error`.
@@ -2793,6 +2917,7 @@ where
                         // client's silence. The keepalive restarts once it is over.
                         deadline = grace.map(|g| Instant::now() + g);
                         parked = Parked::batch(rule_conn, policy);
+                        reply_bytes += writer.queued_len().saturating_sub(queued_before);
                     }
                 }
             }
@@ -2804,8 +2929,11 @@ where
                     m.observe_ingress_paused(since.elapsed().as_secs_f64());
                 }
                 // The broker paused this client, not the client going quiet: the
-                // keepalive restarts from the moment reading resumes.
+                // keepalive restarts from the moment reading resumes. So does the
+                // write-stall clock: a client that writes before it reads was blocked
+                // on the broker meanwhile, not refusing to read.
                 deadline = grace.map(|g| Instant::now() + g);
+                writer.restart_stall_clock();
                 match resume {
                     Resume::Packet(packet) => {
                         match handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, &mut qos2_inflight, &mut pending_pubacks, &mut current, is_v5, inbound_aliases, session_expiry, session_expiry_override, IngressAdmit::Credit(Some(permit)), credit.as_ref(), rule_conn).await? {
@@ -2816,6 +2944,7 @@ where
                         // place for its derived messages' credit.
                         deadline = grace.map(|g| Instant::now() + g);
                         parked = Parked::batch(rule_conn, policy);
+                        reply_bytes += writer.queued_len().saturating_sub(queued_before);
                     }
                     Resume::Batch(mut batch) => {
                         give_batch_credit(&mut batch, permit);
@@ -2836,26 +2965,34 @@ where
                     rule_conn.closing(reason);
                     return Ok(false);
                 }
-                writer.send(&Packet::PubAck(entry.ack)).await?;
+                writer.queue(&Packet::PubAck(entry.ack))?;
+                reply_bytes += writer.queued_len().saturating_sub(queued_before);
                 // A client whose window is exhausted is WAITING ON US — the old
                 // inline await never ran the keepalive check during that wait,
                 // so writing an ack extends the deadline to keep the tolerance.
                 deadline = grace.map(|g| Instant::now() + g);
             }
-            maybe_out = out_rx.recv() => {
+            // The socket write (issue #1117). Cancel-safe, so the other arms run while
+            // it waits on a peer that is not reading: above all the inbound one, which
+            // takes the PUBACKs and PINGREQs that peer may be blocked writing.
+            flushed = writer.flush_queued(), if writer.has_pending() => flushed?,
+            // The next batch is taken once the last one is wholly written, as when the
+            // flush was awaited in place; the socket buffer is the pipeline. A peer that
+            // never reads leaves the deliveries in the hub's backlog, where the hub's
+            // flow control and shedding see them, not in this connection's buffer.
+            maybe_out = out_rx.recv(), if !writer.has_pending() => {
                 // Acks already resolved leave BEFORE this outbound batch (ADR
                 // 0075): the hub releases a publish's ack before queueing its
                 // fan-out, so this preserves the old order — a message's own
                 // PUBACK precedes any delivery that followed from it.
-                if let Err(reason) = flush_ready_pubacks(
+                if let Err(reason) = queue_ready_pubacks(
                     writer,
                     &mut current,
                     &mut pending_pubacks,
                     &mut qos2_inflight,
                     is_v5,
                     client,
-                )
-                .await?
+                )?
                 {
                     rule_conn.closing(reason);
                     return Ok(false);
@@ -2863,9 +3000,9 @@ where
                 // Batch the whole current backlog into one write + flush (issue
                 // #443): `recv` woke us with one packet; drain the rest that are
                 // already queued with `try_recv`, encode them all onto the
-                // writer's buffer, and flush once. On small-message fan-out this
-                // is the difference between a syscall (and TLS record) per
-                // message and one per drain. Bounded so a client that can never
+                // writer's buffer, and let the write arm flush them once. On
+                // small-message fan-out this is the difference between a syscall
+                // (and TLS record) per message and one per drain. Bounded so a client that can never
                 // keep up cannot hold this loop or grow the buffer without limit;
                 // the single writer task still guarantees per-connection order.
                 let Some(mut out) = maybe_out else {
@@ -2962,7 +3099,6 @@ where
                         Err(_) => break,
                     }
                 }
-                writer.flush_queued().await?;
             }
             // While parked the socket is unread, so a client that hung up behind its
             // unread publishes would go unnoticed until credit frees (#825). The kernel
@@ -2973,7 +3109,32 @@ where
             () = async { watch.expect("branch guarded on is_some").closed().await },
                 if parked.is_some() && watch.is_some() => {
                 debug!(client = %client.0, "client closed while paused for ingress credit; closing");
+                writer.discard_queued();
                 return Ok(false);
+            }
+            // The write-stall bound (issue #1117): the peer has taken no bytes for
+            // `stall_bound` while the broker held bytes for it. Reading it on is
+            // pointless — it is not reading what it asked for — and every message in
+            // flight to it is pinned until it goes. Not while parked: the broker
+            // stopped reading this client, and a client that writes before it reads
+            // cannot read until it is read (resuming restarts the clock).
+            () = &mut stall, if writer.has_pending() && parked.is_none() => {
+                let due = writer.last_progress() + stall_bound;
+                if due > Instant::now() {
+                    stall.as_mut().reset(due);
+                } else {
+                    warn!(client = %client.0, keep_alive, pending = writer.pending_len(),
+                          stalled_for = ?stall_bound,
+                          "client accepted no bytes for the write-stall bound; closing connection");
+                    count_connection_error(policy, "write-stall");
+                    writer.discard_queued();
+                    // EMQX closes a socket whose send times out (its listeners'
+                    // `send_timeout`) with the socket error `timeout`, which
+                    // `client.disconnected` reports as is. Spelled out for the same
+                    // reason as the keepalive arm's: nothing is sent on the wire.
+                    rule_conn.closing("timeout");
+                    return Ok(false);
+                }
             }
             // Not while parked (ADR 0082 T3): a client the broker stopped reading cannot
             // be blamed for its silence. Resuming resets the deadline.
@@ -2986,6 +3147,8 @@ where
                     _ => {
                         debug!(client = %client.0, keep_alive, "keepalive expired; closing connection");
                         count_connection_error(policy, "keepalive");
+                        // A silent peer is gone: what it was owed is not written.
+                        writer.discard_queued();
                         // EMQX's name for 0x8D. Spelled out, not looked up from `reason::`: nothing is
                         // sent on the wire here, and scripts/check-reason-codes.py counts every
                         // `reason::` constant in conn.rs as a code the broker emits.
@@ -3004,7 +3167,7 @@ where
                 if writer.version() == ProtocolVersion::V5 {
                     // Best-effort: a write failure here just means the client is already
                     // gone, which the graceful close handles anyway.
-                    let _ = disconnect(writer, DISCONNECT_SERVER_SHUTTING_DOWN).await;
+                    let _ = disconnect(writer, DISCONNECT_SERVER_SHUTTING_DOWN);
                 }
                 // EMQX's word for a connection ended by the node going down: its
                 // channel exits `shutdown` (`emqx_rule_events:reason/1`).
@@ -3253,7 +3416,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     if is_v5 && publish.properties.has_subscription_identifier() {
         warn!(client = %client.0,
               "client PUBLISH carries a Subscription Identifier [MQTT-3.3.4-6]; DISCONNECT 0x82");
-        disconnect(writer, DISCONNECT_PROTOCOL_ERROR).await?;
+        disconnect(writer, DISCONNECT_PROTOCOL_ERROR)?;
         // A broker-initiated close (the client did not DISCONNECT): the Will fires.
         return Ok(PacketOutcome::closed_by(DISCONNECT_PROTOCOL_ERROR));
     }
@@ -3265,7 +3428,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
         // (DISCONNECT 0x94 Topic Alias Invalid, ADR 0011 §2) rather than a bare close. The
         // alias property is v5-only, so reaching here implies a v5 connection.
         warn!(client = %client.0, alias = ?alias, "invalid topic alias; DISCONNECT 0x94");
-        disconnect(writer, DISCONNECT_TOPIC_ALIAS_INVALID).await?;
+        disconnect(writer, DISCONNECT_TOPIC_ALIAS_INVALID)?;
         return Ok(PacketOutcome::closed_by(DISCONNECT_TOPIC_ALIAS_INVALID));
     };
     let Publish {
@@ -3475,7 +3638,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
             if is_v5 && *qos2_inflight >= wire_limits().receive_maximum as usize {
                 warn!(client = %client.0, limit = wire_limits().receive_maximum,
                       "QoS 1 publish beyond Receive Maximum; DISCONNECT 0x93");
-                disconnect(writer, DISCONNECT_RECEIVE_MAXIMUM_EXCEEDED).await?;
+                disconnect(writer, DISCONNECT_RECEIVE_MAXIMUM_EXCEEDED)?;
                 return Ok(PacketOutcome::closed_by(
                     DISCONNECT_RECEIVE_MAXIMUM_EXCEEDED,
                 ));
@@ -3524,7 +3687,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                 if let Err(reason) = apply_publish_outcome(&mut entry, outcome, is_v5, client) {
                     return Ok(PacketOutcome::BrokerClose(reason));
                 }
-                writer.send(&Packet::PubAck(entry.ack)).await?;
+                writer.queue(&Packet::PubAck(entry.ack))?;
             }
             *qos2_inflight += 1;
             pending_pubacks.push_back(PendingPuback {
@@ -3592,7 +3755,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                     warn!(client = %client.0, limit = wire_limits().receive_maximum,
                           "client exceeded Receive Maximum; DISCONNECT 0x93");
                     drop_qos2("receive_maximum_exceeded");
-                    disconnect(writer, DISCONNECT_RECEIVE_MAXIMUM_EXCEEDED).await?;
+                    disconnect(writer, DISCONNECT_RECEIVE_MAXIMUM_EXCEEDED)?;
                     return Ok(PacketOutcome::closed_by(
                         DISCONNECT_RECEIVE_MAXIMUM_EXCEEDED,
                     ));
@@ -3674,7 +3837,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
                     // record would make it look like a retry of a different message.
                     release_qos2_dedup(policy, qos2_inbound, client, id).await;
                 }
-                writer.send(&Packet::PubRec(rec)).await?;
+                writer.queue(&Packet::PubRec(rec))?;
                 return Ok(PacketOutcome::Continue);
             }
             // A publish already acknowledged and not yet released is not delivered
@@ -3685,7 +3848,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
             if !dup {
                 drop_qos2("packet_identifier_inuse");
             }
-            writer.send(&Packet::PubRec(id.into())).await?;
+            writer.queue(&Packet::PubRec(id.into()))?;
         }
         _ => debug!(client = %client.0, "dropping QoS>0 publish without packet id"),
     }
@@ -3887,7 +4050,7 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
             release_qos2_dedup(policy, qos2_inbound, client, id).await;
             // The QoS 2 id is released — free its Receive-Maximum slot (ADR 0012).
             *qos2_inflight = qos2_inflight.saturating_sub(1);
-            writer.send(&Packet::PubComp(id.into())).await?;
+            writer.queue(&Packet::PubComp(id.into()))?;
         }
         // Subscriber-side acknowledgements for our downstream deliveries.
         Packet::PubAck(ack) => {
@@ -4016,13 +4179,11 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                 .filter(|(_, code)| **code < 0x80)
                 .map(|(f, code)| (f.path.clone(), *code))
                 .collect();
-            writer
-                .send(&Packet::SubAck(SubAck {
-                    pkid: s.pkid,
-                    return_codes,
-                    properties: mqtt_codec::Properties::new(),
-                }))
-                .await?;
+            writer.queue(&Packet::SubAck(SubAck {
+                pkid: s.pkid,
+                return_codes,
+                properties: mqtt_codec::Properties::new(),
+            }))?;
             if let Some(rules) = rule_conn.wants(mqtt_rules::EventKind::SessionSubscribed) {
                 let info = rule_conn.client(rules, &client.0);
                 for (filter, qos) in subscribed {
@@ -4100,13 +4261,11 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                 .filter(|((_, code), _)| **code == 0x00)
                 .filter_map(|((f, _), qos)| qos.map(|q| (f.clone(), q)))
                 .collect();
-            writer
-                .send(&Packet::UnsubAck(mqtt_codec::packet::UnsubAck {
-                    pkid: u.pkid,
-                    reason_codes,
-                    properties: mqtt_codec::Properties::new(),
-                }))
-                .await?;
+            writer.queue(&Packet::UnsubAck(mqtt_codec::packet::UnsubAck {
+                pkid: u.pkid,
+                reason_codes,
+                properties: mqtt_codec::Properties::new(),
+            }))?;
             if let Some(rules) = rule_conn.wants(mqtt_rules::EventKind::SessionUnsubscribed) {
                 let info = rule_conn.client(rules, &client.0);
                 for (filter, qos) in removed {
@@ -4138,7 +4297,7 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                     hub,
                 );
             }
-            writer.send(&Packet::PingResp).await?;
+            writer.queue(&Packet::PingResp)?;
         }
         Packet::Disconnect(d) => {
             // Its properties are `disconn_props` on `client.disconnected`, however the
@@ -4158,7 +4317,7 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
                     // Post-CONNACK, so announce before closing [MQTT-4.13.2]. The
                     // override is NOT applied — the session still expires at once.
                     if is_v5 {
-                        let _ = disconnect(writer, reason::PROTOCOL_ERROR).await;
+                        let _ = disconnect(writer, reason::PROTOCOL_ERROR);
                     }
                     return Ok(PacketOutcome::closed_by(reason::PROTOCOL_ERROR));
                 }
