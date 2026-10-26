@@ -67,3 +67,10 @@ are built but have no isolated unit tests — they are exercised through the hub
   remaining-interval on delivery) verified built against hub and storage tests plus
   `v5_protocol.rs` e2e. P3 (durable disconnect-time deadline) confirmed not built and split
   out as a deferred §2 follow-up.
+- **2026-10-26** — Issue #1118 (a bug, no new task): the Session Expiry Interval is now
+  persisted with the session at connect, and an inherited record with no deadline is
+  expired `interval` (+10 s in a cluster) after the inherit, closing the §3 residual of
+  2026-08-14 and the crash-while-connected case. Tests
+  `session_expiry_restart::a_session_whose_connection_ended_in_a_crash_expires_after_restart`,
+  `hub::a_session_that_never_detached_expires_from_its_recorded_interval`, and the 1.2.0
+  decoder guard in `mqtt-storage` (`logged::compat_1_2_0`).

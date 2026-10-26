@@ -44,6 +44,7 @@ caller changes this file and the gate fails until it is regenerated and re-read.
 | `crates/mqttd/src/hub/mod.rs` | `enqueue_with_expiry` | `append-hold` | 10ms | helper, 8 call site(s) |
 | `crates/mqttd/src/hub/mod.rs` | `enqueue_with_expiry` | `write-delay` | ? | helper, 8 call site(s) |
 | `crates/mqttd/src/hub/mod.rs` | `publisher_wait` | `subscriber-ack-delay` | ? | helper, 4 call site(s) |
+| `crates/mqttd/src/hub/mod.rs` | `successor_hub` | `successor-scan-cadence` | EXPIRY_RECONCILE_EVERY | helper, 3 call site(s) |
 | `crates/mqttd/src/hub/mod.rs` | `enqueue_with_expiry` | `store-slow-first-enqueue` | ? | helper, 8 call site(s) |
 | `crates/mqttd/src/hub/mod.rs` | `an_uncongested_relaxed_forward_is_answered_at_submit` | `early-verdict-uniqueness` | 100ms | in the test itself |
 | `crates/mqttd/src/hub/mod.rs` | `the_durability_property_is_inert_without_the_operator_opt_in` | `inert-property-negative-window` | 300ms | in the test itself |
@@ -53,7 +54,7 @@ caller changes this file and the gate fails until it is regenerated and re-read.
 | `crates/mqttd/tests/cluster.rs` | `retained_mqtt5_properties_replay_from_any_nodes_cache` | `cluster-sever-eof-props` | 400ms | in the test itself |
 | `crates/mqttd/tests/cluster.rs` | `divergent_retained_writes_across_a_partition_converge_after_heal` | `cluster-sever-eof-divergent` | 400ms | in the test itself |
 | `crates/mqttd/tests/common/mod.rs` | `send_fragmented` | `wire-fragment-gap` | ? | helper, 1 call site(s) |
-| `crates/mqttd/tests/common/mod.rs` | `all_sessions` | `scan-hold` | 20ms | helper, 3 call site(s) |
+| `crates/mqttd/tests/common/mod.rs` | `all_sessions` | `scan-hold` | 20ms | helper, 7 call site(s) |
 | `crates/mqttd/tests/durable_bench.rs` | `run_arm` | `bench-offline-detach` | 500ms | helper, 1 call site(s) |
 | `crates/mqttd/tests/durable_bench.rs` | `durable_path_floor` | `bench-inter-arm-quiesce` | 2s | in the test itself |
 | `crates/mqttd/tests/durable_sessions.rs` | `lease_group_forms_and_is_stable_under_slow_durable_commits` | `lease-term-stability-window` | 5s | in the test itself |
@@ -81,4 +82,4 @@ caller changes this file and the gate fails until it is regenerated and re-read.
 | `crates/mqttd/tests/v5_protocol.rs` | `v5_session_expires_after_interval` | `v5-session-expiry-wire` | 4s | in the test itself |
 | `crates/mqttd/tests/v5_protocol.rs` | `v5_disconnect_session_expiry_overrides_the_connect_value` | `v5-disconnect-expiry-override` | 4s | in the test itself |
 | `crates/mqttd/tests/wire.rs` | `a_split_between_the_type_byte_and_the_length_is_parsed` | `wire-split-read-events` | 50ms | in the test itself |
-| `crates/mqttd/tests/write_stall.rs` | `ping` | `ping-cadence` | ? | helper, 65 call site(s) |
+| `crates/mqttd/tests/write_stall.rs` | `ping` | `ping-cadence` | ? | helper, 68 call site(s) |

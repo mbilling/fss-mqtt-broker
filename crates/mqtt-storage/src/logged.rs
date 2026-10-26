@@ -42,8 +42,8 @@
 
 use crate::repl::{ReplError, ReplicatedLog};
 use crate::{
-    Enqueued, InboundSighting, OutboundInflight, QueueLimits, QueuedMessage, SessionClaim,
-    SessionExport, SessionExportScan, SessionScan, SessionStore, StorageError,
+    Enqueued, InboundSighting, OutboundInflight, QueueLimits, QueuedMessage, ScannedSession,
+    SessionClaim, SessionExport, SessionExportScan, SessionScan, SessionStore, StorageError,
 };
 use async_trait::async_trait;
 use mqtt_core::{ClientId, Message, QoS, Subscription};
@@ -181,6 +181,8 @@ impl<L: ReplicatedLog<Key = String>> ReplicatedSessionStore<L> {
     }
 }
 
+#[cfg(test)]
+mod compat_1_2_0;
 #[cfg(test)]
 mod metadata_concurrency;
 
@@ -576,6 +578,19 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
         self.store_meta(client, &meta).await
     }
 
+    async fn set_session_lifetime(
+        &self,
+        client: &ClientId,
+        interval: u32,
+        deadline: Option<u64>,
+    ) -> Result<(), StorageError> {
+        let _guard = self.lock_meta(client).await;
+        let mut meta = self.load_meta(client).await?.unwrap_or_default();
+        meta.session_expiry_at = deadline;
+        meta.session_expiry_interval = Some(interval);
+        self.store_meta(client, &meta).await
+    }
+
     async fn expiring_sessions(&self) -> Result<Vec<(ClientId, u64)>, StorageError> {
         // Enumerate the metadata keys this node holds (`m/{client}`) and return those with
         // a persisted deadline. Off the hot path — used at takeover to inherit expiries.
@@ -620,7 +635,12 @@ impl<L: ReplicatedLog<Key = String>> SessionStore for ReplicatedSessionStore<L> 
             // gossip an interest snapshot built from it). Reading an OWNED key
             // eagerly recovers its cold group — intended.
             match self.load_meta(&client).await {
-                Ok(Some(meta)) => out.push((client, meta.subscriptions, meta.session_expiry_at)),
+                Ok(Some(meta)) => out.push(ScannedSession {
+                    client,
+                    subscriptions: meta.subscriptions,
+                    expiry_at: meta.session_expiry_at,
+                    expiry_interval: meta.session_expiry_interval,
+                }),
                 Ok(None) | Err(StorageError::NotOwner) => {}
                 Err(e) => {
                     complete = false;
@@ -812,6 +832,15 @@ struct SessionMeta {
     /// entirely — degrading to the #238 `QoS` 2 bug for the duration of a downgrade, never
     /// to corruption. That is the rollback trade, and it is named in the ADR.
     unacked_received_qos2: BTreeSet<u16>,
+    /// The Session Expiry Interval of the session's last connection, in seconds
+    /// (`u32::MAX` = never), written at connect beside the cleared deadline (issue
+    /// #1118). `None` = unknown: a record written before the field (1.2.0 and earlier).
+    ///
+    /// The LAST tail, after the sub-id block. When it is present the two conditional
+    /// blocks before it are forced present (counts may be 0), so a decoder still reads
+    /// every tail strictly in order; a 1.2.0 decoder reads those empty blocks as
+    /// "nothing unacked, no ids" — what they mean — and ignores the 4 trailing bytes.
+    session_expiry_interval: Option<u32>,
 }
 
 fn qos_to_u8(q: QoS) -> u8 {
@@ -965,7 +994,8 @@ fn encode_session_meta(m: &SessionMeta) -> Vec<u8> {
     // wrote, so nothing about the common record changes. An older record ends before this
     // and decodes with every held id treated as ACKED — the pre-#238 behaviour.
     let has_sub_ids = m.subscriptions.iter().any(|s| s.sub_id.is_some());
-    if !m.unacked_received_qos2.is_empty() || has_sub_ids {
+    let has_interval = m.session_expiry_interval.is_some();
+    if !m.unacked_received_qos2.is_empty() || has_sub_ids || has_interval {
         // The unacked block is FORCED present (count may be 0) whenever the
         // sub-id block follows, so the two conditional tails stay deterministically
         // distinguishable — a decoder reads them strictly in order.
@@ -979,7 +1009,7 @@ fn encode_session_meta(m: &SessionMeta) -> Vec<u8> {
     // session whose subscriptions carry no ids encodes byte-identically to the
     // pre-#266 record. An older build ignores unread trailing bytes, so rollback
     // loses the ids (deliveries revert to id-less) and never corrupts.
-    if has_sub_ids {
+    if has_sub_ids || has_interval {
         let with: Vec<_> = m
             .subscriptions
             .iter()
@@ -991,6 +1021,14 @@ fn encode_session_meta(m: &SessionMeta) -> Vec<u8> {
             put_str(&mut out, f);
             out.extend_from_slice(&id.to_be_bytes());
         }
+    }
+    // Appended after the sub-id block (issue #1118), ONLY when known; both blocks before
+    // it are then forced present, so the read order stays deterministic. An older build
+    // ignores the unread trailing bytes: a rollback loses the interval and the session
+    // reverts to the pre-#1118 handling of a record without a deadline, never to
+    // corruption.
+    if let Some(interval) = m.session_expiry_interval {
+        out.extend_from_slice(&interval.to_be_bytes());
     }
     out
 }
@@ -1188,6 +1226,9 @@ fn decode_session_meta(buf: &[u8]) -> Result<SessionMeta, StorageError> {
             }
         }
     }
+    // The expiry-interval tail (issue #1118): a record written before it ends here, and
+    // its interval is unknown.
+    let session_expiry_interval = if r.is_empty() { None } else { Some(r.u32()?) };
     Ok(SessionMeta {
         subscriptions,
         received_qos2,
@@ -1196,6 +1237,7 @@ fn decode_session_meta(buf: &[u8]) -> Result<SessionMeta, StorageError> {
         owner,
         outbound_qos2,
         unacked_received_qos2,
+        session_expiry_interval,
     })
 }
 
@@ -1928,6 +1970,7 @@ mod tests {
             owner: Some("subject".into()),
             outbound_qos2: [(9u16, (100u64, true))].into_iter().collect(),
             unacked_received_qos2: BTreeSet::new(),
+            session_expiry_interval: None,
         };
         let without = encode_session_meta(&base);
 
@@ -1942,6 +1985,7 @@ mod tests {
                 owner: base.owner.clone(),
                 outbound_qos2: base.outbound_qos2.clone(),
                 unacked_received_qos2: BTreeSet::new(),
+                session_expiry_interval: None,
             }
         };
         let encoded_with = encode_session_meta(&with);
@@ -2016,6 +2060,7 @@ mod tests {
             owner: None,
             outbound_qos2: BTreeMap::new(),
             unacked_received_qos2: BTreeSet::new(),
+            session_expiry_interval: None,
         };
         // (a) round-trip, per filter; id-less stays None.
         let encoded = encode_session_meta(&meta(true));

@@ -3041,7 +3041,7 @@ mod zone_fwd_proofs {
             let (id, _rx) = register(&mut h, "t/x");
             h.pending_publishes.get_mut(id).unwrap().reroute_grace = Some(REROUTE_GRACE_TICKS);
             let sessions = if materialized {
-                vec![(
+                vec![mqtt_storage::ScannedSession::new(
                     ClientId("moved".into()),
                     vec![mqtt_core::Subscription {
                         filter: "t/x".into(),
@@ -3577,8 +3577,8 @@ mod zone_fwd_proofs {
     }
 
     /// One session to materialise on this node, subscribed to `t/x`.
-    fn a_session_for_t_x() -> Vec<(ClientId, Vec<mqtt_core::Subscription>, Option<u64>)> {
-        vec![(
+    fn a_session_for_t_x() -> Vec<mqtt_storage::ScannedSession> {
+        vec![mqtt_storage::ScannedSession::new(
             ClientId("moved".into()),
             vec![mqtt_core::Subscription {
                 filter: "t/x".into(),
