@@ -51,6 +51,14 @@ old rig. `KEEP_INFRA=1` skips the teardown and says so; destroy later with
 `bench/scale/teardown.sh`. The runner refuses to apply while `../terraform`'s state still
 tracks servers (another run, or a leak).
 
+Ctrl-C or a TERM to `run.sh` tears down at once, whatever the run is doing: every long
+child (tofu, the bootstrap, each ladder) runs as a background job under `wait`, which a
+signal interrupts, while bash holds a trap back until a foreground child returns (on the
+first 10-node run a TERM waited behind the ladder until the fleet was torn down by hand).
+The trap stops the run's children (TERM, `CHILD_GRACE` s, default 60, then KILL; a
+TERMed tofu writes its state first), then destroys; a second Ctrl-C does not interrupt
+the teardown. `kill -9` still leaves the fleet up.
+
 Expected duration and price (estimate: about 9 steps per ladder at about 135 s each plus
 the priming run, 10 to 14 minutes of bring-up, 3 of teardown; the real step count
 depends on where the knee is, on transient retries and on how long the settles take):
@@ -151,7 +159,15 @@ run keeps them out.
 
 ## A step
 
-1. **The settle.** Every broker is scraped every 5 s (`verdict.py idle`). The step starts
+1. **The settle.** Every broker is scraped every `SETTLE_POLL` (5) s (`verdict.py idle`),
+   all of them together: in the cloud one ssh to generator host 0 curls every broker's
+   `/metrics` over the private network, and a broker that pass missed is asked again over
+   its own ssh (`SSH_PAR`, 5, at a time). A pass that still misses a broker is unknown: it
+   neither confirms nor restarts the quiet period, and the next complete pass is compared
+   with the last complete one. Budgets and the quiet period are wall-clock seconds. (On the
+   first 10-node run, ten scrapes in a row over ssh took 10-15 s a pass, a single failed
+   one restarted the quiet period, and the cluster, idle throughout, never settled.) A
+   broker that never answered within the budget is named in the VOID's reasons. The step starts
    when the cluster holds no connections (`IDLE_FLOOR`), its session count is back to the
    run's baseline (scraped on the fresh cluster before the first ladder; mqtt-load ends its
    durable sessions with expiry 0, so a clean step leaves none), and nothing is in the
@@ -299,4 +315,6 @@ states it.
 - **Calibration against emqtt-bench** is 0090-T2.
 
 Tests: `python3 bench/scale/rig2/test-verdict.py` (offline; CI runs it; it includes
-`chart-ramp.py --self-test`).
+`chart-ramp.py --self-test`) and `python3 bench/scale/rig2/test-run-sh.py` (offline; CI
+runs it): the real `run.sh` at `TIER=local` against fake brokers, for a flaky scrape, the
+wall-clock budget, a broker that never answers, and a TERM mid-step.

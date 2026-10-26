@@ -1714,6 +1714,15 @@ requires = ["python3"]
 hidden = true
 
 [[task]]
+id = "rig2-run-sh-tests"
+group = "Benchmark"
+name = "Offline tests of the rig2 run.sh settle and signal handling"
+script = "bench/scale/rig2/test-run-sh.py"
+about = "Runs the real run.sh at TIER=local against fake brokers in this process (flaky, stalled, busy); stub mqttd, mqtt-load and local cluster. Invoked by CI with python3."
+requires = ["python3", "curl", "git"]
+hidden = true
+
+[[task]]
 id = "scale-teardown"
 group = "Benchmark"
 name = "Destroy any leftover scale-curve cloud resources"
