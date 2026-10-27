@@ -172,6 +172,13 @@ class Verdicts(unittest.TestCase):
         self.assertTrue(any(x.startswith("generator 2's ack p99 291.0 ms is far above the other generators' (median")
                             for x in v["voids"]), v["voids"])
 
+    def test_a_few_ms_between_healthy_hosts_is_not_divergence(self):
+        # 225k QoS 0 on 2026-10-27: 2.1, 2.3, 12.8 and 20.9 ms. No band is within reach.
+        gens = [summary(7500, p99_us=p) for p in (2_100, 2_300, 12_800, 20_900)]
+        v = verdict_of(make_step(self.root, 30000, gens))
+        self.assertEqual(v["verdict"], V.CARRIED, v)
+        self.assertEqual(v["harness_generators"], [])
+
     def test_generators_that_agree_do_not_diverge_even_at_a_high_p99(self):
         # The cluster at its knee slows every generator alike.
         gens = [summary(10000, p99_us=400_000), summary(10000, p99_us=900_000), summary(10000, p99_us=600_000)]
