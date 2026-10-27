@@ -19,7 +19,8 @@ Everything is judged from the broker's side (D1):
   measured window (mqtt-load `generator.saturated`), a generator produced no summary, the
   generators' measured windows do not overlap, a broker of the run has no scrapes of the
   step (its fetch failed) or its scrapes do not cover the window, or the cluster was not
-  idle when the step started. The brokers' rates are a cluster's only when every broker
+  idle when the step started (unreset: VOID even over a loss finding, which stays
+  listed, since residue of the step before can cause it). The brokers' rates are a cluster's only when every broker
   has a usable window; a partial sum is never judged against the offer. A VOID step is rerun; it
   never counts against the broker.
 - **DISCONNECTED**: connections were lost during the step (mqtt-load outcome `error`).
@@ -63,6 +64,7 @@ import json
 import math
 import re
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -330,18 +332,46 @@ HUB_QUEUE_IDLE = 8
 # catch-up write through the durable writer).
 QUIET_COUNTERS = ("mqttd_publish_received_total", "mqttd_publish_delivered_total",
                   "mqttd_publish_forwarded_total", "mqttd_durable_writer_ops_total")
+# ...but a counter ticking at a background rate does not hold the settle: at most
+# QUIET_FRACTION of the coming step's msg/s, and never less than QUIET_FLOOR per second,
+# summed over the cluster, between two complete passes. 0.1 % of the step is 30x below
+# the ramp's resolution (GAP_PCT, 3 %) and far below the rig's run-to-run noise (~15 %).
+# The floor covers an idle cluster's own housekeeping on a small step: on the 10-node run
+# of 2026-10-27 the durable writer did 0 to 110 ops in five minutes of settle (at most
+# 22/s, had they all fallen into one 5 s pass). A real drain is far above both: the
+# writer's tail after a durable step ran at 15,000/s, then 4,000, 520, 360 and 220/s in
+# its last 2 s scrapes, and a drain of deliveries runs at the step's own rate. Work still
+# in the pipes (lanes, pending publishes, inflight, backlog, peer frames) is held by the
+# BUSY_GAUGES whatever the counters do.
+QUIET_FRACTION = 0.001
+QUIET_FLOOR = 20.0
+# mqttd_routing_unsettled{reason="scan"}: a session scan is running. Under a durable
+# plane every broker runs one every ~30 s, for under a second; ten brokers make a pass
+# see one of them about 30 % of the time (the 2026-10-27 run: 215 of 755 cluster-wide
+# scrapes), so treating it as unsettled held a 30 s quiet period off for minutes (six
+# clean passes in a row: 13 %). A scan is background, not settling: it holds the settle
+# only when the same broker is still scanning on the next pass (a stuck scan). The
+# other terms (takeover, scan-incomplete, interest, mesh) hold it on any pass.
+SCAN_REASON = "scan"
+
+
+def quiet_allowance(step_rate: float | None) -> float:
+    """Ops/s a quiet counter may move at between two passes without holding the settle."""
+    return max(QUIET_FLOOR, QUIET_FRACTION * (step_rate or 0.0))
 
 
 def idle_state(paths: list[Path]) -> dict:
     """Cluster sums of the residue and busy gauges and of the quiet counters, the hub
     queue, and per broker: placement groups holding fewer copies than desired
     (mqttd_replication_min_actual < _desired), replication lag in groups
-    (mqttd_replica_groups_tracked - _current) and a routing view still settling
-    (any mqttd_routing_unsettled term at 1). A cluster still re-replicating, catching up
-    or settling after formation or a previous step is not ready for the next one."""
+    (mqttd_replica_groups_tracked - _current), a routing view still settling (any
+    mqttd_routing_unsettled term but `scan` at 1) and a session scan running (`scan`
+    at 1, in `scanning`). A cluster still re-replicating, catching up or settling after
+    formation or a previous step is not ready for the next one."""
     tot: dict = {g: 0.0 for g in IDLE_GAUGES + BUSY_GAUGES + QUIET_COUNTERS}
     tot["mqttd_hub_queue_depth"] = 0.0
     tot["under_replicated"], tot["routing_unsettled"], tot["replication_lag"] = [], [], {}
+    tot["scanning"] = []
     for p in paths:
         parsed = E.parse_prom(p)
         for g in (*IDLE_GAUGES, *BUSY_GAUGES, *QUIET_COUNTERS, "mqttd_hub_queue_depth"):
@@ -352,20 +382,28 @@ def idle_state(paths: list[Path]) -> dict:
         tracked, current = parsed.get(("mqttd_replica_groups_tracked", "")), parsed.get(("mqttd_replica_groups_current", ""))
         if tracked is not None and current is not None and current < tracked:
             tot["replication_lag"][p.stem] = tracked - current
-        if E.sum_family(parsed, "mqttd_routing_unsettled") > 0:
+        terms = E.by_label(parsed, "mqttd_routing_unsettled", "reason")
+        if any(v > 0 for r, v in terms.items() if r != SCAN_REASON):
             tot["routing_unsettled"].append(p.stem)
+        if terms.get(SCAN_REASON, 0.0) > 0:
+            tot["scanning"].append(p.stem)
     return tot
 
 
-def not_idle(state: dict, floor: float, baseline_sessions: float = 0.0, prev: dict | None = None) -> list[str]:
+def not_idle(state: dict, floor: float, baseline_sessions: float = 0.0, prev: dict | None = None,
+             step_rate: float | None = None) -> list[str]:
     """Why the cluster is not settled (empty when it is). `baseline_sessions` is the
-    session count the run started with; `prev`, the state of the previous scrape, makes
-    any movement of the QUIET_COUNTERS since then a reason.
+    session count the run started with; `prev`, the state of the previous complete
+    scrape pass, makes movement of the QUIET_COUNTERS since then a reason, unless it was
+    at a background rate (`quiet_allowance(step_rate)` per second, when both states
+    carry their time `at_unix_s`; without times any movement is a reason). Movement
+    below the allowance is listed in `state["background"]`.
 
     Replication lag (groups tracked but not caught up) holds the settle while it moves:
     without `prev`, or when it differs from `prev`'s. A lag that stood still since the
     previous scrape is not catching up with anything and is left to the record (a local
-    3-node cluster held 72 groups behind on one node, at idle, for minutes)."""
+    3-node cluster held 72 groups behind on one node, at idle, for minutes). A session
+    scan (`scanning`) holds it only when the same broker was scanning in `prev` too."""
     why = []
     if state["mqttd_connections_active"] > floor:
         why.append(f"connections {state['mqttd_connections_active']:.0f} > {floor:g}")
@@ -385,14 +423,34 @@ def not_idle(state: dict, floor: float, baseline_sessions: float = 0.0, prev: di
     if lag and (prev is None or (prev.get("replication_lag") or {}) != lag):
         why.append("replication catching up: " + ", ".join(f"{b} {n:.0f} groups behind" for b, n in sorted(lag.items())))
     if prev is not None:
-        moved = [g.removeprefix("mqttd_") for g in QUIET_COUNTERS if state.get(g, 0.0) != prev.get(g, 0.0)]
+        stuck = sorted(set(state.get("scanning") or []) & set(prev.get("scanning") or []))
+        if stuck:
+            why.append(f"session scan still running on {', '.join(stuck)} (two passes in a row)")
+        t0, t1 = prev.get("at_unix_s"), state.get("at_unix_s")
+        dt = t1 - t0 if (t0 is not None and t1 is not None and t1 > t0) else None
+        allowed = quiet_allowance(step_rate)
+        moved, background = [], []
+        for g in QUIET_COUNTERS:
+            d = state.get(g, 0.0) - prev.get(g, 0.0)
+            if d == 0:
+                continue
+            name = g.removeprefix("mqttd_")
+            if dt is None:
+                moved.append(f"{name} moved by {d:.0f}")
+            elif abs(d) / dt > allowed:
+                moved.append(f"{name} moved by {d:.0f} in {dt:.1f} s ({abs(d) / dt:.0f}/s > {allowed:.0f}/s allowed)")
+            else:
+                background.append(f"{name} +{d:.0f} in {dt:.1f} s ({abs(d) / dt:.1f}/s, background)")
         if moved:
-            why.append("not quiet: " + ", ".join(moved) + " moved")
+            why.append("not quiet: " + "; ".join(moved))
+        if background:
+            state["background"] = background
     return why
 
 
-def is_idle(state: dict, floor: float, baseline_sessions: float = 0.0, prev: dict | None = None) -> bool:
-    return not not_idle(state, floor, baseline_sessions, prev)
+def is_idle(state: dict, floor: float, baseline_sessions: float = 0.0, prev: dict | None = None,
+            step_rate: float | None = None) -> bool:
+    return not not_idle(state, floor, baseline_sessions, prev, step_rate)
 
 
 # ── one step ────────────────────────────────────────────────────────────────────────
@@ -512,14 +570,21 @@ def judge(step: Path, cfg: dict | None = None) -> dict:
             continue
         gens.append((g, s, code))
     idle = meta.get("idle_before")
-    if idle is not None and not idle.get("idle", False):
+    unreset = idle is not None and not idle.get("idle", False)
+    if unreset:
         st_ = idle.get("state") or {}
         why = "; ".join(st_.get("why_not") or []) if isinstance(st_, dict) else ""
         out["voids"].append(f"the cluster was not settled when the step started, after {idle.get('waited_s', '?')} s "
-                            f"({why or st_})")
+                            f"({why or 'no reason recorded'})")
 
     out["generators"] = []
     for g, s, code in gens:
+        st_ = s.get("start") or {}
+        if st_.get("by") in ("late", "timeout"):
+            out["notes"].append(f"generator {g} missed the shared start: "
+                                + (f"it named a time {st_.get('late_ms')} ms past" if st_["by"] == "late"
+                                   else f"none came in {st_.get('waited_s', 0):.1f} s")
+                                + ", so it started on its own")
         h = generator_health(s)
         h.update(generator=g, exit=code, ledger=s["ledger"], errors=s["errors"],
                  offered_rate=s["phases"][0]["offered_rate"], sent_rate=s["phases"][0]["sent_rate"],
@@ -603,6 +668,12 @@ def judge(step: Path, cfg: dict | None = None) -> dict:
         out["voids"].append(f"no {gate} latency samples")
     else:
         verdict = CARRIED
+    if unreset and verdict != VOID:
+        # A step that started on an unsettled cluster is VOID whatever it measured, loss
+        # included: residue of the step before can cause what it shows. Its findings
+        # stay listed; the rerun after a full settle decides.
+        out["notes"].append(f"would have been {verdict} on a settled cluster; VOID because it started unsettled")
+        verdict = VOID
     out["verdict"] = verdict
     # Good for the ramp: carried, whatever its latency. A lossless step above 1 s is
     # still a step the cluster carried; the latency bands are the report's business.
@@ -920,7 +991,9 @@ def main(argv: list[str]) -> int:
     i = sub.add_parser("idle")
     i.add_argument("--floor", type=float, default=0)
     i.add_argument("--baseline-sessions", type=float, default=0)
-    i.add_argument("--prev", help="the previous scrape's state (JSON, as this prints): the quiet counters must not have moved")
+    i.add_argument("--prev", help="the previous scrape's state (JSON, as this prints): the quiet counters must not "
+                   "have moved faster than the background allowance")
+    i.add_argument("--step-rate", type=float, help="msg/s of the step to come: sets the background allowance")
     i.add_argument("scrapes", nargs="+")
     c = sub.add_parser("cost")
     c.add_argument("--tier", required=True, choices=sorted(TIERS))
@@ -956,13 +1029,14 @@ def main(argv: list[str]) -> int:
         return 0
     if a.cmd == "idle":
         st = idle_state([Path(p) for p in a.scrapes])
+        st["at_unix_s"] = round(time.time(), 3)
         prev = None
         if a.prev:
             try:
                 prev = json.loads(Path(a.prev).read_text())
             except (OSError, ValueError):
                 prev = None
-        st["why_not"] = not_idle(st, a.floor, a.baseline_sessions, prev)
+        st["why_not"] = not_idle(st, a.floor, a.baseline_sessions, prev, a.step_rate)
         print(json.dumps(st))
         return 0 if not st["why_not"] else 1
     if a.cmd == "cost":

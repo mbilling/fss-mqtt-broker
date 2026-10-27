@@ -182,6 +182,79 @@ async fn qos0_clean_fanout_run_closes_its_ledger() {
     assert_eq!(s.ledger.expected, 1500);
 }
 
+/// Two generator processes' worth of runs share one start through the ready/start
+/// files, although one of them starts connecting only once the other is ready: their schedules start
+/// within milliseconds of each other and of the time the "rig" named, so their
+/// measured windows coincide (the 10-node run of 2026-10-27 lost a step to windows
+/// that overlapped 51.6 s of 60).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn generators_share_a_start_through_the_start_file() {
+    let dir = common::TempDir::new();
+    let broker = spawn_broker(dir.path()).await;
+    let gen = |g: usize| {
+        let mut c = workload(broker.client, 200.0, 4);
+        c.qos = 1;
+        c.topics = 2;
+        c.shape = Shape::Share;
+        c.consumers = 1;
+        c.sessions = Sessions::Clean;
+        c.topic_prefix = format!("sync/g{g}");
+        c.client_prefix = Some(format!("sync-g{g}"));
+        c.ready_file = Some(dir.path().join(format!("gen-{g}.ready")));
+        c.start_file = Some(dir.path().join(format!("gen-{g}.start")));
+        c.start_wait_ns = 20_000_000_000;
+        c
+    };
+    let (c0, c1) = (gen(0), gen(1));
+    let ready = [
+        c0.ready_file.clone().unwrap(),
+        c1.ready_file.clone().unwrap(),
+    ];
+    let starts = [
+        c0.start_file.clone().unwrap(),
+        c1.start_file.clone().unwrap(),
+    ];
+    // Generator 1 starts only once generator 0 is connected and waiting: the slow one.
+    let g0 = tokio::spawn(mqtt_load::run(c0));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !ready[0].is_file() {
+        assert!(Instant::now() < deadline, "generator 0 never got ready");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let g1 = tokio::spawn(mqtt_load::run(c1));
+    // The rig: every generator ready (bounded poll), then one start 500 ms ahead.
+    while !ready.iter().all(|p| p.is_file()) {
+        assert!(Instant::now() < deadline, "the generators never got ready");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let at = mqtt_load::start::unix_ms_now() + 500;
+    for p in &starts {
+        mqtt_load::start::write_atomic(p, &format!("{at}\n")).unwrap();
+    }
+    let s0 = g0.await.unwrap().expect("run 0");
+    let s1 = g1.await.unwrap().expect("run 1");
+    for s in [&s0, &s1] {
+        assert_closed(s, &broker);
+        assert_eq!(s.start.by, "shared", "{:?}", s.start);
+        assert_eq!(s.start.requested_unix_ms, Some(at));
+        // The process clock maps onto the wall clock within a few ms.
+        assert!(
+            s.schedule_start_unix_ms.abs_diff(at) <= 25,
+            "{} vs {at}",
+            s.schedule_start_unix_ms
+        );
+    }
+    // Generator 0 waited for generator 1's connections and the lead, generator 1 only
+    // for the lead.
+    assert!(
+        s0.start.waited_s > s1.start.waited_s,
+        "{:?} {:?}",
+        s0.start,
+        s1.start
+    );
+    assert!(s0.started_unix_ms <= s1.started_unix_ms);
+}
+
 /// A TCP proxy that holds every chunk for `delay` in each direction, in order, and —
 /// with `cut_after` — closes a connection once it has forwarded that many bytes from
 /// the broker to the client.

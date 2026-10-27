@@ -100,9 +100,12 @@ MARGIN_S="${MARGIN_S:-$DEF_MARGIN}"
 # Between steps, the settle (verdict.py idle): no connections (<= IDLE_FLOOR), sessions
 # back to the run's baseline, nothing in the append lanes, the pending-publish table,
 # the delivery inflight or backlog, or on the peer links, no placement group under-
-# replicated, replication not still catching up, routing settled; then SETTLE_QUIET s more of the same with the
-# traffic and durable-writer counters standing still. Within RESET_BUDGET s, or the step
-# is VOID (unreset) and the reasons are recorded. After a step that was not carried, and
+# replicated, replication not still catching up, routing settled (a periodic session scan
+# is not settling; one still running on the next pass is); then SETTLE_QUIET s more of the
+# same with the traffic and durable-writer counters standing still, or ticking no faster
+# than a background allowance (verdict.py QUIET_FRACTION of the step's msg/s, at least
+# QUIET_FLOOR per second). Within RESET_BUDGET s, or the step runs and is VOID (unreset),
+# whatever it measured, and the reasons are recorded. After a step that was not carried, and
 # before a ladder's first step, the budget is SETTLE_BUDGET_LONG and the quiet period
 # SETTLE_QUIET_LONG (sessions expiring, replication catching up).
 IDLE_FLOOR="${IDLE_FLOOR:-0}"
@@ -110,6 +113,15 @@ RESET_BUDGET="${RESET_BUDGET:-120}"
 SETTLE_QUIET="${SETTLE_QUIET:-10}"
 SETTLE_BUDGET_LONG="${SETTLE_BUDGET_LONG:-300}"
 SETTLE_QUIET_LONG="${SETTLE_QUIET_LONG:-30}"
+# One start for every generator: each mqtt-load writes a ready file once its clients are
+# connected and waits for a start file; when every generator is ready (or START_SYNC_WAIT
+# s have passed) the rig writes one start, START_LEAD_MS ahead on generator host 0's
+# clock, into every start file. A generator that connected 8.6 s after the others on the
+# 10-node run (clean-qos1 303,800) left windows overlapping 51.6 s of 60: VOID. One that
+# is not ready in time starts on its own when it is (mqtt-load --start-wait), and the
+# judge's overlap check decides.
+START_SYNC_WAIT="${START_SYNC_WAIT:-30}"
+if [ "$TIER" = local ]; then START_LEAD_MS="${START_LEAD_MS:-500}"; else START_LEAD_MS="${START_LEAD_MS:-3000}"; fi
 # For the price quote: steps a ladder is expected to take (coarse climb + bisection).
 EST_STEPS="${EST_STEPS:-9}"
 
@@ -453,17 +465,23 @@ scrape_once_all() {
 	rm -rf "$SCRAPE_TMP" "$d/.missing"
 }
 
-# await_idle <step-dir> <budget-s> <quiet-s>: settle, then print the record as JSON.
-# Budget and quiet are wall-clock seconds since the call. A pass that missed a broker
-# is UNKNOWN: it neither confirms the quiet period nor restarts it, and the next
-# complete pass is compared with the last complete one, so a counter that moved in
-# between still shows. Only a complete pass that is not idle restarts the quiet period.
-# A broker that never answered within the budget is named in the VOID's reasons.
+# await_idle <step-dir> <budget-s> <quiet-s> <step msg/s> <on-fail>: settle, then print
+# the record as JSON. Budget and quiet are wall-clock seconds since the call. A pass that
+# missed a broker is UNKNOWN: it neither confirms the quiet period nor restarts it, and
+# the next complete pass is compared with the last complete one, so a counter that moved
+# in between still shows. Only a complete pass that is not idle restarts the quiet
+# period. A counter ticking below verdict.py's background allowance (0.1 % of <step
+# msg/s>, at least 20/s) does not. Every pass is logged to <step-dir>/pre/passes.jsonl,
+# and a settle that runs out of budget names what held it: the last pass's reasons,
+# or, when that pass was idle, the last pass that restarted the quiet period. A broker
+# that never answered within the budget is named in the VOID's reasons. <on-fail> ends
+# the warning: what happens next.
 await_idle() {
-	local d="$1/pre" budget="$2" quiet="$3" t0=$SECONDS t state since=-1 prev="" rc i passes=0 unknown=0
+	local d="$1/pre" budget="$2" quiet="$3" step_rate="$4" on_fail="$5" t0=$SECONDS t state since=-1 prev="" rc i passes=0 unknown=0
 	local -a answered=() missed=()
 	for ((i = 0; i < BROKERS; i++)); do answered+=(0) missed+=(0); done
 	mkdir -p "$d"
+	: >"$d/passes.jsonl"
 	while :; do
 		t=$((SECONDS - t0))
 		passes=$((passes + 1))
@@ -472,10 +490,11 @@ await_idle() {
 			for ((i = 0; i < BROKERS; i++)); do answered[i]=1; done
 			rc=0
 			state=$(python3 "$RIG2/verdict.py" idle --floor "$IDLE_FLOOR" --baseline-sessions "$BASELINE_SESSIONS" \
-				${prev:+--prev "$prev"} "$d"/broker-*.prom) || rc=$?
+				--step-rate "$step_rate" ${prev:+--prev "$prev"} "$d"/broker-*.prom) || rc=$?
 			if [ -z "$state" ]; then
 				warn "verdict.py idle printed nothing (exit $rc) — this pass counts as unknown"
 				unknown=$((unknown + 1))
+				printf '{"t": %d, "unknown": "verdict.py idle printed nothing (exit %d)"}\n' "$t" "$rc" >>"$d/passes.jsonl"
 			else
 				if [ "$rc" = 0 ]; then
 					[ "$since" -ge 0 ] || since=$t
@@ -484,6 +503,7 @@ await_idle() {
 				fi
 				prev="$d/state.json"
 				printf '%s\n' "$state" >"$prev.tmp" && mv -f "$prev.tmp" "$prev"
+				printf '{"t": %d, "idle": %s, "state": %s}\n' "$t" "$([ "$rc" = 0 ] && echo true || echo false)" "$state" >>"$d/passes.jsonl"
 			fi
 		else
 			unknown=$((unknown + 1))
@@ -491,6 +511,7 @@ await_idle() {
 			for ((i = 0; i < BROKERS; i++)); do
 				case " $(cat "$d/.missing") " in *" $i "*) ;; *) answered[i]=1 ;; esac
 			done
+			printf '{"t": %d, "unknown": "no scrape from broker(s) %s"}\n' "$t" "$(cat "$d/.missing")" >>"$d/passes.jsonl"
 		fi
 		if [ -n "$state" ] && [ "$since" -ge 0 ] && [ $((t - since)) -ge "$quiet" ]; then
 			settle_record true "$((SECONDS - t0))" "$quiet" "$budget" "$passes" "$unknown" "$prev" "${answered[*]}" "${missed[*]}"
@@ -498,7 +519,7 @@ await_idle() {
 		fi
 		if [ $((SECONDS - t0)) -ge "$budget" ]; then
 			state=$(settle_record false "$((SECONDS - t0))" "$quiet" "$budget" "$passes" "$unknown" "$prev" "${answered[*]}" "${missed[*]}")
-			warn "cluster not settled after $((SECONDS - t0))s (budget ${budget}s): $(python3 -c 'import json,sys; print("; ".join(json.loads(sys.argv[1])["state"]["why_not"]))' "$state") — the step will be VOID (unreset)"
+			warn "cluster not settled after $((SECONDS - t0))s (budget ${budget}s, ${quiet}s quiet needed): $(python3 -c 'import json,sys; print("; ".join(json.loads(sys.argv[1])["state"]["why_not"]))' "$state") — $on_fail"
 			echo "$state"
 			return 0
 		fi
@@ -508,6 +529,7 @@ await_idle() {
 settle_record() { # settle_record <idle> <waited> <quiet> <budget> <passes> <unknown> <state-file|""> <answered...> <missed...>: the JSON await_idle prints
 	python3 - "$@" <<'PY'
 import json, sys
+from pathlib import Path
 idle, waited, quiet, budget, passes, unknown, state_file, answered, missed = sys.argv[1:10]
 answered, missed = [int(x) for x in answered.split()], [int(x) for x in missed.split()]
 state = None
@@ -516,17 +538,35 @@ if state_file:
         state = json.load(open(state_file))
     except (OSError, ValueError):
         state = None
+log = []
+if state_file:
+    try:
+        log = [json.loads(x) for x in (Path(state_file).parent / "passes.jsonl").read_text().splitlines() if x.strip()]
+    except (OSError, ValueError):
+        log = []
+blocked = [x for x in log if x.get("idle") is False]
 rec = {"idle": idle == "true", "waited_s": int(waited), "quiet_s": int(quiet), "budget_s": int(budget),
-       "passes": int(passes), "unknown_passes": int(unknown),
+       "passes": int(passes), "unknown_passes": int(unknown), "blocked_passes": len(blocked),
        "scrape_misses": {f"broker-{i}": n for i, n in enumerate(missed) if n}, "state": state}
+if blocked:
+    rec["last_blocked"] = {"t_s": blocked[-1]["t"], "why_not": blocked[-1]["state"].get("why_not") or []}
 if not rec["idle"]:
     why = list((state or {}).get("why_not") or [])
     never = [f"broker-{i}" for i, a in enumerate(answered) if not a]
     if never:
         why.append(f"no scrape of {', '.join(never)} answered in {waited} s")
+    elif not why and blocked:
+        # The last pass was idle, but the quiet period it was counting had not run its
+        # course: name the pass that restarted it.
+        last = blocked[-1]
+        why.append(f"the {quiet} s quiet period last restarted at {last['t']} s of {waited}, on: "
+                   + "; ".join(last["state"].get("why_not") or ["?"])
+                   + f" ({len(blocked)} of {passes} passes were not idle)")
     elif not why and int(unknown):
         why.append(f"{unknown} of {passes} scrape passes incomplete ("
                    + ", ".join(f"{b} missed {n}" for b, n in rec["scrape_misses"].items()) + ")")
+    elif not why:
+        why.append(f"idle on every pass but not yet {quiet} s quiet when the budget ran out")
     if state is None:
         state = rec["state"] = {}
     state["why_not"] = why
@@ -534,23 +574,25 @@ print(json.dumps(rec))
 PY
 }
 
-launch_gens() { # launch_gens <local-dir> <host-id> <per-gen rate> <warmup> <measure>: one mqtt-load per generator, together
+launch_gens() { # launch_gens <local-dir> <host-id> <per-gen rate> <warmup> <measure>: one mqtt-load per generator, one start
 	local dir="$1" hid="$2" per_gen="$3" warmup="$4" measure="$5" g bound metrics pids=()
 	local -a args=(--broker "$ENDPOINTS" --rate "$per_gen" --qos "$QOS" --payload "$PAYLOAD"
 		--topics "$TOPICS" --shape "$SHAPE" --consumers "$CONSUMERS_N" --groups "$SHARE_GROUPS"
 		--sessions "$SESSIONS" --rate-per-publisher "$RATE_PER_PUBLISHER" --inflight "$INFLIGHT"
 		--warmup "$warmup" --duration "$measure" --window "$WINDOW" --drain-timeout "$DRAIN_TIMEOUT"
-		--drain-quiet "$DRAIN_QUIET" --drain-quiet-factor "$DRAIN_QUIET_FACTOR" --quiet)
+		--drain-quiet "$DRAIN_QUIET" --drain-quiet-factor "$DRAIN_QUIET_FACTOR" --quiet
+		--ready-file "steps/$hid/gen.ready" --start-file "steps/$hid/gen.start" --start-wait $((START_SYNC_WAIT + 15)))
 	[ "$SESSIONS" != durable ] || args+=(--session-expiry "$SESSION_EXPIRY")
-	bound=$((warmup + measure + DRAIN_TIMEOUT + 180))
+	bound=$((START_SYNC_WAIT + 15 + warmup + measure + DRAIN_TIMEOUT + 180))
 	for ((g = 0; g < GENERATORS; g++)); do
 		metrics=""
 		[ "$OBSERVE" != 1 ] || metrics="--metrics $(gen_metrics_addr "$g")"
-		run_bounded "$bound" on_gen "$g" "mkdir -p \$H/steps/$hid && cd \$H && { ulimit -n 262144 2>/dev/null || ulimit -n \$(ulimit -Hn); } 2>/dev/null; ./mqtt-load ${args[*]@Q} \
+		run_bounded "$bound" on_gen "$g" "mkdir -p \$H/steps/$hid && cd \$H && rm -f steps/$hid/gen.ready steps/$hid/gen.start steps/$hid/gen.exit && { ulimit -n 262144 2>/dev/null || ulimit -n \$(ulimit -Hn); } 2>/dev/null; ./mqtt-load ${args[*]@Q} \
 			--topic-prefix rig2/$hid/g$g --client-prefix r2-$hid-g$g --out steps/$hid/gen.json $metrics \
 			2>steps/$hid/gen.stderr; echo \$? >steps/$hid/gen.exit" &
 		pids+=($!)
 	done
+	start_gens "$hid"
 	for pid in "${pids[@]}"; do wait "$pid" || warn "a generator session ended with $? (its exit code is in gen-*.exit)"; done
 	local f part
 	for ((g = 0; g < GENERATORS; g++)); do
@@ -565,6 +607,39 @@ launch_gens() { # launch_gens <local-dir> <host-id> <per-gen rate> <warmup> <mea
 		[ -f "$dir/gen-$g.json" ] || warn "generator $g left no summary"
 	done
 }
+# gens_ready <host-id>: 0 when every generator has connected its clients (its ready file)
+# or is already gone (its exit file: it failed to start, and waiting is pointless).
+gens_ready() {
+	local hid="$1" g rc=0
+	local -a pids=()
+	for ((g = 0; g < GENERATORS; g++)); do
+		run_bounded 20 on_gen "$g" "test -f \$H/steps/$hid/gen.ready || test -f \$H/steps/$hid/gen.exit" >/dev/null 2>&1 &
+		pids+=($!)
+	done
+	for pid in "${pids[@]}"; do wait "$pid" || rc=1; done
+	return "$rc"
+}
+# start_gens <host-id>: wait for every generator to be ready, then write one start time
+# into every start file (atomically: a temporary file renamed into place).
+start_gens() {
+	local hid="$1" deadline=$((SECONDS + START_SYNC_WAIT)) at g missed_start=""
+	local -a pids=()
+	until gens_ready "$hid"; do
+		if [ "$SECONDS" -ge "$deadline" ]; then
+			warn "not every generator connected within ${START_SYNC_WAIT}s; starting the ready ones (a late one starts on its own, and the judge checks the overlap)"
+			break
+		fi
+		sleep 0.5
+	done
+	at=$(run_bounded 20 on_gen 0 "python3 -c 'import time; print(int(time.time() * 1000) + $START_LEAD_MS)'" 2>/dev/null) || at=""
+	[[ "$at" =~ ^[0-9]+$ ]] || at=$(python3 -c "import time; print(int(time.time() * 1000) + $START_LEAD_MS)")
+	for ((g = 0; g < GENERATORS; g++)); do
+		run_bounded 20 on_gen "$g" "printf '%s\\n' $at >\$H/steps/$hid/gen.start.part && mv -f \$H/steps/$hid/gen.start.part \$H/steps/$hid/gen.start" >/dev/null 2>&1 &
+		pids+=($!)
+	done
+	for g in "${!pids[@]}"; do wait "${pids[g]}" || missed_start+=" $g"; done
+	[ -z "$missed_start" ] || warn "could not write the start to generator(s)$missed_start (they start on their own after the wait)"
+}
 
 prime_ladder() { # prime_ladder <ladder-dir>: unmeasured load at the start rate before the first step
 	local ladder="$1" per_gen
@@ -572,7 +647,8 @@ prime_ladder() { # prime_ladder <ladder-dir>: unmeasured load at the start rate 
 	mkdir -p "$ladder/prime"
 	# The same full settle as before a first step: the prime must not start on residue
 	# either (a prime started on a cluster seconds old was refused with 0x88 locally).
-	await_idle "$ladder/prime" "$SETTLE_BUDGET_LONG" "$SETTLE_QUIET_LONG" >"$ladder/prime/idle_before.json"
+	await_idle "$ladder/prime" "$SETTLE_BUDGET_LONG" "$SETTLE_QUIET_LONG" "$START_RATE" \
+		"priming anyway (the prime is not judged; the first step settles again before it starts)" >"$ladder/prime/idle_before.json"
 	per_gen=$(python3 -c "print(f'{$START_RATE / $GENERATORS:.3f}')")
 	say "[$WORKLOAD] priming: ${PRIME_SECS}s at $START_RATE msg/s, not measured"
 	phase running "$WORKLOAD priming: $START_RATE msg/s"
@@ -616,7 +692,7 @@ print(json.loads(vs[-1].read_text())["verdict"] if vs else "none")
 PY
 )
 	if [ "$prev_v" = CARRIED ]; then budget=$RESET_BUDGET quiet=$SETTLE_QUIET; else budget=$SETTLE_BUDGET_LONG quiet=$SETTLE_QUIET_LONG; fi
-	idle=$(await_idle "$step" "$budget" "$quiet")
+	idle=$(await_idle "$step" "$budget" "$quiet" "$rate" "the step runs and is VOID (unreset)")
 	per_gen=$(python3 -c "print(f'{$rate / $GENERATORS:.3f}')")
 	python3 - "$step/step.json" <<PY
 import json, sys

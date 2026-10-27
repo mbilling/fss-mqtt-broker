@@ -165,6 +165,20 @@ struct Cli {
     #[arg(long)]
     metrics: Option<SocketAddr>,
 
+    /// Write this file (Unix ms) once every client is connected.
+    #[arg(long)]
+    ready_file: Option<PathBuf>,
+
+    /// Once connected, wait for this file to name the Unix ms at which the schedule
+    /// starts (several generators sharing one start).
+    #[arg(long)]
+    start_file: Option<PathBuf>,
+
+    /// The longest wait for --start-file, seconds (at most the keep-alive); then the
+    /// schedule starts on its own.
+    #[arg(long, default_value_t = 30.0)]
+    start_wait: f64,
+
     /// Tokio worker threads. Default: the machine's available parallelism.
     #[arg(long)]
     threads: Option<usize>,
@@ -256,6 +270,9 @@ fn config(cli: Cli, threads: usize) -> Result<(Config, Option<PathBuf>), String>
         sched_lag_p99_us: lag_us,
     };
     c.metrics_bind = cli.metrics;
+    c.ready_file = cli.ready_file;
+    c.start_file = cli.start_file;
+    c.start_wait_ns = secs_ns(cli.start_wait)?;
     c.worker_threads = threads;
     c.progress = !cli.quiet;
     c.validate()?;
