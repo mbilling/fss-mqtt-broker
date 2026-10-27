@@ -98,7 +98,7 @@
 | [0088](../adr/0088-credential-lifetimes-and-rotation.md) | Cluster credentials have a lifetime the deployer sets, the broker enforces it strictly, and whoever operates the cluster rotates in time | Accepted | [3/7 done](0088-credential-lifetimes-and-rotation.md) | 4 open |
 | [0089](../adr/0089-durable-write-elision.md) | Write elision on the durable QoS 1 path: a message the subscriber has acknowledged need never be written | Accepted | [4/8 done](0089-durable-write-elision.md) | 4 open |
 | [0090](../adr/0090-benchmark-rig-redesign.md) | The benchmark rig measures msg/s and ack latency on one clock, at a fraction of the cost | Accepted | [0/7 done](0090-benchmark-rig-redesign.md) | 7 open |
-| [0091](../adr/0091-capacity-model.md) | Every bound is a function of a few measured numbers | Accepted | [0/7 done](0091-capacity-model.md) | 7 open |
+| [0091](../adr/0091-capacity-model.md) | Every bound is a function of a few measured numbers | Accepted | [1/7 done](0091-capacity-model.md) | 6 open |
 
 ## Open and deferred work
 
@@ -266,7 +266,6 @@
 
 **0091 — Every bound is a function of a few measured numbers**
 
-- `0091-T1` 🚧 in-progress ([#1132](https://github.com/mbilling/fss-mqtt-broker/issues/1132)): "The harness never sets the knee (D3): mqtt-load deals every topic and group over every broker, refuses a skewed workload, reports the broker's measured spread; rig2 VOIDs a skewed step" — "Size S. PR #1133. Publisher i on broker (i % topics + i / topics) % brokers, member j of stream s on (s + j) % brokers; derived publishers round up to a multiple of topics x brokers; session_skew (expected busiest session / mean, under prefer-local) refused above --max-skew 1.25; spread (measured busiest consumer / mean) in the summary; verdict.py VOIDs a step with session_skew > 1.25 and notes a measured spread > 1.5. The old deal fails every_topic_has_publishers_on_every_broker with topic 0 spread [51, 0, ..., 0]."
 - `0091-T2` ⬜ planned ([#1134](https://github.com/mbilling/fss-mqtt-broker/issues/1134)): "A hot-session workload (D3): one topic's whole rate into one durable $share member, to measure one session's ceiling before and after T4" — "Size S. mqtt-load --max-skew 0; a rig2 workload env; reported as msg/s per session, beside D2's D / L."
 - `0091-T3` ⬜ planned ([#1078](https://github.com/mbilling/fss-mqtt-broker/issues/1078)): "$share selection skips a member past a quarter of its lane or outbound bound when another eligible member exists (D4)" — "Size M. Test first: a hub test that joins a cold member under load and a test with one member's lane held full; neither withholds acks while another member can take the publish. Locality still decides among members that keep up."
 - `0091-T4` ⬜ planned ([#1134](https://github.com/mbilling/fss-mqtt-broker/issues/1134)): "One session's durable rate is the store's (D5): a lane submits its queued jobs as one batch with one durability wait" — "Size M-L. Order and per-message outcomes unchanged; measured with T2 before and after."
