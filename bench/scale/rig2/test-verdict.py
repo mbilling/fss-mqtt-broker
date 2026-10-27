@@ -82,13 +82,16 @@ def prom(received, delivered, dropped=None, start=1700000000.0, gauges=None):
 
 
 def make_step(root: Path, rate, gens, *, brokers=3, received_share=1.0, drops=None, idle=True, gate="ack",
-              restart=False, coverage_s=None, held=None):
+              restart=False, coverage_s=None, held=None, unfetched=(), short=()):
     """A step directory: `gens` summaries, and brokers whose received counters grew at
-    received_share x rate in total over the measured window (scrapes every 2 s)."""
+    received_share x rate in total over the measured window (scrapes every 2 s).
+    `unfetched`: brokers whose scrapes never came back (no directory); `short`: brokers
+    whose scrapes stop 10 s into the measured window."""
     step = root / f"{len(list(root.iterdir())) + 1:02d}-{rate}"
     (step / "scrapes").mkdir(parents=True)
     (step / "step.json").write_text(json.dumps({
         "index": len(list(root.iterdir())), "id": step.name, "rate": rate, "attempt": 1, "generators": len(gens),
+        "brokers": brokers,
         "idle_before": {"idle": idle, "state": {}}, "judge": {"margin_s": 1.0, "latency_gate": gate}}))
     for g, s in enumerate(gens):
         (step / f"gen-{g}.json").write_text(json.dumps(s))
@@ -98,9 +101,11 @@ def make_step(root: Path, rate, gens, *, brokers=3, received_share=1.0, drops=No
     if coverage_s is not None:
         last = T0 + 20_000 + int(coverage_s * 1000)
     for b in range(brokers):
+        if b in unfetched:
+            continue
         d = step / "scrapes" / f"broker-{b}"
         d.mkdir()
-        stamps = list(range(first, last + 1, 2000))
+        stamps = list(range(first, (T0 + 30_000 if b in short else last) + 1, 2000))
         for t in stamps:
             secs = max(0.0, (t - first) / 1000)
             dropped = {k: (v if t == stamps[-1] else 0) for k, v in (drops or {}).items()} if b == 0 else None
@@ -186,6 +191,46 @@ class Verdicts(unittest.TestCase):
         v = verdict_of(make_step(self.root, 30000, [summary(30000)], coverage_s=10))
         self.assertEqual(v["verdict"], V.VOID)
         self.assertTrue(any("broker evidence" in x for x in v["voids"]), v["voids"])
+
+    def test_brokers_whose_scrapes_were_not_fetched_void_the_step(self):
+        # The aborted 10-node run's 01-30000: brokers 5-9's scrapes never came back, and
+        # the sum over the other five read as OFFER NOT TAKEN at half the offer.
+        v = verdict_of(make_step(self.root, 30000, [summary(30000)], brokers=10, unfetched=(5, 6, 7, 8, 9)))
+        self.assertEqual(v["verdict"], V.VOID, v)
+        self.assertIn("broker evidence: no scrapes from broker(s) 5 6 7 8 9", v["voids"])
+        self.assertIsNone(v["received_rate"], "a sum over half the brokers is not the cluster's rate")
+        self.assertFalse(v["brokers"]["complete"])
+        self.assertEqual(V.next_rate([v], {"start_rate": 30000})[0], 30000, "a VOID step is rerun")
+
+    def test_the_broker_count_comes_from_run_json_when_step_json_lacks_it(self):
+        run = Path(self.tmp.name) / "run"
+        steps = run / "A" / "durable-qos1" / "steps"
+        steps.mkdir(parents=True)
+        (run / "run.json").write_text(json.dumps({"brokers": 3}))
+        step = make_step(steps, 30000, [summary(30000)], unfetched=(2,))
+        meta = json.loads((step / "step.json").read_text())
+        del meta["brokers"]
+        (step / "step.json").write_text(json.dumps(meta))
+        v = verdict_of(step)
+        self.assertEqual(v["verdict"], V.VOID, v)
+        self.assertIn("broker evidence: no scrapes from broker(s) 2", v["voids"])
+
+    def test_one_broker_short_of_the_window_voids_not_offer_not_taken(self):
+        v = verdict_of(make_step(self.root, 30000, [summary(30000)], short=(1,)))
+        self.assertEqual(v["verdict"], V.VOID, v)
+        self.assertTrue(any(x.startswith("broker evidence: broker 1: scrapes cover") for x in v["voids"]), v["voids"])
+        self.assertIsNone(v["received_rate"])
+
+    def test_missing_brokers_void_a_step_without_summaries_too(self):
+        step = make_step(self.root, 30000, [summary(30000)], unfetched=(0,))
+        (step / "gen-0.json").unlink()
+        v = verdict_of(step)
+        self.assertEqual(v["verdict"], V.VOID)
+        self.assertIn("broker evidence: no scrapes from broker(s) 0", v["voids"])
+
+    def test_loss_on_the_brokers_that_were_fetched_still_fails(self):
+        v = verdict_of(make_step(self.root, 30000, [summary(30000)], drops={"queue-overflow": 3}, unfetched=(2,)))
+        self.assertEqual(v["verdict"], V.FAILED, v)
 
     def test_a_missing_summary_voids_the_step(self):
         step = make_step(self.root, 30000, [summary(30000)])

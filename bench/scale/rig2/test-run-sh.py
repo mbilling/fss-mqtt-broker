@@ -10,7 +10,8 @@ verdict.py and the workloads are the real ones (symlinked). Checked: a broker wh
 scrapes fail now and then does not hold the settle back (the first 10-node run never
 settled because one failed scrape restarted the quiet period); the settle budget is
 wall-clock time, not a count of sleeps; a broker that never answers voids the step with
-its name; and a TERM sent mid-step runs the trap at once (it used to wait for the ladder
+its name; a broker whose step scrapes cannot be fetched voids that step by name, and the
+ladder reruns it; and a TERM sent mid-step runs the trap at once (it used to wait for the ladder
 to finish), stopping the generator and the local cluster.
 """
 import json
@@ -196,6 +197,27 @@ class RunShTest(unittest.TestCase):
         verdict = json.loads(next((self.run_dir / "A" / "durable-qos1" / "steps").glob("*/verdict.json")).read_text())
         self.assertEqual(verdict["verdict"], "VOID", verdict)
         self.assertTrue(any("broker-2" in v for v in verdict.get("voids", [])), verdict)
+
+    def test_a_broker_whose_step_scrapes_cannot_be_fetched_voids_the_step_and_it_is_rerun(self):
+        # Broker 1's host has no room for the step (its steps/ is a file): its scrape loop
+        # does not start and its scrapes cannot be fetched. The step is VOID by that
+        # broker's name, never judged on the others' sum, and the ladder reruns it.
+        host = self.run_dir / "hosts" / "broker-1"
+        host.mkdir(parents=True)
+        (host / "steps").write_text("not a directory\n")
+        r = self.run_to_end(MAX_STEPS=2, SETTLE_QUIET_LONG=1, SETTLE_BUDGET_LONG=20)
+        self.assertIn("could not fetch the scrapes of broker(s) 1", r.stderr)
+        steps = sorted(p for p in (self.run_dir / "A" / "durable-qos1" / "steps").iterdir() if p.is_dir())
+        self.assertEqual(len(steps), 2, [p.name for p in steps])
+        first = json.loads((steps[0] / "verdict.json").read_text())
+        self.assertEqual(first["verdict"], "VOID", first)
+        self.assertIn("broker evidence: no scrapes from broker(s) 1", first["voids"])
+        # The other brokers' scrapes came back whole, through the tar stream.
+        for b in (0, 2):
+            self.assertTrue(list((steps[0] / "scrapes" / f"broker-{b}").glob("*.prom")), f"broker {b}'s scrapes")
+        self.assertFalse(list(steps[0].glob(".fetch-*")), "a fetch left its staging directory")
+        self.assertEqual(json.loads((steps[1] / "step.json").read_text())["rate"], first["rate"])
+        self.assertIn("rerun of a VOID step", json.loads((steps[1] / "step.json").read_text())["ramp_reason"])
 
     def test_term_mid_step_runs_the_trap_at_once(self):
         pidfile = self.root / "load.pid"

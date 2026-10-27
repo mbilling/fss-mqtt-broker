@@ -192,21 +192,25 @@ say "run dir: $RUN"
 
 # ── host plumbing: the same verbs for local processes and cloud hosts ───────────────
 # on_gen <g> <cmd> / on_broker <i> <cmd>: run <cmd> on that host with $H = its rig dir.
-# get_gen / get_broker <i> <remote-rel> <local>: copy a file or directory back.
+# tar_gen <g> / tar_broker <i> <remote-rel-dir> [file...]: that directory's contents (or
+# the files named) as ONE tar stream on stdout. A step's ~60 scrapes came back one scp
+# round trip each, ~15 s a broker, on the 10-node run.
 if [ "$TIER" = local ]; then
 	host_dir() { echo "$RUN/hosts/$1"; }
 	on_gen() { H="$(host_dir "gen-$1")" bash -c "$2"; }
 	on_broker() { H="$(host_dir "broker-$1")" bash -c "$2"; }
-	get_gen() { cp -R "$(host_dir "gen-$1")/$2" "$3"; }
-	get_broker() { cp -R "$(host_dir "broker-$1")/$2" "$3"; }
+	tar_gen() { local g="$1" d="$2"; shift 2; tar -C "$(host_dir "gen-$g")/$d" -cf - "${@:-.}"; }
+	export COPYFILE_DISABLE=1 # macOS tar: no ._ AppleDouble entries among the scrapes
+	tar_broker() { tar -C "$(host_dir "broker-$1")/$2" -cf - .; }
 	broker_metrics_url() { echo "http://$(sed -n "$(($1 + 1))p" "$RUN/local/brokers.tsv" | cut -f3)/metrics"; }
 	gen_metrics_addr() { echo "127.0.0.1:$LOAD_METRICS_PORT"; }
 else
 	REMOTE_H=/root/rig2
 	on_gen() { rssh "$(driver_pub_ip "$1")" "H=$REMOTE_H; $2"; }
 	on_broker() { rssh "$(broker_pub_ip "$1")" "H=$REMOTE_H; $2"; }
-	get_gen() { rscp -r "root@$(driver_pub_ip "$1"):$REMOTE_H/$2" "$3"; }
-	get_broker() { rscp -r "root@$(broker_pub_ip "$1"):$REMOTE_H/$2" "$3"; }
+	# A file of the list that is not there (no summary) still lets tar send the rest.
+	tar_gen() { local g="$1" d="$2"; shift 2; run_bounded 60 rssh "$(driver_pub_ip "$g")" "tar -C $REMOTE_H/$d -cf - ${*:-.} 2>/dev/null; true"; }
+	tar_broker() { run_bounded 60 rssh "$(broker_pub_ip "$1")" "tar -C $REMOTE_H/$2 -cf - ."; }
 	broker_metrics_url() { echo "http://localhost:8080/metrics"; }
 	gen_metrics_addr() { echo "$(driver_priv_ip "$1"):$LOAD_METRICS_PORT"; }
 fi
@@ -548,10 +552,17 @@ launch_gens() { # launch_gens <local-dir> <host-id> <per-gen rate> <warmup> <mea
 		pids+=($!)
 	done
 	for pid in "${pids[@]}"; do wait "$pid" || warn "a generator session ended with $? (its exit code is in gen-*.exit)"; done
+	local f part
 	for ((g = 0; g < GENERATORS; g++)); do
-		get_gen "$g" "steps/$hid/gen.json" "$dir/gen-$g.json" || warn "generator $g left no summary"
-		get_gen "$g" "steps/$hid/gen.stderr" "$dir/gen-$g.stderr" || true
-		get_gen "$g" "steps/$hid/gen.exit" "$dir/gen-$g.exit" || true
+		part="$dir/.fetch-gen-$g"
+		rm -rf "$part"
+		mkdir -p "$part"
+		tar_gen "$g" "steps/$hid" gen.json gen.stderr gen.exit 2>/dev/null | tar -C "$part" -xf - 2>/dev/null || true
+		for f in json stderr exit; do
+			[ ! -f "$part/gen.$f" ] || mv -f "$part/gen.$f" "$dir/gen-$g.$f"
+		done
+		rm -rf "$part"
+		[ -f "$dir/gen-$g.json" ] || warn "generator $g left no summary"
 	done
 }
 
@@ -575,9 +586,15 @@ scrape_loop_start() {
 		--out \$H/steps/$hid/scrapes --interval $SCRAPE_INTERVAL --max-secs 1800 >/dev/null 2>&1 </dev/null & echo \$! >\$H/steps/$hid/scrape.pid"
 }
 scrape_loop_stop() { on_broker "$1" "kill \$(cat \$H/steps/$hid/scrape.pid) 2>/dev/null; true"; }
+# One tar stream per broker, unpacked beside the target and renamed into place only when
+# the whole stream arrived: a cut connection leaves no directory (the judge then names
+# the broker and VOIDs the step), never a partial one that passes for a broker's step.
 scrape_loop_fetch() {
-	rm -rf "$step/scrapes/broker-$1"
-	get_broker "$1" "steps/$hid/scrapes" "$step/scrapes/broker-$1"
+	local dst="$step/scrapes/broker-$1" part="$step/.fetch-broker-$1"
+	rm -rf "$dst" "$part"
+	mkdir -p "$part"
+	tar_broker "$1" "steps/$hid/scrapes" | tar -C "$part" -xf - || { rm -rf "$part"; return 1; }
+	mv "$part" "$dst"
 }
 
 run_step() { # run_step <ladder-dir> <index> <rate> <why the ramp chose it>
@@ -604,6 +621,7 @@ PY
 	python3 - "$step/step.json" <<PY
 import json, sys
 json.dump({"index": $idx, "id": "$id", "rate": float($rate), "attempt": $attempt, "generators": $GENERATORS,
+           "brokers": $BROKERS,
            "per_generator_rate": float($per_gen), "workload": "$WORKLOAD", "arm": "$ARM",
            "idle_before": json.loads(r"""$idle"""), "after": "$prev_v", "ramp_reason": r"""$why""",
            "judge": {"margin_s": $MARGIN_S, "latency_gate": "$LATENCY_GATE", "idle_floor": $IDLE_FLOOR}},
