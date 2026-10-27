@@ -42,9 +42,37 @@ cmd="${1:?usage: observe.sh attach <run-dir> <inventory.json> | detach | stop | 
 
 stop_tunnel() {
 	if [ -f "$TUNNEL_PID_FILE" ]; then
-		kill "$(cat "$TUNNEL_PID_FILE")" 2>/dev/null || true
+		local pid
+		pid=$(cat "$TUNNEL_PID_FILE")
+		# The supervisor and the ssh it runs.
+		pkill -P "$pid" 2>/dev/null || true
+		kill "$pid" 2>/dev/null || true
 		rm -f "$TUNNEL_PID_FILE"
 	fi
+}
+
+# tunnel_supervisor <driver-ip> <known_hosts>: keep laptop:8096 -> driver:8096 open.
+# Twice on 2026-10-27 the tunnel stopped carrying data mid-run, once with its ssh gone
+# and once with it alive and the forward hung, and the dashboards went flat while the
+# bridge on the driver was fine. Keep-alives end a dead connection; the probe catches a
+# hung forward. Either way the ssh is restarted.
+tunnel_supervisor() {
+	local ip="$1" kh="$2" ssh_pid
+	trap 'kill "$ssh_pid" 2>/dev/null; exit 0' TERM INT
+	while :; do
+		ssh "${SSH_OPTS[@]}" -o UserKnownHostsFile="$kh" -o ServerAliveInterval=10 -o ServerAliveCountMax=3 \
+			-o ExitOnForwardFailure=yes -N -L 8096:localhost:8096 "root@$ip" &
+		ssh_pid=$!
+		sleep 5
+		while kill -0 "$ssh_pid" 2>/dev/null; do
+			curl -s -m 5 -o /dev/null http://localhost:8096/ || break
+			sleep 20
+		done
+		kill "$ssh_pid" 2>/dev/null || true
+		wait "$ssh_pid" 2>/dev/null || true
+		echo "observe: tunnel to $ip stopped answering at $(date -u +%TZ); reopening" >&2
+		sleep 2
+	done
 }
 
 start_stack() {
@@ -182,14 +210,13 @@ attach)
 	# it backs off while the first rung is already running.
 	say "observe: opening forward tunnel (laptop:8096 -> driver-1:8096)"
 	stop_tunnel
-	ssh "${SSH_OPTS[@]}" -o UserKnownHostsFile="$RUN/known_hosts" \
-		-N -L 8096:localhost:8096 "root@$DRIVER_IP" &
+	tunnel_supervisor "$DRIVER_IP" "$RUN/known_hosts" </dev/null >>"$RUN/observe-tunnel.log" 2>&1 &
 	echo $! >"$TUNNEL_PID_FILE"
 
 	say "observe: pointing local Alloy at $(jq -r '.brokers | length' "$INVENTORY") broker(s)${GEN_PORT:+ and $(jq -r '.drivers | length' "$INVENTORY") generator(s)}"
 	restart_alloy
 	live_banner "$GEN_PORT"
-	say "observe: the tunnel is this run's ssh -N -L 8096:localhost:8096 root@$DRIVER_IP (pid $(cat "$TUNNEL_PID_FILE")); Grafana listens on every interface of this machine (:3000)"
+	say "observe: the tunnel is this run's ssh -N -L 8096:localhost:8096 root@$DRIVER_IP, kept open by a supervisor (pid $(cat "$TUNNEL_PID_FILE"); its log is $RUN/observe-tunnel.log); Grafana listens on every interface of this machine (:3000)"
 	;;
 attach-local)
 	# rig2 TIER=local: the brokers and mqtt-load run on this machine, so Alloy scrapes

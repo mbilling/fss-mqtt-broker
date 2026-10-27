@@ -153,6 +153,11 @@ CALIB_RATE_PER_GEN="${CALIB_RATE_PER_GEN:-30000}"
 CALIB_WARMUP="${CALIB_WARMUP:-10}"
 CALIB_MEASURE="${CALIB_MEASURE:-30}"
 CALIB_REPLACE_MAX="${CALIB_REPLACE_MAX:-2}"
+# During the ladders (cloud): a generator the judge names (sustained saturation or a
+# diverging p99) in REPLACE_STRIKES VOID attempts of one step gets a new host before the
+# next attempt, and those VOIDs do not use up the round's reruns (verdict.py
+# replace-due). At most GEN_REPLACE_MAX such replacements a run.
+GEN_REPLACE_MAX="${GEN_REPLACE_MAX:-2}"
 LOAD_METRICS_PORT="${LOAD_METRICS_PORT:-9464}"
 phase() { # phase <name> [detail]: the run's phase on the dashboards; best-effort
 	[ "$OBSERVE" = 1 ] || return 0
@@ -759,8 +764,40 @@ PY
 		read -r rdir settle reason <<<"$plan"
 		n=$((n + 1))
 		run_round "$step_dir" "$idx" "$rate" "$rdir" "$settle" "$reason"
+		replace_if_due "$step_dir"
 	done
 	python3 "$RIG2/verdict.py" step "$step_dir" | while IFS= read -r line; do say "  $line"; done
+}
+
+# replace_if_due <step-dir>: see GEN_REPLACE_MAX. Records the replacement in the step's
+# replaced.json (verdict.py reads it) and the run's replacements.log.
+replace_if_due() {
+	local step_dir="$1" due g after strikes done_n
+	[ "$TIER" != local ] || return 0
+	due=$(python3 "$RIG2/verdict.py" replace-due "$step_dir") || return 0
+	[ -n "$due" ] || return 0
+	read -r g after strikes <<<"$due"
+	done_n=$(grep -c . "$RUN/replacements.log" 2>/dev/null || true)
+	if [ "${done_n:-0}" -ge "$GEN_REPLACE_MAX" ]; then
+		warn "generator $g voided $strikes attempts of $(basename "$step_dir"), but GEN_REPLACE_MAX=$GEN_REPLACE_MAX replacements are used up"
+		return 0
+	fi
+	warn "generator $g voided $strikes attempts of $(basename "$step_dir") (last: $after) — replacing its host"
+	replace_gen "$g"
+	python3 - "$step_dir/replaced.json" "$g" "$after" <<'PY'
+import json, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+done = json.loads(p.read_text()) if p.is_file() else []
+done.append({"generator": int(sys.argv[2]), "after": sys.argv[3]})
+p.write_text(json.dumps(done, indent=2) + "\n")
+PY
+	echo "$(date -u +%TZ) $(basename "$(dirname "$(dirname "$step_dir")")")/$(basename "$step_dir") generator $g after $after" >>"$RUN/replacements.log"
+	if [ "$g" = 0 ] && [ "$OBSERVE" = 1 ]; then
+		# Generator host 0 carries the observe bridge.
+		OBSERVE_GEN_METRICS_PORT="$LOAD_METRICS_PORT" run_fg "$SCALE_DIR/observe.sh" attach "$RUN" "$INVENTORY" ||
+			warn "observe re-attach failed — continuing unobserved"
+	fi
 }
 
 run_round() { # run_round <step-dir> <index> <rate> <round-dir name> <short|long settle> <why>: one round of the step

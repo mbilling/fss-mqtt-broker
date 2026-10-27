@@ -35,7 +35,7 @@ def hist(samples_us: dict[int, int]) -> dict:
 
 def summary(rate, *, p99_us=50_000, saturated=False, missing=0, outcome=None, start_shift_s=0.0,
             measure_s=60.0, warmup_s=20.0, errors=None, drain="complete", unexpected=0,
-            missing_acked=None, unacked=0, session_skew=1.0, spread=None):
+            missing_acked=None, unacked=0, session_skew=1.0, spread=None, stalled_windows=0):
     """A minimal mqtt-load.summary.v2 with one phase: `rate` msg/s offered; ack and e2e
     histograms whose p99 is `p99_us` (98 % at 1 ms, 1.5 % at p99, 0.5 % at 2 x p99)."""
     n = int(rate * measure_s)
@@ -45,13 +45,17 @@ def summary(rate, *, p99_us=50_000, saturated=False, missing=0, outcome=None, st
     windows.append({"index": 0, "kind": "warmup", "start_s": 0.0, "end_s": warmup_s, "sched_lag": {"p99_us": 1000},
                     "health": {"cpu_fraction": 0.2, "busiest_worker": 0.3, "credit_stall_fraction": 0.0, "backlog": 0,
                                "saturated": False, "reasons": []}})
+    measured = 0
     while t < warmup_s + measure_s - 1e-9:
+        # `stalled_windows`: the first that many measured windows paused (scheduling lag).
+        stall = not saturated and measured < stalled_windows
         windows.append({"index": len(windows), "kind": "measure", "start_s": t, "end_s": t + 10,
-                        "sched_lag": {"p99_us": 2000},
+                        "sched_lag": {"p99_us": 41_000 if stall else 2000},
                         "health": {"cpu_fraction": 0.95 if saturated else 0.3, "busiest_worker": 0.4,
-                                   "credit_stall_fraction": 0.0, "backlog": 0, "saturated": saturated,
-                                   "reasons": ["cpu"] if saturated else []}})
+                                   "credit_stall_fraction": 0.0, "backlog": 0, "saturated": saturated or stall,
+                                   "reasons": ["cpu"] if saturated else (["sched_lag"] if stall else [])}})
         t += 10
+        measured += 1
     closed = missing == 0
     return {
         "schema": "mqtt-load.summary.v2",
@@ -67,7 +71,7 @@ def summary(rate, *, p99_us=50_000, saturated=False, missing=0, outcome=None, st
         "drain": {"duration_s": 0.05 if drain == "complete" else 10.0, "ended_by": drain, "quiet_s": 10.0,
                   "outstanding_deliveries": missing, "outstanding_acks": 0, "since_progress_s": 10.0},
         "errors": errors or {"connect": 0, "disconnects": 0, "server_disconnects": 0, "protocol": 0, "write": 0},
-        "generator": {"saturated": saturated, "sent_per_cpu_second": 40000.0},
+        "generator": {"saturated": saturated or stalled_windows > 0, "sent_per_cpu_second": 40000.0},
         "outcome": outcome or ("void" if saturated else ("ok" if closed else "loss")),
         **({} if spread is None else {"spread": spread}),
     }
@@ -219,6 +223,26 @@ class Verdicts(unittest.TestCase):
         for g in (2, 3):
             (d / f"gen-{g}.json").write_text(json.dumps(summary(30000, p99_us=1000)))
         self.assertEqual(V.calibrate(d)["bad"], [])
+
+    def test_one_paused_window_is_a_note_not_a_void(self):
+        # 225k QoS 0 on 2026-10-27: one window at 37-45 ms scheduling lag, five at 2.1 ms.
+        v = verdict_of(make_step(self.root, 30000, [summary(15000), summary(15000, stalled_windows=1)]))
+        self.assertEqual(v["verdict"], V.CARRIED, v)
+        self.assertEqual(v["harness_generators"], [])
+        self.assertTrue(any(n.startswith("generator 1 stalled in 1 of its measured windows (sched_lag; "
+                                         "scheduling lag p99 41.0 ms there)") for n in v["notes"]), v["notes"])
+
+    def test_two_paused_windows_void_the_round(self):
+        v = verdict_of(make_step(self.root, 30000, [summary(15000), summary(15000, stalled_windows=2)]))
+        self.assertEqual(v["verdict"], V.VOID, v)
+        self.assertEqual(v["harness_generators"], [1])
+
+    def test_calibration_rejects_a_host_for_a_single_paused_window(self):
+        d = self.ladder / "calibration"
+        d.mkdir()
+        (d / "gen-0.json").write_text(json.dumps(summary(30000, p99_us=1000)))
+        (d / "gen-1.json").write_text(json.dumps(summary(30000, p99_us=1000, stalled_windows=1)))
+        self.assertEqual(V.calibrate(d)["bad"], [1])
 
     def test_a_saturated_generator_voids_even_its_ledger_loss(self):
         v = verdict_of(make_step(self.root, 30000, [summary(30000, saturated=True, missing=5)]))
@@ -614,6 +638,24 @@ class Rounds(unittest.TestCase):
         rate, why = V.next_rate([v], RAMP)
         self.assertIsNone(rate)
         self.assertIn("round 1 stayed VOID", why)
+
+    def test_a_host_that_voids_two_attempts_is_due_for_replacement_and_gets_another_attempt(self):
+        step = new_step(self.root, 30000)
+        add_round(step, "round-1", 30000, [summary(30000, saturated=True)])
+        self.assertIsNone(V.replace_due(step))
+        add_round(step, "round-1-a2", 30000, [summary(30000, saturated=True)])
+        self.assertEqual(V.replace_due(step), {"generator": 0, "after": "round-1-a2", "strikes": 2})
+        # run.sh replaces the host and records it: no longer due, and the round reruns.
+        (step / "replaced.json").write_text(json.dumps([{"generator": 0, "after": "round-1-a2"}]))
+        self.assertIsNone(V.replace_due(step))
+        plan = self.plan(step)
+        self.assertFalse(plan["done"], plan)
+        self.assertEqual(plan["next"]["dir"], "round-1-a3")
+        add_round(step, "round-1-a3", 30000, [summary(30000)])
+        add_round(step, "round-2", 30000, [summary(30000)])
+        add_round(step, "round-3", 30000, [summary(30000)])
+        v = self.finish(step)
+        self.assertEqual(v["verdict"], V.CARRIED, v)
 
     def test_a_transient_bad_round_is_retried_and_the_step_carries(self):
         below = self.flat_step()
