@@ -163,6 +163,11 @@ struct Cli {
     #[arg(long, default_value_t = 10.0)]
     sat_lag_ms: f64,
 
+    /// Saturation: the host's softnet squeezes above this many per second (Linux): its
+    /// receive path is out of budget, so deliveries reach the generator late.
+    #[arg(long, default_value_t = Thresholds::default().squeeze_per_s)]
+    sat_squeeze_per_s: f64,
+
     /// Refuse a workload whose busiest consumer session would carry more than this
     /// many times the mean session's load (prefer-local $share); 0 accepts any skew,
     /// e.g. to measure one hot session on purpose.
@@ -280,6 +285,7 @@ fn config(cli: Cli, threads: usize) -> Result<(Config, Option<PathBuf>), String>
         cpu_fraction: cli.sat_cpu,
         thread_fraction: cli.sat_thread,
         sched_lag_p99_us: lag_us,
+        squeeze_per_s: cli.sat_squeeze_per_s,
     };
     c.max_skew = cli.max_skew;
     c.metrics_bind = cli.metrics;

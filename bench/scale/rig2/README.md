@@ -19,10 +19,27 @@ figure crosses hosts.
 |---|---|---|---|
 | `local` | 3 local mqttd processes (durable, own data dirs) + 1 local mqtt-load | free | proves the pipeline; relative figures only |
 | `n3` | 3 brokers CCX23 + 1 generator host CCX33 | EUR 0.794/h | nightly or weekly; absolute figures |
-| `n10` | 10 brokers CCX23 + 3 generator hosts CCX33 | EUR 2.555/h | release confirmation |
+| `n10` | 10 brokers CCX23 + 4 generator hosts CCX33 | EUR 2.832/h | release confirmation |
 
 `BROKERS`, `GENERATORS`, `BROKER_TYPE` and `GEN_TYPE` override the shape. Prices are in
 `verdict.py` (`PRICES_EUR_H`, Hetzner, excluding VAT).
+
+**Generator hosts are checked before they measure anything.**
+
+- **RPS at bring-up.** Every generator host gets RPS/RFS over all its CPUs, as the brokers
+  do. With one NIC queue and no RPS, all received packets are processed on one core. That
+  core runs out of budget (softnet squeezes) long before the generator's own CPU looks busy.
+- **Calibration.** With 2+ generators in the cloud, every generator runs the same QoS 0
+  share load before the first ladder: `CALIB_RATE_PER_GEN`, 30,000 msg/s, for
+  `CALIB_MEASURE`, 30 s. `verdict.py calibrate` names a host that saturated, or whose
+  end-to-end p99 is above 5 × the other generators' median + 5 ms.
+- **Replacement.** That host is replaced (`tofu apply -replace`, same name and private
+  address) and calibration runs again, up to `CALIB_REPLACE_MAX` (2) times. Then the run
+  stops. `CALIBRATE=0` skips calibration.
+
+The brokers serve every generator alike, so a generator far slower than the rest is
+measuring its own host. On 2026-10-27 one host's deliveries arrived after 291 ms, while
+the other generators' arrived after 0.8 and 1.6 ms.
 
 ## Running
 
@@ -301,14 +318,19 @@ Judged on the broker only (ADR 0090 D1), for every round. In order:
 | verdict | when | ramp |
 |---|---|---|
 | **FAILED** | a generator's ledger did not close (missing, unexpected, unacked), a broker dropped a message by a reason that is loss (`mqttd_publish_dropped_total`, see below), or a broker restarted | stops the ladder (`BISECT_ON_FAIL=1` keeps bisecting below it) |
-| **VOID** | a generator saturated in a measured window, a generator left no summary, the generators' windows overlap less than 90%, a broker of the run has no scrapes of the round or its scrapes do not cover the window, or the cluster was not idle (unreset: VOID before any other verdict, FAILED included) | the round is rerun (`VOID_RETRIES`, 1); never counted against the broker |
+| **VOID** | a generator saturated in a measured window (CPU, a worker thread, scheduling lag, or more than 50 softnet squeezes/s), a generator's gated p99 above 5 × the other generators' median + 5 ms, a generator left no summary, the generators' windows overlap less than 90%, a broker of the run has no scrapes of the round or its scrapes do not cover the window, or the cluster was not idle (unreset: VOID before any other verdict, FAILED included) | the round is rerun (`VOID_RETRIES`, 1); never counted against the broker |
 | **DISCONNECTED** | connections were lost during the step. mqtt-load does not reconnect, so its ledger cannot be read after that | not carried; the ramp treats it as above the knee |
 | **NOT DRAINED** | the ledger misses deliveries, no broker dropped any as loss, the drain ended before it was complete, and the brokers' own gauges at their first scrape after the drain (`mqttd_inflight_messages` + `mqttd_pending_publishes`) hold at least what the ledger misses: the messages were still queued, not lost | not carried, not loss; above the knee |
 | **OFFER NOT TAKEN** | the brokers received less than 99% of the offered msg/s (`OFFER_TAKEN` from `../summarize-curve.py`) | above the knee |
 | **CARRIED** | none of the above | at or below the knee, whatever its latency |
 
 A broker drop that is loss fails a step even when the generator's ledger closes. A VOID
-ledger loss (the generator saturated) is not counted.
+ledger loss (the generator saturated) is not counted. When a generator saturated or
+diverged, and the brokers' only loss was for slow consumers (`outbound-full`,
+`backlog-overflow`, `queue-overflow`), the step is VOID too, with the finding listed in
+its notes. A broker that drops for a client that stopped reading is doing its job, and
+that client was the harness's. Drops on the publisher side, and broker restarts, still
+fail the step.
 
 **The missing count, reconciled.** When a drain ended before it was complete, the verdict
 (`drain` in `verdict.json`, a note in the report) splits the ledger's missing count:

@@ -123,6 +123,7 @@ A window is **saturated** when any of these thresholds is crossed:
 | process CPU above this fraction of the worker threads | 0.85 | `--sat-cpu` |
 | busiest worker above this fraction of a core (Linux) | 0.95 | `--sat-thread` |
 | scheduling lag p99 above this | 10 ms | `--sat-lag-ms` |
+| the host's softnet squeezes above this (Linux; the kernel out of budget for received packets, host-wide) | 50 /s | `--sat-squeeze-per-s` |
 
 A run with a saturated **measured** window is `void`. Rerun it with more generator
 capacity; it says nothing about the broker. Tokio's timers have a resolution of 1 ms, so

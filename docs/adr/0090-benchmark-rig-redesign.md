@@ -117,7 +117,7 @@ setup is needed (D1).
 |---|---|---|---|
 | Local | A/B against main on one machine (extends `durable_bench`) | free | every PR; relative only |
 | Cloud, 3 nodes | 3 brokers (CCX23) + 1 generator host (CCX33) | about €0.80/h, 30–60 min | nightly or weekly; absolute figures and A/B |
-| Cloud, 10 nodes | 10 brokers + 3 generator hosts | about €2.55/h, about 1 h | release confirmation |
+| Cloud, 10 nodes | 10 brokers + 4 generator hosts | about €2.83/h, about 1 h | release confirmation |
 
 A release confirmation goes from about €20 to about €3.
 
