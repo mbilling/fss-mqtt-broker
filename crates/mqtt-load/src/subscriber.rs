@@ -108,6 +108,8 @@ pub async fn consumer(
         }
         if batch.received > 0 {
             ctx.progress(now);
+            // The stats shard is the consumer's own index.
+            ctx.consumer_received[shard].fetch_add(batch.received, Ordering::Relaxed);
             let mut s = ctx.stats.shard(shard);
             s.received += batch.received;
             for &l in &batch.e2e {

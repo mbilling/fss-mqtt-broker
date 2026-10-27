@@ -59,12 +59,15 @@ pub struct ConsumerSpec {
     pub stream: usize,
     /// The filter it subscribes to.
     pub filter: String,
+    /// Index into [`Config::brokers`] it connects to ([`Config::consumer_specs`]).
+    pub broker: usize,
 }
 
 /// A whole run.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Brokers; connections are spread over them round-robin.
+    /// Brokers; every topic's publishers and every stream's consumers are spread over
+    /// all of them ([`Config::publisher_broker`], [`Config::consumer_specs`]).
     pub brokers: Vec<SocketAddr>,
     /// The offered-rate schedule.
     pub phases: Vec<Phase>,
@@ -123,6 +126,8 @@ pub struct Config {
     pub connect_timeout_ns: u64,
     /// Saturation thresholds.
     pub thresholds: Thresholds,
+    /// The highest [`Config::session_skew`] the workload may have; 0 accepts any.
+    pub max_skew: f64,
     /// Serve Prometheus `/metrics` here during the run.
     pub metrics_bind: Option<SocketAddr>,
     /// Written (Unix ms) once every client is connected ([`crate::start`]).
@@ -174,6 +179,7 @@ impl Config {
             connect_concurrency: 128,
             connect_timeout_ns: 10_000_000_000,
             thresholds: Thresholds::default(),
+            max_skew: 1.25,
             metrics_bind: None,
             ready_file: None,
             start_file: None,
@@ -245,7 +251,87 @@ impl Config {
                 self.keepalive
             ));
         }
+        if !(self.max_skew.is_finite() && self.max_skew >= 0.0) {
+            return Err("max skew must be finite and >= 0".into());
+        }
+        let skew = self.session_skew();
+        if self.max_skew > 0.0 && skew > self.max_skew {
+            return Err(format!(
+                "the busiest consumer session would carry {skew:.2}x the mean session's load \
+                 (limit {:.2}): {} publishers over {} topics and {} brokers do not divide evenly \
+                 — use a multiple of topics x brokers ({}) or raise --max-skew",
+                self.max_skew,
+                self.publishers,
+                self.topics,
+                self.brokers.len(),
+                self.topics * self.brokers.len()
+            ));
+        }
         Ok(())
+    }
+
+    /// The broker publisher `i` connects to, as an index into [`Config::brokers`].
+    /// Publisher `i` publishes to topic `i % topics`; its broker steps once per round of
+    /// topics, so every topic's publishers are spread over every broker. (Dealing
+    /// connections `i % brokers` instead puts all of a topic's publishers on ONE broker
+    /// whenever the broker count divides the topic count, and a locality-preferring
+    /// `$share` then hands that topic to the one member on that broker.)
+    #[must_use]
+    pub fn publisher_broker(&self, i: usize) -> usize {
+        (i % self.topics + i / self.topics) % self.brokers.len()
+    }
+
+    /// The busiest consumer session's expected load over the mean session's, for a
+    /// broker that hands a `$share` publish to a member on the publisher's own broker
+    /// when there is one (prefer-local; otherwise to any member). 1.0 is an even
+    /// spread; [`Config::validate`] refuses a workload above [`Config::max_skew`]. The
+    /// load counts publishers, which all publish at the same rate.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn session_skew(&self) -> f64 {
+        let brokers = self.brokers.len();
+        if brokers == 0 || self.topics == 0 {
+            return 1.0;
+        }
+        // Publishers per topic and broker.
+        let mut pubs = vec![vec![0usize; brokers]; self.topics];
+        for i in 0..self.publishers as usize {
+            pubs[i % self.topics][self.publisher_broker(i)] += 1;
+        }
+        let specs = self.consumer_specs();
+        let mut loads: Vec<f64> = Vec::with_capacity(specs.len());
+        match self.shape {
+            Shape::None => return 1.0,
+            Shape::Fanout => {
+                for spec in &specs {
+                    let t = spec.stream / self.consumers;
+                    loads.push(pubs[t].iter().sum::<usize>() as f64);
+                }
+            }
+            Shape::Share => {
+                let topics = self.stream_topics();
+                let mut members = vec![vec![0usize; brokers]; topics.len()];
+                for spec in &specs {
+                    members[spec.stream][spec.broker] += 1;
+                }
+                for spec in &specs {
+                    let on = &pubs[topics[spec.stream]];
+                    let here = &members[spec.stream];
+                    // Publishers on a broker with no member of the group go to any member.
+                    let remote: usize = (0..brokers).filter(|&b| here[b] == 0).map(|b| on[b]).sum();
+                    loads.push(
+                        on[spec.broker] as f64 / here[spec.broker] as f64
+                            + remote as f64 / self.consumers as f64,
+                    );
+                }
+            }
+        }
+        let mean = loads.iter().sum::<f64>() / loads.len().max(1) as f64;
+        if mean > 0.0 {
+            loads.iter().copied().fold(0.0, f64::max) / mean
+        } else {
+            1.0
+        }
     }
 
     /// The drain's quiet window, ns: the floor, or `drain_quiet_factor` times the
@@ -292,10 +378,14 @@ impl Config {
                     for t in 0..self.topics {
                         let stream = g * self.topics + t;
                         let filter = format!("$share/{}{g}/{}", self.group_prefix, self.topic(t));
-                        for _ in 0..self.consumers {
+                        // Member j of a stream on broker (stream + j): with as many
+                        // members as brokers, every broker holds one member of every
+                        // group.
+                        for j in 0..self.consumers {
                             v.push(ConsumerSpec {
                                 stream,
                                 filter: filter.clone(),
+                                broker: (stream + j) % self.brokers.len(),
                             });
                         }
                     }
@@ -306,6 +396,8 @@ impl Config {
                 .map(|stream| ConsumerSpec {
                     stream,
                     filter: self.topic(stream / self.consumers),
+                    broker: (stream / self.consumers + stream % self.consumers)
+                        % self.brokers.len(),
                 })
                 .collect(),
         }
@@ -378,6 +470,86 @@ mod tests {
         assert_eq!(specs.len(), 6);
         assert_eq!(specs[4].filter, "load/1");
         assert_eq!(specs[4].stream, 4);
+    }
+
+    /// `brokers` local endpoints, 20 topics, one `$share` group with a member on every
+    /// broker: the 10-node rig2 shape.
+    fn cluster(brokers: u16, publishers: u32) -> Config {
+        let eps = (0..brokers)
+            .map(|b| format!("10.99.1.{}:1883", 11 + b).parse().unwrap())
+            .collect();
+        let mut c = Config::new(eps, 50.0 * f64::from(publishers), publishers);
+        c.topics = 20;
+        c.consumers = usize::from(brokers);
+        c
+    }
+
+    #[test]
+    fn every_topic_has_publishers_on_every_broker() {
+        // 1014 publishers over 20 topics and 10 brokers: the 152k msg/s step of the
+        // 10-node run that put every publisher of a topic on one broker (dealt
+        // i % brokers, with 10 dividing 20).
+        for (brokers, publishers) in [(10, 1014), (10, 1200), (3, 1014), (4, 333), (1, 40)] {
+            let c = cluster(brokers, publishers);
+            let mut on = vec![vec![0u32; usize::from(brokers)]; c.topics];
+            for i in 0..publishers as usize {
+                on[i % c.topics][c.publisher_broker(i)] += 1;
+            }
+            for (t, per_broker) in on.iter().enumerate() {
+                let (lo, hi) = (
+                    per_broker.iter().min().unwrap(),
+                    per_broker.iter().max().unwrap(),
+                );
+                assert!(
+                    hi - lo <= 1,
+                    "{brokers} brokers, {publishers} publishers: topic {t} spread {per_broker:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_group_has_a_member_on_every_broker() {
+        let mut c = cluster(10, 1200);
+        c.groups = 2;
+        let specs = c.consumer_specs();
+        for stream in 0..c.stream_topics().len() {
+            let mut brokers: Vec<usize> = specs
+                .iter()
+                .filter(|s| s.stream == stream)
+                .map(|s| s.broker)
+                .collect();
+            brokers.sort_unstable();
+            assert_eq!(brokers, (0..10).collect::<Vec<_>>(), "stream {stream}");
+        }
+    }
+
+    #[test]
+    fn session_skew_is_one_for_a_whole_number_of_publishers_per_topic_and_broker() {
+        assert!((cluster(10, 1200).session_skew() - 1.0).abs() < 1e-9);
+        assert!((cluster(3, 1020).session_skew() - 1.0).abs() < 1e-9);
+        // One publisher short of whole: 5 or 6 per member, under the default limit.
+        let c = cluster(10, 1014);
+        assert!(
+            c.session_skew() > 1.0 && c.session_skew() < 1.25,
+            "{}",
+            c.session_skew()
+        );
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn a_hot_session_is_refused_unless_asked_for() {
+        // 30 publishers over 20 topics: topics 0-9 get two, topics 10-19 one, so the
+        // members of the first ten groups carry twice the others' load.
+        let mut c = cluster(10, 30);
+        assert!(c.session_skew() > 1.25, "{}", c.session_skew());
+        let e = c.validate().unwrap_err();
+        assert!(e.contains("busiest consumer session"), "{e}");
+        assert!(e.contains("multiple of topics x brokers (200)"), "{e}");
+        // --max-skew 0: measure a hot session on purpose.
+        c.max_skew = 0.0;
+        assert!(c.validate().is_ok());
     }
 
     #[test]

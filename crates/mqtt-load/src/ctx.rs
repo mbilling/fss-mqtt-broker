@@ -65,6 +65,9 @@ pub struct Ctx {
     pub filler: Vec<u8>,
     /// Messages written, per topic (the drain's "expected" figure).
     pub topic_sent: Vec<AtomicU64>,
+    /// Deliveries read, per consumer connection (in [`Config::consumer_specs`] order):
+    /// how evenly the broker spread them ([`crate::summary::Spread`]).
+    pub consumer_received: Vec<AtomicU64>,
     /// Last time an ack or delivery was read, ns.
     pub last_progress_ns: AtomicU64,
     /// Failures.
