@@ -2761,11 +2761,12 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `session_takeover_publishes_will`
 - `zero_keepalive_is_never_idle_disconnected`
 
-## `crates/mqttd/tests/loadgen.rs` — 5 test(s)
+## `crates/mqttd/tests/loadgen.rs` — 6 test(s)
 
 - `a_lost_consumer_opens_the_ledger`
 - `generators_share_a_start_through_the_start_file`
 - `measured_latency_reflects_an_injected_delay`
+- `publishers_stay_connected_through_a_drain_longer_than_the_keep_alive`
 - `qos0_clean_fanout_run_closes_its_ledger`
 - `qos1_durable_share_run_closes_its_ledger`
 

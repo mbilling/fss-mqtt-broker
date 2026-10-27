@@ -370,6 +370,44 @@ async fn a_lost_consumer_opens_the_ledger() {
     assert_eq!(s.outcome, Outcome::Error, "{}", report());
 }
 
+/// Publishers keep their connections through a drain longer than the broker's
+/// keep-alive allowance. The consumer is cut early, so the drain waits its whole quiet
+/// window (6 s) with nothing left to publish; at a 2 s keep-alive the broker closes a
+/// connection silent for 3 s. Before the publishers pinged through the drain, every one
+/// of them was closed so (the 10-node run of 2026-10-27 lost 5,200 at once); now the
+/// cut consumer is the only connection lost, and every publish is acknowledged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn publishers_stay_connected_through_a_drain_longer_than_the_keep_alive() {
+    let dir = common::TempDir::new();
+    let broker = spawn_broker(dir.path()).await;
+    let cut = proxy(broker.client, Duration::ZERO, Some(4096)).await;
+    // The consumer (connection 0) goes through the cutting proxy; the publishers
+    // alternate over [cut, direct], their PUBACK streams far below the cut.
+    let mut c = workload(cut, 200.0, 4);
+    c.brokers = vec![cut, broker.client];
+    c.topics = 1;
+    c.consumers = 1;
+    c.keepalive = 2;
+    c.drain_quiet_ns = 6_000_000_000;
+    let s = mqtt_load::run(c).await.expect("run");
+    let report = || {
+        format!(
+            "{}\n--- mqttd log ---\n{}",
+            serde_json::to_string_pretty(&s).unwrap(),
+            proc_common::log_tail(&broker.log)
+        )
+    };
+    assert_eq!(s.drain.ended_by, "quiet", "{}", report());
+    assert!(s.drain.quiet_s >= 6.0, "{}", report());
+    assert_eq!(s.ledger.unacked, 0, "{}", report());
+    assert_eq!(
+        s.errors.disconnects,
+        1,
+        "only the cut consumer may be lost: {}",
+        report()
+    );
+}
+
 /// Ack and end-to-end latency through a proxy adding a known delay each way: both
 /// grow by the round trip the proxy adds, and a direct run shows the baseline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
