@@ -944,7 +944,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_reserved_tree_is_exactly_sys_and_below`
 - `tests::topic_name_validity_rejects_wildcards_and_emptiness`
 
-## `crates/mqtt-load/src/lib.rs` — 34 test(s)
+## `crates/mqtt-load/src/lib.rs` — 38 test(s)
 
 - `client::tests::fixed_packets_decode_as_themselves`
 - `clock::tests::clock_is_monotonic_and_maps_back_to_instants`
@@ -978,6 +978,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `schedule::tests::offered_total_matches_rate_times_time`
 - `schedule::tests::rate_is_split_evenly_and_interleaved`
 - `schedule::tests::step_changes_rate_per_publisher_without_changing_publishers`
+- `start::tests::a_future_start_maps_onto_the_process_clock`
+- `start::tests::a_start_already_past_begins_now_and_says_how_late`
+- `start::tests::a_start_file_is_read_whole_or_not_at_all`
+- `start::tests::the_wait_ends_at_the_start_file_or_at_its_bound`
 - `stats::tests::drain_moves_histograms_and_sums_counters`
 - `subscriber::tests::packet_ids_follow_in_order_and_skip_zero`
 
@@ -2751,9 +2755,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `session_takeover_publishes_will`
 - `zero_keepalive_is_never_idle_disconnected`
 
-## `crates/mqttd/tests/loadgen.rs` — 4 test(s)
+## `crates/mqttd/tests/loadgen.rs` — 5 test(s)
 
 - `a_lost_consumer_opens_the_ledger`
+- `generators_share_a_start_through_the_start_file`
 - `measured_latency_reflects_an_injected_delay`
 - `qos0_clean_fanout_run_closes_its_ledger`
 - `qos1_durable_share_run_closes_its_ledger`

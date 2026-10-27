@@ -155,6 +155,7 @@ run (derived from the highest step), so the rate per publisher steps with the to
 | `--client-prefix` | `mqload-<run id>` | client id prefix |
 | `--drain-timeout`, `--drain-quiet`, `--drain-quiet-factor` | 30 s, 5 s, 2 | the drain ends when nothing is in flight and every expected delivery has arrived, when nothing moves for the quiet window, or at the timeout. The quiet window is `--drain-quiet`, or `--drain-quiet-factor` times the slowest measured window's ack or end-to-end p99 if that is longer (never past the timeout): deliveries running 10 s behind are not over after 5 s of silence |
 | `--metrics` | off | Prometheus endpoint during the run |
+| `--ready-file`, `--start-file`, `--start-wait` | off, off, 30 s | one start for several generator processes: write the ready file (Unix ms) once every client is connected; then wait for the start file to name the Unix ms at which the schedule starts, at most `--start-wait` (no more than the keep-alive: publishers are silent while they wait), else start at once. Without a start file the schedule starts 200 ms after the last connection |
 | `--threads` | available parallelism | tokio worker threads (the denominator of the CPU fraction) |
 | `--out` | stdout | JSON summary path |
 | `--quiet` | off | no per-window lines on stderr |
@@ -203,6 +204,10 @@ workload          {phases: [{rate, warmup_s, measure_s}], window_s, publishers, 
                    qos, payload_bytes, topics, topic_prefix, shape, consumers, groups,
                    sessions, session_expiry_s, deliveries_per_message, brokers}
 connections       {publishers, consumers, receive_maximum_min, inflight_window_min, connect_s}
+start             {by: own|shared|late|timeout, requested_unix_ms, waited_s, late_ms}: how the
+                  schedule's start was set; own without --start-file, shared at the start
+                  file's time, late when that time had passed (late_ms) and timeout when
+                  none came within --start-wait (both: started at once). Added within v2
 windows[]         one per warm-up, measured window and drain, in time order:
                   {index, phase, kind: warmup|measure|drain, start_s, end_s, target_rate,
                    <aggregate>, health}

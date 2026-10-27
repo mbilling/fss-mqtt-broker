@@ -182,10 +182,27 @@ class Verdicts(unittest.TestCase):
         v = verdict_of(make_step(self.root, 30000, [summary(30000)], idle=False))
         self.assertEqual(v["verdict"], V.VOID)
 
+    def test_an_unidle_cluster_voids_a_step_that_lost_messages_too(self):
+        # The 10-node run's 05-152000 started unsettled and dropped 467 messages: it was
+        # judged FAILED although the settle had warned "the step will be VOID".
+        v = verdict_of(make_step(self.root, 30000, [summary(30000)], idle=False, drops={"append-backlog-full": 7}))
+        self.assertEqual(v["verdict"], V.VOID, v)
+        self.assertTrue(any("append-backlog-full" in x for x in v["failures"]), v)
+        self.assertIn("would have been FAILED on a settled cluster; VOID because it started unsettled", v["notes"])
+
     def test_misaligned_generators_void_the_step(self):
         v = verdict_of(make_step(self.root, 30000, [summary(15000), summary(15000, start_shift_s=30)]))
         self.assertEqual(v["verdict"], V.VOID)
         self.assertTrue(any("overlap" in x for x in v["voids"]), v["voids"])
+
+    def test_a_generator_that_missed_the_shared_start_is_noted(self):
+        late = summary(15000)
+        late["start"] = {"by": "timeout", "requested_unix_ms": None, "waited_s": 45.0, "late_ms": 0}
+        on_time = summary(15000)
+        on_time["start"] = {"by": "shared", "requested_unix_ms": 1, "waited_s": 2.0, "late_ms": 0}
+        v = verdict_of(make_step(self.root, 30000, [on_time, late]))
+        self.assertIn("generator 1 missed the shared start: none came in 45.0 s, so it started on its own", v["notes"])
+        self.assertFalse(any("generator 0" in x for x in v["notes"]), v["notes"])
 
     def test_scrapes_that_miss_the_window_void_the_step(self):
         v = verdict_of(make_step(self.root, 30000, [summary(30000)], coverage_s=10))
@@ -649,9 +666,19 @@ class IdleAndCost(unittest.TestCase):
             self.assertEqual(V.not_idle(closer, 0, prev=closer), [])
             self.assertEqual(closer["replication_lag"], {"b": 4})
             self.assertEqual(V.not_idle(state(mqttd_replica_groups_tracked=179, mqttd_replica_groups_current=179), 0), [])
+            p.write_text(prom(1, 1).replace("# EOF", 'mqttd_routing_unsettled{reason="scan"} 0\n'
+                                                      'mqttd_routing_unsettled{reason="mesh"} 1\n# EOF'))
+            self.assertEqual(V.not_idle(V.idle_state([p]), 0), ["routing unsettled: b"])
+            # A session scan running is background (every broker runs one every ~30 s):
+            # recorded, and it holds the settle only when still running on the next pass.
             p.write_text(prom(1, 1).replace("# EOF", 'mqttd_routing_unsettled{reason="scan"} 1\n'
                                                       'mqttd_routing_unsettled{reason="mesh"} 0\n# EOF'))
-            self.assertEqual(V.not_idle(V.idle_state([p]), 0), ["routing unsettled: b"])
+            scanning = V.idle_state([p])
+            self.assertEqual(scanning["scanning"], ["b"])
+            self.assertEqual(V.not_idle(scanning, 0), [])
+            self.assertEqual(V.not_idle(scanning, 0, prev=state()), [])
+            self.assertEqual(V.not_idle(scanning, 0, prev=scanning),
+                             ["session scan still running on b (two passes in a row)"])
             # Sessions back to the run's baseline, not below it.
             p.write_text(prom(1, 1).replace("mqttd_sessions 0", "mqttd_sessions 3"))
             self.assertTrue(V.not_idle(V.idle_state([p]), 0))
@@ -660,7 +687,38 @@ class IdleAndCost(unittest.TestCase):
             before = state(mqttd_durable_writer_ops_total=340254)
             self.assertEqual(V.not_idle(state(mqttd_durable_writer_ops_total=340254), 0, prev=before), [])
             self.assertEqual(V.not_idle(state(mqttd_durable_writer_ops_total=340910), 0, prev=before),
-                             ["not quiet: durable_writer_ops_total moved"])
+                             ["not quiet: durable_writer_ops_total moved by 656"])
+
+    def test_a_background_tick_does_not_hold_the_settle_and_a_drain_does(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "b.prom"
+
+            def state(at, **gauges):
+                p.write_text(prom(1, 1, gauges=gauges))
+                st_ = V.idle_state([p])
+                st_["at_unix_s"] = at
+                return st_
+
+            before = state(1000.0, mqttd_durable_writer_ops_total=340254)
+            # 50 writer ops in 5 s (10/s): under the floor of 20/s, background.
+            tick = state(1005.0, mqttd_durable_writer_ops_total=340304)
+            self.assertEqual(V.not_idle(tick, 0, prev=before, step_rate=1000), [])
+            self.assertEqual(tick["background"], ["durable_writer_ops_total +50 in 5.0 s (10.0/s, background)"])
+            # 500 in 5 s (100/s): background beside a 152,000 msg/s step (0.1 %: 152/s),
+            # not beside a 30,000 one (30/s).
+            more = state(1005.0, mqttd_durable_writer_ops_total=340754)
+            self.assertEqual(V.not_idle(more, 0, prev=before, step_rate=152000), [])
+            self.assertEqual(V.not_idle(more, 0, prev=before, step_rate=30000),
+                             ["not quiet: durable_writer_ops_total moved by 500 in 5.0 s (100/s > 30/s allowed)"])
+            # A drain: deliveries at thousands per second, named with their size.
+            p.write_text(prom(1, 26001, gauges={"mqttd_durable_writer_ops_total": 340254}))
+            drain = V.idle_state([p])
+            drain["at_unix_s"] = 1005.0
+            self.assertEqual(V.not_idle(drain, 0, prev=before, step_rate=152000),
+                             ["not quiet: publish_delivered_total moved by 26000 in 5.0 s (5200/s > 152/s allowed)"])
+            # Work in the pipes holds it whatever the counters do.
+            lanes = state(1005.0, mqttd_durable_writer_ops_total=340254, mqttd_append_lane_jobs=3)
+            self.assertEqual(V.not_idle(lanes, 0, prev=before, step_rate=152000), ["append_lane_jobs 3"])
 
     def test_the_idle_command_reports_why_not(self):
         with tempfile.TemporaryDirectory() as d:

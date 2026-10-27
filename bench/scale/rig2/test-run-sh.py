@@ -8,7 +8,9 @@ server per broker in this process, serving a canned /metrics that can fail, stal
 report a busy cluster on demand. local-cluster.sh, mqttd and mqtt-load are stubs; lib.sh,
 verdict.py and the workloads are the real ones (symlinked). Checked: a broker whose
 scrapes fail now and then does not hold the settle back (the first 10-node run never
-settled because one failed scrape restarted the quiet period); the settle budget is
+settled because one failed scrape restarted the quiet period); a counter ticking at a
+background rate does not hold it either, a drain does, and a settle that runs out names
+what held it, even when its last pass was idle; the settle budget is
 wall-clock time, not a count of sleeps; a broker that never answers voids the step with
 its name; a broker whose step scrapes cannot be fetched voids that step by name, and the
 ladder reruns it; and a TERM sent mid-step runs the trap at once (it used to wait for the ladder
@@ -28,15 +30,20 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 SCALE = HERE.parent
 
-IDLE = "# TYPE mqttd_connections_active gauge\nmqttd_connections_active {conns}\n# EOF\n"
+IDLE = ("# TYPE mqttd_connections_active gauge\nmqttd_connections_active {conns}\n"
+        "mqttd_durable_writer_ops_total {writer}\nmqttd_publish_delivered_total {delivered}\n# EOF\n")
 
 
 class FakeBroker:
     """One broker's health port. `pattern` is a cycle of 'ok' / 'fail' (HTTP 500) per
-    request; `delay` stalls every answer; `conns` is the connection gauge served."""
+    request; `delay` stalls every answer; `conns` is the connection gauge served, or
+    `conns_cycle` a cycle of them per answer; `writer_tick` and `delivered_tick` grow
+    the durable-writer and delivered counters by that much on every answer."""
 
     def __init__(self):
         self.pattern, self.delay, self.conns, self.requests = ["ok"], 0.0, 0, 0
+        self.conns_cycle, self.writer_tick, self.delivered_tick = None, 0, 0
+        self.writer = self.delivered = self.answers = 0
         self.lock = threading.Lock()
         fb = self
 
@@ -45,13 +52,18 @@ class FakeBroker:
                 with fb.lock:
                     kind = fb.pattern[fb.requests % len(fb.pattern)]
                     fb.requests += 1
+                    if kind != "fail":
+                        fb.writer += fb.writer_tick
+                        fb.delivered += fb.delivered_tick
+                        conns = fb.conns_cycle[fb.answers % len(fb.conns_cycle)] if fb.conns_cycle else fb.conns
+                        fb.answers += 1
+                        body = IDLE.format(conns=conns, writer=fb.writer, delivered=fb.delivered).encode()
                 if fb.delay:
                     time.sleep(fb.delay)  # the fake broker's stall, not a wait in the test
                 if kind == "fail":
                     self.send_response(500)
                     self.end_headers()
                     return
-                body = IDLE.format(conns=fb.conns).encode()
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -186,6 +198,49 @@ class RunShTest(unittest.TestCase):
         self.assertLessEqual(rec["waited_s"], 14, rec)
         self.assertGreaterEqual(rec["passes"], 3, rec)
         self.assertTrue(any("connections" in w for w in rec["state"]["why_not"]), rec)
+
+    def test_a_background_tick_does_not_hold_the_settle(self):
+        # Every broker's durable writer ticks by 2 an answer, one answer a pass of ~1 s:
+        # 6/s over the cluster, under the background floor (20/s). Before, any movement
+        # restarted the quiet period and this cluster never settled.
+        for b in self.brokers:
+            b.writer_tick = 2
+        self.run_to_end(SETTLE_QUIET_LONG=3, SETTLE_BUDGET_LONG=30)
+        rec = self.idle_before()
+        self.assertTrue(rec["idle"], rec)
+        self.assertLess(rec["waited_s"], 15, rec)
+        self.assertTrue(any("durable_writer_ops_total" in x for x in rec["state"].get("background", [])), rec)
+
+    def test_a_drain_holds_the_settle_and_is_named(self):
+        # Deliveries still flowing at ~30,000/s: not background, and the warning says so.
+        for b in self.brokers:
+            b.delivered_tick = 10000
+        r = self.run_to_end(SETTLE_QUIET_LONG=3, SETTLE_BUDGET_LONG=6)
+        rec = self.idle_before()
+        self.assertFalse(rec["idle"], rec)
+        self.assertTrue(any("publish_delivered_total moved by 30000" in w for w in rec["state"]["why_not"]), rec)
+        self.assertIn("cluster not settled", r.stderr)
+        self.assertRegex(r.stderr, r"publish_delivered_total moved by 30000 in [0-9.]+ s .*VOID \(unreset\)")
+
+    def test_a_settle_that_ends_on_an_idle_pass_names_what_restarted_it(self):
+        # Broker 0 has a connection on its second answer only (the first is the run's
+        # baseline scrape): the settle's first pass is busy, every later one idle, and
+        # the budget (4 s) runs out before the quiet period (6 s). The last pass is idle;
+        # the record and the warning still name what restarted the quiet period.
+        self.brokers[0].conns_cycle = [0, 1] + [0] * 1000
+        r = self.run_to_end(SETTLE_QUIET_LONG=6, SETTLE_BUDGET_LONG=4)
+        rec = self.idle_before()
+        self.assertFalse(rec["idle"], rec)
+        self.assertEqual(rec["blocked_passes"], 1, rec)
+        self.assertEqual(rec["last_blocked"]["why_not"], ["connections 1 > 0"], rec)
+        self.assertEqual(len(rec["state"]["why_not"]), 1, rec)
+        self.assertRegex(rec["state"]["why_not"][0], r"^the 6 s quiet period last restarted at 0 s of \d+, on: "
+                                                      r"connections 1 > 0 \(1 of \d+ passes were not idle\)$")
+        self.assertIn("on: connections 1 > 0", r.stderr)
+        log = [json.loads(x) for x in next((self.run_dir / "A" / "durable-qos1" / "steps").glob("*/pre/passes.jsonl"))
+               .read_text().splitlines()]
+        self.assertEqual(len(log), rec["passes"], rec)
+        self.assertEqual([x["idle"] for x in log], [False] + [True] * (len(log) - 1), log)
 
     def test_a_broker_that_never_answers_voids_the_step_by_name(self):
         self.brokers[2].pattern = ["fail"]

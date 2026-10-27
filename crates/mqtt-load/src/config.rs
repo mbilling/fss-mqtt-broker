@@ -1,6 +1,7 @@
 //! A workload (ADR 0090 D3): what is offered, to whom, and how it is judged.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use crate::schedule::Phase;
 
@@ -124,6 +125,13 @@ pub struct Config {
     pub thresholds: Thresholds,
     /// Serve Prometheus `/metrics` here during the run.
     pub metrics_bind: Option<SocketAddr>,
+    /// Written (Unix ms) once every client is connected ([`crate::start`]).
+    pub ready_file: Option<PathBuf>,
+    /// Waited for once connected: the Unix ms at which the schedule starts
+    /// ([`crate::start`]).
+    pub start_file: Option<PathBuf>,
+    /// The longest wait for `start_file`, ns; then the schedule starts on its own.
+    pub start_wait_ns: u64,
     /// The runtime's worker threads (the denominator of the CPU fraction).
     pub worker_threads: usize,
     /// Print a line per window to stderr.
@@ -167,6 +175,9 @@ impl Config {
             connect_timeout_ns: 10_000_000_000,
             thresholds: Thresholds::default(),
             metrics_bind: None,
+            ready_file: None,
+            start_file: None,
+            start_wait_ns: 30_000_000_000,
             worker_threads: std::thread::available_parallelism().map_or(1, usize::from),
             progress: false,
         }
@@ -222,6 +233,17 @@ impl Config {
         }
         if !(self.drain_quiet_factor.is_finite() && self.drain_quiet_factor >= 0.0) {
             return Err("drain quiet factor must be finite and >= 0".into());
+        }
+        // Publishers do not write while they wait for the start: past the keep-alive
+        // the broker would drop them (it allows 1.5x).
+        if self.start_file.is_some()
+            && self.keepalive > 0
+            && self.start_wait_ns > u64::from(self.keepalive) * 1_000_000_000
+        {
+            return Err(format!(
+                "start wait must not exceed the keep-alive ({} s): publishers are silent while they wait",
+                self.keepalive
+            ));
         }
         Ok(())
     }

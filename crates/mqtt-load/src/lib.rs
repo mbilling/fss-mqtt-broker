@@ -16,6 +16,7 @@
 //! - [`client`], [`publisher`], [`subscriber`] — the connections, on `mqtt-codec`.
 //! - [`health`] — the generator's own CPU.
 //! - [`metrics`], [`summary`] — Prometheus during the run; the JSON summary after it.
+//! - [`start`] — a start shared by several generator processes.
 //! - [`run`] — one run end to end.
 //!
 //! The JSON schema and the CLI are documented in `crates/mqtt-load/README.md`.
@@ -32,6 +33,7 @@ pub mod payload;
 pub mod publisher;
 pub mod run;
 pub mod schedule;
+pub mod start;
 pub mod stats;
 pub mod subscriber;
 pub mod summary;

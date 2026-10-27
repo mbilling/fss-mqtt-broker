@@ -37,6 +37,8 @@ pub struct Summary {
     pub workload: Workload,
     /// What was connected.
     pub connections: Connections,
+    /// How the schedule's start was set.
+    pub start: StartReport,
     /// Every window in time order: warm-ups, measured windows, and the drain.
     pub windows: Vec<WindowReport>,
     /// Per phase (step), aggregated over its measured windows.
@@ -157,6 +159,21 @@ pub struct Connections {
     pub inflight_window_min: u16,
     /// Seconds spent establishing every connection.
     pub connect_s: f64,
+}
+
+/// How the schedule's start was set (`--start-file`, [`crate::start`]).
+#[derive(Debug, Clone, Serialize)]
+pub struct StartReport {
+    /// `own` (no start file: as soon as connected), `shared` (the start file's time),
+    /// `late` (the start file's time had passed when it was read: started at once) or
+    /// `timeout` (the start file named no start within `--start-wait`: started at once).
+    pub by: &'static str,
+    /// The start the start file named, Unix ms.
+    pub requested_unix_ms: Option<u64>,
+    /// Seconds waited for the start file.
+    pub waited_s: f64,
+    /// How late the start file's time was when it was read, ms (`late` only).
+    pub late_ms: u64,
 }
 
 /// Counts, rates and latencies over a span.

@@ -175,16 +175,31 @@ run keeps them out.
    `_publish_held_for_unreachable`, `_append_lane_jobs`, `_inflight_messages`,
    `_backlog_bytes` and `_peer_forwards_in_flight` all 0, `mqttd_hub_queue_depth` at most
    8; no placement group under-replicated (`mqttd_replication_min_actual < _desired`), no
-   routing view unsettled (`mqttd_routing_unsettled`), and the replication lag
+   routing view unsettled (`mqttd_routing_unsettled`, any term but `scan`), no session
+   scan still running on the same broker two passes in a row (`scan`: every broker of a
+   durable cluster runs one every ~30 s for under a second, so on ten brokers a pass sees
+   one about 30% of the time; counted as unsettled, it held the 30 s quiet period off
+   for whole 300 s budgets on the 10-node run of 2026-10-27, which VOIDed every step
+   after the first one that was not carried), and the replication lag
    (`mqttd_replica_groups_tracked - _current`) not moving (a lag that stands still between
    two scrapes is recorded, not waited for: a local cluster held 72 groups behind at idle
    for minutes). Then it must stay so for a quiet period with the traffic and durable-writer
    counters (`mqttd_publish_received_total`, `_delivered_total`, `_forwarded_total`,
-   `mqttd_durable_writer_ops_total`) standing still: `SETTLE_QUIET` (10 s) within
+   `mqttd_durable_writer_ops_total`) standing still, or moving between two passes at no
+   more than a background rate: 0.1% of the coming step's msg/s, at least 20/s
+   (`verdict.py` `QUIET_FRACTION`, `QUIET_FLOOR`; an idle 10-node cluster's writer did 0
+   to 110 ops in five minutes, a drain runs at hundreds to thousands a second, and work
+   still in the pipes is held by the gauges above whatever the counters do):
+   `SETTLE_QUIET` (10 s) within
    `RESET_BUDGET` (120 s) after a carried step; `SETTLE_QUIET_LONG` (30 s) within
    `SETTLE_BUDGET_LONG` (300 s) before a ladder's first step and after any step that was
-   not carried. Otherwise the step runs but is VOID (unreset), and `step.json`'s
-   `idle_before.state.why_not` and the verdict say what had not settled. These are the
+   not carried. Otherwise the step runs but is VOID (unreset), whatever it measured, loss
+   included (its findings stay listed: residue of the step before can cause them), and
+   `step.json`'s `idle_before.state.why_not` and the verdict say what had not settled:
+   the last pass's reasons, or, when that pass was idle, the reasons of the last pass
+   that restarted the quiet period (`idle_before.last_blocked`). Every pass is in
+   `pre/passes.jsonl`. Before a prime, a settle that runs out only says so: the prime is
+   not judged, and the first step settles again. These are the
    lane E rig's UNRESET gauges (connections, sessions) and the residue its `run-curve.sh`
    compared against a baseline, plus the pipes. In run 2 every step started with all of
    them idle: the excursions of clean-qos1's first steps were not visible on any broker
@@ -194,8 +209,16 @@ run keeps them out.
    After the step each broker's scrapes come back as one tar stream over one ssh (one scp
    per file took ~15 s a broker on the 10-node run), unpacked aside and renamed into
    place only when the stream arrived whole.
-3. **Load.** One mqtt-load process per generator host, started together, each offering
-   `rate / GENERATORS` msg/s: `WARMUP` (20 s) of warm-up, then `MEASURE` (60 s) measured in
+3. **Load.** One mqtt-load process per generator host, each offering `rate / GENERATORS`
+   msg/s, all on one start: each writes a ready file once its clients are connected
+   (`--ready-file`) and waits for a start file (`--start-file`); when every generator is
+   ready, or after `START_SYNC_WAIT` (30 s), the rig writes one start time,
+   `START_LEAD_MS` (3000; local 500) ahead on generator host 0's clock, into every start
+   file. On the 10-node run of 2026-10-27 one generator took 13.8 s to connect against
+   the others' 5.2 s, and the windows of clean-qos1 303,800 overlapped 51.6 s of 60. A
+   generator that misses the start begins on its own (`--start-wait`), the summary's
+   `start.by` says so, the verdict notes it, and the overlap check decides.
+   Then: `WARMUP` (20 s) of warm-up, then `MEASURE` (60 s) measured in
    `WINDOW` (10 s) windows, then the drain. Each step has its own process, so each has its
    own ledger.
 4. **The drain** ends when every expected delivery and ack is in (`complete`), after a
@@ -218,7 +241,7 @@ run keeps them out.
 
 Raw evidence per step: `<run>/<arm>/<workload>/steps/<NN>-<rate>/` holds `step.json`,
 `gen-<g>.json` (the mqtt-load summary, schema `mqtt-load.summary.v2`), `.stderr`,
-`.exit`, `pre/` (the last settle scrapes and their state), `scrapes/broker-<i>/<unix_ms>.prom`,
+`.exit`, `pre/` (the last settle scrapes, their state, and every pass in `passes.jsonl`), `scrapes/broker-<i>/<unix_ms>.prom`,
 and `verdict.json`. A retried step has its own directory, `<NN>-<rate>-a2`, beside the
 first attempt's.
 
@@ -229,7 +252,7 @@ Judged on the broker only (ADR 0090 D1). In order:
 | verdict | when | ramp |
 |---|---|---|
 | **FAILED** | a generator's ledger did not close (missing, unexpected, unacked), a broker dropped a message by a reason that is loss (`mqttd_publish_dropped_total`, see below), or a broker restarted | stops the ladder (`BISECT_ON_FAIL=1` keeps bisecting below it) |
-| **VOID** | a generator saturated in a measured window, a generator left no summary, the generators' windows overlap less than 90%, a broker of the run has no scrapes of the step or its scrapes do not cover the window, or the cluster was not idle | rerun (`VOID_RETRIES`, 1); never counted against the broker |
+| **VOID** | a generator saturated in a measured window, a generator left no summary, the generators' windows overlap less than 90%, a broker of the run has no scrapes of the step or its scrapes do not cover the window, or the cluster was not idle (unreset: VOID before any other verdict, FAILED included) | rerun (`VOID_RETRIES`, 1); never counted against the broker |
 | **DISCONNECTED** | connections were lost during the step. mqtt-load does not reconnect, so its ledger cannot be read after that | not carried; the ramp treats it as above the knee |
 | **NOT DRAINED** | the ledger misses deliveries, no broker dropped any as loss, the drain ended before it was complete, and the brokers' own gauges at their first scrape after the drain (`mqttd_inflight_messages` + `mqttd_pending_publishes`) hold at least what the ledger misses: the messages were still queued, not lost | not carried, not loss; above the knee |
 | **OFFER NOT TAKEN** | the brokers received less than 99% of the offered msg/s (`OFFER_TAKEN` from `../summarize-curve.py`) | above the knee |
@@ -324,4 +347,6 @@ states it.
 Tests: `python3 bench/scale/rig2/test-verdict.py` (offline; CI runs it; it includes
 `chart-ramp.py --self-test`) and `python3 bench/scale/rig2/test-run-sh.py` (offline; CI
 runs it): the real `run.sh` at `TIER=local` against fake brokers, for a flaky scrape, the
-wall-clock budget, a broker that never answers, and a TERM mid-step.
+wall-clock budget, a broker that never answers, a background counter tick (no hold), a
+drain (held, and named), a settle that runs out on an idle pass (the reason still named),
+and a TERM mid-step.

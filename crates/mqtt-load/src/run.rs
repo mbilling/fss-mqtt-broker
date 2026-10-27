@@ -17,11 +17,12 @@ use crate::ledger::Ledger;
 use crate::metrics::{self, View};
 use crate::publisher::{self, PubShared};
 use crate::schedule::Schedule;
+use crate::start;
 use crate::stats::{Counters, Histos, Stats};
 use crate::subscriber;
 use crate::summary::{
-    Aggregate, Connections, DrainReport, GeneratorReport, Outcome, PhaseReport, PhaseSpec, Summary,
-    Tool, WindowHealth, WindowKind, WindowReport, Workload, SCHEMA,
+    Aggregate, Connections, DrainReport, GeneratorReport, Outcome, PhaseReport, PhaseSpec,
+    StartReport, Summary, Tool, WindowHealth, WindowKind, WindowReport, Workload, SCHEMA,
 };
 
 /// A run that could not start.
@@ -43,6 +44,9 @@ pub enum RunError {
     /// The metrics endpoint could not be bound.
     #[error("metrics endpoint: {0}")]
     Metrics(std::io::Error),
+    /// The ready file could not be written.
+    #[error("ready file: {0}")]
+    Ready(std::io::Error),
 }
 
 const TICK_NS: u64 = 1_000_000_000;
@@ -434,8 +438,62 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
         .unwrap_or(u16::MAX);
     let window = cfg.inflight.min(receive_maximum_min).max(1);
 
-    // Start the schedule a moment from now, so every writer starts on time.
-    let start = now_ns() + 200_000_000;
+    // Start the schedule a moment from now, so every writer starts on time; or, with a
+    // start file, at the time it names (several generators sharing one start).
+    if let Some(p) = &cfg.ready_file {
+        if let Err(e) = start::write_atomic(p, &format!("{}\n", start::unix_ms_now())) {
+            ctx.stopping.store(true, Ordering::Relaxed);
+            let _ = stop_tx.send(true);
+            return Err(RunError::Ready(e));
+        }
+    }
+    let (start, start_report) = match &cfg.start_file {
+        None => (
+            now_ns() + start::OWN_LEAD_NS,
+            StartReport {
+                by: "own",
+                requested_unix_ms: None,
+                waited_s: 0.0,
+                late_ms: 0,
+            },
+        ),
+        Some(p) => {
+            let (at, late_ms, w) = start::await_start(p, cfg.start_wait_ns).await;
+            let by = if w.timed_out {
+                "timeout"
+            } else if late_ms > 0 {
+                "late"
+            } else {
+                "shared"
+            };
+            if by != "shared" {
+                eprintln!(
+                    "mqtt-load: start {by}: {}",
+                    if w.timed_out {
+                        format!(
+                            "no start in {} after {:.1} s",
+                            p.display(),
+                            w.waited_ns as f64 / NS
+                        )
+                    } else {
+                        format!(
+                            "the start named in {} had passed {late_ms} ms before",
+                            p.display()
+                        )
+                    }
+                );
+            }
+            (
+                at,
+                StartReport {
+                    by,
+                    requested_unix_ms: w.requested_unix_ms,
+                    waited_s: w.waited_ns as f64 / NS,
+                    late_ms,
+                },
+            )
+        }
+    };
     let sched = Schedule::new(&cfg.phases, cfg.publishers, start);
     let mut pubs = Vec::with_capacity(pub_conns.len());
     for (i, c) in pub_conns.into_iter().enumerate() {
@@ -773,6 +831,7 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
             inflight_window_min: window_min,
             connect_s,
         },
+        start: start_report,
         windows,
         phases,
         totals: aggregate(tot_d, tot_o, &tot_c, &tot_h, true),
