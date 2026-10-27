@@ -674,7 +674,9 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
             .pubs
             .iter()
             .all(|p| p.outstanding() == 0 || p.is_closed());
-        let writers_done = pubs.iter().all(|p| p.writer.is_finished());
+        let writers_done = pubs
+            .iter()
+            .all(|p| p.shared.schedule_done() || p.writer.is_finished());
         let deliveries_done = ctx.unique_deliveries() >= ctx.expected_deliveries();
         if writers_done && inflight_done && deliveries_done {
             break "complete";
@@ -727,12 +729,21 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
     };
     ctx.stopping.store(true, Ordering::Relaxed);
     let _ = stop_tx.send(true);
-    for p in pubs {
-        p.writer.abort();
-        if let Ok(mut w) = p.writer.await {
-            use tokio::io::AsyncWriteExt;
-            let _ = w.write_all(&client::disconnect_bytes(false)).await;
-            let _ = w.shutdown().await;
+    // Writers ping through the drain; stop them all, then take each write half back
+    // for its DISCONNECT, under one deadline (a writer stuck on a full socket is
+    // aborted at it).
+    for p in &pubs {
+        p.shared.stop();
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    for mut p in pubs {
+        match tokio::time::timeout_at(deadline, &mut p.writer).await {
+            Ok(Ok(mut w)) => {
+                use tokio::io::AsyncWriteExt;
+                let _ = w.write_all(&client::disconnect_bytes(false)).await;
+                let _ = w.shutdown().await;
+            }
+            _ => p.writer.abort(),
         }
         p.reader.abort();
     }

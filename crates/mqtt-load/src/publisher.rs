@@ -102,6 +102,10 @@ pub struct PubShared {
     pub credit: Notify,
     /// The connection is gone.
     pub closed: AtomicBool,
+    /// The writer has written everything its schedule offered (it still pings).
+    schedule_done: AtomicBool,
+    /// The run is ending: the writer stops pinging and returns its write half.
+    stop: AtomicBool,
 }
 
 impl PubShared {
@@ -112,7 +116,22 @@ impl PubShared {
             inflight: Mutex::new(Inflight::new(window)),
             credit: Notify::new(),
             closed: AtomicBool::new(false),
+            schedule_done: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
         }
+    }
+
+    /// Whether the writer has written all its schedule offered (or its connection is
+    /// gone): the drain's "nothing more will be sent".
+    #[must_use]
+    pub fn schedule_done(&self) -> bool {
+        self.schedule_done.load(Ordering::Relaxed)
+    }
+
+    /// End the writer's keep-alive pings: it returns its write half.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.credit.notify_one();
     }
 
     /// Messages in flight.
@@ -162,8 +181,11 @@ async fn write_tracked(w: &mut OwnedWriteHalf, mut buf: &[u8]) -> std::io::Resul
     Ok((blocked, blocked_ns))
 }
 
-/// The writer: follows `cursor` until the schedule ends or the connection closes, and
-/// returns the write half (for the closing DISCONNECT).
+/// The writer: follows `cursor` until the schedule ends or the connection closes,
+/// then keeps the connection alive with PINGREQs until [`PubShared::stop`], and returns
+/// the write half (for the closing DISCONNECT). Without the pings a publisher is silent
+/// through the drain, and a broker closes it after 1.5 x the keep-alive: on the
+/// 10-node run of 2026-10-27 a 106 s drain lost all 5,200 publishers of one generator.
 ///
 /// # Panics
 /// If another task panicked holding the in-flight lock.
@@ -290,6 +312,25 @@ pub async fn writer(
                 s.sched_lag.record_ns(d);
             }
         }
+    }
+    state.schedule_done.store(true, Ordering::Relaxed);
+    // The drain: nothing more to send, but the connection must outlive it.
+    while !state.is_closed() && !state.stop.load(Ordering::Relaxed) {
+        let now = now_ns();
+        if ka_ns > 0 && now >= last_write + ka_ns {
+            if write_tracked(&mut w, &client::PINGREQ).await.is_err() {
+                break;
+            }
+            last_write = now_ns();
+            continue;
+        }
+        // Woken by stop() (or an ack: the loop checks again).
+        let wait = if ka_ns > 0 {
+            last_write + ka_ns - now
+        } else {
+            1_000_000_000
+        };
+        let _ = tokio::time::timeout(Duration::from_nanos(wait), state.credit.notified()).await;
     }
     w
 }
