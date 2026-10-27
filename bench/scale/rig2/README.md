@@ -27,8 +27,10 @@ figure crosses hosts.
 ## Running
 
 ```sh
-# Free: a 3-node local cluster and a short ramp (3 steps of 5 s warm-up + 10 s measured).
+# Free: a 3-node local cluster and a short ramp (3 steps of 5 s warm-up + 10 s measured,
+# one round a step; ROUNDS=2 measures each step twice).
 TIER=local bench/scale/rig2/run.sh
+TIER=local ROUNDS=2 bench/scale/rig2/run.sh
 TIER=local WORKLOADS="durable-qos1 clean-qos1 qos0" MAX_STEPS=6 bench/scale/rig2/run.sh
 
 # The quote, with no cloud call:
@@ -59,14 +61,22 @@ The trap stops the run's children (TERM, `CHILD_GRACE` s, default 60, then KILL;
 TERMed tofu writes its state first), then destroys; a second Ctrl-C does not interrupt
 the teardown. `kill -9` still leaves the fleet up.
 
-Expected duration and price (estimate: about 9 steps per ladder at about 135 s each plus
-the priming run, 10 to 14 minutes of bring-up, 3 of teardown; the real step count
-depends on where the knee is, on transient retries and on how long the settles take):
+Expected duration and price, as the runner quotes it (`verdict.py cost`): about 9 steps
+per ladder (`EST_STEPS`), each `ROUNDS` (3) rounds of about 135 s (20 s warm-up, 60 s
+measured, ~20 s of connect, start, drain and scrape fetch, the 10-node runs of
+2026-10-27 took 97 to 111 s a round, plus the short settle), and per ladder ~350 s for
+the 90 s prime and four long settles (the first, and `EST_LONG_SETTLES`, 3, after bad
+steps or before transient retries); then 10 to 14 minutes of bring-up and 3 of
+teardown. The real step count depends on where the knee is; a step that is not carried
+stops at its first bad round, so its other rounds are not paid for.
 
 | tier | one workload | three workloads |
 |---|---|---|
-| n3 | ~36 min, EUR 0.47 prorated (EUR 0.79 per started hour) | ~80 min, EUR 1.07 (EUR 1.59) |
-| n10 | ~40 min, EUR 1.68 prorated (EUR 2.55 per started hour) | ~84 min, EUR 3.60 (EUR 5.11) |
+| n3 | ~80 min, EUR 1.05 prorated (EUR 1.59 per started hour) | ~213 min, EUR 2.82 (EUR 3.18) |
+| n10 | ~84 min, EUR 3.56 prorated (EUR 5.11 per started hour) | ~217 min, EUR 9.23 (EUR 10.22) |
+
+With `ROUNDS=1` (one measurement a step, as before 2026-10-27) the three-workload n10 run
+is ~95 min, EUR 4.06 (EUR 5.11).
 
 ### Live Grafana (OBSERVE, on by default)
 
@@ -157,7 +167,43 @@ against 2.2 ms on the next step, all of it in the last measured window; clean 30
 148 ms), so a longer warm-up inside the step would have measured them, and a separate
 run keeps them out.
 
-## A step
+## A step: its rounds
+
+A step is measured `ROUNDS` times at its msg/s (3 on n3 and n10, 1 locally; the
+maintainer's request of 2026-10-27: "3 rounds per step to avoid disturbance — report the
+variance and plot mean"). Each round is a separate mqtt-load run per generator host at
+the same rate, with everything a step had before: its own settle (the full one before a
+ladder's first round and after any round that was not carried, the short one between
+the rounds of a carried step), its own warm-up, the shared start, its own ledger, its own
+broker scrapes, and its own verdict (below). `verdict.py round-next` names the next
+round to run and its settle; `verdict.py step` then judges the step from its rounds:
+
+- **FAILED** if any round FAILED (loss is loss; the verdict names the round), **VOID** if
+  any round stayed VOID through its reruns, then **DISCONNECTED**, **NOT DRAINED**,
+  **OFFER NOT TAKEN** (the precedence of the round verdicts below); **CARRIED** only when
+  every round carried.
+- A **VOID round is rerun alone** (`VOID_RETRIES`, 1, per round), its other rounds
+  standing; a round VOID through its reruns makes the step VOID and stops the ladder.
+- **The transient retry is per step, on one round**: the first bad round of a step, when
+  the ladder's transient-retry rule allows it (see the ramp), is rerun once after the full
+  settle. If that retry carries, the round counts as carried and the step says "round K
+  retried: transient"; if it is bad too, it counts. One retry a step, `RETRY_MAX` a
+  ladder.
+- A step stops at its first round that settles it as not carried: more rounds cannot
+  carry it.
+
+**Statistics across the rounds** that count (each round's last attempt; a retried
+round's first attempt and VOID attempts do not count), in `verdict.json` `stats`: mean,
+sample standard deviation (n − 1; none for one round), min and max of the brokers'
+received and delivered msg/s, ack p50/p99/p999 and end-to-end p50/p99/p999, and the
+coefficient of variation (sd / mean) of each, reported for the received msg/s and the
+gated p99. **A step's headline latency is the MEAN of its rounds' p99** (and p50, p999):
+`ack_latency`, `e2e_latency` and `gate_p99_us` are the means. Beside them,
+`ack_latency_merged` and `gate_p99_merged_us` are the exact merge of every round's
+histograms (the p99 of all the step's samples). `spread` flags rounds that disagree by
+more than 10% in received msg/s ((max − min) / min) or more than 2× in p99 (max / min).
+
+### One round
 
 1. **The settle.** Every broker is scraped every `SETTLE_POLL` (5) s (`verdict.py idle`),
    all of them together: in the cloud one ssh to generator host 0 curls every broker's
@@ -167,7 +213,7 @@ run keeps them out.
    with the last complete one. Budgets and the quiet period are wall-clock seconds. (On the
    first 10-node run, ten scrapes in a row over ssh took 10-15 s a pass, a single failed
    one restarted the quiet period, and the cluster, idle throughout, never settled.) A
-   broker that never answered within the budget is named in the VOID's reasons. The step starts
+   broker that never answered within the budget is named in the VOID's reasons. The round starts
    when the cluster holds no connections (`IDLE_FLOOR`), its session count is back to the
    run's baseline (scraped on the fresh cluster before the first ladder; mqtt-load ends its
    durable sessions with expiry 0, so a clean step leaves none), and nothing is in the
@@ -191,9 +237,10 @@ run keeps them out.
    to 110 ops in five minutes, a drain runs at hundreds to thousands a second, and work
    still in the pipes is held by the gauges above whatever the counters do):
    `SETTLE_QUIET` (10 s) within
-   `RESET_BUDGET` (120 s) after a carried step; `SETTLE_QUIET_LONG` (30 s) within
-   `SETTLE_BUDGET_LONG` (300 s) before a ladder's first step and after any step that was
-   not carried. Otherwise the step runs but is VOID (unreset), whatever it measured, loss
+   `RESET_BUDGET` (120 s) after a carried round (between a step's rounds, or the first
+   round after a carried step); `SETTLE_QUIET_LONG` (30 s) within
+   `SETTLE_BUDGET_LONG` (300 s) before a ladder's first round and after any round that was
+   not carried. Otherwise the round runs but is VOID (unreset), whatever it measured, loss
    included (its findings stay listed: residue of the step before can cause them), and
    `step.json`'s `idle_before.state.why_not` and the verdict say what had not settled:
    the last pass's reasons, or, when that pass was idle, the reasons of the last pass
@@ -239,20 +286,22 @@ run keeps them out.
    an outage on the operator's side, and the sum over the other five read as OFFER NOT
    TAKEN at half the offer.
 
-Raw evidence per step: `<run>/<arm>/<workload>/steps/<NN>-<rate>/` holds `step.json`,
-`gen-<g>.json` (the mqtt-load summary, schema `mqtt-load.summary.v2`), `.stderr`,
-`.exit`, `pre/` (the last settle scrapes, their state, and every pass in `passes.jsonl`), `scrapes/broker-<i>/<unix_ms>.prom`,
-and `verdict.json`. A retried step has its own directory, `<NN>-<rate>-a2`, beside the
-first attempt's.
+Raw evidence per step: `<run>/<arm>/<workload>/steps/<NN>-<rate>/` holds the step's
+`step.json` (rate, rounds, why the ramp chose it) and `verdict.json` (the step's verdict,
+its rounds and their statistics), and one directory per round attempt, `round-<K>/`, a
+rerun `round-<K>-a2/` beside it. A round directory holds what a step held before:
+`step.json`, `gen-<g>.json` (the mqtt-load summary, schema `mqtt-load.summary.v2`),
+`.stderr`, `.exit`, `pre/` (the last settle scrapes, their state, and every pass in
+`passes.jsonl`), `scrapes/broker-<i>/<unix_ms>.prom`, and the round's `verdict.json`.
 
 ## The verdict
 
-Judged on the broker only (ADR 0090 D1). In order:
+Judged on the broker only (ADR 0090 D1), for every round. In order:
 
 | verdict | when | ramp |
 |---|---|---|
 | **FAILED** | a generator's ledger did not close (missing, unexpected, unacked), a broker dropped a message by a reason that is loss (`mqttd_publish_dropped_total`, see below), or a broker restarted | stops the ladder (`BISECT_ON_FAIL=1` keeps bisecting below it) |
-| **VOID** | a generator saturated in a measured window, a generator left no summary, the generators' windows overlap less than 90%, a broker of the run has no scrapes of the step or its scrapes do not cover the window, or the cluster was not idle (unreset: VOID before any other verdict, FAILED included) | rerun (`VOID_RETRIES`, 1); never counted against the broker |
+| **VOID** | a generator saturated in a measured window, a generator left no summary, the generators' windows overlap less than 90%, a broker of the run has no scrapes of the round or its scrapes do not cover the window, or the cluster was not idle (unreset: VOID before any other verdict, FAILED included) | the round is rerun (`VOID_RETRIES`, 1); never counted against the broker |
 | **DISCONNECTED** | connections were lost during the step. mqtt-load does not reconnect, so its ledger cannot be read after that | not carried; the ramp treats it as above the knee |
 | **NOT DRAINED** | the ledger misses deliveries, no broker dropped any as loss, the drain ended before it was complete, and the brokers' own gauges at their first scrape after the drain (`mqttd_inflight_messages` + `mqttd_pending_publishes`) hold at least what the ledger misses: the messages were still queued, not lost | not carried, not loss; above the knee |
 | **OFFER NOT TAKEN** | the brokers received less than 99% of the offered msg/s (`OFFER_TAKEN` from `../summarize-curve.py`) | above the knee |
@@ -283,14 +332,16 @@ owns the message), `outbound-id-write-failed` (a deferral), and the retained-rep
 `$SYS` guards. A reason not in the table is loss. A test fails when the broker gains a
 reason the table does not classify. The identity ledger stays the primary judge.
 
-Latency is the exact merge of every generator's HDR histogram: mqtt-load exports its
-buckets, and `verdict.py` adds the counts of equal buckets and reads the quantile as
-hdrhistogram does. It is never an average of percentiles.
+A round's latency is the exact merge of every generator's HDR histogram: mqtt-load
+exports its buckets, and `verdict.py` adds the counts of equal buckets and reads the
+quantile as hdrhistogram does. It is never an average of percentiles. A step's headline
+across its rounds is the mean of the rounds' percentiles (the request of 2026-10-27: the
+mean, with the variance), and the exact merge across the rounds is reported beside it.
 
-**Maximum lossless** (the headline) is the highest CARRIED step, whatever its latency,
-with its ack p99 and end-to-end p99: a step above 1 s that lost nothing still counts.
-Below it, the highest CARRIED step with **ack p99 ≤ 1 s**, ≤ 250 ms and ≤ 100 ms. For
-`qos0` the bands apply to the end-to-end p99.
+**Maximum lossless** (the headline) is the highest CARRIED step (every round carried),
+whatever its latency, with its mean ack p99 and end-to-end p99: a step above 1 s that
+lost nothing still counts. Below it, the highest CARRIED step with **mean ack p99 ≤ 1 s**,
+≤ 250 ms and ≤ 100 ms. For `qos0` the bands apply to the end-to-end p99.
 
 ## The ramp
 
@@ -299,15 +350,18 @@ The first step is the workload's `START_RATE_<tier>`. Coarse steps multiply by `
 TAKEN, DISCONNECTED or NOT DRAINED step. Then the ramp bisects between the last carried and that
 step until their gap is at most `GAP_PCT` (3%) of the carried one. A VOID step is rerun. Rates are rounded to `GRANULARITY` (100 msg/s). A step that is not carried at the
 first rate steps down by the factor instead. `MAX_STEPS` (14; local 3) and `MAX_RATE`
-bound a ladder.
+bound a ladder. The ramp reads only step verdicts, so a step's rounds never make the
+ladder rerun it.
 
-**Transient retries.** One bad step must not cap a ladder when nothing below it pointed at
-the knee. A FAILED, OFFER NOT TAKEN, DISCONNECTED or NOT DRAINED step whose nearest carried
-step below it had its gated p99 (ack; QoS 0: end-to-end) under `RETRY_P99_MS` (50 ms) is
-rerun once at the same rate, after the full settle. Only a second bad attempt counts; a
-retry that carries makes the ladder climb on, and the first attempt is reported
-"retried: transient" (and drawn as a dashed grey ring). A retry is never retried, and a
-ladder retries at most `RETRY_MAX` (2) times, so a real cliff cannot loop. Why 50 ms: on
+**Transient retries.** One bad round must not cap a ladder when nothing below it pointed at
+the knee. A FAILED, OFFER NOT TAKEN, DISCONNECTED or NOT DRAINED round of a step whose
+nearest carried step below it had its (mean) gated p99 (ack; QoS 0: end-to-end) under
+`RETRY_P99_MS` (50 ms) is rerun once at the same rate, after the full settle. Only a
+second bad attempt counts; a retry that carries lets the step carry, reported "round K
+retried: transient". One retry a step and never a retry of a retry; a ladder retries at
+most `RETRY_MAX` (2) times, so a real cliff cannot loop. (Ladders judged before rounds
+retried the whole step, `<NN>-<rate>-a2`, reported "retried: transient" and drawn as a
+dashed grey ring; their reports still read that way.) Why 50 ms: on
 these hosts a flat, healthy step's p99 is 1 to 4 ms (durable and clean QoS 1, QoS 0
 end-to-end below 75,000 msg/s); every carried step that preceded a real knee in runs 1
 and 2 had already risen past it (durable 76,100: 66 ms, clean 101,300: 638 ms) or close to
@@ -318,21 +372,28 @@ lowest reported band. Run 2's durable-qos1 had 32,400 and 33,100 carried at ack 
 
 ## Output
 
-`<run>/report.md` and `<run>/report.json` (`mqtt-rig2.report.v1`). Per step: msg/s
-offered, brokers received, delivered, the received share, loss, ack p50/p99/p999,
-end-to-end p50/p99/p999, generator health (worst CPU fraction and scheduling-lag p99,
-saturation) and the verdict with its reasons. Per ladder: the maximum lossless msg/s,
-the three latency-band lines (`capacity` in the JSON: `lossless`, `p99_le_1000ms`,
-`p99_le_250ms`, `p99_le_100ms`) and why the ladder ended. `verdict.py report <run>`
-re-renders them from the steps' `verdict.json`.
+`<run>/report.md` and `<run>/report.json` (`mqtt-rig2.report.v1`). Per step: the rounds
+that count of those planned, msg/s offered, brokers received, delivered, the received
+share, loss, ack p50/p99/p999, "ack p99 mean ± sd" (± the sample standard deviation, then
+the merged rounds' p99), "CV" (of the received msg/s and of the p99; ⚑ when the rounds
+disagree), end-to-end p50/p99/p999, generator health (worst CPU fraction and
+scheduling-lag p99, saturation) and the verdict with the round that decided it and the
+reasons; every figure of a step is the mean of its rounds. Per ladder: the maximum
+lossless msg/s, the three latency-band lines (`capacity` in the JSON: `lossless`,
+`p99_le_1000ms`, `p99_le_250ms`, `p99_le_100ms`, on the mean p99, with the rounds and the
+merged p99), why the ladder ended, and a variance section: the largest CV of the received
+msg/s and of the p99, and the steps whose rounds disagree by more than 10% in received
+msg/s or 2× in p99. `verdict.py report <run>` re-renders them from the steps'
+`verdict.json`.
 
 **Charts.** One SVG per ladder, `<run>/report-<workload>.svg`, linked from report.md
 (`chart-ramp.py`, called by the report; `chart-ramp.py <run>` redraws them from
-report.json). x is the offered msg/s of every step; y the ack p99 (QoS 0: end-to-end) on
-a log scale with the p50 lighter, over the GREEN (≤ 1 s), YELLOW (≤ 5 s) and RED bands.
-Carried steps are filled points, FAILED / OFFER NOT TAKEN / DISCONNECTED hollow red
-rings, VOID dashed grey rings; the maximum lossless step is labelled, and the title
-states it.
+report.json). x is the offered msg/s of every step; y the MEAN ack p99 of its rounds
+(QoS 0: end-to-end) on a log scale with the mean p50 lighter, over the GREEN (≤ 1 s),
+YELLOW (≤ 5 s) and RED bands; each mean carries an error bar from the rounds' min to
+their max (the legend and subtitle say so). Carried steps are filled points, FAILED /
+OFFER NOT TAKEN / DISCONNECTED hollow red rings, VOID dashed grey rings; the maximum
+lossless step is labelled, and the title states it.
 
 ## Not yet
 
@@ -349,4 +410,5 @@ Tests: `python3 bench/scale/rig2/test-verdict.py` (offline; CI runs it; it inclu
 runs it): the real `run.sh` at `TIER=local` against fake brokers, for a flaky scrape, the
 wall-clock budget, a broker that never answers, a background counter tick (no hold), a
 drain (held, and named), a settle that runs out on an idle pass (the reason still named),
-and a TERM mid-step.
+a broker whose scrapes cannot be fetched (that round rerun alone), a `ROUNDS=2` step
+against a generator stub that writes clean summaries, and a TERM mid-step.

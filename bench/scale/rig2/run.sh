@@ -8,10 +8,12 @@
 #   HCLOUD_TOKEN=... MQTTD_URL=... MQTTD_SHA256=... TIER=n10 WORKLOADS="durable-qos1" ./run.sh
 #
 # One provisioning carries every workload in WORKLOADS, one ladder after the other, on
-# the same cluster. A ladder is a sequence of steps; a step is ONE mqtt-load process per
-# generator host (its own ledger), all started together, the total msg/s split evenly.
-# Every step scrapes every broker's /metrics on the broker's own host for the whole
-# step, and verdict.py judges it from those counters and the generators' summaries.
+# the same cluster. A ladder is a sequence of steps; a step is ROUNDS rounds at its msg/s
+# (3 on n3 and n10, 1 locally), each round ONE mqtt-load process per generator host (its
+# own ledger), all started together, the total msg/s split evenly. Every round scrapes
+# every broker's /metrics on the broker's own host for the whole round, and verdict.py
+# judges it from those counters and the generators' summaries, then the step from its
+# rounds (verdict.py round-next decides which round runs next, verdict.py step judges).
 #
 # Teardown (bench/scale/teardown.sh: tofu destroy, then the label audit) is trapped on
 # EXIT/INT/TERM. KEEP_INFRA=1 skips it and says so. Hetzner only (CLOUD=hcloud).
@@ -43,15 +45,15 @@ ARM="${ARM:-A}"
 case "$TIER" in
 local)
 	BROKERS="${BROKERS:-3}" GENERATORS=1
-	DEF_WARMUP=5 DEF_MEASURE=10 DEF_WINDOW=5 DEF_SCRAPE=1 DEF_MARGIN=0.5 DEF_MAX_STEPS=3 DEF_PRIME=0
+	DEF_WARMUP=5 DEF_MEASURE=10 DEF_WINDOW=5 DEF_SCRAPE=1 DEF_MARGIN=0.5 DEF_MAX_STEPS=3 DEF_PRIME=0 DEF_ROUNDS=1
 	;;
 n3)
 	BROKERS="${BROKERS:-3}" GENERATORS="${GENERATORS:-1}"
-	DEF_WARMUP=20 DEF_MEASURE=60 DEF_WINDOW=10 DEF_SCRAPE=2 DEF_MARGIN=1 DEF_MAX_STEPS=14 DEF_PRIME=90
+	DEF_WARMUP=20 DEF_MEASURE=60 DEF_WINDOW=10 DEF_SCRAPE=2 DEF_MARGIN=1 DEF_MAX_STEPS=14 DEF_PRIME=90 DEF_ROUNDS=3
 	;;
 n10)
 	BROKERS="${BROKERS:-10}" GENERATORS="${GENERATORS:-3}"
-	DEF_WARMUP=20 DEF_MEASURE=60 DEF_WINDOW=10 DEF_SCRAPE=2 DEF_MARGIN=1 DEF_MAX_STEPS=14 DEF_PRIME=90
+	DEF_WARMUP=20 DEF_MEASURE=60 DEF_WINDOW=10 DEF_SCRAPE=2 DEF_MARGIN=1 DEF_MAX_STEPS=14 DEF_PRIME=90 DEF_ROUNDS=3
 	;;
 *) die "TIER must be local, n3 or n10, not '$TIER'" ;;
 esac
@@ -59,7 +61,12 @@ BROKER_TYPE="${BROKER_TYPE:-ccx23}"
 GEN_TYPE="${GEN_TYPE:-ccx33}"
 
 # ── the ramp (ADR 0090 D4) ──────────────────────────────────────────────────────────
-# A step: WARMUP s, then MEASURE s measured in WINDOW s windows, then the drain.
+# A step: ROUNDS rounds at the same msg/s, each a settle, then WARMUP s, then MEASURE s
+# measured in WINDOW s windows, then the drain. Three rounds a step on the cloud tiers
+# (2026-10-27: one round's disturbance must not decide a step); the report gives their
+# mean, spread and coefficient of variation.
+ROUNDS="${ROUNDS:-$DEF_ROUNDS}"
+[[ "$ROUNDS" =~ ^[1-9][0-9]*$ ]] || die "ROUNDS must be a positive integer, not '$ROUNDS'"
 WARMUP="${WARMUP:-$DEF_WARMUP}"
 MEASURE="${MEASURE:-$DEF_MEASURE}"
 WINDOW="${WINDOW:-$DEF_WINDOW}"
@@ -84,13 +91,15 @@ GRANULARITY="${GRANULARITY:-100}"
 MIN_RATE="${MIN_RATE:-$GRANULARITY}"
 MAX_RATE="${MAX_RATE:-2000000}"
 MAX_STEPS="${MAX_STEPS:-$DEF_MAX_STEPS}"
-# A VOID step (the harness's fault) is rerun this many times before the ladder stops.
+# A VOID round (the harness's fault) is rerun this many times before its step is VOID
+# and the ladder stops; the step's other rounds stand.
 VOID_RETRIES="${VOID_RETRIES:-1}"
 # A FAILED step (loss) ends the ladder; BISECT_ON_FAIL=1 keeps bisecting below it.
 BISECT_ON_FAIL="${BISECT_ON_FAIL:-0}"
-# A FAILED / OFFER NOT TAKEN / DISCONNECTED / NOT DRAINED step whose nearest carried step
-# below had its gated p99 under RETRY_P99_MS is retried once after a full settle; only a
-# second bad attempt counts. At most RETRY_MAX per ladder (verdict.py retry_marks).
+# A FAILED / OFFER NOT TAKEN / DISCONNECTED / NOT DRAINED round of a step whose nearest
+# carried step below had its gated p99 under RETRY_P99_MS is retried once after a full
+# settle; only a second bad attempt counts. One round a step, at most RETRY_MAX per
+# ladder (verdict.py plan_rounds, retry_eligible).
 RETRY_P99_MS="${RETRY_P99_MS:-50}"
 RETRY_MAX="${RETRY_MAX:-2}"
 # Broker scrapes: every SCRAPE_INTERVAL s on the broker's host; the window edges shrink
@@ -122,8 +131,11 @@ SETTLE_QUIET_LONG="${SETTLE_QUIET_LONG:-30}"
 # judge's overlap check decides.
 START_SYNC_WAIT="${START_SYNC_WAIT:-30}"
 if [ "$TIER" = local ]; then START_LEAD_MS="${START_LEAD_MS:-500}"; else START_LEAD_MS="${START_LEAD_MS:-3000}"; fi
-# For the price quote: steps a ladder is expected to take (coarse climb + bisection).
+# For the price quote: steps a ladder is expected to take (coarse climb + bisection), and
+# the long settles it waits through besides the first (after a step that was not carried,
+# before a transient retry), each about SETTLE_QUIET_LONG + 30 s.
 EST_STEPS="${EST_STEPS:-9}"
+EST_LONG_SETTLES="${EST_LONG_SETTLES:-3}"
 
 # Live Grafana (bench/scale/observe.sh). mqtt-load serves its --metrics on this port: on
 # 127.0.0.1 locally, on the generator's private address in the cloud (the public
@@ -185,13 +197,17 @@ for w in $WORKLOADS; do
 	[ -f "$RIG2/workloads/$w.env" ] || die "no workload $w (have: $(cd "$RIG2/workloads" && ls ./*.env | sed 's|./||; s|\.env||' | tr '\n' ' '))"
 done
 NWORK=$(wc -w <<<"$WORKLOADS" | tr -d ' ')
-STEP_SECS=$((WARMUP + MEASURE + 55))
+# One round: ~20 s of connect, start lead, drain and scrape fetch around WARMUP + MEASURE
+# (the 10-node runs of 2026-10-27: 97-111 s a round at 20 + 60), plus its short settle.
+ROUND_SECS=$((WARMUP + MEASURE + 20 + SETTLE_QUIET + 25))
+# A ladder outside its rounds: the prime (and its overhead) and its long settles.
+LADDER_SECS=$((PRIME_SECS + 20 + (1 + EST_LONG_SETTLES) * (SETTLE_QUIET_LONG + 30)))
 
 # ── the quote, before anything is provisioned ───────────────────────────────────────
 if [ "$TIER" != local ]; then
 	say "$(python3 "$RIG2/verdict.py" cost --tier "$TIER" --brokers "$BROKERS" --generators "$GENERATORS" \
-		--broker-type "$BROKER_TYPE" --gen-type "$GEN_TYPE" --workloads "$NWORK" --steps "$((EST_STEPS + 1))" \
-		--step-secs "$STEP_SECS")"
+		--broker-type "$BROKER_TYPE" --gen-type "$GEN_TYPE" --workloads "$NWORK" --steps "$EST_STEPS" \
+		--rounds "$ROUNDS" --step-secs "$ROUND_SECS" --ladder-secs "$LADDER_SECS")"
 	[ "${PRICE_ONLY:-0}" != 1 ] || exit 0
 fi
 
@@ -370,7 +386,7 @@ json.dump({"tier": "$TIER", "brokers": $BROKERS, "broker_type": "$BROKER_TYPE" i
            "binary": """$BINARY_DESC""", "unreleased": bool("${MQTTD_URL:-}"), "workloads": "$WORKLOADS".split(),
            "started_utc": "$STAMP", "warmup_s": $WARMUP, "measure_s": $MEASURE, "window_s": $WINDOW,
            "prime_s": $PRIME_SECS, "drain_timeout_s": $DRAIN_TIMEOUT, "drain_quiet_s": $DRAIN_QUIET,
-           "settle_quiet_s": $SETTLE_QUIET,
+           "settle_quiet_s": $SETTLE_QUIET, "rounds": $ROUNDS,
            "observe": "$OBSERVE" == "1",
            "git": "$(git -C "$REPO_ROOT" rev-parse HEAD)"}, open(sys.argv[1], "w"), indent=2)
 PY
@@ -655,7 +671,7 @@ prime_ladder() { # prime_ladder <ladder-dir>: unmeasured load at the start rate 
 	launch_gens "$ladder/prime" "$ARM-$WORKLOAD-prime" "$per_gen" $((PRIME_SECS - WINDOW)) "$WINDOW"
 }
 
-# A step's scrape loop on broker <i>, for the step $hid (run_step's): started (any loop
+# A round's scrape loop on broker <i>, for the round $hid (run_round's): started (any loop
 # left by an earlier try of the same start is stopped first), stopped, fetched.
 scrape_loop_start() {
 	on_broker "$1" "[ -f \$H/steps/$hid/scrape.pid ] && kill \$(cat \$H/steps/$hid/scrape.pid) 2>/dev/null; rm -rf \$H/steps/$hid; mkdir -p \$H/steps/$hid; nohup python3 \$H/scrape-loop.py --url '$(broker_metrics_url "$1")' \
@@ -673,17 +689,14 @@ scrape_loop_fetch() {
 	mv "$part" "$dst"
 }
 
-run_step() { # run_step <ladder-dir> <index> <rate> <why the ramp chose it>
-	local ladder="$1" idx="$2" rate="$3" why="$4" id hid step i per_gen idle attempt prev_v budget quiet failed
+run_step() { # run_step <ladder-dir> <index> <rate> <why the ramp chose it>: its rounds, then the step's verdict
+	local ladder="$1" idx="$2" rate="$3" why="$4" id step_dir attempt prev_v plan rdir settle reason n=0
 	attempt=$(find "$ladder/steps" -maxdepth 1 \( -name "[0-9]*-$rate" -o -name "[0-9]*-$rate-a*" \) 2>/dev/null | wc -l | tr -d ' ')
 	attempt=$((attempt + 1))
 	id=$(printf '%02d-%s' "$idx" "$rate")
 	[ "$attempt" = 1 ] || id="$id-a$attempt"
-	step="$ladder/steps/$id"
-	# Unique on the hosts across arms and ladders: step ids repeat between workloads.
-	hid="$ARM-$WORKLOAD-$id"
-	mkdir -p "$step/scrapes"
-	# The full settle before a ladder's first step and after any step that was not carried.
+	step_dir="$ladder/steps/$id"
+	mkdir -p "$step_dir"
 	prev_v=$(python3 - "$ladder" <<'PY'
 import json, sys
 from pathlib import Path
@@ -691,19 +704,49 @@ vs = sorted(Path(sys.argv[1], "steps").glob("*/verdict.json"))
 print(json.loads(vs[-1].read_text())["verdict"] if vs else "none")
 PY
 )
-	if [ "$prev_v" = CARRIED ]; then budget=$RESET_BUDGET quiet=$SETTLE_QUIET; else budget=$SETTLE_BUDGET_LONG quiet=$SETTLE_QUIET_LONG; fi
-	idle=$(await_idle "$step" "$budget" "$quiet" "$rate" "the step runs and is VOID (unreset)")
+	python3 - "$step_dir/step.json" <<PY
+import json, sys
+json.dump({"index": $idx, "id": "$id", "rate": float($rate), "attempt": $attempt, "rounds": $ROUNDS,
+           "generators": $GENERATORS, "brokers": $BROKERS, "workload": "$WORKLOAD", "arm": "$ARM",
+           "after": "$prev_v", "ramp_reason": r"""$why"""}, open(sys.argv[1], "w"), indent=2)
+PY
+	say "[$WORKLOAD] step $id: $rate msg/s offered, $ROUNDS round(s)"
+	# verdict.py round-next names the next round attempt (a new round, a VOID round's rerun,
+	# or a bad round's transient retry) and its settle, or nothing when the step is decided.
+	# Bounded: no plan can need more attempts than this.
+	while [ "$n" -lt $((ROUNDS * (VOID_RETRIES + 1) * 2)) ]; do
+		plan=$(python3 "$RIG2/verdict.py" round-next "$step_dir")
+		[ -n "$plan" ] || break
+		read -r rdir settle reason <<<"$plan"
+		n=$((n + 1))
+		run_round "$step_dir" "$idx" "$rate" "$rdir" "$settle" "$reason"
+	done
+	python3 "$RIG2/verdict.py" step "$step_dir" | while IFS= read -r line; do say "  $line"; done
+}
+
+run_round() { # run_round <step-dir> <index> <rate> <round-dir name> <short|long settle> <why>: one round of the step
+	local step_dir="$1" idx="$2" rate="$3" rname="$4" settle="$5" why="$6" id hid step per_gen idle budget quiet failed
+	id="$(basename "$step_dir")/$rname"
+	step="$step_dir/$rname"
+	# Unique on the hosts across arms, ladders and rounds: step ids repeat between workloads.
+	hid="$ARM-$WORKLOAD-$(basename "$step_dir")-$rname"
+	mkdir -p "$step/scrapes"
+	# The full settle before a ladder's first round and after any round that was not
+	# carried; the short one between the rounds of a carried step.
+	if [ "$settle" = short ]; then budget=$RESET_BUDGET quiet=$SETTLE_QUIET; else budget=$SETTLE_BUDGET_LONG quiet=$SETTLE_QUIET_LONG; fi
+	idle=$(await_idle "$step" "$budget" "$quiet" "$rate" "the round runs and is VOID (unreset)")
 	per_gen=$(python3 -c "print(f'{$rate / $GENERATORS:.3f}')")
 	python3 - "$step/step.json" <<PY
-import json, sys
-json.dump({"index": $idx, "id": "$id", "rate": float($rate), "attempt": $attempt, "generators": $GENERATORS,
-           "brokers": $BROKERS,
+import json, re, sys
+m = re.match(r"round-(\d+)(?:-a(\d+))?$", "$rname")
+json.dump({"index": $idx, "id": "$id", "rate": float($rate), "round": int(m.group(1)), "attempt": int(m.group(2) or 1),
+           "generators": $GENERATORS, "brokers": $BROKERS,
            "per_generator_rate": float($per_gen), "workload": "$WORKLOAD", "arm": "$ARM",
-           "idle_before": json.loads(r"""$idle"""), "after": "$prev_v", "ramp_reason": r"""$why""",
+           "idle_before": json.loads(r"""$idle"""), "settle": "$settle", "ramp_reason": r"""$why""",
            "judge": {"margin_s": $MARGIN_S, "latency_gate": "$LATENCY_GATE", "idle_floor": $IDLE_FLOOR}},
           open(sys.argv[1], "w"), indent=2)
 PY
-	say "[$WORKLOAD] step $id: $rate msg/s offered ($GENERATORS generator(s) x $per_gen)"
+	say "[$WORKLOAD] step $id: $rate msg/s ($GENERATORS generator(s) x $per_gen) — $why"
 	phase running "$WORKLOAD step $id: $rate msg/s"
 	# In parallel (SSH_PAR at a time) and retried: a broker whose loop did not start, or
 	# whose scrapes did not come back, leaves the judge short of that broker (VOID), not
@@ -735,7 +778,7 @@ json.dump({"workload": "$WORKLOAD", "arm": "$ARM", "binary": """$BINARY_DESC""",
            "ramp": {"start_rate": $START_RATE, "factor": $FACTOR, "gap_pct": $GAP_PCT, "granularity": $GRANULARITY,
                     "min_rate": $MIN_RATE, "max_rate": $MAX_RATE, "void_retries": $VOID_RETRIES,
                     "bisect_on_fail": bool($BISECT_ON_FAIL), "latency_gate": "$LATENCY_GATE",
-                    "retry_p99_ms": $RETRY_P99_MS, "retry_max": $RETRY_MAX},
+                    "retry_p99_ms": $RETRY_P99_MS, "retry_max": $RETRY_MAX, "rounds": $ROUNDS},
            "mqtt_load": {"qos": $QOS, "shape": "$SHAPE", "sessions": "$SESSIONS", "session_expiry_s": $SESSION_EXPIRY,
                          "payload": $PAYLOAD, "topics_per_generator": $TOPICS, "consumers": $CONSUMERS_N,
                          "groups": $SHARE_GROUPS, "rate_per_publisher": $RATE_PER_PUBLISHER, "inflight": $INFLIGHT,

@@ -210,11 +210,14 @@ HELD_GAUGES = ("mqttd_inflight_messages", "mqttd_pending_publishes", "mqttd_back
 
 
 def expected_brokers(step: Path, meta: dict) -> int | None:
-    """How many brokers the step's run has: step.json `brokers`, else the run's run.json
-    (<run>/<arm>/<workload>/steps/<step>), else None (judge whatever scrapes are there)."""
+    """How many brokers the step's run has: step.json `brokers`, else the nearest run.json
+    above it (<run>/<arm>/<workload>/steps/<step>[/round-K]), else None (judge whatever
+    scrapes are there)."""
     if meta.get("brokers") is not None:
         return int(meta["brokers"])
-    run_json = step.resolve().parents[3] / "run.json"
+    run_json = next((p / "run.json" for p in step.resolve().parents if (p / "run.json").is_file()), None)
+    if run_json is None:
+        return None
     try:
         n = json.loads(run_json.read_text()).get("brokers")
     except (OSError, ValueError):
@@ -708,6 +711,11 @@ def retry_marks(steps: list[dict], cfg: dict) -> list[dict | None]:
     marks: list[dict | None] = [None] * len(steps)
     used, waiting = 0, None
     for i, s in enumerate(steps):
+        if s.get("rounds_planned") is not None:
+            # A step measured in rounds retries a bad round inside itself (plan_rounds):
+            # never pending here, but its retries count against the ladder's cap.
+            used += len(s.get("round_retries") or [])
+            continue
         if s["verdict"] == VOID:
             continue
         if waiting is not None:
@@ -752,6 +760,9 @@ def next_rate(steps: list[dict], cfg: dict) -> tuple[float | None, str]:
                               f"< {m['threshold_ms']:g} ms, no sign of the knee (retry {m['n']} of at most {m['of_max']})")
     if last["verdict"] == FAILED and not cfg.get("bisect_on_fail", False):
         return None, f"FAILED at {last['rate']:g} msg/s (loss stops the ladder)"
+    if last["verdict"] == VOID and last.get("rounds_planned") is not None:
+        # Its VOID round was already rerun inside the step (plan_rounds), up to the cap.
+        return None, f"VOID at {last['rate']:g} msg/s: {last.get('void_reason') or 'a round stayed VOID'}"
     if last["verdict"] == VOID:
         same = 0
         for s in reversed(steps):
@@ -792,12 +803,284 @@ def next_rate(steps: list[dict], cfg: dict) -> tuple[float | None, str]:
     return mid, f"bisect between {lo:g} and {hi:g}"
 
 
-def ladder_steps(ladder: Path) -> list[dict]:
+def ladder_steps(ladder: Path, before: str | None = None) -> list[dict]:
+    """The judged steps of a ladder in run order; `before`: only those whose directory
+    name sorts before it (the steps run before that one)."""
     out = []
     for d in sorted((p for p in (ladder / "steps").glob("*") if p.is_dir()), key=lambda p: p.name):
+        if before is not None and d.name >= before:
+            break
         v = d / "verdict.json"
         if v.is_file():
             out.append(json.loads(v.read_text()))
+    return out
+
+
+# ── rounds ──────────────────────────────────────────────────────────────────────────
+# A step is measured `rounds` times at its msg/s (run.sh ROUNDS: 3 on n3 and n10, 1
+# locally): separate mqtt-load runs, each with its own settle, warm-up, ledger and
+# scrapes, in <step>/round-K/; a rerun of round K is <step>/round-K-a2, -a3, ... Every
+# round directory is judged as a step was before (judge). The step's verdict is then
+# its rounds' (aggregate):
+#
+# - FAILED if any round FAILED, VOID if any round stayed VOID through its reruns, then
+#   DISCONNECTED, NOT DRAINED, OFFER NOT TAKEN; CARRIED only when every round carried.
+#   The verdict names the round.
+# - A VOID round is rerun on its own, up to void_retries times; the other rounds stand.
+# - The transient retry, per step: a round that is bad (BAD) while the ladder's
+#   transient-retry rule allows one (retry_marks: the nearest carried step below had its
+#   gated p99 under retry_p99_ms, fewer than retry_max retries in the ladder) is rerun
+#   once after the full settle. If that retry carries, the round counts as carried and
+#   the step says "round K retried: transient"; if it is bad too, it counts. One per step.
+# - A step stops at its first round that settles it as not carried: further rounds
+#   cannot carry it.
+#
+# Statistics over the rounds that count (the last attempt of each round; a retried
+# round's first attempt and VOID attempts do not count): mean, sample standard deviation
+# (n - 1; none for one round), min and max, and the coefficient of variation sd / mean.
+# The step's headline latency (ack_latency, e2e_latency, gate_p99_us) is the MEAN of
+# its rounds' percentiles; the exact merge of every round's histograms is kept beside it
+# (ack_latency_merged, gate_p99_merged_us).
+
+ROUND_DIR = re.compile(r"^round-(\d+)(?:-a(\d+))?$")
+# A step's verdict is the first of these that any of its counted rounds has.
+STEP_PRECEDENCE = (FAILED, VOID, DISCONNECTED, NOT_DRAINED, NOT_TAKEN, CARRIED)
+# Rounds that disagree by more than this are flagged: received msg/s (max - min) / min,
+# and gated p99 max / min.
+SPREAD_RECEIVED = 0.10
+SPREAD_P99 = 2.0
+STAT_KEYS = ("offered_rate", "received_rate", "delivered_rate", "ack_p50_us", "ack_p99_us", "ack_p999_us",
+             "e2e_p50_us", "e2e_p99_us", "e2e_p999_us", "gate_p50_us", "gate_p99_us")
+
+
+def round_attempts(step: Path) -> list[dict]:
+    """Every judged round attempt of a step in run order (round, then attempt): dicts of
+    round, attempt, dir and v (its verdict.json). An attempt without a verdict is left out."""
+    out = []
+    for d in step.iterdir() if step.is_dir() else []:
+        m = ROUND_DIR.match(d.name)
+        if not (m and d.is_dir() and (d / "verdict.json").is_file()):
+            continue
+        out.append({"round": int(m.group(1)), "attempt": int(m.group(2) or 1), "dir": d.name,
+                    "v": json.loads((d / "verdict.json").read_text())})
+    out.sort(key=lambda a: (a["round"], a["attempt"]))
+    return out
+
+
+def retry_eligible(prior: list[dict], rate: float, cfg: dict) -> dict | None:
+    """Whether a bad round of a step at `rate` may be retried, given the ladder's steps
+    before it: the transient-retry rule of retry_marks (cap and the carried step below)."""
+    thr_us = float(cfg.get("retry_p99_ms", RETRY_P99_MS)) * 1000
+    cap = int(cfg.get("retry_max", RETRY_MAX))
+    marks = retry_marks(prior, cfg)
+    used = (sum(1 for m in marks if m and "n" in m)
+            + sum(len(s.get("round_retries") or []) for s in prior if s.get("rounds_planned") is not None))
+    if used >= cap:
+        return None
+    below = [p for p in prior if p["verdict"] == CARRIED and p["rate"] < rate and p.get("gate_p99_us") is not None]
+    if not below:
+        return None
+    ref = max(below, key=lambda p: p["rate"])
+    if ref["gate_p99_us"] >= thr_us:
+        return None
+    return {"n": used + 1, "of_max": cap, "ref_rate": ref["rate"], "ref_step": ref.get("step"),
+            "ref_p99_us": ref["gate_p99_us"], "threshold_ms": thr_us / 1000}
+
+
+def _why(v: dict) -> str:
+    return "; ".join(v.get("failures", []) + v.get("voids", [])) or "no reason recorded"
+
+
+def plan_rounds(step: Path, prior: list[dict], ramp: dict) -> dict:
+    """What a step measured in rounds does next. `done` false: `next` is the attempt to
+    run (dir, round, attempt, settle "short" or "long", reason). `done` true: `counted`
+    (the attempt that counts for each round run), `retries`, and `void_reason` when a
+    round stayed VOID through its reruns."""
+    meta = json.loads((step / "step.json").read_text())
+    n_rounds = int(meta.get("rounds", 1))
+    void_retries = int(ramp.get("void_retries", 1))
+    by: dict[int, list[dict]] = {}
+    for a in round_attempts(step):
+        by.setdefault(a["round"], []).append(a)
+    counted, retries, last = [], [], None
+    retried_round = None
+    for k in range(1, n_rounds + 1):
+        voids, retrying, eff = 0, False, None
+        for a in by.get(k, []):
+            last = a
+            v = a["v"]["verdict"]
+            if v == VOID:
+                voids += 1
+                continue
+            if v in BAD and retried_round is None:
+                e = retry_eligible(prior, float(meta["rate"]), ramp)
+                if e:
+                    retried_round, retrying, voids = k, True, 0
+                    retries.append({"round": k, "first": a["dir"], "first_verdict": v, "first_why": _why(a["v"]), **e})
+                    continue
+            eff = a
+            break
+        if eff is None and voids > void_retries:
+            eff = last  # stayed VOID through its reruns: it counts, as VOID
+        if eff is None:
+            attempt = by[k][-1]["attempt"] + 1 if by.get(k) else 1
+            if last is None:
+                settle = "short" if meta.get("after") == CARRIED else "long"
+            else:
+                settle = "short" if last["v"]["verdict"] == CARRIED else "long"
+            if voids:
+                reason = f"rerun of VOID round {k} (attempt {voids + 1} of {void_retries + 1}): {_why(last['v'])}"
+            elif retrying:
+                r = retries[-1]
+                reason = (f"retry of round {k} ({r['first_verdict']}) after a full settle: the carried step below it "
+                          f"({r['ref_rate']:g} msg/s) had p99 {r['ref_p99_us'] / 1000:.1f} ms < {r['threshold_ms']:g} ms, "
+                          f"no sign of the knee (retry {r['n']} of at most {r['of_max']})")
+            else:
+                reason = f"round {k} of {n_rounds}"
+            name = f"round-{k}" if attempt == 1 else f"round-{k}-a{attempt}"
+            return {"done": False, "next": {"dir": name, "round": k, "attempt": attempt, "settle": settle,
+                                            "reason": reason}, "counted": counted, "retries": retries}
+        if retrying:
+            retries[-1].update(retry=eff["dir"], outcome="transient" if eff["v"]["verdict"] == CARRIED else "confirmed")
+        counted.append(eff)
+        if eff["v"]["verdict"] != CARRIED:
+            break
+    out = {"done": True, "next": None, "counted": counted, "retries": retries, "void_reason": None}
+    if counted and counted[-1]["v"]["verdict"] == VOID:
+        a = counted[-1]
+        out["void_reason"] = (f"round {a['round']} stayed VOID through {len(by[a['round']])} attempt(s) "
+                              f"(last: {_why(a['v'])})")
+    return out
+
+
+def stat(values: list) -> dict:
+    """mean, sample standard deviation (n - 1; None for fewer than two), min, max and the
+    coefficient of variation (sd / mean) of the values that are not None."""
+    xs = [float(x) for x in values if x is not None]
+    n = len(xs)
+    if not n:
+        return {"n": 0, "mean": None, "sd": None, "min": None, "max": None, "cv": None}
+    mean = sum(xs) / n
+    sd = math.sqrt(sum((x - mean) ** 2 for x in xs) / (n - 1)) if n > 1 else None
+    return {"n": n, "mean": mean, "sd": sd, "min": min(xs), "max": max(xs),
+            "cv": sd / mean if (sd is not None and mean) else None}
+
+
+def round_figures(v: dict) -> dict:
+    """One round's figures, as STAT_KEYS names them."""
+    gate = v.get("latency_gate", "ack")
+    out = {"offered_rate": v.get("offered_rate"), "received_rate": v.get("received_rate"),
+           "delivered_rate": v.get("delivered_rate")}
+    for kind in ("ack", "e2e"):
+        lat = v.get(f"{kind}_latency") or {}
+        for q in QUANTILES:
+            out[f"{kind}_{q}_us"] = lat.get(f"{q}_us")
+    g = "ack" if gate == "ack" else "e2e"
+    out["gate_p50_us"], out["gate_p99_us"] = out[f"{g}_p50_us"], out[f"{g}_p99_us"]
+    return out
+
+
+def spread(stats: dict) -> dict:
+    """How far a step's rounds disagree: received msg/s (max - min) / min, gated p99
+    max / min, and the flags when past SPREAD_RECEIVED or SPREAD_P99."""
+    rx, p = stats["received_rate"], stats["gate_p99_us"]
+    out = {"received": None, "p99": None, "flags": []}
+    if rx["n"] >= 2 and rx["min"]:
+        out["received"] = (rx["max"] - rx["min"]) / rx["min"]
+        if out["received"] > SPREAD_RECEIVED:
+            out["flags"].append(f"received msg/s differs by {out['received']:.1%} across rounds "
+                                f"({rx['min']:,.0f} to {rx['max']:,.0f})")
+    if p["n"] >= 2 and p["min"]:
+        out["p99"] = p["max"] / p["min"]
+        if out["p99"] > SPREAD_P99:
+            out["flags"].append(f"p99 differs {out['p99']:.1f}x across rounds ({fmt_us(p['min'])} to {fmt_us(p['max'])})")
+    return out
+
+
+def _mean_latency(rounds: list[dict], kind: str) -> dict:
+    lats = [r.get(f"{kind}_latency") or {} for r in rounds]
+    out: dict = {"of": f"mean of {len(rounds)} round(s)", "count": sum(x.get("count") or 0 for x in lats)}
+    for q in QUANTILES:
+        m = stat([x.get(f"{q}_us") for x in lats])["mean"]
+        out[f"{q}_us"] = None if m is None else round(m)
+    mx = [x.get("max_us") for x in lats if x.get("max_us") is not None]
+    out["max_us"] = max(mx) if mx else None
+    return out
+
+
+def merged_latency(dirs: list[Path], kind: str) -> dict:
+    """The exact merge of every generator's `kind` histogram over the given round dirs."""
+    exports = []
+    for d in dirs:
+        for p in sorted(d.glob("gen-*.json")):
+            try:
+                s = json.loads(p.read_text())
+            except (OSError, ValueError):
+                continue
+            if s.get("schema") in SCHEMAS_ACCEPTED:
+                exports.append(s["phases"][0].get(f"{kind}_histogram"))
+    return latency_summary(merge_histograms(exports))
+
+
+def aggregate(step: Path, prior: list[dict], ramp: dict) -> dict:
+    """The step's verdict from its rounds (see the comment above ROUND_DIR)."""
+    meta = json.loads((step / "step.json").read_text())
+    plan = plan_rounds(step, prior, ramp)
+    counted = plan["counted"]
+    vs = [a["v"] for a in counted]
+    gate = vs[0].get("latency_gate", "ack") if vs else (meta.get("judge") or {}).get("latency_gate", "ack")
+    out = {"step": meta["index"], "id": meta.get("id", step.name), "rate": meta["rate"], "attempt": meta.get("attempt", 1),
+           "rounds_planned": int(meta.get("rounds", 1)), "ramp_reason": meta.get("ramp_reason"),
+           "failures": [], "voids": [], "notes": [], "round_retries": plan["retries"],
+           "void_reason": plan.get("void_reason"), "latency_gate": gate}
+    for a in counted:
+        for key in ("failures", "voids", "notes"):
+            out[key] += [f"round {a['round']}: {x}" for x in a["v"].get(key, [])]
+    if not plan["done"]:
+        nxt = plan["next"]
+        out["voids"].append(f"incomplete: {nxt['dir']} ({nxt['reason']}) never ran")
+    for r in plan["retries"]:
+        if r.get("outcome") == "transient":
+            out["notes"].append(f"round {r['round']} retried: transient ({r['first']} was {r['first_verdict']}: "
+                                f"{r['first_why']}; the retry {r['retry']} carried)")
+        elif r.get("outcome") == "confirmed":
+            out["notes"].append(f"round {r['round']} retried: bad again in {r['retry']} ({r['first']} was "
+                                f"{r['first_verdict']}), counts")
+    reruns = [a for a in round_attempts(step) if a["v"]["verdict"] == VOID and a not in counted]
+    for a in reruns:
+        out["notes"].append(f"{a['dir']} was VOID ({_why(a['v'])}), rerun")
+    present = {v["verdict"] for v in vs}
+    if not plan["done"]:
+        verdict = VOID
+    else:
+        verdict = next((x for x in STEP_PRECEDENCE if x in present), VOID)
+    deciding = next((a for a in counted if a["v"]["verdict"] == verdict), None)
+    out["verdict"], out["good"] = verdict, verdict == CARRIED
+    out["decided_by"] = None if deciding is None or verdict == CARRIED else deciding["dir"]
+    figs = [round_figures(v) for v in vs]
+    out["rounds"] = [{"round": a["round"], "dir": a["dir"], "verdict": a["v"]["verdict"],
+                      "attempts": [x["dir"] for x in round_attempts(step) if x["round"] == a["round"]], **f}
+                     for a, f in zip(counted, figs)]
+    out["stats"] = {k: stat([f[k] for f in figs]) for k in STAT_KEYS}
+    out["spread"] = spread(out["stats"])
+    out["offered_rate"] = out["stats"]["offered_rate"]["mean"] if figs else meta["rate"]
+    # The cluster's rate only when every counted round has one (a round's partial sum is None).
+    rx = [f["received_rate"] for f in figs]
+    out["received_rate"] = out["stats"]["received_rate"]["mean"] if rx and None not in rx else None
+    dl = [f["delivered_rate"] for f in figs]
+    out["delivered_rate"] = out["stats"]["delivered_rate"]["mean"] if dl and None not in dl else None
+    out["received_share"] = (out["received_rate"] / out["offered_rate"]
+                             if out["received_rate"] is not None and out["offered_rate"] else None)
+    out["ack_latency"], out["e2e_latency"] = _mean_latency(vs, "ack"), _mean_latency(vs, "e2e")
+    dirs = [step / a["dir"] for a in counted]
+    out["ack_latency_merged"], out["e2e_latency_merged"] = merged_latency(dirs, "ack"), merged_latency(dirs, "e2e")
+    g = "ack" if gate == "ack" else "e2e"
+    out["gate_p99_us"] = out[f"{g}_latency"]["p99_us"]
+    out["gate_p99_merged_us"] = out[f"{g}_latency_merged"]["p99_us"]
+    out["generators"] = [x for v in vs for x in v.get("generators", [])]
+    out["brokers"] = {"lost": sum((v.get("brokers") or {}).get("lost", 0.0) for v in vs),
+                      "dropped": sum((v.get("brokers") or {}).get("dropped", 0.0) for v in vs)}
+    out["drain"] = (deciding or (counted[-1] if counted else {"v": {}}))["v"].get("drain") or {}
     return out
 
 
@@ -807,19 +1090,26 @@ def ladder_steps(ladder: Path) -> list[dict]:
 def capacity(steps: list[dict]) -> dict:
     """`lossless`: the highest CARRIED step, whatever its latency, with its ack and
     end-to-end p99. `p99_le_<band>ms`: the highest CARRIED step whose gated p99 (ack;
-    QoS 0: end-to-end) is within the band."""
+    QoS 0: end-to-end) is within the band. A step measured in rounds is CARRIED only when
+    every round carried, and its figures are the rounds' means (p99: the mean of the
+    rounds' p99; `gate_p99_merged_us` beside it)."""
     carried = [s for s in steps if s["verdict"] == CARRIED and s["gate_p99_us"] is not None]
     top = max(carried, key=lambda s: s["rate"]) if carried else None
+
+    def rounds_of(s: dict) -> dict:
+        # A step measured in rounds: its figures are the rounds' means (every round carried).
+        return {"rounds": len(s.get("rounds") or []) or 1, "gate_p99_merged_us": s.get("gate_p99_merged_us"),
+                "gate_p99_sd_us": ((s.get("stats") or {}).get("gate_p99_us") or {}).get("sd")}
     out: dict = {"lossless": None if top is None else {
         "offered_rate": top["offered_rate"], "received_rate": top["received_rate"],
         "gate_p99_us": top["gate_p99_us"], "ack_p99_us": top["ack_latency"]["p99_us"],
-        "e2e_p99_us": top["e2e_latency"]["p99_us"], "step": top["step"]}}
+        "e2e_p99_us": top["e2e_latency"]["p99_us"], "step": top["step"], **rounds_of(top)}}
     for band in BANDS_MS:
         ok = [s for s in carried if s["gate_p99_us"] <= band * 1000]
         best = max(ok, key=lambda s: s["rate"]) if ok else None
         out[f"p99_le_{band}ms"] = None if best is None else {
             "offered_rate": best["offered_rate"], "received_rate": best["received_rate"],
-            "gate_p99_us": best["gate_p99_us"], "step": best["step"]}
+            "gate_p99_us": best["gate_p99_us"], "step": best["step"], **rounds_of(best)}
     return out
 
 
@@ -831,6 +1121,22 @@ def fmt_us(x) -> str:
     if x is None:
         return "—"
     return f"{x / 1000:.1f} ms" if x < 10_000_000 else f"{x / 1e6:.2f} s"
+
+
+def fmt_pct(x) -> str:
+    return "—" if x is None else f"{x:.1%}"
+
+
+def fmt_mean_sd(st_: dict | None) -> str:
+    """'12.3 ± 1.1 ms' (latency in us), or the mean alone for one round."""
+    if not st_ or st_.get("mean") is None:
+        return "—"
+    if st_.get("sd") is None:
+        return fmt_us(st_["mean"])
+    m, sd = st_["mean"], st_["sd"]
+    if m < 10_000_000:
+        return f"{m / 1000:.1f} ± {sd / 1000:.1f} ms"
+    return f"{m / 1e6:.2f} ± {sd / 1e6:.2f} s"
 
 
 def fmt_ledger(s: dict) -> str:
@@ -874,6 +1180,9 @@ def render_ladder_md(r: dict) -> list[str]:
     top = cap.get("lossless")
     if top:
         lat = (f"ack p99 {fmt_us(top['ack_p99_us'])}, " if gate == "ack" else "") + f"e2e p99 {fmt_us(top['e2e_p99_us'])}"
+        if top.get("rounds", 1) > 1:
+            lat += (f"; means of {top['rounds']} rounds, all carried; {label} p99 of the merged rounds "
+                    f"{fmt_us(top.get('gate_p99_merged_us'))}")
         lines.append(f"**Maximum lossless: {fmt_rate(top['offered_rate'])} msg/s** ({lat}).")
     else:
         lines.append("**Maximum lossless: none** — no step was carried.")
@@ -885,9 +1194,15 @@ def render_ladder_md(r: dict) -> list[str]:
     lines += [f"- ladder ended: {r['ended']}", ""]
     if r.get("chart"):
         lines += [f"![{r['workload']}: {label} p99 by offered msg/s]({r['chart']})", ""]
-    lines.append("| step | offered msg/s | brokers received | delivered | share | loss | ack p50 / p99 / p999 | "
-                 "e2e p50 / p99 / p999 | generator health | verdict |")
-    lines.append("|---|---|---|---|---|---|---|---|---|---|")
+    multi = any(len(s.get("rounds") or []) > 1 for s in r["steps"])
+    if multi:
+        lines += [f"Every figure of a step measured in rounds is the mean of its rounds; its {label} p99 is the mean "
+                  f"of the rounds' p99 (\"{label} p99 mean ± sd\": ± the sample standard deviation, then the p99 of "
+                  "all its rounds' histograms merged). CV: coefficient of variation (sd / mean) of the brokers' "
+                  f"received msg/s and of the {label} p99.", ""]
+    lines.append("| step | rounds | offered msg/s | brokers received | delivered | share | loss | ack p50 / p99 / p999 | "
+                 f"{label} p99 mean ± sd | CV | e2e p50 / p99 / p999 | generator health | verdict |")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for s in r["steps"]:
         a, e = s["ack_latency"], s["e2e_latency"]
         share = "—" if s["received_share"] is None else f"{s['received_share']:.1%}"
@@ -905,6 +1220,21 @@ def render_ladder_md(r: dict) -> list[str]:
         why = "; ".join(s["failures"] + s["voids"] + s["notes"])
         m = s.get("retry")
         tag = ""
+        rounds = s.get("rounds")
+        st_ = s.get("stats") or {}
+        if rounds is None:  # a step judged before rounds: one measurement
+            n_txt, pm, cv = "1", "—", "—"
+        else:
+            n_txt = f"{len(rounds)} of {s.get('rounds_planned', len(rounds))}"
+            pm = fmt_mean_sd(st_.get("gate_p99_us"))
+            if len(rounds) > 1:
+                pm += f" (merged {fmt_us(s.get('gate_p99_merged_us'))})"
+            cv = (f"rx {fmt_pct((st_.get('received_rate') or {}).get('cv'))}, "
+                  f"p99 {fmt_pct((st_.get('gate_p99_us') or {}).get('cv'))}") if len(rounds) > 1 else "—"
+            if (s.get("spread") or {}).get("flags"):
+                cv += " ⚑"
+            if s.get("decided_by"):
+                tag += f" ({s['decided_by']})"
         if m:
             tag = {"pending": " (retry pending)",
                    "transient": f" (retried: transient, step {m.get('retry_step')} carried)",
@@ -912,11 +1242,42 @@ def render_ladder_md(r: dict) -> list[str]:
                    "retry": f" (retry of step {m.get('of')})",
                    "not-retried": " (retry-eligible, not retried in this run)"}[m["mark"]]
         lines.append(
-            f"| {s['step']} | {fmt_rate(s['offered_rate'])} | {fmt_rate(s['received_rate'])} | "
+            f"| {s['step']} | {n_txt} | {fmt_rate(s['offered_rate'])} | {fmt_rate(s['received_rate'])} | "
             f"{fmt_rate(s['delivered_rate'])} | {share} | {loss} | "
-            f"{fmt_us(a['p50_us'])} / {fmt_us(a['p99_us'])} / {fmt_us(a['p999_us'])} | "
+            f"{fmt_us(a['p50_us'])} / {fmt_us(a['p99_us'])} / {fmt_us(a['p999_us'])} | {pm} | {cv} | "
             f"{fmt_us(e['p50_us'])} / {fmt_us(e['p99_us'])} / {fmt_us(e['p999_us'])} | {fmt_health(s)} | "
             f"**{s['verdict']}**{tag}{(' — ' + why) if why else ''} |")
+    lines.append("")
+    lines += render_variance_md(r)
+    return lines
+
+
+def render_variance_md(r: dict) -> list[str]:
+    """The ladder's variance across rounds: the largest CVs and the steps whose rounds
+    disagree (received msg/s by more than SPREAD_RECEIVED, p99 by more than SPREAD_P99)."""
+    label = "ack" if r["latency_gate"] == "ack" else "end-to-end"
+    multi = [s for s in r["steps"] if len(s.get("rounds") or []) > 1]
+    lines = [f"### Variance across rounds: {r['workload']}", ""]
+    if not multi:
+        return lines + ["One round per step: no variance to report.", ""]
+
+    def worst(key: str):
+        xs = [(s["stats"][key]["cv"], s) for s in multi if s["stats"][key]["cv"] is not None]
+        return max(xs, key=lambda x: x[0]) if xs else (None, None)
+    for key, what in (("received_rate", "brokers' received msg/s"), ("gate_p99_us", f"{label} p99")):
+        cv, s = worst(key)
+        lines.append(f"- largest CV of the {what}: " + ("—" if s is None else
+                     f"{cv:.1%} at step {s['step']} ({fmt_rate(s['offered_rate'])} msg/s, {s['verdict']})"))
+    flagged = [s for s in multi if (s.get("spread") or {}).get("flags")]
+    if flagged:
+        lines.append(f"- rounds that disagree (received msg/s by > {SPREAD_RECEIVED:.0%}, or {label} p99 by "
+                     f"> {SPREAD_P99:g}x), flagged ⚑ in the table:")
+        for s in flagged:
+            lines.append(f"  - step {s['step']} ({fmt_rate(s['offered_rate'])} msg/s, {s['verdict']}): "
+                         + "; ".join(s["spread"]["flags"]))
+    else:
+        lines.append(f"- no step's rounds disagree by > {SPREAD_RECEIVED:.0%} in received msg/s or > {SPREAD_P99:g}x "
+                     f"in {label} p99")
     lines.append("")
     return lines
 
@@ -937,8 +1298,8 @@ def report(run: Path) -> dict:
         md.append(f"- tier `{meta.get('tier')}`: {meta.get('brokers')} brokers ({meta.get('broker_type')}), "
                   f"{meta.get('generators')} generator host(s) ({meta.get('gen_type')})")
         md.append(f"- broker: {meta.get('binary', '?')}")
-        md.append(f"- started {meta.get('started_utc', '?')}; steps: {meta.get('warmup_s')} s warm-up, "
-                  f"{meta.get('measure_s')} s measured")
+        md.append(f"- started {meta.get('started_utc', '?')}; steps: {meta.get('rounds', 1)} round(s) of "
+                  f"{meta.get('warmup_s')} s warm-up, {meta.get('measure_s')} s measured")
         if meta.get("unreleased"):
             md.append("- **UNRELEASED binary**: these figures are attributable to that binary only")
         md.append("")
@@ -946,7 +1307,9 @@ def report(run: Path) -> dict:
            f"must receive ≥ {OFFER_TAKEN:.0%} of the offer, and latency is the exact merge of every generator's "
            "histogram. The ramp climbs on every carried step, whatever its latency; a bad step right above a carried "
            f"step with p99 < {RETRY_P99_MS:g} ms is retried once after a full settle, and counts only if the retry "
-           "is bad too (\"retried: transient\" otherwise). **Maximum lossless** is the "
+           "is bad too (\"retried: transient\" otherwise). A step measured in rounds is CARRIED only when every "
+           "round carried, FAILED when any round lost a message; a VOID round is rerun on its own, and the transient "
+           "retry reruns the one bad round. **Maximum lossless** is the "
            "highest carried step; the lines below it are the highest carried step within each ack p99 band "
            "(QoS 0: end-to-end p99).", ""]
     for r in data["ladders"]:
@@ -960,7 +1323,13 @@ def report(run: Path) -> dict:
 
 def cost(tier: str, brokers: int | None = None, gens: int | None = None, broker_type: str | None = None,
          gen_type: str | None = None, workloads: int = 1, steps: int = 9, step_secs: float = 120.0,
-         bringup_min: float | None = None, teardown_min: float = 3.0, prices: dict | None = None) -> dict:
+         bringup_min: float | None = None, teardown_min: float = 3.0, prices: dict | None = None,
+         rounds: int = 1, ladder_secs: float = 0.0) -> dict:
+    """The price of a run. A ladder: `ladder_secs` (what it spends outside its steps' short
+    settles: the prime and the long settles), then `steps` steps of `rounds` rounds, each
+    round `step_secs` (its short settle, warm-up, measured time, drain and fetch). A step
+    that is not carried stops at its first bad round, so this is the upper end for a given
+    step count."""
     t = TIERS[tier]
     brokers, gens = brokers or t["brokers"], gens or t["gens"]
     bt, gt = broker_type or t["broker_type"], gen_type or t["gen_type"]
@@ -969,10 +1338,11 @@ def cost(tier: str, brokers: int | None = None, gens: int | None = None, broker_
         raise ValueError(f"no price for {bt if bt not in p else gt}; pass --price TYPE=EUR")
     hourly = brokers * p[bt] + gens * p[gt]
     bring = bringup_min if bringup_min is not None else (10.0 if brokers <= 3 else 14.0)
-    ramp_min = workloads * steps * step_secs / 60
+    ramp_min = workloads * (ladder_secs + steps * rounds * step_secs) / 60
     total = bring + ramp_min + teardown_min
     return {"tier": tier, "brokers": brokers, "broker_type": bt, "generators": gens, "gen_type": gt,
-            "eur_per_hour": round(hourly, 6), "minutes": round(total), "bringup_min": bring, "ramp_min": round(ramp_min, 1),
+            "rounds": rounds, "eur_per_hour": round(hourly, 6), "minutes": round(total), "bringup_min": bring,
+            "ramp_min": round(ramp_min, 1), "teardown_min": teardown_min,
             "eur_prorated": round(hourly * total / 60, 2), "eur_hours_rounded_up": round(hourly * math.ceil(total / 60), 2)}
 
 
@@ -984,6 +1354,10 @@ def main(argv: list[str]) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     j = sub.add_parser("judge")
     j.add_argument("step")
+    rn = sub.add_parser("round-next")
+    rn.add_argument("step")
+    sa = sub.add_parser("step")
+    sa.add_argument("step")
     n = sub.add_parser("next")
     n.add_argument("ladder")
     r = sub.add_parser("report")
@@ -1003,7 +1377,10 @@ def main(argv: list[str]) -> int:
     c.add_argument("--gen-type")
     c.add_argument("--workloads", type=int, default=1)
     c.add_argument("--steps", type=int, default=9)
-    c.add_argument("--step-secs", type=float, default=120)
+    c.add_argument("--step-secs", type=float, default=120, help="seconds a round takes, settle included")
+    c.add_argument("--rounds", type=int, default=1)
+    c.add_argument("--ladder-secs", type=float, default=0,
+                   help="seconds a ladder spends outside its rounds: the prime and the long settles")
     c.add_argument("--price", action="append", default=[], help="TYPE=EUR per hour")
     c.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
@@ -1014,6 +1391,27 @@ def main(argv: list[str]) -> int:
         print(f"{v['verdict']}{' (good)' if v['good'] else ''}: offered {fmt_rate(v['offered_rate'])} msg/s, brokers "
               f"received {fmt_rate(v['received_rate'])}, ack p99 {fmt_us(v['ack_latency']['p99_us'])}, e2e p99 "
               f"{fmt_us(v['e2e_latency']['p99_us'])}" + "".join(f"\n  - {x}" for x in v["failures"] + v["voids"] + v["notes"]))
+        return 0
+    if a.cmd in ("round-next", "step"):
+        step = Path(a.step)
+        ladder = step.parent.parent
+        ramp = json.loads((ladder / "ladder.json").read_text())["ramp"]
+        prior = ladder_steps(ladder, before=step.name)
+        if a.cmd == "round-next":
+            plan = plan_rounds(step, prior, ramp)
+            if not plan["done"]:
+                n = plan["next"]
+                print(f"{n['dir']} {n['settle']} {n['reason']}")
+            return 0
+        v = aggregate(step, prior, ramp)
+        (step / "verdict.json").write_text(json.dumps(v, indent=2) + "\n")
+        st_ = v["stats"]
+        n = len(v["rounds"])
+        print(f"STEP {v['verdict']}{' (' + v['decided_by'] + ')' if v.get('decided_by') else ''}: {n} round(s), "
+              f"offered {fmt_rate(v['offered_rate'])} msg/s, brokers received {fmt_rate(v['received_rate'])} (CV "
+              f"{fmt_pct(st_['received_rate']['cv'])}), {v['latency_gate']} p99 mean {fmt_mean_sd(st_['gate_p99_us'])}, "
+              f"merged {fmt_us(v['gate_p99_merged_us'])}"
+              + "".join(f"\n  - {x}" for x in v["failures"] + v["voids"] + v["notes"] + v["spread"]["flags"]))
         return 0
     if a.cmd == "next":
         ladder = Path(a.ladder)
@@ -1045,15 +1443,18 @@ def main(argv: list[str]) -> int:
             k, v = kv.split("=", 1)
             prices[k] = float(v)
         c = cost(a.tier, a.brokers, a.generators, a.broker_type, a.gen_type, a.workloads, a.steps, a.step_secs,
-                 prices=prices)
+                 prices=prices, rounds=a.rounds, ladder_secs=a.ladder_secs)
         if a.json:
             print(json.dumps(c))
         else:
+            per = f"~{a.steps} steps x {a.rounds} round(s) of ~{a.step_secs:.0f} s"
+            if a.ladder_secs:
+                per = f"~{a.ladder_secs:.0f} s of prime and long settles + " + per
             print(f"tier {c['tier']}: {c['brokers']} x {c['broker_type']} + {c['generators']} x {c['gen_type']} = "
                   f"EUR {c['eur_per_hour']:.4f}/h; expected ~{c['minutes']} min ({c['bringup_min']:.0f} bring-up + "
-                  f"{c['ramp_min']:.0f} ramp for {a.workloads} workload(s) x ~{a.steps} steps of ~{a.step_secs:.0f} s + "
-                  f"teardown) = EUR {c['eur_prorated']:.2f} prorated, EUR {c['eur_hours_rounded_up']:.2f} if every "
-                  "started hour is billed")
+                  f"{c['ramp_min']:.0f} ramp for {a.workloads} workload(s) x ({per}) + "
+                  f"{c['teardown_min']:.0f} teardown) = EUR {c['eur_prorated']:.2f} "
+                  f"prorated, EUR {c['eur_hours_rounded_up']:.2f} if every started hour is billed")
         return 0
     return 2
 
