@@ -382,7 +382,10 @@ jobs:
   docs:
     name: delivery dashboard
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The rig's offline run.sh tests (test-run-sh.py) run the real script against stub
+    # brokers and take about a minute; with every other doc and rig gate the job needs
+    # more than the 15 minutes it had.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Status dashboard is up to date
