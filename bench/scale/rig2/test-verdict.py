@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Offline tests for bench/scale/rig2/verdict.py: the step verdicts, the drop-reason
-classification, the capacity lines, the ramp's next step, the histogram merge, the idle
-check, the price quote, and the report's charts (chart-ramp.py's self-test).
+classification, the capacity lines, the ramp's next step, a step's rounds (their plan,
+the step verdict and the statistics across them), the histogram merge, the idle check,
+the price quote, and the report's charts (chart-ramp.py's self-test).
 
     python3 bench/scale/rig2/test-verdict.py
 
@@ -14,6 +15,7 @@ import importlib.util
 import json
 import math
 import re
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -414,6 +416,247 @@ class RetryReport(unittest.TestCase):
             self.assertIn("retried: transient", (run / "report-durable-qos1.svg").read_text())
 
 
+def new_step(steps_root: Path, rate, rounds=3, after="CARRIED") -> Path:
+    """A step directory measured in rounds, as run.sh's run_step writes it (no round yet)."""
+    idx = len([p for p in steps_root.iterdir() if p.is_dir()]) + 1
+    step = steps_root / f"{idx:02d}-{rate}"
+    step.mkdir()
+    (step / "step.json").write_text(json.dumps({"index": idx, "id": step.name, "rate": rate, "attempt": 1,
+                                                "rounds": rounds, "generators": 1, "brokers": 3, "after": after}))
+    return step
+
+
+def add_round(step: Path, name: str, rate, gens, **kw) -> dict:
+    """One judged round, `name` (round-K or round-K-aN), as run.sh's run_round leaves it."""
+    with tempfile.TemporaryDirectory() as d:
+        shutil.move(str(make_step(Path(d), rate, gens, **kw)), str(step / name))
+    return verdict_of(step / name)
+
+
+RAMP = {"start_rate": 10000, "factor": 1.5, "gap_pct": 3, "granularity": 100, "void_retries": 1,
+        "retry_p99_ms": 50, "retry_max": 2}
+
+
+class Rounds(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ladder = Path(self.tmp.name)
+        self.root = self.ladder / "steps"
+        self.root.mkdir()
+        (self.ladder / "ladder.json").write_text(json.dumps({"workload": "durable-qos1", "arm": "A", "ramp": RAMP}))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def plan(self, step, prior=()):
+        return V.plan_rounds(step, list(prior), RAMP)
+
+    def finish(self, step, prior=()):
+        v = V.aggregate(step, list(prior), RAMP)
+        (step / "verdict.json").write_text(json.dumps(v))
+        return v
+
+    def flat_step(self, rate=20000, p99_us=1_500):
+        """A carried step below, its rounds flat (p99 under the 50 ms retry threshold)."""
+        step = new_step(self.root, rate)
+        for k in (1, 2, 3):
+            add_round(step, f"round-{k}", rate, [summary(rate, p99_us=p99_us)])
+        return self.finish(step)
+
+    def test_three_carried_rounds_carry_the_step_with_their_statistics(self):
+        step = new_step(self.root, 30000)
+        self.assertEqual(self.plan(step)["next"], {"dir": "round-1", "round": 1, "attempt": 1, "settle": "short",
+                                                   "reason": "round 1 of 3"})
+        for k, (p99, share) in enumerate(((10_000, 1.0), (100_000, 1.02), (100_000, 0.995)), 1):
+            add_round(step, f"round-{k}", 30000, [summary(30000, p99_us=p99)], received_share=share)
+            nxt = self.plan(step)["next"]
+            if k < 3:
+                # Between the rounds of a carried step: the short settle.
+                self.assertEqual((nxt["dir"], nxt["settle"]), (f"round-{k + 1}", "short"))
+        self.assertTrue(self.plan(step)["done"])
+        v = self.finish(step)
+        self.assertEqual(v["verdict"], V.CARRIED, v)
+        self.assertEqual([r["dir"] for r in v["rounds"]], ["round-1", "round-2", "round-3"])
+        p = v["stats"]["ack_p99_us"]
+        self.assertEqual((p["n"], p["mean"], p["min"], p["max"]), (3, 70_000, 10_000, 100_000))
+        self.assertAlmostEqual(p["sd"], math.sqrt(2700) * 1000, places=3)   # sample sd, n - 1
+        self.assertAlmostEqual(p["cv"], math.sqrt(2700) / 70, places=6)
+        # The headline is the MEAN of the rounds' p99; the merged histogram is beside it.
+        self.assertEqual(v["ack_latency"]["p99_us"], 70_000)
+        self.assertEqual(v["gate_p99_us"], 70_000)
+        # Merged: 98 % at 1 ms, 0.5 % at 10 ms, 0.17 % at 20 ms, 1 % at 100 ms: its p99 is 100 ms.
+        self.assertEqual(v["gate_p99_merged_us"], 100_000)
+        self.assertEqual(v["ack_latency_merged"]["count"], 3 * 30000 * 60)
+        rx = v["stats"]["received_rate"]
+        self.assertAlmostEqual(rx["mean"], 30000 * (1.0 + 1.02 + 0.995) / 3, delta=1)
+        self.assertAlmostEqual(v["received_rate"], rx["mean"])
+        self.assertAlmostEqual(v["spread"]["received"], 0.025 / 0.995, places=3)
+        # 10x in p99 is flagged, 2.5 % in received msg/s is not.
+        self.assertEqual(len(v["spread"]["flags"]), 1, v["spread"])
+        self.assertIn("p99 differs 10.0x across rounds", v["spread"]["flags"][0])
+        self.assertIsNone(v["decided_by"])
+
+    def test_one_round_that_lost_messages_fails_the_step_by_name(self):
+        step = new_step(self.root, 30000)
+        add_round(step, "round-1", 30000, [summary(30000)])
+        add_round(step, "round-2", 30000, [summary(30000, missing=3)])
+        # Nothing carried below it: no transient retry, and round 3 cannot carry the step.
+        plan = self.plan(step)
+        self.assertTrue(plan["done"], plan)
+        v = self.finish(step)
+        self.assertEqual(v["verdict"], V.FAILED)
+        self.assertEqual(v["decided_by"], "round-2")
+        self.assertTrue(v["failures"][0].startswith("round 2: ledger did not close"), v["failures"])
+        self.assertEqual(len(v["rounds"]), 2)
+        self.assertEqual(V.next_rate([v], RAMP)[0], None)
+
+    def test_a_void_round_is_rerun_alone(self):
+        step = new_step(self.root, 30000)
+        add_round(step, "round-1", 30000, [summary(30000)])
+        add_round(step, "round-2", 30000, [summary(30000, saturated=True)])
+        nxt = self.plan(step)["next"]
+        self.assertEqual((nxt["dir"], nxt["settle"]), ("round-2-a2", "long"))
+        self.assertIn("rerun of VOID round 2 (attempt 2 of 2): generator 0 saturated", nxt["reason"])
+        add_round(step, "round-2-a2", 30000, [summary(30000)])
+        self.assertEqual(self.plan(step)["next"]["dir"], "round-3")
+        add_round(step, "round-3", 30000, [summary(30000)])
+        v = self.finish(step)
+        self.assertEqual(v["verdict"], V.CARRIED, v)
+        self.assertEqual([r["dir"] for r in v["rounds"]], ["round-1", "round-2-a2", "round-3"])
+        self.assertEqual(v["rounds"][1]["attempts"], ["round-2", "round-2-a2"])
+        self.assertTrue(any(n.startswith("round-2 was VOID (generator 0 saturated") for n in v["notes"]), v["notes"])
+        self.assertEqual(v["stats"]["received_rate"]["n"], 3)
+
+    def test_a_round_void_through_its_reruns_voids_the_step_and_stops_the_ladder(self):
+        step = new_step(self.root, 30000)
+        add_round(step, "round-1", 30000, [summary(30000, saturated=True)])
+        add_round(step, "round-1-a2", 30000, [summary(30000, saturated=True)])
+        self.assertTrue(self.plan(step)["done"])
+        v = self.finish(step)
+        self.assertEqual(v["verdict"], V.VOID)
+        self.assertIn("round 1 stayed VOID through 2 attempt(s)", v["void_reason"])
+        rate, why = V.next_rate([v], RAMP)
+        self.assertIsNone(rate)
+        self.assertIn("round 1 stayed VOID", why)
+
+    def test_a_transient_bad_round_is_retried_and_the_step_carries(self):
+        below = self.flat_step()
+        step = new_step(self.root, 30000)
+        add_round(step, "round-1", 30000, [summary(30000, p99_us=1_500)])
+        add_round(step, "round-2", 30000, [summary(30000)], received_share=0.9)  # OFFER NOT TAKEN
+        nxt = self.plan(step, [below])["next"]
+        self.assertEqual((nxt["dir"], nxt["settle"]), ("round-2-a2", "long"))
+        self.assertIn("retry of round 2 (OFFER NOT TAKEN) after a full settle: the carried step below it "
+                      "(20000 msg/s) had p99 1.5 ms < 50 ms", nxt["reason"])
+        self.assertIn("retry 1 of at most 2", nxt["reason"])
+        add_round(step, "round-2-a2", 30000, [summary(30000, p99_us=1_500)])
+        add_round(step, "round-3", 30000, [summary(30000, p99_us=1_500)])
+        v = self.finish(step, [below])
+        self.assertEqual(v["verdict"], V.CARRIED, v)
+        self.assertEqual(v["round_retries"][0]["outcome"], "transient")
+        self.assertTrue(any(n.startswith("round 2 retried: transient (round-2 was OFFER NOT TAKEN") for n in v["notes"]))
+        # The retried round's first attempt does not count in the statistics.
+        self.assertEqual([r["dir"] for r in v["rounds"]], ["round-1", "round-2-a2", "round-3"])
+        self.assertAlmostEqual(v["stats"]["received_rate"]["min"], 30000, delta=1)
+        # A ladder's retries are capped across steps: this one used one of two.
+        self.assertEqual(V.retry_eligible([below, v], 40000, RAMP)["n"], 2)
+        self.assertIsNone(V.retry_eligible([below, v, v], 40000, RAMP))
+        # The step's retry is its own: the ladder never reruns the whole step.
+        self.assertEqual(V.next_rate([below, v], RAMP), (45000, "coarse step up"))
+
+    def test_a_retry_that_is_bad_again_counts_and_one_retry_a_step(self):
+        below = self.flat_step()
+        step = new_step(self.root, 30000)
+        add_round(step, "round-1", 30000, [summary(30000, missing=2)])
+        add_round(step, "round-1-a2", 30000, [summary(30000, missing=2)])
+        self.assertTrue(self.plan(step, [below])["done"])
+        v = self.finish(step, [below])
+        self.assertEqual(v["verdict"], V.FAILED)
+        self.assertEqual(v["decided_by"], "round-1-a2")
+        self.assertIn("round 1 retried: bad again in round-1-a2", "; ".join(v["notes"]))
+        # A second bad round after a transient one is not retried.
+        step2 = new_step(self.root, 25000)
+        add_round(step2, "round-1", 25000, [summary(25000, missing=2)])
+        add_round(step2, "round-1-a2", 25000, [summary(25000)])
+        add_round(step2, "round-2", 25000, [summary(25000, missing=1)])
+        self.assertTrue(self.plan(step2, [below])["done"])
+        self.assertEqual(self.finish(step2, [below])["decided_by"], "round-2")
+
+    def test_no_retry_above_a_step_that_already_showed_the_knee(self):
+        below = self.flat_step(p99_us=80_000)
+        step = new_step(self.root, 30000)
+        add_round(step, "round-1", 30000, [summary(30000, missing=2)])
+        self.assertTrue(self.plan(step, [below])["done"])
+
+    def test_capacity_uses_the_step_verdicts_and_their_means(self):
+        # 60 ms below: past the retry threshold, so the bad round counts at once.
+        low = self.flat_step(rate=20000, p99_us=60_000)
+        high = new_step(self.root, 30000)
+        add_round(high, "round-1", 30000, [summary(30000, p99_us=5_000)])
+        add_round(high, "round-2", 30000, [summary(30000, p99_us=5_000)], drops={"queue-overflow": 4})
+        high_v = self.finish(high, [low])
+        self.assertEqual(high_v["verdict"], V.FAILED)
+        cap = V.capacity([low, high_v])
+        # The FAILED step's carried round does not count: the step is the unit.
+        self.assertEqual(cap["lossless"]["offered_rate"], 20000)
+        self.assertEqual(cap["lossless"]["gate_p99_us"], 60_000)
+        self.assertEqual(cap["lossless"]["rounds"], 3)
+        self.assertEqual(cap["p99_le_100ms"]["offered_rate"], 20000)
+        self.assertEqual(cap["p99_le_100ms"]["gate_p99_sd_us"], 0.0)  # flat rounds
+
+    def test_the_report_has_rounds_variance_and_merged_p99(self):
+        run = Path(self.tmp.name) / "run"
+        lad = run / "A" / "durable-qos1"
+        (lad / "steps").mkdir(parents=True)
+        (lad / "ladder.json").write_text(json.dumps({"workload": "durable-qos1", "arm": "A", "ramp": RAMP}))
+        (run / "run.json").write_text(json.dumps({"tier": "n3", "brokers": 3, "workloads": ["durable-qos1"],
+                                                  "rounds": 3, "started_utc": "20261027T063123Z"}))
+        prior = []
+        for rate, p99s in ((10000, (2_000, 2_100, 1_900)), (15000, (3_000, 9_000, 3_100))):
+            step = new_step(lad / "steps", rate)
+            for k, p99 in enumerate(p99s, 1):
+                add_round(step, f"round-{k}", rate, [summary(rate, p99_us=p99)])
+            v = V.aggregate(step, prior, RAMP)
+            (step / "verdict.json").write_text(json.dumps(v))
+            prior.append(v)
+        V.report(run)
+        md = (run / "report.md").read_text()
+        self.assertIn("| step | rounds | offered msg/s |", md)
+        self.assertIn("ack p99 mean ± sd | CV |", md)
+        self.assertIn("| 3 of 3 |", md)
+        self.assertIn("2.0 ± 0.1 ms (merged 2.0 ms)", md)
+        self.assertIn("5.0 ± 3.4 ms (merged 3.1 ms) | rx 0.0%, p99 68.3% ⚑ |", md)
+        self.assertIn("### Variance across rounds: durable-qos1", md)
+        self.assertIn("largest CV of the ack p99: 68.3% at step 2 (15,000 msg/s, CARRIED)", md)
+        self.assertIn("step 2 (15,000 msg/s, CARRIED): p99 differs 3.0x across rounds", md)
+        self.assertIn("means of 3 rounds, all carried", md)
+        self.assertIn("steps: 3 round(s) of", md)
+        svg = (run / "report-durable-qos1.svg").read_text()
+        self.assertIn("min–max of the rounds", svg)
+        self.assertIn("ack p99 mean", svg)
+
+    def test_a_round_dir_is_judged_with_the_run_s_broker_count(self):
+        run = Path(self.tmp.name) / "run"
+        steps = run / "A" / "durable-qos1" / "steps"
+        steps.mkdir(parents=True)
+        (run / "run.json").write_text(json.dumps({"brokers": 3}))
+        step = new_step(steps, 30000)
+        add_round(step, "round-1", 30000, [summary(30000)], unfetched=(2,))
+        meta = json.loads((step / "round-1" / "step.json").read_text())
+        del meta["brokers"]
+        (step / "round-1" / "step.json").write_text(json.dumps(meta))
+        self.assertIn("broker evidence: no scrapes from broker(s) 2", verdict_of(step / "round-1")["voids"])
+
+    def test_statistics(self):
+        st_ = V.stat([1, 2, 3, None])
+        self.assertEqual((st_["n"], st_["mean"], st_["sd"], st_["min"], st_["max"], st_["cv"]), (3, 2, 1, 1, 3, 0.5))
+        one = V.stat([5])
+        self.assertEqual((one["mean"], one["sd"], one["cv"]), (5, None, None))
+        self.assertEqual(V.stat([])["mean"], None)
+        self.assertEqual(V.fmt_mean_sd(V.stat([10_000, 12_000])), "11.0 ± 1.4 ms")
+        self.assertEqual(V.fmt_mean_sd(V.stat([10_000])), "10.0 ms")
+
+
 class DropReasons(unittest.TestCase):
     def test_every_reason_the_broker_documents_or_increments_is_classified(self):
         root = HERE.parents[2]
@@ -739,6 +982,10 @@ class IdleAndCost(unittest.TestCase):
         self.assertAlmostEqual(n10["eur_per_hour"], 10 * 0.17225 + 3 * 0.277375, places=6)
         one = V.cost("n3", workloads=1, steps=9, step_secs=120)
         self.assertEqual(one["minutes"], round(10 + 18 + 3))
+        # Rounds multiply the measuring time; a ladder's prime and long settles add to it.
+        three = V.cost("n10", workloads=3, steps=9, step_secs=135, rounds=3, ladder_secs=300)
+        self.assertEqual(three["ramp_min"], round(3 * (300 + 9 * 3 * 135) / 60, 1))
+        self.assertEqual(three["minutes"], round(14 + 3 * (300 + 9 * 3 * 135) / 60 + 3))
         self.assertEqual(one["eur_hours_rounded_up"], round(n3["eur_per_hour"], 2))
         with self.assertRaises(ValueError):
             V.cost("n3", broker_type="ccx99")

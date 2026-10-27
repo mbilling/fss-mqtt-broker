@@ -7,7 +7,9 @@
 verdict.py report calls this too, so a re-rendered report always has its charts.
 
 x is the offered msg/s of every step, sorted; y is the gated p99 (ack; QoS 0:
-end-to-end) on a log scale, with the p50 lighter below it. The background carries the
+end-to-end) on a log scale, with the p50 lighter below it. For a step measured in
+rounds, the point is the MEAN of its rounds' percentile and the error bar spans the
+rounds' min to max (the legend says so). The background carries the
 latency bands of ADR 0048 (2026-09-27): GREEN p99 <= 1 s, YELLOW <= 5 s, RED above.
 A CARRIED step (no loss, offer taken) is a filled point; a FAILED, OFFER NOT TAKEN,
 DISCONNECTED or NOT DRAINED step a hollow red ring; a VOID step (the harness's fault) and
@@ -58,6 +60,19 @@ def gated(step: dict, gate: str) -> dict:
     return step["ack_latency"] if gate == "ack" else step["e2e_latency"]
 
 
+def rounds_n(step: dict) -> int:
+    return len(step.get("rounds") or []) or 1
+
+
+def spread_us(step: dict, key: str) -> tuple[float, float] | None:
+    """(min, max) of the step's rounds for `key` (gate_p50_us, gate_p99_us), when it has
+    two or more rounds with that figure."""
+    st = (step.get("stats") or {}).get(key) or {}
+    if (st.get("n") or 0) < 2 or st.get("min") is None:
+        return None
+    return st["min"], st["max"]
+
+
 def y_range(values_us: list[float]) -> tuple[float, float]:
     """Log decades (in ms) that hold every value and the whole band ladder (to 10 s)."""
     ms = [v / 1000 for v in values_us if v]
@@ -83,9 +98,11 @@ def render(ladder: dict, run: dict) -> str:
     name = WORKLOAD_NAME.get(ladder["workload"], ladder["workload"])
     nodes = run.get("brokers", "?")
     top = (ladder.get("capacity") or {}).get("lossless")
+    multi = max((rounds_n(s) for s in steps), default=1)
     if top:
+        mean = " mean" if (top.get("rounds") or 1) > 1 else ""
         title = (f"{name}, {nodes} nodes: {top['offered_rate']:,.0f} msg/s lossless, "
-                 f"{'ack' if gate == 'ack' else 'e2e'} p99 {fmt_lat(top['gate_p99_us'])}")
+                 f"{'ack' if gate == 'ack' else 'e2e'} p99{mean} {fmt_lat(top['gate_p99_us'])}")
     else:
         title = f"{name}, {nodes} nodes: no step carried without loss"
     started = str(run.get("started_utc", ""))
@@ -96,13 +113,16 @@ def render(ladder: dict, run: dict) -> str:
            ladder["workload"]]
     if payload:
         sub.append(f"{payload} B payload")
+    if multi > 1:
+        sub.append(f"{multi} rounds a step: means, bars min–max")
     sub.append(date)
     if run.get("unreleased"):
         sub.append("UNRELEASED binary")
     out = cs.open_svg(W, H, title, " · ".join(sub),
                       desc=f"{label} p99 and p50 by offered msg/s for every step of the ladder")
 
-    lo_ms, hi_ms = y_range([v for s in steps for v in (gated(s, gate)["p99_us"], gated(s, gate)["p50_us"])])
+    extremes = [v for s in steps for k in ("gate_p50_us", "gate_p99_us") for v in (spread_us(s, k) or ())]
+    lo_ms, hi_ms = y_range([v for s in steps for v in (gated(s, gate)["p99_us"], gated(s, gate)["p50_us"])] + extremes)
     l_lo, l_hi = math.log10(lo_ms), math.log10(hi_ms)
 
     def y(us: float) -> float:
@@ -148,12 +168,29 @@ def render(ladder: dict, run: dict) -> str:
             pts = " ".join(f"{x(s['offered_rate']):.1f},{y(gated(s, gate)[key]):.1f}" for s in carried)
             out.append(f'<polyline points="{pts}" fill="none" class="k-s1" stroke-width="{width}" '
                        f'stroke-opacity="{op}" stroke-linejoin="round"/>')
+    # Error bars under the points: the rounds' min to max, p50 lighter.
+    for s in steps:
+        cx = x(s["offered_rate"])
+        role = ("s1" if s["verdict"] == CARRIED else "ghost" if (s["verdict"] == VOID or transient(s)) else "crit")
+        for key, op, cap in (("gate_p50_us", "0.45", 3.0), ("gate_p99_us", "0.85", 4.5)):
+            sp = spread_us(s, key)
+            if sp is None:
+                continue
+            y_lo, y_hi = y(sp[0]), y(sp[1])
+            out.append(f'<line x1="{cx:.1f}" y1="{y_hi:.1f}" x2="{cx:.1f}" y2="{y_lo:.1f}" class="k-{role}" '
+                       f'stroke-width="1.5" stroke-opacity="{op}"/>')
+            for yy in (y_lo, y_hi):
+                out.append(f'<line x1="{cx - cap:.1f}" y1="{yy:.1f}" x2="{cx + cap:.1f}" y2="{yy:.1f}" '
+                           f'class="k-{role}" stroke-width="1.5" stroke-opacity="{op}"/>')
     for s in steps:
         g = gated(s, gate)
         cx = x(s["offered_rate"])
+        n = rounds_n(s)
+        sp = spread_us(s, "gate_p99_us")
         tip = (f"step {s['step']}: {s['offered_rate']:,.0f} msg/s offered, {s['verdict']}"
                f"{' (retried: transient)' if transient(s) else ''}; "
-               f"{label} p50 {fmt_lat(g['p50_us'])}, p99 {fmt_lat(g['p99_us'])}")
+               f"{label} p50 {fmt_lat(g['p50_us'])}, p99 {fmt_lat(g['p99_us'])}"
+               + (f" (means of {n} rounds; p99 {fmt_lat(sp[0])} to {fmt_lat(sp[1])})" if sp else ""))
         for key, r, op in (("p50_us", 3.5, 0.45), ("p99_us", 5, 1.0)):
             cy = y(g[key]) if g[key] is not None else None
             if cy is None:
@@ -177,25 +214,35 @@ def render(ladder: dict, run: dict) -> str:
         if s is not None:
             cx, cy = x(s["offered_rate"]), y(gated(s, gate)["p99_us"])
             l1 = f"{s['offered_rate']:,.0f} msg/s lossless"
-            l2 = f"{'ack' if gate == 'ack' else 'e2e'} p99 {fmt_lat(gated(s, gate)['p99_us'])}"
+            mean = " mean" if rounds_n(s) > 1 else ""
+            l2 = f"{'ack' if gate == 'ack' else 'e2e'} p99{mean} {fmt_lat(gated(s, gate)['p99_us'])}"
             if gate == "ack":
                 l2 += f" · e2e p99 {fmt_lat(s['e2e_latency']['p99_us'])}"
             left = cx > X0 + 260
             anchor, lx = ("end", cx - 8) if left else ("start", cx + 8)
-            ly = max(cy - 30, Y0 + 40)
-            out.append(f'<line x1="{cx:.1f}" y1="{cy - 7:.1f}" x2="{cx:.1f}" y2="{ly + 6:.1f}" class="k-ink2" '
-                       'stroke-width="1"/>')
+            sp = spread_us(s, "gate_p99_us")
+            top_y = min(cy, y(sp[1])) if sp else cy  # above the error bar's top too
+            ly = max(top_y - 30, Y0 + 40)
+            if top_y - 7 > ly + 6:
+                out.append(f'<line x1="{cx:.1f}" y1="{top_y - 7:.1f}" x2="{cx:.1f}" y2="{ly + 6:.1f}" class="k-ink2" '
+                           'stroke-width="1"/>')
             out.append(cs.text(lx, ly - 14, l1, size=13, role="ink", weight=650, anchor=anchor, num=True, halo=True))
             out.append(cs.text(lx, ly + 2, l2, size=12, role="ink2", anchor=anchor, num=True, halo=True))
 
     # Legend.
     ly, lx = H - 26, 92.0
+    mean = " mean" if multi > 1 else ""
     entries = [
-        (f'<circle cx="{lx + 6:.1f}" cy="{ly - 4:.1f}" r="5" class="f-s1"/>', f"carried: {label} p99"),
-        (f'<circle cx="{0:.1f}" cy="{ly - 4:.1f}" r="3.5" class="f-s1" fill-opacity="0.45"/>', f"{label} p50"),
+        (f'<circle cx="{lx + 6:.1f}" cy="{ly - 4:.1f}" r="5" class="f-s1"/>', f"carried: {label} p99{mean}"),
+        (f'<circle cx="{0:.1f}" cy="{ly - 4:.1f}" r="3.5" class="f-s1" fill-opacity="0.45"/>', f"{label} p50{mean}"),
         (f'<circle cx="{0:.1f}" cy="{ly - 4:.1f}" r="5" fill="none" class="k-crit" stroke-width="2"/>',
          "not carried"),
     ]
+    if any(spread_us(s, "gate_p99_us") for s in steps):
+        entries.append((f'<line x1="{0:.1f}" y1="{ly - 11:.1f}" x2="{0:.1f}" y2="{ly + 3:.1f}" class="k-s1" '
+                        f'stroke-width="1.5"/><line x1="{-4:.1f}" y1="{ly - 11:.1f}" x2="{4:.1f}" y2="{ly - 11:.1f}" '
+                        f'class="k-s1" stroke-width="1.5"/><line x1="{-4:.1f}" y1="{ly + 3:.1f}" x2="{4:.1f}" '
+                        f'y2="{ly + 3:.1f}" class="k-s1" stroke-width="1.5"/>', "min–max of the rounds"))
     if any(s["verdict"] == VOID or transient(s) for s in steps):
         what = " / ".join(w for w, on in (("void (rerun)", any(s["verdict"] == VOID for s in steps)),
                                           ("retried: transient", any(transient(s) for s in steps))) if on)
@@ -203,6 +250,9 @@ def render(ladder: dict, run: dict) -> str:
                         'stroke-width="1.5" stroke-dasharray="2 2"/>', what))
     for mark, txt in entries:
         mark = mark.replace(f'cx="{0:.1f}"', f'cx="{lx + 6:.1f}"')
+        for a in ("x1", "x2"):  # the error-bar glyph, drawn around x = 0
+            for off in (-4, 0, 4):
+                mark = mark.replace(f'{a}="{off:.1f}"', f'{a}="{lx + 6 + off:.1f}"')
         out.append(mark)
         out.append(cs.text(lx + 17, ly, txt, size=12))
         lx += cs.legend_width(txt) + 6
@@ -259,6 +309,32 @@ def self_test() -> None:
           "steps": [_step(1, 50000, "FAILED", 30)]}
     t = ET.fromstring(render(q0, run)).find(f"{ns}title").text
     assert t == "QoS 0, 3 nodes: no step carried without loss", t
+    # Rounds: the point is the mean, the bar the rounds' min to max, and the chart says so.
+    def with_rounds(step, p99s_ms):
+        n = len(p99s_ms)
+        mean = sum(p99s_ms) / n * 1000
+        step["ack_latency"] = step["e2e_latency"] = {"p50_us": mean / 4, "p99_us": mean, "p999_us": None}
+        step["rounds"] = [{} for _ in p99s_ms]
+        step["stats"] = {"gate_p99_us": {"n": n, "mean": mean, "min": min(p99s_ms) * 1000, "max": max(p99s_ms) * 1000},
+                         "gate_p50_us": {"n": n, "mean": mean / 4, "min": min(p99s_ms) * 250, "max": max(p99s_ms) * 250}}
+        return step
+    r_steps = [with_rounds(_step(1, 10000, CARRIED, 2), [1.5, 2, 2.5]),
+               with_rounds(_step(2, 15000, CARRIED, 40), [20, 40, 60]),
+               with_rounds(_step(3, 22500, "FAILED", 3000), [3000])]
+    r_ladder = {**ladder, "steps": r_steps,
+                "capacity": {"lossless": {"offered_rate": 15000, "gate_p99_us": 40_000, "step": 2, "rounds": 3}}}
+    r_svg = render(r_ladder, run)
+    r_root = ET.fromstring(r_svg)
+    assert r_root.find(f"{ns}title").text == "Durable QoS 1, 3 nodes: 15,000 msg/s lossless, ack p99 mean 40 ms", \
+        r_root.find(f"{ns}title").text
+    assert "min–max of the rounds" in r_svg and "3 rounds a step: means, bars min–max" in r_svg
+    assert "ack p99 mean" in r_svg and "means of 3 rounds; p99 20 ms to 60 ms" in r_svg
+    # Two carried steps with spread, each a p99 and a p50 bar of three lines (stem, two caps);
+    # the one-round FAILED step has none.
+    bars = [ln for ln in r_root.iter(f"{ns}line") if ln.get("stroke-opacity") in ("0.85", "0.45")]
+    assert len(bars) == 2 * 2 * 3, len(bars)
+    stems = sorted((float(ln.get("y1")), float(ln.get("y2"))) for ln in bars if ln.get("x1") == ln.get("x2"))
+    assert all(a < b for a, b in stems), stems  # top above bottom: max above min on the log scale
     assert y_range([500, 18_940_000]) == (0.1, 100_000)
     assert y_range([800, 140_000]) == (0.1, 10_000)
     assert x_ticks(114200)[0] >= 114200 * 1.08
