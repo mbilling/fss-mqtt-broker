@@ -88,6 +88,15 @@ OFFER_TAKEN = _load("summarize_curve", SCALE / "summarize-curve.py").OFFER_TAKEN
 SCHEMA_REPORT = "mqtt-rig2.report.v1"
 SCHEMAS_ACCEPTED = ("mqtt-load.summary.v2",)
 BANDS_MS = (1000, 250, 100)
+# The workload's own spread (mqtt-load's session_skew: the busiest consumer session's
+# expected load over the mean, from how publishers and consumers were dealt over the
+# brokers). Above this the HARNESS concentrated the load, and the step says nothing
+# about the cluster: VOID. mqtt-load refuses such a workload by default (--max-skew).
+SESSION_SKEW_MAX = 1.25
+# The broker's spread (mqtt-load's spread.consumer_skew: the busiest consumer's
+# deliveries over the mean). With an even deal this is the broker's doing, so it is
+# reported, never judged; above this it is noted on the step.
+SPREAD_NOTE = 1.5
 QUANTILES = {"p50": 0.5, "p99": 0.99, "p999": 0.999}
 
 # Hetzner hourly prices (EUR, excl. VAT) for the server types the tiers use. Unknown
@@ -480,6 +489,8 @@ def generator_health(s: dict) -> dict:
         "credit_stall_max": max((x["credit_stall_fraction"] for x in h), default=0.0),
         "backlog_max": max((x["backlog"] for x in h), default=0),
         "sent_per_cpu_second": s["generator"]["sent_per_cpu_second"],
+        "session_skew": s["workload"].get("session_skew"),
+        "spread": s.get("spread"),
     }
 
 
@@ -594,6 +605,17 @@ def judge(step: Path, cfg: dict | None = None) -> dict:
                  received_rate=s["phases"][0]["received_rate"],
                  deliveries_per_message=s["workload"]["deliveries_per_message"])
         out["generators"].append(h)
+        if (h["session_skew"] or 1.0) > SESSION_SKEW_MAX:
+            out["voids"].append(f"generator {g}'s workload was not spread evenly: its busiest consumer session "
+                                f"would carry {h['session_skew']:.2f}x the mean session's load "
+                                f"(limit {SESSION_SKEW_MAX}), so the harness, not the cluster, set the knee")
+        sp = h["spread"] or {}
+        if sp.get("consumer_skew", 0) > SPREAD_NOTE:
+            out["notes"].append(f"uneven delivery: generator {g}'s busiest consumer (c{sp['busiest_consumer']}, "
+                                f"on broker {sp['busiest_broker'] + 1}) received {sp['consumer_skew']:.2f}x the mean "
+                                f"consumer's deliveries" + (f", {sp['idle_consumers']} consumer(s) none"
+                                                            if sp.get("idle_consumers") else "")
+                                + "; the deal was even, so this is how the broker spread them")
     offered = sum(x["offered_rate"] for x in out["generators"])
     out["offered_rate"] = offered if gens else meta["rate"]
 
@@ -1158,6 +1180,9 @@ def fmt_health(s: dict) -> str:
     lag = max(g["sched_lag_p99_us_max"] for g in gs)
     sat = [str(g["generator"]) for g in gs if g["saturated"]]
     txt = f"cpu {cpu:.0%}, lag p99 {lag / 1000:.1f} ms"
+    spread = [g["spread"]["consumer_skew"] for g in gs if g.get("spread")]
+    if spread:
+        txt += f", spread {max(spread):.2f}x"
     return txt + (f", SATURATED g{','.join(sat)}" if sat else "")
 
 

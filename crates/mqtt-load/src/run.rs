@@ -21,7 +21,7 @@ use crate::start;
 use crate::stats::{Counters, Histos, Stats};
 use crate::subscriber;
 use crate::summary::{
-    Aggregate, Connections, DrainReport, GeneratorReport, Outcome, PhaseReport, PhaseSpec,
+    Aggregate, Connections, DrainReport, GeneratorReport, Outcome, PhaseReport, PhaseSpec, Spread,
     StartReport, Summary, Tool, WindowHealth, WindowKind, WindowReport, Workload, SCHEMA,
 };
 
@@ -312,6 +312,9 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
             .map(|i| b'a' + u8::try_from(i % 26).unwrap_or(0))
             .collect(),
         topic_sent: (0..cfg.topics).map(|_| AtomicU64::new(0)).collect(),
+        consumer_received: (0..cfg.consumer_specs().len())
+            .map(|_| AtomicU64::new(0))
+            .collect(),
         last_progress_ns: AtomicU64::new(0),
         errors: Errors::default(),
         stopping: AtomicBool::new(false),
@@ -343,7 +346,7 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
     let consumers = connect_with_limit(specs.len(), cfg.connect_concurrency, |i| {
         let ctx = ctx.clone();
         let spec = specs[i].clone();
-        let addr = ctx.cfg.brokers[i % ctx.cfg.brokers.len()];
+        let addr = ctx.cfg.brokers[spec.broker];
         let id = format!("{prefix}-c{i}");
         let stop = stop_rx.clone();
         async move {
@@ -400,7 +403,7 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
     // Publishers.
     let conns = connect_with_limit(cfg.publishers as usize, cfg.connect_concurrency, |i| {
         let ctx = ctx.clone();
-        let addr = ctx.cfg.brokers[i % ctx.cfg.brokers.len()];
+        let addr = ctx.cfg.brokers[ctx.cfg.publisher_broker(i)];
         let id = format!("{prefix}-p{i}");
         async move {
             let c = &ctx.cfg;
@@ -821,6 +824,7 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
             },
             sessions: cfg.sessions,
             session_expiry_s: if durable { cfg.session_expiry } else { 0 },
+            session_skew: cfg.session_skew(),
             deliveries_per_message: streams_per_topic,
             brokers: cfg.brokers.iter().map(ToString::to_string).collect(),
         },
@@ -845,6 +849,13 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
         },
         ledger,
         missing_sample,
+        spread: Spread::of(
+            &cfg.consumer_specs(),
+            &ctx.consumer_received
+                .iter()
+                .map(|n| n.load(Ordering::Relaxed))
+                .collect::<Vec<_>>(),
+        ),
         generator: GeneratorReport {
             saturated,
             saturated_windows,

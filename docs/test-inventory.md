@@ -944,11 +944,15 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_reserved_tree_is_exactly_sys_and_below`
 - `tests::topic_name_validity_rejects_wildcards_and_emptiness`
 
-## `crates/mqtt-load/src/lib.rs` — 38 test(s)
+## `crates/mqtt-load/src/lib.rs` — 43 test(s)
 
 - `client::tests::fixed_packets_decode_as_themselves`
 - `clock::tests::clock_is_monotonic_and_maps_back_to_instants`
+- `config::tests::a_hot_session_is_refused_unless_asked_for`
+- `config::tests::every_group_has_a_member_on_every_broker`
+- `config::tests::every_topic_has_publishers_on_every_broker`
 - `config::tests::fanout_shape_is_one_stream_per_subscriber`
+- `config::tests::session_skew_is_one_for_a_whole_number_of_publishers_per_topic_and_broker`
 - `config::tests::share_shape_is_one_stream_per_group_and_topic`
 - `config::tests::the_drain_quiet_window_follows_the_slowest_p99_between_floor_and_timeout`
 - `config::tests::validation_catches_unrunnable_workloads`
@@ -984,6 +988,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `start::tests::the_wait_ends_at_the_start_file_or_at_its_bound`
 - `stats::tests::drain_moves_histograms_and_sums_counters`
 - `subscriber::tests::packet_ids_follow_in_order_and_skip_zero`
+- `summary::tests::spread_names_the_busiest_consumer_and_its_broker`
 
 ## `crates/mqtt-load/src/main.rs` — 0 test(s)
 

@@ -44,7 +44,18 @@ never linked into `mqttd`.
   subscribers (`--shape fanout`). Their sessions are durable (`clean_start=false` plus a
   session expiry) or clean. Durable sessions are ended with a DISCONNECT carrying session
   expiry 0, unless `--keep-sessions` is given.
-- **Endpoints.** Connections are spread round-robin over `--broker` endpoints.
+- **Endpoints.** Every topic's publishers and every stream's consumers are spread over
+  all `--broker` endpoints: publisher `i` publishes to topic `i % topics` on broker
+  `(i % topics + i / topics) % brokers`, and member `j` of stream `s` connects to broker
+  `(s + j) % brokers`. Dealing publishers `i % brokers` instead would put every publisher
+  of a topic on one broker whenever the broker count divides the topic count; a broker
+  that prefers a local `$share` member then hands the whole topic to one session.
+- **Even load.** Before it connects, the generator computes `session_skew`: the busiest
+  consumer session's expected load over the mean session's, for a broker that prefers a
+  local `$share` member. Above `--max-skew` (1.25) it refuses to run. With the derived
+  `--publishers` the skew is 1.0. After the run, `spread` reports how evenly the broker
+  actually delivered: the busiest consumer's deliveries over the mean, which consumer and
+  broker that was, and how many consumers received nothing.
 
 ### Payload
 
@@ -140,11 +151,12 @@ run (derived from the highest step), so the rate per publisher steps with the to
 
 | flag | default | meaning |
 |---|---|---|
-| `--broker` | `127.0.0.1:1883` | endpoints, comma-separated; connections are spread round-robin |
+| `--broker` | `127.0.0.1:1883` | endpoints, comma-separated; every topic is spread over all of them |
 | `--rate` / `--steps` | 1000 | total msg/s; `--steps` gives one phase per rate |
 | `--warmup`, `--duration`, `--window` | 10, 60, 10 s | per phase: warm-up, measured span, and measured-window length |
-| `--publishers` | ceil(peak / `--rate-per-publisher`) | publisher connections (at least one per topic) |
+| `--publishers` | ceil(peak / `--rate-per-publisher`), rounded up to a multiple of topics x brokers | publisher connections |
 | `--rate-per-publisher` | 10 | used to derive `--publishers` |
+| `--max-skew` | 1.25 | refuse a workload whose busiest consumer session would carry more than this times the mean; 0 accepts any (to measure one hot session on purpose) |
 | `--inflight` | 32 | QoS 1 window per publisher, capped by Receive Maximum; it holds the offer up to `inflight / rate-per-publisher` seconds of ack latency |
 | `--qos` | 1 | 0 or 1 |
 | `--payload` | 128 | bytes, at least 32 |

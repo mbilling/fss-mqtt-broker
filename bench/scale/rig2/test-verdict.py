@@ -35,7 +35,7 @@ def hist(samples_us: dict[int, int]) -> dict:
 
 def summary(rate, *, p99_us=50_000, saturated=False, missing=0, outcome=None, start_shift_s=0.0,
             measure_s=60.0, warmup_s=20.0, errors=None, drain="complete", unexpected=0,
-            missing_acked=None, unacked=0):
+            missing_acked=None, unacked=0, session_skew=1.0, spread=None):
     """A minimal mqtt-load.summary.v2 with one phase: `rate` msg/s offered; ack and e2e
     histograms whose p99 is `p99_us` (98 % at 1 ms, 1.5 % at p99, 0.5 % at 2 x p99)."""
     n = int(rate * measure_s)
@@ -56,7 +56,7 @@ def summary(rate, *, p99_us=50_000, saturated=False, missing=0, outcome=None, st
     return {
         "schema": "mqtt-load.summary.v2",
         "schedule_start_unix_ms": T0 + int(start_shift_s * 1000),
-        "workload": {"deliveries_per_message": 1},
+        "workload": {"deliveries_per_message": 1, "session_skew": session_skew},
         "windows": windows,
         "phases": [{"index": 0, "target_rate": rate, "offered_rate": rate, "sent_rate": rate, "received_rate": rate,
                     "ack_histogram": h, "e2e_histogram": h, "saturated": saturated}],
@@ -69,6 +69,7 @@ def summary(rate, *, p99_us=50_000, saturated=False, missing=0, outcome=None, st
         "errors": errors or {"connect": 0, "disconnects": 0, "server_disconnects": 0, "protocol": 0, "write": 0},
         "generator": {"saturated": saturated, "sent_per_cpu_second": 40000.0},
         "outcome": outcome or ("void" if saturated else ("ok" if closed else "loss")),
+        **({} if spread is None else {"spread": spread}),
     }
 
 
@@ -274,6 +275,23 @@ class Verdicts(unittest.TestCase):
         # Lossless and taken: carried, and good for the ramp, at any latency.
         self.assertEqual(v["verdict"], V.CARRIED)
         self.assertTrue(v["good"])
+
+    def test_a_workload_the_harness_concentrated_voids_the_step(self):
+        # All of a topic's publishers on one broker (the 10-node deal before the fix):
+        # one session per group carried the topic, so the knee was the harness's.
+        v = verdict_of(make_step(self.root, 30000, [summary(30000), summary(30000, session_skew=9.6)]))
+        self.assertEqual(v["verdict"], V.VOID, v)
+        self.assertTrue(any("generator 1's workload was not spread evenly" in x for x in v["voids"]), v["voids"])
+
+    def test_an_uneven_broker_spread_is_noted_not_judged(self):
+        spread = {"consumer_skew": 3.4, "busiest_consumer": 66, "busiest_broker": 6, "idle_consumers": 9}
+        v = verdict_of(make_step(self.root, 30000, [summary(30000, spread=spread)]))
+        self.assertEqual(v["verdict"], V.CARRIED, v)
+        self.assertTrue(any("busiest consumer (c66, on broker 7) received 3.40x" in x and "9 consumer(s) none" in x
+                            for x in v["notes"]), v["notes"])
+        even = {"consumer_skew": 1.1, "busiest_consumer": 3, "busiest_broker": 0, "idle_consumers": 0}
+        v = verdict_of(make_step(self.root, 30000, [summary(30000, spread=even)]))
+        self.assertFalse(any("uneven delivery" in x for x in v["notes"]), v["notes"])
 
     def test_a_drop_that_is_not_loss_is_a_note_not_a_failure(self):
         v = verdict_of(make_step(self.root, 30000, [summary(30000)],

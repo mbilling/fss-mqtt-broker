@@ -48,7 +48,9 @@ struct Cli {
     #[arg(long, default_value_t = 10.0)]
     window: f64,
 
-    /// Publisher connections. Default: ceil(highest rate / --rate-per-publisher).
+    /// Publisher connections. Default: ceil(highest rate / --rate-per-publisher),
+    /// rounded up to a multiple of topics x brokers so every topic has the same
+    /// publishers on every broker.
     #[arg(long)]
     publishers: Option<u32>,
 
@@ -161,6 +163,12 @@ struct Cli {
     #[arg(long, default_value_t = 10.0)]
     sat_lag_ms: f64,
 
+    /// Refuse a workload whose busiest consumer session would carry more than this
+    /// many times the mean session's load (prefer-local $share); 0 accepts any skew,
+    /// e.g. to measure one hot session on purpose.
+    #[arg(long, default_value_t = 1.25)]
+    max_skew: f64,
+
     /// Serve Prometheus metrics here during the run (e.g. 0.0.0.0:9464).
     #[arg(long)]
     metrics: Option<SocketAddr>,
@@ -234,8 +242,12 @@ fn config(cli: Cli, threads: usize) -> Result<(Config, Option<PathBuf>), String>
         }
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let p = (max_rate / cli.rate_per_publisher).ceil().max(1.0) as u32;
-        // At least one publisher per topic, so every topic carries traffic.
-        p.max(u32::try_from(cli.topics).unwrap_or(u32::MAX))
+        // A whole number of publishers per topic and broker, so every consumer
+        // session gets the same share (and every topic carries traffic).
+        let unit = u32::try_from(cli.topics.saturating_mul(brokers.len().max(1)))
+            .unwrap_or(u32::MAX)
+            .max(1);
+        p.div_ceil(unit).saturating_mul(unit)
     };
     let mut c = Config::new(brokers, max_rate, publishers);
     c.phases = phases;
@@ -269,6 +281,7 @@ fn config(cli: Cli, threads: usize) -> Result<(Config, Option<PathBuf>), String>
         thread_fraction: cli.sat_thread,
         sched_lag_p99_us: lag_us,
     };
+    c.max_skew = cli.max_skew;
     c.metrics_bind = cli.metrics;
     c.ready_file = cli.ready_file;
     c.start_file = cli.start_file;

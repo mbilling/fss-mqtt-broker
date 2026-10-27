@@ -52,6 +52,10 @@ pub struct Summary {
     /// The first missing identities (`--report-missing`), for diagnosis.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub missing_sample: Vec<MissingId>,
+    /// How evenly the broker spread deliveries over the consumers; absent without
+    /// consumers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spread: Option<Spread>,
     /// The generator's own health.
     pub generator: GeneratorReport,
     /// Connection failures.
@@ -128,11 +132,50 @@ pub struct Workload {
     pub sessions: Sessions,
     /// Session expiry of durable consumers, seconds.
     pub session_expiry_s: u32,
+    /// The busiest consumer session's expected load over the mean session's
+    /// ([`crate::config::Config::session_skew`]); 1.0 is an even spread.
+    pub session_skew: f64,
     /// Deliveries each published message should produce (streams per topic): received
     /// rates divide by this to compare with the publish rate.
     pub deliveries_per_message: usize,
     /// Broker endpoints.
     pub brokers: Vec<String>,
+}
+
+/// Deliveries per consumer connection over the whole run, against the share each
+/// should get. With an even deal ([`crate::config::Config::session_skew`] near 1) an
+/// uneven spread is the broker's doing: reported, not judged.
+#[derive(Debug, Clone, Serialize)]
+pub struct Spread {
+    /// The busiest consumer's deliveries over the mean consumer's.
+    pub consumer_skew: f64,
+    /// The busiest consumer, by index (its client id ends in `-c<index>`).
+    pub busiest_consumer: usize,
+    /// The broker it was connected to, as an index into the workload's brokers.
+    pub busiest_broker: usize,
+    /// Consumers that received nothing.
+    pub idle_consumers: usize,
+}
+
+impl Spread {
+    /// The spread of `received` (per consumer, in `specs` order); `None` without
+    /// consumers or deliveries.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn of(specs: &[crate::config::ConsumerSpec], received: &[u64]) -> Option<Self> {
+        let total: u64 = received.iter().sum();
+        if received.is_empty() || total == 0 {
+            return None;
+        }
+        let (busiest, &max) = received.iter().enumerate().max_by_key(|&(_, n)| *n)?;
+        let mean = total as f64 / received.len() as f64;
+        Some(Self {
+            consumer_skew: (max as f64 / mean * 100.0).round() / 100.0,
+            busiest_consumer: busiest,
+            busiest_broker: specs.get(busiest).map_or(0, |s| s.broker),
+            idle_consumers: received.iter().filter(|&&n| n == 0).count(),
+        })
+    }
 }
 
 /// One phase as configured.
@@ -326,4 +369,29 @@ pub struct GeneratorReport {
     /// consumers and collector together) over the measured windows: msg/s per core,
     /// the figure for sizing generator hosts.
     pub sent_per_cpu_second: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spread_names_the_busiest_consumer_and_its_broker() {
+        let specs: Vec<_> = (0..4)
+            .map(|i| crate::config::ConsumerSpec {
+                stream: 0,
+                filter: String::new(),
+                broker: i % 2,
+            })
+            .collect();
+        // One member of four takes 1000 of 1200 deliveries.
+        let s = Spread::of(&specs, &[100, 1000, 0, 100]).unwrap();
+        assert!((s.consumer_skew - 3.33).abs() < 1e-9, "{}", s.consumer_skew);
+        assert_eq!(
+            (s.busiest_consumer, s.busiest_broker, s.idle_consumers),
+            (1, 1, 1)
+        );
+        assert!(Spread::of(&specs, &[0, 0, 0, 0]).is_none());
+        assert!(Spread::of(&[], &[]).is_none());
+    }
 }
