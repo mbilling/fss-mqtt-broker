@@ -5,8 +5,10 @@ adr_status: Accepted
 tasks:
   - id: 0091-T1
     title: "The harness never sets the knee (D3): mqtt-load deals every topic and group over every broker, refuses a skewed workload, reports the broker's measured spread; rig2 VOIDs a skewed step"
-    status: in-progress
+    status: done
     issue: 1132
+    date: 2026-10-27
+    evidence: "#1133 (mqtt-load config tests every_topic_has_publishers_on_every_broker, every_group_has_a_member_on_every_broker, session_skew_is_one_for_a_whole_number_of_publishers_per_topic_and_broker, a_hot_session_is_refused_unless_asked_for; rig2 test-verdict a_workload_the_harness_concentrated_voids_the_step, an_uneven_broker_spread_is_noted_not_judged)"
     notes: "Size S. PR #1133. Publisher i on broker (i % topics + i / topics) % brokers, member j of stream s on (s + j) % brokers; derived publishers round up to a multiple of topics x brokers; session_skew (expected busiest session / mean, under prefer-local) refused above --max-skew 1.25; spread (measured busiest consumer / mean) in the summary; verdict.py VOIDs a step with session_skew > 1.25 and notes a measured spread > 1.5. The old deal fails every_topic_has_publishers_on_every_broker with topic 0 spread [51, 0, ..., 0]."
   - id: 0091-T2
     title: "A hot-session workload (D3): one topic's whole rate into one durable $share member, to measure one session's ceiling before and after T4"
@@ -52,7 +54,7 @@ above; the table below is generated from it.
 <!-- status-table:0091 -->
 | Task | Status | Issue | When | Evidence / notes |
 |------|--------|-------|------|------------------|
-| 0091-T1 | 🚧 in-progress | [#1132](https://github.com/mbilling/fss-mqtt-broker/issues/1132) | — | "Size S. PR #1133. Publisher i on broker (i % topics + i / topics) % brokers, member j of stream s on (s + j) % brokers; derived publishers round up to a multiple of topics x brokers; session_skew (expected busiest session / mean, under prefer-local) refused above --max-skew 1.25; spread (measured busiest consumer / mean) in the summary; verdict.py VOIDs a step with session_skew > 1.25 and notes a measured spread > 1.5. The old deal fails every_topic_has_publishers_on_every_broker with topic 0 spread [51, 0, ..., 0]." |
+| 0091-T1 | ✅ done | [#1132](https://github.com/mbilling/fss-mqtt-broker/issues/1132) | 2026-10-27 | "#1133 (mqtt-load config tests every_topic_has_publishers_on_every_broker, every_group_has_a_member_on_every_broker, session_skew_is_one_for_a_whole_number_of_publishers_per_topic_and_broker, a_hot_session_is_refused_unless_asked_for; rig2 test-verdict a_workload_the_harness_concentrated_voids_the_step, an_uneven_broker_spread_is_noted_not_judged)" |
 | 0091-T2 | ⬜ planned | [#1134](https://github.com/mbilling/fss-mqtt-broker/issues/1134) | — | "Size S. mqtt-load --max-skew 0; a rig2 workload env; reported as msg/s per session, beside D2's D / L." |
 | 0091-T3 | ⬜ planned | [#1078](https://github.com/mbilling/fss-mqtt-broker/issues/1078) | — | "Size M. Test first: a hub test that joins a cold member under load and a test with one member's lane held full; neither withholds acks while another member can take the publish. Locality still decides among members that keep up." |
 | 0091-T4 | ⬜ planned | [#1134](https://github.com/mbilling/fss-mqtt-broker/issues/1134) | — | "Size M-L. Order and per-message outcomes unchanged; measured with T2 before and after." |
@@ -63,4 +65,4 @@ above; the table below is generated from it.
 
 ## Changelog
 
-- **2026-10-27:** ADR accepted after the 10-node rig2 run. T1 is in review (#1133).
+- **2026-10-27:** ADR accepted after the 10-node rig2 run. T1 merged (#1133).
