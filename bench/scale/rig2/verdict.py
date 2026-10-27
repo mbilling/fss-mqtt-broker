@@ -17,8 +17,10 @@ Everything is judged from the broker's side (D1):
   ladder.
 - **VOID**: the evidence is the harness's, not the broker's. A generator saturated in its
   measured window (mqtt-load `generator.saturated`), a generator produced no summary, the
-  generators' measured windows do not overlap, the brokers' scrapes do not cover the
-  window, or the cluster was not idle when the step started. A VOID step is rerun; it
+  generators' measured windows do not overlap, a broker of the run has no scrapes of the
+  step (its fetch failed) or its scrapes do not cover the window, or the cluster was not
+  idle when the step started. The brokers' rates are a cluster's only when every broker
+  has a usable window; a partial sum is never judged against the offer. A VOID step is rerun; it
   never counts against the broker.
 - **DISCONNECTED**: connections were lost during the step (mqtt-load outcome `error`).
   mqtt-load does not reconnect, so its ledger cannot be read after that: not carried,
@@ -205,8 +207,30 @@ def load_samples(d: Path) -> tuple[list[tuple[int, dict]], int]:
 HELD_GAUGES = ("mqttd_inflight_messages", "mqttd_pending_publishes", "mqttd_backlog_bytes")
 
 
+def expected_brokers(step: Path, meta: dict) -> int | None:
+    """How many brokers the step's run has: step.json `brokers`, else the run's run.json
+    (<run>/<arm>/<workload>/steps/<step>), else None (judge whatever scrapes are there)."""
+    if meta.get("brokers") is not None:
+        return int(meta["brokers"])
+    run_json = step.resolve().parents[3] / "run.json"
+    try:
+        n = json.loads(run_json.read_text()).get("brokers")
+    except (OSError, ValueError):
+        return None
+    return None if n is None else int(n)
+
+
+def missing_brokers(step: Path, expected: int | None) -> list[int]:
+    """The brokers of the run with no scrapes at all in the step (no directory, or not
+    one .prom file in it): their fetch failed, so any cluster sum would be partial."""
+    if expected is None:
+        return []
+    root = step / "scrapes"
+    return [i for i in range(expected) if not any((root / f"broker-{i}").glob("*.prom"))]
+
+
 def broker_figures(step: Path, lo_ms: float, hi_ms: float, margin_ms: float, min_cover: float,
-                   cutoff_ms: float | None = None) -> dict:
+                   cutoff_ms: float | None = None, expected: int | None = None) -> dict:
     """The brokers' own counters over [lo, hi] (wall ms), and their drops over the step.
 
     Per broker: the first and last scrape inside the window shrunk by `margin_ms` at each
@@ -216,21 +240,36 @@ def broker_figures(step: Path, lo_ms: float, hi_ms: float, margin_ms: float, min
 
     `held_at_cutoff`: what the brokers still held for clients (HELD_GAUGES, summed) at
     each broker's first scrape at or after `cutoff_ms`, the generators' drain end.
+
+    `expected`: the run's broker count. The figures are a cluster's only when EVERY
+    broker has a usable window: `complete` is false, a problem names the brokers whose
+    scrapes are missing, and the rates are None otherwise. On the aborted 10-node run
+    (2026-10-27) brokers 5-9's scrapes could not be fetched and the sum over the other
+    five read as half the offer: OFFER NOT TAKEN, for a network outage on the operator's
+    side.
     """
     root = step / "scrapes"
     brokers = sorted((p for p in root.glob("broker-*") if p.is_dir()), key=lambda p: int(p.name.split("-")[1]))
     res = {"brokers": [], "received_rate": 0.0, "delivered_rate": 0.0, "dropped": 0.0, "dropped_by_reason": {},
            "lost": 0.0, "lost_by_reason": {}, "not_lost_by_reason": {}, "restarted": [], "problems": [],
-           "held_at_cutoff": None}
+           "held_at_cutoff": None, "expected": expected, "complete": False}
+    absent = missing_brokers(step, expected)
+    if absent:
+        res["problems"].append(f"no scrapes from broker(s) {' '.join(map(str, absent))}")
     if not brokers:
-        res["problems"].append("no broker scrapes")
+        if not absent:
+            res["problems"].append("no broker scrapes")
+        res["received_rate"] = res["delivered_rate"] = None
         return res
+    rated = 0
     want = (hi_ms - lo_ms - 2 * margin_ms) * min_cover
     for b in brokers:
         idx = int(b.name.split("-")[1])
         samples, refused = load_samples(b)
         row = {"broker": idx, "scrapes": len(samples), "refused": refused}
         res["brokers"].append(row)
+        if idx in absent:
+            continue  # named above
         if len(samples) < 2:
             res["problems"].append(f"broker {idx}: {len(samples)} usable scrapes")
             continue
@@ -268,6 +307,11 @@ def broker_figures(step: Path, lo_ms: float, hi_ms: float, margin_ms: float, min
         row.update(window_s=dt, received_rate=rx, delivered_rate=dl)
         res["received_rate"] += rx
         res["delivered_rate"] += dl
+        rated += 1
+    res["complete"] = not absent and rated == len(brokers) and (expected is None or rated >= expected)
+    if not res["complete"]:
+        # A sum over some of the brokers is not the cluster's rate: never report it as one.
+        res["received_rate"] = res["delivered_rate"] = None
     return res
 
 
@@ -487,6 +531,7 @@ def judge(step: Path, cfg: dict | None = None) -> dict:
 
     # The brokers' window: the overlap of every generator's measured span.
     bf = None
+    n_brokers = expected_brokers(step, meta)
     if gens:
         spans = [measured_span(s) for _, s, _ in gens]
         lo, hi = max(a for a, _ in spans), min(b for _, b in spans)
@@ -495,7 +540,8 @@ def judge(step: Path, cfg: dict | None = None) -> dict:
         if hi - lo < min_overlap * shortest:
             out["voids"].append(f"generator measured windows overlap {max(0.0, hi - lo) / 1000:.1f} s of {shortest / 1000:.1f} s")
         else:
-            bf = broker_figures(step, lo, hi, margin_ms, min_cover, cutoff_ms=max(drain_end_ms(s) for _, s, _ in gens))
+            bf = broker_figures(step, lo, hi, margin_ms, min_cover, cutoff_ms=max(drain_end_ms(s) for _, s, _ in gens),
+                                expected=n_brokers)
             out["brokers"] = bf
             out["voids"].extend(f"broker evidence: {p}" for p in bf["problems"])
             if bf["lost"] > 0:
@@ -506,6 +552,10 @@ def judge(step: Path, cfg: dict | None = None) -> dict:
                 out["notes"].append(f"broker drops that are not loss: {why}")
             if bf["restarted"]:
                 out["failures"].append(f"broker(s) {bf['restarted']} restarted during the step")
+    if bf is None:
+        absent = missing_brokers(step, n_brokers)
+        if absent:
+            out["voids"].append(f"broker evidence: no scrapes from broker(s) {' '.join(map(str, absent))}")
     for x in out["generators"]:
         if x["saturated"]:
             out["voids"].append(f"generator {x['generator']} saturated ({', '.join(x['reasons']) or 'see summary'})")
@@ -523,7 +573,7 @@ def judge(step: Path, cfg: dict | None = None) -> dict:
 
     received = bf["received_rate"] if bf else None
     out["received_rate"] = received
-    out["delivered_rate"] = bf["delivered_rate"] if bf else None
+    out["delivered_rate"] = bf.get("delivered_rate") if bf else None
     out["received_share"] = received / offered if (received is not None and offered) else None
 
     if out["failures"]:
@@ -639,7 +689,8 @@ def next_rate(steps: list[dict], cfg: dict) -> tuple[float | None, str]:
             same += 1
         if same <= retries:
             return last["rate"], f"rerun of a VOID step ({same} of {retries + 1} attempts)"
-        return None, f"VOID {same} times at {last['rate']:g} msg/s (more generator capacity needed)"
+        why = "; ".join(last.get("voids") or []) or "more generator capacity needed"
+        return None, f"VOID {same} times at {last['rate']:g} msg/s (last: {why})"
     # Carried is good, whatever its latency (a lossless step at ack p99 2 s still climbs);
     # FAILED, OFFER NOT TAKEN and DISCONNECTED are bad. The verdict decides, not the
     # stored `good`, so a ladder judged before 2026-10-26 replays the same way.

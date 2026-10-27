@@ -191,6 +191,9 @@ run keeps them out.
    gauge.
 2. **Broker scrapes.** `scrape-loop.py` starts on every broker host and scrapes
    `/metrics` every `SCRAPE_INTERVAL` (2 s) on the broker's own clock for the whole step.
+   After the step each broker's scrapes come back as one tar stream over one ssh (one scp
+   per file took ~15 s a broker on the 10-node run), unpacked aside and renamed into
+   place only when the stream arrived whole.
 3. **Load.** One mqtt-load process per generator host, started together, each offering
    `rate / GENERATORS` msg/s: `WARMUP` (20 s) of warm-up, then `MEASURE` (60 s) measured in
    `WINDOW` (10 s) windows, then the drain. Each step has its own process, so each has its
@@ -207,7 +210,11 @@ run keeps them out.
    generator's measured span (on the wall clock, from the summary's
    `schedule_start_unix_ms`). For each broker, the first and last scrape inside it (less
    `MARGIN_S` at each edge) give its received and delivered msg/s. Drops are read over the
-   whole step.
+   whole step. The cluster's rates exist only when EVERY broker of the run (`step.json`
+   `brokers`) has a usable window; a broker without scrapes VOIDs the step by name. On
+   the aborted 10-node run (2026-10-27) brokers 5-9's scrapes could not be fetched during
+   an outage on the operator's side, and the sum over the other five read as OFFER NOT
+   TAKEN at half the offer.
 
 Raw evidence per step: `<run>/<arm>/<workload>/steps/<NN>-<rate>/` holds `step.json`,
 `gen-<g>.json` (the mqtt-load summary, schema `mqtt-load.summary.v2`), `.stderr`,
@@ -222,7 +229,7 @@ Judged on the broker only (ADR 0090 D1). In order:
 | verdict | when | ramp |
 |---|---|---|
 | **FAILED** | a generator's ledger did not close (missing, unexpected, unacked), a broker dropped a message by a reason that is loss (`mqttd_publish_dropped_total`, see below), or a broker restarted | stops the ladder (`BISECT_ON_FAIL=1` keeps bisecting below it) |
-| **VOID** | a generator saturated in a measured window, a generator left no summary, the generators' windows overlap less than 90%, the scrapes do not cover the window, or the cluster was not idle | rerun (`VOID_RETRIES`, 1); never counted against the broker |
+| **VOID** | a generator saturated in a measured window, a generator left no summary, the generators' windows overlap less than 90%, a broker of the run has no scrapes of the step or its scrapes do not cover the window, or the cluster was not idle | rerun (`VOID_RETRIES`, 1); never counted against the broker |
 | **DISCONNECTED** | connections were lost during the step. mqtt-load does not reconnect, so its ledger cannot be read after that | not carried; the ramp treats it as above the knee |
 | **NOT DRAINED** | the ledger misses deliveries, no broker dropped any as loss, the drain ended before it was complete, and the brokers' own gauges at their first scrape after the drain (`mqttd_inflight_messages` + `mqttd_pending_publishes`) hold at least what the ledger misses: the messages were still queued, not lost | not carried, not loss; above the knee |
 | **OFFER NOT TAKEN** | the brokers received less than 99% of the offered msg/s (`OFFER_TAKEN` from `../summarize-curve.py`) | above the knee |
