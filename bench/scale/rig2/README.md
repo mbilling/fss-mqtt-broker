@@ -32,7 +32,7 @@ figure crosses hosts.
 - **Calibration.** With 2+ generators in the cloud, every generator runs the same QoS 0
   share load before the first ladder: `CALIB_RATE_PER_GEN`, 30,000 msg/s, for
   `CALIB_MEASURE`, 30 s. `verdict.py calibrate` names a host that saturated, or whose
-  end-to-end p99 is above 5 × the other generators' median + 5 ms.
+  end-to-end p99 is above 5 × the other generators' median + 50 ms.
 - **Replacement.** That host is replaced (`tofu apply -replace`, same name and private
   address) and calibration runs again, up to `CALIB_REPLACE_MAX` (2) times. Then the run
   stops. `CALIBRATE=0` skips calibration.
@@ -318,7 +318,7 @@ Judged on the broker only (ADR 0090 D1), for every round. In order:
 | verdict | when | ramp |
 |---|---|---|
 | **FAILED** | a generator's ledger did not close (missing, unexpected, unacked), a broker dropped a message by a reason that is loss (`mqttd_publish_dropped_total`, see below), or a broker restarted | stops the ladder (`BISECT_ON_FAIL=1` keeps bisecting below it) |
-| **VOID** | a generator saturated in a measured window (CPU, a worker thread, scheduling lag, or more than 50 softnet squeezes/s), a generator's gated p99 above 5 × the other generators' median + 5 ms, a generator left no summary, the generators' windows overlap less than 90%, a broker of the run has no scrapes of the round or its scrapes do not cover the window, or the cluster was not idle (unreset: VOID before any other verdict, FAILED included) | the round is rerun (`VOID_RETRIES`, 1); never counted against the broker |
+| **VOID** | a generator saturated in a measured window (CPU, a worker thread, scheduling lag, or more than 50 softnet squeezes/s), a generator's gated p99 above 5 × the other generators' median + 50 ms, a generator left no summary, the generators' windows overlap less than 90%, a broker of the run has no scrapes of the round or its scrapes do not cover the window, or the cluster was not idle (unreset: VOID before any other verdict, FAILED included) | the round is rerun (`VOID_RETRIES`, 1); never counted against the broker |
 | **DISCONNECTED** | connections were lost during the step. mqtt-load does not reconnect, so its ledger cannot be read after that | not carried; the ramp treats it as above the knee |
 | **NOT DRAINED** | the ledger misses deliveries, no broker dropped any as loss, the drain ended before it was complete, and the brokers' own gauges at their first scrape after the drain (`mqttd_inflight_messages` + `mqttd_pending_publishes`) hold at least what the ledger misses: the messages were still queued, not lost | not carried, not loss; above the knee |
 | **OFFER NOT TAKEN** | the brokers received less than 99% of the offered msg/s (`OFFER_TAKEN` from `../summarize-curve.py`) | above the knee |

@@ -108,9 +108,12 @@ QUANTILES = {"p50": 0.5, "p99": 0.99, "p999": 0.999}
 # A generator whose gated p99 is above DIVERGE_FACTOR x the median of the other
 # generators' plus DIVERGE_FLOOR_MS diverges: its connections reach the same brokers the
 # same way as theirs, so the gap is its host's (a 10-node run measured 0.8, 1.6 and
-# 291 ms on one step, from a host whose receive path was pinned to one core).
+# 291 ms on one step, from a host whose receive path was pinned to one core). The floor
+# is half the narrowest latency band (100 ms): a gap below it cannot move a step across
+# a band, and hosts differ that much on a healthy fleet (2 against 21 ms at 225k QoS 0
+# on 2026-10-27, which a 5 ms floor voided and so ended the ladder).
 DIVERGE_FACTOR = 5.0
-DIVERGE_FLOOR_MS = 5.0
+DIVERGE_FLOOR_MS = 50.0
 # Broker drops for a subscriber that does not read fast enough: VOID, not FAILED, when a
 # generator could not keep up (the subscriber was the generator's).
 CONSUMER_QUEUE_REASONS = frozenset({"outbound-full", "backlog-overflow", "queue-overflow"})
