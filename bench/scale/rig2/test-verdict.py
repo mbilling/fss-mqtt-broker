@@ -163,6 +163,56 @@ class Verdicts(unittest.TestCase):
         self.assertEqual(v["verdict"], V.VOID)
         self.assertTrue(any("generator 1 saturated (cpu)" in x for x in v["voids"]), v["voids"])
 
+    def test_a_generator_whose_p99_diverges_from_the_others_voids_the_step(self):
+        # 0.8, 1.6 and 291 ms on one step: one host's receive path, not the brokers.
+        gens = [summary(30000, p99_us=800), summary(30000, p99_us=1600), summary(30000, p99_us=291_000)]
+        v = verdict_of(make_step(self.root, 30000, gens))
+        self.assertEqual(v["verdict"], V.VOID, v)
+        self.assertEqual(v["harness_generators"], [2])
+        self.assertTrue(any(x.startswith("generator 2's ack p99 291.0 ms is far above the other generators' (median")
+                            for x in v["voids"]), v["voids"])
+
+    def test_generators_that_agree_do_not_diverge_even_at_a_high_p99(self):
+        # The cluster at its knee slows every generator alike.
+        gens = [summary(10000, p99_us=400_000), summary(10000, p99_us=900_000), summary(10000, p99_us=600_000)]
+        v = verdict_of(make_step(self.root, 30000, gens))
+        self.assertEqual(v["verdict"], V.CARRIED, v)
+        self.assertEqual(v["harness_generators"], [])
+        self.assertEqual(V.diverging({0: 1000, 1: None}), [])
+
+    def test_slow_consumer_drops_under_a_saturated_generator_are_void_not_failed(self):
+        # The 10-node QoS 0 step at 150k: generator 2 stalled, and the brokers dropped 40
+        # messages for its consumers (outbound-full).
+        v = verdict_of(make_step(self.root, 30000, [summary(30000), summary(30000, saturated=True)],
+                                 drops={"outbound-full": 40}))
+        self.assertEqual(v["verdict"], V.VOID, v)
+        self.assertEqual(v["failures"], [])
+        self.assertTrue(any(x.startswith("would have been FAILED (brokers dropped 40 messages (outbound-full=40))")
+                            for x in v["notes"]), v["notes"])
+
+    def test_publisher_side_drops_still_fail_under_a_saturated_generator(self):
+        v = verdict_of(make_step(self.root, 30000, [summary(30000), summary(30000, saturated=True)],
+                                 drops={"append-backlog-full": 20}))
+        self.assertEqual(v["verdict"], V.FAILED, v)
+
+    def test_slow_consumer_drops_fail_when_every_generator_kept_up(self):
+        v = verdict_of(make_step(self.root, 30000, [summary(30000)], drops={"outbound-full": 40}))
+        self.assertEqual(v["verdict"], V.FAILED, v)
+
+    def test_calibration_names_the_slow_generator_host(self):
+        d = self.ladder / "calibration"
+        d.mkdir()
+        for g, p99 in enumerate([800, 1600, 291_000, 900]):
+            (d / f"gen-{g}.json").write_text(json.dumps(summary(30000, p99_us=p99)))
+        (d / "gen-3.json").write_text(json.dumps(summary(30000, p99_us=900, saturated=True)))
+        c = V.calibrate(d)
+        self.assertEqual(c["bad"], [2, 3], c)
+        self.assertIn("against the others' median", c["why"][2])
+        self.assertIn("saturated (cpu)", c["why"][3])
+        for g in (2, 3):
+            (d / f"gen-{g}.json").write_text(json.dumps(summary(30000, p99_us=1000)))
+        self.assertEqual(V.calibrate(d)["bad"], [])
+
     def test_a_saturated_generator_voids_even_its_ledger_loss(self):
         v = verdict_of(make_step(self.root, 30000, [summary(30000, saturated=True, missing=5)]))
         self.assertEqual(v["verdict"], V.VOID)
@@ -259,7 +309,8 @@ class Verdicts(unittest.TestCase):
         self.assertEqual(v["verdict"], V.VOID)
 
     def test_two_generators_sum_offer_and_merge_latency(self):
-        v = verdict_of(make_step(self.root, 30000, [summary(15000, p99_us=20_000), summary(15000, p99_us=400_000)]))
+        # 100 and 400 ms: apart, but within DIVERGE_* of each other.
+        v = verdict_of(make_step(self.root, 30000, [summary(15000, p99_us=100_000), summary(15000, p99_us=400_000)]))
         self.assertEqual(v["verdict"], V.CARRIED)
         self.assertEqual(v["offered_rate"], 30000)
         # Each puts 0.5 % of its samples at twice its p99, so the merged top 0.25 % is the
@@ -997,7 +1048,7 @@ class IdleAndCost(unittest.TestCase):
         n3 = V.cost("n3")
         self.assertAlmostEqual(n3["eur_per_hour"], 3 * 0.17225 + 0.277375, places=6)
         n10 = V.cost("n10")
-        self.assertAlmostEqual(n10["eur_per_hour"], 10 * 0.17225 + 3 * 0.277375, places=6)
+        self.assertAlmostEqual(n10["eur_per_hour"], 10 * 0.17225 + 4 * 0.277375, places=6)
         one = V.cost("n3", workloads=1, steps=9, step_secs=120)
         self.assertEqual(one["minutes"], round(10 + 18 + 3))
         # Rounds multiply the measuring time; a ladder's prime and long settles add to it.

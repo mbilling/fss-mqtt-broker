@@ -237,11 +237,16 @@ fn health(
     if h.sched_lag.count() > 0 && h.sched_lag.quantile_us(0.99) > cfg.thresholds.sched_lag_p99_us {
         reasons.push("sched_lag".to_string());
     }
+    let squeeze = cpu.and_then(|u| u.squeeze_per_s);
+    if squeeze.is_some_and(|q| q > cfg.thresholds.squeeze_per_s) {
+        reasons.push("softnet".to_string());
+    }
     let round3 = |x: f64| (x * 1000.0).round() / 1000.0;
     WindowHealth {
         cpu_cores: round3(cores),
         cpu_fraction: round3(cpu_fraction),
         busiest_worker: busiest.map(round3),
+        softnet_squeeze_per_s: squeeze.map(f64::round),
         credit_stall_fraction: round3(c.credit_stall_ns as f64 / pub_ns),
         socket_blocked: c.socket_blocked,
         socket_blocked_fraction: round3(c.socket_blocked_ns as f64 / pub_ns),

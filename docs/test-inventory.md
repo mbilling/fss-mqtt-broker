@@ -944,7 +944,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_reserved_tree_is_exactly_sys_and_below`
 - `tests::topic_name_validity_rejects_wildcards_and_emptiness`
 
-## `crates/mqtt-load/src/lib.rs` — 43 test(s)
+## `crates/mqtt-load/src/lib.rs` — 44 test(s)
 
 - `client::tests::fixed_packets_decode_as_themselves`
 - `clock::tests::clock_is_monotonic_and_maps_back_to_instants`
@@ -958,6 +958,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `config::tests::validation_catches_unrunnable_workloads`
 - `health::tests::proc_stat_fields_survive_odd_command_names`
 - `health::tests::ps_time_formats`
+- `health::tests::softnet_squeezes_are_the_third_column_summed_over_cpus`
 - `health::tests::this_platform_can_be_sampled`
 - `health::tests::utilisation_is_cpu_over_wall`
 - `hist::tests::export_round_trips_and_merges_by_bucket`

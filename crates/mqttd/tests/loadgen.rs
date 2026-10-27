@@ -92,6 +92,7 @@ fn workload(broker: SocketAddr, rate: f64, publishers: u32) -> Config {
         cpu_fraction: 1000.0,
         thread_fraction: 1000.0,
         sched_lag_p99_us: 60_000_000,
+        squeeze_per_s: f64::INFINITY,
     };
     c
 }

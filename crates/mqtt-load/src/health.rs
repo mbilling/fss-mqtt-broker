@@ -5,6 +5,12 @@
 //! hot thread saturates a generator long before the process total does. Elsewhere (the
 //! macOS developer tier) the process total comes from `ps`, and per-thread figures are
 //! absent. No `unsafe` and no new dependency for either.
+//!
+//! Linux also reads the host's softnet `time_squeeze` count (`/proc/net/softnet_stat`):
+//! how often the kernel ran out of budget processing received packets. It is host-wide,
+//! which on a generator host is this process's traffic. A generator whose receive path
+//! is pinned to one core (one NIC queue, no RPS) squeezes long before its own CPU or
+//! scheduling lag look busy, and its deliveries arrive late.
 
 use std::process::Command;
 
@@ -19,6 +25,8 @@ pub struct CpuSample {
     pub process_ns: u64,
     /// Per runtime worker thread: (thread id, CPU ns). Empty where not available.
     pub workers: Vec<(u64, u64)>,
+    /// The host's softnet `time_squeeze` total, over every CPU (Linux only).
+    pub squeezed: Option<u64>,
 }
 
 /// Utilisation between two readings.
@@ -29,6 +37,8 @@ pub struct CpuUse {
     /// The busiest worker thread, as a fraction of one core; `None` where per-thread
     /// CPU is not available.
     pub busiest_worker: Option<f64>,
+    /// Softnet squeezes per second on the host; `None` where not read.
+    pub squeeze_per_s: Option<f64>,
 }
 
 /// Reads the process's CPU.
@@ -111,8 +121,24 @@ impl CpuSampler {
         Some(CpuSample {
             process_ns,
             workers,
+            squeezed: std::fs::read_to_string("/proc/net/softnet_stat")
+                .ok()
+                .and_then(|t| softnet_squeezed(&t)),
         })
     }
+}
+
+/// The `time_squeeze` column (the third, hex) summed over every CPU's line of
+/// `/proc/net/softnet_stat`.
+fn softnet_squeezed(text: &str) -> Option<u64> {
+    let mut total = 0u64;
+    let mut lines = 0;
+    for line in text.lines() {
+        let field = line.split_whitespace().nth(2)?;
+        total = total.saturating_add(u64::from_str_radix(field, 16).ok()?);
+        lines += 1;
+    }
+    (lines > 0).then_some(total)
 }
 
 /// utime + stime, in clock ticks, from a `/proc/<pid>/stat` line.
@@ -133,6 +159,7 @@ fn sample_ps() -> Option<CpuSample> {
     Some(CpuSample {
         process_ns,
         workers: Vec::new(),
+        squeezed: None,
     })
 }
 
@@ -179,9 +206,14 @@ pub fn utilisation(a: &CpuSample, b: &CpuSample, wall_ns: u64, per_thread: bool)
             })
             .fold(0.0, f64::max)
     });
+    let squeeze_per_s = match (a.squeezed, b.squeezed) {
+        (Some(x), Some(y)) => Some(y.saturating_sub(x) as f64 / (wall / 1e9)),
+        _ => None,
+    };
     CpuUse {
         cores,
         busiest_worker,
+        squeeze_per_s,
     }
 }
 
@@ -209,15 +241,42 @@ mod tests {
         let a = CpuSample {
             process_ns: 1_000,
             workers: vec![(1, 0), (2, 100)],
+            squeezed: Some(10),
         };
         let b = CpuSample {
             process_ns: 3_001_000,
             workers: vec![(1, 900_000), (2, 200), (3, 50)],
+            squeezed: Some(10),
         };
         let u = utilisation(&a, &b, 1_000_000, true);
         assert!((u.cores - 3.0).abs() < 1e-9);
         assert!((u.busiest_worker.unwrap() - 0.9).abs() < 1e-9);
         assert_eq!(utilisation(&a, &b, 1_000_000, false).busiest_worker, None);
+    }
+
+    #[test]
+    fn softnet_squeezes_are_the_third_column_summed_over_cpus() {
+        // Two CPUs, as the kernel prints them: processed, dropped, time_squeeze, ...
+        let text = "0001a2b3 00000000 00000010 00000000 00000000\n\
+                    000c0ffe 00000000 0001100a 00000000 00000000\n";
+        assert_eq!(softnet_squeezed(text), Some(0x10 + 0x1100a));
+        assert_eq!(softnet_squeezed(""), None);
+        assert_eq!(softnet_squeezed("zz yy xx\n"), None);
+        // 85,000 squeezes over 10 minutes, as on the slow 10-node generator host.
+        let a = CpuSample {
+            squeezed: Some(0),
+            ..Default::default()
+        };
+        let b = CpuSample {
+            squeezed: Some(85_000),
+            ..Default::default()
+        };
+        let u = utilisation(&a, &b, 600_000_000_000, true);
+        assert!(
+            (u.squeeze_per_s.unwrap() - 141.67).abs() < 0.01,
+            "{:?}",
+            u.squeeze_per_s
+        );
     }
 
     #[test]

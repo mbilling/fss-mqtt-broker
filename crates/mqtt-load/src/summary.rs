@@ -300,6 +300,9 @@ pub struct WindowHealth {
     pub cpu_fraction: f64,
     /// The busiest worker thread, fraction of a core (null where not measured).
     pub busiest_worker: Option<f64>,
+    /// The host's softnet squeezes per second (null where not measured): the kernel
+    /// out of budget for received packets.
+    pub softnet_squeeze_per_s: Option<f64>,
     /// Share of publisher-time spent with due messages and no send credit (the
     /// broker holding acks back — not a generator problem).
     pub credit_stall_fraction: f64,
@@ -311,7 +314,7 @@ pub struct WindowHealth {
     pub backlog: u64,
     /// The generator crossed a saturation threshold in this window.
     pub saturated: bool,
-    /// Which thresholds, e.g. `cpu`, `worker_thread`, `sched_lag`.
+    /// Which thresholds, e.g. `cpu`, `worker_thread`, `sched_lag`, `softnet`.
     pub reasons: Vec<String>,
 }
 

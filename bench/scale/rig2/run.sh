@@ -52,7 +52,9 @@ n3)
 	DEF_WARMUP=20 DEF_MEASURE=60 DEF_WINDOW=10 DEF_SCRAPE=2 DEF_MARGIN=1 DEF_MAX_STEPS=14 DEF_PRIME=90 DEF_ROUNDS=3
 	;;
 n10)
-	BROKERS="${BROKERS:-10}" GENERATORS="${GENERATORS:-3}"
+	# Four generators: each runs a quarter of the offer with headroom, and calibration
+	# (calibrate_gens) has a median to compare a slow host against.
+	BROKERS="${BROKERS:-10}" GENERATORS="${GENERATORS:-4}"
 	DEF_WARMUP=20 DEF_MEASURE=60 DEF_WINDOW=10 DEF_SCRAPE=2 DEF_MARGIN=1 DEF_MAX_STEPS=14 DEF_PRIME=90 DEF_ROUNDS=3
 	;;
 *) die "TIER must be local, n3 or n10, not '$TIER'" ;;
@@ -141,6 +143,16 @@ EST_LONG_SETTLES="${EST_LONG_SETTLES:-3}"
 # 127.0.0.1 locally, on the generator's private address in the cloud (the public
 # interface admits SSH only), where generator host 0's bridge reads it.
 OBSERVE="${OBSERVE:-1}"
+# Generator calibration (cloud, 2+ generators): before the first ladder every generator
+# runs the same QoS 0 load; a host that saturates or whose end-to-end p99 diverges from
+# the others' (verdict.py calibrate) is replaced, and the calibration runs again, at most
+# CALIB_REPLACE_MAX times. The brokers serve every generator alike, so a generator far
+# slower than the rest measures its own host (2026-10-27: 0.8, 1.6 and 291 ms on one step).
+CALIBRATE="${CALIBRATE:-1}"
+CALIB_RATE_PER_GEN="${CALIB_RATE_PER_GEN:-30000}"
+CALIB_WARMUP="${CALIB_WARMUP:-10}"
+CALIB_MEASURE="${CALIB_MEASURE:-30}"
+CALIB_REPLACE_MAX="${CALIB_REPLACE_MAX:-2}"
 LOAD_METRICS_PORT="${LOAD_METRICS_PORT:-9464}"
 phase() { # phase <name> [detail]: the run's phase on the dashboards; best-effort
 	[ "$OBSERVE" = 1 ] || return 0
@@ -362,21 +374,48 @@ else
 	run_fg await_fleet
 	phase bootstrapping "rig2 $TIER: $BROKERS nodes"
 	run_fg "$SCALE_DIR/bootstrap-cluster.sh" "$RUN" "$INVENTORY" durable
-	if [ "$OBSERVE" = 1 ]; then
-		OBSERVE_GEN_METRICS_PORT="$LOAD_METRICS_PORT" run_fg "$SCALE_DIR/observe.sh" attach "$RUN" "$INVENTORY" ||
-			warn "observe attach failed — continuing unobserved (OBSERVE=0 skips it)"
-	fi
 	ENDPOINTS=$(jq -r '[.brokers[].mqtt_plain] | join(",")' "$INVENTORY")
 	mapfile -t BROKER_PRIV < <(jq -r '.brokers[].private_ip' "$INVENTORY")
 	for i in $(seq 0 $((BROKERS - 1))); do
 		on_broker "$i" 'mkdir -p $H'
 		rscp "$RIG2/scrape-loop.py" "root@$(broker_pub_ip "$i"):$REMOTE_H/"
 	done
-	for g in $(seq 0 $((GENERATORS - 1))); do
+	# setup_gen <g>: mqtt-load on generator host g, and its receive path spread over
+	# every CPU (RPS/RFS, as the brokers get at boot): with one NIC queue and no RPS a
+	# generator's received packets are all processed on one core, which squeezes long
+	# before the generator's own CPU looks busy (2026-10-27, 10 nodes: 85,000 squeezes,
+	# and that host's deliveries arrived 100x later than the other generators').
+	setup_gen() {
+		local g="$1" out
 		on_gen "$g" 'mkdir -p $H'
 		rscp "$LOAD_BIN" "root@$(driver_pub_ip "$g"):$REMOTE_H/mqtt-load"
 		on_gen "$g" 'chmod +x $H/mqtt-load && $H/mqtt-load --version'
-	done
+		out=$(on_gen "$g" 'MASK=$(printf "%x" $(( (1 << $(nproc)) - 1 )))
+			echo 32768 > /proc/sys/net/core/rps_sock_flow_entries
+			for IF in $(ls /sys/class/net | grep -v "^lo$"); do
+				for Q in /sys/class/net/$IF/queues/rx-*; do
+					echo $MASK > $Q/rps_cpus; echo 4096 > $Q/rps_flow_cnt
+				done
+				echo "$IF rps_cpus=$(cat /sys/class/net/$IF/queues/rx-0/rps_cpus)"
+			done') || die "could not set RPS on generator host $g"
+		say "generator host $g: $(echo "$out" | tr '\n' ' ')"
+		! grep -qE 'rps_cpus=0+(,0+)*$' <<<"$out" || die "RPS did not take on generator host $g: $out"
+	}
+	# replace_gen <g>: a fresh server for generator host g (same name, same private
+	# address), brought up and set up like the first.
+	replace_gen() {
+		local g="$1" old_ip
+		old_ip=$(driver_pub_ip "$g")
+		phase provisioning "rig2 $TIER: replacing generator host $g"
+		run_fg tf apply -auto-approve -input=false "${TF_APPLY_ARGS[@]}" -replace="hcloud_server.driver[$g]" \
+			>>"$RUN/tf-apply.log" 2>&1 || { tail -30 "$RUN/tf-apply.log" >&2; die "tofu apply (replace generator $g) failed"; }
+		run_fg tf output -json inventory >"$INVENTORY"
+		ssh-keygen -R "$old_ip" -f "$RUN/known_hosts" >/dev/null 2>&1 || true
+		run_fg await_fleet
+		setup_gen "$g"
+		say "generator host $g replaced: $old_ip -> $(driver_pub_ip "$g")"
+	}
+	for g in $(seq 0 $((GENERATORS - 1))); do setup_gen "$g"; done
 fi
 
 python3 - "$RUN/run.json" <<PY
@@ -797,6 +836,40 @@ PY
 	done
 	[ "$idx" -lt "$MAX_STEPS" ] || warn "[$WORKLOAD] stopped at MAX_STEPS=$MAX_STEPS"
 }
+
+# calibrate_gens: see CALIBRATE. Each attempt is one round of the same QoS 0 share load
+# on every generator, judged by verdict.py calibrate; the slow hosts are replaced.
+calibrate_gens() {
+	[ "$TIER" != local ] && [ "$CALIBRATE" = 1 ] && [ "$GENERATORS" -ge 2 ] || return 0
+	local attempt=0 dir bad g
+	while :; do
+		attempt=$((attempt + 1))
+		dir="$RUN/calibration/attempt-$attempt"
+		mkdir -p "$dir"
+		phase running "calibrating the generator hosts (attempt $attempt)"
+		say "calibrating the generator hosts: $CALIB_RATE_PER_GEN msg/s each, QoS 0 share, ${CALIB_MEASURE}s (attempt $attempt)"
+		(
+			QOS=0 SHAPE=share SESSIONS=clean SESSION_EXPIRY=0 PAYLOAD=200 TOPICS=20 SHARE_GROUPS=1
+			CONSUMERS_N="$BROKERS" RATE_PER_PUBLISHER=50 INFLIGHT=128
+			launch_gens "$dir" "calib-$attempt" "$CALIB_RATE_PER_GEN" "$CALIB_WARMUP" "$CALIB_MEASURE"
+		)
+		if python3 "$RIG2/verdict.py" calibrate "$dir" >"$dir/verdict.out"; then
+			say "generator hosts agree: end-to-end p99 (ms) $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["p99_ms"])' "$dir/calibration.json")"
+			return 0
+		fi
+		bad=$(python3 -c 'import json,sys; print(" ".join(map(str, json.load(open(sys.argv[1]))["bad"])))' "$dir/calibration.json")
+		[ "$attempt" -le "$CALIB_REPLACE_MAX" ] ||
+			die "generator host(s) $bad still too slow after $CALIB_REPLACE_MAX replacement round(s): $(cat "$dir/verdict.out")"
+		warn "generator host(s) $bad too slow: $(cat "$dir/verdict.out") — replacing"
+		for g in $bad; do replace_gen "$g"; done
+	done
+}
+calibrate_gens
+if [ "$TIER" != local ] && [ "$OBSERVE" = 1 ]; then
+	# After calibration: a replaced generator host 0 carries the bridge.
+	OBSERVE_GEN_METRICS_PORT="$LOAD_METRICS_PORT" run_fg "$SCALE_DIR/observe.sh" attach "$RUN" "$INVENTORY" ||
+		warn "observe attach failed — continuing unobserved (OBSERVE=0 skips it)"
+fi
 
 # The run's baseline: what the fresh cluster holds before any step (normally no sessions).
 # Every settle waits for the session count to be back to it.

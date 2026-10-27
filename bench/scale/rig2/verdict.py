@@ -6,6 +6,7 @@
     verdict.py report <run-dir>                  write <run-dir>/report.md and report.json
     verdict.py idle   [--floor N] <scrape.prom>...  exit 0 when the cluster is idle (between steps)
     verdict.py cost   --tier n3|n10 [...]        hourly price and expected duration of a run
+    verdict.py calibrate <dir>                   exit 1 and name the generators whose host is too slow
 
 Everything is judged from the broker's side (D1):
 
@@ -16,11 +17,17 @@ Everything is judged from the broker's side (D1):
   entry leaving the settle-replay window, a withheld ack) is a note. Loss stops the
   ladder.
 - **VOID**: the evidence is the harness's, not the broker's. A generator saturated in its
-  measured window (mqtt-load `generator.saturated`), a generator produced no summary, the
+  measured window (mqtt-load `generator.saturated`: CPU, a worker thread, scheduling lag
+  or softnet squeezes), a generator whose gated p99 diverges from the others' (DIVERGE_*:
+  every generator reaches the same brokers the same way, so one far slower than the rest
+  measured its own host), a generator produced no summary, the
   generators' measured windows do not overlap, a broker of the run has no scrapes of the
   step (its fetch failed) or its scrapes do not cover the window, or the cluster was not
   idle when the step started (unreset: VOID even over a loss finding, which stays
-  listed, since residue of the step before can cause it). The brokers' rates are a cluster's only when every broker
+  listed, since residue of the step before can cause it). A generator that could not keep
+  up (saturated or diverging) also VOIDs the brokers' drops for slow consumers
+  (CONSUMER_QUEUE_REASONS): a broker that drops for a client that stopped reading is
+  doing its job, and the client was the harness's. The brokers' rates are a cluster's only when every broker
   has a usable window; a partial sum is never judged against the offer. A VOID step is rerun; it
   never counts against the broker.
 - **DISCONNECTED**: connections were lost during the step (mqtt-load outcome `error`).
@@ -98,13 +105,22 @@ SESSION_SKEW_MAX = 1.25
 # reported, never judged; above this it is noted on the step.
 SPREAD_NOTE = 1.5
 QUANTILES = {"p50": 0.5, "p99": 0.99, "p999": 0.999}
+# A generator whose gated p99 is above DIVERGE_FACTOR x the median of the other
+# generators' plus DIVERGE_FLOOR_MS diverges: its connections reach the same brokers the
+# same way as theirs, so the gap is its host's (a 10-node run measured 0.8, 1.6 and
+# 291 ms on one step, from a host whose receive path was pinned to one core).
+DIVERGE_FACTOR = 5.0
+DIVERGE_FLOOR_MS = 5.0
+# Broker drops for a subscriber that does not read fast enough: VOID, not FAILED, when a
+# generator could not keep up (the subscriber was the generator's).
+CONSUMER_QUEUE_REASONS = frozenset({"outbound-full", "backlog-overflow", "queue-overflow"})
 
 # Hetzner hourly prices (EUR, excl. VAT) for the server types the tiers use. Unknown
 # types have no price here; pass --price TYPE=EUR to cost one.
 PRICES_EUR_H = {"ccx23": 0.17225, "ccx33": 0.277375}
 TIERS = {
     "n3": {"brokers": 3, "broker_type": "ccx23", "gens": 1, "gen_type": "ccx33"},
-    "n10": {"brokers": 10, "broker_type": "ccx23", "gens": 3, "gen_type": "ccx33"},
+    "n10": {"brokers": 10, "broker_type": "ccx23", "gens": 4, "gen_type": "ccx33"},
 }
 
 CARRIED, FAILED, VOID, NOT_TAKEN, DISCONNECTED = "CARRIED", "FAILED", "VOID", "OFFER NOT TAKEN", "DISCONNECTED"
@@ -559,6 +575,53 @@ def drain_figures(gens: list, bf: dict | None) -> dict:
     return out
 
 
+def gen_p99_us(s: dict, gate: str) -> int | None:
+    """One generator's gated p99 over its measured phase, from its own histogram."""
+    h = s["phases"][0].get("ack_histogram" if gate == "ack" else "e2e_histogram")
+    return latency_summary(merge_histograms([h]))["p99_us"] if h else None
+
+
+def diverging(p99s: dict[int, int | None]) -> list[tuple[int, int, float]]:
+    """The generators whose p99 diverges from the others' (DIVERGE_*), as
+    (generator, its p99 us, the others' median us). Needs two generators with samples."""
+    have = {g: v for g, v in p99s.items() if v is not None}
+    out = []
+    for g, v in have.items():
+        others = sorted(x for h, x in have.items() if h != g)
+        if not others:
+            continue
+        mid = len(others) // 2
+        med = others[mid] if len(others) % 2 else (others[mid - 1] + others[mid]) / 2
+        if v > DIVERGE_FACTOR * med + DIVERGE_FLOOR_MS * 1000:
+            out.append((g, v, med))
+    return out
+
+
+def calibrate(d: Path) -> dict:
+    """The calibration load's verdict on the generator hosts: the ones that saturated or
+    diverge (see diverging) are named in `bad`."""
+    p99s, bad, why = {}, [], {}
+    for p in sorted(d.glob("gen-*.json")):
+        g = int(p.stem.split("-")[1])
+        try:
+            s = json.loads(p.read_text())
+        except (OSError, ValueError):
+            bad.append(g)
+            why[g] = "no summary"
+            continue
+        p99s[g] = gen_p99_us(s, "e2e")
+        h = generator_health(s)
+        if h["saturated"]:
+            bad.append(g)
+            why[g] = f"saturated ({', '.join(h['reasons']) or 'see summary'})"
+    for g, v, med in diverging(p99s):
+        if g not in bad:
+            bad.append(g)
+            why[g] = f"end-to-end p99 {v / 1000:.1f} ms against the others' median {med / 1000:.1f} ms"
+    return {"p99_ms": {g: (None if v is None else round(v / 1000, 2)) for g, v in p99s.items()},
+            "bad": sorted(bad), "why": why}
+
+
 def judge(step: Path, cfg: dict | None = None) -> dict:
     """The verdict of one step directory (see the module docstring for the layout)."""
     meta = json.loads((step / "step.json").read_text())
@@ -646,9 +709,18 @@ def judge(step: Path, cfg: dict | None = None) -> dict:
         absent = missing_brokers(step, n_brokers)
         if absent:
             out["voids"].append(f"broker evidence: no scrapes from broker(s) {' '.join(map(str, absent))}")
+    harness = []
     for x in out["generators"]:
         if x["saturated"]:
+            harness.append(x["generator"])
             out["voids"].append(f"generator {x['generator']} saturated ({', '.join(x['reasons']) or 'see summary'})")
+    for (g, s, _), x in zip(gens, out["generators"]):
+        x["gate_p99_us"] = gen_p99_us(s, gate)
+    for g, v, med in diverging({x["generator"]: x["gate_p99_us"] for x in out["generators"]}):
+        harness.append(g)
+        out["voids"].append(f"generator {g}'s {gate} p99 {fmt_us(v)} is far above the other generators' "
+                            f"(median {fmt_us(med)}): they reach the same brokers the same way, so its host set it")
+    out["harness_generators"] = sorted(set(harness))
     disconnected = [x for x in out["generators"] if x["outcome"] == "error"]
     ledger_open = [x for x in out["generators"] if not x["ledger"]["closed"]]
     out["drain"] = drain = drain_figures(gens, bf)
@@ -666,6 +738,16 @@ def judge(step: Path, cfg: dict | None = None) -> dict:
     out["delivered_rate"] = bf.get("delivered_rate") if bf else None
     out["received_share"] = received / offered if (received is not None and offered) else None
 
+    consumer_drops_only = (bf is not None and not bf["restarted"] and bf["lost"] > 0
+                           and set(bf["lost_by_reason"]) <= CONSUMER_QUEUE_REASONS
+                           and len(out["failures"]) == 1)
+    if out["failures"] and out["harness_generators"] and consumer_drops_only:
+        # The brokers dropped for consumers that stopped reading, and a generator could
+        # not keep up: those consumers were the harness's. The finding stays listed.
+        g_ = ", ".join(map(str, out["harness_generators"]))
+        out["notes"].append(f"would have been FAILED ({out['failures'][0]}); VOID because generator(s) {g_} "
+                            f"could not keep up, and the brokers dropped only for slow consumers")
+        out["failures"] = []
     if out["failures"]:
         verdict = FAILED
     elif out["voids"]:
@@ -1394,6 +1476,8 @@ def main(argv: list[str]) -> int:
                    "have moved faster than the background allowance")
     i.add_argument("--step-rate", type=float, help="msg/s of the step to come: sets the background allowance")
     i.add_argument("scrapes", nargs="+")
+    cal = sub.add_parser("calibrate")
+    cal.add_argument("dir")
     c = sub.add_parser("cost")
     c.add_argument("--tier", required=True, choices=sorted(TIERS))
     c.add_argument("--brokers", type=int)
@@ -1438,6 +1522,11 @@ def main(argv: list[str]) -> int:
               f"merged {fmt_us(v['gate_p99_merged_us'])}"
               + "".join(f"\n  - {x}" for x in v["failures"] + v["voids"] + v["notes"] + v["spread"]["flags"]))
         return 0
+    if a.cmd == "calibrate":
+        c_ = calibrate(Path(a.dir))
+        (Path(a.dir) / "calibration.json").write_text(json.dumps(c_, indent=2) + "\n")
+        print(json.dumps(c_))
+        return 1 if c_["bad"] else 0
     if a.cmd == "next":
         ladder = Path(a.ladder)
         meta = json.loads((ladder / "ladder.json").read_text())

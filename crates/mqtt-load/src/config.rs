@@ -40,6 +40,8 @@ pub struct Thresholds {
     /// p99 of the generator's own scheduling lag (due → written, for sends nothing
     /// outside the generator held back), µs.
     pub sched_lag_p99_us: u64,
+    /// The host's softnet squeezes per second (Linux only; [`crate::health`]).
+    pub squeeze_per_s: f64,
 }
 
 impl Default for Thresholds {
@@ -48,6 +50,7 @@ impl Default for Thresholds {
             cpu_fraction: 0.85,
             thread_fraction: 0.95,
             sched_lag_p99_us: 10_000,
+            squeeze_per_s: 50.0,
         }
     }
 }
