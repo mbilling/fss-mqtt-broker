@@ -20,9 +20,17 @@ figure crosses hosts.
 | `local` | 3 local mqttd processes (durable, own data dirs) + 1 local mqtt-load | free | proves the pipeline; relative figures only |
 | `n3` | 3 brokers CCX23 + 1 generator host CCX33 | EUR 0.794/h | nightly or weekly; absolute figures |
 | `n10` | 10 brokers CCX23 + 4 generator hosts CCX33 | EUR 2.832/h | release confirmation |
+| `h3` | 3 brokers CCX53 (32 vCPU) + 6 generator hosts CCX33, 20,000 clients held fixed | EUR 4.871/h | like for like with HiveMQ 4.18's published run (3 x 32 vCPU, 20,000 clients) |
 
 `BROKERS`, `GENERATORS`, `BROKER_TYPE` and `GEN_TYPE` override the shape. Prices are in
-`verdict.py` (`PRICES_EUR_H`, Hetzner, excluding VAT).
+`verdict.py` (`PRICES_EUR_H`, Hetzner's API `price_hourly` gross). The report states every
+capacity per vCPU of the brokers' server type too (`verdict.py` `VCPU`), and the run
+records every host's CPU model (`run.json` `cpu`): a CCX host may be EPYC Milan or Genoa.
+
+`PUBLISHERS` holds the publisher connections per generator at every step (`mqtt-load
+--publishers`); unset, they follow the step's rate (`RATE_PER_PUBLISHER`). On `h3` it
+defaults to 10,000 in all, with 10,000 durable consumers (`CONSUMERS` per topic, rounded
+up to a multiple of the brokers).
 
 **Generator hosts are checked before they measure anything.**
 

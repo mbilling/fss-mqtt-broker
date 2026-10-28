@@ -1111,5 +1111,18 @@ class IdleAndCost(unittest.TestCase):
                                      3 + 0.277375))
 
 
+
+class PerVcpu(unittest.TestCase):
+    def test_capacity_is_stated_per_vcpu_of_the_brokers_server_type(self):
+        self.assertEqual(V.cluster_vcpu({"brokers": 3, "broker_type": "ccx53"}), 96)
+        self.assertIsNone(V.cluster_vcpu({"brokers": 3, "broker_type": "local"}))
+        self.assertEqual(V.per_vcpu(288_000, 96), " · 3,000 msg/s per vCPU")
+        self.assertEqual(V.per_vcpu(288_000, None), "")
+
+    def test_the_h3_tier_is_priced(self):
+        c = V.cost("h3", workloads=1, steps=10, rounds=3)
+        self.assertEqual((c["brokers"], c["broker_type"], c["generators"], c["gen_type"]), (3, "ccx53", 6, "ccx33"))
+        self.assertAlmostEqual(c["eur_per_hour"], 3 * 1.06875 + 6 * 0.277375)
+
 if __name__ == "__main__":
     unittest.main()

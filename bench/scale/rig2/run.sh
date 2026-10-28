@@ -58,9 +58,20 @@ n10)
 	BROKERS="${BROKERS:-10}" GENERATORS="${GENERATORS:-4}"
 	DEF_WARMUP=20 DEF_MEASURE=60 DEF_WINDOW=10 DEF_SCRAPE=2 DEF_MARGIN=1 DEF_MAX_STEPS=14 DEF_PRIME=90 DEF_ROUNDS=3
 	;;
-*) die "TIER must be local, n3 or n10, not '$TIER'" ;;
+h3)
+	# HiveMQ 4.18's published shape: 3 brokers of 32 vCPU (AWS m6a.8xlarge there), with
+	# 20,000 clients held fixed (PUBLISHERS, CONSUMERS below).
+	BROKERS="${BROKERS:-3}" GENERATORS="${GENERATORS:-6}" DEF_BROKER_TYPE=ccx53
+	DEF_WARMUP=20 DEF_MEASURE=60 DEF_WINDOW=10 DEF_SCRAPE=2 DEF_MARGIN=1 DEF_MAX_STEPS=14 DEF_PRIME=90 DEF_ROUNDS=3
+	# Per generator: 10,000 publishers and 10,000 consumers in all, the consumers per topic
+	# (20 topics a generator) rounded up to a multiple of the brokers, so each holds as many.
+	DEF_PUBLISHERS=$((10000 / GENERATORS))
+	DEF_CONSUMERS=$(((10000 / (20 * GENERATORS) + BROKERS - 1) / BROKERS * BROKERS))
+	;;
+*) die "TIER must be local, n3, n10 or h3, not '$TIER'" ;;
 esac
-BROKER_TYPE="${BROKER_TYPE:-ccx23}"
+BROKER_TYPE="${BROKER_TYPE:-${DEF_BROKER_TYPE:-ccx23}}"
+PUBLISHERS_N=""
 GEN_TYPE="${GEN_TYPE:-ccx33}"
 
 # ── the ramp (ADR 0090 D4) ──────────────────────────────────────────────────────────
@@ -454,6 +465,28 @@ else
 	for g in $(seq 0 $((GENERATORS - 1))); do setup_gen "$g"; done
 fi
 
+# Every host's CPU model, for the record: a vCPU is only comparable on a known CPU (a CCX
+# host may be EPYC Milan or Genoa).
+CPU_JSON="{}"
+if [ "$TIER" != local ]; then
+	cpu_list=""
+	for ((i = 0; i < BROKERS; i++)); do
+		cpu_list+="broker	$(on_broker "$i" "lscpu | sed -n 's/^Model name: *//p' | head -1" 2>/dev/null || echo unknown)"$'\n'
+	done
+	for ((g = 0; g < GENERATORS; g++)); do
+		cpu_list+="generator	$(on_gen "$g" "lscpu | sed -n 's/^Model name: *//p' | head -1" 2>/dev/null || echo unknown)"$'\n'
+	done
+	CPU_JSON=$(printf '%s' "$cpu_list" | python3 -c 'import json, sys
+out = {}
+for line in sys.stdin:
+    if "\t" in line:
+        role, model = line.rstrip("\n").split("\t", 1)
+        out.setdefault(role, {}).setdefault(model or "unknown", 0)
+        out[role][model or "unknown"] += 1
+print(json.dumps(out))')
+	say "CPU: $CPU_JSON"
+fi
+
 python3 - "$RUN/run.json" <<PY
 import json, sys
 json.dump({"tier": "$TIER", "brokers": $BROKERS, "broker_type": "$BROKER_TYPE" if "$TIER" != "local" else "local",
@@ -462,7 +495,7 @@ json.dump({"tier": "$TIER", "brokers": $BROKERS, "broker_type": "$BROKER_TYPE" i
            "started_utc": "$STAMP", "warmup_s": $WARMUP, "measure_s": $MEASURE, "window_s": $WINDOW,
            "prime_s": $PRIME_SECS, "drain_timeout_s": $DRAIN_TIMEOUT, "drain_quiet_s": $DRAIN_QUIET,
            "settle_quiet_s": $SETTLE_QUIET, "rounds": $ROUNDS,
-           "observe": "$OBSERVE" == "1",
+           "observe": "$OBSERVE" == "1", "cpu": json.loads("""$CPU_JSON"""),
            "git": "$(git -C "$REPO_ROOT" rev-parse HEAD)"}, open(sys.argv[1], "w"), indent=2)
 PY
 
@@ -674,6 +707,7 @@ launch_gens() { # launch_gens <local-dir> <host-id> <per-gen rate> <warmup> <mea
 		--drain-quiet "$DRAIN_QUIET" --drain-quiet-factor "$DRAIN_QUIET_FACTOR" --quiet
 		--ready-file "steps/$hid/gen.ready" --start-file "steps/$hid/gen.start" --start-wait $((START_SYNC_WAIT + 15)))
 	[ "$SESSIONS" != durable ] || args+=(--session-expiry "$SESSION_EXPIRY")
+	[ -z "$PUBLISHERS_N" ] || args+=(--publishers "$PUBLISHERS_N")
 	bound=$((START_SYNC_WAIT + 15 + warmup + measure + DRAIN_TIMEOUT + 180))
 	for ((g = 0; g < GENERATORS; g++)); do
 		metrics=""
@@ -875,7 +909,11 @@ run_ladder() { # run_ladder <workload>, as a background job (run_fg): its own su
 	WORKLOAD="$1"
 	# shellcheck disable=SC1090
 	. "$RIG2/workloads/$WORKLOAD.env"
-	if [ "$CONSUMERS" = auto ]; then CONSUMERS_N="$BROKERS"; else CONSUMERS_N="$CONSUMERS"; fi
+	if [ "$CONSUMERS" = auto ]; then CONSUMERS_N="${DEF_CONSUMERS:-$BROKERS}"; else CONSUMERS_N="$CONSUMERS"; fi
+	# PUBLISHERS: publisher connections per generator, held at every step (mqtt-load
+	# --publishers, rounded up to a multiple of topics x brokers); unset, mqtt-load derives
+	# them from the step's rate and RATE_PER_PUBLISHER.
+	PUBLISHERS_N="${PUBLISHERS:-${DEF_PUBLISHERS:-}}"
 	local start_var="START_RATE_$TIER" ladder="$RUN/$ARM/$WORKLOAD" idx=0 rate
 	START_RATE="${START_RATE:-${!start_var}}"
 	mkdir -p "$ladder/steps"
@@ -889,6 +927,7 @@ json.dump({"workload": "$WORKLOAD", "arm": "$ARM", "binary": """$BINARY_DESC""",
            "mqtt_load": {"qos": $QOS, "shape": "$SHAPE", "sessions": "$SESSIONS", "session_expiry_s": $SESSION_EXPIRY,
                          "payload": $PAYLOAD, "topics_per_generator": $TOPICS, "consumers": $CONSUMERS_N,
                          "groups": $SHARE_GROUPS, "rate_per_publisher": $RATE_PER_PUBLISHER, "inflight": $INFLIGHT,
+                         "publishers_per_generator": ${PUBLISHERS_N:-None},
                          "warmup_s": $WARMUP, "measure_s": $MEASURE, "window_s": $WINDOW, "drain_timeout_s": $DRAIN_TIMEOUT,
                          "drain_quiet_s": $DRAIN_QUIET, "drain_quiet_factor": $DRAIN_QUIET_FACTOR, "prime_s": $PRIME_SECS}},
           open(sys.argv[1], "w"), indent=2)
@@ -918,7 +957,7 @@ calibrate_gens() {
 		say "calibrating the generator hosts: $CALIB_RATE_PER_GEN msg/s each, QoS 0 share, ${CALIB_MEASURE}s (attempt $attempt)"
 		(
 			QOS=0 SHAPE=share SESSIONS=clean SESSION_EXPIRY=0 PAYLOAD=200 TOPICS=20 SHARE_GROUPS=1
-			CONSUMERS_N="$BROKERS" RATE_PER_PUBLISHER=50 INFLIGHT=128
+			CONSUMERS_N="$BROKERS" RATE_PER_PUBLISHER=50 INFLIGHT=128 PUBLISHERS_N=""
 			launch_gens "$dir" "calib-$attempt" "$CALIB_RATE_PER_GEN" "$CALIB_WARMUP" "$CALIB_MEASURE"
 		)
 		if python3 "$RIG2/verdict.py" calibrate "$dir" >"$dir/verdict.out"; then
