@@ -33,7 +33,7 @@ release do not, and neither does a compose file or a Helm release that still pin
 older image tag. Take the binary for your platform from the
 [release page](https://github.com/mbilling/fss-mqtt-broker/releases)
 ([RELEASING.md](../RELEASING.md#verifying-a-release) verifies it) and put it on your
-`PATH`, or build from source (Rust ≥ 1.96; the first build takes a few minutes):
+`PATH`, or build from source (Rust ≥ 1.97; the first build takes a few minutes):
 
 ```sh
 git clone https://github.com/mbilling/fss-mqtt-broker && cd fss-mqtt-broker

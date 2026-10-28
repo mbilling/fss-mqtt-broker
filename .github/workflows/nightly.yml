@@ -339,7 +339,7 @@ jobs:
     # toolchain, and nothing checked it: every other job runs `stable` or the
     # 1.97.0 reproducibility pin, so the declared version was an untested claim.
     #
-    # The workspace declares 1.96 since ADR 0086: wasmtime, the runtime behind the
+    # The workspace declares 1.97 since wasmtime 50 (1.96 from ADR 0086): wasmtime, the runtime behind the
     # rule engine's jq, needs it, and its minimum moves with its monthly releases
     # (the current stable compiler and the two before it). mqttd-operator links
     # neither and still declares 1.89, checked on its own.
@@ -359,7 +359,7 @@ jobs:
       fail-fast: false # each declared MSRV is its own promise; report both
       matrix:
         include:
-          - toolchain: "1.96.0"
+          - toolchain: "1.97.0"
             args: "--workspace"
             why: "the workspace rust-version"
           - toolchain: "1.89.0"

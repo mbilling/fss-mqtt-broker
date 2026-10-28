@@ -9,7 +9,7 @@ publish = false
 build = "build.rs"
 
 [dependencies]
-# The runtime (Apache-2.0 WITH LLVM-exception, MSRV 1.96): Cranelift compiles a module
+# The runtime (Apache-2.0 WITH LLVM-exception, MSRV 1.97): Cranelift compiles a module
 # to machine code when it is loaded. Not the defaults, only:
 #   runtime, cranelift, std  the runtime and its compiler;
 #   async                    a call runs on a stack of its own (a fiber), so a module's
