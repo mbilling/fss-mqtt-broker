@@ -3792,12 +3792,26 @@ sql = '''SELECT jq('"x" * 600000 | length', payload) AS n, jq('"x" * 600000', pa
 actions = [{ function = "republish", args = { topic = "jq/out/once", payload = "${n}" } }]
 "#;
 
-/// The last line the broker logged at WARN for a failed evaluation of `rule`.
-fn rule_failure(broker: &Broker, rule: &str) -> String {
-    broker
-        .log_lines(|l| l.contains("rule SQL failed") && l.contains(&format!("rule={rule} ")))
-        .pop()
-        .unwrap_or_else(|| panic!("no failure of `{rule}` logged:\n{}", broker.log.tail(40)))
+/// The last line the broker logged at WARN for a failed evaluation of `rule`. Waits for
+/// it, bounded: the failure is counted on the metrics before its WARN line reaches the
+/// log file, so a test that has just sampled the counter can read the log a moment too
+/// early (2 of 25 CI runs on 2026-10-28 did).
+async fn rule_failure(broker: &Broker, rule: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(line) = broker
+            .log_lines(|l| l.contains("rule SQL failed") && l.contains(&format!("rule={rule} ")))
+            .pop()
+        {
+            return line;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no failure of `{rule}` logged after 15 s:\n{}",
+            broker.log.tail(40)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// ADR 0086 D4, D7, D8, D10, through the shipped binary with `[rules] jq = true`: the
@@ -3956,7 +3970,7 @@ async fn jq_runs_in_the_broker_with_emqx_results_limits_and_metrics() {
             "{rule}"
         );
         assert_eq!(broker.sample(&jq_errors(kind)).await, Some(1), "{rule}");
-        let logged = rule_failure(&broker, rule);
+        let logged = rule_failure(&broker, rule).await;
         assert!(
             logged.contains(&format!("error={text}")),
             "{rule}: {logged}"
@@ -4666,7 +4680,7 @@ async fn a_publisher_cannot_make_a_jq_or_module_call_outlast_the_brokers_ceiling
             broker.sample(&evaluations("asked", "failed")).await,
             Some(u64::from(n))
         );
-        let logged = rule_failure(&broker, "asked");
+        let logged = rule_failure(&broker, "asked").await;
         assert!(logged.contains(&format!("error={cut}")), "{logged}");
     }
     // The same day for a program that ends: its answer, as without a ceiling.
@@ -4693,7 +4707,7 @@ async fn a_publisher_cannot_make_a_jq_or_module_call_outlast_the_brokers_ceiling
     broker
         .wait_metric(&function_errors("loop_forever", "timeout"), 1)
         .await;
-    let logged = rule_failure(&broker, "hang");
+    let logged = rule_failure(&broker, "hang").await;
     assert!(
         logged.contains(
             "error=loop_forever(): sandbox_limit (timeout): the call ran past its 400 ms \
