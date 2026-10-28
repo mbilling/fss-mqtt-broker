@@ -30,15 +30,16 @@ members = [
 exclude = ["tools/mqttui", "examples/rule-plugins/rust"]
 
 [workspace.package]
-version = "1.2.0"
+version = "1.3.0"
 edition = "2021"
 # Raised from 1.75 by the OTLP/HTTP metric exporter (ADR 0020 T9: the OpenTelemetry
 # SDK + reqwest stack requires Rust 1.85), then from 1.85 by jsonwebtoken 11
 # (rust-version 1.88; taken for its aws_lc_rs backend — ADR 0053 staged prep), then
 # from 1.88 by wasmtime 49 (rust-version 1.96), the runtime the `jq` rule function's
-# sandbox is built on (ADR 0086 §8). wasmtime's minimum is the stable compiler and the
-# two before it, so its security updates will keep moving this.
-rust-version = "1.96"
+# sandbox is built on (ADR 0086 §8), then to 1.97 by wasmtime 50 (its Cranelift 0.137
+# crates declare 1.97; 1.3.0). wasmtime's minimum is the stable compiler and the two
+# before it, so its security updates will keep moving this.
+rust-version = "1.97"
 license = "Apache-2.0"
 repository = "https://github.com/mbilling/fss-mqtt-broker"
 authors = ["mqtt-broker contributors"]

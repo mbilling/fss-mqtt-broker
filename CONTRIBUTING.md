@@ -37,7 +37,7 @@ Those last two are **gates, not suggestions** — CI runs with `RUSTFLAGS: -D
 warnings`, so a warning is a failed build. Run both before you push; it is the
 single most common reason a first PR goes red.
 
-Minimum supported Rust is **1.96** (the `mqttd-operator` crate alone still builds on **1.89**).
+Minimum supported Rust is **1.97** (the `mqttd-operator` crate alone still builds on **1.89**).
 `rust-toolchain.toml` pins **1.97.0**, which is a reproducible-build anchor, not
 a requirement on you — it is simply what `cargo` will use in this repo unless you
 override it.

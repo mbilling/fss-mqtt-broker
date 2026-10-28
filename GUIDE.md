@@ -940,7 +940,7 @@ be found. Each is tracked; none is a silent surprise.
 
 ## Supported Rust, platforms, and stability
 
-- **Minimum supported Rust: 1.96** for the broker and its libraries (what the
+- **Minimum supported Rust: 1.97** for the broker and its libraries (what the
   WebAssembly runtime behind the rule engine's `jq` needs, ADR 0086; it follows that
   runtime's releases); the `mqttd-operator` crate alone still builds on **1.89**.
   Both are verified nightly against those exact toolchains rather than asserted — see the `msrv` job in
@@ -1127,7 +1127,7 @@ Bare metal: [`deploy/systemd/`](deploy/systemd/) · tutorial: [SECURED-CLUSTER-T
 
 **Binaries:** [GitHub Releases](https://github.com/mbilling/fss-mqtt-broker/releases) (`mqttd-*`, `mqttd-fips-*`, `mqtt-bridge-*`)
 
-**Source** (Rust ≥ 1.96)
+**Source** (Rust ≥ 1.97)
 ```sh
 git clone https://github.com/mbilling/fss-mqtt-broker && cd fss-mqtt-broker
 cargo build --release --bin mqttd

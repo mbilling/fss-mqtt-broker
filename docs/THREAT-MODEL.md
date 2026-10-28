@@ -1,6 +1,6 @@
 # Threat model
 
-**Verified against `v1.2.0` (2026-10-21).** This is the one-document answer to "what
+**Verified against `v1.3.0` (2026-10-28).** This is the one-document answer to "what
 is your threat model?" (ADR 0066 T1). It consolidates — it does not invent: every
 mitigation row names the ADR that decided it and the code that enforces it, and every
 accepted risk is quoted from the record that accepted it. The maintenance rule: a PR
@@ -83,6 +83,7 @@ The client listener carries broker-originated data only when the operator turns 
 | Oversized packets | Inbound ceiling advertised as MQTT 5 Maximum Packet Size and enforced; outbound honors the client's advertised maximum | ADR 0041 T4; `mqtt-net/src/frame.rs` |
 | Slow/stalled subscribers | Per-subscriber bounds on backlog (messages **and** bytes — accounting includes topic+properties, or it would be evadable ~100×), in-flight window, outbound socket bytes | ADR 0041 T10; `mqttd/src/backpressure.rs` |
 | A slow subscriber pinning held deliveries in memory (write elision, on by default from 1.3.0) | Held deliveries bounded per node in entries and bytes, writing instead at the bound and halving the window past three quarters of it; a session that keeps missing the window is written directly for a while | ADR 0089 D7, Amendment 1 A3/A4; `mqttd/src/hub/elision.rs` |
+| A client that stops reading (accepts no bytes while the broker has bytes for it) | Closed after `limits.write_stall_keepalives` keepalive periods (default 2), or `limits.write_stall_timeout_secs` (120) for keepalive 0; the connection keeps reading the client's PUBACKs while its write waits, so a slow reader cannot deadlock its own acks | issue #1117; `mqttd/src/conn.rs` |
 | Publish floods | Read-pause (TCP backpressure), not drops or kills; in-flight overrun is a protocol error (`0x93`) | ADR 0012, 0041; `mqttd/src/conn.rs` |
 | Disk/memory exhaustion | Watermarks → **brownout**: growth writes refused effect-free while acks/reads/expiry continue; two independent axes ORed; refusal travels cross-node as a peer-bus verdict | ADR 0041 T5/T8/T12; `mqttd/src/store_watch.rs`, `hub/policy.rs` |
 | The broker's own `$SYS` publishes crowding out clients | Statistics and trace publishes take node-pool ingress credit (ADR 0082), as a peer's QoS 0 forward does, one permit per message, the statistics summary first; when the pool is short the rest of a statistics tick is skipped and a trace record dropped, each counted (`stats_dropped`, `trace_dropped`), never queued unbounded. The trace is also bounded at `trace_rate` records per rule per second (and as many `no_result` records), max(`trace_rate`, 200) per node, and a queue of 1,024 records and 4 MiB; a record copies at most 1 KiB of a payload, 16 outputs and 256 bytes of a topic, client id or username. QoS 0, never retained and live-only: never queued for an offline session or shared member, so no durable append and no stale backlog on reconnect, and each carries a Message Expiry Interval (statistics max(2 × `sys_interval_secs`, 10) s, trace 10 s) for a copy an older node queues anyway; no retained quota | ADR 0084 D1/D4/D5; `mqttd/src/rules_sys.rs`, `hub/` |
@@ -403,7 +404,7 @@ expiry. "Tests" names the test that fails if the mitigation is removed:
 |---|---|---|
 | Foreign/older/newer store files | Schema gate on every store (the four broker stores + the bridge spool): fresh stamped, newer refused, older migrated one committed step at a time or refused on a gap | ADR 0038 T2, 0058; `mqtt-storage/src/schema.rs` |
 | Cross-node data-dir mixups | `node-id` ownership stamp — a directory stamped by another node refuses to open; `cluster-id` persisted beside it | ADR 0018, 0054; `mqtt-storage/src/data_dir.rs` |
-| Concurrent opens | redb exclusive `flock`; no second reader in- or cross-process | ADR 0061; `mqttd/src/backup.rs` |
+| Concurrent opens | redb exclusive `flock` on the lease, session and retained stores; the lease store opens before the replica store (the segment log from 1.3.0, which takes no lock of its own), so a second process is refused before it touches either | ADR 0061; `mqttd/src/backup.rs`, `mqtt-cluster/src/durable_node.rs` |
 | Truncated/tampered backups | Trailer with SHA-256 over every prior byte; missing/malformed trailer refuses; `complete=false` refuses; unknown record kind refuses (a silently skipped kind is data loss); mixed cluster ids refuse naming both | ADR 0062; `mqttd/src/backup.rs` |
 | Restore onto live data | Restore only into a **fresh** data dir, checked before any store opens; interrupted restores never resume; `restored-from` stamp is the licence to boot | ADR 0062 §7 |
 | Restored-session theft | Session owners travel in exports and are re-applied through `claim_session` — a foreign principal cannot adopt a restored session | ADR 0031/0062 |
@@ -423,7 +424,7 @@ expiry. "Tests" names the test that fails if the mitigation is removed:
   heads are shipped, but store files themselves carry no MAC.
 - **The aggregate disk mark cannot name the store eating the budget** (the >70%
   skew WARN is the compensating signal), and **a browned-out follower keeps
-  applying peers' committed appends into `replicas.redb`** — the dominant store's
+  applying peers' committed appends into its replica store** — the dominant store's
   growth is not gated locally on a cluster node. (ADR 0041 §5.)
 
 ---
