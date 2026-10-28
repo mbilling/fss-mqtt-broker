@@ -56,6 +56,19 @@ Per node, at the maximum lossless step:
 
 ![Durable QoS 1 per vCPU: mqttd against HiveMQ 4.18's published figure](img/readme-durable-per-vcpu.svg)
 
+![Monthly infrastructure cost against durable QoS 1 throughput, both at AWS m6a.8xlarge prices, licence not included](img/readme-durable-cost.svg)
+
+**In money:**
+- **The price basis:** both brokers are priced at AWS `m6a.8xlarge` on-demand (us-east-1,
+  Linux, $1.3824 an hour for 32 vCPU), the instance HiveMQ's run used. Hetzner CCX23
+  costs about the same per vCPU.
+- **The result:** mqttd's measured durable QoS 1 clusters cost 3.4× less than HiveMQ at
+  the same traffic on 3 nodes, and 2.0× less on 10 nodes.
+- **HiveMQ's line is an extrapolation,** drawn straight through its one published point.
+- **The licence comes on top:** HiveMQ's clustering needs its commercial edition, whose
+  price is not published.
+- **Not counted:** our load generators.
+
 A vCPU is not a fixed unit, so every figure here says what one is:
 - **An SMT thread** on our Hetzner CCX23s and on HiveMQ's AWS `m6a`. Both are AMD EPYC
   Milan, with two vCPUs per physical core. Per vCPU, these compare directly.

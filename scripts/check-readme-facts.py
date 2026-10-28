@@ -117,6 +117,14 @@ def headline_figures(rows: list[dict]) -> set[str]:
             for b in vals.values():
                 if a > b:
                     out.add(f"{a / b:.1f}×")
+    # The cost chart's ratios: HiveMQ's published per-vCPU rate against each measured
+    # durable QoS 1 point (the highest step at ack p99 <= 1 s), at the same vCPU price.
+    hive = [r for r in rows if r["chart"] == "durable-per-vcpu" and r["series"] == "hivemq"]
+    if hive:
+        hv = int(hive[0]["msg_per_s"]) / int(hive[0]["vcpu"])
+        for r in rows:
+            if r["chart"] == "scale-out" and r["series"] == "durable" and r["state"] == "green":
+                out.add(f"{int(r['msg_per_s']) / int(r['vcpu']) / hv:.1f}×")
     return out
 
 
@@ -448,7 +456,25 @@ def main() -> int:
                      and int(p["msg_per_s"]) == int(r["msg_per_s"]) and int(p["vcpu"]) == int(r["vcpu"])
                      for p in per_vcpu_rows)
         else:
-            ok = int(r["msg_per_s"]) in digits(src.read_text(encoding="utf-8"))
+            # The figure must be in the section the row names: a heading path such as
+            # "10 nodes / Durable QoS 1" (each part a heading, nested in order), so a figure
+            # that appears elsewhere in the card does not vouch for this row.
+            body = src.read_text(encoding="utf-8")
+            scope, found = body, True
+            for part in [p.strip() for p in r["section"].split(" / ")]:
+                m = re.search(rf"^(#+) {re.escape(part)}\s*$", scope, re.MULTILINE)
+                if not m:
+                    found = False
+                    break
+                level = len(m.group(1))
+                rest = scope[m.end():]
+                end = re.search(rf"^#{{1,{level}}} ", rest, re.MULTILINE)
+                scope = rest[: end.start()] if end else rest
+            if not found:
+                problems.append(f"headline.csv row {r['label']!r} cites section {r['section']!r}, "
+                                f"which {r['source']} has no heading for")
+                continue
+            ok = int(r["msg_per_s"]) in digits(scope)
         if not ok:
             problems.append(
                 f"headline.csv row {r['label']!r} ({r['nodes']} nodes) says {int(r['msg_per_s']):,} msg/s, "
