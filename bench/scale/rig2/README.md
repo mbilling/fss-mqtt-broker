@@ -66,6 +66,11 @@ MQTTD_VERSION=1.2.0 TIER=n3 WORKLOADS="durable-qos1 clean-qos1 qos0" bench/scale
 # PAID. A candidate (stamped UNRELEASED in the run dir):
 MQTTD_URL=https://.../mqttd-x86_64-unknown-linux-musl MQTTD_SHA256=<sha256> \
   TIER=n10 WORKLOADS=durable-qos1 bench/scale/rig2/run.sh
+
+# PAID. A build on this machine, not published anywhere (stamped UNRELEASED too):
+# cloud-init installs a placeholder release, then the rig copies this binary to every
+# broker, checks its sha256 there and installs it before any broker starts.
+MQTTD_LOCAL_BIN=path/to/mqttd TIER=n3 WORKLOADS=durable-qos1 bench/scale/rig2/run.sh
 ```
 
 Before provisioning, the runner prints the tier's hourly price and the expected
