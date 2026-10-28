@@ -2166,6 +2166,14 @@ requires = ["python3"]
 duration = "instant"
 
 [[task]]
+id = "readme-charts"
+group = "Benchmark"
+hidden = true
+name = "Regenerate the README's evidence charts"
+script = "bench/scale/chart-readme.py"
+about = "Draws the README's evidence charts (docs/benchmarks/img/readme-*.svg) from docs/benchmarks/data/headline.csv, where every figure cites the bench card it comes from. The output is committed; a diff after running means a chart and its data disagree. `--self-test` checks the drawing rules."
+
+[[task]]
 id = "scale-budgets"
 group = "Benchmark"
 name = "Check the harness time budgets are self-consistent"

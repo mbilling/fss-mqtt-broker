@@ -1740,6 +1740,16 @@ This is not downstream credit: remote capacity is unknown, and bridge live queue
 are not covered by the disconnected-spool cap. Track subscriber/downstream receipts,
 not enqueue/forward-attempt counters; [evidence and limits](benchmarks/SHARED-CAPACITY.md).
 
+**The observability surface at a glance** (the README's Monitoring section until 2026-10-25):
+
+| | |
+|---|---|
+| Metrics | Prometheus `GET /metrics` · OTLP push (`MQTTD_OTLP_ENDPOINT`) · bounded labels |
+| Probes | `/livez` · `/readyz` (members, lease, decommission) · `/statusz` · `mqttd --probe` |
+| Audit | hash-chained JSON; schema + verifier: [AUDIT-SCHEMA.md](AUDIT-SCHEMA.md) |
+| Dashboards | Grafana for broker + bridge: [`deploy/observability/`](../deploy/observability/); alert runbooks: [Shipped alerting](#shipped-alerting) below |
+| Demo | `cd demo && docker compose up --build` → cluster + Grafana + Prometheus + Alloy at `localhost:3000`; rules live: `demo/rules-live/up.sh` → simulated devices, rule statistics and trace on `$SYS`, a rules editor at `localhost:8070` |
+
 ## Shipped alerting
 
 Index of every rule the chart installs. The table is the catalogue; the
