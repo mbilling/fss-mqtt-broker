@@ -48,7 +48,7 @@ mqttd has no production users yet. The evidence below is what it offers instead.
 Durable QoS 1 is the hardest path a broker serves: every acknowledgement waits for
 fsync and a quorum copy on another node. It is the one we measure first.
 
-![Cluster msg/s at 1, 3 and 10 nodes, with the per-node rate, for durable QoS 1, QoS 1 with clean sessions and QoS 0, measured on the 1.3.0 candidate](docs/benchmarks/img/readme-scale-out.svg)
+![Cluster msg/s as columns at 1, 3 and 10 nodes on a linear node axis, one panel each for durable QoS 1, QoS 1 with clean sessions and QoS 0, with the per-node rate and a linear-scaling line, measured on the 1.3.0 candidate](docs/benchmarks/img/readme-scale-out.svg)
 
 - **Durable QoS 1** carries 117,800 msg/s on 3 nodes (39.3k per node) and 292,200 on
   10 (29.2k per node), with no message lost. At ack p99 ≤ 1 s it carries 114k and 228k.
@@ -63,6 +63,9 @@ fsync and a quorum copy on another node. It is the one we measure first.
   the instance HiveMQ's run used. Hetzner charges about the same per vCPU.
   - **3 nodes:** mqttd's durable cluster costs 3.4× less than HiveMQ at the same traffic.
   - **10 nodes:** it costs 2.0× less, because mqttd's per-node durable rate falls.
+  - **At HiveMQ's published 270k:** extending mqttd's line on its 3-to-10-node slope, it
+    needs about 13 nodes, $1,640 a month against HiveMQ's $3,027: 1.8× less. That rate is
+    an estimate, not a measurement.
   - **The licence:** HiveMQ's clustering licence comes on top, at a price not published.
 
 ![Durable QoS 1 per vCPU: mqttd against HiveMQ 4.18's published figure](docs/benchmarks/img/readme-durable-per-vcpu.svg)

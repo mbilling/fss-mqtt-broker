@@ -126,6 +126,16 @@ def headline_figures(rows: list[dict]) -> set[str]:
             if (r["chart"] == "scale-out" and r["series"] == "durable" and r["state"] == "green"
                     and int(r["nodes"]) > 1):
                 out.add(f"{int(r['msg_per_s']) / int(r['vcpu']) / hv:.1f}×")
+    # The cost chart's estimate at HiveMQ's published rate: mqttd's line extended along its
+    # last measured slope, in whole nodes, against HiveMQ's own monthly cost. The chart's
+    # functions compute it, so the prose cannot drift from what the chart draws.
+    import runpy
+    chart = runpy.run_path(str(ROOT / "bench/scale/chart-readme.py"))
+    pts = chart["cost_points"](chart["load"]())
+    hv_rate, hv_vcpu = pts["hivemq"]
+    nodes = -(-chart["mqttd_vcpu"](pts["mqttd"], hv_rate) // 4)
+    est, hive_month = chart["month_usd"](nodes * 4), chart["month_usd"](hv_vcpu)
+    out |= {f"{est:,.0f}", f"{hive_month:,.0f}", f"{hive_month / est:.1f}×"}
     return out
 
 

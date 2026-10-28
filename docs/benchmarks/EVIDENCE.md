@@ -69,6 +69,10 @@ clusters', which keep 2 copies.
 - **The result:** mqttd's measured durable QoS 1 clusters cost 3.4× less than HiveMQ at
   the same traffic on 3 nodes, and 2.0× less on 10 nodes.
 - **HiveMQ's line is an extrapolation,** drawn straight through its one published point.
+- **mqttd's line is extended dotted** beyond its measured points: below 3 nodes at the
+  3-node cost per msg/s, above 10 nodes along the slope from 3 to 10. At HiveMQ's
+  published 270k msg/s that slope needs about 13 nodes, $1,640 a month, 1.8× less than
+  HiveMQ's $3,027. It is an estimate, not a measurement.
 - **The licence comes on top:** HiveMQ's clustering needs its commercial edition, whose
   price is not published.
 - **Not counted:** our load generators.

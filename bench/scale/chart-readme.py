@@ -4,8 +4,8 @@
     python3 bench/scale/chart-readme.py              # both, into docs/benchmarks/img/
     python3 bench/scale/chart-readme.py --self-test
 
-  readme-scale-out.svg         cluster msg/s at each measured cluster size: durable QoS 1, QoS 1
-                               clean sessions, QoS 0; per-node rates labelled
+  readme-scale-out.svg         cluster msg/s against nodes, one panel per workload: QoS 1
+                               (durable, clean sessions) above, QoS 0 below; per-node rates labelled
   readme-durable-per-vcpu.svg  durable QoS 1 per vCPU against HiveMQ's published run
 
 Every figure is a row of headline.csv, and every row names the results card (and the
@@ -53,19 +53,20 @@ def per_node(v: float) -> str:
 
 # --------------------------------------------------------------------------- scale-out
 
-W, H = 1000, 606
-T0, PH = 196, 270          # plot top, plot height
-Y0 = T0 + PH               # baseline
-BAR, IN_GAP = 52, 20       # bar width, gap between a class's bars (one per cluster size)
+W = 1000
+PH = 220                   # plot height
+BAR = 26                   # column width
+X_NODES = 10.6             # the x axis runs a little past the largest cluster
+ROW_T0, ROW_STEP = 192, 352     # first plot top, plot top to the next row's
+COLS = [(96, 462), (596, 962)]  # plot left and right, per column
 
+# Two rows: QoS 1 on top (durable, clean sessions), QoS 0 below; the cell beside QoS 0 reads
+# how close each line comes to linear.
 PANELS = [
-    {"title": "Durable QoS 1",
-     "x0": 84, "x1": 380, "y_step": 50_000, "backdrop": True,
-     "groups": [("durable", "persistent sessions", "ack after fsync + quorum copy; 1 node: fsync")]},
-    {"title": "Not durable",
-     "x0": 476, "x1": 968, "y_step": 200_000, "backdrop": False,
-     "groups": [("qos1-clean", "QoS 1, clean sessions", "routing path, no fsync"),
-                ("qos0", "QoS 0", "at most once")]},
+    {"series": "durable", "title": "Durable QoS 1",
+     "sub": "ack after fsync + a quorum copy · 1 node keeps one copy"},
+    {"series": "qos1-clean", "title": "QoS 1, clean sessions", "sub": "routing path, no fsync"},
+    {"series": "qos0", "title": "QoS 0", "sub": "at most once"},
 ]
 
 
@@ -102,85 +103,118 @@ def node_counts(rows: list[dict]) -> list[int]:
     return sorted({r["nodes"] for r in rows if r["chart"] == "scale-out"})
 
 
+def y_step(peak: float) -> int:
+    return next(st for st in (50_000, 100_000, 200_000, 250_000, 500_000) if peak / st <= 5)
+
+
+def linearity(b: dict, ref: int, n: int) -> float:
+    """The n-node lossless rate as a share of the ref-node rate per node times n."""
+    return top_of(b[n])["msg_per_s"] / (top_of(b[ref])["msg_per_s"] / ref * n)
+
+
 def draw_scale_out(rows: list[dict]) -> str:
     bars = scale_bars(rows)
     sizes = node_counts(rows)
+    ref = min(n for n in sizes if n > 1)
+    big = sizes[-1]
     builds = sorted({r["build"].split()[-1] for r in rows if r["chart"] == "scale-out"})
     dates = sorted({r["date"] for r in rows if r["chart"] == "scale-out"})
-    desc = [describe(bars[series][n], n) for p in PANELS for series, _, _ in p["groups"] for n in sizes]
+    desc = [describe(bars[p["series"]][n], n) for p in PANELS for n in sizes]
+    h = ROW_T0 + 2 * ROW_STEP - 40
     o = cs.open_svg(
-        W, H, f"Cluster throughput from {sizes[0]} to {sizes[-1]} nodes, no message lost on any column",
+        W, h, f"Cluster throughput from {sizes[0]} to {big} nodes, no message lost at any point",
         f"cluster msg/s from the brokers' own counters · 4-vCPU nodes · 3 rounds a step · main {' and '.join(builds)}, "
         f"{' to '.join([dates[0], dates[-1]] if len(dates) > 1 else dates)}",
-        f"Columns are the cluster's msg/s at {', '.join(map(str, sizes))} nodes; the per-node rate is printed under each total. "
-        "The green part is the highest step carried at p99 ≤ 1 s; a yellow cap reaches the maximum lossless step "
-        "when it ran at p99 ≤ 5 s, a red cap when it ran above. " + "; ".join(desc) + ".")
-    o.append(cs.text(32, 84, "The per-node rate under each total · p99 is the ack latency for QoS 1 and the "
-                     "end-to-end latency for QoS 0, the mean of the rounds", size=13, role="ink2"))
+        f"Columns of the cluster's msg/s at their number of nodes, on a linear axis, {', '.join(map(str, sizes))}, one panel per "
+        "workload. The green part is the highest step carried at p99 ≤ 1 s; a yellow cap reaches the maximum "
+        "lossless step when it ran at p99 ≤ 5 s, a red cap when it ran above; the dotted line is the "
+        f"{ref}-node rate per node times the number of nodes. "
+        + "; ".join(desc) + ".")
+    o.append(cs.text(32, 84, "p99 is the ack latency for QoS 1 and the end-to-end latency for QoS 0, the mean "
+                     "of the rounds", size=13, role="ink2"))
     present = {r["state"] for r in rows if r["chart"] == "scale-out"}
-    keys = [k for k in (("good", "GREEN · carried at p99 ≤ 1 s", "box", "green"),
-                        ("warn", "YELLOW · lossless, p99 ≤ 5 s", "box", "yellow"),
-                        ("crit", "RED · lossless, p99 > 5 s", "box", "red")) if k[3] in present]
-    keys = [k[:3] for k in keys]
     lx = 32
-    for role, label, kind in keys:
-        o += cs.swatch(lx, 120, role, label, kind=kind)
-        lx += cs.legend_width(label, kind) - 8
+    for role, label, state in (("good", "GREEN · carried at p99 ≤ 1 s", "green"),
+                               ("warn", "YELLOW · lossless, p99 ≤ 5 s", "yellow"),
+                               ("crit", "RED · lossless, p99 > 5 s", "red")):
+        if state in present:
+            o += cs.swatch(lx, 117, role, label)
+            lx += cs.legend_width(label) - 8
+    o.append(f'<line x1="{lx}" y1="113" x2="{lx + 20}" y2="113" class="k-ink2" stroke-width="1.5" '
+             'stroke-dasharray="2 4" stroke-linecap="round"/>')
+    o.append(cs.text(lx + 28, 117, f"linear: the {ref}-node rate per node × nodes", size=12, role="ink2"))
 
-    for p in PANELS:
-        x0, x1 = p["x0"], p["x1"]
-        peak = max(top_of(bars[s][n])["msg_per_s"] for s, _, _ in p["groups"] for n in sizes)
-        step = p["y_step"]
-        y_max = int(-(-peak * 1.25 // step) * step)
+    for i, p in enumerate(PANELS):
+        x0, x1 = COLS[i % 2]
+        yt = ROW_T0 + (i // 2) * ROW_STEP
+        yb = yt + PH
+        b = bars[p["series"]]
+        rate = top_of(b[ref])["msg_per_s"] / ref
+        peak = max(max(top_of(b[n])["msg_per_s"] for n in sizes), rate * big)
+        step = y_step(peak)
+        y_max = int(-(-peak * 1.25 // step) * step)   # room above the tallest column for its figures
 
-        def y(v: float, y_max=y_max) -> float:
-            return Y0 - v / y_max * PH
+        def X(n: float, x0=x0, x1=x1) -> float:
+            return x0 + n / X_NODES * (x1 - x0)
 
-        if p["backdrop"]:
-            o.append(f'<rect x="{x0 - 64}" y="{T0 - 52}" width="{x1 - x0 + 76}" height="{PH + 136}" '
-                     'rx="10" class="f-grid" fill-opacity="0.55"/>')
-        o.append(cs.text(x0 - 52, T0 - 30, p["title"], size=13, role="ink", weight=650))
+        def Y(v: float, yb=yb, y_max=y_max) -> float:
+            return yb - v / y_max * PH
+
+        o.append(cs.text(x0 - 64, yt - 34, p["title"], size=14, role="ink", weight=650))
+        o.append(cs.text(x0 - 64, yt - 17, p["sub"], size=11, role="muted"))
         for v in range(0, y_max + 1, step):
-            o.append(cs.hline(x0, x1, y(v), "axis" if v == 0 else "grid"))
-            o.append(cs.text(x0 - 8, y(v) + 4, cs.compact(v) if v else "0", size=11, role="muted",
+            o.append(cs.hline(x0, X(big), Y(v), "axis" if v == 0 else "grid"))
+            o.append(cs.text(x0 - 8, Y(v) + 4, cs.compact(v) if v else "0", size=11, role="muted",
                              anchor="end", num=True))
-        o.append(cs.text(x0 - 40, T0 - 12, "msg/s, whole cluster", size=10, role="muted"))
+        for n in range(0, big + 1):
+            measured = n in sizes
+            if measured:
+                o.append(cs.vline(X(n), yt, yb, "grid"))
+            o.append(cs.text(X(n), yb + 16, n, size=12 if measured else 10, role="ink" if measured else "muted",
+                             anchor="middle", weight=650 if measured else 400, num=True))
+        o.append(cs.text(X(big / 2), yb + 36, "nodes in the cluster", size=11, role="muted", anchor="middle"))
+        o.append(f'<line x1="{X(0):.1f}" y1="{Y(0):.1f}" x2="{X(big):.1f}" y2="{Y(rate * big):.1f}" '
+                 'class="k-ink2" stroke-width="1.5" stroke-dasharray="2 4" stroke-linecap="round"/>')
+        for n in sizes:
+            v = top_of(b[n])["msg_per_s"]
+            bx = X(n) - BAR / 2
+            if b[n]["green"]:
+                gy = Y(b[n]["green"]["msg_per_s"])
+                o.append(cs.column(bx, gy, yb, BAR, "good", round_top=not b[n]["cap"]))
+            else:
+                gy = yb
+            if b[n]["cap"]:
+                base = gy - (2 if b[n]["green"] else 0)
+                # A cap is never thinner than 2 px, so a lossless step just above p99 <= 1 s still shows.
+                o.append(cs.column(bx, min(Y(v), base - 2), base, BAR, CAP_ROLE[b[n]["cap"]["state"]]))
+            lines = [(per_node(v), 13, "ink", 650), (f"{per_node(v / n)}/node", 11, "ink2", 400)]
+            if b[n]["cap"] and b[n]["green"]:
+                lines.append((f"≤ 1 s: {per_node(b[n]['green']['msg_per_s'])}", 11, "muted", 400))
+            ly = Y(v) - 7
+            for s_, size, role_, wt in reversed(lines):
+                o.append(cs.text(X(n), ly, s_, size=size, role=role_, anchor="middle", weight=wt, num=True,
+                                 halo=True))
+                ly -= size + 3
 
-        gw = len(sizes) * BAR + (len(sizes) - 1) * IN_GAP
-        k = len(p["groups"])
-        gap = (x1 - x0 - k * gw) / (k + 1)
-        for gi, (series, name, sub) in enumerate(p["groups"]):
-            gx = x0 + gap + gi * (gw + gap)
-            for bi, n in enumerate(sizes):
-                b = bars[series][n]
-                t = top_of(b)
-                bx = gx + bi * (BAR + IN_GAP)
-                mid = bx + BAR / 2
-                head = y(t["msg_per_s"])
-                if b["green"]:
-                    gy = y(b["green"]["msg_per_s"])
-                    o.append(cs.column(bx, gy, Y0, BAR, "good", round_top=not b["cap"]))
-                else:
-                    gy = Y0
-                if b["cap"]:
-                    o.append(cs.column(bx, head, gy - (2 if b["green"] else 0), BAR, CAP_ROLE[b["cap"]["state"]]))
-                lines = [(per_node(t["msg_per_s"]), 15, "ink", 650),
-                         (f"{per_node(t['msg_per_s'] / n)} per node", 11, "ink2", 400)]
-                if b["cap"] and b["green"]:
-                    lines.append((f"≤ 1 s: {cs.compact(b['green']['msg_per_s'])}", 11, "ink2", 400))
-                ly = head - 8
-                for s_, size, role, wt in reversed(lines):
-                    o.append(cs.text(mid, ly, s_, size=size, role=role, anchor="middle", weight=wt, num=True))
-                    ly -= size + 4
-                o.append(cs.text(mid, Y0 + 18, f"{n} node" + ("s" if n > 1 else ""), size=12, role="ink",
-                                 anchor="middle", weight=600))
-            gm = gx + gw / 2
-            o.append(cs.text(gm, Y0 + 42, name, size=13, role="ink", anchor="middle", weight=650))
-            o.append(cs.text(gm, Y0 + 59, sub, size=11, role="muted", anchor="middle"))
+    # The free cell: how close each workload comes to linear.
+    x0 = COLS[1][0] - 64
+    yt = ROW_T0 + ROW_STEP - 34
+    o.append(cs.text(x0, yt, f"From {ref} to {big} nodes, against linear", size=14, role="ink", weight=650))
+    o.append(cs.text(x0, yt + 17, f"the {big}-node maximum lossless as a share of the {ref}-node rate × {big // 1}",
+                     size=11, role="muted"))
+    ly = yt + 52
+    for p in PANELS:
+        share = linearity(bars[p["series"]], ref, big)
+        o.append(cs.text(x0, ly, p["title"], size=13, role="ink2"))
+        o.append(cs.text(x0 + 300, ly, f"{share:.0%}", size=15, role="ink", weight=650, anchor="end", num=True))
+        ly += 30
+    o.append(cs.text(x0, ly + 6, "Durable QoS 1 falls furthest: at 10 nodes more of each message's", size=11,
+                     role="muted"))
+    o.append(cs.text(x0, ly + 21, "replication and forwarding crosses between nodes.", size=11, role="muted"))
 
-    o.append(cs.text(32, H - 36, "Hetzner CCX23 brokers (4 vCPU) · CCX33 load generators, calibrated before the "
+    o.append(cs.text(32, h - 36, "Hetzner CCX23 brokers (4 vCPU) · CCX33 load generators, calibrated before the "
                      "ladder · $share, one member per broker, 200 B · 60 s windows", size=11, role="muted"))
-    o.append(cs.text(32, H - 18, "source: docs/benchmarks/data/headline.csv → docs/benchmarks/RIG2-RESULTS.md "
+    o.append(cs.text(32, h - 18, "source: docs/benchmarks/data/headline.csv → docs/benchmarks/RIG2-RESULTS.md "
                      "(bench/scale/rig2, ADR 0090)", size=11, role="muted"))
     o.append("</svg>")
     return "\n".join(o) + "\n"
@@ -288,6 +322,16 @@ def cost_points(rows: list[dict]) -> dict:
     return {"mqttd": mq, "hivemq": (hive["msg_per_s"], hive["vcpu"])}
 
 
+def mqttd_vcpu(pts: list, rate: float) -> float:
+    """mqttd's vCPU for a durable rate outside the measured points: below the first, at the
+    first's msg/s per vCPU; above the last, along the slope between the last two."""
+    (r0, v0, _), (r1, v1, _) = pts[0], pts[-1]
+    if rate <= r0:
+        return rate * v0 / r0
+    (rp, vp, _) = pts[-2]
+    return v1 + (rate - r1) * (v1 - vp) / (r1 - rp)
+
+
 def draw_cost(rows: list[dict]) -> str:
     pts = cost_points(rows)
     hv_rate, hv_vcpu = pts["hivemq"]
@@ -313,16 +357,21 @@ def draw_cost(rows: list[dict]) -> str:
                         f"4.18 at the same rate ${hive_month(r):,.0f} ({hive_month(r) / month_usd(v):.1f}×)"
                         for r, v, n in pts["mqttd"])
             + f"; HiveMQ 4.18 published: {hv_rate:,} msg/s on {hv_vcpu} vCPU, ${month_usd(hv_vcpu):,.0f} a month, "
-            "drawn as a straight line from that one point. HiveMQ's clustering needs its commercial "
+            "drawn as a straight line from that one point. mqttd's line is extended dotted: below its first "
+            "point at that point's msg/s per vCPU, above its last along the slope between its last two; at "
+            f"HiveMQ's published rate it needs about {-(-mqttd_vcpu(pts['mqttd'], hv_rate) // 4):.0f} nodes, "
+            f"${month_usd(-(-mqttd_vcpu(pts['mqttd'], hv_rate) // 4) * 4):,.0f} a month. "
+            "HiveMQ's clustering needs its commercial "
             "edition, whose price is not published and is not included.")
     o = cs.open_svg(w, h, f"Durable QoS 1 costs {min(ratios):.1f}–{max(ratios):.1f}× less to run than HiveMQ, "
                     "before its licence",
                     f"monthly infrastructure at AWS m6a.8xlarge on-demand prices for both, ${USD_PER_VCPU_H:.4f} "
                     "per vCPU-hour · no licence included", desc)
     lx = 32
-    for role, label, kind in (("s1", "mqttd, measured (ack p99 ≤ 1 s)", "line"),
-                              ("s4", "HiveMQ 4.18, from its published run", "dash"),
-                              ("s4", "HiveMQ licence on top (not published)", "box")):
+    for role, label, kind in (("s1", "mqttd, measured (p99 ≤ 1 s)", "line"),
+                              ("s1", "mqttd, extended", "dot"),
+                              ("s4", "HiveMQ 4.18, its published run", "dash"),
+                              ("s4", "HiveMQ licence (not published)", "box")):
         o += cs.swatch(lx, 100, role, label, kind=kind)
         lx += cs.legend_width(label, kind)
     # The licence: everything above HiveMQ's infrastructure line, unknown but not zero.
@@ -345,6 +394,23 @@ def draw_cost(rows: list[dict]) -> str:
     o.append(f'<circle cx="{hx:.1f}" cy="{hy:.1f}" r="5" class="f-surface k-s4" stroke-width="2.5"/>')
     o.append(cs.text(hx - 10, hy - 12, f"published: {cs.compact(hv_rate)} msg/s on 3 × m6a.8xlarge, "
                      f"${month_usd(hv_vcpu):,.0f}", size=11, role="ink2", anchor="end", num=True, halo=True))
+    # mqttd beyond what was measured: dotted, back to zero and on past HiveMQ's point.
+    mq = pts["mqttd"]
+    (r0, v0, _), (r1, v1, _) = mq[0], mq[-1]
+    for a_, b_ in ((0, r0), (r1, x_max)):
+        o.append(f'<line x1="{X(a_):.1f}" y1="{Y(month_usd(mqttd_vcpu(mq, a_))):.1f}" x2="{X(b_):.1f}" '
+                 f'y2="{Y(month_usd(mqttd_vcpu(mq, b_))):.1f}" class="k-s1" stroke-width="2.5" '
+                 'stroke-dasharray="0.1 6" stroke-linecap="round"/>')
+    # What mqttd would cost at HiveMQ's published rate, in whole 4-vCPU nodes.
+    est_nodes = -(-mqttd_vcpu(mq, hv_rate) // 4)
+    est = month_usd(est_nodes * 4)
+    ex, ey = X(hv_rate), Y(est)
+    o.append(cs.vline(ex, hy + 7, ey - 7, "ink2", 1.2, "2 3"))
+    o.append(f'<circle cx="{ex:.1f}" cy="{ey:.1f}" r="5" class="f-surface k-s1" stroke-width="2.5"/>')
+    o.append(cs.text(ex + 8, (hy + ey) / 2 + 4, f"{month_usd(hv_vcpu) / est:.1f}× less", size=13, role="ink",
+                     weight=650, num=True, halo=True))
+    o.append(cs.text(ex, ey + 30, f"≈ {est_nodes:.0f} nodes: ${est:,.0f}", size=11, role="ink2", anchor="middle",
+                     num=True, halo=True))
     # mqttd: its measured points, joined.
     pp = " ".join(f"{X(r):.1f},{Y(month_usd(v)):.1f}" for r, v, _ in pts["mqttd"])
     o.append(f'<polyline points="{pp}" fill="none" class="k-s1" stroke-width="2.5" stroke-linejoin="round"/>')
@@ -354,8 +420,11 @@ def draw_cost(rows: list[dict]) -> str:
         o.append(cs.text(mx + 8, (hyv + my) / 2 + 4, f"{hive_month(r) / month_usd(v):.1f}× less",
                          size=13, role="ink", weight=650, num=True, halo=True))
         o.append(f'<circle cx="{mx:.1f}" cy="{my:.1f}" r="5.5" class="f-s1 k-surface" stroke-width="2"/>')
-        o.append(cs.text(mx + 12, my + 18, f"{n} nodes: {cs.compact(r)} msg/s, ${month_usd(v):,.0f}", size=11,
-                         role="ink2", anchor="start", num=True, halo=True))
+        # The last point's label sits above-left, clear of the extended line to its right.
+        last = (r, v, n) == pts["mqttd"][-1]
+        o.append(cs.text(mx - 12 if last else mx + 12, my - 10 if last else my + 18,
+                         f"{n} nodes: {cs.compact(r)} msg/s, ${month_usd(v):,.0f}", size=11,
+                         role="ink2", anchor="end" if last else "start", num=True, halo=True))
     o.append(cs.text(32, h - 36, "mqttd: Hetzner CCX23 brokers (4 vCPU, EPYC Milan), the 1.3.0 candidate, 2 copies · the same "
                      "per-vCPU price as Hetzner's own (EUR 0.0431) · load generators not counted", size=11, role="muted"))
     o.append(cs.text(32, h - 18, "HiveMQ: its published 4.18 run, default configuration (persistent, 2 copies), not "
@@ -388,8 +457,8 @@ def self_test() -> None:
          body.count('class="f-crit"') == sum(r["state"] == "red" for r in scale)
          + (1 if any(r["state"] == "red" for r in scale) else 0)),
         ("every class has every cluster size", all(set(v) == set(node_counts(rows)) for v in bars.values())),
-        ("every column's lossless total and per-node rate are printed",
-         all(f">{per_node(top_of(b)['msg_per_s'])}<" in body and f">{per_node(top_of(b)['msg_per_s'] / n)} per node<" in body
+        ("every point's lossless total and per-node rate are printed",
+         all(f">{per_node(top_of(b)['msg_per_s'])}<" in body and f">{per_node(top_of(b)['msg_per_s'] / n)}/node<" in body
              for v in bars.values() for n, b in v.items())),
         ("the subtitle says what build was measured", all(r["build"].split()[-1] in body for r in scale)),
         ("the description names every figure", all(f"{r['msg_per_s']:,}" in head for r in scale)),
