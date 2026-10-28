@@ -3463,8 +3463,9 @@ adds to one publish, paid on the connection task:
 | `SELECT *` with a `${.}` JSON republish | 6.3 µs |
 | `FOREACH` over 10 elements, 10 republishes | 15.8 µs |
 
-The single-node knee is 75,000 msg/s, measured across 4 vCPUs. At 1.8 µs per matching
-publish, rule work on every one of those messages would take about 0.14 core, spread
+A 4-vCPU node carried 113k msg/s of QoS 0 in a 3-node cluster
+([benchmarks/RIG2-RESULTS.md](benchmarks/RIG2-RESULTS.md)). At 1.8 µs per matching
+publish, rule work on every one of those messages would take about 0.2 core, spread
 across the connection tasks. These are microbenchmarks of the engine, not a cluster
 benchmark. A derived message costs what any publish costs to route, so a rule that
 doubles your message count doubles the routing load.

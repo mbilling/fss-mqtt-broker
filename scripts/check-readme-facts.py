@@ -384,44 +384,35 @@ def main() -> int:
                     "or a GENERATED banner) — ADR 0070 T8"
                 )
 
-    # --- the candidate scale section quotes its cards, figure for figure -------
-    # "Scale: what we measured on the 1.2.0 candidate" publishes rates, ledger totals
-    # and forwarded shares from three run cards. The cards are the record (the raw runs
-    # are untracked), so every figure in the section must be one a card states: a
-    # number edited in the README alone, or left behind when a card is corrected, is
-    # a claim with no source. Three shapes are held to it — thousands-separated
-    # counts (`233,716,926`), per-node rates (`20.7–20.9k`) and percentages
-    # (`13–17%`) — with a range kept whole, so neither end can drift. Prose numbers
-    # (node counts, dates, `p99 ≤ 500 ms`) are left to the reader.
-    # The section moved from the README to docs/benchmarks/EVIDENCE.md on 2026-10-25,
-    # and this check moved with it.
+    # --- EVIDENCE.md's figures are the results card's, figure for figure ---------
+    # "The figures" publishes the benchmark rig's capacity per tier and workload, and the
+    # per-node rates derived from them. The card (docs/benchmarks/RIG2-RESULTS.md) is the
+    # record (the raw runs are untracked), so every figure in the section must be one the
+    # card states: a number edited here alone, or left behind when the card is corrected,
+    # is a claim with no source. Thousands-separated counts (`292,200`) and per-node rates
+    # (`39.3k`) are held to it; prose numbers (node counts, `p99 ≤ 1 s`) are left to the
+    # reader. This replaced the 1.2.0 scale section's check when the page moved to the
+    # ADR 0090 rig on 2026-10-28.
     evidence_text = EVIDENCE.read_text(encoding="utf-8")
-    section = re.search(
-        r"^### Scale: what we measured on 1\.2\.0\n(.*?)(?=^#{2,3} )",
-        evidence_text, re.MULTILINE | re.DOTALL)
+    section = re.search(r"^## The figures\n(.*?)(?=^#{2,3} )", evidence_text, re.MULTILINE | re.DOTALL)
     figure_count = 0
+    card = ROOT / "docs" / "benchmarks" / "RIG2-RESULTS.md"
     if not section:
-        problems.append(
-            "docs/benchmarks/EVIDENCE.md's '### Scale: what we measured on 1.2.0' section "
-            "is gone — restore it or update this script"
-        )
+        problems.append("docs/benchmarks/EVIDENCE.md's '## The figures' section is gone — restore it or update this script")
+    elif not card.is_file():
+        problems.append("docs/benchmarks/RIG2-RESULTS.md, the card EVIDENCE.md's figures come from, is missing")
     else:
-        cards = [ROOT / "bench" / "scale" / n
-                 for n in ("qos1-knees-2026-10-12.md", "qos1-knees-2026-10-21.md",
-                           "durable-knees-2026-10-12.md", "durable-knees-2026-10-21.md",
-                           "durable-scaleout-10-12-14.md")]
-        stated = set()
-        for card in cards:
-            stated |= scale_figures(card.read_text(encoding="utf-8"))
-        quoted = scale_figures(section.group(1))
+        stated = scale_figures(card.read_text(encoding="utf-8"))
+        stated |= set(re.findall(r"(?<![\d.,])\d+k\b", card.read_text(encoding="utf-8")))
+        body = section.group(1)
+        quoted = scale_figures(body) | set(re.findall(r"(?<![\d.,])\d+k\b", body))
         figure_count = len(quoted)
         for figure in sorted(quoted - stated):
             problems.append(
-                f"EVIDENCE.md's 1.2.0 scale section says {figure}, which none of "
-                + ", ".join(f"bench/scale/{c.name}" for c in cards) + " states"
+                f"EVIDENCE.md's '## The figures' says {figure}, which docs/benchmarks/RIG2-RESULTS.md does not state"
             )
         if not quoted:
-            problems.append("EVIDENCE.md's 1.2.0 scale section quotes no figure at all")
+            problems.append("EVIDENCE.md's '## The figures' quotes no figure at all")
 
     # --- the README's evidence figures are headline.csv's, and its rows are their cards' --
     # The README's header, Why mqttd and Evidence sections quote throughput figures
@@ -481,7 +472,7 @@ def main() -> int:
         f"README facts check: {len(adrs)} ADRs, {len(crates)} crates, "
         f"{task_count} scripts, {anchor_count} anchors (README + EVIDENCE.md), "
         f"{citation_count} evidence citations across {len(cited_docs)} cited docs, "
-        f"{figure_count} 1.2.0 scale figures found in their cards, "
+        f"{figure_count} EVIDENCE figures found in the results card, "
         f"{headline_count} README evidence figures and {len(rows)} headline.csv rows checked, "
         f"dates in sync — all match."
     )

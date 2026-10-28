@@ -1,5 +1,7 @@
 # Gated membership A/B — did wave B remove an O(peers) per-message term?
 
+> **Historical record, 2026-09-25.** Written during the QoS 0 scaling investigation on an earlier benchmark rig. Its figures are kept as the record and are not comparable with the current ones in [RIG2-RESULTS.md](RIG2-RESULTS.md).
+
 A paired before/after of the gated `shared_membership` matrix across the #613
 wave A/B change set. **Local mechanism probe on one shared workstation, not a
 broker capacity result.** It answers one narrow question — does per-message hub

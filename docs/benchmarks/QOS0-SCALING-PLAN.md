@@ -1,5 +1,7 @@
 # QoS 0 scaling investigation plan (#613)
 
+> **Historical record, 2026-09-25 to 2026-09-27.** Written during the QoS 0 scaling investigation on an earlier benchmark rig. Its figures are kept as the record and are not comparable with the current ones in [RIG2-RESULTS.md](RIG2-RESULTS.md).
+
 **Implementation follow-up:** #612 is now merged as `5c5cbae`. The first
 [receipt-gated membership probe and two local pilots](MEMBERSHIP-PROBE.md) and
 [profiles/TCP-client fixed-offer probes](MEMBERSHIP-TCP-PROBE.md) are implemented.

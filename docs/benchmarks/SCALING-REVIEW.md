@@ -1,5 +1,7 @@
 # Broker scaling review
 
+> **Historical record, 2026-09-06 to 2026-09-25.** A broker scaling review written against an earlier benchmark rig. Its figures are kept as the record and are not comparable with the current ones in [RIG2-RESULTS.md](RIG2-RESULTS.md).
+
 For the prioritized QoS 0 investigation brief at `4cf6503`, see
 [QoS 0 scaling investigation plan (#613)](QOS0-SCALING-PLAN.md).
 This older review retains its original scope and evidence below.
