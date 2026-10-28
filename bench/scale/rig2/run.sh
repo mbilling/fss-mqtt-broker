@@ -4,7 +4,7 @@
 #
 #   TIER=local ./run.sh                                   # free: 3 local nodes, a short ramp
 #   PRICE_ONLY=1 TIER=n3 WORKLOADS="durable-qos1 clean-qos1 qos0" ./run.sh   # the quote, no cloud call
-#   HCLOUD_TOKEN=... MQTTD_VERSION=1.3.0 TIER=n3 ./run.sh                 # PAID
+#   HCLOUD_TOKEN=... MQTTD_VERSION=1.2.0 TIER=n3 ./run.sh                 # PAID
 #   HCLOUD_TOKEN=... MQTTD_URL=... MQTTD_SHA256=... TIER=n10 WORKLOADS="durable-qos1" ./run.sh
 #
 # One provisioning carries every workload in WORKLOADS, one ladder after the other, on

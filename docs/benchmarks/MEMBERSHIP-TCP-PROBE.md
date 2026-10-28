@@ -1,5 +1,7 @@
 # Membership investigation: profiles, TCP receipts and fixed offer (#613)
 
+> **Historical record, 2026-09-25.** Written during the QoS 0 scaling investigation on an earlier benchmark rig. Its figures are kept as the record and are not comparable with the current ones in [RIG2-RESULTS.md](RIG2-RESULTS.md).
+
 Follow-up: [instruction accounting and the group-first shared index](GROUPED-SHARED-INDEX.md).
 The timing failures below remain failures; the follow-up makes a narrower work-count claim.
 

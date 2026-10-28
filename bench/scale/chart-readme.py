@@ -77,7 +77,11 @@ def scale_bars(rows: list[dict]) -> dict:
         if r["chart"] != "scale-out":
             continue
         slot = out.setdefault(r["series"], {}).setdefault(r["nodes"], {"green": None, "cap": None})
-        slot["green" if r["state"] == "green" else "cap"] = r
+        key = "green" if r["state"] == "green" else "cap"
+        if slot[key] is not None:
+            raise SystemExit(f"headline.csv: two scale-out rows for {r['series']} at {r['nodes']} nodes "
+                             f"({slot[key]['state']} and {r['state']}): one would hide the other")
+        slot[key] = r
     return out
 
 
@@ -252,9 +256,110 @@ def draw_per_vcpu(rows: list[dict]) -> str:
     )
 
 
+# --------------------------------------------------------------------------- cost
+
+# AWS EC2 on-demand, us-east-1, Linux, m6a.8xlarge (32 vCPU, AMD EPYC Milan): the instance
+# HiveMQ 4.18's published run used. Both brokers are priced at it, per vCPU, so the gap is
+# the software's; Hetzner CCX23 (EUR 0.17225 an hour for 4 vCPU) is EUR 0.0431 a vCPU-hour.
+M6A_8XL_USD_H = 1.3824
+M6A_8XL_VCPU = 32
+MONTH_H = 730
+USD_PER_VCPU_H = M6A_8XL_USD_H / M6A_8XL_VCPU
+
+
+def month_usd(vcpu: float) -> float:
+    return vcpu * USD_PER_VCPU_H * MONTH_H
+
+
+def cost_points(rows: list[dict]) -> dict:
+    """mqttd's measured durable QoS 1 points (the highest step at ack p99 <= 1 s, from
+    the scale-out rows) and HiveMQ's one published point."""
+    mq = sorted(((r["msg_per_s"], r["vcpu"], r["nodes"]) for r in rows
+                 if r["chart"] == "scale-out" and r["series"] == "durable" and r["state"] == "green"))
+    hive = next(r for r in rows if r["chart"] == "durable-per-vcpu" and r["series"] == "hivemq")
+    return {"mqttd": mq, "hivemq": (hive["msg_per_s"], hive["vcpu"])}
+
+
+def draw_cost(rows: list[dict]) -> str:
+    pts = cost_points(rows)
+    hv_rate, hv_vcpu = pts["hivemq"]
+    hv_per_vcpu = hv_rate / hv_vcpu
+
+    def hive_month(rate: float) -> float:
+        return month_usd(rate / hv_per_vcpu)
+
+    w, h = 900, 560
+    x0, x1, y0, y1 = 96, 860, 470, 150      # plot box: left, right, baseline, top
+    x_max, y_max = 300_000, 4_000
+
+    def X(v: float) -> float:
+        return x0 + v / x_max * (x1 - x0)
+
+    def Y(v: float) -> float:
+        return y0 - v / y_max * (y0 - y1)
+
+    ratios = [hive_month(r) / month_usd(v) for r, v, _ in pts["mqttd"]]
+    desc = ("Monthly infrastructure cost against durable QoS 1 throughput, both priced at AWS m6a.8xlarge "
+            f"on-demand (${USD_PER_VCPU_H:.4f} per vCPU-hour, {MONTH_H} hours a month), no licence. "
+            + "; ".join(f"mqttd, {n} nodes: {r:,} msg/s on {v} vCPU, ${month_usd(v):,.0f} a month; HiveMQ "
+                        f"4.18 at the same rate ${hive_month(r):,.0f} ({hive_month(r) / month_usd(v):.1f}×)"
+                        for r, v, n in pts["mqttd"])
+            + f"; HiveMQ 4.18 published: {hv_rate:,} msg/s on {hv_vcpu} vCPU, ${month_usd(hv_vcpu):,.0f} a month, "
+            "drawn as a straight line from that one point. HiveMQ's clustering needs its commercial "
+            "edition, whose price is not published and is not included.")
+    o = cs.open_svg(w, h, f"Durable QoS 1 costs {min(ratios):.1f}–{max(ratios):.1f}× less to run than HiveMQ, "
+                    "before its licence",
+                    f"monthly infrastructure at AWS m6a.8xlarge on-demand prices for both, ${USD_PER_VCPU_H:.4f} "
+                    "per vCPU-hour · no licence included", desc)
+    lx = 32
+    for role, label, kind in (("s1", "mqttd, measured (ack p99 ≤ 1 s)", "line"),
+                              ("s4", "HiveMQ 4.18, from its published run", "dash"),
+                              ("s4", "HiveMQ licence on top (not published)", "box")):
+        o += cs.swatch(lx, 100, role, label, kind=kind)
+        lx += cs.legend_width(label, kind)
+    # The licence: everything above HiveMQ's infrastructure line, unknown but not zero.
+    top_hive = hive_month(x_max)
+    o.append(f'<path d="M{X(0):.1f},{Y(0):.1f} L{X(x_max):.1f},{Y(min(top_hive, y_max)):.1f} '
+             f'L{X(x_max):.1f},{Y(y_max):.1f} L{X(0):.1f},{Y(y_max):.1f} Z" class="f-s4" fill-opacity="0.07"/>')
+    for v in range(0, y_max + 1, 1000):
+        o.append(cs.hline(x0, x1, Y(v), "axis" if v == 0 else "grid"))
+        o.append(cs.text(x0 - 10, Y(v) + 4, f"${v:,}" if v else "$0", size=11, role="muted", anchor="end", num=True))
+    for v in range(0, x_max + 1, 50_000):
+        o.append(cs.text(X(v), y0 + 18, cs.compact(v) if v else "0", size=11, role="muted", anchor="middle", num=True))
+    o.append(cs.text((x0 + x1) / 2, y0 + 40, "durable QoS 1 msg/s carried", size=12, role="ink2", anchor="middle"))
+    o.append(cs.text(x0 - 64, y1 - 18, "per month", size=11, role="muted"))
+    o.append(cs.text(X(20_000), Y(3_700), "HiveMQ's clustering needs its commercial edition: that licence comes on "
+                     "top of its line, at a price not published", size=12, role="ink2"))
+    # HiveMQ: a straight line through its one published point.
+    o.append(f'<line x1="{X(0):.1f}" y1="{Y(0):.1f}" x2="{X(x_max):.1f}" y2="{Y(top_hive):.1f}" class="k-s4" '
+             'stroke-width="2" stroke-dasharray="6 4"/>')
+    hx, hy = X(hv_rate), Y(month_usd(hv_vcpu))
+    o.append(f'<circle cx="{hx:.1f}" cy="{hy:.1f}" r="5" class="f-surface k-s4" stroke-width="2.5"/>')
+    o.append(cs.text(hx - 10, hy - 12, f"published: {cs.compact(hv_rate)} msg/s on 3 × m6a.8xlarge, "
+                     f"${month_usd(hv_vcpu):,.0f}", size=11, role="ink2", anchor="end", num=True, halo=True))
+    # mqttd: its measured points, joined.
+    pp = " ".join(f"{X(r):.1f},{Y(month_usd(v)):.1f}" for r, v, _ in pts["mqttd"])
+    o.append(f'<polyline points="{pp}" fill="none" class="k-s1" stroke-width="2.5" stroke-linejoin="round"/>')
+    for r, v, n in pts["mqttd"]:
+        mx, my, hyv = X(r), Y(month_usd(v)), Y(hive_month(r))
+        o.append(cs.vline(mx, hyv + 6, my - 8, "ink2", 1.2, "2 3"))
+        o.append(cs.text(mx + 8, (hyv + my) / 2 + 4, f"{hive_month(r) / month_usd(v):.1f}× less",
+                         size=13, role="ink", weight=650, num=True, halo=True))
+        o.append(f'<circle cx="{mx:.1f}" cy="{my:.1f}" r="5.5" class="f-s1 k-surface" stroke-width="2"/>')
+        o.append(cs.text(mx + 12, my + 18, f"{n} nodes: {cs.compact(r)} msg/s, ${month_usd(v):,.0f}", size=11,
+                         role="ink2", anchor="start", num=True, halo=True))
+    o.append(cs.text(32, h - 36, "mqttd: Hetzner CCX23 brokers (4 vCPU, EPYC Milan), the 1.3.0 candidate, 2 copies · the same "
+                     "per-vCPU price as Hetzner's own (EUR 0.0431) · load generators not counted", size=11, role="muted"))
+    o.append(cs.text(32, h - 18, "HiveMQ: its published 4.18 run, default configuration (persistent, 2 copies), not "
+                     "reproduced, payload not published · source: docs/benchmarks/data/headline.csv", size=11, role="muted"))
+    o.append("</svg>")
+    return "\n".join(o) + "\n"
+
+
 CHARTS = {
     "readme-scale-out.svg": draw_scale_out,
     "readme-durable-per-vcpu.svg": draw_per_vcpu,
+    "readme-durable-cost.svg": draw_cost,
 }
 
 

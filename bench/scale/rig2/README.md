@@ -61,7 +61,7 @@ PRICE_ONLY=1 TIER=n3 WORKLOADS="durable-qos1 clean-qos1 qos0" bench/scale/rig2/r
 
 # PAID. A release:
 export HCLOUD_TOKEN=...            # the dedicated bench project
-MQTTD_VERSION=1.3.0 TIER=n3 WORKLOADS="durable-qos1 clean-qos1 qos0" bench/scale/rig2/run.sh
+MQTTD_VERSION=1.2.0 TIER=n3 WORKLOADS="durable-qos1 clean-qos1 qos0" bench/scale/rig2/run.sh
 
 # PAID. A candidate (stamped UNRELEASED in the run dir):
 MQTTD_URL=https://.../mqttd-x86_64-unknown-linux-musl MQTTD_SHA256=<sha256> \

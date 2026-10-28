@@ -117,6 +117,14 @@ def headline_figures(rows: list[dict]) -> set[str]:
             for b in vals.values():
                 if a > b:
                     out.add(f"{a / b:.1f}×")
+    # The cost chart's ratios: HiveMQ's published per-vCPU rate against each measured
+    # durable QoS 1 point (the highest step at ack p99 <= 1 s), at the same vCPU price.
+    hive = [r for r in rows if r["chart"] == "durable-per-vcpu" and r["series"] == "hivemq"]
+    if hive:
+        hv = int(hive[0]["msg_per_s"]) / int(hive[0]["vcpu"])
+        for r in rows:
+            if r["chart"] == "scale-out" and r["series"] == "durable" and r["state"] == "green":
+                out.add(f"{int(r['msg_per_s']) / int(r['vcpu']) / hv:.1f}×")
     return out
 
 
@@ -384,44 +392,35 @@ def main() -> int:
                     "or a GENERATED banner) — ADR 0070 T8"
                 )
 
-    # --- the candidate scale section quotes its cards, figure for figure -------
-    # "Scale: what we measured on the 1.2.0 candidate" publishes rates, ledger totals
-    # and forwarded shares from three run cards. The cards are the record (the raw runs
-    # are untracked), so every figure in the section must be one a card states: a
-    # number edited in the README alone, or left behind when a card is corrected, is
-    # a claim with no source. Three shapes are held to it — thousands-separated
-    # counts (`233,716,926`), per-node rates (`20.7–20.9k`) and percentages
-    # (`13–17%`) — with a range kept whole, so neither end can drift. Prose numbers
-    # (node counts, dates, `p99 ≤ 500 ms`) are left to the reader.
-    # The section moved from the README to docs/benchmarks/EVIDENCE.md on 2026-10-25,
-    # and this check moved with it.
+    # --- EVIDENCE.md's figures are the results card's, figure for figure ---------
+    # "The figures" publishes the benchmark rig's capacity per tier and workload, and the
+    # per-node rates derived from them. The card (docs/benchmarks/RIG2-RESULTS.md) is the
+    # record (the raw runs are untracked), so every figure in the section must be one the
+    # card states: a number edited here alone, or left behind when the card is corrected,
+    # is a claim with no source. Thousands-separated counts (`292,200`) and per-node rates
+    # (`39.3k`) are held to it; prose numbers (node counts, `p99 ≤ 1 s`) are left to the
+    # reader. This replaced the 1.2.0 scale section's check when the page moved to the
+    # ADR 0090 rig on 2026-10-28.
     evidence_text = EVIDENCE.read_text(encoding="utf-8")
-    section = re.search(
-        r"^### Scale: what we measured on 1\.2\.0\n(.*?)(?=^#{2,3} )",
-        evidence_text, re.MULTILINE | re.DOTALL)
+    section = re.search(r"^## The figures\n(.*?)(?=^#{2,3} )", evidence_text, re.MULTILINE | re.DOTALL)
     figure_count = 0
+    card = ROOT / "docs" / "benchmarks" / "RIG2-RESULTS.md"
     if not section:
-        problems.append(
-            "docs/benchmarks/EVIDENCE.md's '### Scale: what we measured on 1.2.0' section "
-            "is gone — restore it or update this script"
-        )
+        problems.append("docs/benchmarks/EVIDENCE.md's '## The figures' section is gone — restore it or update this script")
+    elif not card.is_file():
+        problems.append("docs/benchmarks/RIG2-RESULTS.md, the card EVIDENCE.md's figures come from, is missing")
     else:
-        cards = [ROOT / "bench" / "scale" / n
-                 for n in ("qos1-knees-2026-10-12.md", "qos1-knees-2026-10-21.md",
-                           "durable-knees-2026-10-12.md", "durable-knees-2026-10-21.md",
-                           "durable-scaleout-10-12-14.md")]
-        stated = set()
-        for card in cards:
-            stated |= scale_figures(card.read_text(encoding="utf-8"))
-        quoted = scale_figures(section.group(1))
+        stated = scale_figures(card.read_text(encoding="utf-8"))
+        stated |= set(re.findall(r"(?<![\d.,])\d+k\b", card.read_text(encoding="utf-8")))
+        body = section.group(1)
+        quoted = scale_figures(body) | set(re.findall(r"(?<![\d.,])\d+k\b", body))
         figure_count = len(quoted)
         for figure in sorted(quoted - stated):
             problems.append(
-                f"EVIDENCE.md's 1.2.0 scale section says {figure}, which none of "
-                + ", ".join(f"bench/scale/{c.name}" for c in cards) + " states"
+                f"EVIDENCE.md's '## The figures' says {figure}, which docs/benchmarks/RIG2-RESULTS.md does not state"
             )
         if not quoted:
-            problems.append("EVIDENCE.md's 1.2.0 scale section quotes no figure at all")
+            problems.append("EVIDENCE.md's '## The figures' quotes no figure at all")
 
     # --- the README's evidence figures are headline.csv's, and its rows are their cards' --
     # The README's header, Why mqttd and Evidence sections quote throughput figures
@@ -457,7 +456,25 @@ def main() -> int:
                      and int(p["msg_per_s"]) == int(r["msg_per_s"]) and int(p["vcpu"]) == int(r["vcpu"])
                      for p in per_vcpu_rows)
         else:
-            ok = int(r["msg_per_s"]) in digits(src.read_text(encoding="utf-8"))
+            # The figure must be in the section the row names: a heading path such as
+            # "10 nodes / Durable QoS 1" (each part a heading, nested in order), so a figure
+            # that appears elsewhere in the card does not vouch for this row.
+            body = src.read_text(encoding="utf-8")
+            scope, found = body, True
+            for part in [p.strip() for p in r["section"].split(" / ")]:
+                m = re.search(rf"^(#+) {re.escape(part)}\s*$", scope, re.MULTILINE)
+                if not m:
+                    found = False
+                    break
+                level = len(m.group(1))
+                rest = scope[m.end():]
+                end = re.search(rf"^#{{1,{level}}} ", rest, re.MULTILINE)
+                scope = rest[: end.start()] if end else rest
+            if not found:
+                problems.append(f"headline.csv row {r['label']!r} cites section {r['section']!r}, "
+                                f"which {r['source']} has no heading for")
+                continue
+            ok = int(r["msg_per_s"]) in digits(scope)
         if not ok:
             problems.append(
                 f"headline.csv row {r['label']!r} ({r['nodes']} nodes) says {int(r['msg_per_s']):,} msg/s, "
@@ -481,7 +498,7 @@ def main() -> int:
         f"README facts check: {len(adrs)} ADRs, {len(crates)} crates, "
         f"{task_count} scripts, {anchor_count} anchors (README + EVIDENCE.md), "
         f"{citation_count} evidence citations across {len(cited_docs)} cited docs, "
-        f"{figure_count} 1.2.0 scale figures found in their cards, "
+        f"{figure_count} EVIDENCE figures found in the results card, "
         f"{headline_count} README evidence figures and {len(rows)} headline.csv rows checked, "
         f"dates in sync — all match."
     )

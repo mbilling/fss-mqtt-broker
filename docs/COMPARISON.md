@@ -132,7 +132,7 @@ What one mqttd build contains, by area. This was the README's Features section u
 | Scale & HA | |
 |---|---|
 | Mesh | masterless; SWIM membership; auto mTLS peer links; interest-based routing; HRW placement |
-| Durability | openraft lease group + epoch-fenced quorum replication + on-disk redb — **default** |
+| Durability | openraft lease group + epoch-fenced quorum replication + an on-disk segment log (new data dirs; existing ones keep redb) — **default** |
 | Resize | grow / shrink (`SIGUSR1` drain) / replace with zero acked loss, verified under SIGKILL + partition |
 | Partition | CP: minority serves committed state, retained writes queue until heal |
 | Upgrades | adjacent-release skew (N ↔ N+1), nightly-tested both directions |
@@ -194,7 +194,8 @@ The load-bearing differences. mqttd's own weak spot is printed first: **durable-
 serving capacity scales with the lease voter set (`MQTTD_LEASE_VOTERS`, default 5), not
 the node count** (ADR 0021/0049) — connections, fan-out, and shared-subscription
 throughput scale with nodes; durable ownership does not. Tested envelope to date: 3–5
-node clusters under kill/partition/upgrade/soak harnesses.
+node clusters under kill/partition/upgrade/soak harnesses, and throughput measured at 3
+and 10 nodes ([RIG2-RESULTS.md](benchmarks/RIG2-RESULTS.md)).
 
 | | mqttd | Mosquitto | EMQX 6.2 | NanoMQ | VerneMQ 2.1 |
 |---|---|---|---|---|---|
@@ -305,21 +306,17 @@ quoted — **not reproduced**, with every workload difference beside them — in
   CI, and a continuous-assurance program (fuzzing, soak, fault/upgrade harnesses) — but
   a mitigations list is not a track record, and pretending otherwise would break this
   document's own rules.
-- **Performance:** no cross-broker numbers are printed here, deliberately. The
-  [benchmark harness](../bench/) runs all five brokers under disclosed postures;
-  cross-broker numbers appear in [docs/benchmarks/](benchmarks/) only from dedicated,
-  documented hardware (ADR 0048's dev-grade/publishable line): the single-node
-  comparison is [SINGLE-NODE-COMPARISON.md](benchmarks/SINGLE-NODE-COMPARISON.md), and the
-  QoS 0 scale-out curve (3 → 10 nodes, one provisioning) is
-  [knee-3-5-7-10.md](../bench/scale/knee-3-5-7-10.md). Also published, both about mqttd alone and both labelled with their
-  limits: our micro-baselines in [BASELINE.md](benchmarks/BASELINE.md), and the
-  end-to-end **durable-path** measurement in
-  [DURABLE-PATH.md](benchmarks/DURABLE-PATH.md) — acked QoS 1/2 throughput and latency
-  against a real 3-node quorum, measured **single-host and dev-grade**, which states in
-  its first paragraph that it is not the multi-host result and carries the multi-host
-  invocation as documented-but-unrun. Read together they price the durability
-  guarantee this table's Durability rows describe: on that host a durable QoS 1 publish
-  costs ~28 ms at p50 against ~0.03 ms for the same publish to a clean session.
+- **Performance:** no cross-broker numbers are printed here, deliberately.
+  - **mqttd's own figures** are in [RIG2-RESULTS.md](benchmarks/RIG2-RESULTS.md), the
+    benchmark rig of ADR 0090. Durable QoS 1, ack after fsync and a quorum copy, carries
+    117,800 msg/s on 3 nodes and 292,200 on 10 with no message lost. QoS 1 with clean
+    sessions carries 270,800 and 875,900, and QoS 0 340,300 and 973,200.
+  - **Comparing with the vendors** is done in [EVIDENCE.md](benchmarks/EVIDENCE.md), next
+    to their published figures. It isn't a reproduction.
+  - **No other broker has been measured on this rig yet.** The earlier single-node
+    comparison is kept as a dated record in
+    [SINGLE-NODE-COMPARISON.md](benchmarks/SINGLE-NODE-COMPARISON.md).
+  - **Micro-baselines** are in [BASELINE.md](benchmarks/BASELINE.md).
 
 ## Sources & staleness
 
@@ -332,6 +329,10 @@ not as absent. This file is re-checked at every cross-broker benchmark re-run
 
 ## Changelog
 
+- 2026-10-28 — Performance: mqttd's figures now come from the benchmark rig of ADR 0090
+  ([RIG2-RESULTS.md](benchmarks/RIG2-RESULTS.md), 3 and 10 nodes, 1.3.0 candidate). The
+  single-node comparison and the earlier scale-out cards stay as dated records. The
+  Durability row names the segment log, the default for new data dirs from 1.3.0.
 - 2026-10-25 — The README's feature matrix (with its HiveMQ CE column), its feature list and
   its Open == Enterprise section moved here unchanged, as *The matrix at a glance* and
   *mqttd's feature list*; the README keeps a subset of the matrix rows. No cell changed, so

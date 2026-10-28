@@ -2,7 +2,7 @@
 # The scale-curve orchestrator (ADR 0048 T3). Run from a laptop, never from CI:
 #
 #   export HCLOUD_TOKEN=...     # Read & Write token from a DEDICATED project
-#   export MQTTD_VERSION=1.0.6  # the release under test — required, recorded in the run
+#   export MQTTD_VERSION=1.2.0  # the release under test — required, recorded in the run
 #   ./run.sh smoke              # 1 node, minutes, <€0.50 — proves the whole rig
 #   ./run.sh standard           # the release gate: one 10-node cluster, ~30 min
 #   ./run.sh full               # the curve: fresh 1-, 3- and 5-node clusters
