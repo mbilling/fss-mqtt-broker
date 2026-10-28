@@ -56,7 +56,7 @@ on 2026-10-27 and 2026-10-28 with the benchmark rig of
 
 Run `n10-20261028T013559Z` · 10 × ccx23 brokers, 4 × ccx33 generators · 3 rounds a step · 200 B payload · latency is the end-to-end p99, the mean of the rounds ± their standard deviation.
 
-- **Maximum lossless:** 973,200 msg/s offered (brokers received 973,040), end-to-end p99 4.49 ± 0.13 s
+- **Maximum lossless:** 973,200 msg/s offered, 97.3k per node (brokers received 973,040), end-to-end p99 4.49 ± 0.13 s
 - **end-to-end p99 ≤ 1 s:** 506,300 msg/s (394.7 ± 67.9 ms)
 - **end-to-end p99 ≤ 250 ms:** 337,500 msg/s (13.9 ± 2.8 ms)
 - **end-to-end p99 ≤ 100 ms:** 337,500 msg/s (13.9 ± 2.8 ms)
@@ -80,7 +80,7 @@ Run `n10-20261028T013559Z` · 10 × ccx23 brokers, 4 × ccx33 generators · 3 ro
 
 Run `n10-20261027T141938Z` · 10 × ccx23 brokers, 4 × ccx33 generators · 3 rounds a step · 200 B payload · latency is the ack p99, the mean of the rounds ± their standard deviation.
 
-- **Maximum lossless:** 875,900 msg/s offered (brokers received 878,217), ack p99 4.54 ± 0.07 s
+- **Maximum lossless:** 875,900 msg/s offered, 87.6k per node (brokers received 878,217), ack p99 4.54 ± 0.07 s
 - **ack p99 ≤ 1 s:** 303,800 msg/s (84.9 ± 1.3 ms)
 - **ack p99 ≤ 250 ms:** 303,800 msg/s (84.9 ± 1.3 ms)
 - **ack p99 ≤ 100 ms:** 303,800 msg/s (84.9 ± 1.3 ms)
@@ -105,7 +105,7 @@ Run `n10-20261027T141938Z` · 10 × ccx23 brokers, 4 × ccx33 generators · 3 ro
 
 Run `n10-20261027T141938Z` · 10 × ccx23 brokers, 4 × ccx33 generators · 3 rounds a step · 200 B payload · latency is the ack p99, the mean of the rounds ± their standard deviation.
 
-- **Maximum lossless:** 292,200 msg/s offered (brokers received 291,395), ack p99 1.37 ± 1.60 s
+- **Maximum lossless:** 292,200 msg/s offered, 29.2k per node (brokers received 291,395), ack p99 1.37 ± 1.60 s
 - **ack p99 ≤ 1 s:** 228,000 msg/s (58.9 ± 3.0 ms)
 - **ack p99 ≤ 250 ms:** 228,000 msg/s (58.9 ± 3.0 ms)
 - **ack p99 ≤ 100 ms:** 228,000 msg/s (58.9 ± 3.0 ms)
@@ -131,7 +131,7 @@ Run `n10-20261027T141938Z` · 10 × ccx23 brokers, 4 × ccx33 generators · 3 ro
 
 Run `n3-20261028T030901Z` · 3 × ccx23 brokers, 2 × ccx33 generators · 3 rounds a step · 200 B payload · latency is the end-to-end p99, the mean of the rounds ± their standard deviation.
 
-- **Maximum lossless:** 340,300 msg/s offered (brokers received 341,479), end-to-end p99 2.52 ± 0.40 s
+- **Maximum lossless:** 340,300 msg/s offered, 113k per node (brokers received 341,479), end-to-end p99 2.52 ± 0.40 s
 - **end-to-end p99 ≤ 1 s:** 253,200 msg/s (546.7 ± 146.2 ms)
 - **end-to-end p99 ≤ 250 ms:** 168,800 msg/s (8.0 ± 2.2 ms)
 - **end-to-end p99 ≤ 100 ms:** 168,800 msg/s (8.0 ± 2.2 ms)
@@ -155,7 +155,7 @@ Run `n3-20261028T030901Z` · 3 × ccx23 brokers, 2 × ccx33 generators · 3 roun
 
 Run `n3-20261028T030901Z` · 3 × ccx23 brokers, 2 × ccx33 generators · 3 rounds a step · 200 B payload · latency is the ack p99, the mean of the rounds ± their standard deviation.
 
-- **Maximum lossless:** 270,800 msg/s offered (brokers received 271,264), ack p99 3.31 ± 0.69 s
+- **Maximum lossless:** 270,800 msg/s offered, 90.3k per node (brokers received 271,264), ack p99 3.31 ± 0.69 s
 - **ack p99 ≤ 1 s:** 152,000 msg/s (67.2 ± 47.9 ms)
 - **ack p99 ≤ 250 ms:** 152,000 msg/s (67.2 ± 47.9 ms)
 - **ack p99 ≤ 100 ms:** 152,000 msg/s (67.2 ± 47.9 ms)
@@ -180,7 +180,7 @@ Run `n3-20261028T030901Z` · 3 × ccx23 brokers, 2 × ccx33 generators · 3 roun
 
 Run `n3-20261028T030901Z` · 3 × ccx23 brokers, 2 × ccx33 generators · 3 rounds a step · 200 B payload · latency is the ack p99, the mean of the rounds ± their standard deviation.
 
-- **Maximum lossless:** 117,800 msg/s offered (brokers received 118,047), ack p99 1.35 ± 0.60 s
+- **Maximum lossless:** 117,800 msg/s offered, 39.3k per node (brokers received 118,047), ack p99 1.35 ± 0.60 s
 - **ack p99 ≤ 1 s:** 114,200 msg/s (708.1 ± 113.9 ms)
 - **ack p99 ≤ 250 ms:** 76,100 msg/s (72.2 ± 28.7 ms)
 - **ack p99 ≤ 100 ms:** 76,100 msg/s (72.2 ± 28.7 ms)

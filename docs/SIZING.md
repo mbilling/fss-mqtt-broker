@@ -330,8 +330,9 @@ disk overshoot ≤ poll interval × your store growth rate   (+ the write in fli
 ```
 
 Measure the rate rather than guess it: run `bench/run.sh` at your intended publish mix and
-watch `store_bytes` climb. As an *example* of the arithmetic (not a measured throughput —
-this repo publishes none): 500 durable writes/s at 4 KiB is ~2 MB/s, so a 10 s poll costs
+watch `store_bytes` climb. As an *example* of the arithmetic (not one of the measured
+cluster figures in [benchmarks/RIG2-RESULTS.md](benchmarks/RIG2-RESULTS.md)): 500 durable
+writes/s at 4 KiB is ~2 MB/s, so a 10 s poll costs
 ~20 MB of overshoot and a 1 s near-mark poll ~2 MB. If your rate makes that number
 uncomfortable next to your headroom, lower `MQTTD_WATERMARK_POLL`.
 
@@ -359,7 +360,8 @@ mid-write — with recovery and back-fill verified (ADR 0044 P2).
 **Why the mark is an aggregate, and what closes the gap.** One store can consume the whole
 budget and brown out the others. That is enforced at the aggregate on purpose, not for lack
 of effort: the resource being protected is *one filesystem*, and two of the four stores have
-no client write to refuse — `replicas.redb` grows from other nodes' already-committed
+no client write to refuse — the replica store (the segment log on a data dir created by
+1.3.0 or later, `replicas.redb` before) grows from other nodes' already-committed
 appends and `lease.redb` from consensus itself, so "refuse the writes to the over-share
 store" is undefinable for half the enumeration, and a follower refusing committed entries
 would be thinning its group's replica count (the `min_replicas` floor's job), not enforcing
@@ -372,7 +374,7 @@ not, so a bare vector-to-vector divide matches nothing and the rule is silently 
 Selective refusal for
 the two stores where it *is* definable (`sessions`, `retained`) remains ADR 0041 T9.
 
-**A browned-out node still grows `replicas.redb`.** The refusal is decided at the session's
+**A browned-out node still grows its replica store.** The refusal is decided at the session's
 owner, so a node that merely *follows* a group keeps applying its peers' committed appends
 while browned out — and those are full message payloads, not metadata. On a cluster node
 (the default) the dominant store's growth is therefore not gated locally at all: headroom
@@ -459,8 +461,8 @@ flattering half of it: its latency improved (p50 0.31–0.47×, p95 0.35–0.50�
 *because* its throughput fell — **0.41–0.77×** in the same four runs. Fewer messages in
 flight is why each one went faster. So the honest claim is isolation of *failure*, not of
 *capacity*: a degraded group cannot stop or stall a healthy group's publishes, but on a
-shared host it does take a share of the throughput with it. Whether that share survives on
-separate hosts is exactly what the unrun multi-host lane would answer.
+shared host it does take a share of the throughput with it. These are 2026-08 single-host
+ratios; the degraded-group case has not been re-run on separate hosts.
 
 Two further caveats belong beside those: the *tail beyond p95* could not be attributed on
 the measuring host (every phase, baseline included, carried unrelated 10–20 s stalls), and
@@ -469,12 +471,15 @@ p99 under the fault — so "connects are unaffected" holds for clients in health
 universally. Method, limits and the commands:
 [benchmarks/DURABLE-PATH.md](benchmarks/DURABLE-PATH.md).
 
-**And what the durable write costs per message** (same source, single-host and dev-grade):
-an acked QoS 1 publish to a persistent subscriber took ~28 ms at p50 against ~0.03 ms for
-the same publish to a clean session, and the node's durable append rate was pinned by the
-host's **per-volume** disk barrier (~215–240 flushes/s, shared by every store on the machine)
-rather than by CPU — which is the number to re-measure on your own hardware before sizing
-a write rate, because it is the one that decides it.
+**What a durable node carries.** On the benchmark rig of ADR 0090, with Hetzner CCX23
+brokers (4 vCPU, local NVMe), 2 copies and the 1.3.0 defaults, durable QoS 1 carried 39.3k
+msg/s per node on 3 nodes and 29.2k per node on 10, with no message lost. At ack p99 ≤ 1 s
+it carried 114,200 msg/s on 3 nodes and 228,000 on 10.
+- **A starting point, not a promise:** your disk's barrier latency and your network decide
+  your figure.
+- **One durable session tops out at about 2,500 msg/s,** however many nodes there are.
+  Spread a hot topic over a `$share` group.
+- **Every step:** [benchmarks/RIG2-RESULTS.md](benchmarks/RIG2-RESULTS.md).
 
 **The broker now measures that number for you** (ADR 0076): a durable node
 probes its data-dir volume shortly after start and publishes the result —

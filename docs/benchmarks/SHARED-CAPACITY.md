@@ -1,5 +1,7 @@
 # QoS 0 shared-worker capacity — #482
 
+> **Historical record, 2026-09-14 to 2026-09-25.** Written during the QoS 0 scaling investigation on an earlier benchmark rig. Its figures are kept as the record and are not comparable with the current ones in [RIG2-RESULTS.md](RIG2-RESULTS.md).
+
 ## Acceptance target
 
 For a fixed payload and one delivery obligation per source message, sustainable

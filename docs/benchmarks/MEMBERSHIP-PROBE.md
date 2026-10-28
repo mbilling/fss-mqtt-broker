@@ -1,5 +1,7 @@
 # QoS 0 membership probe — #613
 
+> **Historical record, 2026-09-25.** Written during the QoS 0 scaling investigation on an earlier benchmark rig. Its figures are kept as the record and are not comparable with the current ones in [RIG2-RESULTS.md](RIG2-RESULTS.md).
+
 Follow-up: [profiles, real TCP client receipts and aligned fixed-offer probes](MEMBERSHIP-TCP-PROBE.md).
 The historical channel results and their limitations below are unchanged.
 

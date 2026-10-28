@@ -1664,10 +1664,14 @@ The publisher's ack waits for that PUBACK or the quorum write, whichever comes f
 quorum, or every session it was owed to has acknowledged it.
 
 **Choosing the window.** It must cover the subscriber's acknowledgement tail under load,
-not its mean. On the 2026-10-21 rig the mean was under 3 ms, but p99.9 was 30–44 ms at the
-knee. With 5–20 ms windows most deliveries ended up written, and 50 ms kept 98% off the
-disk ([the sweep](../bench/scale/elision-window-n3-2026-10-21.md)). A subscriber that keeps
-up pays nothing for a longer window, because a held delivery is discharged at its PUBACK.
+not its mean.
+- **The tail is longer than the mean:** a few milliseconds on average can be tens of
+  milliseconds at the tail near a cluster's knee.
+- **Too short, and nothing is saved:** a window shorter than the tail writes most
+  deliveries anyway. That's why the default is 50 ms (the dated sweep that chose it:
+  [elision-window-n3-2026-10-21.md](../bench/scale/elision-window-n3-2026-10-21.md)).
+- **Longer costs nothing for a subscriber that keeps up,** because a held delivery is
+  discharged at its PUBACK.
 
 **What the broker does on its own:**
 - A session that misses the window three times in a row is written directly for 2 s.

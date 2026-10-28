@@ -8,7 +8,8 @@ progress live under [`adr/`](adr/) and [`delivery/`](delivery/) — they are the
 
 The front door is the repository [README](../README.md): why, the evidence in three
 charts, a feature matrix, getting started, then links. Every number it states is in
-[benchmarks/EVIDENCE.md](benchmarks/EVIDENCE.md) with its method. The long-form [GUIDE](../GUIDE.md) keeps the
+[benchmarks/RIG2-RESULTS.md](benchmarks/RIG2-RESULTS.md) with its method, and
+[benchmarks/EVIDENCE.md](benchmarks/EVIDENCE.md) sets them beside the vendors' published figures. The long-form [GUIDE](../GUIDE.md) keeps the
 "Start here" persona fork: *evaluate it · run it · build against it · secure and
 audit it · contribute*.
 
@@ -75,7 +76,7 @@ The README's documentation table until 2026-10-25.
 |---|---|---|
 | [`adr/`](adr/) | Contributor (internal) | Why a decision was made. Frozen once Accepted. |
 | [`delivery/`](delivery/) | Contributor (internal) | How it is built and where each task stands. [STATUS.md](delivery/STATUS.md) is generated. |
-| [`benchmarks/`](benchmarks/) | Evaluator / operator | Published numbers with method, limits, and dated caveats. Start at [EVIDENCE.md](benchmarks/EVIDENCE.md): every figure the README states, its method and where competitors win. |
+| [`benchmarks/`](benchmarks/) | Evaluator / operator | Published numbers with method, limits, and dated caveats. Start at [RIG2-RESULTS.md](benchmarks/RIG2-RESULTS.md): every figure the README states and its method. [EVIDENCE.md](benchmarks/EVIDENCE.md) compares with published cluster benchmarks and says where competitors win. |
 | [`compliance/`](compliance/) | Compliance / procurement | ADR 0067 mappings (EU CRA, IEC 62443, SOC 2/ISO 27001, crypto policy, OpenSSF). |
 | [`postmortems/`](postmortems/) | Operator / contributor | Incident write-ups. |
 | [`review-panels/`](review-panels/) | Maintainer | Dated panel runs. |

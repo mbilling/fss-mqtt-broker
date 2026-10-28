@@ -166,71 +166,34 @@ promise in force. In place today:
 
 The largest known gaps, stated rather than discovered (full list:
 [**Limitations**](#limitations)): the memory watermark is backpressure, not a
-hard ceiling (the container limit is the real bound), and the horizontal
-scaling curve is unmeasured — the durable path's throughput/latency *is*
-measured on one host, limits printed beside every number
-([docs/benchmarks/DURABLE-PATH.md](docs/benchmarks/DURABLE-PATH.md)).
+hard ceiling (the container limit is the real bound), and one durable session tops
+out at about 2,500 msg/s. Cluster throughput is measured at 3 and 10 nodes, with
+the method and limits beside every figure ([docs/benchmarks/RIG2-RESULTS.md](docs/benchmarks/RIG2-RESULTS.md)).
 
 See [`docs/adr/`](docs/adr/) for the decisions and the
 [**delivery dashboard**](docs/delivery/STATUS.md) — the authoritative, live
-record of exactly what is built (78 ADRs, per-task status).
+record of exactly what is built (91 ADRs, per-task status).
 
-## How fast is one node, next to the others
+## How fast is it
 
-**One Hetzner CCX23 (4 dedicated vCPU), all four brokers run on the same
-host in sequence, 2026-09-16.** The knee is the highest rate that still met
-**p99 ≤ 1 s** with ≥99% delivered, 1:1 QoS 0 publish/subscribe — the GREEN
-(certified) band. Since 2026-09-27 a rung fails only on loss, and a lossless
-rung above 1 s is graded YELLOW (≤ 5 s) or RED instead
-([ADR 0048](docs/adr/0048-comparative-benchmarking.md#amendment-2026-09-27-a-rung-fails-only-on-loss-p99-is-graded-green--yellow--red)):
+Measured with the benchmark rig of
+[ADR 0090](docs/adr/0090-benchmark-rig-redesign.md) on the 1.3.0 candidate:
+- **Hosts:** Hetzner CCX23 brokers, 4 vCPU each.
+- **Load:** 200 B payloads, `$share` groups with one member per broker.
+- **Steps:** 3 rounds a step. A step counts only when no round lost a message.
 
-| broker | knee | p99 at knee | CPU idle at knee | RSS at knee |
-|---|---|---|---|---|
-| **mqttd 1.0.17** | **75 000 msg/s** | ≤500 ms | 30% | 133 MiB |
-| Mosquitto 2.0.20 | 45 000 msg/s | ≤100 ms | 70% | **18 MiB** |
-| EMQX 5.8.6 | 45 000 msg/s | ≤500 ms | 2% | 434 MiB |
-| HiveMQ CE 2024.3 | 30 000 msg/s | ≤100 ms | 5% | 927 MiB |
+| workload | 3 nodes | 10 nodes |
+|---|---|---|
+| durable QoS 1, ack after fsync and a quorum copy | 117,800 msg/s (114,200 at ack p99 ≤ 1 s) | 292,200 msg/s (228,000 at ack p99 ≤ 1 s) |
+| QoS 1, clean sessions | 270,800 msg/s | 875,900 msg/s |
+| QoS 0 | 340,300 msg/s | 973,200 msg/s |
 
-**Where mqttd loses:** Mosquitto holds its knee in **7× less memory**, and
-both Mosquitto and HiveMQ keep a **tighter tail at their own knees** (≤100 ms)
-than mqttd does at its (≤500 ms). The single claim here is the highest rate on
-this host at this service level. The ladder steps in 15 000 msg/s, so every
-knee is bracketed by its next rung, ours included.
-
-**The fairness choices that matter most**, all arguable and all published:
-the load generator is **EMQX's own `emqtt-bench`**, not ours; measurement is
-**driver-side only**, because the four brokers' internal counters are not
-comparable; **mqttd's durable-by-default is switched OFF** so every broker is
-in-memory alike ([ADR 0048](docs/adr/0048-comparative-benchmarking.md) §4
-forbids buying "fast" by quietly disabling a guarantee); and **mqttd ran
-twice — first and last** — as a control, reproducing its own knee to 0.1%
-after four reboots and three other brokers, or the run would have been
-declared void instead of published. **No broker here is tuned**, including
-ours; each runs a documented reasonable minimum, and a vendor tuning their own
-would likely beat its figure.
-
-**Latency is a distribution, not a number.** At 45 000 msg/s — Mosquitto's and
-EMQX's knee, inside mqttd's — mqttd delivers 97.8% of messages within 10 ms,
-Mosquitto 30.6%, EMQX 14.9%, and HiveMQ 0.4% with only 61% inside a second. The
-dashed line is mqttd's control arm, run last: two lines lying on each other are
-the reproducibility claim, drawn rather than asserted.
-
-![Latency distribution at 45,000 msg/s offered](docs/benchmarks/img/latency-45000.svg)
-
-**Overloaded, the four behave differently, and that is a choice, not a ranking.**
-Driven at 150 000 msg/s, mqttd queues — memory to 3.8 GiB — then drains at
-**1.6× the offered rate** once publishers stop and gives 95% of the memory back.
-Mosquitto never accepts the load (38% of offer) so it has nothing to flush and
-stays under 1 GiB. EMQX keeps 76% of its peak memory after the backlog is gone.
-HiveMQ carried 5.8 GiB into the rung, reached 12 GiB, and its JVM terminated —
-which is HiveMQ's own configured behaviour (`-XX:+CrashOnOutOfMemoryError`), and
-it happened on two separate fleets.
-
-**Every setting for every broker, the gates, the per-rung tables, the charts and
-the limits are in
-[docs/benchmarks/SINGLE-NODE-COMPARISON.md](docs/benchmarks/SINGLE-NODE-COMPARISON.md)**
-— published so the numbers can be attacked, not just read. One node, QoS 0,
-plaintext: it says nothing about clustered, durable or TLS throughput.
+- **Every step, with its method, limits and charts:** [docs/benchmarks/RIG2-RESULTS.md](docs/benchmarks/RIG2-RESULTS.md).
+- **The comparison with published cluster benchmarks:**
+  [docs/benchmarks/EVIDENCE.md](docs/benchmarks/EVIDENCE.md).
+- **No other broker has been measured on this rig yet.** The earlier single-node
+  comparison with Mosquitto, EMQX and HiveMQ CE is kept as a dated record in
+  [docs/benchmarks/SINGLE-NODE-COMPARISON.md](docs/benchmarks/SINGLE-NODE-COMPARISON.md).
 
 ## The runnable map: mqttui
 
@@ -306,9 +269,9 @@ binary — are marked `-` in the list with the reason, rather than left to fail.
 - **Open == Enterprise.** One Apache-2.0 codebase, no gated features. Only
   support, SLAs, and certified builds are paid.
 - **Horizontal scalability by design.** Shared-nothing nodes, no coordinator on
-  the publish hot path — an architectural statement, not yet a benchmarked
-  curve: what is measured is one 3-node point on one host, limits printed
-  beside every number ([docs/benchmarks/DURABLE-PATH.md](docs/benchmarks/DURABLE-PATH.md)).
+  the publish hot path. It is measured at 3 and 10 nodes:
+  - **QoS 1 with clean sessions and QoS 0** hold close to their per-node rate.
+  - **Durable QoS 1** falls from 39.3k to 29.2k msg/s per node ([docs/benchmarks/RIG2-RESULTS.md](docs/benchmarks/RIG2-RESULTS.md)).
 - **Memory safety.** Rust, `#![forbid(unsafe_code)]` across crates.
 
 ## What's different about it
@@ -882,19 +845,12 @@ be found. Each is tracked; none is a silent surprise.
   own types, and — per the Kubernetes alpha-API convention — may change until
   promoted to `v1beta1`, a promotion act of its own, versioned independently
   of the broker's semver.
-- **The horizontal scaling curve is unmeasured; the durable path itself now is,
-  on one host.** [docs/benchmarks/DURABLE-PATH.md](docs/benchmarks/DURABLE-PATH.md)
-  publishes end-to-end **acked** QoS 1/2 throughput and latency percentiles against
-  a real 3-node quorum with the durable plane on, from a harness whose multi-host
-  invocation is documented and parameterised. What that does **not** settle: it is
-  one developer machine (three broker processes and the driver sharing 8 cores and
-  **one** disk, loopback, no TLS), so it is dev-grade and is not a capacity claim;
-  and throughput-vs-node-count is still absent on purpose, because a single-host
-  curve scales *negatively* and would manufacture false evidence (ADR 0048 §2 and
-  the [2026-07-14 post-mortem](docs/postmortems/2026-07-14-ha-bridge-durable-refused.md)).
-  Treat **scaling** claims as design intent; treat the durable-path numbers as a
-  floor measured under stated, unflattering conditions. The multi-host run needs
-  hardware, and is the one thing standing between the two.
+- **Throughput is measured at 3 and 10 nodes, not beyond.**
+  - **The figures:** [docs/benchmarks/RIG2-RESULTS.md](docs/benchmarks/RIG2-RESULTS.md) has the cluster figures, the method and the limits.
+  - **Durable QoS 1 scales sub-linearly:** 117,800 msg/s on 3 nodes, 292,200 on 10.
+  - **One durable session tops out at about 2,500 msg/s.** That's 16 writes in flight ÷
+    the append latency (ADR 0091 T4).
+  - **Connections:** the runs used 7,200 to 18,400, not millions.
 - **Durability costs a write on the delivery path.** A QoS 1/2 message for a
   **persistent** subscriber is appended to that session's durable log before it
   goes on the wire — that is what makes the guarantee above hold. Clean sessions
@@ -1814,27 +1770,10 @@ bottleneck and does not silently regress. A per-PR **regression floor**
 (`cargo test -p mqtt-codec --test perf_gate`) fails the build on a gross slowdown, and the
 nightly tier re-runs the full benches ([ADR 0044](docs/adr/0044-release-readiness-assurance.md) P6).
 
-**End-to-end, with the durable plane on**, is a separate and much harder number, and it is
-published in [docs/benchmarks/DURABLE-PATH.md](docs/benchmarks/DURABLE-PATH.md): acked
-QoS 1/QoS 2 throughput and p50/p95/p99 latency against a real 3-node quorum, measured
-through the production binary. Read its first paragraph before its tables. In one line:
-on the machine it was run on, an acked durable QoS 1 publish costs ~28 ms at p50 while
-the same publish to a **clean** session costs ~0.03 ms — the price of the guarantee — and
-the durable rate is pinned by that host's per-volume disk barrier, not by the broker's
-CPU. It is **single-host and dev-grade**: three broker processes and the load driver on
-8 cores and one disk.
-
-**The multi-host scaling curve** (ADR 0048 §2 — the same workload against real 1-, 3- and
-5-node clusters, one dedicated host and one disk per broker) is published in
-[docs/benchmarks/SCALE-CURVE.md](docs/benchmarks/SCALE-CURVE.md), measured against the
-signed `v1.0.1` release. In one line each: `$share` fan-out scaled ~4.6× from one node to
-five with the p99 bound *tightening* (100→25 ms) and every rung driver-limited (floors,
-not capacities); durable QoS 1 runs at ~2.0k acked msg/s on one node (p99 0.82 ms
-uncontended) and ~0.6k across a 3-node quorum — the measured price of ack-after-quorum,
-with ownership capacity bounded by the voter cap, not node count; 50k connections cost a
-flat 19.3 KiB each at every size. The curve publishes its own defects: it caught, fixed
-and re-measured #358 (v1.0.0's durable stall in production topology) and isolated the
-still-open 5-node formation instability (#368).
+**End-to-end, in a cluster,** is a separate and much harder number.
+[docs/benchmarks/RIG2-RESULTS.md](docs/benchmarks/RIG2-RESULTS.md) publishes it: msg/s from the brokers' counters and p99 on the load generator's clock,
+for durable QoS 1, QoS 1 with clean sessions and QoS 0 at 3 and 10 nodes. Every step of
+every ramp is there, measured in 3 rounds.
 
 ## Architecture decisions
 

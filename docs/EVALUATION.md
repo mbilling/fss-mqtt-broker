@@ -21,13 +21,11 @@ out. External consumers are an ordinary MQTT `$share` group; see
 the broker is covered (since `v1.2.0`): mqttd runs EMQX's rule SQL with
 `republish` and `console` ([RULES.md](RULES.md), [ADR 0083](adr/0083-rule-engine.md)).
 
-**Not yet, if** your decision hinges on a measured near-linear scale-out curve
-across QoS 0/1/2. Horizontal scalability is an architectural claim with
-published one-host and small-cluster numbers
-([DURABLE-PATH.md](benchmarks/DURABLE-PATH.md),
-[SCALE-CURVE.md](benchmarks/SCALE-CURVE.md)); the ordered plan to measure and
-then optimize is issue #537, not evidence that linear scaling is already
-achieved.
+**Not yet, if** your decision hinges on near-linear durable scale-out. Throughput is
+measured at 3 and 10 nodes ([RIG2-RESULTS.md](benchmarks/RIG2-RESULTS.md)):
+- **QoS 1 with clean sessions and QoS 0** hold close to their per-node rate.
+- **Durable QoS 1** falls from 39.3k to 29.2k msg/s per node.
+- **Beyond 10 nodes** is unmeasured. Issue #537 is the plan to optimize it.
 
 ## What is in force today
 
