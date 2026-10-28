@@ -274,7 +274,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 428 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 429 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -493,6 +493,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `placement::tests::a_dead_peer_drops_its_domain`
 - `placement::tests::a_declared_member_count_arms_the_write_floor_before_gossip_or_the_roster`
 - `placement::tests::a_joining_node_moves_only_a_minority`
+- `placement::tests::a_lone_node_wants_one_copy_and_the_factor_grows_with_the_cluster`
 - `placement::tests::a_memo_hit_does_not_recompute_the_hrw_pass`
 - `placement::tests::a_narrower_replica_set_is_a_prefix_of_a_wider_one`
 - `placement::tests::a_new_replication_factor_reshapes_sets_and_keeps_owners`

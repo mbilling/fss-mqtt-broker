@@ -44,7 +44,9 @@ pub const NUM_GROUPS: u64 = 256;
 /// factor and the smallest replica set any placement group currently has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplicationHealth {
-    /// The configured replication factor R.
+    /// The replication factor a group should hold now: the configured factor R, capped
+    /// by the cluster size this node knows it belongs to (1 on a node that never knew a
+    /// peer).
     pub desired: usize,
     /// The smallest replica-set size across all groups right now — the worst-case
     /// durability. `min_actual < desired` means at least one group commits with fewer
@@ -382,17 +384,7 @@ impl Placement {
         match self.floor {
             WriteFloor::Fixed(n) => n,
             WriteFloor::Majority { declared } => {
-                let witness = self
-                    .durable_roster
-                    .as_ref()
-                    .map(|(known, unknown)| known.len() + unknown)
-                    // An empty roster is an uninitialised raft group, not a one-member
-                    // cluster: fall through to the gossip high-water witness.
-                    .filter(|&members| members > 0)
-                    .unwrap_or(self.peak_members)
-                    .max(declared)
-                    .min(self.replicas);
-                witness / 2 + 1
+                self.membership_witness().max(declared).min(self.replicas) / 2 + 1
             }
             // No durable plane: nothing can be refused for want of replicas.
             WriteFloor::DurableOff => 1,
@@ -857,6 +849,22 @@ impl Placement {
         self.group_owner(group) == self.local
     }
 
+    /// The cluster size this node knows it belongs to: the durable raft roster when one
+    /// has been pushed (quorum-committed, so it cannot shrink while a majority is down,
+    /// and it shrinks on a consented decommission), else the high-water observed
+    /// membership. Never follows liveness down. Shared by the derived write floor
+    /// ([`min_replicas`](Self::min_replicas)) and the replication factor a group can be
+    /// held to ([`replication_health`](Self::replication_health)).
+    fn membership_witness(&self) -> usize {
+        self.durable_roster
+            .as_ref()
+            .map(|(known, unknown)| known.len() + unknown)
+            // An empty roster is an uninitialised raft group, not a one-member
+            // cluster: fall through to the gossip high-water witness.
+            .filter(|&members| members > 0)
+            .unwrap_or(self.peak_members)
+    }
+
     /// The configured replication factor R — the placement width, [`DEFAULT_REPLICAS`]
     /// at assembly. (Independent of the lease-voter cap: ADR 0021 keeps replication
     /// width and the voter set separate.)
@@ -876,7 +884,12 @@ impl Placement {
     /// and cheap enough to poll from the reconcile loop.
     #[must_use]
     pub fn replication_health(&self) -> ReplicationHealth {
-        let desired = self.replicas;
+        // The factor a group can be held to: R, capped by the cluster this node knows it
+        // belongs to. A lone, never-peered node wants (and holds) one copy; a second node
+        // raises it to two, and the catch-up sweep back-fills them. The witness never
+        // follows liveness down, so a peer lost after it joined still reads as
+        // under-replication.
+        let desired = self.replicas.min(self.membership_witness()).max(1);
         // Shares the hot path's memo (see [`ReplicaSetMemo`]), so a poll over a settled
         // ring is 256 map lookups instead of 256 HRW passes. `nodes()` is still built
         // ONCE here and threaded into the misses, so a cold sweep costs no more than it
@@ -1703,14 +1716,18 @@ mod tests {
     /// #167 — replication health reflects when too few nodes are alive to hold R copies.
     #[test]
     fn replication_health_reports_under_replication_below_r() {
-        // A lone node with R=3: every group's replica set is just itself (1 < 3).
-        let p = Placement::new(node("a"), 3);
+        // Two of three nodes left alive with R=3: every group holds 2 copies of the 3 the
+        // node knows the cluster can hold.
+        let mut p = Placement::new(node("a"), 3);
+        p.observe(&node("b"), MemberState::Alive, "b:7000", None);
+        p.observe(&node("c"), MemberState::Alive, "c:7000", None);
+        p.observe(&node("c"), MemberState::Dead, "", None);
         let h = p.replication_health();
         assert_eq!(h.desired, 3);
-        assert_eq!(h.min_actual, 1, "a lone node holds one copy per group");
+        assert_eq!(h.min_actual, 2, "two live nodes hold two copies per group");
         assert!(
             h.is_under_replicated(),
-            "1 of 3 configured copies is under-replicated"
+            "2 of 3 configured copies is under-replicated"
         );
 
         // Three alive nodes: every group can hold the full R, so not under-replicated.
@@ -1720,6 +1737,48 @@ mod tests {
         let h = full.replication_health();
         assert_eq!(h.min_actual, 3, "three nodes fill an R=3 set");
         assert!(!h.is_under_replicated());
+    }
+
+    /// A lone node that never knew a peer wants one copy, not the configured factor: it
+    /// holds every copy there is to hold, so it is not under-replicated (a fresh single
+    /// node used to report itself under-replicated forever). The factor it wants grows
+    /// with the membership it has seen, and never follows liveness down: a peer that
+    /// joined and then died leaves the node wanting two copies with one, which is the
+    /// under-replication the signal exists for.
+    #[test]
+    fn a_lone_node_wants_one_copy_and_the_factor_grows_with_the_cluster() {
+        let mut p = Placement::new(node("a"), 2);
+        let h = p.replication_health();
+        assert_eq!((h.desired, h.min_actual), (1, 1));
+        assert!(
+            !h.is_under_replicated(),
+            "a never-peered node holds all it can"
+        );
+
+        p.observe(&node("b"), MemberState::Alive, "b:7000", None);
+        let h = p.replication_health();
+        assert_eq!(
+            (h.desired, h.min_actual),
+            (2, 2),
+            "a second node: two copies"
+        );
+        assert!(!h.is_under_replicated());
+
+        p.observe(&node("b"), MemberState::Dead, "", None);
+        let h = p.replication_health();
+        assert_eq!(
+            (h.desired, h.min_actual),
+            (2, 1),
+            "the witness does not follow liveness down"
+        );
+        assert!(h.is_under_replicated(), "a lost peer is under-replication");
+
+        // Never above the configured factor, however large the cluster grows.
+        let mut big = Placement::new(node("a"), 2);
+        for n in ["b", "c", "d", "e"] {
+            big.observe(&node(n), MemberState::Alive, &format!("{n}:7000"), None);
+        }
+        assert_eq!(big.replication_health().desired, 2);
     }
 
     // --- Issue #239: the DERIVED write floor (the shipped default) ---
@@ -2082,8 +2141,12 @@ mod tests {
     fn replication_health_is_unchanged_by_the_memo() {
         let alone = ring("a", &[]);
         let h = alone.replication_health();
-        assert_eq!((h.desired, h.min_actual), (DEFAULT_REPLICAS, 1));
-        assert!(h.is_under_replicated());
+        assert_eq!(
+            (h.desired, h.min_actual),
+            (1, 1),
+            "a never-peered node wants one copy"
+        );
+        assert!(!h.is_under_replicated());
         // Warm the memo, then ask again: the same verdict, from cache.
         let _ = alone.group_replica_set(0);
         assert_eq!(alone.replication_health(), h);
