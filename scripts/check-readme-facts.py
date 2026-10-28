@@ -123,7 +123,8 @@ def headline_figures(rows: list[dict]) -> set[str]:
     if hive:
         hv = int(hive[0]["msg_per_s"]) / int(hive[0]["vcpu"])
         for r in rows:
-            if r["chart"] == "scale-out" and r["series"] == "durable" and r["state"] == "green":
+            if (r["chart"] == "scale-out" and r["series"] == "durable" and r["state"] == "green"
+                    and int(r["nodes"]) > 1):
                 out.add(f"{int(r['msg_per_s']) / int(r['vcpu']) / hv:.1f}×")
     return out
 

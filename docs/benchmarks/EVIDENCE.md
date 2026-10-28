@@ -2,7 +2,7 @@
 
 **Dated 2026-10-28.** The throughput and latency mqttd publishes. They were measured with
 the benchmark rig of [ADR 0090](../adr/0090-benchmark-rig-redesign.md) on the 1.3.0
-candidate (main `edfdb49`).
+candidate (main `edfdb49`; the 1-node run on `9520b33`).
 
 - **The full card:** [RIG2-RESULTS.md](RIG2-RESULTS.md) has the method, the limits, every
   step of every ramp and each ramp's chart.
@@ -23,19 +23,19 @@ The setup:
 For each workload, the table gives the **maximum lossless** step (every round of it lost
 nothing), then the highest step at p99 ≤ 1 s:
 
-| workload | 3 nodes | 10 nodes |
-|---|---|---|
-| durable QoS 1 (ack after fsync and a quorum copy) | 117,800 msg/s · 114,200 at ack p99 ≤ 1 s | 292,200 msg/s · 228,000 at ack p99 ≤ 1 s |
-| QoS 1, clean sessions | 270,800 msg/s · 152,000 at ack p99 ≤ 1 s | 875,900 msg/s · 303,800 at ack p99 ≤ 1 s |
-| QoS 0 | 340,300 msg/s · 253,200 at end-to-end p99 ≤ 1 s | 973,200 msg/s · 506,300 at end-to-end p99 ≤ 1 s |
+| workload | 1 node | 3 nodes | 10 nodes |
+|---|---|---|---|
+| durable QoS 1 (ack after fsync and a quorum copy) | 92,900 msg/s, one copy · the same at ack p99 ≤ 1 s | 117,800 msg/s · 114,200 at ack p99 ≤ 1 s | 292,200 msg/s · 228,000 at ack p99 ≤ 1 s |
+| QoS 1, clean sessions | 114,000 msg/s · the same at ack p99 ≤ 1 s | 270,800 msg/s · 152,000 at ack p99 ≤ 1 s | 875,900 msg/s · 303,800 at ack p99 ≤ 1 s |
+| QoS 0 | 123,100 msg/s · the same at end-to-end p99 ≤ 1 s | 340,300 msg/s · 253,200 at end-to-end p99 ≤ 1 s | 973,200 msg/s · 506,300 at end-to-end p99 ≤ 1 s |
 
 Per node, at the maximum lossless step:
 
-| workload | 3 nodes | 10 nodes |
-|---|---|---|
-| durable QoS 1 | 39.3k | 29.2k |
-| QoS 1, clean sessions | 90.3k | 87.6k |
-| QoS 0 | 113k | 97.3k |
+| workload | 1 node | 3 nodes | 10 nodes |
+|---|---|---|---|
+| durable QoS 1 | 92.9k (one copy) | 39.3k | 29.2k |
+| QoS 1, clean sessions | 114k | 90.3k | 87.6k |
+| QoS 0 | 123k | 113k | 97.3k |
 
 **How a figure is judged:**
 - **Carried:** a step counts only when every one of its rounds lost nothing. That's
@@ -46,6 +46,10 @@ Per node, at the maximum lossless step:
   end-to-end latency for QoS 0. It is the mean of the rounds' p99.
 - **Generators are calibrated:** a load generator that can't keep up voids its round,
   and a host that keeps voiding is replaced. So no figure here is the harness's.
+
+**One node** runs main `9520b33`, the candidate plus #1146. A lone node keeps one copy of a
+durable session, so its durable figure is fsync only and is not comparable with the
+clusters', which keep 2 copies.
 
 **Scaling from 3 to 10 nodes:**
 - **QoS 1 with clean sessions and QoS 0** hold close to their per-node rate.
