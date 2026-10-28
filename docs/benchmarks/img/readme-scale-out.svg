@@ -1,86 +1,83 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 606" width="900" height="606" role="img" aria-labelledby="t d">
-<title id="t">Per-node throughput holds from 3 to 10 nodes, durable QoS 1 included</title><desc id="d">Columns are msg/s per node at 3 and 10 nodes; the cluster total is printed above each column. A filled green column was certified GREEN by the rig (p99 ≤ 1 s, zero loss); a green outline holds by the reading rule (zero loss, p99 ≤ 1 s) and was not certified; a yellow cap was carried with zero loss at p99 ≤ 5 s; an arrow marks the top of the ladder that was run. Durable QoS 1, default store (redb), 3 nodes: 19.3k msg/s per node, 57,973 msg/s in total, holds, not certified; Durable QoS 1, default store (redb), 10 nodes: 18.5k msg/s per node, 185,376 msg/s in total, holds, not certified; Durable QoS 1, log store (experimental in 1.2.0), 3 nodes: 30.0k msg/s per node, 90,003 msg/s in total, certified GREEN; Durable QoS 1, log store (experimental in 1.2.0), 10 nodes: 27.0k msg/s per node, 270,034 msg/s in total, certified GREEN; QoS 1, clean sessions, 3 nodes: 50.0k msg/s per node, 150,002 msg/s in total, certified GREEN, the top of the ladder run; QoS 1, clean sessions, 10 nodes: 45.0k msg/s per node, 449,995 msg/s in total, holds, not certified, the top of the ladder run; QoS 0, 3 nodes: 120k msg/s per node, 360,000 msg/s in total, certified GREEN, the top of the ladder run; QoS 0, 10 nodes: 114k msg/s per node, 1,140,000 msg/s in total, holds, not certified; YELLOW at 1,200,000 msg/s (p99 ≤ 5 s, zero loss). Durable QoS 1 and QoS 1 clean sessions on the 1.2.0 release candidate ec407218, 2026-10-21; QoS 0 on main 0a08187, 2026-09-26.</desc>
+<title id="t">Throughput per node from 3 to 10 nodes, no message lost on any column</title><desc id="d">Columns are msg/s per node at 3 and 10 nodes; the cluster total is printed above each column. The green part is the highest step carried at p99 ≤ 1 s; a yellow cap reaches the maximum lossless step when it ran at p99 ≤ 5 s, a red cap when it ran above. Durable QoS 1, 3 nodes: 39.3k msg/s per node lossless, 117,800 msg/s in total (maximum lossless; ack p99 1.35 s); 114,200 msg/s at p99 ≤ 1 s (ack p99 708 ms); Durable QoS 1, 10 nodes: 29.2k msg/s per node lossless, 292,200 msg/s in total (maximum lossless; ack p99 1.37 s); 228,000 msg/s at p99 ≤ 1 s (ack p99 59 ms); QoS 1, clean sessions, 3 nodes: 90.3k msg/s per node lossless, 270,800 msg/s in total (maximum lossless; ack p99 3.31 s); 152,000 msg/s at p99 ≤ 1 s (ack p99 67 ms); QoS 1, clean sessions, 10 nodes: 87.6k msg/s per node lossless, 875,900 msg/s in total (maximum lossless; ack p99 4.54 s); 303,800 msg/s at p99 ≤ 1 s (ack p99 85 ms); QoS 0, 3 nodes: 113k msg/s per node lossless, 340,300 msg/s in total (maximum lossless; end-to-end p99 2.52 s); 253,200 msg/s at p99 ≤ 1 s (end-to-end p99 547 ms); QoS 0, 10 nodes: 97.3k msg/s per node lossless, 973,200 msg/s in total (maximum lossless; end-to-end p99 4.49 s); 506,300 msg/s at p99 ≤ 1 s (end-to-end p99 395 ms).</desc>
 <style>text{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-kerning:normal}.num{font-variant-numeric:tabular-nums}.f-surface{fill:#fcfcfb}.k-surface{stroke:#fcfcfb}.f-border{fill:#e1e0d9}.k-border{stroke:#e1e0d9}.f-ink{fill:#0b0b0b}.k-ink{stroke:#0b0b0b}.f-ink2{fill:#52514e}.k-ink2{stroke:#52514e}.f-muted{fill:#898781}.k-muted{stroke:#898781}.f-grid{fill:#eceae4}.k-grid{stroke:#eceae4}.f-axis{fill:#c3c2b7}.k-axis{stroke:#c3c2b7}.f-good{fill:#0ca30c}.k-good{stroke:#0ca30c}.f-warn{fill:#fab219}.k-warn{stroke:#fab219}.f-crit{fill:#d03b3b}.k-crit{stroke:#d03b3b}.f-ghost{fill:#898781}.k-ghost{stroke:#898781}.f-s1{fill:#2a78d6}.k-s1{stroke:#2a78d6}.f-s2{fill:#eb6834}.k-s2{stroke:#eb6834}.f-s3{fill:#1baf7a}.k-s3{stroke:#1baf7a}.f-s4{fill:#4a3aa7}.k-s4{stroke:#4a3aa7}@media (prefers-color-scheme:dark){.f-surface{fill:#1a1a19}.k-surface{stroke:#1a1a19}.f-border{fill:#2c2c2a}.k-border{stroke:#2c2c2a}.f-ink{fill:#ffffff}.k-ink{stroke:#ffffff}.f-ink2{fill:#c3c2b7}.k-ink2{stroke:#c3c2b7}.f-muted{fill:#898781}.k-muted{stroke:#898781}.f-grid{fill:#262624}.k-grid{stroke:#262624}.f-axis{fill:#383835}.k-axis{stroke:#383835}.f-good{fill:#0ca30c}.k-good{stroke:#0ca30c}.f-warn{fill:#fab219}.k-warn{stroke:#fab219}.f-crit{fill:#d03b3b}.k-crit{stroke:#d03b3b}.f-ghost{fill:#6f6e69}.k-ghost{stroke:#6f6e69}.f-s1{fill:#3987e5}.k-s1{stroke:#3987e5}.f-s2{fill:#d95926}.k-s2{stroke:#d95926}.f-s3{fill:#199e70}.k-s3{stroke:#199e70}.f-s4{fill:#9085e9}.k-s4{stroke:#9085e9}}</style>
 <rect x="0.5" y="0.5" width="899" height="605" rx="14" class="f-surface k-border"/>
-<text x="32" y="42" font-size="20" font-weight="650" class="f-ink">Per-node throughput holds from 3 to 10 nodes, durable QoS 1 included</text>
-<text x="32" y="64" font-size="13" class="f-ink2">msg/s per 4-vCPU node from the brokers' own counters · no message lost on any bar · measured on 1.2.0, 2026-10-21</text>
-<text x="32.0" y="84.0" font-size="13" text-anchor="start" class="f-ink2">Cluster totals above each column. QoS 0 was measured on main 0a08187 (2026-09-26), before 1.2.0.</text>
+<text x="32" y="42" font-size="20" font-weight="650" class="f-ink">Throughput per node from 3 to 10 nodes, no message lost on any column</text>
+<text x="32" y="64" font-size="13" class="f-ink2">msg/s per 4-vCPU node from the brokers' own counters · 3 rounds a step · measured on 1.3.0 candidate edfdb49, 2026-10-27 to 2026-10-28</text>
+<text x="32.0" y="84.0" font-size="13" text-anchor="start" class="f-ink2">Cluster totals above each column · p99 is the ack latency for QoS 1 and the end-to-end latency for QoS 0, the mean of the rounds</text>
 <rect x="32.0" y="109.0" width="12" height="12" rx="3" class="f-good"/>
-<text x="51.0" y="120.0" font-size="12" text-anchor="start" class="f-ink2">certified GREEN · p99 ≤ 1 s, zero loss</text>
-<rect x="309.2" y="109.0" width="12" height="12" rx="3" fill="none" class="k-good" stroke-width="2"/>
-<text x="327.2" y="120.0" font-size="12" text-anchor="start" class="f-ink2">holds: zero loss, p99 ≤ 1 s · not certified</text>
-<rect x="616.4" y="109.0" width="12" height="12" rx="3" class="f-warn"/>
-<text x="635.4" y="120.0" font-size="12" text-anchor="start" class="f-ink2">YELLOW · zero loss, p99 ≤ 5 s</text>
-<rect x="20" y="144" width="478" height="406" rx="10" class="f-grid" fill-opacity="0.55"/>
-<text x="32.0" y="166.0" font-size="13" font-weight="650" text-anchor="start" class="f-ink">Durable QoS 1 · every ack after fsync + 2-copy quorum replication</text>
-<line x1="84.0" y1="466.0" x2="486.0" y2="466.0" class="k-axis" stroke-width="1"/>
+<text x="51.0" y="120.0" font-size="12" text-anchor="start" class="f-ink2">GREEN · carried at p99 ≤ 1 s</text>
+<rect x="244.2" y="109.0" width="12" height="12" rx="3" class="f-warn"/>
+<text x="263.2" y="120.0" font-size="12" text-anchor="start" class="f-ink2">YELLOW · lossless, p99 ≤ 5 s</text>
+<rect x="20" y="144" width="352" height="406" rx="10" class="f-grid" fill-opacity="0.55"/>
+<text x="32.0" y="166.0" font-size="13" font-weight="650" text-anchor="start" class="f-ink">Durable QoS 1</text>
+<line x1="84.0" y1="466.0" x2="360.0" y2="466.0" class="k-axis" stroke-width="1"/>
 <text x="76.0" y="470.0" font-size="11" text-anchor="end" class="f-muted num">0</text>
-<line x1="84.0" y1="398.5" x2="486.0" y2="398.5" class="k-grid" stroke-width="1"/>
-<text x="76.0" y="402.5" font-size="11" text-anchor="end" class="f-muted num">10k</text>
-<line x1="84.0" y1="331.0" x2="486.0" y2="331.0" class="k-grid" stroke-width="1"/>
-<text x="76.0" y="335.0" font-size="11" text-anchor="end" class="f-muted num">20k</text>
-<line x1="84.0" y1="263.5" x2="486.0" y2="263.5" class="k-grid" stroke-width="1"/>
-<text x="76.0" y="267.5" font-size="11" text-anchor="end" class="f-muted num">30k</text>
-<line x1="84.0" y1="196.0" x2="486.0" y2="196.0" class="k-grid" stroke-width="1"/>
-<text x="76.0" y="200.0" font-size="11" text-anchor="end" class="f-muted num">40k</text>
+<line x1="84.0" y1="412.0" x2="360.0" y2="412.0" class="k-grid" stroke-width="1"/>
+<text x="76.0" y="416.0" font-size="11" text-anchor="end" class="f-muted num">10k</text>
+<line x1="84.0" y1="358.0" x2="360.0" y2="358.0" class="k-grid" stroke-width="1"/>
+<text x="76.0" y="362.0" font-size="11" text-anchor="end" class="f-muted num">20k</text>
+<line x1="84.0" y1="304.0" x2="360.0" y2="304.0" class="k-grid" stroke-width="1"/>
+<text x="76.0" y="308.0" font-size="11" text-anchor="end" class="f-muted num">30k</text>
+<line x1="84.0" y1="250.0" x2="360.0" y2="250.0" class="k-grid" stroke-width="1"/>
+<text x="76.0" y="254.0" font-size="11" text-anchor="end" class="f-muted num">40k</text>
+<line x1="84.0" y1="196.0" x2="360.0" y2="196.0" class="k-grid" stroke-width="1"/>
+<text x="76.0" y="200.0" font-size="11" text-anchor="end" class="f-muted num">50k</text>
 <text x="44.0" y="184.0" font-size="10" text-anchor="start" class="f-muted">msg/s per node</text>
-<path d="M137.7,466.0 V340.6 Q137.7,336.6 141.7,336.6 H185.7 Q189.7,336.6 189.7,340.6 V466.0" fill="none" class="k-good" stroke-width="2" data-bar="holds"/>
-<text x="163.7" y="327.6" font-size="11" text-anchor="middle" class="f-ink2 num">58k total</text>
-<text x="163.7" y="312.6" font-size="15" font-weight="650" text-anchor="middle" class="f-ink num">19.3k</text>
-<text x="163.7" y="484.0" font-size="12" font-weight="600" text-anchor="middle" class="f-ink">3 nodes</text>
-<path d="M205.7,466.0 V345.9 Q205.7,341.9 209.7,341.9 H253.7 Q257.7,341.9 257.7,345.9 V466.0" fill="none" class="k-good" stroke-width="2" data-bar="holds"/>
-<text x="231.7" y="332.9" font-size="11" text-anchor="middle" class="f-ink2 num">185k total</text>
-<text x="231.7" y="317.9" font-size="15" font-weight="650" text-anchor="middle" class="f-ink num">18.5k</text>
-<text x="231.7" y="484.0" font-size="12" font-weight="600" text-anchor="middle" class="f-ink">10 nodes</text>
-<text x="197.7" y="508.0" font-size="13" font-weight="650" text-anchor="middle" class="f-ink">default store (redb)</text>
-<text x="197.7" y="525.0" font-size="11" text-anchor="middle" class="f-muted">the 1.2.0 default</text>
-<path d="M311.3,466.0 V267.5 Q311.3,263.5 315.3,263.5 H361.3 Q365.3,263.5 365.3,267.5 V466.0 Z" class="f-good"/>
-<text x="338.3" y="255.5" font-size="11" text-anchor="middle" class="f-ink2 num">90k total</text>
-<text x="338.3" y="240.5" font-size="15" font-weight="650" text-anchor="middle" class="f-ink num">30.0k</text>
-<text x="338.3" y="484.0" font-size="12" font-weight="600" text-anchor="middle" class="f-ink">3 nodes</text>
-<path d="M379.3,466.0 V287.7 Q379.3,283.7 383.3,283.7 H429.3 Q433.3,283.7 433.3,287.7 V466.0 Z" class="f-good"/>
-<text x="406.3" y="275.7" font-size="11" text-anchor="middle" class="f-ink2 num">270k total</text>
-<text x="406.3" y="260.7" font-size="15" font-weight="650" text-anchor="middle" class="f-ink num">27.0k</text>
-<text x="406.3" y="484.0" font-size="12" font-weight="600" text-anchor="middle" class="f-ink">10 nodes</text>
-<text x="372.3" y="508.0" font-size="13" font-weight="650" text-anchor="middle" class="f-ink">log store</text>
-<text x="372.3" y="525.0" font-size="11" text-anchor="middle" class="f-muted">experimental in 1.2.0</text>
-<text x="516.0" y="166.0" font-size="13" font-weight="650" text-anchor="start" class="f-ink">Not durable</text>
-<line x1="568.0" y1="466.0" x2="868.0" y2="466.0" class="k-axis" stroke-width="1"/>
-<text x="560.0" y="470.0" font-size="11" text-anchor="end" class="f-muted num">0</text>
-<line x1="568.0" y1="398.5" x2="868.0" y2="398.5" class="k-grid" stroke-width="1"/>
-<text x="560.0" y="402.5" font-size="11" text-anchor="end" class="f-muted num">40k</text>
-<line x1="568.0" y1="331.0" x2="868.0" y2="331.0" class="k-grid" stroke-width="1"/>
-<text x="560.0" y="335.0" font-size="11" text-anchor="end" class="f-muted num">80k</text>
-<line x1="568.0" y1="263.5" x2="868.0" y2="263.5" class="k-grid" stroke-width="1"/>
-<text x="560.0" y="267.5" font-size="11" text-anchor="end" class="f-muted num">120k</text>
-<line x1="568.0" y1="196.0" x2="868.0" y2="196.0" class="k-grid" stroke-width="1"/>
-<text x="560.0" y="200.0" font-size="11" text-anchor="end" class="f-muted num">160k</text>
-<text x="528.0" y="184.0" font-size="10" text-anchor="start" class="f-muted">msg/s per node</text>
-<path d="M586.7,466.0 V385.6 Q586.7,381.6 590.7,381.6 H636.7 Q640.7,381.6 640.7,385.6 V466.0 Z" class="f-good"/>
-<path d="M613.7,375.6 V355.6 M608.7,361.6 L613.7,354.6 L618.7,361.6" fill="none" class="k-good" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-<text x="613.7" y="345.6" font-size="11" text-anchor="middle" class="f-ink2 num">150k total</text>
-<text x="613.7" y="330.6" font-size="15" font-weight="650" text-anchor="middle" class="f-ink num">≥ 50.0k</text>
-<text x="613.7" y="484.0" font-size="12" font-weight="600" text-anchor="middle" class="f-ink">3 nodes</text>
-<path d="M655.7,466.0 V395.1 Q655.7,391.1 659.7,391.1 H703.7 Q707.7,391.1 707.7,395.1 V466.0" fill="none" class="k-good" stroke-width="2" data-bar="holds"/>
-<path d="M681.7,384.1 V364.1 M676.7,370.1 L681.7,363.1 L686.7,370.1" fill="none" class="k-good" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-<text x="681.7" y="354.1" font-size="11" text-anchor="middle" class="f-ink2 num">450k total</text>
-<text x="681.7" y="339.1" font-size="15" font-weight="650" text-anchor="middle" class="f-ink num">≥ 45.0k</text>
-<text x="681.7" y="484.0" font-size="12" font-weight="600" text-anchor="middle" class="f-ink">10 nodes</text>
-<text x="647.7" y="508.0" font-size="13" font-weight="650" text-anchor="middle" class="f-ink">QoS 1, clean sessions</text>
-<text x="647.7" y="525.0" font-size="11" text-anchor="middle" class="f-muted">routing path, no fsync</text>
-<path d="M727.3,466.0 V267.5 Q727.3,263.5 731.3,263.5 H777.3 Q781.3,263.5 781.3,267.5 V466.0 Z" class="f-good"/>
-<path d="M754.3,257.5 V237.5 M749.3,243.5 L754.3,236.5 L759.3,243.5" fill="none" class="k-good" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-<text x="754.3" y="227.5" font-size="11" text-anchor="middle" class="f-ink2 num">360k total</text>
-<text x="754.3" y="212.5" font-size="15" font-weight="650" text-anchor="middle" class="f-ink num">≥ 120k</text>
-<text x="754.3" y="484.0" font-size="12" font-weight="600" text-anchor="middle" class="f-ink">3 nodes</text>
-<path d="M796.3,466.0 V278.6 Q796.3,274.6 800.3,274.6 H844.3 Q848.3,274.6 848.3,278.6 V466.0" fill="none" class="k-good" stroke-width="2" data-bar="holds"/>
-<path d="M795.3,271.6 V267.5 Q795.3,263.5 799.3,263.5 H845.3 Q849.3,263.5 849.3,267.5 V271.6 Z" class="f-warn"/>
-<text x="822.3" y="255.5" font-size="11" text-anchor="middle" class="f-ink2 num">YELLOW 1.2M</text>
-<text x="822.3" y="240.5" font-size="11" text-anchor="middle" class="f-ink2 num">1.14M total</text>
-<text x="822.3" y="225.5" font-size="15" font-weight="650" text-anchor="middle" class="f-ink num">114k</text>
-<text x="822.3" y="484.0" font-size="12" font-weight="600" text-anchor="middle" class="f-ink">10 nodes</text>
-<text x="788.3" y="508.0" font-size="13" font-weight="650" text-anchor="middle" class="f-ink">QoS 0</text>
-<text x="788.3" y="525.0" font-size="11" text-anchor="middle" class="f-muted">at most once</text>
-<text x="32.0" y="570.0" font-size="11" text-anchor="start" class="f-muted">1.2.0 = the release candidate ec407218, built with the release recipe (v1.2.0 adds a TLS-library patch) · Hetzner CCX23 brokers · $share 1:1, 200 B · 60 s windows</text>
-<text x="32.0" y="588.0" font-size="11" text-anchor="start" class="f-muted">source: docs/benchmarks/data/headline.csv → bench/scale/durable-knees-2026-10-21.md · qos1-knees-2026-10-21.md · knee-3-5-7-10.md</text>
+<rect x="161.0" y="260.4" width="54.0" height="205.6" class="f-good"/>
+<path d="M161.0,258.4 V258.0 Q161.0,254.0 165.0,254.0 H211.0 Q215.0,254.0 215.0,258.0 V258.4 Z" class="f-warn"/>
+<text x="188.0" y="246.0" font-size="11" text-anchor="middle" class="f-ink2 num">≤ 1 s: 114k</text>
+<text x="188.0" y="231.0" font-size="11" text-anchor="middle" class="f-ink2 num">118k total</text>
+<text x="188.0" y="216.0" font-size="15" font-weight="650" text-anchor="middle" class="f-ink num">39.3k</text>
+<text x="188.0" y="484.0" font-size="12" font-weight="600" text-anchor="middle" class="f-ink">3 nodes</text>
+<rect x="229.0" y="342.9" width="54.0" height="123.1" class="f-good"/>
+<path d="M229.0,340.9 V312.2 Q229.0,308.2 233.0,308.2 H279.0 Q283.0,308.2 283.0,312.2 V340.9 Z" class="f-warn"/>
+<text x="256.0" y="300.2" font-size="11" text-anchor="middle" class="f-ink2 num">≤ 1 s: 228k</text>
+<text x="256.0" y="285.2" font-size="11" text-anchor="middle" class="f-ink2 num">292k total</text>
+<text x="256.0" y="270.2" font-size="15" font-weight="650" text-anchor="middle" class="f-ink num">29.2k</text>
+<text x="256.0" y="484.0" font-size="12" font-weight="600" text-anchor="middle" class="f-ink">10 nodes</text>
+<text x="222.0" y="508.0" font-size="13" font-weight="650" text-anchor="middle" class="f-ink">persistent sessions</text>
+<text x="222.0" y="525.0" font-size="11" text-anchor="middle" class="f-muted">ack after fsync + quorum copy</text>
+<text x="400.0" y="166.0" font-size="13" font-weight="650" text-anchor="start" class="f-ink">Not durable</text>
+<line x1="452.0" y1="466.0" x2="868.0" y2="466.0" class="k-axis" stroke-width="1"/>
+<text x="444.0" y="470.0" font-size="11" text-anchor="end" class="f-muted num">0</text>
+<line x1="452.0" y1="398.5" x2="868.0" y2="398.5" class="k-grid" stroke-width="1"/>
+<text x="444.0" y="402.5" font-size="11" text-anchor="end" class="f-muted num">40k</text>
+<line x1="452.0" y1="331.0" x2="868.0" y2="331.0" class="k-grid" stroke-width="1"/>
+<text x="444.0" y="335.0" font-size="11" text-anchor="end" class="f-muted num">80k</text>
+<line x1="452.0" y1="263.5" x2="868.0" y2="263.5" class="k-grid" stroke-width="1"/>
+<text x="444.0" y="267.5" font-size="11" text-anchor="end" class="f-muted num">120k</text>
+<line x1="452.0" y1="196.0" x2="868.0" y2="196.0" class="k-grid" stroke-width="1"/>
+<text x="444.0" y="200.0" font-size="11" text-anchor="end" class="f-muted num">160k</text>
+<text x="412.0" y="184.0" font-size="10" text-anchor="start" class="f-muted">msg/s per node</text>
+<rect x="509.3" y="380.5" width="54.0" height="85.5" class="f-good"/>
+<path d="M509.3,378.5 V317.7 Q509.3,313.7 513.3,313.7 H559.3 Q563.3,313.7 563.3,317.7 V378.5 Z" class="f-warn"/>
+<text x="536.3" y="305.7" font-size="11" text-anchor="middle" class="f-ink2 num">≤ 1 s: 152k</text>
+<text x="536.3" y="290.7" font-size="11" text-anchor="middle" class="f-ink2 num">271k total</text>
+<text x="536.3" y="275.7" font-size="15" font-weight="650" text-anchor="middle" class="f-ink num">90.3k</text>
+<text x="536.3" y="484.0" font-size="12" font-weight="600" text-anchor="middle" class="f-ink">3 nodes</text>
+<rect x="577.3" y="414.7" width="54.0" height="51.3" class="f-good"/>
+<path d="M577.3,412.7 V322.2 Q577.3,318.2 581.3,318.2 H627.3 Q631.3,318.2 631.3,322.2 V412.7 Z" class="f-warn"/>
+<text x="604.3" y="310.2" font-size="11" text-anchor="middle" class="f-ink2 num">≤ 1 s: 304k</text>
+<text x="604.3" y="295.2" font-size="11" text-anchor="middle" class="f-ink2 num">876k total</text>
+<text x="604.3" y="280.2" font-size="15" font-weight="650" text-anchor="middle" class="f-ink num">87.6k</text>
+<text x="604.3" y="484.0" font-size="12" font-weight="600" text-anchor="middle" class="f-ink">10 nodes</text>
+<text x="570.3" y="508.0" font-size="13" font-weight="650" text-anchor="middle" class="f-ink">QoS 1, clean sessions</text>
+<text x="570.3" y="525.0" font-size="11" text-anchor="middle" class="f-muted">routing path, no fsync</text>
+<rect x="688.7" y="323.6" width="54.0" height="142.4" class="f-good"/>
+<path d="M688.7,321.6 V278.6 Q688.7,274.6 692.7,274.6 H738.7 Q742.7,274.6 742.7,278.6 V321.6 Z" class="f-warn"/>
+<text x="715.7" y="266.6" font-size="11" text-anchor="middle" class="f-ink2 num">≤ 1 s: 253k</text>
+<text x="715.7" y="251.6" font-size="11" text-anchor="middle" class="f-ink2 num">340k total</text>
+<text x="715.7" y="236.6" font-size="15" font-weight="650" text-anchor="middle" class="f-ink num">113k</text>
+<text x="715.7" y="484.0" font-size="12" font-weight="600" text-anchor="middle" class="f-ink">3 nodes</text>
+<rect x="756.7" y="380.6" width="54.0" height="85.4" class="f-good"/>
+<path d="M756.7,378.6 V305.8 Q756.7,301.8 760.7,301.8 H806.7 Q810.7,301.8 810.7,305.8 V378.6 Z" class="f-warn"/>
+<text x="783.7" y="293.8" font-size="11" text-anchor="middle" class="f-ink2 num">≤ 1 s: 506k</text>
+<text x="783.7" y="278.8" font-size="11" text-anchor="middle" class="f-ink2 num">973k total</text>
+<text x="783.7" y="263.8" font-size="15" font-weight="650" text-anchor="middle" class="f-ink num">97.3k</text>
+<text x="783.7" y="484.0" font-size="12" font-weight="600" text-anchor="middle" class="f-ink">10 nodes</text>
+<text x="749.7" y="508.0" font-size="13" font-weight="650" text-anchor="middle" class="f-ink">QoS 0</text>
+<text x="749.7" y="525.0" font-size="11" text-anchor="middle" class="f-muted">at most once</text>
+<text x="32.0" y="570.0" font-size="11" text-anchor="start" class="f-muted">Hetzner CCX23 brokers (4 vCPU) · CCX33 load generators, calibrated before the ladder · $share, one member per broker, 200 B · 60 s windows</text>
+<text x="32.0" y="588.0" font-size="11" text-anchor="start" class="f-muted">source: docs/benchmarks/data/headline.csv → docs/benchmarks/RIG2-RESULTS.md (bench/scale/rig2, ADR 0090)</text>
 </svg>

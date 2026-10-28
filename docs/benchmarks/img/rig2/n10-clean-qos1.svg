@@ -1,0 +1,125 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 560" width="960" height="560" role="img" aria-labelledby="t d">
+<title id="t">Clean QoS 1, 10 nodes: 875,900 msg/s lossless, ack p99 mean 4.5 s</title><desc id="d">ack p99 and p50 by offered msg/s for every step of the ladder</desc>
+<style>text{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-kerning:normal}.num{font-variant-numeric:tabular-nums}.f-surface{fill:#fcfcfb}.k-surface{stroke:#fcfcfb}.f-border{fill:#e1e0d9}.k-border{stroke:#e1e0d9}.f-ink{fill:#0b0b0b}.k-ink{stroke:#0b0b0b}.f-ink2{fill:#52514e}.k-ink2{stroke:#52514e}.f-muted{fill:#898781}.k-muted{stroke:#898781}.f-grid{fill:#eceae4}.k-grid{stroke:#eceae4}.f-axis{fill:#c3c2b7}.k-axis{stroke:#c3c2b7}.f-good{fill:#0ca30c}.k-good{stroke:#0ca30c}.f-warn{fill:#fab219}.k-warn{stroke:#fab219}.f-crit{fill:#d03b3b}.k-crit{stroke:#d03b3b}.f-ghost{fill:#898781}.k-ghost{stroke:#898781}.f-s1{fill:#2a78d6}.k-s1{stroke:#2a78d6}.f-s2{fill:#eb6834}.k-s2{stroke:#eb6834}.f-s3{fill:#1baf7a}.k-s3{stroke:#1baf7a}.f-s4{fill:#4a3aa7}.k-s4{stroke:#4a3aa7}@media (prefers-color-scheme:dark){.f-surface{fill:#1a1a19}.k-surface{stroke:#1a1a19}.f-border{fill:#2c2c2a}.k-border{stroke:#2c2c2a}.f-ink{fill:#ffffff}.k-ink{stroke:#ffffff}.f-ink2{fill:#c3c2b7}.k-ink2{stroke:#c3c2b7}.f-muted{fill:#898781}.k-muted{stroke:#898781}.f-grid{fill:#262624}.k-grid{stroke:#262624}.f-axis{fill:#383835}.k-axis{stroke:#383835}.f-good{fill:#0ca30c}.k-good{stroke:#0ca30c}.f-warn{fill:#fab219}.k-warn{stroke:#fab219}.f-crit{fill:#d03b3b}.k-crit{stroke:#d03b3b}.f-ghost{fill:#6f6e69}.k-ghost{stroke:#6f6e69}.f-s1{fill:#3987e5}.k-s1{stroke:#3987e5}.f-s2{fill:#d95926}.k-s2{stroke:#d95926}.f-s3{fill:#199e70}.k-s3{stroke:#199e70}.f-s4{fill:#9085e9}.k-s4{stroke:#9085e9}}</style>
+<rect x="0.5" y="0.5" width="959" height="559" rx="14" class="f-surface k-border"/>
+<text x="32" y="42" font-size="20" font-weight="650" class="f-ink">Clean QoS 1, 10 nodes: 875,900 msg/s lossless, ack p99 mean 4.5 s</text>
+<text x="32" y="64" font-size="13" class="f-ink2">tier n10: 10 × ccx23 brokers, 4 × ccx33 generator · clean-qos1 · 200 B payload · 3 rounds a step: means, bars min–max · 2026-10-27 · UNRELEASED binary</text>
+<rect x="92.0" y="175.6" width="836.0" height="286.4" class="f-good" fill-opacity="0.08"/>
+<rect x="911.0" y="182.6" width="9" height="9" rx="2" class="f-good"/>
+<text x="906.0" y="191.1" font-size="11" font-weight="600" text-anchor="end" class="f-ink2">GREEN · p99 ≤ 1 s</text>
+<rect x="92.0" y="125.6" width="836.0" height="50.0" class="f-warn" fill-opacity="0.14"/>
+<rect x="911.0" y="132.6" width="9" height="9" rx="2" class="f-warn"/>
+<text x="906.0" y="141.1" font-size="11" font-weight="600" text-anchor="end" class="f-ink2">YELLOW · ≤ 5 s</text>
+<rect x="92.0" y="104.0" width="836.0" height="21.6" class="f-crit" fill-opacity="0.08"/>
+<rect x="911.0" y="111.0" width="9" height="9" rx="2" class="f-crit"/>
+<text x="906.0" y="119.5" font-size="11" font-weight="600" text-anchor="end" class="f-ink2">RED · &gt; 5 s</text>
+<line x1="92.0" y1="462.0" x2="928.0" y2="462.0" class="k-grid" stroke-width="1"/>
+<text x="82.0" y="466.0" font-size="11" text-anchor="end" class="f-muted num">0.1 ms</text>
+<line x1="92.0" y1="390.4" x2="928.0" y2="390.4" class="k-grid" stroke-width="1"/>
+<text x="82.0" y="394.4" font-size="11" text-anchor="end" class="f-muted num">1 ms</text>
+<line x1="92.0" y1="318.8" x2="928.0" y2="318.8" class="k-grid" stroke-width="1"/>
+<text x="82.0" y="322.8" font-size="11" text-anchor="end" class="f-muted num">10 ms</text>
+<line x1="92.0" y1="247.2" x2="928.0" y2="247.2" class="k-grid" stroke-width="1"/>
+<text x="82.0" y="251.2" font-size="11" text-anchor="end" class="f-muted num">100 ms</text>
+<line x1="92.0" y1="175.6" x2="928.0" y2="175.6" class="k-grid" stroke-width="1"/>
+<text x="82.0" y="179.6" font-size="11" text-anchor="end" class="f-muted num">1 s</text>
+<line x1="92.0" y1="104.0" x2="928.0" y2="104.0" class="k-grid" stroke-width="1"/>
+<text x="82.0" y="108.0" font-size="11" text-anchor="end" class="f-muted num">10 s</text>
+<line x1="92.0" y1="104.0" x2="92.0" y2="462.0" class="k-grid" stroke-width="1"/>
+<text x="92.0" y="480.0" font-size="11" text-anchor="middle" class="f-muted num">0</text>
+<line x1="259.2" y1="104.0" x2="259.2" y2="462.0" class="k-grid" stroke-width="1"/>
+<text x="259.2" y="480.0" font-size="11" text-anchor="middle" class="f-muted num">250k</text>
+<line x1="426.4" y1="104.0" x2="426.4" y2="462.0" class="k-grid" stroke-width="1"/>
+<text x="426.4" y="480.0" font-size="11" text-anchor="middle" class="f-muted num">500k</text>
+<line x1="593.6" y1="104.0" x2="593.6" y2="462.0" class="k-grid" stroke-width="1"/>
+<text x="593.6" y="480.0" font-size="11" text-anchor="middle" class="f-muted num">750k</text>
+<line x1="760.8" y1="104.0" x2="760.8" y2="462.0" class="k-grid" stroke-width="1"/>
+<text x="760.8" y="480.0" font-size="11" text-anchor="middle" class="f-muted num">1M</text>
+<line x1="928.0" y1="104.0" x2="928.0" y2="462.0" class="k-grid" stroke-width="1"/>
+<text x="928.0" y="480.0" font-size="11" text-anchor="middle" class="f-muted num">1.25M</text>
+<line x1="92.0" y1="462.0" x2="928.0" y2="462.0" class="k-axis" stroke-width="1"/>
+<text x="510.0" y="502.0" font-size="12" text-anchor="middle" class="f-ink2">offered msg/s</text>
+<text x="28" y="283.0" font-size="12" text-anchor="middle" class="f-ink2" transform="rotate(-90 28 283.0)">ack latency (log)</text>
+<polyline points="152.2,398.3 182.3,395.4 227.4,387.4 295.2,323.2 396.8,275.5 549.2,202.7 663.5,178.3 677.8,172.8" fill="none" class="k-s1" stroke-width="1.5" stroke-opacity="0.4" stroke-linejoin="round"/>
+<polyline points="152.2,378.0 182.3,350.7 227.4,300.3 295.2,252.3 396.8,173.5 549.2,142.4 663.5,129.2 677.8,128.6" fill="none" class="k-s1" stroke-width="2" stroke-opacity="1" stroke-linejoin="round"/>
+<line x1="152.2" y1="397.9" x2="152.2" y2="398.7" class="k-s1" stroke-width="1.5" stroke-opacity="0.45"/>
+<line x1="149.2" y1="398.7" x2="155.2" y2="398.7" class="k-s1" stroke-width="1.5" stroke-opacity="0.45"/>
+<line x1="149.2" y1="397.9" x2="155.2" y2="397.9" class="k-s1" stroke-width="1.5" stroke-opacity="0.45"/>
+<line x1="152.2" y1="377.1" x2="152.2" y2="378.7" class="k-s1" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="147.7" y1="378.7" x2="156.7" y2="378.7" class="k-s1" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="147.7" y1="377.1" x2="156.7" y2="377.1" class="k-s1" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="182.3" y1="395.1" x2="182.3" y2="395.9" class="k-s1" stroke-width="1.5" stroke-opacity="0.45"/>
+<line x1="179.3" y1="395.9" x2="185.3" y2="395.9" class="k-s1" stroke-width="1.5" stroke-opacity="0.45"/>
+<line x1="179.3" y1="395.1" x2="185.3" y2="395.1" class="k-s1" stroke-width="1.5" stroke-opacity="0.45"/>
+<line x1="182.3" y1="349.1" x2="182.3" y2="352.9" class="k-s1" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="177.8" y1="352.9" x2="186.8" y2="352.9" class="k-s1" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="177.8" y1="349.1" x2="186.8" y2="349.1" class="k-s1" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="227.4" y1="387.0" x2="227.4" y2="387.9" class="k-s1" stroke-width="1.5" stroke-opacity="0.45"/>
+<line x1="224.4" y1="387.9" x2="230.4" y2="387.9" class="k-s1" stroke-width="1.5" stroke-opacity="0.45"/>
+<line x1="224.4" y1="387.0" x2="230.4" y2="387.0" class="k-s1" stroke-width="1.5" stroke-opacity="0.45"/>
+<line x1="227.4" y1="298.0" x2="227.4" y2="302.2" class="k-s1" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="222.9" y1="302.2" x2="231.9" y2="302.2" class="k-s1" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="222.9" y1="298.0" x2="231.9" y2="298.0" class="k-s1" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="295.2" y1="322.9" x2="295.2" y2="323.4" class="k-s1" stroke-width="1.5" stroke-opacity="0.45"/>
+<line x1="292.2" y1="323.4" x2="298.2" y2="323.4" class="k-s1" stroke-width="1.5" stroke-opacity="0.45"/>
+<line x1="292.2" y1="322.9" x2="298.2" y2="322.9" class="k-s1" stroke-width="1.5" stroke-opacity="0.45"/>
+<line x1="295.2" y1="251.9" x2="295.2" y2="252.8" class="k-s1" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="290.7" y1="252.8" x2="299.7" y2="252.8" class="k-s1" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="290.7" y1="251.9" x2="299.7" y2="251.9" class="k-s1" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="396.8" y1="275.1" x2="396.8" y2="276.1" class="k-s1" stroke-width="1.5" stroke-opacity="0.45"/>
+<line x1="393.8" y1="276.1" x2="399.8" y2="276.1" class="k-s1" stroke-width="1.5" stroke-opacity="0.45"/>
+<line x1="393.8" y1="275.1" x2="399.8" y2="275.1" class="k-s1" stroke-width="1.5" stroke-opacity="0.45"/>
+<line x1="396.8" y1="173.2" x2="396.8" y2="174.0" class="k-s1" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="392.3" y1="174.0" x2="401.3" y2="174.0" class="k-s1" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="392.3" y1="173.2" x2="401.3" y2="173.2" class="k-s1" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="549.2" y1="201.9" x2="549.2" y2="203.6" class="k-s1" stroke-width="1.5" stroke-opacity="0.45"/>
+<line x1="546.2" y1="203.6" x2="552.2" y2="203.6" class="k-s1" stroke-width="1.5" stroke-opacity="0.45"/>
+<line x1="546.2" y1="201.9" x2="552.2" y2="201.9" class="k-s1" stroke-width="1.5" stroke-opacity="0.45"/>
+<line x1="549.2" y1="142.0" x2="549.2" y2="142.9" class="k-s1" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="544.7" y1="142.9" x2="553.7" y2="142.9" class="k-s1" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="544.7" y1="142.0" x2="553.7" y2="142.0" class="k-s1" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="663.5" y1="176.6" x2="663.5" y2="179.6" class="k-s1" stroke-width="1.5" stroke-opacity="0.45"/>
+<line x1="660.5" y1="179.6" x2="666.5" y2="179.6" class="k-s1" stroke-width="1.5" stroke-opacity="0.45"/>
+<line x1="660.5" y1="176.6" x2="666.5" y2="176.6" class="k-s1" stroke-width="1.5" stroke-opacity="0.45"/>
+<line x1="663.5" y1="128.8" x2="663.5" y2="129.5" class="k-s1" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="659.0" y1="129.5" x2="668.0" y2="129.5" class="k-s1" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="659.0" y1="128.8" x2="668.0" y2="128.8" class="k-s1" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="677.8" y1="171.4" x2="677.8" y2="173.8" class="k-s1" stroke-width="1.5" stroke-opacity="0.45"/>
+<line x1="674.8" y1="173.8" x2="680.8" y2="173.8" class="k-s1" stroke-width="1.5" stroke-opacity="0.45"/>
+<line x1="674.8" y1="171.4" x2="680.8" y2="171.4" class="k-s1" stroke-width="1.5" stroke-opacity="0.45"/>
+<line x1="677.8" y1="128.1" x2="677.8" y2="129.0" class="k-s1" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="673.3" y1="129.0" x2="682.3" y2="129.0" class="k-s1" stroke-width="1.5" stroke-opacity="0.85"/>
+<line x1="673.3" y1="128.1" x2="682.3" y2="128.1" class="k-s1" stroke-width="1.5" stroke-opacity="0.85"/>
+<circle cx="152.2" cy="398.3" r="3.5" class="f-s1 k-surface" stroke-width="2" fill-opacity="0.45"><title>step 1: 90,000 msg/s offered, CARRIED; ack p50 0.8 ms, p99 1.5 ms (means of 3 rounds; p99 1.5 ms to 1.5 ms)</title></circle>
+<circle cx="152.2" cy="378.0" r="5" class="f-s1 k-surface" stroke-width="2"><title>step 1: 90,000 msg/s offered, CARRIED; ack p50 0.8 ms, p99 1.5 ms (means of 3 rounds; p99 1.5 ms to 1.5 ms)</title></circle>
+<circle cx="182.3" cy="395.4" r="3.5" class="f-s1 k-surface" stroke-width="2" fill-opacity="0.45"><title>step 2: 135,000 msg/s offered, CARRIED; ack p50 0.9 ms, p99 3.6 ms (means of 3 rounds; p99 3.3 ms to 3.8 ms)</title></circle>
+<circle cx="182.3" cy="350.7" r="5" class="f-s1 k-surface" stroke-width="2"><title>step 2: 135,000 msg/s offered, CARRIED; ack p50 0.9 ms, p99 3.6 ms (means of 3 rounds; p99 3.3 ms to 3.8 ms)</title></circle>
+<circle cx="227.4" cy="387.4" r="3.5" class="f-s1 k-surface" stroke-width="2" fill-opacity="0.45"><title>step 3: 202,500 msg/s offered, CARRIED; ack p50 1.1 ms, p99 18 ms (means of 3 rounds; p99 17 ms to 20 ms)</title></circle>
+<circle cx="227.4" cy="300.3" r="5" class="f-s1 k-surface" stroke-width="2"><title>step 3: 202,500 msg/s offered, CARRIED; ack p50 1.1 ms, p99 18 ms (means of 3 rounds; p99 17 ms to 20 ms)</title></circle>
+<circle cx="295.2" cy="323.2" r="3.5" class="f-s1 k-surface" stroke-width="2" fill-opacity="0.45"><title>step 4: 303,800 msg/s offered, CARRIED; ack p50 8.7 ms, p99 85 ms (means of 3 rounds; p99 84 ms to 86 ms)</title></circle>
+<circle cx="295.2" cy="252.3" r="5" class="f-s1 k-surface" stroke-width="2"><title>step 4: 303,800 msg/s offered, CARRIED; ack p50 8.7 ms, p99 85 ms (means of 3 rounds; p99 84 ms to 86 ms)</title></circle>
+<circle cx="396.8" cy="275.5" r="3.5" class="f-s1 k-surface" stroke-width="2" fill-opacity="0.45"><title>step 5: 455,700 msg/s offered, CARRIED; ack p50 40 ms, p99 1.1 s (means of 3 rounds; p99 1.1 s to 1.1 s)</title></circle>
+<circle cx="396.8" cy="173.5" r="5" class="f-s1 k-surface" stroke-width="2"><title>step 5: 455,700 msg/s offered, CARRIED; ack p50 40 ms, p99 1.1 s (means of 3 rounds; p99 1.1 s to 1.1 s)</title></circle>
+<circle cx="549.2" cy="202.7" r="3.5" class="f-s1 k-surface" stroke-width="2" fill-opacity="0.45"><title>step 6: 683,600 msg/s offered, CARRIED; ack p50 418 ms, p99 2.9 s (means of 3 rounds; p99 2.9 s to 2.9 s)</title></circle>
+<circle cx="549.2" cy="142.4" r="5" class="f-s1 k-surface" stroke-width="2"><title>step 6: 683,600 msg/s offered, CARRIED; ack p50 418 ms, p99 2.9 s (means of 3 rounds; p99 2.9 s to 2.9 s)</title></circle>
+<circle cx="663.5" cy="178.3" r="3.5" class="f-s1 k-surface" stroke-width="2" fill-opacity="0.45"><title>step 8: 854,500 msg/s offered, CARRIED; ack p50 918 ms, p99 4.4 s (means of 3 rounds; p99 4.4 s to 4.5 s)</title></circle>
+<circle cx="663.5" cy="129.2" r="5" class="f-s1 k-surface" stroke-width="2"><title>step 8: 854,500 msg/s offered, CARRIED; ack p50 918 ms, p99 4.4 s (means of 3 rounds; p99 4.4 s to 4.5 s)</title></circle>
+<circle cx="677.8" cy="172.8" r="3.5" class="f-s1 k-surface" stroke-width="2" fill-opacity="0.45"><title>step 11: 875,900 msg/s offered, CARRIED; ack p50 1.1 s, p99 4.5 s (means of 3 rounds; p99 4.5 s to 4.6 s)</title></circle>
+<circle cx="677.8" cy="128.6" r="5" class="f-s1 k-surface" stroke-width="2"><title>step 11: 875,900 msg/s offered, CARRIED; ack p50 1.1 s, p99 4.5 s (means of 3 rounds; p99 4.5 s to 4.6 s)</title></circle>
+<circle cx="692.1" cy="171.9" r="3.5" fill="none" class="k-crit" stroke-width="2" stroke-opacity="0.6"><title>step 10: 897,300 msg/s offered, DISCONNECTED; ack p50 1.1 s, p99 4.9 s</title></circle>
+<circle cx="692.1" cy="126.2" r="5" fill="none" class="k-crit" stroke-width="2"><title>step 10: 897,300 msg/s offered, DISCONNECTED; ack p50 1.1 s, p99 4.9 s</title></circle>
+<circle cx="720.7" cy="167.7" r="3.5" fill="none" class="k-crit" stroke-width="2" stroke-opacity="0.6"><title>step 9: 940,000 msg/s offered, OFFER NOT TAKEN; ack p50 1.3 s, p99 5.0 s</title></circle>
+<circle cx="720.7" cy="125.6" r="5" fill="none" class="k-crit" stroke-width="2"><title>step 9: 940,000 msg/s offered, OFFER NOT TAKEN; ack p50 1.3 s, p99 5.0 s</title></circle>
+<circle cx="777.8" cy="165.8" r="3.5" fill="none" class="k-crit" stroke-width="2" stroke-opacity="0.6"><title>step 7: 1,025,400 msg/s offered, DISCONNECTED; ack p50 1.4 s, p99 5.7 s</title></circle>
+<circle cx="777.8" cy="121.6" r="5" fill="none" class="k-crit" stroke-width="2"><title>step 7: 1,025,400 msg/s offered, DISCONNECTED; ack p50 1.4 s, p99 5.7 s</title></circle>
+<text x="669.8" y="130.0" font-size="13" font-weight="650" text-anchor="end" class="f-ink num k-surface" stroke-width="4" paint-order="stroke" stroke-linejoin="round">875,900 msg/s lossless</text>
+<text x="669.8" y="146.0" font-size="12" text-anchor="end" class="f-ink2 num k-surface" stroke-width="4" paint-order="stroke" stroke-linejoin="round">ack p99 mean 4.5 s · e2e p99 23.9 s</text>
+<circle cx="98.0" cy="530.0" r="5" class="f-s1"/>
+<text x="109.0" y="534.0" font-size="12" text-anchor="start" class="f-ink2">carried: ack p99 mean</text>
+<circle cx="279.4" cy="530.0" r="3.5" class="f-s1" fill-opacity="0.45"/>
+<text x="290.4" y="534.0" font-size="12" text-anchor="start" class="f-ink2">ack p50 mean</text>
+<circle cx="403.2" cy="530.0" r="5" fill="none" class="k-crit" stroke-width="2"/>
+<text x="414.2" y="534.0" font-size="12" text-anchor="start" class="f-ink2">not carried</text>
+<line x1="520.6" y1="523.0" x2="520.6" y2="537.0" class="k-s1" stroke-width="1.5"/><line x1="516.6" y1="523.0" x2="524.6" y2="523.0" class="k-s1" stroke-width="1.5"/><line x1="516.6" y1="537.0" x2="524.6" y2="537.0" class="k-s1" stroke-width="1.5"/>
+<text x="531.6" y="534.0" font-size="12" text-anchor="start" class="f-ink2">min–max of the rounds</text>
+</svg>

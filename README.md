@@ -10,19 +10,18 @@
 An MQTT 3.1.1 and 5.0 broker in Rust that clusters, replicates durable sessions by
 default, and ships every feature under Apache-2.0.
 
-> - **QoS 0:** 114k msg/s per 4-vCPU node, 1.14M msg/s on 10 nodes.
-> - **Durable QoS 1** (acked after fsync and 2-copy replication): 27.0k msg/s per node,
->   270k on 10 nodes, certified on the log store (experimental in 1.2.0).
+> - **Durable QoS 1** (acked after fsync and a quorum copy on another node): 292,200 msg/s
+>   with no message lost on 10 nodes, 228k at ack p99 ≤ 1 s.
+> - **QoS 1 with clean sessions:** 876k msg/s on 10 nodes. **QoS 0:** 973k.
 > - **Every feature, no paid tier:** clustering, durable replication, OIDC, audit, operator.
 
 ## Why mqttd
 
-- **Cost per message.** Durable QoS 1 with 2 copies carries 7,500 msg/s per vCPU on
-  1.2.0's log store, 2.7× the 2,812 per vCPU that HiveMQ 4.18 publishes for its default
+- **Cost per message.** Durable QoS 1 with 2 copies carries 9,517 msg/s per vCPU at ack
+  p99 ≤ 1 s on 3 nodes, 3.4× the 2,812 per vCPU that HiveMQ 4.18 publishes for its default
   configuration, which also keeps 2 copies, on the same kind of vCPU (an AMD EPYC Milan
-  SMT thread). On 1.2.0's default store it is 4,831, 1.7×. HiveMQ's figure is its own;
-  we have not reproduced it, and its payload is not published.
-  [Per vCPU, like for like](docs/benchmarks/EVIDENCE.md#per-vcpu-like-for-like)
+  SMT thread). HiveMQ's figure is its own; we have not reproduced it, and its payload is
+  not published. [The results](docs/benchmarks/RIG2-RESULTS.md)
 - **No paid tier.** HiveMQ sells clustering in its commercial edition (the Community
   Edition is single-node), EMQX licenses production clustering under BSL 1.1 since 5.9,
   and VerneMQ's official binaries need a paid licence for commercial production. In
@@ -48,27 +47,27 @@ mqttd has no production users yet. The evidence below is what it offers instead.
 Durable QoS 1 is the hardest path a broker serves: every acknowledgement waits for
 fsync and a quorum copy on another node. It is the one we measure first.
 
-![Per-node msg/s at 3 and 10 nodes for durable QoS 1 (default store and log store), QoS 1 clean sessions and QoS 0, measured on 1.2.0](docs/benchmarks/img/readme-scale-out.svg)
+![msg/s per node at 3 and 10 nodes for durable QoS 1, QoS 1 with clean sessions and QoS 0, measured on the 1.3.0 candidate](docs/benchmarks/img/readme-scale-out.svg)
 
-- **The per-node rate holds from 3 to 10 nodes** in every class, and no message was
-  lost on any bar.
-- **Durable QoS 1 on 1.2.0's default store (redb)** stops taking more at 19.3k msg/s
-  per node on 3 nodes and 18.5k on 10 (185k in total). Nothing was lost and p99 stayed
-  at or below 500 ms, but the rig did not certify these rungs, so they are drawn hollow.
-- **The log store** (`MQTTD_REPLICA_STORE=log`, experimental in 1.2.0) carries
-  30.0k per node on 3 nodes and 27.0k on 10, certified GREEN. The 1.3.0 draft makes it
-  the default for new data directories; this chart will be redrawn on 1.3.0.
+- **Durable QoS 1** carries 117,800 msg/s on 3 nodes (39.3k per node) and 292,200 on
+  10 (29.2k per node), with no message lost. At ack p99 ≤ 1 s it carries 114k and 228k.
+- **QoS 1 with clean sessions** carries 271k on 3 nodes and 876k on 10.
+- **QoS 0** carries 340k on 3 nodes and 973k on 10.
 
-![Durable QoS 1 per vCPU: mqttd 1.2.0 on the log store and the default store against HiveMQ 4.18's published figure](docs/benchmarks/img/readme-durable-per-vcpu.svg)
+![Durable QoS 1 per vCPU: mqttd against HiveMQ 4.18's published figure](docs/benchmarks/img/readme-durable-per-vcpu.svg)
 
-![Single-node knee on one 4-vCPU host: mqttd, Mosquitto, EMQX, HiveMQ CE](docs/benchmarks/img/readme-single-node.svg)
+![Durable QoS 1 on 10 nodes: ack p99 by offered msg/s, the mean of 3 rounds per step](docs/benchmarks/img/rig2/n10-durable-qos1.svg)
 
-**How a rung is judged** ([ADR 0048](docs/adr/0048-comparative-benchmarking.md#amendment-2026-09-27-a-rung-fails-only-on-loss-p99-is-graded-green--yellow--red)):
-a rung fails only if it loses a message. A lossless rung is GREEN at p99 ≤ 1 s
-(certified), YELLOW at ≤ 5 s, RED above.
-How each figure was measured, every rung and the commands:
-[EVIDENCE.md](docs/benchmarks/EVIDENCE.md). Where the others beat us (memory, tail
-latency at their knee, connection scale, track record):
+**How a step is judged** ([ADR 0090](docs/adr/0090-benchmark-rig-redesign.md)):
+- **Carried:** a step counts only when all 3 of its rounds lose no message and the brokers
+  take at least 99% of the offered msg/s.
+- **Throughput** comes from the brokers' own counters.
+- **Latency** is the p99 on the load generator's own clock, the mean of the rounds. It is
+  GREEN at ≤ 1 s, YELLOW at ≤ 5 s and RED above.
+
+[RIG2-RESULTS.md](docs/benchmarks/RIG2-RESULTS.md) has every step, how it was measured and
+the limits of these runs. Where the others beat us (memory, tail latency at their knee,
+connection scale, track record):
 [Where competitors win](docs/benchmarks/EVIDENCE.md#where-competitors-win).
 
 ## Feature matrix
@@ -175,7 +174,7 @@ prose must not actively mislead.
 ```sh
 cargo build && cargo test && cargo clippy --all-targets && cargo deny check
 ./scripts/interop/run.sh     # foreign-client conformance
-mqttui --list                # There are 144 runnable scripts here: demos, smokes, migrations, benches
+mqttui --list                # There are 153 runnable scripts here: demos, smokes, migrations, benches
 ```
 
 ## License
