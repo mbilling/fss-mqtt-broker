@@ -117,6 +117,14 @@ DIVERGE_FLOOR_MS = 50.0
 # Broker drops for a subscriber that does not read fast enough: VOID, not FAILED, when a
 # generator could not keep up (the subscriber was the generator's).
 CONSUMER_QUEUE_REASONS = frozenset({"outbound-full", "backlog-overflow", "queue-overflow"})
+# A generator is saturated, and its round VOID, when at least this many of its measured
+# windows crossed a threshold. One window is a pause, not a generator that cannot keep
+# up: on 2026-10-27 one 10-node host paused about 100 ms once a round (one window's
+# scheduling-lag p99 at 37-45 ms, the other five at 2.1 ms, CPU 15%), which voided
+# 225k QoS 0 twice and ended the ladder. A single such window is a note.
+SATURATED_WINDOWS_MIN = 2
+# A generator named in this many VOID attempts of one step gets a new host (run.sh).
+REPLACE_STRIKES = 2
 
 # Hetzner hourly prices (EUR, excl. VAT) for the server types the tiers use. Unknown
 # types have no price here; pass --price TYPE=EUR to cost one.
@@ -494,14 +502,19 @@ def measured_span(s: dict) -> tuple[float, float]:
     return base + min(w["start_s"] for w in ms) * 1000, base + max(w["end_s"] for w in ms) * 1000
 
 
-def generator_health(s: dict) -> dict:
+def generator_health(s: dict, min_windows: int = 1) -> dict:
+    """A generator's health over its measured windows. `saturated` when at least
+    `min_windows` of them crossed a threshold (judge: SATURATED_WINDOWS_MIN; the
+    calibration, whose job is to reject hosts: any one); `stalled_windows` counts them."""
     ms = [w for w in s["windows"] if w["kind"] == "measure"]
     h = [w["health"] for w in ms]
     bw = [x["busiest_worker"] for x in h if x.get("busiest_worker") is not None]
+    stalled = sum(1 for x in h if x.get("saturated"))
     return {
         "outcome": s["outcome"],
-        "saturated": s["generator"]["saturated"],
-        "reasons": sorted({r for x in h for r in x.get("reasons", [])}),
+        "saturated": stalled >= min_windows if h else bool(s["generator"]["saturated"]),
+        "stalled_windows": stalled,
+        "reasons": sorted({r for x in h if x.get("saturated") for r in x.get("reasons", [])}),
         "cpu_fraction_max": max((x["cpu_fraction"] for x in h), default=0.0),
         "busiest_worker_max": max(bw) if bw else None,
         "sched_lag_p99_us_max": max((w["sched_lag"]["p99_us"] for w in ms), default=0),
@@ -613,7 +626,7 @@ def calibrate(d: Path) -> dict:
             why[g] = "no summary"
             continue
         p99s[g] = gen_p99_us(s, "e2e")
-        h = generator_health(s)
+        h = generator_health(s, 1)
         if h["saturated"]:
             bad.append(g)
             why[g] = f"saturated ({', '.join(h['reasons']) or 'see summary'})"
@@ -665,7 +678,14 @@ def judge(step: Path, cfg: dict | None = None) -> dict:
                                 + (f"it named a time {st_.get('late_ms')} ms past" if st_["by"] == "late"
                                    else f"none came in {st_.get('waited_s', 0):.1f} s")
                                 + ", so it started on its own")
-        h = generator_health(s)
+        h = generator_health(s, SATURATED_WINDOWS_MIN)
+        if h["stalled_windows"] and not h["saturated"]:
+            w = max((x for x in s["windows"] if x["kind"] == "measure" and x["health"].get("saturated")),
+                    key=lambda x: x["sched_lag"]["p99_us"])
+            out["notes"].append(f"generator {g} stalled in {h['stalled_windows']} of its measured windows "
+                                f"({', '.join(w['health'].get('reasons', [])) or 'see summary'}; scheduling lag p99 "
+                                f"{w['sched_lag']['p99_us'] / 1000:.1f} ms there): a pause, not judged "
+                                f"(VOID from {SATURATED_WINDOWS_MIN} windows)")
         h.update(generator=g, exit=code, ledger=s["ledger"], errors=s["errors"],
                  offered_rate=s["phases"][0]["offered_rate"], sent_rate=s["phases"][0]["sent_rate"],
                  received_rate=s["phases"][0]["received_rate"],
@@ -998,6 +1018,37 @@ def _why(v: dict) -> str:
     return "; ".join(v.get("failures", []) + v.get("voids", [])) or "no reason recorded"
 
 
+def replacements(step: Path) -> list[dict]:
+    """The generator hosts replaced during this step, as run.sh recorded them."""
+    p = step / "replaced.json"
+    try:
+        return json.loads(p.read_text())
+    except (OSError, ValueError):
+        return []
+
+
+def replace_due(step: Path) -> dict | None:
+    """The generator whose host should be replaced before the step's next attempt: one
+    that the judge named (saturated or diverging) in REPLACE_STRIKES VOID attempts of
+    this step since its host was last replaced here. None when there is none."""
+    done = replacements(step)
+    strikes: dict[int, int] = {}
+    last_dir: dict[int, str] = {}
+    for a in round_attempts(step):
+        if a["v"]["verdict"] == VOID:
+            for g in a["v"].get("harness_generators", []):
+                strikes[g] = strikes.get(g, 0) + 1
+                last_dir[g] = a["dir"]
+        # A replacement after this attempt clears that host's strikes.
+        for r in done:
+            if r["after"] == a["dir"]:
+                strikes.pop(int(r["generator"]), None)
+    for g, n in sorted(strikes.items()):
+        if n >= REPLACE_STRIKES:
+            return {"generator": g, "after": last_dir[g], "strikes": n}
+    return None
+
+
 def plan_rounds(step: Path, prior: list[dict], ramp: dict) -> dict:
     """What a step measured in rounds does next. `done` false: `next` is the attempt to
     run (dir, round, attempt, settle "short" or "long", reason). `done` true: `counted`
@@ -1009,6 +1060,9 @@ def plan_rounds(step: Path, prior: list[dict], ramp: dict) -> dict:
     by: dict[int, list[dict]] = {}
     for a in round_attempts(step):
         by.setdefault(a["round"], []).append(a)
+    # A generator host replaced after an attempt (replace_due): the VOIDs before it were
+    # that host's, so they do not use up the round's reruns.
+    reset_after = {r["after"] for r in replacements(step)}
     counted, retries, last = [], [], None
     retried_round = None
     for k in range(1, n_rounds + 1):
@@ -1017,7 +1071,7 @@ def plan_rounds(step: Path, prior: list[dict], ramp: dict) -> dict:
             last = a
             v = a["v"]["verdict"]
             if v == VOID:
-                voids += 1
+                voids = 0 if a["dir"] in reset_after else voids + 1
                 continue
             if v in BAD and retried_round is None:
                 e = retry_eligible(prior, float(meta["rate"]), ramp)
@@ -1479,6 +1533,8 @@ def main(argv: list[str]) -> int:
                    "have moved faster than the background allowance")
     i.add_argument("--step-rate", type=float, help="msg/s of the step to come: sets the background allowance")
     i.add_argument("scrapes", nargs="+")
+    rd = sub.add_parser("replace-due")
+    rd.add_argument("step")
     cal = sub.add_parser("calibrate")
     cal.add_argument("dir")
     c = sub.add_parser("cost")
@@ -1524,6 +1580,11 @@ def main(argv: list[str]) -> int:
               f"{fmt_pct(st_['received_rate']['cv'])}), {v['latency_gate']} p99 mean {fmt_mean_sd(st_['gate_p99_us'])}, "
               f"merged {fmt_us(v['gate_p99_merged_us'])}"
               + "".join(f"\n  - {x}" for x in v["failures"] + v["voids"] + v["notes"] + v["spread"]["flags"]))
+        return 0
+    if a.cmd == "replace-due":
+        r = replace_due(Path(a.step))
+        if r:
+            print(f"{r['generator']} {r['after']} {r['strikes']}")
         return 0
     if a.cmd == "calibrate":
         c_ = calibrate(Path(a.dir))
