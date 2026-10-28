@@ -1207,7 +1207,7 @@ impl Metrics {
         let replication_desired = register_gauge(
             &mut registry,
             "replication_desired",
-            "Configured replication factor R for durable placement groups",
+            "Replication factor durable placement groups should hold now: the configured R, capped by the cluster size this node knows it belongs to (1 on a node that never knew a peer; it never follows liveness down)",
         );
         let replication_min_actual = register_gauge(
             &mut registry,

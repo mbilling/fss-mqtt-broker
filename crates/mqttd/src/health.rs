@@ -1534,14 +1534,16 @@ mod tests {
         );
         assert!(body.contains("\"members\":["), "{body}");
         assert!(body.contains("\"id\":\"peer-1\""), "{body}");
-        // Replication health (issue #167): 2 members under R=3 → every group holds 2
-        // of the 3 configured copies, and the operator can SEE that here. This
-        // placement comes from `Placement::new`, i.e. an explicit `Fixed(1)` floor —
-        // so the source reads `configured` (issue #239).
+        // Replication health (issue #167): a cluster that has only ever had 2 members
+        // wants 2 copies under R=3 (the factor is capped by the membership the node
+        // knows it belongs to), holds them, and is not under-replicated; a lost member
+        // is (statusz_reports_the_derived_write_floor_and_its_source). This placement
+        // comes from `Placement::new`, i.e. an explicit `Fixed(1)` floor — so the
+        // source reads `configured` (issue #239).
         assert!(
             body.contains(
-                "\"replication\":{\"desired\":3,\"min_actual\":2,\
-                 \"under_replicated\":true,\"write_floor\":1,\
+                "\"replication\":{\"desired\":2,\"min_actual\":2,\
+                 \"under_replicated\":false,\"write_floor\":1,\
                  \"write_floor_source\":\"configured\"}"
             ),
             "{body}"
