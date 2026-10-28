@@ -10,14 +10,17 @@
 # floor = 1 where the step is the top of the ramp that was run, so the knee lies above it.
 # msg_per_s is the cluster total (offered and taken, from the brokers' counters); per node = msg_per_s / nodes.
 chart,series,label,build,date,nodes,vcpu,state,floor,msg_per_s,source,section,note
+scale-out,durable,Durable QoS 1,1.3.0 candidate + #1146 9520b33,2026-10-28,1,4,green,0,92900,docs/benchmarks/RIG2-RESULTS.md,1 node / Durable QoS 1,"maximum lossless; ack p99 744 ms; 1 copy, fsync only"
 scale-out,durable,Durable QoS 1,1.3.0 candidate edfdb49,2026-10-28,3,12,green,0,114200,docs/benchmarks/RIG2-RESULTS.md,3 nodes / Durable QoS 1,ack p99 708 ms
 scale-out,durable,Durable QoS 1,1.3.0 candidate edfdb49,2026-10-28,3,12,yellow,0,117800,docs/benchmarks/RIG2-RESULTS.md,3 nodes / Durable QoS 1,maximum lossless; ack p99 1.35 s
 scale-out,durable,Durable QoS 1,1.3.0 candidate edfdb49,2026-10-27,10,40,green,0,228000,docs/benchmarks/RIG2-RESULTS.md,10 nodes / Durable QoS 1,ack p99 59 ms
 scale-out,durable,Durable QoS 1,1.3.0 candidate edfdb49,2026-10-27,10,40,yellow,0,292200,docs/benchmarks/RIG2-RESULTS.md,10 nodes / Durable QoS 1,maximum lossless; ack p99 1.37 s
+scale-out,qos1-clean,"QoS 1, clean sessions",1.3.0 candidate + #1146 9520b33,2026-10-28,1,4,green,0,114000,docs/benchmarks/RIG2-RESULTS.md,"1 node / QoS 1, clean sessions",maximum lossless; ack p99 315 ms
 scale-out,qos1-clean,"QoS 1, clean sessions",1.3.0 candidate edfdb49,2026-10-28,3,12,green,0,152000,docs/benchmarks/RIG2-RESULTS.md,"3 nodes / QoS 1, clean sessions",ack p99 67 ms
 scale-out,qos1-clean,"QoS 1, clean sessions",1.3.0 candidate edfdb49,2026-10-28,3,12,yellow,0,270800,docs/benchmarks/RIG2-RESULTS.md,"3 nodes / QoS 1, clean sessions",maximum lossless; ack p99 3.31 s
 scale-out,qos1-clean,"QoS 1, clean sessions",1.3.0 candidate edfdb49,2026-10-27,10,40,green,0,303800,docs/benchmarks/RIG2-RESULTS.md,"10 nodes / QoS 1, clean sessions",ack p99 85 ms
 scale-out,qos1-clean,"QoS 1, clean sessions",1.3.0 candidate edfdb49,2026-10-27,10,40,yellow,0,875900,docs/benchmarks/RIG2-RESULTS.md,"10 nodes / QoS 1, clean sessions",maximum lossless; ack p99 4.54 s
+scale-out,qos0,QoS 0,1.3.0 candidate + #1146 9520b33,2026-10-28,1,4,green,0,123100,docs/benchmarks/RIG2-RESULTS.md,1 node / QoS 0,maximum lossless; end-to-end p99 136 ms
 scale-out,qos0,QoS 0,1.3.0 candidate edfdb49,2026-10-28,3,12,green,0,253200,docs/benchmarks/RIG2-RESULTS.md,3 nodes / QoS 0,end-to-end p99 547 ms
 scale-out,qos0,QoS 0,1.3.0 candidate edfdb49,2026-10-28,3,12,yellow,0,340300,docs/benchmarks/RIG2-RESULTS.md,3 nodes / QoS 0,maximum lossless; end-to-end p99 2.52 s
 scale-out,qos0,QoS 0,1.3.0 candidate edfdb49,2026-10-28,10,40,green,0,506300,docs/benchmarks/RIG2-RESULTS.md,10 nodes / QoS 0,end-to-end p99 395 ms

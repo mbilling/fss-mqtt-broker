@@ -48,12 +48,14 @@ mqttd has no production users yet. The evidence below is what it offers instead.
 Durable QoS 1 is the hardest path a broker serves: every acknowledgement waits for
 fsync and a quorum copy on another node. It is the one we measure first.
 
-![msg/s per node at 3 and 10 nodes for durable QoS 1, QoS 1 with clean sessions and QoS 0, measured on the 1.3.0 candidate](docs/benchmarks/img/readme-scale-out.svg)
+![msg/s per node at 1, 3 and 10 nodes for durable QoS 1, QoS 1 with clean sessions and QoS 0, measured on the 1.3.0 candidate](docs/benchmarks/img/readme-scale-out.svg)
 
 - **Durable QoS 1** carries 117,800 msg/s on 3 nodes (39.3k per node) and 292,200 on
   10 (29.2k per node), with no message lost. At ack p99 ≤ 1 s it carries 114k and 228k.
 - **QoS 1 with clean sessions** carries 271k on 3 nodes and 876k on 10.
 - **QoS 0** carries 340k on 3 nodes and 973k on 10.
+- **One node** carries 92,900 durable (one copy, fsync only), 114,000 clean QoS 1 and
+  123,100 QoS 0, all at p99 ≤ 1 s.
 
 ![Monthly infrastructure cost against durable QoS 1 throughput: mqttd's measured points against HiveMQ 4.18's published run, both at AWS m6a.8xlarge prices, licence not included](docs/benchmarks/img/readme-durable-cost.svg)
 

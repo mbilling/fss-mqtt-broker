@@ -4,7 +4,7 @@
     python3 bench/scale/chart-readme.py              # both, into docs/benchmarks/img/
     python3 bench/scale/chart-readme.py --self-test
 
-  readme-scale-out.svg         msg/s per node at 3 and 10 nodes: durable QoS 1, QoS 1
+  readme-scale-out.svg         msg/s per node at each measured cluster size: durable QoS 1, QoS 1
                                clean sessions, QoS 0; cluster totals labelled
   readme-durable-per-vcpu.svg  durable QoS 1 per vCPU against HiveMQ's published run
 
@@ -53,17 +53,17 @@ def per_node(v: float) -> str:
 
 # --------------------------------------------------------------------------- scale-out
 
-W, H = 900, 606
+W, H = 1000, 606
 T0, PH = 196, 270          # plot top, plot height
 Y0 = T0 + PH               # baseline
-BAR, IN_GAP = 54, 14       # bar width, gap between the 3- and 10-node bars of a class
+BAR, IN_GAP = 52, 20       # bar width, gap between a class's bars (one per cluster size)
 
 PANELS = [
     {"title": "Durable QoS 1",
-     "x0": 84, "x1": 360, "y_step": 10_000, "backdrop": True,
-     "groups": [("durable", "persistent sessions", "ack after fsync + quorum copy")]},
+     "x0": 84, "x1": 380, "y_step": 10_000, "backdrop": True,
+     "groups": [("durable", "persistent sessions", "ack after fsync + quorum copy; 1 node: fsync")]},
     {"title": "Not durable",
-     "x0": 452, "x1": 868, "y_step": 40_000, "backdrop": False,
+     "x0": 476, "x1": 968, "y_step": 40_000, "backdrop": False,
      "groups": [("qos1-clean", "QoS 1, clean sessions", "routing path, no fsync"),
                 ("qos0", "QoS 0", "at most once")]},
 ]
@@ -98,16 +98,21 @@ def describe(b: dict, n: int) -> str:
     return s
 
 
+def node_counts(rows: list[dict]) -> list[int]:
+    return sorted({r["nodes"] for r in rows if r["chart"] == "scale-out"})
+
+
 def draw_scale_out(rows: list[dict]) -> str:
     bars = scale_bars(rows)
-    builds = sorted({r["build"] for r in rows if r["chart"] == "scale-out"})
+    sizes = node_counts(rows)
+    builds = sorted({r["build"].split()[-1] for r in rows if r["chart"] == "scale-out"})
     dates = sorted({r["date"] for r in rows if r["chart"] == "scale-out"})
-    desc = [describe(bars[series][n], n) for p in PANELS for series, _, _ in p["groups"] for n in (3, 10)]
+    desc = [describe(bars[series][n], n) for p in PANELS for series, _, _ in p["groups"] for n in sizes]
     o = cs.open_svg(
-        W, H, "Throughput per node from 3 to 10 nodes, no message lost on any column",
-        f"msg/s per 4-vCPU node from the brokers' own counters · 3 rounds a step · measured on {', '.join(builds)}, "
+        W, H, f"Throughput per node from {sizes[0]} to {sizes[-1]} nodes, no message lost on any column",
+        f"msg/s per 4-vCPU node from the brokers' own counters · 3 rounds a step · 1.3.0 candidate, main {' and '.join(builds)}, "
         f"{' to '.join([dates[0], dates[-1]] if len(dates) > 1 else dates)}",
-        "Columns are msg/s per node at 3 and 10 nodes; the cluster total is printed above each column. "
+        f"Columns are msg/s per node at {', '.join(map(str, sizes))} nodes; the cluster total is printed above each column. "
         "The green part is the highest step carried at p99 ≤ 1 s; a yellow cap reaches the maximum lossless step "
         "when it ran at p99 ≤ 5 s, a red cap when it ran above. " + "; ".join(desc) + ".")
     o.append(cs.text(32, 84, "Cluster totals above each column · p99 is the ack latency for QoS 1 and the "
@@ -124,7 +129,7 @@ def draw_scale_out(rows: list[dict]) -> str:
 
     for p in PANELS:
         x0, x1 = p["x0"], p["x1"]
-        peak = max(top_of(bars[s][n])["msg_per_s"] / n for s, _, _ in p["groups"] for n in (3, 10))
+        peak = max(top_of(bars[s][n])["msg_per_s"] / n for s, _, _ in p["groups"] for n in sizes)
         step = p["y_step"]
         y_max = int(-(-peak * 1.25 // step) * step)
 
@@ -141,12 +146,12 @@ def draw_scale_out(rows: list[dict]) -> str:
                              anchor="end", num=True))
         o.append(cs.text(x0 - 40, T0 - 12, "msg/s per node", size=10, role="muted"))
 
-        gw = 2 * BAR + IN_GAP
+        gw = len(sizes) * BAR + (len(sizes) - 1) * IN_GAP
         k = len(p["groups"])
         gap = (x1 - x0 - k * gw) / (k + 1)
         for gi, (series, name, sub) in enumerate(p["groups"]):
             gx = x0 + gap + gi * (gw + gap)
-            for bi, n in enumerate((3, 10)):
+            for bi, n in enumerate(sizes):
                 b = bars[series][n]
                 t = top_of(b)
                 bx = gx + bi * (BAR + IN_GAP)
@@ -167,7 +172,8 @@ def draw_scale_out(rows: list[dict]) -> str:
                 for s_, size, role, wt in reversed(lines):
                     o.append(cs.text(mid, ly, s_, size=size, role=role, anchor="middle", weight=wt, num=True))
                     ly -= size + 4
-                o.append(cs.text(mid, Y0 + 18, f"{n} nodes", size=12, role="ink", anchor="middle", weight=600))
+                o.append(cs.text(mid, Y0 + 18, f"{n} node" + ("s" if n > 1 else ""), size=12, role="ink",
+                                 anchor="middle", weight=600))
             gm = gx + gw / 2
             o.append(cs.text(gm, Y0 + 42, name, size=13, role="ink", anchor="middle", weight=650))
             o.append(cs.text(gm, Y0 + 59, sub, size=11, role="muted", anchor="middle"))
@@ -274,8 +280,10 @@ def month_usd(vcpu: float) -> float:
 def cost_points(rows: list[dict]) -> dict:
     """mqttd's measured durable QoS 1 points (the highest step at ack p99 <= 1 s, from
     the scale-out rows) and HiveMQ's one published point."""
+    # A cluster only: one node keeps one copy, and HiveMQ's run keeps two.
     mq = sorted(((r["msg_per_s"], r["vcpu"], r["nodes"]) for r in rows
-                 if r["chart"] == "scale-out" and r["series"] == "durable" and r["state"] == "green"))
+                 if r["chart"] == "scale-out" and r["series"] == "durable" and r["state"] == "green"
+                 and r["nodes"] > 1))
     hive = next(r for r in rows if r["chart"] == "durable-per-vcpu" and r["series"] == "hivemq")
     return {"mqttd": mq, "hivemq": (hive["msg_per_s"], hive["vcpu"])}
 
@@ -379,10 +387,10 @@ def self_test() -> None:
         ("every RED cap is drawn, plus its legend key when there is one",
          body.count('class="f-crit"') == sum(r["state"] == "red" for r in scale)
          + (1 if any(r["state"] == "red" for r in scale) else 0)),
-        ("every column has both node counts", all(set(v) == {3, 10} for v in bars.values())),
+        ("every class has every cluster size", all(set(v) == set(node_counts(rows)) for v in bars.values())),
         ("every column's lossless total is printed",
          all(f">{cs.compact(top_of(b)['msg_per_s'])} total<" in body for v in bars.values() for b in v.values())),
-        ("the subtitle says what build was measured", all(r["build"] in body for r in scale)),
+        ("the subtitle says what build was measured", all(r["build"].split()[-1] in body for r in scale)),
         ("the description names every figure", all(f"{r['msg_per_s']:,}" in head for r in scale)),
     ]
     for name, fn in CHARTS.items():

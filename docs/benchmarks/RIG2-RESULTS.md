@@ -8,9 +8,11 @@ on 2026-10-27 and 2026-10-28 with the benchmark rig of
 
 - **The broker under test** is the 1.3.0 candidate, main `edfdb49`, as a static musl binary
   with sha256 `f5c13cb1…677ebc2`. It runs with its defaults: the segment log store for a
-  fresh data dir, 2 copies of every durable session, and TLS between nodes.
+  fresh data dir, 2 copies of every durable session, and TLS between nodes. The 1-node
+  run used main `9520b33`, which adds #1146 so that a lone node keeps one copy
+  ([1 node](#1-node)).
 - **The hosts** are Hetzner CCX23 brokers (4 dedicated vCPU, AMD EPYC Milan, local NVMe).
-  The load generators run on CCX33 hosts: 2 for 3 nodes, 4 for 10 nodes.
+  The load generators run on CCX33 hosts: 2 for 1 and 3 nodes, 4 for 10 nodes.
 - **The load generator** is `mqtt-load` (`crates/mqtt-load`), an open-loop paced
   generator. Every topic's publishers and every `$share` group's members are spread over
   every broker. A generator refuses a workload whose busiest session would carry more than
@@ -200,3 +202,80 @@ Run `n3-20261028T030901Z` · 3 × ccx23 brokers, 2 × ccx33 generators · 3 roun
 | 11 | 121,400 | FAILED | 1 | 115,502 | 4.75 s |
 | 12 | 117,800 | CARRIED | 3 | 118,047 | 1.35 ± 0.60 s |
 | 13 | 119,600 | FAILED | 2 | 114,623 | 2.95 ± 2.66 s |
+
+## 1 node
+
+One broker, measured on 2026-10-28 on main `9520b33`: the 1.3.0 candidate plus #1146, the
+only broker change between the two. With #1146 a lone node wants one copy of a durable
+session, so **durable QoS 1 on 1 node is fsync only, with no quorum copy**. Its figure is
+not comparable with the 3- and 10-node ones, which keep 2 copies.
+
+### QoS 0
+
+![QoS 0, 1 node: p99 by offered msg/s](img/rig2/n1-qos0.svg)
+
+Run `n3-20261028T152346Z` (the 3-node tier with `BROKERS=1`) · 1 × ccx23 broker, 2 × ccx33 generators · 3 rounds a step · 200 B payload · latency is the end-to-end p99, the mean of the rounds ± their standard deviation.
+
+- **Maximum lossless:** 123,100 msg/s offered, 123k per node (brokers received 123,132), end-to-end p99 135.7 ± 55.2 ms
+- **end-to-end p99 ≤ 1 s:** 123,100 msg/s (135.7 ± 55.2 ms)
+- **end-to-end p99 ≤ 250 ms:** 123,100 msg/s (135.7 ± 55.2 ms)
+- **end-to-end p99 ≤ 100 ms:** 119,600 msg/s (76.3 ± 112.5 ms)
+
+| step | offered msg/s | verdict | rounds | brokers received (mean) | end-to-end p99 (mean ± sd) |
+|---|---|---|---|---|---|
+| 1 | 50,000 | CARRIED | 3 | 50,000 | 1.4 ± 0.0 ms |
+| 2 | 75,000 | CARRIED | 3 | 75,000 | 1.8 ± 0.1 ms |
+| 3 | 112,500 | CARRIED | 3 | 112,320 | 683.6 ± 784.7 ms |
+| 4 | 168,800 | FAILED | 1 | 168,596 | 3.29 s |
+| 5 | 140,700 | FAILED | 1 | 140,699 | 3.45 s |
+| 6 | 126,600 | FAILED | 2 | 126,658 | 1.01 ± 0.95 s |
+| 7 | 119,600 | CARRIED | 3 | 119,646 | 76.3 ± 112.5 ms |
+| 8 | 123,100 | CARRIED | 3 | 123,132 | 135.7 ± 55.2 ms |
+
+### QoS 1, clean sessions
+
+![QoS 1, clean sessions, 1 node: p99 by offered msg/s](img/rig2/n1-clean-qos1.svg)
+
+Run `n3-20261028T152346Z` (the 3-node tier with `BROKERS=1`) · 1 × ccx23 broker, 2 × ccx33 generators · 3 rounds a step · 200 B payload · latency is the ack p99, the mean of the rounds ± their standard deviation.
+
+- **Maximum lossless:** 114,000 msg/s offered, 114k per node (brokers received 114,043), ack p99 315.4 ± 62.3 ms
+- **ack p99 ≤ 1 s:** 114,000 msg/s (315.4 ± 62.3 ms)
+- **ack p99 ≤ 250 ms:** 67,500 msg/s (3.6 ± 0.1 ms)
+- **ack p99 ≤ 100 ms:** 67,500 msg/s (3.6 ± 0.1 ms)
+
+| step | offered msg/s | verdict | rounds | brokers received (mean) | ack p99 (mean ± sd) |
+|---|---|---|---|---|---|
+| 1 | 30,000 | CARRIED | 3 | 30,000 | 1.1 ± 0.0 ms |
+| 2 | 45,000 | CARRIED | 3 | 45,000 | 1.6 ± 0.2 ms |
+| 3 | 67,500 | CARRIED | 3 | 67,500 | 3.6 ± 0.1 ms |
+| 4 | 101,300 | CARRIED | 3 | 101,441 | 256.6 ± 13.8 ms |
+| 5 | 152,000 | OFFER NOT TAKEN | 1 | 111,194 | 5.88 s |
+| 6 | 126,700 | OFFER NOT TAKEN | 1 | 108,654 | 8.86 s |
+| 7 | 114,000 | CARRIED | 3 | 114,043 | 315.4 ± 62.3 ms |
+| 8 | 120,400 | OFFER NOT TAKEN | 1 | 113,839 | 3.94 s |
+| 9 | 117,200 | OFFER NOT TAKEN | 1 | 108,796 | 4.85 s |
+
+### Durable QoS 1
+
+![Durable QoS 1, 1 node: p99 by offered msg/s](img/rig2/n1-durable-qos1.svg)
+
+Run `n3-20261028T152346Z` (the 3-node tier with `BROKERS=1`) · 1 × ccx23 broker, 2 × ccx33 generators · 3 rounds a step · 200 B payload · latency is the ack p99, the mean of the rounds ± their standard deviation.
+
+- **Maximum lossless:** 92,900 msg/s offered, 92.9k per node (brokers received 93,277), ack p99 744.4 ± 208.5 ms
+- **ack p99 ≤ 1 s:** 92,900 msg/s (744.4 ± 208.5 ms)
+- **ack p99 ≤ 250 ms:** 50,700 msg/s (11.9 ± 11.2 ms)
+- **ack p99 ≤ 100 ms:** 50,700 msg/s (11.9 ± 11.2 ms)
+
+| step | offered msg/s | verdict | rounds | brokers received (mean) | ack p99 (mean ± sd) |
+|---|---|---|---|---|---|
+| 1 | 10,000 | CARRIED | 3 | 10,000 | 1.0 ± 0.1 ms |
+| 2 | 15,000 | CARRIED | 3 | 15,000 | 1.1 ± 0.0 ms |
+| 3 | 22,500 | CARRIED | 3 | 22,500 | 1.3 ± 0.0 ms |
+| 4 | 33,800 | CARRIED | 3 | 33,800 | 1.8 ± 0.0 ms |
+| 5 | 50,700 | CARRIED | 3 | 50,700 | 11.9 ± 11.2 ms |
+| 6 | 76,100 | CARRIED | 3 | 76,080 | 379.4 ± 123.8 ms |
+| 7 | 114,200 | OFFER NOT TAKEN | 1 | 88,334 | 6.32 s |
+| 8 | 95,200 | OFFER NOT TAKEN | 1 | 67,631 | 6.91 s |
+| 9 | 85,700 | CARRIED | 3 | 85,951 | 857.3 ± 49.6 ms |
+| 10 | 90,500 | CARRIED | 3 | 90,207 | 1.01 ± 0.17 s |
+| 11 | 92,900 | CARRIED | 3 | 93,277 | 744.4 ± 208.5 ms |
