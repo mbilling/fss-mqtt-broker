@@ -10,7 +10,7 @@ Apache-licensed line — its single-node results **are now published in-tree**, 
 cloud hardware with a control arm, in
 [`docs/benchmarks/SINGLE-NODE-COMPARISON.md`](benchmarks/SINGLE-NODE-COMPARISON.md);
 issue #244 tracks the remaining multi-host run) · **NanoMQ** 0.25.5 ·
-**VerneMQ** 2.1.1.
+**VerneMQ** 2.2.1 (2026-09-17).
 
 This document obeys [ADR 0048](adr/0048-comparative-benchmarking.md)'s honesty rules,
 applied to prose: versions pinned, claims dated, **losing cells printed as prominently
@@ -39,7 +39,9 @@ feature surface (dashboard, rule engine, gateways) and accept BSL licensing with
 commercially-licensed clustering. **Choose NanoMQ when** the broker runs at the edge
 next to the sensor and kilobytes matter. **Choose VerneMQ when** you want
 Erlang-ecosystem clustering and can accept node-local queue durability and EULA'd
-production binaries.
+production binaries. Its 2.2 line is aimed at high-fanout load: publishes to many
+subscribers can be sharded across processes (`fanout.shard_count`), and each listener
+can carry its own auth plugins.
 
 **Do not choose mqttd (yet) if** you need a built-in web dashboard (there is an
 authenticated admin API and CLI, not a UI), rule-engine **data sinks** (mqttd runs
@@ -63,7 +65,7 @@ HiveMQ sells in its commercial edition, as
 
 ✅ open build · 💰 **paid edition only** · ⚠️ partial · ✖ absent · n/v not verified. Sources and notes: the sections below.
 
-| Feature | mqttd | Mosquitto 2.x | EMQX 6.x | HiveMQ CE | VerneMQ 2.1 | NanoMQ 0.25 |
+| Feature | mqttd | Mosquitto 2.x | EMQX 6.x | HiveMQ CE | VerneMQ 2.2 | NanoMQ 0.25 |
 |---|---|---|---|---|---|---|
 | **Protocol** | | | | | | |
 | MQTT 3.1.1 + 5.0 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -165,13 +167,13 @@ What one mqttd build contains, by area. This was the README's Features section u
 
 All five serve MQTT 3.1.1 and 5.0. The differences are in the v5 details:
 
-| Feature | mqttd | Mosquitto 2.0→2.1 | EMQX 6.2 | NanoMQ 0.25 | VerneMQ 2.1 |
+| Feature | mqttd | Mosquitto 2.0→2.1 | EMQX 6.2 | NanoMQ 0.25 | VerneMQ 2.2 |
 |---|---|---|---|---|---|
 | Session expiry | ✅ | ✅ | ✅ | ⚠️ offline redelivery bug open (nanomq#1934) | ⚠️ subscriptions survive node loss; queued messages don't (documented) |
 | Message expiry | ✅ | ✅ | ✅ | ✖ broker-side undocumented | ✅ |
 | Topic aliases | ✅ both directions | ⚠️ 2.0 inbound-only → ✅ 2.1 both | ✅ | ✅ | ✅ both |
 | Flow control (Receive Maximum) | ✅ enforced (`0x93`) | ⚠️ 2.0 outbound-only → ✅ 2.1 enforced | ✅ | ✖ inflight window marked "unsupported now" in shipped config | ✅ both directions |
-| Shared subscriptions | ✅ incl. **cluster-wide** (ADR 0010/0015) | ✅ (single node) | ✅ cluster-wide | ⚠️ `$share`+wildcard protocol error (nanomq#1883) | ⚠️ cluster-wide; recurring cluster bugs 2018→2025 (vernemq#1570, #2405) |
+| Shared subscriptions | ✅ incl. **cluster-wide** (ADR 0010/0015) | ✅ (single node) | ✅ cluster-wide | ⚠️ `$share`+wildcard protocol error (nanomq#1883) | ⚠️ cluster-wide; recurring cluster bugs 2018→2025 (vernemq#1570, #2405); 2.2.1 fixed stale local shared subscriptions after a trie restart, a 2.1.0 regression |
 | Subscription identifiers | **✖ not delivered — and the wire says so**: CONNACK advertises `Subscription Identifiers Available = 0`, a SUBSCRIBE carrying one is refused with DISCONNECT `0xA1` (§3.2.2.3.12), so a client fails fast instead of silently losing its demux. Delivery tracked. | ✅ | ✅ | ✅ | ✅ |
 | User properties | ✅ end-to-end | ✅ | ✅ | ⚠️ property size cap (default 32) | ✅ |
 | Enhanced auth (AUTH) | ⚠️ **built-in** challenge/response; server-initiated re-auth deferred (0013-T8) | ⚠️ plugin events only, no built-in | ✅ | ✖ documented unsupported | ⚠️ plugin-provided only, no built-in |
@@ -197,23 +199,23 @@ throughput scale with nodes; durable ownership does not. Tested envelope to date
 node clusters under kill/partition/upgrade/soak harnesses, and throughput measured at 3
 and 10 nodes ([RIG2-RESULTS.md](benchmarks/RIG2-RESULTS.md)).
 
-| | mqttd | Mosquitto | EMQX 6.2 | NanoMQ | VerneMQ 2.1 |
+| | mqttd | Mosquitto | EMQX 6.2 | NanoMQ | VerneMQ 2.2 |
 |---|---|---|---|---|---|
 | Clustering model | masterless mesh (authenticated SWIM + HRW placement); Raft lease group for config only | ✖ none (bridges only) | Mria: core nodes (full mesh) + replicants; **production clustering requires a commercial license** (BSL) | ✖ single node (bridge to cloud) | masterless; fully-replicated EC metadata (SWC) |
 | Session queues replicated across nodes | ✅ **default** (2 copies, both ack — configurable 2–7 per cluster, ADR 0080; epoch-fenced) | n/a (single-node disk persistence) | ⚠️ opt-in "durable sessions" feature, non-default (per EMQX docs) | ⚠️ single-node SQLite cache | ✖ node-local only; **documented: lost on node death** |
 | Acked QoS 1/2 survives node loss | ✅ proven under SIGKILL/partition harnesses (acked-facts oracle) — a group holding fewer copies than a majority of the members the node knows about — **capped at the replication factor**, so 2 copies on a 3-node cluster and still 2 on 5 or 7 — **REFUSES** new durable promises by default (QoS≥1 acks withheld so sources redeliver; retained mutations queue) rather than acking on a shrunken quorum; a node that has never known peers still serves fully, a publish for a durable session whose owner is gone is still acked-and-dropped by the no-known-subscriber path (and on a co-subscribed filter the ack rides ANY one subscriber's storage — `Accepted` = stored for at least one owed subscriber, not every one, issue #305), and a correlated restart of a quorum still loses; per ADR 0072 an MQTT 5 publisher may additionally weaken **its own** ack per message (`mqttd-durability: local|relaxed`) — but only when the operator opted in with `MQTTD_ALLOW_RELAXED_PUBLISH`, and never weaker than requested. See [GUIDE Limitations](../GUIDE.md#limitations) | n/a | n/v | ✖ | ✖ documented |
 | Elastic resize without data loss | ✅ grow/shrink/replace (ADR 0043; decommission drain verified) | n/a | n/v | n/a | ⚠️ graceful leave migrates queues; node death loses them |
-| Partition behavior | CP, documented: minority retained writes queue-until-heal; sessions keep serving (ADR 0037) | n/a | n/v | n/a | default **fails closed cluster-wide** on detected netsplit; opt-in AP flags; documented "window of uncertainty" (lost wills, possible duplicate client ids) |
-| Cross-node delivery under backpressure | TCP backpressure — nothing dropped | n/a | n/v | n/a | bounded buffer (default 10 KB), **drop + counter** |
-| Session takeover safety | ✅ single-owner + identity-bound sessions (ADR 0031) | n/a | ✅ | n/a | ⚠️ leader-coordinated registration; duplicate ids possible during splits (documented) |
+| Partition behavior | CP, documented: minority retained writes queue-until-heal; sessions keep serving (ADR 0037) | n/a | n/v | n/a | default **fails closed cluster-wide** on detected netsplit; opt-in AP flags; documented "window of uncertainty" (lost wills, possible duplicate client ids); 2.2.0 bounds the metadata anti-entropy's sync calls and repair writes with timeouts, so a stalled peer no longer blocks it |
+| Cross-node delivery under backpressure | TCP backpressure — nothing dropped | n/a | n/v | n/a | bounded buffer (default 10 KB), **drop + counter**; 2.2 adds a connect-ack handshake on internode links and write batching (`outgoing_clustering_flush_threshold`) |
+| Session takeover safety | ✅ single-owner + identity-bound sessions (ADR 0031) | n/a | ✅ | n/a | ⚠️ leader-coordinated registration; duplicate ids possible during splits (documented); 2.2.0 fixed a takeover wedge during session draining |
 
 ## Security
 
-| | mqttd | Mosquitto | EMQX 6.2 | NanoMQ | VerneMQ 2.1 |
+| | mqttd | Mosquitto | EMQX 6.2 | NanoMQ | VerneMQ 2.2 |
 |---|---|---|---|---|---|
 | TLS stack | rustls on aws-lc-rs, **TLS 1.3 by default**; hardened 1.2 opt-in (ECDHE+AEAD allowlist, EMS required, loudly logged) | OpenSSL | OTP ssl | mbedTLS (1.3 n/v) | OTP ssl |
 | mTLS client certs | ✅ identity from CN/SAN, no-fallback (ADR 0004) | ✅ | ✅ | ✅ | ✅ |
-| Built-in authentication | mTLS + Argon2id passwords + JWT + **OIDC with live JWKS rotation** | password file + dynamic-security plugin | extensive built-ins (DB, JWT, HTTP, LDAP, …) | password file + HTTP auth | files/DB via plugins; no built-in OIDC |
+| Built-in authentication | mTLS + Argon2id passwords + JWT + **OIDC with live JWKS rotation** | password file + dynamic-security plugin | extensive built-ins (DB, JWT, HTTP, LDAP, …) | password file + HTTP auth | files/DB via plugins, chosen per listener since 2.2.0 (`auth_n` / `auth_z`); no built-in OIDC |
 | Authorization | deny-by-default TOML ACLs, `%i`/`%c`, connect ACL; a denied MQTT 5 publish is answered `0x87 Not authorized` | `acl_file` + dynsec | built-in authz sources | HOCON ACL | `vmq_acl` file / DB plugins |
 | Policy hot reload | ✅ validate-before-swap, **and the reload sweeps live state** — revoked cert/user/grant evicts running sessions and flows (ADR 0040) | ⚠️ SIGHUP reloads ACL and password files (TLS certificates too from 2.1); dynsec delete/disable disconnects the client, but file changes leave connected clients alone | ✅ authn/authz changes via API or dashboard; certificate files re-read every 120 s; the effect on connected clients is not documented | ⚠️ `nanomq reload` covers basic/sqlite/auth/log sections, not TLS; live effect not documented | ✅ ACL/password files re-read every 10 s, certificates via `vmq-admin tls clear-pem-cache` — and documented: active subscriptions and running TLS sessions are **not** affected |
 | Audit trail | ✅ hash-chained, tamper-evident | not documented | n/v | not documented | not documented |
@@ -230,7 +232,7 @@ The three admin rows, the policy-reload row and the Kubernetes row were re-verif
 (Mosquitto 2.1 `mosquitto.conf(5)` and release review, HiveMQ's edition docs, NanoMQ's CLI and
 HTTP API pages, VerneMQ's status page and HTTP listener docs).
 
-| | mqttd | Mosquitto | EMQX 6.2 | NanoMQ | VerneMQ 2.1 |
+| | mqttd | Mosquitto | EMQX 6.2 | NanoMQ | VerneMQ 2.2 |
 |---|---|---|---|---|---|
 | Metrics | Prometheus + OTLP push + k8s probes; opt-in per-rule statistics and an opt-in rule trace on `$SYS` — no broker statistics there ([ADR 0084](adr/0084-watching-and-editing-rules-live.md)) | `$SYS` topics | dashboard + Prometheus + `$SYS` | HTTP API + Prometheus endpoint + limited `$SYS` events | Prometheus + `vmq-admin` |
 | Admin API (HTTP) | ✅ its own mTLS listener, viewer/operator roles, every request audited; the cluster view from any node, clients/sessions/subscribers, an ACL dry run, reload with outcome, kick/purge, cordon, the rules with a check and a dry run; writes no config except the rules file, for a subject listed in `[rules] admin_writers` (off by default, ADR 0084) ([ADR 0081](adr/0081-admin-api.md), [ADMIN-API.md](ADMIN-API.md)) | ⚠️ 2.0: none (dynsec is over MQTT `$CONTROL` topics); 2.1: an **experimental** `http_api` listener with read-only broker-info endpoints and **no authentication** — the manual says to front it with a reverse proxy | ✅ REST API | ✅ HTTP API (stats, clients, subscriptions, config reload) | ✅ HTTP management API |
@@ -239,7 +241,7 @@ HTTP API pages, VerneMQ's status page and HTTP listener docs).
 | Rule engine | ✅ EMQX rule SQL, no sinks — since `v1.2.0` ([RULES.md](RULES.md), ADR 0083): `SELECT`/`FOREACH` with EMQX's built-in functions, `republish` and `console`, evaluated once per message on its landing node's connection task (scales with the cluster), a QoS 1/2 ack waits for the derived messages; opt-in per-rule statistics and trace on `$SYS`, and rules editable through the admin API (ADR 0084); data sinks remain the CI-tested **external-consumer pattern** ([INTEGRATION.md](INTEGRATION.md), ADR 0063) | ✖ | ✅ SQL | ✅ SQL (full build) | ✖ |
 | Bridging | ✅ standalone bridge, deny-by-default directional rules, hop-count loop prevention, spool (ADR 0025) | ✅ built-in (the reference implementation) | ✅ data-integration bridges | ✅ TCP/QUIC/AWS bridges | ✅ basic `vmq_bridge` |
 | MQTT-SN / CoAP gateways | ✖ | ✖ (separate projects) | ✅ (SN, CoAP, LwM2M, …) | ✖ (DDS/SOME-IP/ZMQ instead) | ✖ |
-| Kubernetes | Helm chart: StatefulSet, per-pod PV, decommission-draining scale-down, automatic cert/policy rotation via file-watch, PVC lifecycle on shrink (ADR 0047). A Kubernetes **operator** (`MqttdCluster` CRD, split-brain detection and fencing, brownout PVC expansion — ADR 0055) is end-to-end tested and **packaged**: an install chart (`deploy/helm/mqttd-operator`) plus a signed, SBOM-attested image cut by the release pipeline (first published at v0.9.1). The chart-only path stays fully supported; the CRD is v1alpha1, schema-pinned in CI | — | Operator + Helm | container image only (no official chart or operator) | official Helm chart (`docker-vernemq`); `vmq-operator` sees only dependency bumps |
+| Kubernetes | Helm chart: StatefulSet, per-pod PV, decommission-draining scale-down, automatic cert/policy rotation via file-watch, PVC lifecycle on shrink (ADR 0047). A Kubernetes **operator** (`MqttdCluster` CRD, split-brain detection and fencing, brownout PVC expansion — ADR 0055) is end-to-end tested and **packaged**: an install chart (`deploy/helm/mqttd-operator`) plus a signed, SBOM-attested image cut by the release pipeline (first published at v0.9.1). The chart-only path stays fully supported; the CRD is v1alpha1, schema-pinned in CI | — | Operator + Helm | container image only (no official chart or operator) | official Helm chart (`docker-vernemq`, 2.2.0 in 2026-08); `vmq-operator` sees only dependency bumps (last 2025-08) |
 | Config | TOML + env, strict schema, `--check-config`, whole-config hot reload | conf file, SIGHUP | HOCON + dashboard/API | HOCON + env, hot reload | conf file + env mapping, live reconfig |
 
 ## Operational limits & resource governance
@@ -250,11 +252,11 @@ below ships **unset = unbounded** except where a default is printed — the sizi
 consequences and a bounded-node recipe live in [SIZING.md](SIZING.md).
 Packet-size enforcement is compared in the Protocol table above.
 
-| | mqttd | Mosquitto | EMQX 6.2 | NanoMQ | VerneMQ 2.1 |
+| | mqttd | Mosquitto | EMQX 6.2 | NanoMQ | VerneMQ 2.2 |
 |---|---|---|---|---|---|
 | Max connections | ✅ global + per-IP (`MQTTD_MAX_CONNECTIONS`, `_PER_IP`), refused at accept before TLS work | ✅ `max_connections` | ✅ per-listener | n/v | ✅ `listener.max_connections` (default 10 000) |
 | Queued/offline messages per session | ✅ count, default 100 000, overflow `drop-oldest` or `reject-newest` (`MQTTD_MAX_QUEUED_MESSAGES`, `MQTTD_QUEUE_OVERFLOW`) — both overflow policies **ack-and-drop** at the cap: the default `drop-oldest` truncates the oldest *already-acked* entries out of the durable queue, `reject-newest` acks and sheds the newest (counted `publish_dropped{reason="queue-overflow"}`); ✖ **no byte-based cap** — accepted, tracked (ADR 0041 amendment T6; issue #241 byte-bounded the in-memory backlog and deliberately did **not** claim this one, because an exact byte total on disk needs a *persisted* per-session counter). The same ack-and-drop arm is now also reachable at the in-memory backlog's byte bound (`publish_dropped{reason="backlog-overflow"}`), which an operator can set low enough to make routine | ✅ count (`max_queued_messages`, default 1000) **and bytes** (`max_queued_bytes`) | ✅ `max_mqueue_len` (default 1000); byte variant n/v | ⚠️ `msq_len`; byte variant n/v | ✅ `max_online_messages` / `max_offline_messages` (1000/1000) |
-| Subscriptions per client | ✅ `MQTTD_MAX_SUBSCRIPTIONS_PER_CLIENT` (per-slot `0x97`) | n/v | ✅ | n/v | n/v |
+| Subscriptions per client | ✅ `MQTTD_MAX_SUBSCRIPTIONS_PER_CLIENT` (per-slot `0x97`) | n/v | ✅ | n/v | ✅ `max_subscriptions_per_client` (global, 2.2.0) |
 | Publish rate limiting | ✅ token bucket + TCP backpressure — pause, not drop (`MQTTD_MAX_PUBLISH_RATE`) | ✖ | ✅ rate limiters | n/v | n/v |
 | Retained-store bound | ✅ topic count (`MQTTD_MAX_RETAINED_MESSAGES`); overwrite/clear always allowed | ✖ | ✅ retainer limits | n/v | n/v |
 | Sessions cap | ✅ `MQTTD_MAX_SESSIONS` (new refused; resume never refused) | ✖ | ✅ | n/v | n/v |
@@ -329,6 +331,9 @@ not as absent. This file is re-checked at every cross-broker benchmark re-run
 
 ## Changelog
 
+- 2026-10-28 — VerneMQ re-checked against 2.2.1 (2.2.0 on 2026-08-09, 2.2.1 on 2026-09-17), and the column renamed 2.2.
+  - **Better in 2.2:** per-listener auth plugin chains, a per-client subscription cap, fanout sharding, a connect-ack handshake and write batching on internode links, bounded anti-entropy timeouts, a takeover wedge fixed, and stale shared subscriptions after a trie restart fixed.
+  - **Unchanged:** session queues are still node-local (the clustering docs: persisted QoS 1/2 messages "aren't replicated to the other nodes", and offline messages on a leaving node are lost), the operator still sees only dependency bumps, and commercial use of the binaries still needs a yearly subscription.
 - 2026-10-28 — Performance: mqttd's figures now come from the benchmark rig of ADR 0090
   ([RIG2-RESULTS.md](benchmarks/RIG2-RESULTS.md), 3 and 10 nodes, 1.3.0 candidate). The
   single-node comparison and the earlier scale-out cards stay as dated records. The

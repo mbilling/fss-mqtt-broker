@@ -85,7 +85,7 @@ connection scale, track record):
 A subset of the full matrix in [COMPARISON.md](docs/COMPARISON.md) (dated 2026-10-12),
 which carries every row, the notes and the sources.
 
-| | mqttd | EMQX 6.x | HiveMQ CE | Mosquitto 2.x | VerneMQ 2.1 |
+| | mqttd | EMQX 6.x | HiveMQ CE | Mosquitto 2.x | VerneMQ 2.2 |
 |---|---|---|---|---|---|
 | Clustering | ✅ | 💰 BSL | 💰 | ✖ | ✅ (💰 binaries) |
 | Replicated sessions | ✅ default | ⚠️ opt-in | 💰 | n/a | ✖ |
