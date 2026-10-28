@@ -6,6 +6,7 @@
 #   PRICE_ONLY=1 TIER=n3 WORKLOADS="durable-qos1 clean-qos1 qos0" ./run.sh   # the quote, no cloud call
 #   HCLOUD_TOKEN=... MQTTD_VERSION=1.2.0 TIER=n3 ./run.sh                 # PAID
 #   HCLOUD_TOKEN=... MQTTD_URL=... MQTTD_SHA256=... TIER=n10 WORKLOADS="durable-qos1" ./run.sh
+#   HCLOUD_TOKEN=... MQTTD_LOCAL_BIN=path/to/mqttd TIER=n3 ./run.sh   # a binary on this machine
 #
 # One provisioning carries every workload in WORKLOADS, one ladder after the other, on
 # the same cluster. A ladder is a sequence of steps; a step is ROUNDS rounds at its msg/s
@@ -308,13 +309,28 @@ else
 	command -v jq >/dev/null || die "jq not installed"
 	if [ -n "${SSH_KEY:-}" ]; then [ -f "${SSH_KEY}.pub" ] || die "${SSH_KEY}.pub does not exist"; fi
 	# The binary under test is named every time (bench/scale/run.sh's rule).
-	if [ -n "${MQTTD_URL:-}" ]; then
+	# MQTTD_LOCAL_BIN: a build on this machine (a candidate not published anywhere).
+	# cloud-init installs a placeholder release as usual (MQTTD_VERSION, default
+	# 1.2.0: it also sets up the user, dirs and unit); push_local_bin then copies this
+	# file to every broker, checks its sha256 there and installs it, before the
+	# bootstrap starts any broker.
+	if [ -n "${MQTTD_LOCAL_BIN:-}" ]; then
+		[ -z "${MQTTD_URL:-}" ] || die "set MQTTD_LOCAL_BIN or MQTTD_URL, not both"
+		[ -f "$MQTTD_LOCAL_BIN" ] || die "MQTTD_LOCAL_BIN=$MQTTD_LOCAL_BIN does not exist"
+		file "$MQTTD_LOCAL_BIN" 2>/dev/null | grep -q 'x86-64' ||
+			die "MQTTD_LOCAL_BIN=$MQTTD_LOCAL_BIN is not an x86-64 binary (build it with scripts/release/build-repro.sh x86_64-unknown-linux-musl mqttd)"
+		LOCAL_BIN_SHA=$(shasum -a 256 "$MQTTD_LOCAL_BIN" | cut -d' ' -f1)
+		MQTTD_VERSION="${MQTTD_VERSION:-1.2.0}"
+		BINARY_DESC="UNRELEASED local $MQTTD_LOCAL_BIN sha256=$LOCAL_BIN_SHA"
+		printf 'UNRELEASED\nlocal=%s\nsha256=%s\nplaceholder_release=v%s\n' "$MQTTD_LOCAL_BIN" "$LOCAL_BIN_SHA" \
+			"$MQTTD_VERSION" >"$RUN/UNRELEASED-BINARY.txt"
+	elif [ -n "${MQTTD_URL:-}" ]; then
 		[ -n "${MQTTD_SHA256:-}" ] || die "MQTTD_URL needs MQTTD_SHA256 (an arbitrary URL publishes no .sha256)"
 		MQTTD_VERSION="${MQTTD_VERSION:-candidate}"
 		BINARY_DESC="UNRELEASED $MQTTD_URL sha256=$MQTTD_SHA256"
 		printf 'UNRELEASED\nurl=%s\nsha256=%s\n' "$MQTTD_URL" "$MQTTD_SHA256" >"$RUN/UNRELEASED-BINARY.txt"
 	else
-		[ -n "${MQTTD_VERSION:-}" ] || die "set MQTTD_VERSION (a release) or MQTTD_URL + MQTTD_SHA256 (a candidate)"
+		[ -n "${MQTTD_VERSION:-}" ] || die "set MQTTD_VERSION (a release), MQTTD_URL + MQTTD_SHA256 (a published candidate) or MQTTD_LOCAL_BIN (a local build)"
 		BINARY_DESC="release v$MQTTD_VERSION"
 	fi
 	# A state file that still tracks servers belongs to another run (or a leak): never
@@ -377,6 +393,21 @@ else
 	run_fg tf output -json inventory >"$INVENTORY"
 	: >"$RUN/known_hosts"
 	run_fg await_fleet
+	# push_local_bin: see MQTTD_LOCAL_BIN. Every broker, before any is started; the
+	# hash is checked on the host, so a short or corrupted copy fails the run.
+	push_local_bin() {
+		local i ip got
+		for ((i = 0; i < BROKERS; i++)); do
+			ip=$(broker_pub_ip "$i")
+			rssh "$ip" "systemctl stop mqttd 2>/dev/null; true"
+			rscp "$MQTTD_LOCAL_BIN" "root@$ip:/tmp/mqttd-local"
+			got=$(rssh "$ip" "sha256sum /tmp/mqttd-local | cut -d' ' -f1")
+			[ "$got" = "$LOCAL_BIN_SHA" ] || die "broker $i: the copied binary's sha256 is $got, not $LOCAL_BIN_SHA"
+			rssh "$ip" "install -m 0755 /tmp/mqttd-local /usr/local/bin/mqttd && rm -f /tmp/mqttd-local"
+			say "broker $i: $(rssh "$ip" '/usr/local/bin/mqttd --version' | head -1) (local build, sha256 ${LOCAL_BIN_SHA:0:12}…)"
+		done
+	}
+	[ -z "${MQTTD_LOCAL_BIN:-}" ] || push_local_bin
 	phase bootstrapping "rig2 $TIER: $BROKERS nodes"
 	run_fg "$SCALE_DIR/bootstrap-cluster.sh" "$RUN" "$INVENTORY" durable
 	ENDPOINTS=$(jq -r '[.brokers[].mqtt_plain] | join(",")' "$INVENTORY")
