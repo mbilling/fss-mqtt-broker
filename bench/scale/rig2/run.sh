@@ -147,6 +147,10 @@ SETTLE_QUIET_LONG="${SETTLE_QUIET_LONG:-30}"
 # is not ready in time starts on its own when it is (mqtt-load --start-wait), and the
 # judge's overlap check decides.
 START_SYNC_WAIT="${START_SYNC_WAIT:-${DEF_START_SYNC_WAIT:-30}}"
+# A generator's own wait counts from its ready file, not from its launch, and mqtt-load
+# refuses one longer than the keep-alive (60 s): its publishers are silent while they
+# wait. So it is capped there, whatever the rig waits for the slowest generator.
+GEN_START_WAIT=$((START_SYNC_WAIT + 15 > 55 ? 55 : START_SYNC_WAIT + 15))
 if [ "$TIER" = local ]; then START_LEAD_MS="${START_LEAD_MS:-500}"; else START_LEAD_MS="${START_LEAD_MS:-3000}"; fi
 # For the price quote: steps a ladder is expected to take (coarse climb + bisection), and
 # the long settles it waits through besides the first (after a step that was not carried,
@@ -712,10 +716,10 @@ launch_gens() { # launch_gens <local-dir> <host-id> <per-gen rate> <warmup> <mea
 		--sessions "$SESSIONS" --rate-per-publisher "$RATE_PER_PUBLISHER" --inflight "$INFLIGHT"
 		--warmup "$warmup" --duration "$measure" --window "$WINDOW" --drain-timeout "$DRAIN_TIMEOUT"
 		--drain-quiet "$DRAIN_QUIET" --drain-quiet-factor "$DRAIN_QUIET_FACTOR" --quiet
-		--ready-file "steps/$hid/gen.ready" --start-file "steps/$hid/gen.start" --start-wait $((START_SYNC_WAIT + 15)))
+		--ready-file "steps/$hid/gen.ready" --start-file "steps/$hid/gen.start" --start-wait "$GEN_START_WAIT")
 	[ "$SESSIONS" != durable ] || args+=(--session-expiry "$SESSION_EXPIRY")
 	[ -z "$PUBLISHERS_N" ] || args+=(--publishers "$PUBLISHERS_N")
-	bound=$((START_SYNC_WAIT + 15 + warmup + measure + DRAIN_TIMEOUT + 180))
+	bound=$((START_SYNC_WAIT + GEN_START_WAIT + warmup + measure + DRAIN_TIMEOUT + 180))
 	for ((g = 0; g < GENERATORS; g++)); do
 		metrics=""
 		[ "$OBSERVE" != 1 ] || metrics="--metrics $(gen_metrics_addr "$g")"
