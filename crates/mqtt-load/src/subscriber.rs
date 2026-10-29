@@ -24,6 +24,9 @@ struct Batch {
     e2e: Vec<u64>,
     acks: Vec<u8>,
     received: u64,
+    /// PUBACKs written in the last write: each took the batch's turnaround.
+    acked: usize,
+    turnaround_ns: u64,
 }
 
 /// The packet id a broker allocating sequentially uses after `last` (0 is not an id).
@@ -104,7 +107,18 @@ pub async fn consumer(
                 ctx.errors.write.fetch_add(1, Ordering::Relaxed);
                 return;
             }
+            // From the read that brought these deliveries to their PUBACKs written.
+            batch.acked = batch.acks.len() / client::puback(1).len();
+            batch.turnaround_ns = now_ns().saturating_sub(now);
             batch.acks.clear();
+        }
+        if batch.acked > 0 {
+            let mut s = ctx.stats.shard(shard);
+            for _ in 0..batch.acked {
+                s.puback_turnaround.record_ns(batch.turnaround_ns);
+            }
+            drop(s);
+            batch.acked = 0;
         }
         if batch.received > 0 {
             ctx.progress(now);

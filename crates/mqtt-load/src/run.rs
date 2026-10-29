@@ -133,6 +133,7 @@ fn aggregate(dur_ns: u64, offered: u64, c: &Counters, h: &Histos, buckets: bool)
         e2e_latency: h.e2e.summary(),
         sched_lag: h.sched_lag.summary(),
         send_delay: h.send_delay.summary(),
+        puback_turnaround: h.puback_turnaround.summary(),
         ack_histogram: buckets.then(|| h.ack.export()),
         e2e_histogram: buckets.then(|| h.e2e.export()),
     }

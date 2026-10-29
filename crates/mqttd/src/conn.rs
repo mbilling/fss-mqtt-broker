@@ -3158,7 +3158,14 @@ where
                     // what keeps the byte counter from drifting (issue #241).
                     out_meter.drained(&out);
                     let (pkt, origin) = match &mut *out {
-                        crate::hub::Outgoing::Packet { packet, origin } => (packet, origin.take()),
+                        crate::hub::Outgoing::Packet { packet, origin, queued } => {
+                            if let (Some(m), Packet::Publish(p)) = (&policy.metrics, &*packet) {
+                                if p.pkid.is_some() {
+                                    m.delivery_outbound_wait(queued.elapsed().as_secs_f64());
+                                }
+                            }
+                            (packet, origin.take())
+                        }
                         // A drop the hub decided, for this task to raise: nothing to
                         // write.
                         crate::hub::Outgoing::Note(note) => {

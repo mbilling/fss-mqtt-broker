@@ -249,6 +249,10 @@ pub struct Aggregate {
     pub sched_lag: LatencySummary,
     /// Due → written, every send (includes waiting for credit or the socket).
     pub send_delay: LatencySummary,
+    /// Consumers: delivery read → its PUBACK written. With the broker's
+    /// `mqttd_delivery_outbound_wait_seconds` it splits the write-elision hold into the
+    /// broker's queue, the wire and the consumer.
+    pub puback_turnaround: LatencySummary,
     /// The ack-latency histogram's buckets (phases and totals only; absent on windows).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ack_histogram: Option<HistogramExport>,

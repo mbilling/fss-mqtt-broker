@@ -158,6 +158,7 @@ async fn without_a_message_event_rule_nothing_is_carried_or_noted() {
             Outgoing::Packet {
                 packet: Packet::Publish(p),
                 origin,
+                ..
             } => {
                 assert_eq!(&p.payload[..], b"m");
                 assert!(origin.is_none(), "no rule raises an event at the delivery");
@@ -201,6 +202,7 @@ actions = [{ function = "console" }]
             Outgoing::Packet {
                 packet: Packet::Publish(_),
                 origin,
+                ..
             } => origin.map(|got| Arc::ptr_eq(&got, &o)),
             other => panic!("expected the PUBLISH, got {other:?}"),
         }

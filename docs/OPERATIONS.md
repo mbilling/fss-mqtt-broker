@@ -1688,6 +1688,7 @@ not its mean.
 | `mqttd_durable_elision_fallback_total{reason}` | held deliveries written after all: `timeout` (the window ended), `disconnect`, `brownout`, `drain`, `head` (written before a later durable delivery on the same topic) |
 | `mqttd_durable_elision_hold_seconds` | how long a discharged delivery was held: the subscribers' acknowledgement latency, censored at the window |
 | `mqttd_durable_elision_backoff_total` | sessions backed off for missing the window |
+| `mqttd_delivery_outbound_wait_seconds` | how long a QoS 1 or 2 delivery waited in its subscriber's outbound queue before the connection took it for the socket. It is the broker's own part of the hold: a hold far above it is spent on the wire or in the subscriber |
 | `/statusz` → `write_elision` | `window_ms`, `elided`, `written`, `discharged_x100` (the share of held deliveries discharged, ×100), `backoffs` |
 
 **If most deliveries are still written:**

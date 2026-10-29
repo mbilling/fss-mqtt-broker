@@ -299,6 +299,9 @@ pub struct Outbound {
 
 /// What the hub queues for one client's connection task.
 #[derive(Debug)]
+// The channel carries it boxed (`send_from`), so the variants' size difference —
+// `Packet` is 200 B, a note one pointer — is paid once per queued item, not per slot.
+#[allow(clippy::large_enum_variant)]
 pub enum Outgoing {
     /// A packet to write.
     Packet {
@@ -309,6 +312,9 @@ pub enum Outgoing {
         /// (`$events/message/delivered`, `acked`, a `too_large` `delivery_dropped`;
         /// ADR 0083), and only for a message that still carries one.
         origin: Option<Arc<Origin>>,
+        /// When the hub queued it: the connection's task reports a `QoS` >= 1
+        /// PUBLISH's wait (`delivery_outbound_wait_seconds`).
+        queued: Instant,
     },
     /// A message event the hub decided, for this connection's task to raise (ADR
     /// 0083): nothing is written to the client.
@@ -492,7 +498,11 @@ impl Outbound {
         // that only publishes never pays it.
         if self
             .tx
-            .send(Box::new(Outgoing::Packet { packet, origin }))
+            .send(Box::new(Outgoing::Packet {
+                packet,
+                origin,
+                queued: Instant::now(),
+            }))
             .is_err()
         {
             // Never queued, so never drained: keep both counts honest.

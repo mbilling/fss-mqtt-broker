@@ -347,6 +347,7 @@ struct OtelInstruments {
     durable_elided: OtelCounter<u64>,
     durable_elision_fallbacks: OtelCounter<u64>,
     durable_elision_hold: OtelHistogram<f64>,
+    delivery_outbound_wait: OtelHistogram<f64>,
     durable_elision_backoffs: OtelCounter<u64>,
     durable_recovery_failures: OtelCounter<u64>,
     lease_quorum_ack_ms: OtelGauge<i64>,
@@ -514,6 +515,9 @@ impl OtelInstruments {
             durable_elided: meter.u64_counter("durable_elided").build(),
             durable_elision_fallbacks: meter.u64_counter("durable_elision_fallback").build(),
             durable_elision_hold: meter.f64_histogram("durable_elision_hold_seconds").build(),
+            delivery_outbound_wait: meter
+                .f64_histogram("delivery_outbound_wait_seconds")
+                .build(),
             durable_elision_backoffs: meter.u64_counter("durable_elision_backoff").build(),
             durable_recovery_failures: meter.u64_counter("durable_recovery_failures").build(),
             lease_quorum_ack_ms: meter.i64_gauge("lease_quorum_ack_ms").build(),
@@ -690,6 +694,7 @@ pub struct Metrics {
     durable_elision_fallback_total: Family<ReasonLabel, Counter>,
     durable_elision_hold_seconds: Histogram,
     durable_elision_backoff_total: Counter,
+    delivery_outbound_wait_seconds: Histogram,
     /// Durable session *recovery* refusals (ADR 0049): a persistent attach that stayed
     /// unavailable past its deadline and got CONNACK 0x88. Distinct from an *append*
     /// failure — the signal that was silent for 11 h in the 2026-07-14 incident.
@@ -1335,6 +1340,14 @@ impl Metrics {
              it: the subscriber's acknowledgement latency (ADR 0089)",
             durable_elision_hold_seconds.clone(),
         );
+        let delivery_outbound_wait_seconds = Histogram::new(fine_latency_buckets());
+        registry.register(
+            "delivery_outbound_wait_seconds",
+            "How long a QoS >= 1 delivery waited between the hub handing it to the \
+             subscriber's connection and that connection's task taking it for the socket: \
+             the broker's own share of the write-elision hold (ADR 0089), before the wire",
+            delivery_outbound_wait_seconds.clone(),
+        );
         let durable_elision_backoff_total = register_counter(
             &mut registry,
             "durable_elision_backoff",
@@ -1925,6 +1938,7 @@ impl Metrics {
             durable_elision_fallback_total,
             durable_elision_hold_seconds,
             durable_elision_backoff_total,
+            delivery_outbound_wait_seconds,
             durable_recovery_failures_total,
             lease_quorum_ack_ms,
             gossip_rejected_total,
@@ -2647,6 +2661,13 @@ impl Metrics {
         self.durable_elision_hold_seconds.observe(held_seconds);
         self.otel.durable_elided.add(1, &[]);
         self.otel.durable_elision_hold.record(held_seconds, &[]);
+    }
+
+    /// A `QoS` >= 1 delivery left its connection's outbound queue for the socket after
+    /// waiting `seconds` there since the hub handed it over.
+    pub fn delivery_outbound_wait(&self, seconds: f64) {
+        self.delivery_outbound_wait_seconds.observe(seconds);
+        self.otel.delivery_outbound_wait.record(seconds, &[]);
     }
 
     /// A held delivery fell back to a durable write; `reason` is a bounded class
@@ -3891,6 +3912,12 @@ mod tests {
         );
         assert!(
             out.contains("mqttd_durable_elision_hold_seconds_count 1"),
+            "{out}"
+        );
+        m.delivery_outbound_wait(0.003);
+        let out = m.render();
+        assert!(
+            out.contains("mqttd_delivery_outbound_wait_seconds_count 1"),
             "{out}"
         );
     }
