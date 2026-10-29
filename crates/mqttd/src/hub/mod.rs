@@ -1640,6 +1640,8 @@ pub enum HubCommand {
         client: ClientId,
         /// The packet id being acknowledged.
         pkid: u16,
+        /// When the connection read it (`puback_hub_wait_seconds`).
+        received: Instant,
     },
     /// A subscriber acknowledged receipt of a `QoS` 2 delivery (step 1 of 2).
     PubRec {
@@ -3985,7 +3987,16 @@ impl Hub {
             HubCommand::PkidBlockReserved { client, result } => {
                 self.pkid_block_reserved(&client, result);
             }
-            HubCommand::PubAck { client, pkid } => self.dispatch_pub_ack(&client, pkid),
+            HubCommand::PubAck {
+                client,
+                pkid,
+                received,
+            } => {
+                if let Some(m) = &self.metrics {
+                    m.puback_hub_wait(received.elapsed().as_secs_f64());
+                }
+                self.dispatch_pub_ack(&client, pkid);
+            }
             HubCommand::PubRec { client, pkid } => self.dispatch_pub_rec(&client, pkid),
             HubCommand::PubComp { client, pkid } => self.dispatch_pub_comp(&client, pkid),
             HubCommand::Detach {
@@ -10584,6 +10595,7 @@ mod tests {
             HubCommand::PubAck {
                 client: ClientId("c".into()),
                 pkid: 1,
+                received: tokio::time::Instant::now(),
             }
             .lane(),
             super::Lane::Control
@@ -10955,6 +10967,7 @@ mod tests {
         tx.send(ordered(HubCommand::PubAck {
             client: ClientId(client.into()),
             pkid,
+            received: tokio::time::Instant::now(),
         }))
         .unwrap();
     }

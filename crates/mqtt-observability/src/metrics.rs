@@ -348,6 +348,8 @@ struct OtelInstruments {
     durable_elision_fallbacks: OtelCounter<u64>,
     durable_elision_hold: OtelHistogram<f64>,
     delivery_outbound_wait: OtelHistogram<f64>,
+    delivery_flushed: OtelHistogram<f64>,
+    puback_hub_wait: OtelHistogram<f64>,
     durable_elision_backoffs: OtelCounter<u64>,
     durable_recovery_failures: OtelCounter<u64>,
     lease_quorum_ack_ms: OtelGauge<i64>,
@@ -518,6 +520,8 @@ impl OtelInstruments {
             delivery_outbound_wait: meter
                 .f64_histogram("delivery_outbound_wait_seconds")
                 .build(),
+            delivery_flushed: meter.f64_histogram("delivery_flushed_seconds").build(),
+            puback_hub_wait: meter.f64_histogram("puback_hub_wait_seconds").build(),
             durable_elision_backoffs: meter.u64_counter("durable_elision_backoff").build(),
             durable_recovery_failures: meter.u64_counter("durable_recovery_failures").build(),
             lease_quorum_ack_ms: meter.i64_gauge("lease_quorum_ack_ms").build(),
@@ -695,6 +699,8 @@ pub struct Metrics {
     durable_elision_hold_seconds: Histogram,
     durable_elision_backoff_total: Counter,
     delivery_outbound_wait_seconds: Histogram,
+    delivery_flushed_seconds: Histogram,
+    puback_hub_wait_seconds: Histogram,
     /// Durable session *recovery* refusals (ADR 0049): a persistent attach that stayed
     /// unavailable past its deadline and got CONNACK 0x88. Distinct from an *append*
     /// failure — the signal that was silent for 11 h in the 2026-07-14 incident.
@@ -1348,6 +1354,23 @@ impl Metrics {
              the broker's own share of the write-elision hold (ADR 0089), before the wire",
             delivery_outbound_wait_seconds.clone(),
         );
+        let delivery_flushed_seconds = Histogram::new(fine_latency_buckets());
+        registry.register(
+            "delivery_flushed_seconds",
+            "How long from the hub handing a QoS >= 1 delivery to the subscriber's connection \
+             until the socket write that carried it completed: one sample per write, for \
+             the oldest delivery in it. The broker's whole share of the write-elision hold \
+             on the way out (ADR 0089)",
+            delivery_flushed_seconds.clone(),
+        );
+        let puback_hub_wait_seconds = Histogram::new(fine_latency_buckets());
+        registry.register(
+            "puback_hub_wait_seconds",
+            "How long a subscriber's PUBACK waited between its connection task reading it and \
+             the hub acting on it: the broker's share of the write-elision hold on the way \
+             back (ADR 0089)",
+            puback_hub_wait_seconds.clone(),
+        );
         let durable_elision_backoff_total = register_counter(
             &mut registry,
             "durable_elision_backoff",
@@ -1939,6 +1962,8 @@ impl Metrics {
             durable_elision_hold_seconds,
             durable_elision_backoff_total,
             delivery_outbound_wait_seconds,
+            delivery_flushed_seconds,
+            puback_hub_wait_seconds,
             durable_recovery_failures_total,
             lease_quorum_ack_ms,
             gossip_rejected_total,
@@ -2668,6 +2693,19 @@ impl Metrics {
     pub fn delivery_outbound_wait(&self, seconds: f64) {
         self.delivery_outbound_wait_seconds.observe(seconds);
         self.otel.delivery_outbound_wait.record(seconds, &[]);
+    }
+
+    /// A socket write carrying `QoS` >= 1 deliveries completed `seconds` after the hub
+    /// handed the oldest of them to the connection.
+    pub fn delivery_flushed(&self, seconds: f64) {
+        self.delivery_flushed_seconds.observe(seconds);
+        self.otel.delivery_flushed.record(seconds, &[]);
+    }
+
+    /// The hub acted on a subscriber's PUBACK `seconds` after its connection read it.
+    pub fn puback_hub_wait(&self, seconds: f64) {
+        self.puback_hub_wait_seconds.observe(seconds);
+        self.otel.puback_hub_wait.record(seconds, &[]);
     }
 
     /// A held delivery fell back to a durable write; `reason` is a bounded class
@@ -3915,11 +3953,19 @@ mod tests {
             "{out}"
         );
         m.delivery_outbound_wait(0.003);
+        m.delivery_flushed(0.004);
+        m.puback_hub_wait(0.002);
         let out = m.render();
-        assert!(
-            out.contains("mqttd_delivery_outbound_wait_seconds_count 1"),
-            "{out}"
-        );
+        for name in [
+            "delivery_outbound_wait",
+            "delivery_flushed",
+            "puback_hub_wait",
+        ] {
+            assert!(
+                out.contains(&format!("mqttd_{name}_seconds_count 1")),
+                "{name}: {out}"
+            );
+        }
     }
 
     #[test]
