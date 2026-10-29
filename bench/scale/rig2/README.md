@@ -36,6 +36,12 @@ up to a multiple of the brokers).
 example `EXTRA_BROKER_ENV=MQTTD_STORE_SHARDS=8`), on the cloud tiers only. They are
 logged, kept in `run.json` (`extra_broker_env`) and listed in the report's header.
 
+Each broker scrape also samples the broker host's network path (`scrape-loop.py --net`,
+on the cloud tiers; `NET_PORT=` turns it off): `<unix_ms>.net.json` beside each
+`<unix_ms>.prom`, with the TCP round-trip times and retransmits of the MQTT sockets
+(`ss -ti`), softnet's per-CPU dropped and squeezed counts, per-CPU softirq time, and the
+NICs' packet counters, queue counts and RPS masks. The judge does not read them.
+
 **Generator hosts are checked before they measure anything.**
 
 - **RPS at bring-up.** Every generator host gets RPS/RFS over all its CPUs, as the brokers

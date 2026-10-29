@@ -147,6 +147,11 @@ SETTLE_QUIET_LONG="${SETTLE_QUIET_LONG:-30}"
 # is not ready in time starts on its own when it is (mqtt-load --start-wait), and the
 # judge's overlap check decides.
 START_SYNC_WAIT="${START_SYNC_WAIT:-${DEF_START_SYNC_WAIT:-30}}"
+# The broker host's network path, sampled with every scrape (scrape-loop.py --net):
+# round-trip times and retransmits of the MQTT sockets, softnet, softirq, NIC counters.
+# The port is the brokers' plaintext listener (templates/mqttd.env.tmpl); the local tier
+# has no `ss` and no /proc, so it samples nothing. NET_PORT= turns it off.
+if [ "$TIER" = local ]; then NET_PORT="${NET_PORT-}"; else NET_PORT="${NET_PORT-1883}"; fi
 # A generator's own wait counts from its ready file, not from its launch, and mqtt-load
 # refuses one longer than the keep-alive (60 s): its publishers are silent while they
 # wait. So it is capped there, whatever the rig waits for the slowest generator.
@@ -795,7 +800,7 @@ prime_ladder() { # prime_ladder <ladder-dir>: unmeasured load at the start rate 
 # left by an earlier try of the same start is stopped first), stopped, fetched.
 scrape_loop_start() {
 	on_broker "$1" "[ -f \$H/steps/$hid/scrape.pid ] && kill \$(cat \$H/steps/$hid/scrape.pid) 2>/dev/null; rm -rf \$H/steps/$hid; mkdir -p \$H/steps/$hid; nohup python3 \$H/scrape-loop.py --url '$(broker_metrics_url "$1")' \
-		--out \$H/steps/$hid/scrapes --interval $SCRAPE_INTERVAL --max-secs 1800 >/dev/null 2>&1 </dev/null & echo \$! >\$H/steps/$hid/scrape.pid"
+		--out \$H/steps/$hid/scrapes --interval $SCRAPE_INTERVAL --max-secs 1800 ${NET_PORT:+--net $NET_PORT} >/dev/null 2>&1 </dev/null & echo \$! >\$H/steps/$hid/scrape.pid"
 }
 scrape_loop_stop() { on_broker "$1" "kill \$(cat \$H/steps/$hid/scrape.pid) 2>/dev/null; true"; }
 # One tar stream per broker, unpacked beside the target and renamed into place only when
