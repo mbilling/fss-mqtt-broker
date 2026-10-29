@@ -35,6 +35,9 @@ up to a multiple of the brokers).
 `EXTRA_BROKER_ENV` adds lines to every broker's env after the shipped defaults (for
 example `EXTRA_BROKER_ENV=MQTTD_STORE_SHARDS=8`), on the cloud tiers only. They are
 logged, kept in `run.json` (`extra_broker_env`) and listed in the report's header.
+`BROKER_NIC_SPREAD=1` spreads the brokers' network softirq over every core at boot (one
+NIC queue per CPU where the NIC allows it, and RPS); it is off by default, the untuned
+kernel, and a run with it says so in `run.json` and the report's header.
 
 Each broker scrape also samples the broker host's network path (`scrape-loop.py --net`,
 on the cloud tiers; `NET_PORT=` turns it off): `<unix_ms>.net.json` beside each

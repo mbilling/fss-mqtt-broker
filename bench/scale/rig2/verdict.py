@@ -1482,6 +1482,8 @@ def report(run: Path) -> dict:
         for role, models in sorted((meta.get("cpu") or {}).items()):
             md.append(f"- {role} CPU: " + "; ".join(f"{m} ({n} host(s))" for m, n in sorted(models.items())))
         md.append(f"- broker: {meta.get('binary', '?')}")
+        if meta.get("broker_nic_spread"):
+            md.append("- broker hosts tuned: network softirq spread over every core (`BROKER_NIC_SPREAD=1`)")
         if meta.get("extra_broker_env"):
             md.append("- broker env added to the shipped defaults: "
                       + ", ".join(f"`{e}`" for e in meta["extra_broker_env"]))

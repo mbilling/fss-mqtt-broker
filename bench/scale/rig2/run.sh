@@ -404,6 +404,10 @@ else
 		-var broker_server_type="$BROKER_TYPE" -var driver_server_type="$GEN_TYPE"
 		-var run_label="rig2-$STAMP" -var mqttd_version="$MQTTD_VERSION"
 		-var build_bench=false -var driver_emqtt_bench=false)
+	# BROKER_NIC_SPREAD=1: the brokers' network softirq spread over every core at boot
+	# (one NIC queue per CPU where the NIC allows it, and RPS; terraform's
+	# broker_nic_spread). Off by default, the untuned kernel; disclosed in run.json.
+	[ "${BROKER_NIC_SPREAD:-0}" != 1 ] || TF_APPLY_ARGS+=(-var broker_nic_spread=true)
 	[ -z "${MQTTD_URL:-}" ] || TF_APPLY_ARGS+=(-var mqttd_url="$MQTTD_URL")
 	[ -z "${MQTTD_SHA256:-}" ] || TF_APPLY_ARGS+=(-var mqttd_sha256="$MQTTD_SHA256")
 	TF_APPLY_ARGS+=(${TOFU_SSH_PUBKEY_ARGS[@]+"${TOFU_SSH_PUBKEY_ARGS[@]}"})
@@ -511,6 +515,7 @@ json.dump({"tier": "$TIER", "brokers": $BROKERS, "broker_type": "$BROKER_TYPE" i
            "prime_s": $PRIME_SECS, "drain_timeout_s": $DRAIN_TIMEOUT, "drain_quiet_s": $DRAIN_QUIET,
            "settle_quiet_s": $SETTLE_QUIET, "rounds": $ROUNDS,
            "observe": "$OBSERVE" == "1", "cpu": json.loads("""$CPU_JSON"""),
+           "broker_nic_spread": "${BROKER_NIC_SPREAD:-0}" == "1",
            "extra_broker_env": [l for l in """${EXTRA_BROKER_ENV:-}""".splitlines() if l.strip()],
            "git": "$(git -C "$REPO_ROOT" rev-parse HEAD)"}, open(sys.argv[1], "w"), indent=2)
 PY
