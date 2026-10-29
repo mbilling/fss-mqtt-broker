@@ -117,8 +117,11 @@ def make_step(root: Path, rate, gens, *, brokers=3, received_share=1.0, drops=No
             secs = max(0.0, (t - first) / 1000)
             dropped = {k: (v if t == stamps[-1] else 0) for k, v in (drops or {}).items()} if b == 0 else None
             st = 1700000001.0 if (restart and b == 1 and t == stamps[-1]) else 1700000000.0
-            # `held`: what broker 0's gauges hold from the generators' drain end (80 s) on.
-            g = held if (held and b == 0 and t >= T0 + 80_000) else None
+            # `held`: what broker 0's gauges hold over the generators' drain (its last 10 s,
+            # to the drain end at 80 s). After it they read 0, as on a real run: mqtt-load
+            # disconnects its clients at the drain end, durable consumers with session
+            # expiry 0, and the broker discards their sessions' unacked deliveries.
+            g = held if (held and b == 0 and T0 + 70_000 <= t <= T0 + 80_000) else None
             (d / f"{t}.prom").write_text(prom(per_broker * secs, per_broker * secs, dropped, st, g))
     return step
 
@@ -407,6 +410,19 @@ class Verdicts(unittest.TestCase):
         self.assertIn("missing 500 = broker loss drops 0 + 500 still queued on the brokers at the cut-off", v["notes"][0])
         # For the ramp it is above the knee, like OFFER NOT TAKEN.
         self.assertIn(V.NOT_DRAINED, V.BAD)
+
+    def test_what_the_brokers_held_is_read_before_the_generator_ended_its_sessions(self):
+        # h3 durable-qos1 45,000 round 2 (2026-10-29): the broker held 297 unacked
+        # deliveries until mqtt-load ended its durable sessions at the drain end, and 0
+        # at its first scrape after. Read there, the 297 were "unexplained" loss.
+        v = verdict_of(make_step(self.root, 30000, [summary(30000, missing=297, missing_acked=297,
+                                                            drain="quiet")],
+                                 brokers=1, held={"mqttd_inflight_messages": 297}))
+        self.assertEqual(v["drain"]["held_at_cutoff"]["mqttd_inflight_messages"], 297)
+        self.assertEqual(v["drain"]["queued_at_cutoff"], 297)
+        self.assertEqual(v["drain"]["unexplained"], 0)
+        self.assertEqual(v["drain"]["unexplained_acked"], 0)
+        self.assertEqual(v["verdict"], V.NOT_DRAINED, v)
 
     def test_a_drain_cut_off_with_drops_fails_and_reconciles_missing(self):
         # Run 2's clean-qos1 152,000: missing = loss drops + what the brokers still held.
