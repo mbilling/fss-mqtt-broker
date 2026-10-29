@@ -36,7 +36,7 @@ Everything is judged from the broker's side (D1):
 - **NOT DRAINED**: the ledger misses deliveries, no broker dropped any as loss, and the
   drain ended (quiet or timeout) while the brokers' own gauges still held at least as
   many messages for the generator's clients (`mqttd_inflight_messages` +
-  `mqttd_pending_publishes` at the first scrape after the drain's end). The missing
+  `mqttd_pending_publishes` at the last scrape before the drain's end). The missing
   messages were still queued, not lost: not carried, not loss. With broker loss drops
   the step is FAILED, and its missing count is reconciled as loss drops + still queued
   at the cut-off.
@@ -280,7 +280,8 @@ def broker_figures(step: Path, lo_ms: float, hi_ms: float, margin_ms: float, min
     scrape of the step, warm-up and drain included: a message dropped at any point is loss.
 
     `held_at_cutoff`: what the brokers still held for clients (HELD_GAUGES, summed) at
-    each broker's first scrape at or after `cutoff_ms`, the generators' drain end.
+    each broker's last scrape at or before `cutoff_ms`, the generators' drain end (its first
+    scrape after when none precedes it).
 
     `expected`: the run's broker count. The figures are a cluster's only when EVERY
     broker has a usable window: `complete` is false, a problem names the brokers whose
@@ -326,11 +327,22 @@ def broker_figures(step: Path, lo_ms: float, hi_ms: float, margin_ms: float, min
         res["lost"] += sum(v for k, v in drops.items() if drop_is_loss(k))
         row["dropped"] = sum(drops.values())
         if cutoff_ms is not None:
-            after = [p for t, p in samples if t >= cutoff_ms]
-            if after:
+            # The last scrape at or before the drain's end: what the broker held while
+            # the generator was still connected and waiting. Not the first one after:
+            # at its drain end mqtt-load disconnects every client, a durable consumer
+            # with session expiry 0, and the broker discards those sessions' unacked
+            # deliveries with them, so a scrape after it reads 0 for messages the broker
+            # held until that moment (h3 durable-qos1 45,000 round 2, 2026-10-29: 297
+            # unacked deliveries up to 134 ms before the drain's end, 0 after, reported
+            # as 297 "that no broker drop counter or queue accounts for"). The first
+            # scrape after is the fallback when none precedes the cut-off.
+            before = [p for t, p in samples if t <= cutoff_ms]
+            after = [p for t, p in samples if t > cutoff_ms]
+            at = before[-1] if before else (after[0] if after else None)
+            if at is not None:
                 held = res["held_at_cutoff"] or {g: 0.0 for g in HELD_GAUGES}
                 for g in HELD_GAUGES:
-                    held[g] += E.sum_family(after[0], g)
+                    held[g] += E.sum_family(at, g)
                 res["held_at_cutoff"] = held
         inside = [s for s in samples if lo_ms + margin_ms <= s[0] <= hi_ms - margin_ms]
         if len(inside) < 2 or inside[-1][0] - inside[0][0] < want:
@@ -538,7 +550,7 @@ def drain_figures(gens: list, bf: dict | None) -> dict:
         missing = broker loss drops + still queued at the cut-off + unexplained
 
     `queued_at_cutoff` is what the brokers' gauges account for (unacked deliveries and
-    pending publishes at their first scrape after the drain's end, at most the missing
+    pending publishes at their last scrape before the drain's end, at most the missing
     beyond the drops); `unexplained` is the rest: missing that no drop counter and no
     broker queue accounts for. `still_queued` is true when the gauges account for every
     message missing beyond the drops (and every unacked publish) and nothing unexpected
