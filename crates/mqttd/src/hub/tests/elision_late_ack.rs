@@ -83,6 +83,9 @@ async fn late_pubacks_into_a_shared_group_lose_nothing_a_publisher_was_acked_for
                 let delay = Duration::from_millis(seed % 12);
                 let (tx, client) = (tx.clone(), ClientId(name.clone().into()));
                 tokio::spawn(async move {
+                    // SETTLE(elision-late-puback): the delay IS the fault under test —
+                    // a subscriber's PUBACK landing before, inside or after the window
+                    // and the fallback write; there is no state to poll for instead.
                     tokio::time::sleep(delay).await;
                     // On the control lane, as the connection sends it (ADR 0082 T2).
                     let _ = tx.send(HubCommand::PubAck { client, pkid });
@@ -97,6 +100,8 @@ async fn late_pubacks_into_a_shared_group_lose_nothing_a_publisher_was_acked_for
         let payload = Bytes::from(format!("m{n}").into_bytes());
         dones.push((payload.clone(), publish_owned(&tx, "t", payload)));
         if n % 2 == 1 {
+            // SETTLE(elision-late-ack-pacing): the pause is the publish RATE (~2 per ms),
+            // not a wait: holds, timeouts and writes must overlap, not run in one burst.
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     }
