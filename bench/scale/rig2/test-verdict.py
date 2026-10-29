@@ -1123,6 +1123,14 @@ class PerVcpu(unittest.TestCase):
         c = V.cost("h3", workloads=1, steps=10, rounds=3)
         self.assertEqual((c["brokers"], c["broker_type"], c["generators"], c["gen_type"]), (3, "ccx53", 6, "ccx33"))
         self.assertAlmostEqual(c["eur_per_hour"], 3 * 1.06875 + 6 * 0.277375)
+    def test_added_broker_env_is_disclosed_in_the_report(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d)
+            (run / "run.json").write_text(json.dumps({"tier": "h3", "brokers": 1, "broker_type": "ccx53",
+                                                      "workloads": [], "extra_broker_env": ["MQTTD_STORE_SHARDS=8"]}))
+            V.report(run)
+            self.assertIn("broker env added to the shipped defaults: `MQTTD_STORE_SHARDS=8`",
+                          (run / "report.md").read_text())
 
 if __name__ == "__main__":
     unittest.main()

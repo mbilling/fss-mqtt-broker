@@ -1482,6 +1482,9 @@ def report(run: Path) -> dict:
         for role, models in sorted((meta.get("cpu") or {}).items()):
             md.append(f"- {role} CPU: " + "; ".join(f"{m} ({n} host(s))" for m, n in sorted(models.items())))
         md.append(f"- broker: {meta.get('binary', '?')}")
+        if meta.get("extra_broker_env"):
+            md.append("- broker env added to the shipped defaults: "
+                      + ", ".join(f"`{e}`" for e in meta["extra_broker_env"]))
         md.append(f"- started {meta.get('started_utc', '?')}; steps: {meta.get('rounds', 1)} round(s) of "
                   f"{meta.get('warmup_s')} s warm-up, {meta.get('measure_s')} s measured")
         if meta.get("unreleased"):

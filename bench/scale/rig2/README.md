@@ -32,6 +32,10 @@ records every host's CPU model (`run.json` `cpu`): a CCX host may be EPYC Milan 
 defaults to 10,000 in all, with 10,000 durable consumers (`CONSUMERS` per topic, rounded
 up to a multiple of the brokers).
 
+`EXTRA_BROKER_ENV` adds lines to every broker's env after the shipped defaults (for
+example `EXTRA_BROKER_ENV=MQTTD_STORE_SHARDS=8`), on the cloud tiers only. They are
+logged, kept in `run.json` (`extra_broker_env`) and listed in the report's header.
+
 **Generator hosts are checked before they measure anything.**
 
 - **RPS at bring-up.** Every generator host gets RPS/RFS over all its CPUs, as the brokers
@@ -295,7 +299,8 @@ more than 10% in received msg/s ((max − min) / min) or more than 2× in p99 (m
 3. **Load.** One mqtt-load process per generator host, each offering `rate / GENERATORS`
    msg/s, all on one start: each writes a ready file once its clients are connected
    (`--ready-file`) and waits for a start file (`--start-file`); when every generator is
-   ready, or after `START_SYNC_WAIT` (30 s), the rig writes one start time,
+   ready, or after `START_SYNC_WAIT` (30 s; 120 s on `h3`, where 20,000 clients take
+   about 40 s to connect), the rig writes one start time,
    `START_LEAD_MS` (3000; local 500) ahead on generator host 0's clock, into every start
    file. On the 10-node run of 2026-10-27 one generator took 13.8 s to connect against
    the others' 5.2 s, and the windows of clean-qos1 303,800 overlapped 51.6 s of 60. A

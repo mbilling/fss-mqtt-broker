@@ -67,6 +67,9 @@ h3)
 	# (20 topics a generator) rounded up to a multiple of the brokers, so each holds as many.
 	DEF_PUBLISHERS=$((10000 / GENERATORS))
 	DEF_CONSUMERS=$(((10000 / (20 * GENERATORS) + BROKERS - 1) / BROKERS * BROKERS))
+	# 20,000 clients take ~40 s to connect (one CCX43 generator, 2026-10-28): 30 s left
+	# it starting 10-13 s past the shared start every round.
+	DEF_START_SYNC_WAIT=120
 	;;
 *) die "TIER must be local, n3, n10 or h3, not '$TIER'" ;;
 esac
@@ -143,7 +146,7 @@ SETTLE_QUIET_LONG="${SETTLE_QUIET_LONG:-30}"
 # 10-node run (clean-qos1 303,800) left windows overlapping 51.6 s of 60: VOID. One that
 # is not ready in time starts on its own when it is (mqtt-load --start-wait), and the
 # judge's overlap check decides.
-START_SYNC_WAIT="${START_SYNC_WAIT:-30}"
+START_SYNC_WAIT="${START_SYNC_WAIT:-${DEF_START_SYNC_WAIT:-30}}"
 if [ "$TIER" = local ]; then START_LEAD_MS="${START_LEAD_MS:-500}"; else START_LEAD_MS="${START_LEAD_MS:-3000}"; fi
 # For the price quote: steps a ladder is expected to take (coarse climb + bisection), and
 # the long settles it waits through besides the first (after a step that was not carried,
@@ -420,6 +423,9 @@ else
 	}
 	[ -z "${MQTTD_LOCAL_BIN:-}" ] || push_local_bin
 	phase bootstrapping "rig2 $TIER: $BROKERS nodes"
+	# EXTRA_BROKER_ENV: lines appended to every broker's env (bootstrap-cluster.sh), and
+	# disclosed in run.json and the report: a variant never runs undisclosed.
+	[ -z "${EXTRA_BROKER_ENV:-}" ] || say "broker env added to the shipped defaults: $(printf '%s' "$EXTRA_BROKER_ENV" | tr '\n' ' ')"
 	run_fg "$SCALE_DIR/bootstrap-cluster.sh" "$RUN" "$INVENTORY" durable
 	ENDPOINTS=$(jq -r '[.brokers[].mqtt_plain] | join(",")' "$INVENTORY")
 	mapfile -t BROKER_PRIV < <(jq -r '.brokers[].private_ip' "$INVENTORY")
@@ -496,6 +502,7 @@ json.dump({"tier": "$TIER", "brokers": $BROKERS, "broker_type": "$BROKER_TYPE" i
            "prime_s": $PRIME_SECS, "drain_timeout_s": $DRAIN_TIMEOUT, "drain_quiet_s": $DRAIN_QUIET,
            "settle_quiet_s": $SETTLE_QUIET, "rounds": $ROUNDS,
            "observe": "$OBSERVE" == "1", "cpu": json.loads("""$CPU_JSON"""),
+           "extra_broker_env": [l for l in """${EXTRA_BROKER_ENV:-}""".splitlines() if l.strip()],
            "git": "$(git -C "$REPO_ROOT" rev-parse HEAD)"}, open(sys.argv[1], "w"), indent=2)
 PY
 
