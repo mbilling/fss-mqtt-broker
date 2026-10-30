@@ -2,8 +2,38 @@
 
 The probe runs the same tests on AWS as on Hetzner (`run.sh`, `PROVIDER=aws`): two
 instances in one availability zone, iperf3 and neper, and every counter that can drop or
-delay a packet. The default type is m6a.8xlarge, the instance HiveMQ 4.18 published its
-270k msg/s run on, in eu-central-1 (Frankfurt).
+delay a packet. The default type is m6i.8xlarge (32 vCPU, 12.5 Gbit/s): the generation of
+m6a.8xlarge, the instance HiveMQ 4.18 published its 270k msg/s run on, which eu-north-1
+does not offer. The region is the profile's (`aws configure get region`).
+
+## An account on the new AWS experience (a "project")
+
+An account created through a social sign-in is a project with three constraints that
+matter here, all met on 2026-10-30 for the project this probe was first run in:
+
+- **One region:** every resource lives in the project's region (eu-north-1 here).
+- **The free plan allows only small instance types** (c7i-flex.large, m7i-flex.large, t3
+  and t4g micro/small, all 2 vCPU), and refuses spot. A real probe needs the paid plan
+  (AWS Settings → Billing); a dry-run launch passes on the free plan, the real one does not.
+- **Managed IAM:** the CLI signs in with `aws login` (browser) under the project's own role;
+  there is no IAM user or Identity Center to set up, so section 2's policy does not apply.
+  The probe's teardown still deletes only what carries its tags.
+
+On such an account the setup is:
+
+```bash
+brew install awscli
+```
+
+```bash
+aws configure set region eu-north-1 --profile mqttd-bench
+```
+
+```bash
+aws login --region eu-north-1 --profile mqttd-bench
+```
+
+then section 3 (the quota) and section 4 (the run).
 
 You do the account steps below yourself: the credentials go into the AWS CLI on your
 machine and never into a chat, a file in this repository, or an environment variable you
@@ -19,7 +49,7 @@ brew install awscli
 aws --version
 ```
 
-## 2. Give the probe a narrow identity
+## 2. Give the probe a narrow identity (an ordinary account)
 
 Use an identity that can do only what the probe needs. The policy is
 [`aws-policy.json`](aws-policy.json): it reads instance types, prices, the vCPU quota and
@@ -41,7 +71,7 @@ Then, on your machine:
 aws configure sso --profile mqttd-bench
 ```
 
-It asks for the portal URL and the region (`eu-central-1`), opens the browser to sign in,
+It asks for the portal URL and the region, opens the browser to sign in,
 and lets you pick the account and the `mqttd-netprobe` role. Later sessions only need:
 
 ```bash
@@ -56,7 +86,7 @@ as an inline policy → Security credentials → Create access key (CLI). Then:
 aws configure --profile mqttd-bench
 ```
 
-and type the key ID and secret at its prompts, with region `eu-central-1`.
+and type the key ID and secret at its prompts, with your region.
 
 Check either way:
 
@@ -68,13 +98,13 @@ aws sts get-caller-identity --profile mqttd-bench
 
 New accounts often have a small on-demand limit. Two m6a.8xlarge need **64 vCPU** of
 "Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances" (quota code
-`L-1216C47A`) in eu-central-1. A later like-for-like broker run with HiveMQ's shape
+`L-1216C47A`) in the region. A later like-for-like broker run with HiveMQ's shape
 (3 brokers of 32 vCPU plus load generators) needs about **256 vCPU**.
 
 Check it:
 
 ```bash
-aws service-quotas get-service-quota --service-code ec2 --quota-code L-1216C47A --region eu-central-1 --profile mqttd-bench
+aws service-quotas get-service-quota --service-code ec2 --quota-code L-1216C47A --profile mqttd-bench
 ```
 
 Raise it in the console (Service Quotas → Amazon EC2 → the quota above → Request increase
@@ -82,7 +112,8 @@ at account level), or ask for 256 now so the broker run needs no second request.
 are usually granted within minutes to a day. The policy above does not include the
 request itself (`servicequotas:RequestServiceQuotaIncrease`), on purpose.
 
-The account also needs its **default VPC** in eu-central-1 (every account has one unless it
+Spot instances have their own quota, `L-34B43A08` ("All Standard ... Spot Instance
+Requests"). The account also needs its **default VPC** in the region (every account has one unless it
 was deleted; VPC → Your VPCs shows it).
 
 ## 4. Run the probe
@@ -120,7 +151,7 @@ group on exit, also after an error or Ctrl-C, and then audits by tag: it prints
 `nothing leaked` or lists what is left. To check by hand at any time:
 
 ```bash
-aws ec2 describe-instances --region eu-central-1 --profile mqttd-bench --filters Name=tag:purpose,Values=mqttd-netprobe Name=instance-state-name,Values=pending,running,stopping,stopped --query 'Reservations[].Instances[].[InstanceId,State.Name]' --output text
+aws ec2 describe-instances --profile mqttd-bench --filters Name=tag:purpose,Values=mqttd-netprobe Name=instance-state-name,Values=pending,running,stopping,stopped --query 'Reservations[].Instances[].[InstanceId,State.Name]' --output text
 ```
 
 ## What it measures
