@@ -1535,7 +1535,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 884 test(s)
+## `crates/mqttd/src/lib.rs` — 885 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -2009,6 +2009,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::durable_off_keeps_the_adr_0014_behaviour_with_no_retained_commit`
 - `hub::tests::elision_costs_nothing_when_the_subscriber_is_offline`
 - `hub::tests::elision_is_faster_than_writing_first_when_the_subscriber_keeps_up`
+- `hub::tests::elision_late_ack::late_pubacks_into_a_shared_group_lose_nothing_a_publisher_was_acked_for`
 - `hub::tests::evicting_a_v311_client_closes_without_a_disconnect_packet`
 - `hub::tests::eviction_disconnects_the_target_and_leaves_others_undisturbed`
 - `hub::tests::expired_queued_message_is_dropped_at_replay`
