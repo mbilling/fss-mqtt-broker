@@ -58,9 +58,23 @@ n10)
 	BROKERS="${BROKERS:-10}" GENERATORS="${GENERATORS:-4}"
 	DEF_WARMUP=20 DEF_MEASURE=60 DEF_WINDOW=10 DEF_SCRAPE=2 DEF_MARGIN=1 DEF_MAX_STEPS=14 DEF_PRIME=90 DEF_ROUNDS=3
 	;;
-*) die "TIER must be local, n3 or n10, not '$TIER'" ;;
+h3)
+	# HiveMQ 4.18's published shape: 3 brokers of 32 vCPU (AWS m6a.8xlarge there), with
+	# 20,000 clients held fixed (PUBLISHERS, CONSUMERS below).
+	BROKERS="${BROKERS:-3}" GENERATORS="${GENERATORS:-6}" DEF_BROKER_TYPE=ccx53
+	DEF_WARMUP=20 DEF_MEASURE=60 DEF_WINDOW=10 DEF_SCRAPE=2 DEF_MARGIN=1 DEF_MAX_STEPS=14 DEF_PRIME=90 DEF_ROUNDS=3
+	# Per generator: 10,000 publishers and 10,000 consumers in all, the consumers per topic
+	# (20 topics a generator) rounded up to a multiple of the brokers, so each holds as many.
+	DEF_PUBLISHERS=$((10000 / GENERATORS))
+	DEF_CONSUMERS=$(((10000 / (20 * GENERATORS) + BROKERS - 1) / BROKERS * BROKERS))
+	# 20,000 clients take ~40 s to connect (one CCX43 generator, 2026-10-28): 30 s left
+	# it starting 10-13 s past the shared start every round.
+	DEF_START_SYNC_WAIT=120
+	;;
+*) die "TIER must be local, n3, n10 or h3, not '$TIER'" ;;
 esac
-BROKER_TYPE="${BROKER_TYPE:-ccx23}"
+BROKER_TYPE="${BROKER_TYPE:-${DEF_BROKER_TYPE:-ccx23}}"
+PUBLISHERS_N=""
 GEN_TYPE="${GEN_TYPE:-ccx33}"
 
 # ── the ramp (ADR 0090 D4) ──────────────────────────────────────────────────────────
@@ -132,7 +146,16 @@ SETTLE_QUIET_LONG="${SETTLE_QUIET_LONG:-30}"
 # 10-node run (clean-qos1 303,800) left windows overlapping 51.6 s of 60: VOID. One that
 # is not ready in time starts on its own when it is (mqtt-load --start-wait), and the
 # judge's overlap check decides.
-START_SYNC_WAIT="${START_SYNC_WAIT:-30}"
+START_SYNC_WAIT="${START_SYNC_WAIT:-${DEF_START_SYNC_WAIT:-30}}"
+# The broker host's network path, sampled with every scrape (scrape-loop.py --net):
+# round-trip times and retransmits of the MQTT sockets, softnet, softirq, NIC counters.
+# The port is the brokers' plaintext listener (templates/mqttd.env.tmpl); the local tier
+# has no `ss` and no /proc, so it samples nothing. NET_PORT= turns it off.
+if [ "$TIER" = local ]; then NET_PORT="${NET_PORT-}"; else NET_PORT="${NET_PORT-1883}"; fi
+# A generator's own wait counts from its ready file, not from its launch, and mqtt-load
+# refuses one longer than the keep-alive (60 s): its publishers are silent while they
+# wait. So it is capped there, whatever the rig waits for the slowest generator.
+GEN_START_WAIT=$((START_SYNC_WAIT + 15 > 55 ? 55 : START_SYNC_WAIT + 15))
 if [ "$TIER" = local ]; then START_LEAD_MS="${START_LEAD_MS:-500}"; else START_LEAD_MS="${START_LEAD_MS:-3000}"; fi
 # For the price quote: steps a ladder is expected to take (coarse climb + bisection), and
 # the long settles it waits through besides the first (after a step that was not carried,
@@ -381,6 +404,10 @@ else
 		-var broker_server_type="$BROKER_TYPE" -var driver_server_type="$GEN_TYPE"
 		-var run_label="rig2-$STAMP" -var mqttd_version="$MQTTD_VERSION"
 		-var build_bench=false -var driver_emqtt_bench=false)
+	# BROKER_NIC_SPREAD=1: the brokers' network softirq spread over every core at boot
+	# (one NIC queue per CPU where the NIC allows it, and RPS; terraform's
+	# broker_nic_spread). Off by default, the untuned kernel; disclosed in run.json.
+	[ "${BROKER_NIC_SPREAD:-0}" != 1 ] || TF_APPLY_ARGS+=(-var broker_nic_spread=true)
 	[ -z "${MQTTD_URL:-}" ] || TF_APPLY_ARGS+=(-var mqttd_url="$MQTTD_URL")
 	[ -z "${MQTTD_SHA256:-}" ] || TF_APPLY_ARGS+=(-var mqttd_sha256="$MQTTD_SHA256")
 	TF_APPLY_ARGS+=(${TOFU_SSH_PUBKEY_ARGS[@]+"${TOFU_SSH_PUBKEY_ARGS[@]}"})
@@ -409,6 +436,9 @@ else
 	}
 	[ -z "${MQTTD_LOCAL_BIN:-}" ] || push_local_bin
 	phase bootstrapping "rig2 $TIER: $BROKERS nodes"
+	# EXTRA_BROKER_ENV: lines appended to every broker's env (bootstrap-cluster.sh), and
+	# disclosed in run.json and the report: a variant never runs undisclosed.
+	[ -z "${EXTRA_BROKER_ENV:-}" ] || say "broker env added to the shipped defaults: $(printf '%s' "$EXTRA_BROKER_ENV" | tr '\n' ' ')"
 	run_fg "$SCALE_DIR/bootstrap-cluster.sh" "$RUN" "$INVENTORY" durable
 	ENDPOINTS=$(jq -r '[.brokers[].mqtt_plain] | join(",")' "$INVENTORY")
 	mapfile -t BROKER_PRIV < <(jq -r '.brokers[].private_ip' "$INVENTORY")
@@ -454,6 +484,28 @@ else
 	for g in $(seq 0 $((GENERATORS - 1))); do setup_gen "$g"; done
 fi
 
+# Every host's CPU model, for the record: a vCPU is only comparable on a known CPU (a CCX
+# host may be EPYC Milan or Genoa).
+CPU_JSON="{}"
+if [ "$TIER" != local ]; then
+	cpu_list=""
+	for ((i = 0; i < BROKERS; i++)); do
+		cpu_list+="broker	$(on_broker "$i" "lscpu | sed -n 's/^Model name: *//p' | head -1" 2>/dev/null || echo unknown)"$'\n'
+	done
+	for ((g = 0; g < GENERATORS; g++)); do
+		cpu_list+="generator	$(on_gen "$g" "lscpu | sed -n 's/^Model name: *//p' | head -1" 2>/dev/null || echo unknown)"$'\n'
+	done
+	CPU_JSON=$(printf '%s' "$cpu_list" | python3 -c 'import json, sys
+out = {}
+for line in sys.stdin:
+    if "\t" in line:
+        role, model = line.rstrip("\n").split("\t", 1)
+        out.setdefault(role, {}).setdefault(model or "unknown", 0)
+        out[role][model or "unknown"] += 1
+print(json.dumps(out))')
+	say "CPU: $CPU_JSON"
+fi
+
 python3 - "$RUN/run.json" <<PY
 import json, sys
 json.dump({"tier": "$TIER", "brokers": $BROKERS, "broker_type": "$BROKER_TYPE" if "$TIER" != "local" else "local",
@@ -462,7 +514,9 @@ json.dump({"tier": "$TIER", "brokers": $BROKERS, "broker_type": "$BROKER_TYPE" i
            "started_utc": "$STAMP", "warmup_s": $WARMUP, "measure_s": $MEASURE, "window_s": $WINDOW,
            "prime_s": $PRIME_SECS, "drain_timeout_s": $DRAIN_TIMEOUT, "drain_quiet_s": $DRAIN_QUIET,
            "settle_quiet_s": $SETTLE_QUIET, "rounds": $ROUNDS,
-           "observe": "$OBSERVE" == "1",
+           "observe": "$OBSERVE" == "1", "cpu": json.loads("""$CPU_JSON"""),
+           "broker_nic_spread": "${BROKER_NIC_SPREAD:-0}" == "1",
+           "extra_broker_env": [l for l in """${EXTRA_BROKER_ENV:-}""".splitlines() if l.strip()],
            "git": "$(git -C "$REPO_ROOT" rev-parse HEAD)"}, open(sys.argv[1], "w"), indent=2)
 PY
 
@@ -672,9 +726,10 @@ launch_gens() { # launch_gens <local-dir> <host-id> <per-gen rate> <warmup> <mea
 		--sessions "$SESSIONS" --rate-per-publisher "$RATE_PER_PUBLISHER" --inflight "$INFLIGHT"
 		--warmup "$warmup" --duration "$measure" --window "$WINDOW" --drain-timeout "$DRAIN_TIMEOUT"
 		--drain-quiet "$DRAIN_QUIET" --drain-quiet-factor "$DRAIN_QUIET_FACTOR" --quiet
-		--ready-file "steps/$hid/gen.ready" --start-file "steps/$hid/gen.start" --start-wait $((START_SYNC_WAIT + 15)))
+		--ready-file "steps/$hid/gen.ready" --start-file "steps/$hid/gen.start" --start-wait "$GEN_START_WAIT")
 	[ "$SESSIONS" != durable ] || args+=(--session-expiry "$SESSION_EXPIRY")
-	bound=$((START_SYNC_WAIT + 15 + warmup + measure + DRAIN_TIMEOUT + 180))
+	[ -z "$PUBLISHERS_N" ] || args+=(--publishers "$PUBLISHERS_N")
+	bound=$((START_SYNC_WAIT + GEN_START_WAIT + warmup + measure + DRAIN_TIMEOUT + 180))
 	for ((g = 0; g < GENERATORS; g++)); do
 		metrics=""
 		[ "$OBSERVE" != 1 ] || metrics="--metrics $(gen_metrics_addr "$g")"
@@ -750,7 +805,7 @@ prime_ladder() { # prime_ladder <ladder-dir>: unmeasured load at the start rate 
 # left by an earlier try of the same start is stopped first), stopped, fetched.
 scrape_loop_start() {
 	on_broker "$1" "[ -f \$H/steps/$hid/scrape.pid ] && kill \$(cat \$H/steps/$hid/scrape.pid) 2>/dev/null; rm -rf \$H/steps/$hid; mkdir -p \$H/steps/$hid; nohup python3 \$H/scrape-loop.py --url '$(broker_metrics_url "$1")' \
-		--out \$H/steps/$hid/scrapes --interval $SCRAPE_INTERVAL --max-secs 1800 >/dev/null 2>&1 </dev/null & echo \$! >\$H/steps/$hid/scrape.pid"
+		--out \$H/steps/$hid/scrapes --interval $SCRAPE_INTERVAL --max-secs 1800 ${NET_PORT:+--net $NET_PORT} >/dev/null 2>&1 </dev/null & echo \$! >\$H/steps/$hid/scrape.pid"
 }
 scrape_loop_stop() { on_broker "$1" "kill \$(cat \$H/steps/$hid/scrape.pid) 2>/dev/null; true"; }
 # One tar stream per broker, unpacked beside the target and renamed into place only when
@@ -875,7 +930,11 @@ run_ladder() { # run_ladder <workload>, as a background job (run_fg): its own su
 	WORKLOAD="$1"
 	# shellcheck disable=SC1090
 	. "$RIG2/workloads/$WORKLOAD.env"
-	if [ "$CONSUMERS" = auto ]; then CONSUMERS_N="$BROKERS"; else CONSUMERS_N="$CONSUMERS"; fi
+	if [ "$CONSUMERS" = auto ]; then CONSUMERS_N="${DEF_CONSUMERS:-$BROKERS}"; else CONSUMERS_N="$CONSUMERS"; fi
+	# PUBLISHERS: publisher connections per generator, held at every step (mqtt-load
+	# --publishers, rounded up to a multiple of topics x brokers); unset, mqtt-load derives
+	# them from the step's rate and RATE_PER_PUBLISHER.
+	PUBLISHERS_N="${PUBLISHERS:-${DEF_PUBLISHERS:-}}"
 	local start_var="START_RATE_$TIER" ladder="$RUN/$ARM/$WORKLOAD" idx=0 rate
 	START_RATE="${START_RATE:-${!start_var}}"
 	mkdir -p "$ladder/steps"
@@ -889,6 +948,7 @@ json.dump({"workload": "$WORKLOAD", "arm": "$ARM", "binary": """$BINARY_DESC""",
            "mqtt_load": {"qos": $QOS, "shape": "$SHAPE", "sessions": "$SESSIONS", "session_expiry_s": $SESSION_EXPIRY,
                          "payload": $PAYLOAD, "topics_per_generator": $TOPICS, "consumers": $CONSUMERS_N,
                          "groups": $SHARE_GROUPS, "rate_per_publisher": $RATE_PER_PUBLISHER, "inflight": $INFLIGHT,
+                         "publishers_per_generator": ${PUBLISHERS_N:-None},
                          "warmup_s": $WARMUP, "measure_s": $MEASURE, "window_s": $WINDOW, "drain_timeout_s": $DRAIN_TIMEOUT,
                          "drain_quiet_s": $DRAIN_QUIET, "drain_quiet_factor": $DRAIN_QUIET_FACTOR, "prime_s": $PRIME_SECS}},
           open(sys.argv[1], "w"), indent=2)
@@ -918,7 +978,7 @@ calibrate_gens() {
 		say "calibrating the generator hosts: $CALIB_RATE_PER_GEN msg/s each, QoS 0 share, ${CALIB_MEASURE}s (attempt $attempt)"
 		(
 			QOS=0 SHAPE=share SESSIONS=clean SESSION_EXPIRY=0 PAYLOAD=200 TOPICS=20 SHARE_GROUPS=1
-			CONSUMERS_N="$BROKERS" RATE_PER_PUBLISHER=50 INFLIGHT=128
+			CONSUMERS_N="$BROKERS" RATE_PER_PUBLISHER=50 INFLIGHT=128 PUBLISHERS_N=""
 			launch_gens "$dir" "calib-$attempt" "$CALIB_RATE_PER_GEN" "$CALIB_WARMUP" "$CALIB_MEASURE"
 		)
 		if python3 "$RIG2/verdict.py" calibrate "$dir" >"$dir/verdict.out"; then

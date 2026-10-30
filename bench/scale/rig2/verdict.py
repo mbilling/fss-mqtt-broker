@@ -5,7 +5,7 @@
     verdict.py next   <ladder-dir>               print the next step's msg/s, or nothing when done
     verdict.py report <run-dir>                  write <run-dir>/report.md and report.json
     verdict.py idle   [--floor N] <scrape.prom>...  exit 0 when the cluster is idle (between steps)
-    verdict.py cost   --tier n3|n10 [...]        hourly price and expected duration of a run
+    verdict.py cost   --tier n3|n10|h3 [...]      hourly price and expected duration of a run
     verdict.py calibrate <dir>                   exit 1 and name the generators whose host is too slow
 
 Everything is judged from the broker's side (D1):
@@ -126,12 +126,16 @@ SATURATED_WINDOWS_MIN = 2
 # A generator named in this many VOID attempts of one step gets a new host (run.sh).
 REPLACE_STRIKES = 2
 
-# Hetzner hourly prices (EUR, excl. VAT) for the server types the tiers use. Unknown
-# types have no price here; pass --price TYPE=EUR to cost one.
-PRICES_EUR_H = {"ccx23": 0.17225, "ccx33": 0.277375}
+# Hetzner hourly prices (EUR, the API's gross price_hourly) for the server types the tiers
+# use. Unknown types have no price here; pass --price TYPE=EUR to cost one.
+PRICES_EUR_H = {"ccx23": 0.17225, "ccx33": 0.277375, "ccx43": 0.552875, "ccx53": 1.06875}
+# Dedicated vCPU per server type: the report states every capacity per vCPU as well.
+VCPU = {"ccx13": 2, "ccx23": 4, "ccx33": 8, "ccx43": 16, "ccx53": 32, "ccx63": 48}
 TIERS = {
     "n3": {"brokers": 3, "broker_type": "ccx23", "gens": 1, "gen_type": "ccx33"},
     "n10": {"brokers": 10, "broker_type": "ccx23", "gens": 4, "gen_type": "ccx33"},
+    # HiveMQ 4.18's published shape: 3 x 32 vCPU (AWS m6a.8xlarge there, CCX53 here).
+    "h3": {"brokers": 3, "broker_type": "ccx53", "gens": 6, "gen_type": "ccx33"},
 }
 
 CARRIED, FAILED, VOID, NOT_TAKEN, DISCONNECTED = "CARRIED", "FAILED", "VOID", "OFFER NOT TAKEN", "DISCONNECTED"
@@ -1348,7 +1352,17 @@ def ladder_report(ladder: Path) -> dict:
             "ended": why if nxt is None else f"incomplete (next would be {nxt:g} msg/s: {why})"}
 
 
-def render_ladder_md(r: dict) -> list[str]:
+def cluster_vcpu(meta: dict) -> int | None:
+    """The brokers' dedicated vCPU in all, or None where the server type is unknown."""
+    per = VCPU.get(meta.get("broker_type", ""))
+    return per * int(meta["brokers"]) if per and meta.get("brokers") else None
+
+
+def per_vcpu(rate: float, vcpu: int | None) -> str:
+    return f" · {rate / vcpu:,.0f} msg/s per vCPU" if vcpu else ""
+
+
+def render_ladder_md(r: dict, vcpu: int | None = None) -> list[str]:
     gate = r["latency_gate"]
     lines = [f"## {r['workload']} (arm {r['arm']})", ""]
     cap = r["capacity"]
@@ -1359,14 +1373,15 @@ def render_ladder_md(r: dict) -> list[str]:
         if top.get("rounds", 1) > 1:
             lat += (f"; means of {top['rounds']} rounds, all carried; {label} p99 of the merged rounds "
                     f"{fmt_us(top.get('gate_p99_merged_us'))}")
-        lines.append(f"**Maximum lossless: {fmt_rate(top['offered_rate'])} msg/s** ({lat}).")
+        lines.append(f"**Maximum lossless: {fmt_rate(top['offered_rate'])} msg/s**{per_vcpu(top['offered_rate'], vcpu)} ({lat}).")
     else:
         lines.append("**Maximum lossless: none** — no step was carried.")
     lines.append("")
     for band in BANDS_MS:
         c = cap[f"p99_le_{band}ms"]
         band_txt = "1 s" if band == 1000 else f"{band} ms"
-        lines.append(f"- {label} p99 ≤ {band_txt}: " + (f"{fmt_rate(c['offered_rate'])} msg/s ({fmt_us(c['gate_p99_us'])})" if c else "none"))
+        lines.append(f"- {label} p99 ≤ {band_txt}: " + (f"{fmt_rate(c['offered_rate'])} msg/s{per_vcpu(c['offered_rate'], vcpu)} "
+                                                        f"({fmt_us(c['gate_p99_us'])})" if c else "none"))
     lines += [f"- ladder ended: {r['ended']}", ""]
     if r.get("chart"):
         lines += [f"![{r['workload']}: {label} p99 by offered msg/s]({r['chart']})", ""]
@@ -1463,7 +1478,9 @@ def report(run: Path) -> dict:
     order = {w: i for i, w in enumerate(meta.get("workloads", []))}
     ladders = sorted((p.parent for p in run.glob("**/ladder.json")),
                      key=lambda d: (d.parent.name, order.get(d.name, len(order)), d.name))
-    data = {"schema": SCHEMA_REPORT, "run": meta, "offer_taken": OFFER_TAKEN, "ladders": [ladder_report(p) for p in ladders]}
+    vcpu = cluster_vcpu(meta)
+    data = {"schema": SCHEMA_REPORT, "run": meta, "vcpu": vcpu, "offer_taken": OFFER_TAKEN,
+            "ladders": [ladder_report(p) for p in ladders]}
     try:
         _load("chart_ramp", HERE / "chart-ramp.py").write_charts(run, data)
     except Exception as e:  # a chart must never cost the report
@@ -1471,9 +1488,17 @@ def report(run: Path) -> dict:
     (run / "report.json").write_text(json.dumps(data, indent=2) + "\n")
     md = [f"# mqttd msg/s ramp — {meta.get('tier', '?')}", ""]
     if meta:
-        md.append(f"- tier `{meta.get('tier')}`: {meta.get('brokers')} brokers ({meta.get('broker_type')}), "
+        md.append(f"- tier `{meta.get('tier')}`: {meta.get('brokers')} brokers ({meta.get('broker_type')}"
+                  + (f", {vcpu} vCPU in all" if vcpu else "") + f"), "
                   f"{meta.get('generators')} generator host(s) ({meta.get('gen_type')})")
+        for role, models in sorted((meta.get("cpu") or {}).items()):
+            md.append(f"- {role} CPU: " + "; ".join(f"{m} ({n} host(s))" for m, n in sorted(models.items())))
         md.append(f"- broker: {meta.get('binary', '?')}")
+        if meta.get("broker_nic_spread"):
+            md.append("- broker hosts tuned: network softirq spread over every core (`BROKER_NIC_SPREAD=1`)")
+        if meta.get("extra_broker_env"):
+            md.append("- broker env added to the shipped defaults: "
+                      + ", ".join(f"`{e}`" for e in meta["extra_broker_env"]))
         md.append(f"- started {meta.get('started_utc', '?')}; steps: {meta.get('rounds', 1)} round(s) of "
                   f"{meta.get('warmup_s')} s warm-up, {meta.get('measure_s')} s measured")
         if meta.get("unreleased"):
@@ -1489,7 +1514,7 @@ def report(run: Path) -> dict:
            "highest carried step; the lines below it are the highest carried step within each ack p99 band "
            "(QoS 0: end-to-end p99).", ""]
     for r in data["ladders"]:
-        md += render_ladder_md(r)
+        md += render_ladder_md(r, vcpu)
     (run / "report.md").write_text("\n".join(md))
     return data
 
