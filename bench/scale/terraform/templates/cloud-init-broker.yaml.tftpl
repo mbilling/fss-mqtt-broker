@@ -8,6 +8,12 @@
 # API registration 409s when the key already exists in the project.
 ssh_authorized_keys:
   - ${ssh_public_key}
+%{ if cloud == "aws" ~}
+# AWS (bench/scale/terraform-aws): the image's default user is ubuntu; root gets the same
+# key, without cloud-init's "log in as ubuntu" restriction, because the harness drives
+# every host as root, as on Hetzner.
+disable_root: false
+%{ endif ~}
 
 # Without an API-registered key Hetzner sets a root password and marks it
 # EXPIRED — PAM then demands an interactive change on every login, which kills
@@ -65,6 +71,7 @@ runcmd:
   # deterministically: wait for the hot-plugged NIC (the one with no IPv4), then
   # DHCP it — Hetzner's DHCP answers with exactly the address terraform reserved
   # (${private_ip} here). netplan persists it across the retry reboot.
+%{ if cloud != "aws" ~}
   - |
     for i in $(seq 1 90); do
       IFACE=$(ip -o link show | awk -F': ' '$2 != "lo" {print $2}' | while read -r n; do
@@ -81,6 +88,7 @@ runcmd:
     else
       echo "no unconfigured NIC appeared for the private network (${private_ip})" >&2
     fi
+%{ endif ~}
   - sysctl --system
   # ISSUE #505: on this rig ONE core per broker carries all the network softirq
   # and saturates near 96% while the others idle — mqttd is squeezed off it

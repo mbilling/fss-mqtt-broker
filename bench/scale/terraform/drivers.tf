@@ -24,6 +24,7 @@ resource "hcloud_server" "driver" {
 
   user_data = templatefile("${path.module}/templates/cloud-init-driver.yaml.tftpl", {
     ssh_public_key = trimspace(file(pathexpand(var.ssh_public_key_path)))
+    cloud          = "hcloud"
     private_ip     = local.driver_ips[count.index]
     build_bench    = var.build_bench && count.index == 0
     emqtt_bench    = var.driver_emqtt_bench

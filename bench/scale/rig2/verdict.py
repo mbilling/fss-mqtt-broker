@@ -130,7 +130,11 @@ REPLACE_STRIKES = 2
 # use. Unknown types have no price here; pass --price TYPE=EUR to cost one.
 PRICES_EUR_H = {"ccx23": 0.17225, "ccx33": 0.277375, "ccx43": 0.552875, "ccx53": 1.06875}
 # Dedicated vCPU per server type: the report states every capacity per vCPU as well.
-VCPU = {"ccx13": 2, "ccx23": 4, "ccx33": 8, "ccx43": 16, "ccx53": 32, "ccx63": 48}
+VCPU = {"ccx13": 2, "ccx23": 4, "ccx33": 8, "ccx43": 16, "ccx53": 32, "ccx63": 48,
+        # AWS (CLOUD=aws): rig2/run.sh maps a tier's CCX type to the m6i of the same count.
+        **{f"{fam}.{size}": n for fam in ("m6i", "m6a", "m7a", "c6i", "c7a", "r6i")
+           for size, n in (("large", 2), ("xlarge", 4), ("2xlarge", 8), ("4xlarge", 16),
+                           ("8xlarge", 32), ("12xlarge", 48), ("16xlarge", 64))}}
 TIERS = {
     "n3": {"brokers": 3, "broker_type": "ccx23", "gens": 1, "gen_type": "ccx33"},
     "n10": {"brokers": 10, "broker_type": "ccx23", "gens": 4, "gen_type": "ccx33"},
@@ -1491,6 +1495,9 @@ def report(run: Path) -> dict:
         md.append(f"- tier `{meta.get('tier')}`: {meta.get('brokers')} brokers ({meta.get('broker_type')}"
                   + (f", {vcpu} vCPU in all" if vcpu else "") + f"), "
                   f"{meta.get('generators')} generator host(s) ({meta.get('gen_type')})")
+        if meta.get("cloud") not in (None, "local"):
+            md.append(f"- cloud: {meta['cloud']}" + (f", {meta['region']}" if meta.get("region") else "")
+                      + (f" ({meta['location']})" if meta.get("location") else ""))
         for role, models in sorted((meta.get("cpu") or {}).items()):
             md.append(f"- {role} CPU: " + "; ".join(f"{m} ({n} host(s))" for m, n in sorted(models.items())))
         md.append(f"- broker: {meta.get('binary', '?')}")
@@ -1525,7 +1532,7 @@ def report(run: Path) -> dict:
 def cost(tier: str, brokers: int | None = None, gens: int | None = None, broker_type: str | None = None,
          gen_type: str | None = None, workloads: int = 1, steps: int = 9, step_secs: float = 120.0,
          bringup_min: float | None = None, teardown_min: float = 3.0, prices: dict | None = None,
-         rounds: int = 1, ladder_secs: float = 0.0) -> dict:
+         rounds: int = 1, ladder_secs: float = 0.0, currency: str = "EUR") -> dict:
     """The price of a run. A ladder: `ladder_secs` (what it spends outside its steps' short
     settles: the prime and the long settles), then `steps` steps of `rounds` rounds, each
     round `step_secs` (its short settle, warm-up, measured time, drain and fetch). A step
@@ -1536,12 +1543,12 @@ def cost(tier: str, brokers: int | None = None, gens: int | None = None, broker_
     bt, gt = broker_type or t["broker_type"], gen_type or t["gen_type"]
     p = {**PRICES_EUR_H, **(prices or {})}
     if bt not in p or gt not in p:
-        raise ValueError(f"no price for {bt if bt not in p else gt}; pass --price TYPE=EUR")
+        raise ValueError(f"no price for {bt if bt not in p else gt}; pass --price TYPE={currency}")
     hourly = brokers * p[bt] + gens * p[gt]
     bring = bringup_min if bringup_min is not None else (10.0 if brokers <= 3 else 14.0)
     ramp_min = workloads * (ladder_secs + steps * rounds * step_secs) / 60
     total = bring + ramp_min + teardown_min
-    return {"tier": tier, "brokers": brokers, "broker_type": bt, "generators": gens, "gen_type": gt,
+    return {"tier": tier, "currency": currency, "brokers": brokers, "broker_type": bt, "generators": gens, "gen_type": gt,
             "rounds": rounds, "eur_per_hour": round(hourly, 6), "minutes": round(total), "bringup_min": bring,
             "ramp_min": round(ramp_min, 1), "teardown_min": teardown_min,
             "eur_prorated": round(hourly * total / 60, 2), "eur_hours_rounded_up": round(hourly * math.ceil(total / 60), 2)}
@@ -1586,7 +1593,8 @@ def main(argv: list[str]) -> int:
     c.add_argument("--rounds", type=int, default=1)
     c.add_argument("--ladder-secs", type=float, default=0,
                    help="seconds a ladder spends outside its rounds: the prime and the long settles")
-    c.add_argument("--price", action="append", default=[], help="TYPE=EUR per hour")
+    c.add_argument("--price", action="append", default=[], help="TYPE=PRICE per hour, in --currency")
+    c.add_argument("--currency", default="EUR", help="the currency of the prices (Hetzner's table is EUR; CLOUD=aws passes USD)")
     c.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
     if a.cmd == "judge":
@@ -1658,7 +1666,7 @@ def main(argv: list[str]) -> int:
             k, v = kv.split("=", 1)
             prices[k] = float(v)
         c = cost(a.tier, a.brokers, a.generators, a.broker_type, a.gen_type, a.workloads, a.steps, a.step_secs,
-                 prices=prices, rounds=a.rounds, ladder_secs=a.ladder_secs)
+                 prices=prices, rounds=a.rounds, ladder_secs=a.ladder_secs, currency=a.currency)
         if a.json:
             print(json.dumps(c))
         else:
@@ -1666,10 +1674,11 @@ def main(argv: list[str]) -> int:
             if a.ladder_secs:
                 per = f"~{a.ladder_secs:.0f} s of prime and long settles + " + per
             print(f"tier {c['tier']}: {c['brokers']} x {c['broker_type']} + {c['generators']} x {c['gen_type']} = "
-                  f"EUR {c['eur_per_hour']:.4f}/h; expected ~{c['minutes']} min ({c['bringup_min']:.0f} bring-up + "
+                  f"{c['currency']} {c['eur_per_hour']:.4f}/h; expected ~{c['minutes']} min ({c['bringup_min']:.0f} bring-up + "
                   f"{c['ramp_min']:.0f} ramp for {a.workloads} workload(s) x ({per}) + "
-                  f"{c['teardown_min']:.0f} teardown) = EUR {c['eur_prorated']:.2f} "
-                  f"prorated, EUR {c['eur_hours_rounded_up']:.2f} if every started hour is billed")
+                  f"{c['teardown_min']:.0f} teardown) = {c['currency']} {c['eur_prorated']:.2f} prorated"
+                  + (f", {c['currency']} {c['eur_hours_rounded_up']:.2f} if every started hour is billed"
+                     if c["currency"] == "EUR" else " (EC2 bills per second)"))
         return 0
     return 2
 

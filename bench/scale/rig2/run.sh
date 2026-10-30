@@ -7,6 +7,7 @@
 #   HCLOUD_TOKEN=... MQTTD_VERSION=1.2.0 TIER=n3 ./run.sh                 # PAID
 #   HCLOUD_TOKEN=... MQTTD_URL=... MQTTD_SHA256=... TIER=n10 WORKLOADS="durable-qos1" ./run.sh
 #   HCLOUD_TOKEN=... MQTTD_LOCAL_BIN=path/to/mqttd TIER=n3 ./run.sh   # a binary on this machine
+#   CLOUD=aws AWS_PROFILE=mqttd-bench MQTTD_LOCAL_BIN=... TIER=h3 ./run.sh   # PAID, on AWS EC2
 #
 # One provisioning carries every workload in WORKLOADS, one ladder after the other, on
 # the same cluster. A ladder is a sequence of steps; a step is ROUNDS rounds at its msg/s
@@ -17,7 +18,9 @@
 # rounds (verdict.py round-next decides which round runs next, verdict.py step judges).
 #
 # Teardown (bench/scale/teardown.sh: tofu destroy, then the label audit) is trapped on
-# EXIT/INT/TERM. KEEP_INFRA=1 skips it and says so. Hetzner only (CLOUD=hcloud).
+# EXIT/INT/TERM. KEEP_INFRA=1 skips it and says so. CLOUD=hcloud (default) or CLOUD=aws
+# (bench/scale/terraform-aws: the same hosts, addresses and boot templates; the tiers'
+# Hetzner types map to the m6i of the same vCPU count, below).
 # Every long child (tofu, the bootstrap, each ladder) runs in the background under `wait`
 # (run_fg), so a TERM or Ctrl-C reaches the trap at once: bash defers a trap until a
 # FOREGROUND child returns, and on the first 10-node run (2026-10-26) a TERM sat
@@ -65,8 +68,10 @@ h3)
 	DEF_WARMUP=20 DEF_MEASURE=60 DEF_WINDOW=10 DEF_SCRAPE=2 DEF_MARGIN=1 DEF_MAX_STEPS=14 DEF_PRIME=90 DEF_ROUNDS=3
 	# Per generator: 10,000 publishers and 10,000 consumers in all, the consumers per topic
 	# (20 topics a generator) rounded up to a multiple of the brokers, so each holds as many.
-	DEF_PUBLISHERS=$((10000 / GENERATORS))
-	DEF_CONSUMERS=$(((10000 / (20 * GENERATORS) + BROKERS - 1) / BROKERS * BROKERS))
+	# Both rounded up: 3 generators get 3,334 publishers each, not 3,333 (19,959 clients in
+	# all on 2026-10-30, where 20,000 was meant).
+	DEF_PUBLISHERS=$(((10000 + GENERATORS - 1) / GENERATORS))
+	DEF_CONSUMERS=$((((10000 + 20 * GENERATORS - 1) / (20 * GENERATORS) + BROKERS - 1) / BROKERS * BROKERS))
 	# 20,000 clients take ~40 s to connect (one CCX43 generator, 2026-10-28): 30 s left
 	# it starting 10-13 s past the shared start every round.
 	DEF_START_SYNC_WAIT=120
@@ -76,6 +81,21 @@ esac
 BROKER_TYPE="${BROKER_TYPE:-${DEF_BROKER_TYPE:-ccx23}}"
 PUBLISHERS_N=""
 GEN_TYPE="${GEN_TYPE:-ccx33}"
+CLOUD="${CLOUD:-hcloud}"
+# CLOUD=aws: a tier's Hetzner type becomes the m6i of the same vCPU count (m6i: the
+# generation of HiveMQ 4.18's m6a.8xlarge, which eu-north-1 does not offer); a type that
+# is not a CCX name is taken as an EC2 type as it is.
+aws_type() {
+	case "$1" in
+	ccx13) echo m6i.large ;; ccx23) echo m6i.xlarge ;; ccx33) echo m6i.2xlarge ;;
+	ccx43) echo m6i.4xlarge ;; ccx53) echo m6i.8xlarge ;; ccx63) echo m6i.12xlarge ;;
+	*) echo "$1" ;;
+	esac
+}
+if [ "$CLOUD" = aws ]; then
+	BROKER_TYPE=$(aws_type "$BROKER_TYPE")
+	GEN_TYPE=$(aws_type "$GEN_TYPE")
+fi
 
 # ── the ramp (ADR 0090 D4) ──────────────────────────────────────────────────────────
 # A step: ROUNDS rounds at the same msg/s, each a settle, then WARMUP s, then MEASURE s
@@ -245,10 +265,28 @@ ROUND_SECS=$((WARMUP + MEASURE + 20 + SETTLE_QUIET + 25))
 LADDER_SECS=$((PRIME_SECS + 20 + (1 + EST_LONG_SETTLES) * (SETTLE_QUIET_LONG + 30)))
 
 # ── the quote, before anything is provisioned ───────────────────────────────────────
+# aws_price <type>: the on-demand Linux USD/h in AWS_REGION, from the pricing API.
+aws_price() {
+	aws --region us-east-1 pricing get-products --service-code AmazonEC2 --max-items 1 --output json --filters \
+		"Type=TERM_MATCH,Field=instanceType,Value=$1" "Type=TERM_MATCH,Field=regionCode,Value=$AWS_REGION" \
+		"Type=TERM_MATCH,Field=operatingSystem,Value=Linux" "Type=TERM_MATCH,Field=tenancy,Value=Shared" \
+		"Type=TERM_MATCH,Field=preInstalledSw,Value=NA" "Type=TERM_MATCH,Field=capacitystatus,Value=Used" |
+		jq -r '.PriceList[0] // empty | fromjson | .terms.OnDemand[].priceDimensions[].pricePerUnit.USD' | head -1
+}
 if [ "$TIER" != local ]; then
+	PRICE_ARGS=()
+	if [ "$CLOUD" = aws ]; then
+		require_scale_token
+		aws_region
+		for t in "$BROKER_TYPE" "$GEN_TYPE"; do
+			p=$(aws_price "$t") && [ -n "$p" ] || die "no on-demand price for $t in $AWS_REGION (pricing:GetProducts)"
+			PRICE_ARGS+=(--price "$t=$p")
+		done
+		PRICE_ARGS+=(--currency USD)
+	fi
 	say "$(python3 "$RIG2/verdict.py" cost --tier "$TIER" --brokers "$BROKERS" --generators "$GENERATORS" \
 		--broker-type "$BROKER_TYPE" --gen-type "$GEN_TYPE" --workloads "$NWORK" --steps "$EST_STEPS" \
-		--rounds "$ROUNDS" --step-secs "$ROUND_SECS" --ladder-secs "$LADDER_SECS")"
+		--rounds "$ROUNDS" --step-secs "$ROUND_SECS" --ladder-secs "$LADDER_SECS" ${PRICE_ARGS[@]+"${PRICE_ARGS[@]}"})"
 	[ "${PRICE_ONLY:-0}" != 1 ] || exit 0
 fi
 
@@ -326,8 +364,9 @@ if [ "$TIER" = local ]; then
 	cp "$LOAD_BIN" "$(host_dir gen-0)/mqtt-load"
 else
 	select_scale_cloud
-	[ "$CLOUD" = hcloud ] || die "rig2 runs on CLOUD=hcloud only"
+	case "$CLOUD" in hcloud | aws) ;; *) die "rig2 runs on CLOUD=hcloud or CLOUD=aws, not $CLOUD" ;; esac
 	require_scale_token
+	[ "$CLOUD" != aws ] || aws_region
 	TF=$(command -v tofu) || die "OpenTofu (tofu) is required"
 	command -v jq >/dev/null || die "jq not installed"
 	if [ -n "${SSH_KEY:-}" ]; then [ -f "${SSH_KEY}.pub" ] || die "${SSH_KEY}.pub does not exist"; fi
@@ -358,8 +397,8 @@ else
 	fi
 	# A state file that still tracks servers belongs to another run (or a leak): never
 	# apply over it, and never let this run's trap destroy it either.
-	if [ -f "$SCALE_DIR/terraform/terraform.tfstate" ] && [ "$(jq '[.resources[]? | select(.type == "hcloud_server")] | length' "$SCALE_DIR/terraform/terraform.tfstate")" != 0 ]; then
-		die "bench/scale/terraform's state still tracks servers — another run is up or leaked; run bench/scale/teardown.sh first"
+	if [ -f "$TFDIR/terraform.tfstate" ] && [ "$(jq --arg t "$TF_SERVER_TYPE" '[.resources[]? | select(.type == $t)] | length' "$TFDIR/terraform.tfstate")" != 0 ]; then
+		die "$TFDIR's state still tracks servers — another run is up or leaked; run CLOUD=$CLOUD bench/scale/teardown.sh first"
 	fi
 	LOAD_BIN="${MQTT_LOAD_BIN:-}"
 	if [ -z "$LOAD_BIN" ]; then
@@ -392,13 +431,14 @@ else
 		[ -f "$RUN/report.md" ] || python3 "$RIG2/verdict.py" report "$RUN" >/dev/null 2>&1 || true
 		say "tearing down (trap; exit code was $rc): destroy, then the label audit"
 		"$SCALE_DIR/teardown.sh" 2>&1 | tee -a "$RUN/teardown.log" >&2 || {
-			warn "teardown or its leak audit FAILED — run bench/scale/teardown.sh (--force) and check 'hcloud server list'"
+			warn "teardown or its leak audit FAILED — run CLOUD=$CLOUD bench/scale/teardown.sh (--force) and check the $CLOUD console"
 			exit 1
 		}
 		exit "$rc"
 	}
 	trap cloud_teardown EXIT INT TERM
-	tf() { cd "$TFDIR" && "$TF" "$@"; } # run under run_fg: a background job, so the cd stays there
+	# run under run_fg: a background job, so the cd and the credentials stay there.
+	tf() { cloud_tofu_env && cd "$TFDIR" && "$TF" "$@"; }
 	run_fg tf init -input=false >"$RUN/tf-init.log" 2>&1 || { cat "$RUN/tf-init.log" >&2; die "tofu init failed"; }
 	TF_APPLY_ARGS=(-var node_count="$BROKERS" -var driver_count="$GENERATORS"
 		-var broker_server_type="$BROKER_TYPE" -var driver_server_type="$GEN_TYPE"
@@ -408,6 +448,18 @@ else
 	# (one NIC queue per CPU where the NIC allows it, and RPS; terraform's
 	# broker_nic_spread). Off by default, the untuned kernel; disclosed in run.json.
 	[ "${BROKER_NIC_SPREAD:-0}" != 1 ] || TF_APPLY_ARGS+=(-var broker_nic_spread=true)
+	if [ "$CLOUD" = aws ]; then
+		# The region, and the account's live on-demand vCPU quota for the plan's guard;
+		# AWS_AZ, AWS_PLACEMENT=cluster and AWS_ROOT_GB/_IOPS/_THROUGHPUT pass through.
+		AWS_VCPU_QUOTA=$(aws --region "$AWS_REGION" service-quotas get-service-quota --service-code ec2 \
+			--quota-code L-1216C47A --query Quota.Value --output text 2>/dev/null || echo 256)
+		TF_APPLY_ARGS+=(-var region="$AWS_REGION" -var vcpu_quota="${AWS_VCPU_QUOTA%.*}")
+		[ -z "${AWS_AZ:-}" ] || TF_APPLY_ARGS+=(-var availability_zone="$AWS_AZ")
+		[ -z "${AWS_PLACEMENT:-}" ] || TF_APPLY_ARGS+=(-var placement="$AWS_PLACEMENT")
+		[ -z "${AWS_ROOT_GB:-}" ] || TF_APPLY_ARGS+=(-var root_volume_gb="$AWS_ROOT_GB")
+		[ -z "${AWS_ROOT_IOPS:-}" ] || TF_APPLY_ARGS+=(-var root_volume_iops="$AWS_ROOT_IOPS")
+		[ -z "${AWS_ROOT_THROUGHPUT:-}" ] || TF_APPLY_ARGS+=(-var root_volume_throughput="$AWS_ROOT_THROUGHPUT")
+	fi
 	[ -z "${MQTTD_URL:-}" ] || TF_APPLY_ARGS+=(-var mqttd_url="$MQTTD_URL")
 	[ -z "${MQTTD_SHA256:-}" ] || TF_APPLY_ARGS+=(-var mqttd_sha256="$MQTTD_SHA256")
 	TF_APPLY_ARGS+=(${TOFU_SSH_PUBKEY_ARGS[@]+"${TOFU_SSH_PUBKEY_ARGS[@]}"})
@@ -473,7 +525,7 @@ else
 		local g="$1" old_ip
 		old_ip=$(driver_pub_ip "$g")
 		phase provisioning "rig2 $TIER: replacing generator host $g"
-		run_fg tf apply -auto-approve -input=false "${TF_APPLY_ARGS[@]}" -replace="hcloud_server.driver[$g]" \
+		run_fg tf apply -auto-approve -input=false "${TF_APPLY_ARGS[@]}" -replace="$TF_SERVER_TYPE.driver[$g]" \
 			>>"$RUN/tf-apply.log" 2>&1 || { tail -30 "$RUN/tf-apply.log" >&2; die "tofu apply (replace generator $g) failed"; }
 		run_fg tf output -json inventory >"$INVENTORY"
 		ssh-keygen -R "$old_ip" -f "$RUN/known_hosts" >/dev/null 2>&1 || true
@@ -508,7 +560,9 @@ fi
 
 python3 - "$RUN/run.json" <<PY
 import json, sys
-json.dump({"tier": "$TIER", "brokers": $BROKERS, "broker_type": "$BROKER_TYPE" if "$TIER" != "local" else "local",
+json.dump({"tier": "$TIER", "cloud": "$CLOUD" if "$TIER" != "local" else "local",
+           "region": "${AWS_REGION:-}" or None, "location": json.load(open("$RUN/inventory.json")).get("location") if "$TIER" != "local" else None,
+           "brokers": $BROKERS, "broker_type": "$BROKER_TYPE" if "$TIER" != "local" else "local",
            "generators": $GENERATORS, "gen_type": "$GEN_TYPE" if "$TIER" != "local" else "local",
            "binary": """$BINARY_DESC""", "unreleased": bool("${MQTTD_URL:-}"), "workloads": "$WORKLOADS".split(),
            "started_utc": "$STAMP", "warmup_s": $WARMUP, "measure_s": $MEASURE, "window_s": $WINDOW,
