@@ -35,6 +35,9 @@ pub struct ShardData {
     pub sched_lag: Latency,
     /// Drained per tick: due → written, every send.
     pub send_delay: Latency,
+    /// Drained per tick: delivery read → its PUBACK written. The consumer's own part of
+    /// the broker's write-elision hold (ADR 0089).
+    pub puback_turnaround: Latency,
 }
 
 impl ShardData {
@@ -44,14 +47,16 @@ impl ShardData {
         into.e2e.add(&self.e2e);
         into.sched_lag.add(&self.sched_lag);
         into.send_delay.add(&self.send_delay);
+        into.puback_turnaround.add(&self.puback_turnaround);
         self.ack.reset();
         self.e2e.reset();
         self.sched_lag.reset();
         self.send_delay.reset();
+        self.puback_turnaround.reset();
     }
 }
 
-/// The four latency histograms, accumulated.
+/// The latency histograms, accumulated.
 #[derive(Debug, Default, Clone)]
 pub struct Histos {
     /// Ack latency.
@@ -62,6 +67,8 @@ pub struct Histos {
     pub sched_lag: Latency,
     /// Due-to-sent delay, all sends.
     pub send_delay: Latency,
+    /// Delivery read → PUBACK written.
+    pub puback_turnaround: Latency,
 }
 
 impl Histos {
@@ -71,6 +78,7 @@ impl Histos {
         self.e2e.add(&other.e2e);
         self.sched_lag.add(&other.sched_lag);
         self.send_delay.add(&other.send_delay);
+        self.puback_turnaround.add(&other.puback_turnaround);
     }
 }
 

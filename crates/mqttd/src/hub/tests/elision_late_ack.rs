@@ -31,6 +31,23 @@ fn publish_owned(tx: &HubTx, topic: &str, payload: Bytes) -> oneshot::Receiver<P
     done_rx
 }
 
+/// The consumer's PUBACK for `pkid`, `delay` after the delivery arrived.
+fn pub_ack_after(tx: &HubTx, client: ClientId, pkid: u16, delay: Duration) {
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        // SETTLE(elision-late-puback): the delay IS the fault under test —
+        // a subscriber's PUBACK landing before, inside or after the window
+        // and the fallback write; there is no state to poll for instead.
+        tokio::time::sleep(delay).await;
+        // On the control lane, as the connection sends it (ADR 0082 T2).
+        let _ = tx.send(HubCommand::PubAck {
+            client,
+            pkid,
+            received: tokio::time::Instant::now(),
+        });
+    });
+}
+
 fn counter(metrics: &mqtt_observability::metrics::Metrics, name: &str) -> f64 {
     metrics
         .render()
@@ -81,15 +98,7 @@ async fn late_pubacks_into_a_shared_group_lose_nothing_a_publisher_was_acked_for
                 seed ^= seed >> 7;
                 seed ^= seed << 17;
                 let delay = Duration::from_millis(seed % 12);
-                let (tx, client) = (tx.clone(), ClientId(name.clone().into()));
-                tokio::spawn(async move {
-                    // SETTLE(elision-late-puback): the delay IS the fault under test —
-                    // a subscriber's PUBACK landing before, inside or after the window
-                    // and the fallback write; there is no state to poll for instead.
-                    tokio::time::sleep(delay).await;
-                    // On the control lane, as the connection sends it (ADR 0082 T2).
-                    let _ = tx.send(HubCommand::PubAck { client, pkid });
-                });
+                pub_ack_after(&tx, ClientId(name.clone().into()), pkid, delay);
             }
         }));
     }

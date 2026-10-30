@@ -299,6 +299,9 @@ pub struct Outbound {
 
 /// What the hub queues for one client's connection task.
 #[derive(Debug)]
+// The channel carries it boxed (`send_from`), so the variants' size difference —
+// `Packet` is 200 B, a note one pointer — is paid once per queued item, not per slot.
+#[allow(clippy::large_enum_variant)]
 pub enum Outgoing {
     /// A packet to write.
     Packet {
@@ -309,6 +312,9 @@ pub enum Outgoing {
         /// (`$events/message/delivered`, `acked`, a `too_large` `delivery_dropped`;
         /// ADR 0083), and only for a message that still carries one.
         origin: Option<Arc<Origin>>,
+        /// When the hub queued it: the connection's task reports a `QoS` >= 1
+        /// PUBLISH's wait (`delivery_outbound_wait_seconds`).
+        queued: Instant,
     },
     /// A message event the hub decided, for this connection's task to raise (ADR
     /// 0083): nothing is written to the client.
@@ -492,7 +498,11 @@ impl Outbound {
         // that only publishes never pays it.
         if self
             .tx
-            .send(Box::new(Outgoing::Packet { packet, origin }))
+            .send(Box::new(Outgoing::Packet {
+                packet,
+                origin,
+                queued: Instant::now(),
+            }))
             .is_err()
         {
             // Never queued, so never drained: keep both counts honest.
@@ -1630,6 +1640,8 @@ pub enum HubCommand {
         client: ClientId,
         /// The packet id being acknowledged.
         pkid: u16,
+        /// When the connection read it (`puback_hub_wait_seconds`).
+        received: Instant,
     },
     /// A subscriber acknowledged receipt of a `QoS` 2 delivery (step 1 of 2).
     PubRec {
@@ -3975,7 +3987,16 @@ impl Hub {
             HubCommand::PkidBlockReserved { client, result } => {
                 self.pkid_block_reserved(&client, result);
             }
-            HubCommand::PubAck { client, pkid } => self.dispatch_pub_ack(&client, pkid),
+            HubCommand::PubAck {
+                client,
+                pkid,
+                received,
+            } => {
+                if let Some(m) = &self.metrics {
+                    m.puback_hub_wait(received.elapsed().as_secs_f64());
+                }
+                self.dispatch_pub_ack(&client, pkid);
+            }
             HubCommand::PubRec { client, pkid } => self.dispatch_pub_rec(&client, pkid),
             HubCommand::PubComp { client, pkid } => self.dispatch_pub_comp(&client, pkid),
             HubCommand::Detach {
@@ -10575,6 +10596,7 @@ mod tests {
             HubCommand::PubAck {
                 client: ClientId("c".into()),
                 pkid: 1,
+                received: tokio::time::Instant::now(),
             }
             .lane(),
             super::Lane::Control
@@ -10946,6 +10968,7 @@ mod tests {
         tx.send(ordered(HubCommand::PubAck {
             client: ClientId(client.into()),
             pkid,
+            received: tokio::time::Instant::now(),
         }))
         .unwrap();
     }

@@ -2943,6 +2943,9 @@ where
         .as_ref()
         .map(crate::ingress::IngressCredit::connection);
     let mut parked: Option<Parked> = None;
+    // The hub's hand-off time of the oldest `QoS` >= 1 delivery in the writer's buffer,
+    // reported when the write that carries it completes (`delivery_flushed_seconds`).
+    let mut oldest_queued: Option<Instant> = None;
     // The write-stall bound (issue #1117): a peer that has accepted no bytes for this
     // long while the broker has bytes for it is closed. Its timer is re-armed only
     // when it fires, the same discipline as the keepalive timer above: a write moves
@@ -3103,7 +3106,12 @@ where
             // The socket write (issue #1117). Cancel-safe, so the other arms run while
             // it waits on a peer that is not reading: above all the inbound one, which
             // takes the PUBACKs and PINGREQs that peer may be blocked writing.
-            flushed = writer.flush_queued(), if writer.has_pending() => flushed?,
+            flushed = writer.flush_queued(), if writer.has_pending() => {
+                flushed?;
+                if let (Some(m), Some(q)) = (&policy.metrics, oldest_queued.take()) {
+                    m.delivery_flushed(q.elapsed().as_secs_f64());
+                }
+            }
             // The next batch is taken once the last one is wholly written, as when the
             // flush was awaited in place; the socket buffer is the pipeline. A peer that
             // never reads leaves the deliveries in the hub's backlog, where the hub's
@@ -3158,7 +3166,15 @@ where
                     // what keeps the byte counter from drifting (issue #241).
                     out_meter.drained(&out);
                     let (pkt, origin) = match &mut *out {
-                        crate::hub::Outgoing::Packet { packet, origin } => (packet, origin.take()),
+                        crate::hub::Outgoing::Packet { packet, origin, queued } => {
+                            if let (Some(m), Packet::Publish(p)) = (&policy.metrics, &*packet) {
+                                if p.pkid.is_some() {
+                                    m.delivery_outbound_wait(queued.elapsed().as_secs_f64());
+                                    oldest_queued = Some(oldest_queued.map_or(*queued, |o| o.min(*queued)));
+                                }
+                            }
+                            (packet, origin.take())
+                        }
                         // A drop the hub decided, for this task to raise: nothing to
                         // write.
                         crate::hub::Outgoing::Note(note) => {
@@ -4188,6 +4204,7 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
             let _ = hub.send(HubCommand::PubAck {
                 client: client.clone(),
                 pkid: ack.pkid,
+                received: Instant::now(),
             });
         }
         Packet::PubRec(ack) => {
