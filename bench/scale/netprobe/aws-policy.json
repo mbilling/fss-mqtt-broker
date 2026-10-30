@@ -1,0 +1,105 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Read",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeInstances",
+        "ec2:DescribeInstanceTypes",
+        "ec2:DescribeInstanceTypeOfferings",
+        "ec2:DescribeImages",
+        "ec2:DescribeVpcs",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeVolumes",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeKeyPairs",
+        "ec2:DescribePlacementGroups",
+        "pricing:GetProducts",
+        "servicequotas:GetServiceQuota"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CanonicalUbuntuAmiParameter",
+      "Effect": "Allow",
+      "Action": "ssm:GetParameter",
+      "Resource": "arn:aws:ssm:*::parameter/aws/service/canonical/*"
+    },
+    {
+      "Sid": "LaunchOnlyTaggedInstancesAndVolumes",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": [
+        "arn:aws:ec2:*:*:instance/*",
+        "arn:aws:ec2:*:*:volume/*"
+      ],
+      "Condition": {
+        "StringEquals": { "aws:RequestTag/purpose": "mqttd-netprobe" }
+      }
+    },
+    {
+      "Sid": "LaunchUsingTheseResources",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": [
+        "arn:aws:ec2:*::image/*",
+        "arn:aws:ec2:*:*:subnet/*",
+        "arn:aws:ec2:*:*:network-interface/*",
+        "arn:aws:ec2:*:*:security-group/*",
+        "arn:aws:ec2:*:*:key-pair/*",
+        "arn:aws:ec2:*:*:placement-group/*"
+      ]
+    },
+    {
+      "Sid": "CreateOnlyTagged",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateSecurityGroup",
+        "ec2:ImportKeyPair",
+        "ec2:CreatePlacementGroup"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": { "aws:RequestTag/purpose": "mqttd-netprobe" }
+      }
+    },
+    {
+      "Sid": "CreateSecurityGroupInTheVpc",
+      "Effect": "Allow",
+      "Action": "ec2:CreateSecurityGroup",
+      "Resource": "arn:aws:ec2:*:*:vpc/*"
+    },
+    {
+      "Sid": "TagOnlyWhileCreating",
+      "Effect": "Allow",
+      "Action": "ec2:CreateTags",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "ec2:CreateAction": [
+            "RunInstances",
+            "CreateSecurityGroup",
+            "ImportKeyPair",
+            "CreatePlacementGroup"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "ChangeAndDeleteOnlyTheProbes",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:TerminateInstances",
+        "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:DeleteSecurityGroup",
+        "ec2:DeleteKeyPair",
+        "ec2:DeletePlacementGroup"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": { "aws:ResourceTag/purpose": "mqttd-netprobe" }
+      }
+    }
+  ]
+}
