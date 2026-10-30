@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# netprobe: the packet rate two Hetzner hosts sustain on one private network, with no
-# broker involved. Two hosts (TYPE, default ccx53) are created with the hcloud CLI,
-# iperf3 and neper are installed, and three tests sweep up to where the path breaks:
+# netprobe: the packet rate two cloud hosts sustain on one private network, with no
+# broker involved. Two hosts are created (PROVIDER=hetzner, the default, with the hcloud
+# CLI; PROVIDER=aws with the aws CLI, see AWS.md; each provider's knobs are at the top
+# of providers/<provider>.sh), iperf3 and neper are installed, and three tests sweep up
+# to where the path breaks:
 #
 #   udp   iperf3 -u, 64 B datagrams, 8 streams, at each of UDP_PPS packets/s in all:
 #         the bare packet-rate limit and its loss, no TCP
@@ -15,22 +17,23 @@
 # Everything created carries the labels purpose=mqttd-netprobe and run=<stamp> and is
 # deleted on exit (a trap), then audited by both, so two probes can run at once.
 #
-#   HCLOUD_TOKEN=... bench/scale/netprobe/run.sh          # asks before creating
+#   HCLOUD_TOKEN=... bench/scale/netprobe/run.sh          # Hetzner; asks before creating
+#   AWS_PROFILE=mqttd-bench PROVIDER=aws bench/scale/netprobe/run.sh   # AWS (AWS.md)
 #   NETPROBE_YES=1 ...                                     # no prompt (not a terminal)
 #   PRICE_ONLY=1 ...                                       # the quote, nothing created
-#   TYPE=ccx33 LOCATION=nbg1 TESTS="udp rr" ...            # other shapes
+#   TYPE=ccx33 LOCATION=nbg1 TESTS="udp rr" ...            # other shapes (Hetzner)
+#   PROVIDER=aws TYPE=m6a.4xlarge PLACEMENT=cluster ...      # other shapes (AWS)
 #   QDISCS="default fq fq_codel-big" TESTS=rr ...           # each test once per qdisc
 #
 # QDISCS: the root qdisc of the private interface on both hosts, set before each pass:
-# `default` leaves the image's (fq_codel, limit 10240p, 1024 flows); `fq` paces each
+# `default` leaves the image's own (Hetzner: fq_codel, limit 10240p, 1024 flows; AWS: mq
+# with an fq_codel per queue); `fq` paces each
 # connection with its own queue; `fq_codel-big` is fq_codel with limit 100000p and
 # 65536 flows. Each test's directory is named <test>[@<qdisc>].
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-TYPE="${TYPE:-ccx53}"
-LOCATION="${LOCATION:-fsn1}"
-IMAGE="${IMAGE:-ubuntu-24.04}"
+PROVIDER="${PROVIDER:-hetzner}"
 TESTS="${TESTS:-udp rr bulk}"
 UDP_PPS="${UDP_PPS:-50000 100000 150000 200000 300000 400000 600000 800000}"
 UDP_SECS="${UDP_SECS:-15}"
@@ -46,14 +49,12 @@ NAME=$(echo "netprobe-$STAMP" | tr "[:upper:]" "[:lower:]")
 say() { printf '\033[1;34m==>\033[0m %s %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
 die() { printf '\033[1;31mFAIL\033[0m %s\n' "$*" >&2; exit 1; }
 
-[ -n "${HCLOUD_TOKEN:-}" ] || die "set HCLOUD_TOKEN"
-command -v hcloud >/dev/null || die "the hcloud CLI is required"
+[ -f "$HERE/providers/$PROVIDER.sh" ] || die "PROVIDER must be one of: $(cd "$HERE/providers" && ls ./*.sh | sed 's|./||; s|\.sh||' | tr '\n' ' ')"
+# shellcheck source=/dev/null
+. "$HERE/providers/$PROVIDER.sh"
 command -v jq >/dev/null || die "jq is required"
-
-price=$(hcloud server-type describe "$TYPE" -o json | jq -r --arg l "$LOCATION" \
-	'.prices[] | select(.location == $l) | .price_hourly.gross')
-[ -n "$price" ] || die "no price for $TYPE in $LOCATION"
-say "2 x $TYPE in $LOCATION = EUR $(python3 -c "print(f'{2 * $price:.4f}')")/h; ~25 min = EUR $(python3 -c "print(f'{2 * $price * 25 / 60:.2f}')") prorated"
+provider_check
+provider_quote
 [ "${PRICE_ONLY:-0}" = 1 ] && exit 0
 if [ "${NETPROBE_YES:-0}" != 1 ]; then
 	[ -t 0 ] || die "not a terminal: set NETPROBE_YES=1 to create the hosts without the prompt"
@@ -73,17 +74,9 @@ teardown() {
 	local rc=$?
 	trap - EXIT INT TERM
 	say "tearing down (exit code $rc)"
-	for s in $(hcloud server list -l "$LABEL,run=$STAMP" -o noheader -o columns=id 2>/dev/null); do
-		hcloud server delete "$s" >/dev/null || true
-	done
-	hcloud firewall delete "$NAME" >/dev/null 2>&1 || true
-	hcloud network delete "$NAME" >/dev/null 2>&1 || true
-	hcloud ssh-key delete "$NAME" >/dev/null 2>&1 || true
-	local left
 	# This run's own resources (run=STAMP): two probes may run at once, each audits its own.
-	local sel="$LABEL,run=$STAMP"
-	left=$( { hcloud server list -l "$sel" -o noheader; hcloud firewall list -l "$sel" -o noheader
-		hcloud network list -l "$sel" -o noheader; hcloud ssh-key list -l "$sel" -o noheader; } 2>&1 || true)
+	local left
+	left=$(provider_teardown)
 	if [ -n "$left" ]; then
 		printf '\033[1;31mLEAKED\033[0m:\n%s\n' "$left" >&2
 		exit 1
@@ -93,31 +86,19 @@ teardown() {
 }
 trap teardown EXIT INT TERM
 
-hcloud ssh-key create --name "$NAME" --public-key-from-file "$KEY.pub" --label "$LABEL" --label "run=$STAMP" >/dev/null
-hcloud network create --name "$NAME" --ip-range 10.98.0.0/16 --label "$LABEL" --label "run=$STAMP" >/dev/null
-hcloud network add-subnet "$NAME" --type cloud --network-zone eu-central --ip-range 10.98.1.0/24 >/dev/null
-cat >"$RUN/fw.json" <<'JSON'
-[{"direction":"in","protocol":"tcp","port":"22","source_ips":["0.0.0.0/0","::/0"]},
- {"direction":"in","protocol":"icmp","source_ips":["0.0.0.0/0","::/0"]}]
-JSON
-hcloud firewall create --name "$NAME" --rules-file "$RUN/fw.json" --label "$LABEL" --label "run=$STAMP" >/dev/null
-say "creating 2 x $TYPE"
-for h in a b; do
-	hcloud server create --name "$NAME-$h" --type "$TYPE" --image "$IMAGE" --location "$LOCATION" \
-		--ssh-key "$NAME" --network "$NAME" --firewall "$NAME" \
-		--label "$LABEL" --label "run=$STAMP" -o json >"$RUN/server-$h.json" &
+provider_create
+for v in "$A" "$B" "$APRIV" "$BPRIV"; do
+	[ -n "$v" ] && [ "$v" != null ] && [ "$v" != None ] || die "hosts have no addresses: a=$A ($APRIV) b=$B ($BPRIV)"
 done
-wait
-A=$(jq -r '.server.public_net.ipv4.ip' "$RUN/server-a.json")
-B=$(jq -r '.server.public_net.ipv4.ip' "$RUN/server-b.json")
-BPRIV=$(hcloud server describe "$NAME-b" -o json | jq -r '.private_net[0].ip')
-[ -n "$A" ] && [ -n "$B" ] && [ "$BPRIV" != null ] || die "servers have no addresses: a=$A b=$B b-private=$BPRIV"
-say "client a $A, server b $B (private $BPRIV)"
+say "client a $A (private $APRIV), server b $B (private $BPRIV)"
 for ip in "$A" "$B"; do
 	for _ in $(seq 60); do on "$ip" true 2>/dev/null && break; sleep 5; done
 	on "$ip" "cloud-init status --wait >/dev/null 2>&1 || true; mkdir -p /root/netprobe"
 	scp -q -i "$KEY" -o UserKnownHostsFile="$RUN/known_hosts" -o BatchMode=yes "$HERE/host.sh" "root@$ip:/root/netprobe/"
 done
+# Each host's peer: host.sh measures the interface that reaches it.
+on "$A" "echo $BPRIV >/root/netprobe/peer"
+on "$B" "echo $APRIV >/root/netprobe/peer"
 for h in a b; do
 	ip=$([ $h = a ] && echo "$A" || echo "$B")
 	on "$ip" "bash /root/netprobe/host.sh setup" >"$RUN/setup-$h.txt" 2>&1 &
@@ -168,7 +149,10 @@ test_one() {
 set_qdisc() { # set_qdisc <name>: the root qdisc of both hosts' private interface
 	local q
 	case "$1" in
-	default) q="fq_codel" ;;
+	# The image's own setup, untouched: Hetzner's one queue has a root fq_codel; AWS's
+	# multi-queue ENA has mq with an fq_codel per queue, which a single root qdisc would
+	# collapse onto one lock.
+	default) say "qdisc: default (left as the image set it)"; return ;;
 	fq) q="fq" ;;
 	fq_codel-big) q="fq_codel limit 100000 flows 65536" ;;
 	*) die "unknown qdisc $1" ;;

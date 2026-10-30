@@ -12,7 +12,16 @@
 # differences of two readings.
 set -euo pipefail
 
-iface() { ip -o -4 addr show | awk '$4 ~ /^10\./ {print $2; exit}'; }
+# The interface that reaches the peer (run.sh writes /root/netprobe/peer): the private
+# network on both clouds (Hetzner's enp7s0 beside the public eth0; AWS's one ENI). Before
+# the peer is known, the first interface with a private IPv4 address.
+iface() {
+	if [ -s /root/netprobe/peer ]; then
+		ip -o route get "$(cat /root/netprobe/peer)" | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}'
+	else
+		ip -o -4 addr show | awk '$4 ~ /^(10|172|192)\./ {print $2; exit}'
+	fi
+}
 
 case "${1:?command}" in
 setup)

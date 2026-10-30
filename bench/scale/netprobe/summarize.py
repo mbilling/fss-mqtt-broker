@@ -34,7 +34,7 @@ def reading(path: Path) -> dict | None:
         return None
     s = sections(path.read_text())
     r = {"t": float(s["time"][0]), "nstat": {}, "qdisc_dropped": 0, "qdisc_overlimits": 0,
-         "virtio_drops": 0, "if": {}, "softnet": [], "softirq": []}
+         "virtio_drops": 0, "allowance": 0, "if": {}, "softnet": [], "softirq": []}
     for line in s.get("nstat", []):
         p = line.split()
         if len(p) >= 2 and p[1].isdigit():
@@ -44,8 +44,15 @@ def reading(path: Path) -> dict | None:
         r["qdisc_overlimits"] += int(m.group(2))
     for line in s.get("ethtool-S", []):
         m = re.match(r"\s*(\S+):\s*(\d+)$", line)
-        if m and re.search(r"drop|err|timeout|full", m.group(1)):
-            r["virtio_drops"] += int(m.group(2))
+        if not m:
+            continue
+        k, v = m.group(1), int(m.group(2))
+        # Drop and error counters of the NIC's queues ("interrupt" also contains "err").
+        if re.search(r"drop|error|_err|timeout|full", k) and "interrupt" not in k:
+            r["virtio_drops"] += v
+        # AWS ENA: the platform's own limits, counted when it holds packets back.
+        if k.endswith("_allowance_exceeded"):
+            r["allowance"] += v
     for line in s.get("ifstat", []):
         k, _, v = line.partition(" ")
         if v.strip().isdigit():
@@ -66,6 +73,7 @@ def delta(a: dict, b: dict) -> dict:
         d[k] = (b["nstat"].get(k, 0) - a["nstat"].get(k, 0)) / dt
     d["qdisc_drop"] = (b["qdisc_dropped"] - a["qdisc_dropped"]) / dt
     d["virtio_drop"] = (b["virtio_drops"] - a["virtio_drops"]) / dt
+    d["allowance"] = (b["allowance"] - a["allowance"]) / dt
     d["sn_drop"] = sum(y[1] - x[1] for x, y in zip(a["softnet"], b["softnet"])) / dt
     d["sn_squeeze"] = sum(y[2] - x[2] for x, y in zip(a["softnet"], b["softnet"])) / dt
     d["softirq_max"] = max((y - x for x, y in zip(a["softirq"], b["softirq"])), default=0) / dt  # 100 = one core
@@ -91,11 +99,11 @@ def net_cols(d: dict | None) -> str:
         return "(no counters)"
     return (f"{d['rx_pps']:>8.0f} {d['tx_pps']:>8.0f} | {d['TcpRetransSegs']:>8.0f} {d['TcpExtTCPTimeouts']:>6.0f} | "
             f"{d['qdisc_drop']:>6.0f} {d['virtio_drop']:>6.0f} {d['if_drops']:>5.0f} {d['TcpExtTCPRcvQDrop'] + d['TcpExtTCPBacklogDrop']:>6.0f} "
-            f"{d['UdpRcvbufErrors'] + d['UdpInErrors']:>7.0f} {d['sn_drop'] + d['sn_squeeze']:>6.0f} | {d['softirq_max']:>5.1f}")
+            f"{d['UdpRcvbufErrors'] + d['UdpInErrors']:>7.0f} {d['sn_drop'] + d['sn_squeeze']:>6.0f} {d['allowance']:>6.0f} | {d['softirq_max']:>5.1f}")
 
 
 NET_HDR = (f"{'rx pps':>8} {'tx pps':>8} | {'retr/s':>8} {'RTO/s':>6} | {'qdisc':>6} {'virtio':>6} {'ifdrp':>5} "
-           f"{'tcpQ':>6} {'udpErr':>7} {'snet':>6} | {'sirq%':>5}")
+           f"{'tcpQ':>6} {'udpErr':>7} {'snet':>6} {'allow':>6} | {'sirq%':>5}")
 
 
 def main(run: Path) -> None:
@@ -150,8 +158,9 @@ def main(run: Path) -> None:
             print(f"TCP bulk ({arm(bulk)}): output did not parse ({e!r})")
     print()
     print("pps: the private interface's packets/s; retr/s: TCP retransmitted segments; RTO/s: retransmit timeouts;")
-    print("qdisc/virtio/ifdrp/tcpQ/udpErr/snet: drops per second at the qdisc, the virtio queues (ethtool -S),")
+    print("qdisc/virtio/ifdrp/tcpQ/udpErr/snet: drops per second at the qdisc, the NIC's queues (ethtool -S),")
     print("the interface, TCP's receive queue and backlog, UDP's buffers, softnet (drops + squeezes);")
+    print("allow: AWS ENA's *_allowance_exceeded (pps, bandwidth, conntrack), the platform's own limits;")
     print("sirq%: the busiest CPU's softirq time (100 = one core). a = client, b = server.")
 
 
