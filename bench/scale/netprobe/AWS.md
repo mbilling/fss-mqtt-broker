@@ -96,7 +96,7 @@ aws sts get-caller-identity --profile mqttd-bench
 
 ## 3. Raise the vCPU quota if needed
 
-New accounts often have a small on-demand limit. Two m6a.8xlarge need **64 vCPU** of
+New accounts often have a small on-demand limit. Two m6i.8xlarge need **64 vCPU** of
 "Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances" (quota code
 `L-1216C47A`) in the region. A later like-for-like broker run with HiveMQ's shape
 (3 brokers of 32 vCPU plus load generators) needs about **256 vCPU**.
@@ -132,14 +132,14 @@ AWS_PROFILE=mqttd-bench PROVIDER=aws bench/scale/netprobe/run.sh
 
 Variants:
 
-- `TYPE=m6a.4xlarge`: another size, to see whether the limits scale with it (on AWS they
+- `TYPE=m6i.4xlarge`: another size, to see whether the limits scale with it (on AWS they
   are documented to: network bandwidth and the packet-per-second allowance grow with the
   instance).
 - `PLACEMENT=cluster`: both instances in a cluster placement group, EC2's lowest-latency
   placement. Default `none` is what an ordinary deployment gets.
 - `TESTS="rr" RR_FLOWS="1000 10000 20000"`: only the connection-count test.
 
-Cost: two m6a.8xlarge on demand, billed per second, for a run of about 10 minutes, plus two
+Cost: two m6i.8xlarge on demand, billed per second, for a run of about 10 minutes, plus two
 8 GB gp3 volumes for the same time. The script prints the hourly price from the AWS pricing
 API before it creates anything. Traffic between the two instances on private addresses in
 one availability zone is free.
