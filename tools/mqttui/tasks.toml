@@ -1705,6 +1705,61 @@ requires = ["python3"]
 duration = "~1s"
 
 [[task]]
+id = "netprobe"
+group = "Benchmark"
+name = "Measure the packet rate two cloud hosts sustain, with no broker (PAID)"
+script = "bench/scale/netprobe/run.sh"
+about = """
+Two hosts on one private network (PROVIDER=hetzner, the default, with the hcloud CLI;
+PROVIDER=aws with the aws CLI, see bench/scale/netprobe/AWS.md), iperf3 and neper, and
+three tests: UDP's packet rate per VM, neper tcp_rr at 1,000 to 20,000 connections (the
+rig's 20,000-client shape) and TCP bulk bandwidth. Around each test both hosts record
+every counter that can drop or delay a packet (nstat, tc -s qdisc, ethtool -S, softnet,
+softirq, AWS ENA's allowance counters); summarize.py prints one table per test. QDISCS
+repeats the tests under other qdiscs. PRICE_ONLY=1 prints the quote and stops.
+"""
+requires = ["bash", "jq", "ssh", "python3"]
+optional = ["hcloud", "aws"]
+duration = "~6-10m"
+caution = "Creates two PAID hosts (it asks first). Ctrl-C tears down; everything carries the tags purpose=mqttd-netprobe and run=<stamp> and is audited by them on exit."
+
+[[task]]
+id = "netprobe-summarize"
+group = "Benchmark"
+name = "Print a netprobe run's tables from its counters"
+script = "bench/scale/netprobe/summarize.py"
+about = "`summarize.py <run-dir>`: per test, packets/s, retransmits and every drop counter on both hosts, from the readings run.sh kept."
+requires = ["python3"]
+duration = "~1s"
+
+[[task]]
+id = "netprobe-host"
+group = "Benchmark"
+name = "The netprobe's side on each host (runs on the host)"
+script = "bench/scale/netprobe/host.sh"
+about = "Copied to both hosts by netprobe/run.sh: installs iperf3 and neper, and takes the counter readings around each test."
+requires = ["bash"]
+hidden = true
+
+[[task]]
+id = "netprobe-provider-hetzner"
+group = "Benchmark"
+name = "netprobe's Hetzner provider (sourced, not run)"
+script = "bench/scale/netprobe/providers/hetzner.sh"
+about = "Sourced by netprobe/run.sh for PROVIDER=hetzner: the quote, the two servers on a private network, and the teardown with its label audit."
+requires = ["bash"]
+hidden = true
+
+[[task]]
+id = "netprobe-provider-aws"
+group = "Benchmark"
+name = "netprobe's AWS provider (sourced, not run)"
+script = "bench/scale/netprobe/providers/aws.sh"
+about = "Sourced by netprobe/run.sh for PROVIDER=aws: the account checks and quote, two EC2 instances in one subnet, and the teardown with its tag audit."
+requires = ["bash"]
+hidden = true
+
+[[task]]
 id = "rig2-verdict-tests"
 group = "Benchmark"
 name = "Offline tests of the rig2 verdicts and histogram merge"
