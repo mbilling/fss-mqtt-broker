@@ -12,8 +12,8 @@
 # Around every test both hosts record every counter that can drop or delay a packet
 # (host.sh snap: nstat, tc -s qdisc, ethtool -S/-g/-l, interface and softnet stats,
 # per-CPU time); summarize.py prints one table per test from their differences.
-# Everything created carries the label purpose=mqttd-netprobe and is deleted on exit
-# (a trap), then audited by that label.
+# Everything created carries the labels purpose=mqttd-netprobe and run=<stamp> and is
+# deleted on exit (a trap), then audited by both, so two probes can run at once.
 #
 #   HCLOUD_TOKEN=... bench/scale/netprobe/run.sh          # asks before creating
 #   NETPROBE_YES=1 ...                                     # no prompt (not a terminal)
@@ -80,8 +80,10 @@ teardown() {
 	hcloud network delete "$NAME" >/dev/null 2>&1 || true
 	hcloud ssh-key delete "$NAME" >/dev/null 2>&1 || true
 	local left
-	left=$( { hcloud server list -l "$LABEL" -o noheader; hcloud firewall list -l "$LABEL" -o noheader
-		hcloud network list -l "$LABEL" -o noheader; hcloud ssh-key list -l "$LABEL" -o noheader; } 2>&1 || true)
+	# This run's own resources (run=STAMP): two probes may run at once, each audits its own.
+	local sel="$LABEL,run=$STAMP"
+	left=$( { hcloud server list -l "$sel" -o noheader; hcloud firewall list -l "$sel" -o noheader
+		hcloud network list -l "$sel" -o noheader; hcloud ssh-key list -l "$sel" -o noheader; } 2>&1 || true)
 	if [ -n "$left" ]; then
 		printf '\033[1;31mLEAKED\033[0m:\n%s\n' "$left" >&2
 		exit 1
