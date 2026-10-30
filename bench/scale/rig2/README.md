@@ -20,9 +20,30 @@ figure crosses hosts.
 | `local` | 3 local mqttd processes (durable, own data dirs) + 1 local mqtt-load | free | proves the pipeline; relative figures only |
 | `n3` | 3 brokers CCX23 + 1 generator host CCX33 | EUR 0.794/h | nightly or weekly; absolute figures |
 | `n10` | 10 brokers CCX23 + 4 generator hosts CCX33 | EUR 2.832/h | release confirmation |
+| `h3` | 3 brokers CCX53 (32 vCPU) + 6 generator hosts CCX33, 20,000 clients held fixed | EUR 4.871/h | like for like with HiveMQ 4.18's published run (3 x 32 vCPU, 20,000 clients) |
 
 `BROKERS`, `GENERATORS`, `BROKER_TYPE` and `GEN_TYPE` override the shape. Prices are in
-`verdict.py` (`PRICES_EUR_H`, Hetzner, excluding VAT).
+`verdict.py` (`PRICES_EUR_H`, Hetzner's API `price_hourly` gross). The report states every
+capacity per vCPU of the brokers' server type too (`verdict.py` `VCPU`), and the run
+records every host's CPU model (`run.json` `cpu`): a CCX host may be EPYC Milan or Genoa.
+
+`PUBLISHERS` holds the publisher connections per generator at every step (`mqtt-load
+--publishers`); unset, they follow the step's rate (`RATE_PER_PUBLISHER`). On `h3` it
+defaults to 10,000 in all, with 10,000 durable consumers (`CONSUMERS` per topic, rounded
+up to a multiple of the brokers).
+
+`EXTRA_BROKER_ENV` adds lines to every broker's env after the shipped defaults (for
+example `EXTRA_BROKER_ENV=MQTTD_STORE_SHARDS=8`), on the cloud tiers only. They are
+logged, kept in `run.json` (`extra_broker_env`) and listed in the report's header.
+`BROKER_NIC_SPREAD=1` spreads the brokers' network softirq over every core at boot (one
+NIC queue per CPU where the NIC allows it, and RPS); it is off by default, the untuned
+kernel, and a run with it says so in `run.json` and the report's header.
+
+Each broker scrape also samples the broker host's network path (`scrape-loop.py --net`,
+on the cloud tiers; `NET_PORT=` turns it off): `<unix_ms>.net.json` beside each
+`<unix_ms>.prom`, with the TCP round-trip times and retransmits of the MQTT sockets
+(`ss -ti`), softnet's per-CPU dropped and squeezed counts, per-CPU softirq time, and the
+NICs' packet counters, queue counts and RPS masks. The judge does not read them.
 
 **Generator hosts are checked before they measure anything.**
 
@@ -287,7 +308,8 @@ more than 10% in received msg/s ((max − min) / min) or more than 2× in p99 (m
 3. **Load.** One mqtt-load process per generator host, each offering `rate / GENERATORS`
    msg/s, all on one start: each writes a ready file once its clients are connected
    (`--ready-file`) and waits for a start file (`--start-file`); when every generator is
-   ready, or after `START_SYNC_WAIT` (30 s), the rig writes one start time,
+   ready, or after `START_SYNC_WAIT` (30 s; 120 s on `h3`, where 20,000 clients take
+   about 40 s to connect), the rig writes one start time,
    `START_LEAD_MS` (3000; local 500) ahead on generator host 0's clock, into every start
    file. On the 10-node run of 2026-10-27 one generator took 13.8 s to connect against
    the others' 5.2 s, and the windows of clean-qos1 303,800 overlapped 51.6 s of 60. A
