@@ -9,6 +9,12 @@
 # including the expired-root-password trap chpasswd/runcmd defuse below.
 ssh_authorized_keys:
   - ${ssh_public_key}
+%{ if cloud == "aws" ~}
+# AWS (bench/scale/terraform-aws): the image's default user is ubuntu; root gets the same
+# key, without cloud-init's "log in as ubuntu" restriction, because the harness drives
+# every host as root, as on Hetzner.
+disable_root: false
+%{ endif ~}
 
 chpasswd:
   expire: false
@@ -35,6 +41,7 @@ write_files:
 runcmd:
   - chage -d now root && passwd -l root
   # Deterministic private-NIC config — see cloud-init-broker.yaml.tftpl.
+%{ if cloud != "aws" ~}
   - |
     for i in $(seq 1 90); do
       IFACE=$(ip -o link show | awk -F': ' '$2 != "lo" {print $2}' | while read -r n; do
@@ -51,6 +58,7 @@ runcmd:
     else
       echo "no unconfigured NIC appeared for the private network (${private_ip})" >&2
     fi
+%{ endif ~}
   - sysctl --system
 %{ if emqtt_bench ~}
   - systemctl enable --now docker

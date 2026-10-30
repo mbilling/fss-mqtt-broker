@@ -70,6 +70,33 @@ the other generators' arrived after 0.8 and 1.6 ms.
 
 ## Running
 
+The same rig runs on Hetzner Cloud (`CLOUD=hcloud`, the default) or AWS EC2
+(`CLOUD=aws`). The two share everything after provisioning: the hosts' private addresses
+(10.99.1.11+ brokers, .21+ generators), the boot templates
+(`../terraform/templates`, rendered with `cloud = "aws"` on AWS: root gets the operator's
+key, and there is no second NIC to configure), the inventory, the ladder and the verdict.
+What differs:
+
+| | `CLOUD=hcloud` | `CLOUD=aws` |
+|---|---|---|
+| Terraform | `../terraform` | `../terraform-aws`: its own VPC (10.99.0.0/16, one subnet in one AZ), an internet gateway, a security group, a key pair, an optional cluster placement group (`AWS_PLACEMENT=cluster`) |
+| Credentials | `HCLOUD_TOKEN` | the AWS CLI's profile (`AWS_PROFILE`; `aws login`, see `../netprobe/AWS.md`), exported fresh before every `tofu` call, the teardown's included |
+| Region | `fsn1` | `AWS_REGION`, else the profile's (`eu-north-1` here) |
+| Types | the tier's CCX types | the m6i of the same vCPU count (`ccx23` → `m6i.xlarge`, `ccx33` → `m6i.2xlarge`, `ccx43` → `m6i.4xlarge`, `ccx53` → `m6i.8xlarge`); any EC2 type with `BROKER_TYPE` / `GEN_TYPE` |
+| Brokers' disk | local NVMe | a gp3 root volume, 100 GB at gp3's baseline 3,000 IOPS and 125 MB/s (`AWS_ROOT_GB`, `AWS_ROOT_IOPS`, `AWS_ROOT_THROUGHPUT`): the durable store's fsyncs see it |
+| Price | `verdict.py`'s table (EUR) | AWS's pricing API, on demand (USD; EC2 bills per second) |
+| Leak audit | by label, `hcloud` CLI | by tag `purpose=mqttd-bench-scale`, `aws` CLI: instances, volumes, security groups, key pairs, placement groups, subnets, route tables, gateways, VPCs |
+
+`run.json` and the report name the cloud, the region and the zone. The account's live
+on-demand vCPU quota (L-1216C47A) guards the plan, so a run above it fails before
+anything is created.
+
+```sh
+# PAID, on AWS: HiveMQ 4.18's shape (3 x 32 vCPU brokers, 20,000 clients), a local build.
+CLOUD=aws AWS_PROFILE=mqttd-bench MQTTD_LOCAL_BIN=path/to/mqttd TIER=h3 bench/scale/rig2/run.sh
+CLOUD=aws AWS_PROFILE=mqttd-bench bench/scale/teardown.sh   # by hand: destroy, then the tag audit
+```
+
 ```sh
 # Free: a 3-node local cluster and a short ramp (3 steps of 5 s warm-up + 10 s measured,
 # one round a step; ROUNDS=2 measures each step twice).

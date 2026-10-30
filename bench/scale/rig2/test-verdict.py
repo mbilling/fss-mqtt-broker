@@ -1123,6 +1123,25 @@ class PerVcpu(unittest.TestCase):
         c = V.cost("h3", workloads=1, steps=10, rounds=3)
         self.assertEqual((c["brokers"], c["broker_type"], c["generators"], c["gen_type"]), (3, "ccx53", 6, "ccx33"))
         self.assertAlmostEqual(c["eur_per_hour"], 3 * 1.06875 + 6 * 0.277375)
+    def test_aws_types_have_vcpu_counts_and_a_usd_quote(self):
+        self.assertEqual(V.cluster_vcpu({"brokers": 3, "broker_type": "m6i.8xlarge"}), 96)
+        self.assertEqual(V.VCPU["m6i.4xlarge"], 16)
+        c = V.cost("h3", broker_type="m6i.8xlarge", gen_type="m6i.2xlarge", currency="USD",
+                   prices={"m6i.8xlarge": 1.632, "m6i.2xlarge": 0.408})
+        self.assertEqual(c["currency"], "USD")
+        self.assertAlmostEqual(c["eur_per_hour"], 3 * 1.632 + 6 * 0.408)
+
+    def test_the_cloud_is_named_in_the_report(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d)
+            (run / "run.json").write_text(json.dumps({"tier": "h3", "cloud": "aws", "region": "eu-north-1",
+                                                      "location": "eu-north-1a", "brokers": 1,
+                                                      "broker_type": "m6i.8xlarge", "workloads": []}))
+            V.report(run)
+            md = (run / "report.md").read_text()
+            self.assertIn("- cloud: aws, eu-north-1 (eu-north-1a)", md)
+            self.assertIn("32 vCPU in all", md)
+
     def test_added_broker_env_is_disclosed_in_the_report(self):
         with tempfile.TemporaryDirectory() as d:
             run = Path(d)

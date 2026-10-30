@@ -35,6 +35,79 @@ if [ "$CLOUD" = upcloud ]; then
 	exit 0
 fi
 
+if [ "$CLOUD" = aws ]; then
+	require_scale_token
+	aws_region
+	TEARDOWN_TRIES=${TEARDOWN_TRIES:-3}
+	TEARDOWN_RETRY_SECS=${TEARDOWN_RETRY_SECS:-20}
+	if [ -f "$TFDIR/terraform.tfstate" ]; then
+		destroyed=0
+		for ((try = 1; try <= TEARDOWN_TRIES; try++)); do
+			say "OpenTofu destroy from local state (attempt $try of $TEARDOWN_TRIES)"
+			cloud_tofu_env
+			if (cd "$TFDIR" && "$TF" destroy -auto-approve -var node_count=1 -var region="$AWS_REGION" "${TOFU_SSH_PUBKEY_ARGS[@]}"); then
+				destroyed=1
+				break
+			fi
+			[ "$try" -lt "$TEARDOWN_TRIES" ] && sleep "$TEARDOWN_RETRY_SECS"
+		done
+		[ "$destroyed" = 1 ] || warn "OpenTofu destroy failed $TEARDOWN_TRIES times — continuing to the tag audit"
+	fi
+	# Every resource the rig creates carries the tag purpose=mqttd-bench-scale (the
+	# provider's default_tags). An audit that cannot list a kind is a FAILURE, never an
+	# all-clear (the 2026-10-23 rule below).
+	say "auditing by tag purpose=mqttd-bench-scale in $AWS_REGION"
+	F=(--filters Name=tag:purpose,Values=mqttd-bench-scale)
+	LEAKED=0
+	UNAUDITED=()
+	audit() { # audit <kind> <aws ec2 describe-… arguments…>: what of <kind> is left
+		local kind="$1" out="" listed=0
+		shift
+		for ((try = 1; try <= 5; try++)); do
+			if out=$(aws --region "$AWS_REGION" ec2 "$@" --output text 2>/dev/null); then
+				listed=1
+				break
+			fi
+			sleep "$TEARDOWN_RETRY_SECS"
+		done
+		if [ "$listed" = 0 ]; then
+			UNAUDITED+=("$kind")
+			return
+		fi
+		out=$(grep -v '^\s*$' <<<"$out" || true)
+		if [ -n "$out" ]; then
+			LEAKED=1
+			printf '\033[1;31mLEAKED %s:\033[0m\n%s\n' "$kind" "$out" >&2
+		fi
+	}
+	audit instance describe-instances "${F[@]}" Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down \
+		--query 'Reservations[].Instances[].[InstanceId,InstanceType,State.Name]'
+	audit volume describe-volumes "${F[@]}" --query 'Volumes[].[VolumeId,State,Size]'
+	audit security-group describe-security-groups "${F[@]}" --query 'SecurityGroups[].[GroupId,GroupName]'
+	audit key-pair describe-key-pairs "${F[@]}" --query 'KeyPairs[].KeyName'
+	audit placement-group describe-placement-groups "${F[@]}" --query 'PlacementGroups[].GroupName'
+	audit subnet describe-subnets "${F[@]}" --query 'Subnets[].SubnetId'
+	audit route-table describe-route-tables "${F[@]}" --query 'RouteTables[].RouteTableId'
+	audit internet-gateway describe-internet-gateways "${F[@]}" --query 'InternetGateways[].InternetGatewayId'
+	audit vpc describe-vpcs "${F[@]}" --query 'Vpcs[].VpcId'
+	if [ "${#UNAUDITED[@]}" -gt 0 ]; then
+		die "the tag audit could NOT reach the AWS API for: ${UNAUDITED[*]}. Resources may still be billing. Re-run ./teardown.sh when the network is back, and check the EC2 console in $AWS_REGION"
+	fi
+	if [ "$LEAKED" = 1 ]; then
+		if [ "$FORCE" = 1 ]; then
+			ids=$(aws --region "$AWS_REGION" ec2 describe-instances "${F[@]}" Name=instance-state-name,Values=pending,running,stopping,stopped \
+				--query 'Reservations[].Instances[].InstanceId' --output text)
+			if [ -n "$ids" ]; then
+				# shellcheck disable=SC2086 # ids, split on purpose
+				aws --region "$AWS_REGION" ec2 terminate-instances --instance-ids $ids >/dev/null && say "terminated $ids"
+			fi
+			die "--force terminates the instances (the billing part); the VPC, security group, key pair and the rest cost nothing but must go in order: run ./teardown.sh again once the instances are gone (tofu destroy from state), or delete them in the VPC console"
+		fi
+		die "leaked resources found (listed above). Re-run with --force to terminate the instances."
+	fi
+	say "nothing leaked — you are not paying for anything"
+	exit 0
+fi
 # A network blip must not turn into a fleet left billing: retry the destroy, and an
 # audit that cannot reach the API is a FAILURE, never an all-clear. On 2026-10-23 the
 # laptop's DNS went away for a few minutes; the destroy failed, every audit listing
