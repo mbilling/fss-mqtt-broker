@@ -38,7 +38,7 @@ The README's Architecture section until 2026-10-25: one node, the mesh, the dura
 - consensus for control (epochs, ownership), small replica sets for data
 - refuse at the edge: reason code or backpressure, never a silent drop
 - bridge is a separate process and failure domain
-- decisions: [`docs/adr/`](adr/) (91 ADRs, per-task status) · tour: this page · [THREAT-MODEL.md](THREAT-MODEL.md)
+- decisions: [`docs/adr/`](adr/) (92 ADRs, per-task status) · tour: this page · [THREAT-MODEL.md](THREAT-MODEL.md)
 
 The crates are in [Workspace crates](#workspace-crates) below.
 

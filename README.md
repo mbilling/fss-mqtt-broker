@@ -175,7 +175,7 @@ Next: the secured setup, TLS 1.3 + mTLS + ACL and CI-tested, in
 | Admin API and CLI | [ADMIN-API.md](docs/ADMIN-API.md) · [ADMIN-CLI.md](docs/ADMIN-CLI.md) |
 | Configuration | [CONFIGURATION.md](docs/CONFIGURATION.md) · [`mqttd.example.toml`](docs/mqttd.example.toml) |
 | Migration | [MIGRATION.md](docs/MIGRATION.md): Mosquitto, EMQX and HiveMQ configs and ACLs to a reviewed draft |
-| Architecture | [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [`docs/adr/`](docs/adr/) (91 ADRs, per-task status) |
+| Architecture | [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [`docs/adr/`](docs/adr/) (92 ADRs, per-task status) |
 | Roadmap | [ROADMAP.md](docs/ROADMAP.md) · [delivery dashboard](docs/delivery/STATUS.md) |
 | Policies | [SECURITY.md](SECURITY.md) · [SUPPORT.md](SUPPORT.md) · [docs/compliance/](docs/compliance/) · [security/vex/](security/vex/) |
 | Everything else | [GUIDE.md](GUIDE.md), the long form · [docs/README.md](docs/README.md), the index |
