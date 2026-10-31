@@ -712,6 +712,16 @@ impl HealthState {
                 self.write_elision_ms, e.elided, e.written, e.backoffs
             );
         }
+        // The hub loop's placement (ADR 0092 D1): an OS thread of its own or a task of
+        // the shared runtime, and the CPU it is pinned to (`null` when it is not).
+        if let Some((dedicated, core)) = self.metrics.as_ref().and_then(|m| m.hub_thread()) {
+            let _ = write!(
+                s,
+                ",\"hub\":{{\"thread\":\"{}\",\"core\":{}}}",
+                if dedicated { "dedicated" } else { "shared" },
+                core.map_or_else(|| "null".to_string(), |c| c.to_string())
+            );
+        }
         // Membership: the placement view (self + non-dead peers). Deterministic order.
         if let Some(p) = &self.placement {
             let (members, health, floor, floor_source) = {
@@ -1349,6 +1359,42 @@ mod tests {
         let (rejoined, _) = guarded_state(2, true);
         let (status, _, _) = super::route(&rejoined, "/readyz").await;
         assert_eq!(status, 200, "once it has a peer it is no longer alone");
+    }
+
+    /// ADR 0092 D1: `/statusz` names where the hub loop runs once it is started, and the
+    /// core it is pinned to; before, there is no block.
+    #[tokio::test]
+    async fn statusz_names_where_the_hub_loop_runs() {
+        let status = |state: HealthState| {
+            let cluster = Arc::new(
+                mqtt_cluster::cluster_identity::ClusterIdentity::load_or_mint(true, None).unwrap(),
+            );
+            state.with_status(
+                "node-a".into(),
+                cluster,
+                Arc::new(super::BrownoutStatus::default()),
+                Arc::new(crate::reload::ConfigStamp::default()),
+                Arc::new(std::sync::OnceLock::new()),
+                None,
+            )
+        };
+        let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("t"));
+        let before = status(
+            HealthState::new(spawn_live_hub(), Some(placement(1)), None, 1)
+                .with_metrics(metrics.clone()),
+        );
+        let (_, body, _) = super::route(&before, "/statusz").await;
+        assert!(!body.contains("\"hub\":"), "not started: no block: {body}");
+
+        metrics.set_hub_thread(true, Some(3));
+        let after = status(
+            HealthState::new(spawn_live_hub(), Some(placement(1)), None, 1).with_metrics(metrics),
+        );
+        let (_, body, _) = super::route(&after, "/statusz").await;
+        assert!(
+            body.contains("\"hub\":{\"thread\":\"dedicated\",\"core\":3}"),
+            "{body}"
+        );
     }
 
     /// ADR 0084: once the rules are loaded, `/statusz` carries the running set's digest

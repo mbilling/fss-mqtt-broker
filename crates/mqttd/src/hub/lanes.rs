@@ -886,13 +886,17 @@ impl Hub {
             // Spawned INTO the hub's own JoinSet, never bare: the worker holds the
             // store's exclusive handle, so its lifetime must not outlive the hub's
             // (see `owned_tasks`).
-            self.owned_tasks.spawn(append_lane_worker(
-                self.store.clone(),
-                self.self_tx.clone(),
-                rx,
-                self.metrics.clone(),
-                self.durable_plane.is_some(),
-            ));
+            let spawner = self.spawner();
+            self.owned_tasks.spawn_on(
+                append_lane_worker(
+                    self.store.clone(),
+                    self.self_tx.clone(),
+                    rx,
+                    self.metrics.clone(),
+                    self.durable_plane.is_some(),
+                ),
+                &spawner,
+            );
             self.append_lanes
                 .insert(client.clone(), AppendLane { tx, outstanding: 0 });
         }
@@ -914,7 +918,8 @@ impl Hub {
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        self.owned_tasks.spawn(fut);
+        let spawner = self.spawner();
+        self.owned_tasks.spawn_on(fut, &spawner);
     }
 
     /// Admit one job into its session's lane (spawning the lane on first use), record

@@ -1038,7 +1038,7 @@ impl Hub {
             expires_at,
             restore,
         } = mutation;
-        tokio::spawn(async move {
+        self.spawner().spawn(async move {
             let result = if payload.is_empty() {
                 durable.clear(&topic).await
             } else {

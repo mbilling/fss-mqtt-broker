@@ -71,6 +71,16 @@ pub struct Node {
     pub failure_domain: Option<String>,
     /// Static `node-id → domain` failure-domain topology (`MQTTD_FAILURE_DOMAINS`).
     pub failure_domains: BTreeMap<String, String>,
+    /// Run the hub loop on an OS thread of its own (`MQTTD_HUB_THREAD`, ADR 0092 D1,
+    /// withdrawn by its Amendment 1). Default `false`: measured on the rig, the thread
+    /// made every hand-off out of the hub a remote wake and cost a lone m6i.8xlarge 23%
+    /// of its durable `QoS` 1 knee. `true` keeps the experiment available. Restart-scoped.
+    pub hub_thread: bool,
+    /// Pin the hub's thread to this CPU (`MQTTD_HUB_CORE`, ADR 0092 D1; Linux only, a
+    /// warning elsewhere). Unset = not pinned. The runtime's workers are not kept off that
+    /// CPU: for a core of the hub's own, keep the rest of the process off it too (a
+    /// `taskset`, a cpuset). Ignored with `hub_thread = false`. Restart-scoped.
+    pub hub_core: Option<u32>,
 }
 
 /// The node id a broker uses when the operator sets none.
@@ -87,6 +97,8 @@ impl Default for Node {
             data_dir: None,
             failure_domain: None,
             failure_domains: BTreeMap::new(),
+            hub_thread: false,
+            hub_core: None,
         }
     }
 }
@@ -1397,6 +1409,14 @@ impl Config {
         on!("MQTTD_FAILURE_DOMAIN", v, {
             self.node.failure_domain = Some(v);
         });
+        // ADR 0092 D1: where the hub loop runs. An explicit on/off: a loop placed by a
+        // misread value is a capacity surprise, not a safe default.
+        on!("MQTTD_HUB_THREAD", v, {
+            self.node.hub_thread = on_off("MQTTD_HUB_THREAD", &v)?;
+        });
+        on!("MQTTD_HUB_CORE", v, {
+            self.node.hub_core = Some(num("MQTTD_HUB_CORE", &v)?);
+        });
         on!("MQTTD_FAILURE_DOMAINS", v, {
             let mut m = BTreeMap::new();
             for pair in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -2533,6 +2553,8 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_ALLOW_RELAXED_PUBLISH",
     "MQTTD_SHARED_PREFER_LOCAL",
     "MQTTD_SHARED_LOCAL_BIAS",
+    "MQTTD_HUB_THREAD",
+    "MQTTD_HUB_CORE",
     "MQTTD_OWNERSHIP_DOMAIN",
     // limits
     "MQTTD_MAX_CONNECTIONS",
@@ -2775,6 +2797,42 @@ mod tests {
 
     /// ADR 0084: the four `[rules]` keys for watching and editing rules live, from the
     /// file and from the environment, with their defaults.
+    #[test]
+    fn the_hub_thread_keys_load_from_file_and_environment() {
+        // ADR 0092 D1, withdrawn by Amendment 1: the loop is a task of the shared runtime
+        // by default; its own thread is an experiment the operator asks for, unpinned.
+        let d = Config::default().node;
+        assert!(!d.hub_thread);
+        assert_eq!(d.hub_core, None);
+        let c = Config::from_toml(
+            "[node]\nhub_thread = true\nhub_core = 3\n[durable]\nallow_ephemeral = true\n",
+        )
+        .unwrap();
+        assert!(c.node.hub_thread);
+        assert_eq!(c.node.hub_core, Some(3));
+
+        let mut c = Config::default();
+        c.overlay_from(getter(&[
+            ("MQTTD_HUB_THREAD", "on"),
+            ("MQTTD_HUB_CORE", "2"),
+        ]))
+        .unwrap();
+        assert!(c.node.hub_thread);
+        assert_eq!(c.node.hub_core, Some(2));
+
+        // An explicit on/off, never a guess; a core is a number.
+        let mut c = Config::default();
+        let err = c
+            .overlay_from(getter(&[("MQTTD_HUB_THREAD", "maybe")]))
+            .unwrap_err();
+        assert!(err.to_string().contains("MQTTD_HUB_THREAD"), "{err}");
+        let mut c = Config::default();
+        let err = c
+            .overlay_from(getter(&[("MQTTD_HUB_CORE", "two")]))
+            .unwrap_err();
+        assert!(err.to_string().contains("MQTTD_HUB_CORE"), "{err}");
+    }
+
     #[test]
     fn the_rules_watch_keys_load_from_file_and_environment() {
         let d = Config::default().rules;
@@ -3697,6 +3755,7 @@ mod tests {
             // An explicit on/off (anything else is refused) whose default is off.
             | "MQTTD_TLS_END_SESSIONS_AT_CERT_EXPIRY"
             | "MQTTD_RULES_TRACE"
+            | "MQTTD_HUB_THREAD"
             | "MQTTD_RULES_JQ" => "1",
             // Enums: any valid, non-default (default None) member.
             "MQTTD_SWIM_SIGNED" | "MQTTD_SWIM_REPLAY" => "require",
@@ -3745,6 +3804,7 @@ mod tests {
             | "MQTTD_OTLP_INTERVAL"
             | "MQTTD_SHUTDOWN_GRACE"
             | "MQTTD_DURABLE_WRITE_ELISION_MS"
+            | "MQTTD_HUB_CORE"
             | "MQTTD_READY_MIN_MEMBERS"
             | "MQTTD_CONFIG_WATCH"
             | "MQTTD_OIDC_JWKS_REFRESH"
@@ -3980,8 +4040,9 @@ mod tests {
             // plus MQTTD_TLS_EXPIRY_WARN_PERMILLE (ADR 0088 D2),
             // plus MQTTD_TLS_END_SESSIONS_AT_CERT_EXPIRY (ADR 0088 O2),
             // plus MQTTD_DURABLE_WRITE_ELISION_MS (ADR 0089),
-            // plus MQTTD_WRITE_STALL_KEEPALIVES and MQTTD_WRITE_STALL_TIMEOUT (#1117).
-            129,
+            // plus MQTTD_WRITE_STALL_KEEPALIVES and MQTTD_WRITE_STALL_TIMEOUT (#1117),
+            // plus MQTTD_HUB_THREAD and MQTTD_HUB_CORE (ADR 0092 D1).
+            131,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never

@@ -78,6 +78,9 @@ the core. The upside is bounded by what the loop spends not dispatching at its c
 of wall-clock on Ice Lake and 30% on Genoa, and is taken before anything else because the
 change is small and the measurement exists.
 
+*Withdrawn by Amendment 1 (2026-10-31, below): built, measured, a regression. The knob
+ships off by default.*
+
 ### D2. Less work per message on the loop, in the order the profile gives
 
 With frame pointers in the build, the profile is read again and the loop's per-message work
@@ -114,10 +117,46 @@ record of its own, written when the profile after D1–D3 says what the per-mess
 and it is not started before then. What that ADR must contain is listed in #1163; the
 two-shard prototype that measures the hand-off cost comes before any of it is written.
 
+## Amendment 1 (2026-10-31): D1 withdrawn on its own measurement
+
+D1 was built (T2: `Hub::spawn_dedicated`, `node.hub_thread`, `node.hub_core`, the gauge
+and the `/statusz` block) and measured on the rig the way D4 requires, on one
+`m6i.8xlarge` with the h3 workload, against the baseline run of 2026-10-30 on the same host
+(run `h3-20261031T155400Z` against `h3-20261030T171933Z`). At the same 67,500 msg/s:
+
+| | hub a task of the shared runtime | hub on its own thread |
+|---|---|---|
+| publisher ack, mean | 0.20 ms | 63.9 ms |
+| a delivery waiting for its connection task | 0.01 ms | 17.2 ms |
+| the shared runtime's wake lateness | 0.02 ms | 6.9 ms |
+| append: lane queue / local durable / fsync | 0.02 / 3.4 / 0.9 ms | 23 / 67 / 1.6 ms |
+| elision holds that timed out | 0% | 22% |
+| hub busy share | 0.59 | 0.80 |
+
+The knee fell from 88,700 msg/s at ack p99 in the milliseconds to 68,600 at 533 ms, 23%
+less. The loop's busy ceiling did rise, from 0.83 to 0.85, so the yield's wait was real
+and was removed. What the measurement shows is what that wait had been paying for: on the
+shared runtime, a task the loop wakes (a connection writer, an append lane) ran on the
+loop's own worker at once, through tokio's LIFO slot; the 17% of wall-clock the loop did
+not dispatch was that work. From a thread of its own, every such wake is a remote wake
+through the runtime's injection queue: about 3 µs more per message on the loop's side, and
+7 ms of lateness for everything it hands off, which the durable path turns into stalled
+lanes, oversized batches and expired elision holds.
+
+**The decision changes in two places.** D1 is withdrawn: the hub stays a task of the shared
+runtime. The thread and the pin ship as an operator experiment, off by default, because
+the mechanism and its measurement are the record and a later runtime may change the
+figures. D2 and D3 stand, and D3 gains a reason: a hand-off per message is a cost on
+either side of a runtime boundary, so the PUBACK that no longer crosses the loop is worth
+more than its 2 µs. D5's split inherits the lesson before it is written: shards that hand
+messages to each other pay this same wake unless the hand-off is batched and the
+receiver already running. Pinning (A') and the Genoa host (B, B') were not run: they
+cannot change the mechanism.
+
 ## Consequences
 
-- **A core is the hub's.** With D1 on, a node's capacity planning counts one core for the
-  loop; `/statusz` says which. ADR 0091's "per-node CPU limit" gets its formula from D4:
+- **The hub stays where it was.** No core is reserved; `/statusz` and the gauge say so
+  (`thread="shared"`). ADR 0091's "per-node CPU limit" gets its formula from D4:
   about 1 ÷ (a + b × PUBACKs per message) msg/s per node, with a and b measured per host.
 - **The README's per-node figures move with each task**, and only by the rig's figures: the
   delivery doc records the before and after of each, and the README keeps citing
@@ -143,6 +182,7 @@ two-shard prototype that measures the hand-off cost comes before any of it is wr
 
 ## Delivery
 
-Five tasks: the model as a script (T1), the dedicated pinned thread (T2), the per-message
-work (T3), PUBACKs off the loop (T4), and the control-plane/data-plane ADR after T2–T4 are
-measured (T5). Status in the delivery doc.
+Five tasks: the model as a script (T1), the dedicated pinned thread (T2, built and
+measured, shipped off by default under Amendment 1), the per-message work (T3), PUBACKs
+off the loop (T4), and the control-plane/data-plane ADR after T3 and T4 are measured (T5).
+Status in the delivery doc.

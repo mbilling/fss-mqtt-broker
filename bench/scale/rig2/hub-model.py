@@ -56,6 +56,7 @@ DISPATCH_COUNT = "mqttd_hub_dispatch_seconds_count"
 WAKE_SUM = "mqttd_runtime_wake_seconds_sum"
 WAKE_COUNT = "mqttd_runtime_wake_seconds_count"
 QUEUE = "mqttd_hub_queue_depth"
+PLACEMENT = "mqttd_hub_thread_info"
 # The hub's queue at a window's end above this is a loop that did not keep up: its busy
 # share is then its saturated share, whatever the load. At idle the queue holds one or
 # two commands; a hub near its ceiling carries a standing queue in the low thousands
@@ -144,7 +145,13 @@ def broker_model(samples: list[tuple[int, dict]], lo_ms: float, hi_ms: float, ma
     busy = seconds / dt
     ws, wc = _probe(z, WAKE_SUM) - _probe(a, WAKE_SUM), _probe(z, WAKE_COUNT) - _probe(a, WAKE_COUNT)
     queues = [p.get((QUEUE, ""), 0.0) for _, p in inside]
-    return {"window_s": dt, "received": rx, "received_rate": rx / dt, "busy": busy,
+    # Where the loop ran (ADR 0092 D1, mqttd_hub_thread_info): one live series per node.
+    placement = None
+    for (name, labels), v in z.items():
+        if name == PLACEMENT and v:
+            got = dict(re.findall(r'(\w+)="([^"]*)"', labels))
+            placement = {"thread": got.get("thread", "?"), "core": got.get("core", "?")}
+    return {"window_s": dt, "received": rx, "received_rate": rx / dt, "busy": busy, "placement": placement,
             "us_per_msg": seconds / rx * 1e6 if rx > 0 else None, "classes": classes,
             "wake_us": ws / wc * 1e6 if wc > 0 else None,
             "queue_end": queues[-1], "queue_max": max(queues), "saturated": queues[-1] > HUB_SATURATED,
@@ -207,7 +214,8 @@ def merge_brokers(rounds: list[dict]) -> dict[int, dict]:
                     "us_per_msg": _wmean([(m["us_per_msg"], rx) for m, rx in w]),
                     "wake_us": _wmean([(m["wake_us"], rx) for m, rx in w]), "classes": classes,
                     "queue_max": max(m["queue_max"] for m in ms),
-                    "saturated": any(m["saturated"] for m in ms)}
+                    "saturated": any(m["saturated"] for m in ms),
+                    "placement": next((m["placement"] for m in reversed(ms) if m.get("placement")), None)}
     return out
 
 
@@ -336,6 +344,11 @@ def render_ladder_md(lm: dict) -> list[str]:
                      f"{_us(ack.get('us'))} × {_us(ack.get('per_msg'))} | {_n(c['wake_us_max'])} | "
                      f"{_n(c['queue_max'])} | {sat} |")
     lines.append("")
+    placed = next((s for s in lm["steps"] if any(m.get("placement") for m in s["brokers"].values())), None)
+    if placed:
+        lines.append("- hub loop per node (ADR 0092 D1): " + " · ".join(
+            f"{i} {m['placement']['thread']}, core {m['placement']['core']}"
+            for i, m in sorted(placed["brokers"].items()) if m.get("placement")))
     if lm.get("highest_carried"):
         lines.append(f"- highest carried step: {lm['highest_carried']}")
     if lm.get("first_saturated"):

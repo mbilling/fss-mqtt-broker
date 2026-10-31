@@ -2261,6 +2261,45 @@ const HUB_INGEST_BATCH: usize = 1024;
 /// no longer awaits the channel per command, so it yields itself.
 const HUB_YIELD_EVERY: usize = 64;
 
+/// The name of the hub loop's own OS thread (ADR 0092 D1).
+pub const HUB_THREAD_NAME: &str = "mqttd-hub";
+
+/// Where the hub loop runs (ADR 0092 D1): on an OS thread of its own or as a task of the
+/// shared runtime, and the CPU it is pinned to when it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HubThread {
+    /// `true`: a thread of its own with a runtime of its own; `false`: a task of the
+    /// shared runtime (`node.hub_thread = false`, tests).
+    pub dedicated: bool,
+    /// The CPU the thread is pinned to, when pinning was asked for and the host allowed it.
+    pub core: Option<u32>,
+}
+
+impl HubThread {
+    /// The loop as a task of the shared runtime.
+    pub const SHARED: Self = Self {
+        dedicated: false,
+        core: None,
+    };
+}
+
+/// Pin the calling thread to one CPU (ADR 0092 D1). Linux only; elsewhere an
+/// `Unsupported` error, which [`Hub::spawn_dedicated`] reports as a warning.
+#[cfg(target_os = "linux")]
+fn pin_to_core(core: u32) -> std::io::Result<()> {
+    let mut set = rustix::thread::CpuSet::new();
+    set.set(core as usize);
+    rustix::thread::sched_setaffinity(None, &set).map_err(std::io::Error::from)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_to_core(_core: u32) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "thread affinity is Linux-only",
+    ))
+}
+
 /// A live session seen hosted on a node that does not own its placement group
 /// (issue #284) — the grace counter and last-close time behind rehome-on-settle.
 #[derive(Debug, Default)]
@@ -2980,6 +3019,13 @@ pub struct Hub {
     /// stopped cluster over the same data dirs and failed on the held lock, where every
     /// local run had won the race.
     owned_tasks: tokio::task::JoinSet<()>,
+    /// The runtime the hub's own tasks run on: the append lanes, the truncate flusher,
+    /// session scans, retained commits, Will rules, peer-frame handling. `None` is the
+    /// runtime the loop itself runs on, right when the hub is a task of the shared
+    /// runtime (the default, and tests). On a thread of its own (`node.hub_thread = true`,
+    /// ADR 0092 D1, withdrawn by its Amendment 1) it is the shared runtime's handle, set
+    /// before the move, so nothing but the loop ever runs on the hub's thread.
+    spawner: Option<tokio::runtime::Handle>,
     /// ADR 0074: sender into the truncate flusher — the task that coalesces
     /// per-session ack watermarks and flushes them to the store OFF the hub
     /// loop, so a subscriber ack never waits a truncate round-trip. `None`
@@ -3298,6 +3344,7 @@ impl Hub {
                 resolving_unreachable: false,
                 drain_evicted: 0,
                 owned_tasks: tokio::task::JoinSet::new(),
+                spawner: None,
                 truncate_tx: None,
                 qos2_cleanup: HashSet::new(),
                 qos2_advance_inflight: HashSet::new(),
@@ -3592,6 +3639,58 @@ impl Hub {
 
     /// Run the hub event loop: dispatch commands and periodically sweep expired
     /// sessions (ADR 0009), until all command senders are dropped.
+    /// The runtime the hub's own tasks run on (see [`Hub::spawner`]).
+    pub(super) fn spawner(&self) -> tokio::runtime::Handle {
+        self.spawner
+            .clone()
+            .unwrap_or_else(tokio::runtime::Handle::current)
+    }
+
+    /// Run the loop on an OS thread of its own, with a current-thread runtime of its own
+    /// (ADR 0092 D1), pinned to `core` when asked and the host allows. Everything the hub
+    /// spawns keeps running on the runtime this is called from, so the thread runs the
+    /// loop and nothing else: its yields return at once instead of waiting for a worker.
+    /// Returns where the loop runs; a core that could not be pinned is a warning, not an
+    /// error, and reads back as `None`.
+    ///
+    /// Off by default (ADR 0092 Amendment 1): measured on the rig, every hand-off out of
+    /// the loop became a remote wake through the shared runtime's injection queue, and a
+    /// lone m6i.8xlarge fell from 88,700 to 68,600 msg/s of durable `QoS` 1 with its ack
+    /// p99 at half a second. `node.hub_thread = true` keeps the experiment available.
+    pub fn spawn_dedicated(mut self, core: Option<u32>) -> std::io::Result<HubThread> {
+        self.spawner = Some(tokio::runtime::Handle::current());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let (pinned_tx, pinned_rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name(HUB_THREAD_NAME.into())
+            .spawn(move || {
+                let pinned = match core {
+                    Some(c) => pin_to_core(c).map(|()| Some(c)),
+                    None => Ok(None),
+                };
+                let _ = pinned_tx.send(pinned);
+                runtime.block_on(self.run());
+            })?;
+        let pinned = match pinned_rx.recv() {
+            Ok(Ok(pinned)) => pinned,
+            Ok(Err(e)) => {
+                warn!(
+                    core = ?core,
+                    error = %e,
+                    "hub thread: the core could not be pinned; the loop runs unpinned (ADR 0092 D1)"
+                );
+                None
+            }
+            Err(_) => None,
+        };
+        Ok(HubThread {
+            dedicated: true,
+            core: pinned,
+        })
+    }
+
     pub async fn run(mut self) {
         let mut sweep = tokio::time::interval(SESSION_SWEEP_INTERVAL);
         sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -3601,8 +3700,11 @@ impl Hub {
         // watermark re-advances).
         let (truncate_tx, truncate_rx) = mpsc::unbounded_channel();
         self.truncate_tx = Some(truncate_tx);
-        self.owned_tasks
-            .spawn(run_truncate_flusher(self.store.clone(), truncate_rx));
+        let spawner = self.spawner();
+        self.owned_tasks.spawn_on(
+            run_truncate_flusher(self.store.clone(), truncate_rx),
+            &spawner,
+        );
         // Warm the mesh cache BEFORE the boot scan (issue #613 item 1.1). The
         // cache is unstamped until its first recompute and answers `false` —
         // conservatively — for any hub that has a placement, and `inherit_sessions`
@@ -4985,7 +5087,7 @@ impl Hub {
             // produce is posted back exactly as below.
             let (rules, self_tx) = (rules.clone(), self.self_tx.clone());
             let (client, will) = (client.clone(), will.clone());
-            tokio::spawn(async move {
+            self.spawner().spawn(async move {
                 let w = &will.message;
                 let facts = crate::rules::PublishFacts {
                     client: &client,
@@ -9360,7 +9462,7 @@ impl Hub {
             debug!(req_id, from = %node.0, "replicate: dequeued from hub queue");
         }
         let reply_to = self.peers.get(node).map(|p| (p.tx.clone(), p.ctl.clone()));
-        tokio::spawn(async move {
+        self.spawner().spawn(async move {
             if let Some(reply) = plane.handle(frame).await {
                 if let Some((tx, ctl)) = reply_to {
                     let lane = match &reply {
@@ -9952,6 +10054,57 @@ mod tests {
         let (hub, tx) = Hub::with_config(NodeId("hub-test".into()), std::sync::Arc::new(store));
         tokio::spawn(hub.run());
         tx
+    }
+
+    /// ADR 0092 D1: the loop on an OS thread of its own answers as the task did. Unpinned
+    /// here, so the result is the same on every host.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hub_on_its_own_thread_answers_commands() {
+        let (hub, tx) = Hub::with_config(
+            NodeId("hub-thread-test".into()),
+            Arc::new(MemorySessionStore::new()),
+        );
+        let placed = hub.spawn_dedicated(None).expect("the hub's thread starts");
+        assert_eq!(
+            placed,
+            super::HubThread {
+                dedicated: true,
+                core: None
+            }
+        );
+        for _ in 0..3 {
+            let (reply, done) = oneshot::channel();
+            tx.send(HubCommand::Ping { reply }).unwrap();
+            timeout(Duration::from_secs(5), done)
+                .await
+                .expect("the loop answers from its own thread")
+                .unwrap();
+        }
+    }
+
+    /// ADR 0092 D1: a pin the host allows reads back as the core; one it refuses reads
+    /// back as `None` and the loop still runs (Linux: CPU 0 is in every cpuset we run on).
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pinned_hub_thread_reports_its_core() {
+        let (hub, tx) = Hub::with_config(
+            NodeId("hub-pin-test".into()),
+            Arc::new(MemorySessionStore::new()),
+        );
+        let placed = hub
+            .spawn_dedicated(Some(0))
+            .expect("the hub's thread starts");
+        assert!(placed.dedicated);
+        assert!(
+            placed.core == Some(0) || placed.core.is_none(),
+            "{placed:?}"
+        );
+        let (reply, done) = oneshot::channel();
+        tx.send(HubCommand::Ping { reply }).unwrap();
+        timeout(Duration::from_secs(5), done)
+            .await
+            .expect("the loop answers")
+            .unwrap();
     }
 
     /// A hub with `MQTTD_SHARED_PREFER_LOCAL` on, for the locality-preference tests.
