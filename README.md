@@ -201,7 +201,7 @@ prose must not actively mislead.
 ```sh
 cargo build && cargo test && cargo clippy --all-targets && cargo deny check
 ./scripts/interop/run.sh     # foreign-client conformance
-mqttui --list                # There are 158 runnable scripts here: demos, smokes, migrations, benches
+mqttui --list                # There are 160 runnable scripts here: demos, smokes, migrations, benches
 ```
 
 ## License
