@@ -182,3 +182,9 @@ ceiling is unchanged at 0.83: the 17% it does not dispatch is the work it wakes
 - **2026-10-31** — T3 first batch measured (run `h3-20261031T215218Z`, under Progress): the
   per-node knee 92,400 → 105,500 msg/s on one `m6i.8xlarge`, a publish dispatch 6.7 → 5.3 µs
   at 67,500 msg/s, the busy ceiling unchanged at 0.83.
+- **2026-10-31** — T3 second batch, on the profile's next two items: the hub's maps keyed
+  by a client, a node, a filter or an id, the ordinary and shared subscription tables and
+  the filter trie on a keyed fast hasher (`mqtt_core::FastMap`, `ahash`; SipHash was 10% of
+  the hub task), and the trie's `+` and `#` children as fields rather than map entries
+  (two hashed lookups per topic level per publish gone). Measured after the first batch,
+  on its own run.
