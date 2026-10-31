@@ -468,6 +468,8 @@ jobs:
       # trap at once (the first 10-node run had to be torn down by hand).
       - name: The rig2 run.sh settle and signal handling (offline)
         run: python3 bench/scale/rig2/test-run-sh.py
+      - name: The rig2 hub model, what a message costs the hub loop (offline, ADR 0092 T1)
+        run: python3 bench/scale/rig2/test-hub-model.py
       - name: The README's evidence charts draw every bar from headline.csv in its tier
         run: python3 bench/scale/chart-readme.py --self-test
 

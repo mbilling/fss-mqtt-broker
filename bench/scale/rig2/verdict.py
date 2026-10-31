@@ -91,6 +91,9 @@ def _load(name: str, path: Path):
 E = _load("extract_lane_e", SCALE / "extract-lane-e.py")
 # One constant, one meaning across the rigs: the share of the offer the brokers must take.
 OFFER_TAKEN = _load("summarize_curve", SCALE / "summarize-curve.py").OFFER_TAKEN
+# What a message costs the hub loop, per step, from the same scrapes (ADR 0092 T1); the
+# report cites it under each ladder.
+HM = _load("hub_model", HERE / "hub-model.py")
 
 SCHEMA_REPORT = "mqtt-rig2.report.v1"
 SCHEMAS_ACCEPTED = ("mqtt-load.summary.v2",)
@@ -1345,6 +1348,16 @@ def fmt_health(s: dict) -> str:
     return txt + (f", SATURATED g{','.join(sat)}" if sat else "")
 
 
+def _hub(ladder: Path) -> dict | None:
+    """The ladder's hub model (hub-model.py, ADR 0092 T1); None when it cannot be read,
+    because the model must never cost the report."""
+    try:
+        return HM.ladder_model(ladder)
+    except Exception as e:
+        print(f"verdict.py: hub model not read for {ladder}: {e!r}", file=sys.stderr)
+        return None
+
+
 def ladder_report(ladder: Path) -> dict:
     meta = json.loads((ladder / "ladder.json").read_text())
     steps = ladder_steps(ladder)
@@ -1353,7 +1366,8 @@ def ladder_report(ladder: Path) -> dict:
     nxt, why = next_rate(steps, meta["ramp"]) if steps else (None, "no steps")
     return {"workload": meta["workload"], "arm": meta.get("arm", "A"), "latency_gate": meta["ramp"].get("latency_gate", "ack"),
             "ramp": meta["ramp"], "mqtt_load": meta.get("mqtt_load", {}), "steps": steps, "capacity": capacity(steps),
-            "ended": why if nxt is None else f"incomplete (next would be {nxt:g} msg/s: {why})"}
+            "ended": why if nxt is None else f"incomplete (next would be {nxt:g} msg/s: {why})",
+            "hub": _hub(ladder)}
 
 
 def cluster_vcpu(meta: dict) -> int | None:
@@ -1444,6 +1458,11 @@ def render_ladder_md(r: dict, vcpu: int | None = None) -> list[str]:
             f"**{s['verdict']}**{tag}{(' — ' + why) if why else ''} |")
     lines.append("")
     lines += render_variance_md(r)
+    if r.get("hub"):
+        try:
+            lines += HM.render_ladder_md(r["hub"])
+        except Exception as e:  # the model must never cost the report
+            print(f"verdict.py: hub model not rendered for {r['workload']}: {e!r}", file=sys.stderr)
     return lines
 
 

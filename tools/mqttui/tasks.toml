@@ -1769,6 +1769,23 @@ requires = ["python3"]
 hidden = true
 
 [[task]]
+id = "rig2-hub-model"
+group = "Benchmark"
+name = "The hub model of a rig2 run: what a message costs the hub loop, per step and node"
+script = "bench/scale/rig2/hub-model.py"
+about = "Reads a run's 2-second broker scrapes over each round's measured window and prints, per step, the busiest node's busy share, the hub-µs per message, the publish and ack dispatch costs, the wake probe, the queue and the loop's busy ceiling; report.md cites it (ADR 0092 T1). Pass a run, ladder or step directory; --json for the figures."
+requires = ["python3"]
+
+[[task]]
+id = "rig2-hub-model-tests"
+group = "Benchmark"
+name = "Offline tests of the rig2 hub model"
+script = "bench/scale/rig2/test-hub-model.py"
+about = "Synthesized rounds; no cluster. Invoked by CI with python3."
+requires = ["python3"]
+hidden = true
+
+[[task]]
 id = "rig2-run-sh-tests"
 group = "Benchmark"
 name = "Offline tests of the rig2 run.sh settle and signal handling"

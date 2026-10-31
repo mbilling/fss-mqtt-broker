@@ -466,7 +466,13 @@ lossless msg/s, the three latency-band lines (`capacity` in the JSON: `lossless`
 merged p99), why the ladder ended, and a variance section: the largest CV of the received
 msg/s and of the p99, and the steps whose rounds disagree by more than 10% in received
 msg/s or 2× in p99. `verdict.py report <run>` re-renders them from the steps'
-`verdict.json`.
+`verdict.json`. Under each ladder, **the hub model** (ADR 0092 T1, `hub-model.py`): per
+step, the busiest node's share of wall-clock spent dispatching, the hub-µs per received
+message, the mean µs of a `publish` and of an `ack` (consumer PUBACK) dispatch with their
+dispatches per message, the wake probe's lateness, the queue and the nodes whose queue did
+not keep up; then the loop's busy ceiling, where what is left of wall-clock is the loop's
+own cost (ingest, the yield every 64 commands and its wake, migrations). `hub-model.py
+<run | ladder | step>` prints the same table, `--json` the figures.
 
 **Charts.** One SVG per ladder, `<run>/report-<workload>.svg`, linked from report.md
 (`chart-ramp.py`, called by the report; `chart-ramp.py <run>` redraws them from
@@ -488,7 +494,9 @@ lossless step is labelled, and the title states it.
 - **Calibration against emqtt-bench** is 0090-T2.
 
 Tests: `python3 bench/scale/rig2/test-verdict.py` (offline; CI runs it; it includes
-`chart-ramp.py --self-test`) and `python3 bench/scale/rig2/test-run-sh.py` (offline; CI
+`chart-ramp.py --self-test`), `python3 bench/scale/rig2/test-hub-model.py` (offline; CI
+runs it: one broker's figures over a round's window, a step's rounds merged, the ladder's
+ceiling, the markdown) and `python3 bench/scale/rig2/test-run-sh.py` (offline; CI
 runs it): the real `run.sh` at `TIER=local` against fake brokers, for a flaky scrape, the
 wall-clock budget, a broker that never answers, a background counter tick (no hold), a
 drain (held, and named), a settle that runs out on an idle pass (the reason still named),

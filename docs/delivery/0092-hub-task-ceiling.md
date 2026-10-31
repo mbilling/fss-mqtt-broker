@@ -5,9 +5,10 @@ adr_status: Accepted
 tasks:
   - id: 0092-T1
     title: "The hub model as a script: µs per publish and per consumer PUBACK, and the time lost to wake-ups, from a rig run's scrapes; the report cites it"
-    status: planned
+    status: in-progress
     issue: 1159
-    notes: "Size S. bench/scale/rig2; reads the 2 s scrapes (mqttd_hub_dispatch_seconds by class, the publish and ack counters, mqttd_runtime_wake_seconds). The yardstick for T2–T4: today a = 6.4–7.3 µs and b ≈ 2 µs on m6i.8xlarge, 9.7 and 3.0 on m6i.4xlarge, the loss 18% (Ice Lake) and 41% (Genoa). A test on a recorded run; the four AWS runs of 2026-10-30 and the bisect of 2026-10-31 recorded here."
+    date: 2026-10-31
+    notes: "Size S. bench/scale/rig2/hub-model.py reads a run's 2 s scrapes (mqttd_hub_dispatch_seconds by class, the received counter, mqttd_runtime_wake_seconds, mqttd_hub_queue_depth) over each round's measured window and prints, per step, the busiest node's busy share, the hub-µs per received message, the publish and ack (consumer PUBACK) µs with their dispatches per message, the wake probe's lateness, the queue and the saturated nodes, then the loop's busy ceiling; verdict.py cites it under every ladder of report.md; test-hub-model.py (6 tests) runs in CI. The yardstick for T2–T4; the five AWS runs' figures are under Progress."
   - id: 0092-T2
     title: "The hub loop on its own OS thread, pinned to a core where the host allows (D1): MQTTD_HUB_THREAD and MQTTD_HUB_CORE, named on /statusz and a gauge; the shared runtime keeps everything else"
     status: planned
@@ -42,7 +43,7 @@ above; the table below is generated from it.
 <!-- status-table:0092 -->
 | Task | Status | Issue | When | Evidence / notes |
 |------|--------|-------|------|------------------|
-| 0092-T1 | ⬜ planned | [#1159](https://github.com/mbilling/fss-mqtt-broker/issues/1159) | — | "Size S. bench/scale/rig2; reads the 2 s scrapes (mqttd_hub_dispatch_seconds by class, the publish and ack counters, mqttd_runtime_wake_seconds). The yardstick for T2–T4: today a = 6.4–7.3 µs and b ≈ 2 µs on m6i.8xlarge, 9.7 and 3.0 on m6i.4xlarge, the loss 18% (Ice Lake) and 41% (Genoa). A test on a recorded run; the four AWS runs of 2026-10-30 and the bisect of 2026-10-31 recorded here." |
+| 0092-T1 | 🚧 in-progress | [#1159](https://github.com/mbilling/fss-mqtt-broker/issues/1159) | 2026-10-31 | "Size S. bench/scale/rig2/hub-model.py reads a run's 2 s scrapes (mqttd_hub_dispatch_seconds by class, the received counter, mqttd_runtime_wake_seconds, mqttd_hub_queue_depth) over each round's measured window and prints, per step, the busiest node's busy share, the hub-µs per received message, the publish and ack (consumer PUBACK) µs with their dispatches per message, the wake probe's lateness, the queue and the saturated nodes, then the loop's busy ceiling; verdict.py cites it under every ladder of report.md; test-hub-model.py (6 tests) runs in CI. The yardstick for T2–T4; the five AWS runs' figures are under Progress." |
 | 0092-T2 | ⬜ planned | [#1160](https://github.com/mbilling/fss-mqtt-broker/issues/1160) | — | "Size M. The maintainer's item 1. The three tokio::spawn(hub.run()) sites in crates/mqttd/src/main.rs; a std thread with a current-thread runtime or LocalSet; rustix sched_setaffinity (no unsafe); mqtt-config, CONFIGURATION, OPERATIONS. Measured before and after on one m6i.8xlarge and one m7a.8xlarge (the 30% case) with T1; the upside is bounded by what the loop spends not dispatching at its ceiling, 17% of wall-clock on Ice Lake and 30% on Genoa." |
 | 0092-T3 | ⬜ planned | [#1161](https://github.com/mbilling/fss-mqtt-broker/issues/1161) | — | "Size M–L. The maintainer's item 2. First the frame-pointer profile run (the build exists; about $0.6 of rig time), then the items in profile order. Target about 7 → about 5 µs per publish on m6i, each change re-fitted with T1 on the rig; hub tests green." |
 | 0092-T4 | ⬜ planned | [#1162](https://github.com/mbilling/fss-mqtt-broker/issues/1162) | — | "Size L. The maintainer's item 3. hub/mod.rs dispatch_pub_ack and complete_pending; the connection task's outbound state. Tests first: ADR 0089 T1's order tests, inflight_durability (#124), cluster_proc and false_dead_delivery with elision on. Done when the ack class is below 5% of hub time by T1 and no acknowledged message is lost on the fault suites." |
@@ -78,17 +79,32 @@ The README's per-node figures move only by the rig's results, task by task, thro
 
 ## Progress
 
-Baseline, from the AWS runs of 2026-10-30 and the bisect of 2026-10-31
-(`docs/benchmarks/RIG2-RESULTS.md`):
+**Baseline (T1),** `bench/scale/rig2/hub-model.py` over the AWS runs of 2026-10-30 and the
+bisect of 2026-10-31 (`docs/benchmarks/RIG2-RESULTS.md`). At each run's highest carried
+step: the busiest node's busy share, the hub-µs per received message (every class), the
+mean µs of a `publish` dispatch and of an `ack` (consumer PUBACK) dispatch, and the wake
+probe's mean lateness. The ceiling is the highest busy share a node reached in a step
+whose queue did not keep up; what is left of wall-clock there is the loop's own cost:
+ingest, the yield it takes every 64 commands and the wake it then waits for, migrations.
 
-| shape | durable QoS 1 | per node | hub at the knee |
-|---|---|---|---|
-| 1 × `m6i.8xlarge`, one copy | 88,700 msg/s | 88,700 | a = 6.4–7.3 µs, b ≈ 2 µs; 18% lost to wake-ups |
-| 1 × `m7a.8xlarge`, one copy | 69,700 msg/s | 69,700 | dispatch 8% cheaper; 41% lost to wake-ups |
-| 3 × `m6i.8xlarge` | 270,800 msg/s | 90,300 | |
-| 6 × `m6i.4xlarge` | 390,300 msg/s | 65,050 | a = 9.7 µs, b = 3.0 µs; dispatch 82% of wall-clock |
+| shape | highest carried | busy | µs/msg | publish µs | ack µs | wake µs | busy ceiling | not dispatching |
+|---|---|---|---|---|---|---|---|---|
+| 1 × `m6i.8xlarge` (Ice Lake), one copy | 88,700 | 0.81 | 9.1 | 7.0 | 2.1 | 24 | 0.83 | 17% |
+| 1 × `m7a.8xlarge` (EPYC Genoa), one copy | 69,700 | 0.57 | 8.1 | 6.2 | 1.9 | 360 | 0.70 | 30% |
+| 3 × `m6i.8xlarge` | 270,800 | 0.81 | 9.0 | 7.0 | 1.9 | 28 | 0.83 | 17% |
+| 6 × `m6i.4xlarge`, first ladder | 337,500 | 0.75 | 12.7 | 9.7 | 2.9 | 30 | 0.82 | 18% |
+| 6 × `m6i.4xlarge`, bisect | 390,300 | 0.82 | 12.5 | 9.7 | 2.7 | 40 | 0.82 | 18% |
+
+Two readings the script settles. The Genoa node's loss is 30% at its ceiling, not the
+41% read off its carried step (0.57 busy): its ceiling rises with the offer, from 0.57 at
+69,700 to 0.70 at 101,300, which a fixed share would not do. And the wake probe names the
+mechanism: every 64 commands the loop yields, and each yield waits 24–50 µs on Ice Lake
+and 200–360 µs on Genoa, against 0.6 ms of dispatching between yields. T2 removes that
+wait by giving the loop a runtime with nothing else to run.
 
 ## Changelog
 
 - **2026-10-31** — Delivery doc created with T1–T5 planned, issues #1159–#1163, from the
   maintainer's decision of the same day.
+- **2026-10-31** — T1 in progress: `hub-model.py`, its six tests in CI, the report hook in
+  `verdict.py`, and the five runs' baseline above.
