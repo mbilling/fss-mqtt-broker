@@ -38,18 +38,20 @@ a loop that ingests commands, dispatches them by class (`publish`, `ack`, `attac
 fitted from the runs' 2-second scrapes as busy = load × (a per publish + b per consumer
 PUBACK):
 
-| host | a, per publish | b, per consumer PUBACK | the queue explodes past |
+| host | a, per publish | b, per consumer PUBACK | busy at the loop's ceiling |
 |---|---|---|---|
-| `m6i.8xlarge` (Ice Lake) | 6.4–7.3 µs | about 2 µs | busy 0.76 |
-| `m6i.4xlarge` (Ice Lake) | 9.7 µs | 3.0 µs | |
-| `m7a.8xlarge` (EPYC Genoa) | 8% cheaper than m6i | | busy 0.59 |
+| `m6i.8xlarge` (Ice Lake) | 6.4–7.3 µs | about 2 µs | 0.83 |
+| `m6i.4xlarge` (Ice Lake) | 9.7 µs | 2.7–3.0 µs | 0.82 |
+| `m7a.8xlarge` (EPYC Genoa) | 8% cheaper than m6i | | 0.70 |
 
 Three things in that table are the decision:
 
-- **The task migrates.** On the shared runtime the hub hops across workers; it loses 18% of
-  its time to wake-ups and migrations on Ice Lake and 41% on the four-CCD Genoa, which is
-  why the `m7a` node is slower (69,700 msg/s) although each dispatch is cheaper
-  (`mqttd_runtime_wake_seconds`).
+- **The loop waits for the runtime.** It yields every 64 commands, and on the shared
+  runtime each yield waits for a wake: 24–50 µs on Ice Lake and 200–360 µs on the four-CCD
+  Genoa (`mqttd_runtime_wake_seconds`), against about 0.6 ms of dispatching between yields.
+  At its ceiling the loop dispatches 83% of wall-clock on Ice Lake and 70% on Genoa; the
+  rest, 17% and 30%, is that wait, ingest and migrations. It is why the `m7a` node is
+  slower (69,700 msg/s) although each of its dispatches is cheaper.
 - **Most of the per-message time is not routing.** The flat profile at 67,500 msg/s on
   `m6i.8xlarge`: kernel 39%, the tokio runtime 18%, hub-named symbols 11.7%, memcpy and
   allocation 10%, connection tasks 6.5%, context switches and wake-ups about 14%, vDSO
@@ -72,9 +74,9 @@ connection tasks, lanes, peers and the writer stay on the shared runtime, and th
 channels do not change. Pinning uses `rustix`'s `sched_setaffinity` (the workspace forbids
 `unsafe`) and is configured, not assumed: `MQTTD_HUB_THREAD` (own thread, on by default)
 and `MQTTD_HUB_CORE` (pinning, off by default). `/statusz` and a gauge name the thread and
-the core. The upside is bounded by the measured loss, 18% of hub time on Ice Lake and 41% on
-Genoa, and is taken before anything else because the change is small and the measurement
-exists.
+the core. The upside is bounded by what the loop spends not dispatching at its ceiling, 17%
+of wall-clock on Ice Lake and 30% on Genoa, and is taken before anything else because the
+change is small and the measurement exists.
 
 ### D2. Less work per message on the loop, in the order the profile gives
 
