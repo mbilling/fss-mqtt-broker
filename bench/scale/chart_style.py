@@ -139,6 +139,9 @@ def swatch(x: float, y: float, role: str, label: str, *, kind: str = "box") -> l
     elif kind == "dash":
         mark = (f'<line x1="{x:.1f}" y1="{y - 4:.1f}" x2="{x + 18:.1f}" y2="{y - 4:.1f}" class="k-{role}" '
                 'stroke-width="2" stroke-dasharray="4 3"/>')
+    elif kind == "dot":
+        mark = (f'<line x1="{x + 1:.1f}" y1="{y - 4:.1f}" x2="{x + 18:.1f}" y2="{y - 4:.1f}" class="k-{role}" '
+                'stroke-width="2.5" stroke-dasharray="0.1 5" stroke-linecap="round"/>')
     elif kind == "outline":
         mark = (f'<rect x="{x + 1:.1f}" y="{y - 11:.1f}" width="12" height="12" rx="3" fill="none" '
                 f'class="k-{role}" stroke-width="2"/>')
@@ -147,12 +150,12 @@ def swatch(x: float, y: float, role: str, label: str, *, kind: str = "box") -> l
                 f'class="k-{role}" stroke-width="1.5" stroke-dasharray="3 2"/>')
     else:
         mark = f'<rect x="{x:.1f}" y="{y - 11:.1f}" width="12" height="12" rx="3" class="f-{role}"/>'
-    return [mark, text(x + (26 if kind in ("line", "dash") else 19), y, label, size=12, role="ink2")]
+    return [mark, text(x + (26 if kind in ("line", "dash", "dot") else 19), y, label, size=12, role="ink2")]
 
 
 def legend_width(label: str, kind: str = "box") -> float:
     """A generous estimate of a legend entry's width at 12px system sans."""
-    return (26 if kind in ("line", "dash") else 19) + 6.4 * len(label) + 22
+    return (26 if kind in ("line", "dash", "dot") else 19) + 6.4 * len(label) + 22
 
 
 def compact(v: float) -> str:
