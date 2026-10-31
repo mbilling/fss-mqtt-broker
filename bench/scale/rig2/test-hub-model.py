@@ -171,6 +171,42 @@ class StepAndLadder(unittest.TestCase):
         self.assertEqual(H.find_models(self.ladder)[0]["ladder"], "durable-qos1")
         self.assertEqual(len(H.find_models(self.ladder / "steps" / "02-75000")[0]["steps"]), 1)
 
+    def test_an_idle_step_renders_as_dashes_and_never_raises(self):
+        # Brokers that received nothing (a VOID step, idle but for control and sweeps):
+        # no busy share can be weighted, so the row says so and the ceiling ignores it.
+        self.make_step(1, 50_000, "VOID", [{0: linear(0, 6.0, 2.0)}])
+        lm = H.ladder_model(self.ladder)
+        c = lm["steps"][0]["cluster"]
+        self.assertIsNone(c["busy_max"])
+        self.assertIsNone(lm["ceiling"])
+        md = "\n".join(H.render_ladder_md(lm))
+        self.assertIn("| 1 | 50,000 | VOID | — | — |", md)
+
+    def test_the_ceiling_is_read_on_a_node_that_did_not_keep_up(self):
+        # Node 0 kept up at a higher busy share than node 1, whose queue ran away: the
+        # ceiling is node 1's busy and wake, not the cluster's busiest.
+        self.make_step(1, 140_000, "FAILED", [
+            {0: linear(90_000, 7.0, 2.1, queue=10.0),
+             1: linear(50_000, 12.0, 2.0, wake_ms=0.3, queue=150_000.0)}])
+        lm = H.ladder_model(self.ladder)
+        c = lm["steps"][0]["cluster"]
+        self.assertAlmostEqual(c["busy_max"], 90_000 * 9.1e-6)      # node 0, 0.82
+        self.assertEqual(c["saturated"], [1])
+        self.assertEqual(lm["ceiling"]["node"], 1)
+        self.assertAlmostEqual(lm["ceiling"]["busy"], 50_000 * 14e-6)  # node 1, 0.70
+        self.assertAlmostEqual(lm["ceiling"]["wake_us"], 300.0)
+        self.assertIn("busy ceiling 0.70 on node 1", "\n".join(H.render_ladder_md(lm)))
+
+    def test_a_counter_that_went_backwards_is_a_problem_not_a_figure(self):
+        step = self.make_step(1, 50_000, "VOID", [{0: linear(50_000, 6.0, 2.0)}])
+        d = step / "round-1" / "scrapes" / "broker-0"
+        # The last scrape INSIDE the window (8 s; 10 s is outside its 1 s margin): a
+        # restart there resets every counter below the window's first scrape.
+        (d / f"{T0 + 8000}.prom").write_text(prom(10, {"publish": (0.0, 0), "ack": (0.0, 0)}))
+        m = H.round_model(step / "round-1")
+        self.assertNotIn(0, m["brokers"])
+        self.assertTrue(any("went backwards" in p for p in m["problems"]), m["problems"])
+
     def test_a_step_without_scrapes_is_a_row_with_its_problem(self):
         step = self.make_step(1, 50_000, "VOID", [])
         (step / "round-1").mkdir()

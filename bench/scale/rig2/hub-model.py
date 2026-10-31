@@ -20,8 +20,8 @@ one verdict.py judges the round on), the 2-second scrapes give:
   queue      the hub's queue depth at the window's end, and its maximum in the window
   saturated  the queue ended above HUB_SATURATED; then 1 - busy is the share of the loop's
              time that went to something other than dispatching: ingest, yields, wake-ups
-             and migrations. On the AWS runs of 2026-10-30 that share was 18% on Ice Lake
-             (busy 0.82) and 41% on EPYC Genoa (busy 0.59).
+             and migrations. On the AWS runs of 2026-10-30 that share was 17% on Ice Lake
+             (busy 0.83) and 30% on EPYC Genoa (busy 0.70), read on the saturated node.
 
 Figures are per broker from that broker's own clock (differences of its scrapes), then
 summed or averaged over the cluster weighted by the messages each broker received.
@@ -126,12 +126,16 @@ def broker_model(samples: list[tuple[int, dict]], lo_ms: float, hi_ms: float, ma
     (t0, a), (t1, z) = inside[0], inside[-1]
     dt = (t1 - t0) / 1000
     rx = E.delta(a, z, E.RECEIVED)
+    if rx < 0:
+        raise ValueError("the received counter went backwards inside the window (a restart?)")
     sum_a, sum_z = E.by_label(a, DISPATCH_SUM, "command"), E.by_label(z, DISPATCH_SUM, "command")
     cnt_a, cnt_z = E.by_label(a, DISPATCH_COUNT, "command"), E.by_label(z, DISPATCH_COUNT, "command")
     classes: dict[str, dict] = {}
     for cls in sorted(set(sum_z) | set(cnt_z)):
         ds = sum_z.get(cls, 0.0) - sum_a.get(cls, 0.0)
         dn = cnt_z.get(cls, 0.0) - cnt_a.get(cls, 0.0)
+        if ds < 0 or dn < 0:
+            raise ValueError(f"the {cls} dispatch counters went backwards inside the window (a restart?)")
         classes[cls] = {"seconds": ds, "dispatches": dn,
                         "us": ds / dn * 1e6 if dn > 0 else None,
                         "per_msg": dn / rx if rx > 0 else None,
@@ -162,7 +166,11 @@ def round_model(rd: Path, margin_ms: float = 1000.0) -> dict:
         out["problems"].append("no broker scrapes")
     for d in dirs:
         idx = int(d.name.split("-")[1])
-        m = broker_model(load_samples(d), lo, hi, margin_ms)
+        try:
+            m = broker_model(load_samples(d), lo, hi, margin_ms)
+        except ValueError as e:
+            out["problems"].append(f"broker {idx}: {e}")
+            continue
         if m is None:
             out["problems"].append(f"broker {idx}: fewer than two scrapes inside the window")
             continue
@@ -190,7 +198,8 @@ def merge_brokers(rounds: list[dict]) -> dict[int, dict]:
         classes = {}
         for cls in sorted({c for m in ms for c in m["classes"]}):
             cs = [(m["classes"].get(cls), m["received"]) for m in ms if cls in m["classes"]]
-            classes[cls] = {"us": _wmean([(c["us"], c["dispatches"]) for c, _ in cs]),
+            classes[cls] = {"dispatches": sum(c["dispatches"] for c, _ in cs),
+                            "us": _wmean([(c["us"], c["dispatches"]) for c, _ in cs]),
                             "per_msg": _wmean([(c["per_msg"], rx) for c, rx in cs]),
                             "share": _wmean([(c["share"], rx) for c, rx in cs])}
         out[idx] = {"rounds": len(ms), "received_rate": _wmean([(m["received_rate"], rx) for m, rx in w]),
@@ -211,7 +220,9 @@ def cluster_of(brokers: dict[int, dict]) -> dict | None:
     classes = {}
     for cls in sorted({c for m in brokers.values() for c in m["classes"]}):
         cs = [(m["classes"][cls], rx) for m, rx in w if cls in m["classes"]]
-        classes[cls] = {"us": _wmean([(c["us"], rx) for c, rx in cs]),
+        # A class's mean µs is weighted by its own dispatches, as merge_brokers weights it;
+        # dispatches per message by the node's received messages.
+        classes[cls] = {"us": _wmean([(c["us"], c.get("dispatches", rx)) for c, rx in cs]),
                         "per_msg": _wmean([(c["per_msg"], rx) for c, rx in cs])}
     busiest = max(brokers.items(), key=lambda kv: kv[1]["busy"] or 0.0)
     return {"nodes": len(brokers), "received_rate": sum(rx for _, rx in w),
@@ -255,12 +266,20 @@ def ladder_model(ladder: Path) -> dict:
     out["highest_carried"] = max(carried, key=lambda s: s["rate"] or 0)["id"] if carried else None
     sat = [s for s in out["steps"] if s["cluster"] and s["cluster"]["saturated"]]
     out["first_saturated"] = min(sat, key=lambda s: s["rate"] or 0)["id"] if sat else None
-    # The loop's ceiling: the highest busy share any node reached in a step where a node's
-    # queue did not keep up. What is left of wall-clock there is the loop's own cost:
-    # ingest, the yield every 64 commands and the wake it waits for, migrations.
-    top = max(sat, key=lambda s: s["cluster"]["busy_max"]) if sat else None
-    out["ceiling"] = ({"step": top["id"], "busy": top["cluster"]["busy_max"], "node": top["cluster"]["busiest"],
-                       "wake_us": top["cluster"]["wake_us_max"]} if top else None)
+    # The loop's ceiling: the highest busy share reached by a node whose OWN queue did not
+    # keep up, over every step. A node that kept up at a higher busy share in the same step
+    # is not at its ceiling, so it does not count; the wake lateness is that node's too.
+    # What is left of wall-clock at the ceiling is the loop's own cost: ingest, the yield
+    # every 64 commands and the wake it waits for, migrations.
+    best = None
+    for s in out["steps"]:
+        if not s["cluster"]:
+            continue
+        for i in s["cluster"]["saturated"]:
+            m = s["brokers"][i]
+            if m["busy"] is not None and (best is None or m["busy"] > best["busy"]):
+                best = {"step": s["id"], "busy": m["busy"], "node": i, "wake_us": m["wake_us"]}
+    out["ceiling"] = best
     return out
 
 
@@ -289,6 +308,11 @@ def _n(x: float | None) -> str:
     return "—" if x is None else f"{x:,.0f}"
 
 
+def _busy(c: dict) -> str:
+    """The busiest node's busy share, or — for a step where no node received anything."""
+    return "—" if c["busy_max"] is None else f"{c['busy_max']:.2f} (node {c['busiest']})"
+
+
 def render_ladder_md(lm: dict) -> list[str]:
     lines = [f"### Hub model (ADR 0092): {lm['ladder']}", "",
              "Per step, the busiest node's share of wall-clock spent dispatching, the hub-seconds per received "
@@ -307,7 +331,7 @@ def render_ladder_md(lm: dict) -> list[str]:
             continue
         pub, ack = c["classes"].get("publish", {}), c["classes"].get("ack", {})
         sat = ", ".join(str(i) for i in c["saturated"]) or "none"
-        lines.append(f"| {s['step']} | {_n(s['rate'])} | {s['verdict'] or '—'} | {c['busy_max']:.2f} (node {c['busiest']}) | "
+        lines.append(f"| {s['step']} | {_n(s['rate'])} | {s['verdict'] or '—'} | {_busy(c)} | "
                      f"{_us(c['us_per_msg'])} | {_us(pub.get('us'))} × {_us(pub.get('per_msg'))} | "
                      f"{_us(ack.get('us'))} × {_us(ack.get('per_msg'))} | {_n(c['wake_us_max'])} | "
                      f"{_n(c['queue_max'])} | {sat} |")

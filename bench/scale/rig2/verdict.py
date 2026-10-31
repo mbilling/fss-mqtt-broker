@@ -1459,7 +1459,10 @@ def render_ladder_md(r: dict, vcpu: int | None = None) -> list[str]:
     lines.append("")
     lines += render_variance_md(r)
     if r.get("hub"):
-        lines += HM.render_ladder_md(r["hub"])
+        try:
+            lines += HM.render_ladder_md(r["hub"])
+        except Exception as e:  # the model must never cost the report
+            print(f"verdict.py: hub model not rendered for {r['workload']}: {e!r}", file=sys.stderr)
     return lines
 
 
