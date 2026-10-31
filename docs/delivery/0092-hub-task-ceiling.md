@@ -122,3 +122,8 @@ wait by giving the loop a runtime with nothing else to run.
   Genoa host were not run.
 - **2026-10-31** — T1 done (#1165 merged) and T2 done (#1167 merged, the thread off by
   default under Amendment 1); #1159 and #1160 closed.
+- **2026-10-31** — main `d4afe97d` (T2 merged, the thread off) re-measured on one
+  `m6i.8xlarge` (run `h3-20261031T194739Z`): knee 92,400 msg/s at ack p99 640 ms against the
+  baseline's 88,700, inside the rig's noise; at 67,500 busy 0.58, 6.7 µs per publish, 1.9 per
+  PUBACK, wake 32 µs, ceiling 0.83: the baseline's figures, with `thread="shared"` in the
+  scrapes. The shipped default is the old path.
