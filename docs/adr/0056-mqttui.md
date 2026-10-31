@@ -1,7 +1,13 @@
 # ADR 0056 — `mqttui`: a terminal UI for running the demo, migration and test scripts
 
-- **Status:** Proposed
+- **Status:** Deprecated
 - **Date:** 2026-08-10
+
+> **Deprecated 2026-10-31** by the maintainer: "we should isolate mqttui now. it needs a
+> remake later. lets not build it and release it". The source stays under `tools/mqttui/`,
+> but it is neither built nor released: its CI job and the rolling examples bundle are
+> skipped, and the release workflow no longer builds or checksums it. The remake is a new
+> ADR, which will say what of this one it keeps.
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0056-mqttui.md](../delivery/0056-mqttui.md) — plan, progress, and changelog
 - **Related:** [ADR 0044](0044-release-readiness-assurance.md) (the assurance scripts this

@@ -63,7 +63,7 @@
 | [0053](../adr/0053-single-crypto-provider-aws-lc-rs.md) | One crypto provider: aws-lc-rs everywhere, ring evicted | Accepted | [5/5 done](0053-single-crypto-provider.md) | — |
 | [0054](../adr/0054-operator-facing-state-surface.md) | Operator-facing state surface: `/statusz` + state gauges | Accepted | [5/5 done](0054-operator-facing-state-surface.md) | — |
 | [0055](../adr/0055-kubernetes-operator.md) | The mqttd Kubernetes operator (`MqttdCluster` CRD, kube-rs controller) | Accepted | [10/12 done](0055-kubernetes-operator.md) | 2 deferred |
-| [0056](../adr/0056-mqttui.md) | `mqttui`: a terminal UI for running the demo, migration and test scripts | Proposed | [10/10 done](0056-mqttui.md) | — |
+| [0056](../adr/0056-mqttui.md) | `mqttui`: a terminal UI for running the demo, migration and test scripts | Deprecated | [10/10 done](0056-mqttui.md) | — |
 | [0057](../adr/0057-durable-outbound-inflight.md) | Durable outbound in-flight state: exactly-once across a broker crash | Proposed | [8/8 done](0057-durable-outbound-inflight.md) | — |
 | [0058](../adr/0058-one-dot-zero-stability-contract.md) | The 1.0 stability contract: upgrade-in-place, never wipe-and-rejoin | Proposed | [5/5 done](0058-one-dot-zero-stability-contract.md) | — |
 | [0059](../adr/0059-bridge-ha-topology-and-ordering.md) | Bridge HA topology and message ordering | Proposed | [5/6 done](0059-bridge-ha-topology-and-ordering.md) | 1 deferred |

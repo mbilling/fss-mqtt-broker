@@ -1,7 +1,7 @@
 ---
 adr: "0056"
 title: "mqttui: a terminal UI for running the demo, migration and test scripts"
-adr_status: Proposed
+adr_status: Deprecated
 tasks:
   - id: 0056-T1
     title: The manifest + headless runner + the CI completeness guard — tasks.toml declaring every runnable script with its prerequisites and env surface, `mqttui --list` / `mqttui --run <id>`, and a test that fails when a script is missing from it
@@ -209,3 +209,9 @@ nothing to run).
   is a developer tool or something that ships. The proposal had previously lived only in a
   conversation and then only in issue #138, which is where this project keeps defects and
   tracking plans, not decisions.
+- **2026-10-31** — Deprecated by the maintainer ("we should isolate mqttui now. it needs a
+  remake later. lets not build it and release it"). The source stays under `tools/mqttui/`;
+  the `mqttui (separate workspace)` CI job and the rolling examples bundle are skipped
+  (`if: false`, the ruleset still names the job), and `release.yml` no longer builds or
+  checksums the binary. The tasks above stay as the record of what was built. The remake
+  is a new ADR.

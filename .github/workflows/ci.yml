@@ -622,7 +622,11 @@ jobs:
   mqttui:
     name: mqttui (separate workspace)
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    # Isolated on 2026-10-31 (ADR 0056, deprecated): mqttui is neither built nor released
+    # until its remake, so this job is skipped, not removed. The ruleset still names it as a
+    # required check, and a skipped job satisfies that without a check that cannot fail;
+    # the remake flips the condition back to `needs.changes.outputs.code == 'true'`.
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

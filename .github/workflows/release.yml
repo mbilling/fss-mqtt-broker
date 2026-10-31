@@ -81,41 +81,38 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
 
       - name: Reproducible build
-        # mqttui is named explicitly: it lives in its own workspace with its own lockfile
-        # (ADR 0056 §1), so it is not part of the default package set. mqttd-operator is
-        # a workspace member (same lockfile) shipped as its own binary + image (0055-T8).
-        run: scripts/release/build-repro.sh ${{ matrix.target }} mqttd mqtt-bridge mqttui mqttd-operator mqttd-fips
+        # mqttd-operator is a workspace member (same lockfile) shipped as its own binary +
+        # image (0055-T8). mqttui (its own workspace, ADR 0056 §1) is not built or released
+        # since 2026-10-31: the ADR is deprecated until its remake.
+        run: scripts/release/build-repro.sh ${{ matrix.target }} mqttd mqtt-bridge mqttd-operator mqttd-fips
 
       # Independent proof of byte-reproducibility: fully clean and rebuild from
       # the same tag, then assert the two binaries are identical.
       - name: Verify reproducibility (clean rebuild is byte-identical)
         run: |
           # EVERY shipped binary must be reproducible, not just the broker's — a signature
-          # over a binary nobody can regenerate proves less. mqttui's artefacts live under
-          # its own workspace, so its path differs from the other two.
+          # over a binary nobody can regenerate proves less.
           paths() {
             echo "target/${{ matrix.target }}/release/mqttd"
             echo "target/${{ matrix.target }}/release/mqtt-bridge"
             echo "target/${{ matrix.target }}/release/mqttd-operator"
             echo "target/${{ matrix.target }}/release/mqttd-fips"
-            echo "tools/mqttui/target/${{ matrix.target }}/release/mqttui"
           }
           paths | while read -r b; do
             sha256sum "$b" | awk '{print $1}' >> first.sha256
           done
-          # BOTH workspaces must be cleaned. `cargo clean` at the root does not touch
-          # tools/mqttui/target, so leaving it would re-checksum the very same file and the
-          # comparison would pass without a rebuild having happened — a check that cannot
-          # fail is worse than no check, because it reports the property it never tested.
+          # The clean must remove every binary checked above, or the comparison would pass
+          # without a rebuild having happened — a check that cannot fail is worse than no
+          # check, because it reports the property it never tested. (mqttui, its own
+          # workspace, is not built here since 2026-10-31.)
           cargo clean # also removes target/fips-build (nested under target/)
-          cargo clean --manifest-path tools/mqttui/Cargo.toml
           for b in $(paths); do
             if [ -e "$b" ]; then
               echo "::error title=Reproducibility::$b survived the clean, so the rebuild below would not be a rebuild"
               exit 1
             fi
           done
-          scripts/release/build-repro.sh ${{ matrix.target }} mqttd mqtt-bridge mqttui mqttd-operator mqttd-fips
+          scripts/release/build-repro.sh ${{ matrix.target }} mqttd mqtt-bridge mqttd-operator mqttd-fips
           paths | while read -r b; do
             sha256sum "$b" | awk '{print $1}' >> second.sha256
           done
@@ -124,7 +121,7 @@ jobs:
             paste first.sha256 second.sha256
             exit 1
           fi
-          echo "reproducible:"; paste <(printf 'mqttd\nmqtt-bridge\nmqttd-operator\nmqttd-fips\nmqttui\n') first.sha256
+          echo "reproducible:"; paste <(printf 'mqttd\nmqtt-bridge\nmqttd-operator\nmqttd-fips\n') first.sha256
 
       - name: Stage artifact + checksum
         id: stage

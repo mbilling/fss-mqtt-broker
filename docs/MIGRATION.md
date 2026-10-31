@@ -245,7 +245,9 @@ If your broker is not in the table, the honest read is: the cutover playbook app
 unchanged, and the config work is yours. Nothing here pretends otherwise.
 
 Only the Mosquitto converter has a Rust twin inside `mqttui` (ADR 0056 D, with a
-byte-for-byte differential test). **The EMQX and HiveMQ converters are Python 3
+byte-for-byte differential test), and `mqttui` is not built or released since 2026-10-31
+(ADR 0056 is deprecated until its remake), so run the Python converters from a checkout.
+**The EMQX and HiveMQ converters are Python 3
 only** — `python3` is already a repo tool dependency, but if you have no Python you
 cannot run them, and there is no parity claim here to the contrary.
 
@@ -481,9 +483,10 @@ scripts/migrate/from-mosquitto.py /etc/mosquitto/mosquitto.conf \
 mqttd --check-config --config mqttd.toml     # then read every TODO(migrate)
 ```
 
-Or, with no checkout and no Python: `mqttui migrate mosquitto /etc/mosquitto/mosquitto.conf
---out-config mqttd.toml --out-acl acl.toml`, whose output is byte-identical (a differential
-test holds it there).
+The same converter travels inside `mqttui` (`mqttui migrate mosquitto
+/etc/mosquitto/mosquitto.conf --out-config mqttd.toml --out-acl acl.toml`, byte-identical
+output, held there by a differential test), but that binary is not built or released
+since 2026-10-31 (ADR 0056, deprecated until its remake): use the checkout.
 
 **Two things about this converter that are not obvious**, both of them cases where
 Mosquitto scopes something per listener and mqttd cannot:
@@ -1128,5 +1131,6 @@ and the diff fails. Seven probes over one config is a probe of the auth/ACL/bind
 mappings, **not** coverage of `mosquitto.conf(5)` — the [Verified, and not
 verified](#verified-and-not-verified) section carries the same caveat.
 
-`mqttui` lists all of them (`mqttui --list`), and the converters travel inside the
-`mqttui` binary, so they run with no clone at all.
+`mqttui` lists all of them (`mqttui --list`) and carries the converters inside its binary,
+but it is not built or released since 2026-10-31 (ADR 0056, deprecated until its remake):
+run the scripts from a checkout.
