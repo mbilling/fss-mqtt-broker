@@ -57,6 +57,9 @@ use mqtt_storage::{
     SessionStore, StorageError,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+// The hub's maps keyed by a client, a node or a filter are `mqtt_core::FastMap`s (ADR
+// 0092 T3): SipHash-1-3 on those keys was 10% of the hub task's time.
+use mqtt_core::{FastMap, FastSet};
 use std::num::NonZeroU32;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -2571,17 +2574,17 @@ pub struct Hub {
     /// This node's identity.
     node_id: NodeId,
     /// Currently-connected clients.
-    online: HashMap<ClientId, Online>,
+    online: FastMap<ClientId, Online>,
     /// Retained sessions and their MQTT 5.0 Session Expiry Interval (seconds). A
     /// client is present here iff its session survives disconnect (expiry != 0);
     /// v3.1.1 `clean_session=0` maps to `u32::MAX` (never expire). See ADR 0009.
-    session_expiry: HashMap<ClientId, u32>,
+    session_expiry: FastMap<ClientId, u32>,
     /// Disconnected sessions with a finite expiry, and the **absolute Unix-epoch second**
     /// they expire at (ADR 0009 §3). The sweep discards those past due; a reconnect cancels
     /// the entry. An absolute wall-clock deadline (not a monotonic `Instant`) is what lets a
     /// new owner inherit the right deadline after a takeover — the same value is persisted in
     /// the durable session metadata.
-    expiring: HashMap<ClientId, u64>,
+    expiring: FastMap<ClientId, u64>,
     /// Wills held back by a Will Delay Interval (§3.1.3.2.2, issue #299), keyed by
     /// client, each with the instant it becomes due. The same sweep that expires
     /// sessions publishes them — one tick, not two.
@@ -2601,7 +2604,7 @@ pub struct Hub {
     /// queue, and the honest first cut: firing a delayed Will from a node that no
     /// longer owns the session would be worse than not delaying at all. Recorded
     /// in `docs/TEST-PLAN.md`'s policy register rather than left to be discovered.
-    pending_wills: HashMap<ClientId, (Will, Instant)>,
+    pending_wills: FastMap<ClientId, (Will, Instant)>,
     /// Wills of connections already reaped because their outbound closed before
     /// `Detach` was processed (issue #504). Keyed by `(client, conn_id)` so a
     /// stale detach cannot fire a later connection's will, and so the *real*
@@ -2617,7 +2620,7 @@ pub struct Hub {
     /// already-queued Detach is processed. Tests that drop the outbound without
     /// Detach are the only path that leaves an entry; they send Detach
     /// afterwards or drop the hub.
-    parked_wills: HashMap<(ClientId, u64), Will>,
+    parked_wills: FastMap<(ClientId, u64), Will>,
     /// Sweep-tick counter that paces the durable expiry reconcile (ADR 0009 §3).
     expiry_reconcile_tick: u32,
     /// Sweep-tick counter driving the retained anti-entropy cadence (issue #87),
@@ -2636,7 +2639,7 @@ pub struct Hub {
     ///
     /// An empty entry is meaningful and must not be pruned; see
     /// [`has_materialized_subs`](Self::has_materialized_subs).
-    subs: HashMap<ClientId, ClientSubs>,
+    subs: FastMap<ClientId, ClientSubs>,
     /// Routing index covering online clients and offline persistent sessions.
     table: SubscriptionTable,
     /// Local shared-subscription groups (`$share/<group>/<filter>`) — this node's
@@ -2644,7 +2647,7 @@ pub struct Hub {
     shared: SharedSubscriptionTable,
     /// Each peer's last-announced shared-subscription membership, so this node can
     /// select one member per group across the whole cluster (ADR 0015 §2).
-    remote_shared: HashMap<NodeId, Vec<RemoteSharedGroup>>,
+    remote_shared: FastMap<NodeId, Vec<RemoteSharedGroup>>,
     /// Derived match index over every PEER's shared filters (ADR 0077 T4
     /// follow-up). `remote_shared` above stays the source of truth — it is what
     /// a node's interest update replaces and what its death removes — and these
@@ -2663,13 +2666,13 @@ pub struct Hub {
     /// is skipped once, not once per announcing peer (#613). Each group's locations
     /// retain sorted node order and within-node source order: hot selection, cold
     /// reselection and admission fallback must agree on the same cursor positions.
-    remote_by_filter: HashMap<FilterKey, RemoteGroupsByName>,
+    remote_by_filter: FastMap<FilterKey, RemoteGroupsByName>,
     /// Per-group round-robin cursor for cluster-wide shared selection (ADR 0015).
     /// Round-robin cursors, keyed by `shared_cursor_hash(group, filter)` with the
     /// owned key kept beside the value for collision checking (issue #490).
-    shared_cursor: HashMap<u64, (SharedKey, usize)>,
+    shared_cursor: FastMap<u64, (SharedKey, usize)>,
     /// Per-session outbound `QoS` > 0 in-flight state.
-    inflight: HashMap<ClientId, Inflight>,
+    inflight: FastMap<ClientId, Inflight>,
     /// Durable session/queue storage. `Arc` so connections can share it (e.g. for
     /// the durable QoS-2 dedup window) — ADR 0007 §5.
     store: Arc<dyn SessionStore>,
@@ -2731,7 +2734,7 @@ pub struct Hub {
     /// (updated on link attach, removed only on confirmed death) — a transient
     /// redial must not flap the ownership domain and mass-migrate 256 groups
     /// (ADR 0073). Distinct from `peers` (live links only).
-    known_peer_protos: HashMap<NodeId, u32>,
+    known_peer_protos: FastMap<NodeId, u32>,
     /// Retained message storage. An `Arc` (not a `Box`) so the online backup task can
     /// hold a READ handle on the same store the hub writes (ADR 0062) — one redb handle,
     /// borrowed, never a second open on a dir this process already locks (ADR 0061).
@@ -2777,12 +2780,12 @@ pub struct Hub {
     /// delivered to this client's matching subscriptions by the apply path, deduped
     /// through the window's ledger. Empty in the steady state, so the apply path's
     /// cost is one `is_empty()` check.
-    retained_windows: HashMap<ClientId, RetainedWindow>,
+    retained_windows: FastMap<ClientId, RetainedWindow>,
     /// Per peer, the wall-clock second our retained digests last MATCHED theirs
     /// (issue #229): the observable "this pair has converged" instant the tombstone
     /// reap gates on. Wall clock (the clock seam), not `Instant`, so the gate is
     /// testable and comparable with tombstone observation times.
-    retained_digest_matched_at: HashMap<NodeId, u64>,
+    retained_digest_matched_at: FastMap<NodeId, u64>,
     /// Per tombstoned topic, the wall-clock second this node first held the clear
     /// (issue #229). Present exactly while the fence is a tombstone (a re-set value
     /// discharges the entry); the reap discharges it once every roster member's
@@ -2831,10 +2834,10 @@ pub struct Hub {
     /// recommitting. One entry per peer (senders hold one handoff in flight);
     /// cleared when the peer's link drops (a restarted peer restarts its counter —
     /// the worst case is then a benign idempotent re-commit, never a wrong dedup).
-    retained_handoff_seen: HashMap<NodeId, (u64, (u64, u64))>,
+    retained_handoff_seen: FastMap<NodeId, (u64, (u64, u64))>,
     /// Owner side (T8): the handoff currently queued/committing per routing peer, so
     /// a retransmission that overtakes the commit is not enqueued twice.
-    retained_handoff_pending: HashMap<NodeId, u64>,
+    retained_handoff_pending: FastMap<NodeId, u64>,
     /// Publishes whose `QoS` 1 acknowledgement awaits cluster-wide durability
     /// (ADR 0042 T9): keyed by a monotonic id, ordered so the cap drops the
     /// oldest. Entries resolve via forward acks, the retained commit, and the
@@ -2849,7 +2852,7 @@ pub struct Hub {
     /// random point per process (issue #648, [`forwarding::initial_forward_seq`]).
     forward_seq: u64,
     /// Forward seq → pending publish id, for answer resolution.
-    forward_index: HashMap<u64, u64>,
+    forward_index: FastMap<u64, u64>,
     /// Count of durable session appends this hub has completed successfully.
     /// Incremented only by the `AppendDone` handler (issue #242) — the one place a
     /// lane append's outcome re-enters the loop — which also sets the completing
@@ -2900,7 +2903,7 @@ pub struct Hub {
     /// could not read and say when they complete again.
     incomplete_scans: u32,
     /// Per client, the scans in a row that could not read it (issue #1049).
-    unread_streaks: HashMap<ClientId, quarantine::UnreadStreak>,
+    unread_streaks: FastMap<ClientId, quarantine::UnreadStreak>,
     /// The durable sessions this node owns, could not read for long enough, and
     /// no longer lets hold its scans incomplete, each with its last error (issue
     /// #1049).
@@ -2938,7 +2941,7 @@ pub struct Hub {
     /// skip, which is why `finish_attach` seeds an entry here for a persistent session
     /// that arrives on a non-owning node: a session that becomes misplaced by ARRIVING
     /// moves no lease, so nothing else would ever make the pass look at it.
-    misplaced: HashMap<ClientId, Misplaced>,
+    misplaced: FastMap<ClientId, Misplaced>,
     /// The [`Placement::ownership_epoch`] the last rehome candidate scan ran at (issue
     /// #284 round-2 finding 3). While it is unchanged no committed lease has moved and no
     /// membership relevant to ownership has changed, so the `O(online sessions)` pass is
@@ -2946,7 +2949,7 @@ pub struct Hub {
     /// under a short lock per tick, not a scan.
     ownership_epoch_seen: Option<u64>,
     /// Connected peer nodes.
-    peers: HashMap<NodeId, Peer>,
+    peers: FastMap<NodeId, Peer>,
     /// Each peer's last-announced subscription interest, stored INVERTED
     /// (filter -> nodes) so a publish resolves its forward targets in one trie
     /// walk instead of scanning every peer's filter set. See [`InterestIndex`].
@@ -2970,12 +2973,12 @@ pub struct Hub {
     /// Persistent connections whose durable session is being recovered off-loop, mapped
     /// to the latest `conn_id` (ADR 0017). A `SessionRecovered` whose `conn_id` no longer
     /// matches was superseded by a newer connect and is dropped (last-writer-wins).
-    connecting: HashMap<ClientId, u64>,
+    connecting: FastMap<ClientId, u64>,
     /// Per-session durable-append lanes (issue #242 / ADR 0061): the publish path's
     /// store writes run in these workers, off the command loop, so one placement
     /// group's degraded followers stall only its own sessions' appends — never every
     /// client on the node. Spawned on first submission; reaped by the sweep when idle.
-    append_lanes: HashMap<ClientId, AppendLane>,
+    append_lanes: FastMap<ClientId, AppendLane>,
     /// [`HubCommand::Drained`] barriers waiting for the in-flight work to finish.
     drained_waiters: Vec<oneshot::Sender<u64>>,
     /// A graceful drain has begun ([`HubCommand::Draining`]).
@@ -2988,7 +2991,7 @@ pub struct Hub {
     /// plain forward, so it still delivers it live: nobody would retry it. Only grows
     /// while draining, which ends with the process (a drain that could be cancelled
     /// would have to clear it with `draining`).
-    drain_gated: HashSet<u64>,
+    drain_gated: FastSet<u64>,
     /// Set while [`erase_peer`](Self::erase_peer) resolves what a node held dead was
     /// owed, to the reason a `$share` delivery left with nobody to take it is
     /// counted under (`no-shared-member`, ADR 0087 D9). `false` everywhere else.
@@ -3033,19 +3036,19 @@ pub struct Hub {
     truncate_tx: Option<mpsc::UnboundedSender<(ClientId, Offset)>>,
     /// Sessions with PUBCOMP received but queue/ID retirement still owed. Only these
     /// sessions are retried by the sweep, not a scan of the entire session table.
-    qos2_cleanup: HashSet<ClientId>,
+    qos2_cleanup: FastSet<ClientId>,
     /// A `QoS` 2 `advance_outbound` is in the session lane for this `(client, pkid)`.
-    qos2_advance_inflight: HashSet<(ClientId, u16)>,
+    qos2_advance_inflight: FastSet<(ClientId, u16)>,
     /// PUBCOMP arrived while that pkid's PUBREC advance was still in the lane.
-    qos2_held_pubcomp: HashSet<(ClientId, u16)>,
+    qos2_held_pubcomp: FastSet<(ClientId, u16)>,
     /// At most one retirement job is in the lane per session; completion resubmits.
-    qos2_retire_inflight: HashSet<ClientId>,
+    qos2_retire_inflight: FastSet<ClientId>,
     /// Bumped on session discard so a late lane completion cannot mutate a new session.
-    qos2_epoch: HashMap<ClientId, u64>,
+    qos2_epoch: FastMap<ClientId, u64>,
     /// Peer verdict aggregates for forwards whose fan-out submitted lane jobs
     /// (issue #242): `(origin, seq)` → what is still owed before the verdict can be
     /// answered. Entries drain via [`HubCommand::AppendDone`].
-    remote_append_pending: HashMap<(NodeId, u64), RemoteAppendGate>,
+    remote_append_pending: FastMap<(NodeId, u64), RemoteAppendGate>,
     /// Acked forwards whose answer waits for this node's open takeover to close
     /// (issue #1031): matched a subscriber here, so the origin would take `Reached`
     /// as the ack's release, while a session the takeover is still materialising
@@ -3060,7 +3063,7 @@ pub struct Hub {
     /// [`forwarding::FORWARD_WINDOW`]; an origin's window is dropped when its
     /// routing state is erased — not at a `Dead` verdict, which may be false and
     /// across which the origin retransmits (ADR 0087 D6).
-    forward_windows: HashMap<NodeId, forwarding::ForwardWindow>,
+    forward_windows: FastMap<NodeId, forwarding::ForwardWindow>,
     /// Nodes membership holds `Dead` ([`HubCommand::PeerDead`]) and has not since
     /// held alive ([`HubCommand::PeerAlive`]), and what this hub is keeping for each
     /// ([`VerdictHold`], ADR 0087 D1).
@@ -3080,7 +3083,7 @@ pub struct Hub {
     /// finished the graceful stop it had announced, or died after a false verdict —
     /// no second verdict follows, and this entry is what starts the hold again
     /// ([`peer_disconnected`](Self::peer_disconnected)).
-    held_dead: HashMap<NodeId, VerdictHold>,
+    held_dead: FastMap<NodeId, VerdictHold>,
     /// Prometheus metrics (ADR 0020), when enabled. Updated on the publish/deliver paths.
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
     /// The node's ingress credit (ADR 0082 T3), held only to export its gauges: the hub
@@ -3335,43 +3338,43 @@ impl Hub {
                 control_q: std::collections::VecDeque::new(),
                 data_q: std::collections::VecDeque::new(),
                 self_tx: tx.clone(),
-                connecting: HashMap::new(),
-                append_lanes: HashMap::new(),
+                connecting: HashMap::default(),
+                append_lanes: HashMap::default(),
                 drained_waiters: Vec::new(),
                 draining: false,
                 drain_gating: false,
-                drain_gated: HashSet::new(),
+                drain_gated: HashSet::default(),
                 resolving_unreachable: false,
                 drain_evicted: 0,
                 owned_tasks: tokio::task::JoinSet::new(),
                 spawner: None,
                 truncate_tx: None,
-                qos2_cleanup: HashSet::new(),
-                qos2_advance_inflight: HashSet::new(),
-                qos2_held_pubcomp: HashSet::new(),
-                qos2_retire_inflight: HashSet::new(),
-                qos2_epoch: HashMap::new(),
-                remote_append_pending: HashMap::new(),
+                qos2_cleanup: HashSet::default(),
+                qos2_advance_inflight: HashSet::default(),
+                qos2_held_pubcomp: HashSet::default(),
+                qos2_retire_inflight: HashSet::default(),
+                qos2_epoch: HashMap::default(),
+                remote_append_pending: HashMap::default(),
                 held_forwards: Vec::new(),
                 elision: Box::default(),
-                forward_windows: HashMap::new(),
-                held_dead: HashMap::new(),
+                forward_windows: HashMap::default(),
+                held_dead: HashMap::default(),
                 node_id,
-                online: HashMap::new(),
-                pending_wills: HashMap::new(),
-                parked_wills: HashMap::new(),
-                session_expiry: HashMap::new(),
-                expiring: HashMap::new(),
+                online: HashMap::default(),
+                pending_wills: HashMap::default(),
+                parked_wills: HashMap::default(),
+                session_expiry: HashMap::default(),
+                expiring: HashMap::default(),
                 expiry_reconcile_tick: 0,
                 retained_antientropy_tick: 0,
-                subs: HashMap::new(),
+                subs: HashMap::default(),
                 table: SubscriptionTable::new(),
                 shared: SharedSubscriptionTable::new(),
-                remote_shared: HashMap::new(),
+                remote_shared: HashMap::default(),
                 remote_shared_index: FilterIndex::new(),
-                remote_by_filter: HashMap::new(),
-                shared_cursor: HashMap::new(),
-                inflight: HashMap::new(),
+                remote_by_filter: HashMap::default(),
+                shared_cursor: HashMap::default(),
+                inflight: HashMap::default(),
                 store,
                 durable_plane: None,
                 allow_relaxed_publish: false,
@@ -3388,20 +3391,20 @@ impl Hub {
                 shared_local_bias_permille: 1000,
                 ownership_domain: None,
                 replication_capable: None,
-                known_peer_protos: HashMap::new(),
+                known_peer_protos: HashMap::default(),
                 retained: Arc::new(MemoryRetainedStore::new()),
                 durable_retained: None,
                 authz: None,
                 rules: None,
                 events: events::State::default(),
                 brownout: false,
-                brownout_axes: HashSet::new(),
+                brownout_axes: HashSet::default(),
                 brownout_status: None,
                 quotas: Quotas::default(),
-                retained_tokens: HashMap::new(),
-                retained_windows: HashMap::new(),
-                retained_digest_matched_at: HashMap::new(),
-                retained_tombstone_observed_at: HashMap::new(),
+                retained_tokens: HashMap::default(),
+                retained_windows: HashMap::default(),
+                retained_digest_matched_at: HashMap::default(),
+                retained_tombstone_observed_at: HashMap::default(),
                 retained_may_expire: false,
                 reserved_purge_ticks: RESERVED_PURGE_TICKS,
                 retained_queue: VecDeque::new(),
@@ -3410,12 +3413,12 @@ impl Hub {
                 retained_commit_inflight: false,
                 retained_handoff: None,
                 retained_handoff_seq: 0,
-                retained_handoff_seen: HashMap::new(),
-                retained_handoff_pending: HashMap::new(),
+                retained_handoff_seen: HashMap::default(),
+                retained_handoff_pending: HashMap::default(),
                 pending_publishes: forwarding::PendingTable::default(),
                 publish_ids: forwarding::initial_forward_seq(),
                 forward_seq: forwarding::initial_forward_seq(),
-                forward_index: HashMap::new(),
+                forward_index: HashMap::default(),
                 durable_writes: 0,
                 inherited_scan_inflight: false,
                 scan_started: (0, None),
@@ -3423,7 +3426,7 @@ impl Hub {
                 interest_suppressed_ticks: 0,
                 last_scan_complete: false,
                 incomplete_scans: 0,
-                unread_streaks: HashMap::new(),
+                unread_streaks: HashMap::default(),
                 quarantined_sessions: BTreeMap::new(),
                 quarantine_status: None,
                 cluster_configured: false,
@@ -3438,9 +3441,9 @@ impl Hub {
                 // harmless overlap with the 8 ticks above.
                 known_members: BTreeSet::new(),
                 sweep_epoch_seen: None,
-                misplaced: HashMap::new(),
+                misplaced: HashMap::default(),
                 ownership_epoch_seen: None,
-                peers: HashMap::new(),
+                peers: HashMap::default(),
                 interest: InterestIndex::default(),
                 interest_scratch: Vec::new(),
                 mesh: mesh::MeshCache::default(),
@@ -3523,7 +3526,7 @@ impl Hub {
     /// once per membership change instead of once per message.
     fn rebuild_remote_shared_index(&mut self) {
         let mut index = FilterIndex::new();
-        let mut by_filter: HashMap<FilterKey, RemoteGroupsByName> = HashMap::new();
+        let mut by_filter: FastMap<FilterKey, RemoteGroupsByName> = HashMap::default();
         let mut nodes: Vec<&NodeId> = self.remote_shared.keys().collect();
         nodes.sort();
         for node in nodes {
@@ -5615,7 +5618,7 @@ impl Hub {
         // Their log offsets (#124) are collected so the replay below does not send the
         // same messages a second time. The set is empty after a broker restart — the
         // in-flight table is memory — which is exactly when the replay must carry them.
-        let mut resumed_offsets: HashSet<Offset> = HashSet::new();
+        let mut resumed_offsets: HashSet<Offset> = HashSet::default();
         // Entries still staged behind an outbound-id record (issue #242 finding A)
         // never reached any wire, so there is nothing to DUP-resume: drop them —
         // this attach's replay below delivers their durable copies fresh (their
@@ -6075,7 +6078,7 @@ impl Hub {
                 .entry(client.clone())
                 .or_insert_with(|| RetainedWindow {
                     until: Instant::now(),
-                    seen: HashMap::new(),
+                    seen: HashMap::default(),
                 });
             window.until = Instant::now() + RETAINED_INTEREST_WINDOW;
             for (topic, id) in window_seeds {
@@ -9234,7 +9237,7 @@ impl Hub {
         }
         let mut movable: Vec<(u64, u64)> = Vec::new();
         let mut elsewhere_by_group: HashMap<SharedKey, Vec<(Option<NodeId>, ClientId)>> =
-            HashMap::new();
+            HashMap::default();
         for (id, p) in self.pending_publishes.iter() {
             for (seq, o) in &p.awaiting {
                 let ForwardKind::Shared { key, tried, .. } = &o.kind else {
@@ -9820,7 +9823,7 @@ async fn run_truncate_flusher(
     // Which session each flush serves, so a flush that PANICS still frees its
     // session: `join_next` then yields no `ClientId`, only the task's id, and a
     // session left marked in flight would never be flushed again.
-    let mut serving: HashMap<tokio::task::Id, ClientId> = HashMap::new();
+    let mut serving: HashMap<tokio::task::Id, ClientId> = HashMap::default();
     loop {
         // Wait for work: a new watermark, or a finished flush freeing a slot.
         tokio::select! {
@@ -9882,11 +9885,11 @@ async fn run_truncate_flusher(
 #[derive(Default)]
 struct FlushQueue {
     /// Dirty sessions and the watermark each owes the store.
-    latest: HashMap<ClientId, Offset>,
+    latest: FastMap<ClientId, Offset>,
     /// Dirty sessions not in flight, in the order they became dirty.
     order: VecDeque<ClientId>,
     /// Sessions whose flush is running.
-    busy: HashSet<ClientId>,
+    busy: FastSet<ClientId>,
 }
 
 impl FlushQueue {
@@ -12446,7 +12449,7 @@ mod tests {
         want: usize,
         deadline: Instant,
     ) -> HashSet<String> {
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         while seen.len() < want {
             assert!(Instant::now() < deadline, "drain missed its deadline");
             for rx in rxs.iter_mut() {
@@ -21995,16 +21998,16 @@ mod tests {
                 ack_failures: std::sync::Mutex::new(std::collections::VecDeque::new()),
                 clear_failures: std::sync::Mutex::new(std::collections::VecDeque::new()),
                 outbound_failures: std::sync::Mutex::new(std::collections::VecDeque::new()),
-                gates: std::sync::Mutex::new(std::collections::HashMap::new()),
+                gates: std::sync::Mutex::new(std::collections::HashMap::default()),
                 ops: std::sync::Mutex::new(Vec::new()),
-                slow_first: std::sync::Mutex::new(std::collections::HashMap::new()),
-                outbound_gates: std::sync::Mutex::new(std::collections::HashMap::new()),
-                reserve_gates: std::sync::Mutex::new(std::collections::HashMap::new()),
-                reject_next: std::sync::Mutex::new(std::collections::HashMap::new()),
-                ack_gates: std::sync::Mutex::new(std::collections::HashMap::new()),
-                ack_entered: std::sync::Mutex::new(std::collections::HashMap::new()),
+                slow_first: std::sync::Mutex::new(std::collections::HashMap::default()),
+                outbound_gates: std::sync::Mutex::new(std::collections::HashMap::default()),
+                reserve_gates: std::sync::Mutex::new(std::collections::HashMap::default()),
+                reject_next: std::sync::Mutex::new(std::collections::HashMap::default()),
+                ack_gates: std::sync::Mutex::new(std::collections::HashMap::default()),
+                ack_entered: std::sync::Mutex::new(std::collections::HashMap::default()),
                 ack_panics: std::sync::Mutex::new(0),
-                pipelined: std::sync::Mutex::new(std::collections::HashMap::new()),
+                pipelined: std::sync::Mutex::new(std::collections::HashMap::default()),
             })
         }
 

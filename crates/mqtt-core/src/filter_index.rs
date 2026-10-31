@@ -24,14 +24,13 @@
 //! a filter. `$share/...` envelopes may be stored verbatim; they contain no
 //! wildcard in their first level and behave as literals here.
 
-use crate::FilterKey;
-use std::collections::HashMap;
+use crate::{FastMap, FilterKey};
 
 /// One topic level in the match index. `+` and `#` are stored as ordinary keys;
 /// their wildcard meaning lives in the walk, not the structure.
 #[derive(Debug, Default)]
 struct TrieNode {
-    children: HashMap<String, TrieNode>,
+    children: FastMap<String, TrieNode>,
     /// Set when a registered filter ends at this node: **the same allocation**
     /// `by_filter` is keyed by, not a copy of it. This used to be an owned
     /// `String`, so every distinct filter was stored twice.

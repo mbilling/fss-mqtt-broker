@@ -215,7 +215,7 @@ pub(super) struct HeldForward {
     pub(super) message_expiry: Option<u32>,
     pub(super) app: AppProperties,
     /// The sessions the fan-out handed it at arrival.
-    pub(super) reached: HashSet<ClientId>,
+    pub(super) reached: FastSet<ClientId>,
     pub(super) since: Instant,
     /// Settle passes it has waited through.
     pub(super) ticks: u16,
@@ -273,6 +273,9 @@ pub(super) struct PendingPublish {
     /// difference.
     pub(super) app: Option<Box<AppProperties>>,
     /// Outstanding forward answers: forward seq → what was forwarded, and where.
+    // A std map, not a `FastMap`: one per pending publish, so its hasher's state is
+    // paid per entry (`a_pending_publish_stays_small`), and it is empty on a single
+    // node and answered once per peer ack on a cluster — not the per-message path.
     pub(super) awaiting: HashMap<u64, ForwardObligation>,
     /// Whether this publish is known to be durably STORED somewhere — locally, or on
     /// a peer that answered [`ForwardVerdict::Stored`].
@@ -464,7 +467,7 @@ pub(super) struct SeenForward {
 /// One origin's recent acked forwards, oldest first, capped at [`FORWARD_WINDOW`].
 #[derive(Debug, Default)]
 pub(super) struct ForwardWindow {
-    seen: HashMap<u64, SeenForward>,
+    seen: FastMap<u64, SeenForward>,
     order: VecDeque<u64>,
 }
 
@@ -762,7 +765,7 @@ impl Hub {
             self.finish_peer_verdict(&node, seq, DurableOutcome::Failed, false, true);
             return;
         }
-        let reached: HashSet<ClientId> = self
+        let reached: FastSet<ClientId> = self
             .ordinary_targets(&topic, None, retain)
             .into_iter()
             .map(|(c, _, _)| c)
@@ -1531,7 +1534,7 @@ impl Hub {
                 retain,
                 message_expiry,
                 app: (!app.is_empty()).then(|| Box::new(app.clone())),
-                awaiting: HashMap::new(),
+                awaiting: HashMap::default(),
                 stored: false,
                 acked_nodes: Vec::new(),
                 awaiting_retained: false,
@@ -2163,7 +2166,7 @@ pub(super) struct InterestIndex {
     /// advertised an EMPTY filter list, which still counts as "has interest"
     /// exactly as the old `HashMap` entry did. The table cannot answer this
     /// (it only knows filters that have subscribers), so removal consults this.
-    nodes: HashSet<NodeId>,
+    nodes: FastSet<NodeId>,
 }
 
 impl InterestIndex {
@@ -2197,7 +2200,7 @@ impl InterestIndex {
     /// where a `HashSet<NodeId>` is the convenient shape and one publish's worth
     /// of allocation is invisible. The per-publish path uses
     /// [`matching_into`](Self::matching_into) instead.
-    pub(super) fn nodes_matching(&self, topic: &str) -> HashSet<NodeId> {
+    pub(super) fn nodes_matching(&self, topic: &str) -> FastSet<NodeId> {
         self.by_filter
             .matching_clients(topic)
             .into_iter()
@@ -2262,7 +2265,7 @@ mod interest_index_tests {
 
     /// The linear scan the index replaced: every node whose advertised filters
     /// contain one matching `topic`. The reference the corpus is checked against.
-    fn reference(topic: &str, per_node: &HashMap<NodeId, Vec<String>>) -> HashSet<NodeId> {
+    fn reference(topic: &str, per_node: &FastMap<NodeId, Vec<String>>) -> FastSet<NodeId> {
         per_node
             .iter()
             .filter(|(_, fs)| fs.iter().any(|f| topic_matches(f, topic)))
@@ -2301,7 +2304,7 @@ mod interest_index_tests {
         filters.dedup();
 
         // Spread the filters over several nodes, as peers announce them.
-        let mut per_node: HashMap<NodeId, Vec<String>> = HashMap::new();
+        let mut per_node: FastMap<NodeId, Vec<String>> = HashMap::default();
         for (i, f) in filters.iter().enumerate() {
             per_node
                 .entry(NodeId(format!("n{}", i % 4)))
@@ -2379,7 +2382,7 @@ mod interest_index_tests {
     fn matching_into_agrees_with_nodes_matching() {
         let (filters, topics) = corpus();
         let mut idx = InterestIndex::default();
-        let mut per_node: HashMap<NodeId, Vec<String>> = HashMap::new();
+        let mut per_node: FastMap<NodeId, Vec<String>> = HashMap::default();
         for (i, f) in filters.iter().enumerate() {
             per_node
                 .entry(NodeId(format!("n{}", i % 4)))
@@ -2393,7 +2396,7 @@ mod interest_index_tests {
         let mut scratch = Vec::new();
         for topic in &topics {
             idx.matching_into(topic, &mut scratch);
-            let fast: HashSet<NodeId> = scratch
+            let fast: FastSet<NodeId> = scratch
                 .iter()
                 .map(|c| NodeId(c.as_str().to_string()))
                 .collect();
@@ -2492,13 +2495,13 @@ mod interest_index_tests {
         let mut idx = InterestIndex::default();
         let n = NodeId("n".into());
         idx.replace(n.clone(), vec!["a/#".into(), "b/c".into()]);
-        assert_eq!(idx.nodes_matching("b/c"), HashSet::from([n.clone()]));
+        assert_eq!(idx.nodes_matching("b/c"), FastSet::from_iter([n.clone()]));
         idx.replace(n.clone(), vec!["a/#".into()]);
         assert!(
             idx.nodes_matching("b/c").is_empty(),
             "a filter absent from the new snapshot must stop matching"
         );
-        assert_eq!(idx.nodes_matching("a/x"), HashSet::from([n]));
+        assert_eq!(idx.nodes_matching("a/x"), FastSet::from_iter([n]));
     }
 
     /// Two nodes sharing one filter both match, and removing one leaves the
@@ -2511,10 +2514,10 @@ mod interest_index_tests {
         idx.replace(n2.clone(), vec!["s/+/t".into()]);
         assert_eq!(
             idx.nodes_matching("s/x/t"),
-            HashSet::from([n1.clone(), n2.clone()])
+            FastSet::from_iter([n1.clone(), n2.clone()])
         );
         idx.remove(&n1);
-        assert_eq!(idx.nodes_matching("s/x/t"), HashSet::from([n2]));
+        assert_eq!(idx.nodes_matching("s/x/t"), FastSet::from_iter([n2]));
     }
 }
 
