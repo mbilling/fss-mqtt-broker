@@ -56,7 +56,7 @@ tokio-rustls.workspace = true
 # enables its `process` feature. Unix-gated. `fs` (already compiled for the tests) asks
 # access(2) whether the rules file's directory is writable (ADR 0084).
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["process", "fs"] }
+rustix = { version = "1", features = ["process", "fs", "thread"] }
 
 
 [features]

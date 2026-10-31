@@ -831,7 +831,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 
 - `publish_codec_round_trip_clears_the_floor`
 
-## `crates/mqtt-config/src/lib.rs` — 52 test(s)
+## `crates/mqtt-config/src/lib.rs` — 53 test(s)
 
 - `tests::a_backup_dir_inside_the_data_dir_is_a_config_error`
 - `tests::a_bad_enum_value_is_rejected`
@@ -871,6 +871,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_function_ceiling_loads_has_a_range_and_bounds_the_jq_default_timeout`
 - `tests::the_functions_env_key_loads_from_file_and_environment`
 - `tests::the_gossip_key_is_inline_xor_by_reference`
+- `tests::the_hub_thread_keys_load_from_file_and_environment`
 - `tests::the_jq_keys_load_from_file_and_environment`
 - `tests::the_new_per_subscriber_bounds_are_refused_out_of_range`
 - `tests::the_refound_guard_defaults_on_and_env_can_disable_it`
@@ -1028,7 +1029,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tls::tls12_hardening_tests::the_tls12_suites_are_exactly_the_allowlist`
 - `tls::tls12_hardening_tests::tls12_session_tickets_are_off`
 
-## `crates/mqtt-observability/src/lib.rs` — 28 test(s)
+## `crates/mqtt-observability/src/lib.rs` — 29 test(s)
 
 - `audit_export::tests::a_full_queue_sheds_and_counts_instead_of_blocking`
 - `audit_export::tests::frames_reach_a_tcp_listener_and_flush_waits`
@@ -1037,6 +1038,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `metrics::tests::durable_stage_and_publish_ack_histograms_render`
 - `metrics::tests::elision_counters_move_and_render`
 - `metrics::tests::hub_dispatch_and_append_lane_metrics_render`
+- `metrics::tests::hub_thread_info_names_the_thread_and_the_core`
 - `metrics::tests::no_unbounded_label_keys_are_used`
 - `metrics::tests::otlp_export_posts_to_the_endpoint`
 - `metrics::tests::render_produces_valid_openmetrics_exposition`
@@ -1535,7 +1537,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 885 test(s)
+## `crates/mqttd/src/lib.rs` — 888 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1744,6 +1746,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `health::tests::serves_a_real_http_request_over_tcp`
 - `health::tests::startup_must_finish_before_readiness_but_does_not_override_other_gates`
 - `health::tests::statusz_names_the_quarantined_sessions`
+- `health::tests::statusz_names_where_the_hub_loop_runs`
 - `health::tests::statusz_reports_identity_members_brownout_and_proto`
 - `health::tests::statusz_reports_the_derived_write_floor_and_its_source`
 - `health::tests::statusz_reports_the_running_rules`
@@ -1883,6 +1886,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_held_delivery_is_written_before_a_later_durable_one_on_its_topic`
 - `hub::tests::a_hold_behind_a_written_delivery_replays_after_it`
 - `hub::tests::a_hub_command_slot_stays_publish_sized`
+- `hub::tests::a_hub_on_its_own_thread_answers_commands`
 - `hub::tests::a_large_retained_set_is_chunked_under_the_frame_budget`
 - `hub::tests::a_live_qos1_delivery_to_a_clean_session_writes_nothing`
 - `hub::tests::a_live_qos1_delivery_to_a_persistent_subscriber_is_durable_until_acked`
@@ -1905,6 +1909,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_peer_refusing_a_stored_derived_message_does_not_withhold_the_original`
 - `hub::tests::a_peer_that_missed_the_last_fanout_converges_from_a_restarted_owners_snapshot`
 - `hub::tests::a_peers_refusal_refuses_the_publisher_instead_of_dropping_the_gate`
+- `hub::tests::a_pinned_hub_thread_reports_its_core` — only when `cfg(target_os = "linux")`
 - `hub::tests::a_proto_6_peer_is_answered_with_the_boolean_and_a_proto_7_peer_with_the_verdict`
 - `hub::tests::a_pubcomp_for_a_staged_unsent_id_is_ignored`
 - `hub::tests::a_publish_already_stored_is_withheld_not_refused_when_a_later_pass_is_refused`

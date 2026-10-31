@@ -1368,6 +1368,30 @@ The export never blocks the broker: past the bounded queue it sheds-and-counts
 (`audit_export_dropped` — alert on non-zero; the shed is also visible downstream
 as a `seq` gap).
 
+## The hub thread (ADR 0092)
+
+The hub is one loop per node, and its time per message sets the node's ceiling: a lone
+32-vCPU node carries no more durable QoS 1 than a lone 4-vCPU one (ADR 0092, the AWS runs
+in `docs/benchmarks/RIG2-RESULTS.md`). The loop is a task of the shared runtime, where it
+dispatches about 83% of wall-clock at its ceiling on Ice Lake; the rest is its own worker
+running the connection writers and append lanes it has just woken, which is work, not
+waiting. Moving the loop to an OS thread of its own (`node.hub_thread = true`,
+`node.hub_core = N` to pin it; ADR 0092 D1, withdrawn by Amendment 1) is available as an
+experiment and is **off by default**: on the rig it turned every hand-off out of the hub
+into a remote wake through the runtime's injection queue, deliveries waited 17 ms for their
+connection task instead of 10 µs, and a lone `m6i.8xlarge` fell from 88,700 to 68,600
+msg/s with its ack p99 at half a second.
+
+- **Where it runs:** `mqttd_hub_thread_info{thread="dedicated"|"shared",core="N"|"none"} 1`,
+  one live series; `/statusz` has the same under `hub`.
+- **Is the hub the limit?** `mqttd_hub_dispatch_seconds` summed over its classes, per
+  second, is the share of wall-clock the loop spent dispatching. A loop that keeps up
+  carries a queue (`mqttd_hub_queue_depth`) in the low thousands at most; one whose busy
+  share has stopped growing while the queue grows is at its ceiling, and the node needs
+  the work per message and the hand-offs per message cut (ADR 0092 T3, T4), not more cores
+  and not a thread of its own. `bench/scale/rig2/hub-model.py` reads the same figures from
+  a rig run's scrapes.
+
 ## Overload: bounded hub ingress (ADR 0082)
 
 Each node routes every publish through one hub loop. When publishers offer more than the

@@ -2377,7 +2377,7 @@ async fn start_hub(
             session_quarantine,
             ingress,
         )?;
-        tokio::spawn(hub.run());
+        place_hub(hub, config, metrics)?;
         Ok((
             hub_tx,
             store,
@@ -2421,7 +2421,7 @@ async fn start_hub(
             session_quarantine,
             ingress,
         )?;
-        tokio::spawn(hub.run());
+        place_hub(hub, config, metrics)?;
         Ok((hub_tx, store, Some(retained), None, None))
     } else {
         let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::with_limits(
@@ -2443,7 +2443,7 @@ async fn start_hub(
             session_quarantine,
             ingress,
         )?;
-        tokio::spawn(hub.run());
+        place_hub(hub, config, metrics)?;
         Ok((hub_tx, store, None, None, None))
     }
 }
@@ -3160,6 +3160,30 @@ fn ingress_from_config(config: &Config) -> Arc<mqttd::ingress::IngressCredit> {
 /// and "wired into two of the three" is exactly the class of bug a documented knob cannot
 /// survive: the knob would be inert on one deployment shape and nothing would say so.
 /// One call site per arm, one body.
+/// Place the hub loop where the configuration says (ADR 0092 D1): on an OS thread of its
+/// own, pinned to `node.hub_core` when set, or as a task of the shared runtime with
+/// `node.hub_thread = false`. The `mqttd_hub_thread_info` gauge and `/statusz` say which.
+fn place_hub(
+    hub: hub::Hub,
+    config: &Config,
+    metrics: &Arc<mqtt_observability::metrics::Metrics>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let placed = if config.node.hub_thread {
+        hub.spawn_dedicated(config.node.hub_core)?
+    } else {
+        tokio::spawn(hub.run());
+        hub::HubThread::SHARED
+    };
+    metrics.set_hub_thread(placed.dedicated, placed.core);
+    info!(
+        dedicated = placed.dedicated,
+        core = ?placed.core,
+        requested_core = ?config.node.hub_core,
+        "hub loop placed (ADR 0092 D1)"
+    );
+    Ok(())
+}
+
 fn wire_hub(
     hub: &mut hub::Hub,
     config: &Config,

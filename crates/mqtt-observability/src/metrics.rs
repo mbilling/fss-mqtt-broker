@@ -207,6 +207,16 @@ struct ClusterIdLabel {
     cluster_id: String,
 }
 
+/// `{thread, core}` labels for `mqttd_hub_thread_info` (ADR 0092 D1): where the hub loop
+/// runs, `dedicated` on an OS thread of its own or `shared` as a task of the runtime, and
+/// the CPU it is pinned to (`none` when it is not). One live series, the `build_info`
+/// pattern.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct HubThreadLabel {
+    thread: String,
+    core: String,
+}
+
 /// `{checksum}` label for `mqttd_config_info` (ADR 0054 T3): the sha-256 of the
 /// loaded config file. One live series; the previous series is zeroed on change
 /// so a scrape shows exactly one checksum at 1 per node.
@@ -382,6 +392,7 @@ struct OtelInstruments {
     replica_groups_tracked: OtelGauge<i64>,
     cluster_info: OtelGauge<i64>,
     founder: OtelGauge<i64>,
+    hub_thread_info: OtelGauge<i64>,
     refound_quarantine: OtelGauge<i64>,
     backup_runs: OtelCounter<u64>,
     backup_last_success_timestamp_seconds: OtelGauge<i64>,
@@ -554,6 +565,7 @@ impl OtelInstruments {
             replica_groups_tracked: meter.i64_gauge("replica_groups_tracked").build(),
             cluster_info: meter.i64_gauge("cluster_info").build(),
             founder: meter.i64_gauge("founder").build(),
+            hub_thread_info: meter.i64_gauge("hub_thread_info").build(),
             refound_quarantine: meter.i64_gauge("refound_quarantine").build(),
             backup_runs: meter.u64_counter("backup_runs").build(),
             backup_last_success_timestamp_seconds: meter
@@ -796,6 +808,10 @@ pub struct Metrics {
     cluster_info: Family<ClusterIdLabel, Gauge>,
     /// 1 when this node is the cluster founder (started seedless), else 0.
     founder: Gauge,
+    /// Where the hub loop runs (ADR 0092 D1), as a build_info-style label set.
+    hub_thread_info: Family<HubThreadLabel, Gauge>,
+    /// The same placement for `/statusz`: `(dedicated, core)` once the loop is started.
+    hub_thread: std::sync::RwLock<Option<(bool, Option<u32>)>>,
     refound_quarantine: Gauge,
     backup_runs_total: Family<RunOutcomeLabel, Counter>,
     backup_last_success_timestamp_seconds: Gauge,
@@ -1640,6 +1656,12 @@ impl Metrics {
             "The cluster identity this node belongs to (ADR 0054 T2), as a \
              build_info-style label; two distinct values across a fleet = split brain",
         );
+        let hub_thread_info = register_gauge_family(
+            &mut registry,
+            "hub_thread_info",
+            "Where the hub loop runs (ADR 0092 D1): thread=dedicated on an OS thread of its \
+             own or shared as a task of the runtime; core=the CPU it is pinned to, or none",
+        );
         let founder = register_gauge(
             &mut registry,
             "founder",
@@ -2005,6 +2027,8 @@ impl Metrics {
             replica_groups_tracked,
             cluster_info,
             founder,
+            hub_thread_info,
+            hub_thread: std::sync::RwLock::new(None),
             refound_quarantine,
             backup_runs_total,
             backup_last_success_timestamp_seconds,
@@ -2948,6 +2972,37 @@ impl Metrics {
     pub fn set_founder(&self, founder: bool) {
         self.founder.set(i64::from(founder));
         self.otel.founder.record(i64::from(founder), &[]);
+    }
+
+    /// Where the hub loop runs (ADR 0092 D1), set once when it is started: one live
+    /// series of `mqttd_hub_thread_info`, build_info-style, and the `/statusz` block.
+    pub fn set_hub_thread(&self, dedicated: bool, core: Option<u32>) {
+        let label = HubThreadLabel {
+            thread: if dedicated { "dedicated" } else { "shared" }.to_string(),
+            core: core.map_or_else(|| "none".to_string(), |c| c.to_string()),
+        };
+        self.hub_thread_info.get_or_create(&label).set(1);
+        self.otel.hub_thread_info.record(
+            1,
+            &[
+                KeyValue::new("thread", label.thread.clone()),
+                KeyValue::new("core", label.core.clone()),
+            ],
+        );
+        // A poisoned lock still holds a usable value: nothing here can leave it torn.
+        *self
+            .hub_thread
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((dedicated, core));
+    }
+
+    /// The hub loop's placement as [`Metrics::set_hub_thread`] recorded it: `(dedicated,
+    /// core)`, `None` before the loop is started.
+    pub fn hub_thread(&self) -> Option<(bool, Option<u32>)> {
+        *self
+            .hub_thread
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Publish the re-found self-quarantine state (issue #92 follow-up). `true` means
@@ -3899,6 +3954,28 @@ mod tests {
             "a dropped namespace's gauges are gone:\n{text}"
         );
         assert!(text.contains("mqttd_rule_state_expired_total{namespace=\"alerts\"} 5"));
+    }
+
+    #[test]
+    /// ADR 0092 D1: where the hub loop runs is one build_info-style series, and the
+    /// same answer serves `/statusz`.
+    fn hub_thread_info_names_the_thread_and_the_core() {
+        let m = Metrics::new("t");
+        assert_eq!(m.hub_thread(), None, "unset until the loop is started");
+        assert!(!m.render().contains("mqttd_hub_thread_info{"));
+        m.set_hub_thread(true, Some(3));
+        let out = m.render();
+        assert!(
+            out.contains("mqttd_hub_thread_info{thread=\"dedicated\",core=\"3\"} 1"),
+            "{out}"
+        );
+        assert_eq!(m.hub_thread(), Some((true, Some(3))));
+        let shared = Metrics::new("t");
+        shared.set_hub_thread(false, None);
+        assert!(shared
+            .render()
+            .contains("mqttd_hub_thread_info{thread=\"shared\",core=\"none\"} 1"));
+        assert_eq!(shared.hub_thread(), Some((false, None)));
     }
 
     #[test]
