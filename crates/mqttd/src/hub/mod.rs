@@ -3727,7 +3727,23 @@ impl Hub {
             // cloud run).
             let closed = self.ingest();
             if let Some(cmd) = self.next_command() {
-                self.dispatch_timed(cmd).await;
+                // ADR 0092 T3: a consumer's PUBACK — one of the two commands of nearly
+                // every message cycle — is handled with no future at all. `dispatch_timed`'s
+                // is 2.5 KB and is moved into this loop's state for every command it
+                // takes, needed or not.
+                let class = cmd.class();
+                if let HubCommand::PubAck {
+                    client,
+                    pkid,
+                    received,
+                } = cmd
+                {
+                    let started = Instant::now();
+                    self.dispatch_pub_ack_command(&client, pkid, received);
+                    self.dispatched(class, started);
+                } else {
+                    self.dispatch_timed(cmd).await;
+                }
                 since_yield += 1;
                 if since_yield >= HUB_YIELD_EVERY {
                     since_yield = 0;
@@ -3804,7 +3820,37 @@ impl Hub {
     async fn dispatch_timed(&mut self, cmd: HubCommand) {
         let class = cmd.class();
         let started = Instant::now();
-        self.dispatch(cmd).await;
+        // ADR 0092 T3: a command's dispatch future is built and moved once per command,
+        // and `dispatch`'s carries the locals of every arm — 5.3 KB on 2026-10-31, set
+        // by the attach, cluster and sweep paths, copied for every publish and every
+        // PUBACK (memcpy was 14% of the hub task). A publish takes its own path here
+        // (1.9 KB, the fan-out's), the PUBACK takes none at all (in `run`), and
+        // everything else runs boxed: one allocation per rare command instead of a
+        // 5 KB copy per frequent one. (`dispatch` starts with `refresh_message_wants`;
+        // so do the fast paths.)
+        match cmd {
+            cmd @ HubCommand::Publish { .. } => {
+                self.refresh_message_wants();
+                self.dispatch_publish(cmd).await;
+            }
+            cmd => Box::pin(self.dispatch(cmd)).await,
+        }
+        self.dispatched(class, started);
+    }
+
+    /// The [`HubCommand::PubAck`] arm of [`dispatch`](Self::dispatch), as a plain call:
+    /// the loop runs it without a future (ADR 0092 T3).
+    fn dispatch_pub_ack_command(&mut self, client: &ClientId, pkid: u16, received: Instant) {
+        self.refresh_message_wants();
+        if let Some(m) = &self.metrics {
+            m.puback_hub_wait(received.elapsed().as_secs_f64());
+        }
+        self.dispatch_pub_ack(client, pkid);
+    }
+
+    /// After one command's dispatch: its time on the loop by class (issue #242), and a
+    /// drain barrier that may have come due.
+    fn dispatched(&mut self, class: &'static str, started: Instant) {
         if let Some(m) = &self.metrics {
             m.observe_hub_dispatch(class, started.elapsed().as_secs_f64());
         }
@@ -4234,7 +4280,9 @@ impl Hub {
         // a new topic beyond the cap. Growth is refused; overwrite and clear
         // (empty payload) always work. v5: refuse outright (the publisher is
         // told 0x97); v3.1.1 has no reason codes: deliver live, retain nothing.
-        if retain && !payload.is_empty() && self.retained_quota_exceeded(&topic).await {
+        // Boxed: a store read's future, on the rare retained path only, must not size
+        // every publish's future (ADR 0092 T3).
+        if retain && !payload.is_empty() && Box::pin(self.retained_quota_exceeded(&topic)).await {
             if let Some(m) = &self.metrics {
                 m.quota_rejected("retained");
             }
@@ -11004,6 +11052,65 @@ mod tests {
         let slot = std::mem::size_of::<HubCommand>();
         println!("HubCommand slot = {slot} B");
         assert!(slot <= 256, "HubCommand grew to {slot} B (pinned at 256)");
+    }
+
+    /// ADR 0092 T3: a command's dispatch future is built and moved once per command, so
+    /// its size is `memcpy` per message. `dispatch_timed`'s was 5,832 B on 2026-10-31
+    /// (14% of the hub task's time), set by `dispatch`'s rare arms; those run boxed now
+    /// and the publish rides a 1.9 KB future of its own. A change that grows it past
+    /// the pin fails here: box the cold await, or keep its locals off the hot arm.
+    #[tokio::test]
+    async fn a_dispatch_future_stays_small() {
+        let store = std::sync::Arc::new(mqtt_storage::MemorySessionStore::new());
+        let (mut hub, _tx) = Hub::with_config(NodeId("hub-test".into()), store);
+        let publish = || HubCommand::Publish {
+            topic: "a/b".to_string(),
+            payload: bytes::Bytes::from_static(b"x"),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            message_expiry: None,
+            app: AppProperties::default(),
+            done: None,
+            publisher: None,
+            v5: false,
+            credit: None,
+        };
+        let ack = || HubCommand::PubAck {
+            client: ClientId(std::sync::Arc::from("c1")),
+            pkid: 1,
+            received: tokio::time::Instant::now(),
+        };
+        let f = hub.dispatch_timed(publish());
+        let timed = std::mem::size_of_val(&f);
+        println!("dispatch_timed future = {timed} B");
+        drop(f);
+        let f = hub.dispatch(publish());
+        println!(
+            "dispatch future = {} B (boxed per rare command)",
+            std::mem::size_of_val(&f)
+        );
+        drop(f);
+        let f = hub.dispatch_publish(publish());
+        let publish_fut = std::mem::size_of_val(&f);
+        println!("dispatch_publish future = {publish_fut} B");
+        drop(f);
+        let f = hub.route_publish(publish(), false);
+        println!("route_publish future = {} B", std::mem::size_of_val(&f));
+        drop(f);
+        let f = hub.dispatch_cluster(ack());
+        println!("dispatch_cluster future = {} B", std::mem::size_of_val(&f));
+        drop(f);
+        let f = hub.run_sweep();
+        println!("run_sweep future = {} B", std::mem::size_of_val(&f));
+        drop(f);
+        assert!(
+            timed <= 3072,
+            "dispatch_timed's future grew to {timed} B (pinned at 3,072)"
+        );
+        assert!(
+            publish_fut <= 2560,
+            "dispatch_publish's future grew to {publish_fut} B (pinned at 2,560)"
+        );
     }
 
     /// ADR 0082 T1: a lane an overload grew gives its memory back once it drains, and
