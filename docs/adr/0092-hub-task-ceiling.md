@@ -178,8 +178,13 @@ measured the way D4 requires, on run `h3-20261031T215218Z` against main re-measu
 same day (`h3-20261031T194739Z`): a publish dispatch 6.7 → 5.3 µs at 67,500 msg/s, the
 hub's busy share there 0.58 → 0.48, the publisher's ack p99 at 84,400 msg/s 103–119 ms →
 5.3 ms, the knee 92,400 → 105,500 msg/s on one `m6i.8xlarge`, bracketed at 107,200. The
-busy ceiling did not move: 0.83. The second batch — the hasher and the filter trie's
-wildcard children as fields (#1171) — is measured next, and its figures are recorded here.
+busy ceiling did not move: 0.83. **The second batch** — the hasher and the filter trie's
+wildcard children as fields (#1171) — measured on run `h3-20261031T225644Z` the same way:
+a publish 5.3 → 4.8 µs at 67,500 msg/s, the busy share there 0.48 → 0.44, the knee
+105,500 → 112,100 msg/s, bracketed at 115,400; the ceiling 0.82. Against main, the two
+batches together: a publish 6.7 → 4.8 µs, the knee 92,400 → 112,100 (+21%) — D2's
+target, about 5 µs, reached. The three-node shape follows, batch by batch, in the delivery
+doc's evidence table.
 
 **D2 changes in three places.**
 
