@@ -104,38 +104,17 @@ def compact(v: float) -> str:
 
 def headline_figures(rows: list[dict]) -> set[str]:
     """Every way the README may write a headline.csv figure: 90,003 · 90k · 30.0k per node
-    · 7,500 per vCPU · and the ratios the charts print (2.7×, 1.7×)."""
+    · 7,500 per vCPU · and what the charts derive from them (the cost ratios and monthly
+    costs, the per-vCPU ratios), taken from the chart script itself so the prose cannot
+    drift from what the charts draw."""
     out: set[str] = set()
-    by_chart: dict[str, dict[str, float]] = {}
     for r in rows:
         v, n, vcpu = int(r["msg_per_s"]), int(r["nodes"]), int(r["vcpu"])
         pn = v / n
         out |= {f"{v:,}", compact(v), f"{pn / 1000:.1f}k", f"{pn / 1000:.0f}k", f"{v / vcpu:,.0f}"}
-        by_chart.setdefault(r["chart"], {})[r["series"]] = v / vcpu if r["chart"] == "durable-per-vcpu" else v
-    for vals in by_chart.values():
-        for a in vals.values():
-            for b in vals.values():
-                if a > b:
-                    out.add(f"{a / b:.1f}×")
-    # The cost chart's ratios: HiveMQ's published per-vCPU rate against each measured
-    # durable QoS 1 point (the highest step at ack p99 <= 1 s), at the same vCPU price.
-    hive = [r for r in rows if r["chart"] == "durable-per-vcpu" and r["series"] == "hivemq"]
-    if hive:
-        hv = int(hive[0]["msg_per_s"]) / int(hive[0]["vcpu"])
-        for r in rows:
-            if (r["chart"] == "scale-out" and r["series"] == "durable" and r["state"] == "green"
-                    and int(r["nodes"]) > 1):
-                out.add(f"{int(r['msg_per_s']) / int(r['vcpu']) / hv:.1f}×")
-    # The cost chart's estimate at HiveMQ's published rate: mqttd's line extended along its
-    # last measured slope, in whole nodes, against HiveMQ's own monthly cost. The chart's
-    # functions compute it, so the prose cannot drift from what the chart draws.
     import runpy
     chart = runpy.run_path(str(ROOT / "bench/scale/chart-readme.py"))
-    pts = chart["cost_points"](chart["load"]())
-    hv_rate, hv_vcpu = pts["hivemq"]
-    nodes = -(-chart["mqttd_vcpu"](pts["mqttd"], hv_rate) // 4)
-    est, hive_month = chart["month_usd"](nodes * 4), chart["month_usd"](hv_vcpu)
-    out |= {f"{est:,.0f}", f"{hive_month:,.0f}", f"{hive_month / est:.1f}×"}
+    out |= chart["derived_figures"](chart["load"]())
     return out
 
 

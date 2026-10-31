@@ -7,23 +7,33 @@
 #        yellow    = the maximum lossless step, carried at p99 <= 5 s
 #        red       = the maximum lossless step, carried at p99 above 5 s
 #        published = a vendor's own published figure, not reproduced by us
-# floor = 1 where the step is the top of the ramp that was run, so the knee lies above it.
+# host = the broker instance type; vcpu is the cluster's total, so vcpu / nodes is each node's.
+# floor = 1 where the ladder ended above the step without bracketing the knee (its top, or a
+#         failure that was not bisected), so the knee lies above the figure.
 # msg_per_s is the cluster total (offered and taken, from the brokers' counters); per node = msg_per_s / nodes.
-chart,series,label,build,date,nodes,vcpu,state,floor,msg_per_s,source,section,note
-scale-out,durable,Durable QoS 1,1.3.0 candidate + #1146 9520b33,2026-10-28,1,4,green,0,92900,docs/benchmarks/RIG2-RESULTS.md,1 node / Durable QoS 1,"maximum lossless; ack p99 744 ms; 1 copy, fsync only"
-scale-out,durable,Durable QoS 1,1.3.0 candidate edfdb49,2026-10-28,3,12,green,0,114200,docs/benchmarks/RIG2-RESULTS.md,3 nodes / Durable QoS 1,ack p99 708 ms
-scale-out,durable,Durable QoS 1,1.3.0 candidate edfdb49,2026-10-28,3,12,yellow,0,117800,docs/benchmarks/RIG2-RESULTS.md,3 nodes / Durable QoS 1,maximum lossless; ack p99 1.35 s
-scale-out,durable,Durable QoS 1,1.3.0 candidate edfdb49,2026-10-27,10,40,green,0,228000,docs/benchmarks/RIG2-RESULTS.md,10 nodes / Durable QoS 1,ack p99 59 ms
-scale-out,durable,Durable QoS 1,1.3.0 candidate edfdb49,2026-10-27,10,40,yellow,0,292200,docs/benchmarks/RIG2-RESULTS.md,10 nodes / Durable QoS 1,maximum lossless; ack p99 1.37 s
-scale-out,qos1-clean,"QoS 1, clean sessions",1.3.0 candidate + #1146 9520b33,2026-10-28,1,4,green,0,114000,docs/benchmarks/RIG2-RESULTS.md,"1 node / QoS 1, clean sessions",maximum lossless; ack p99 315 ms
-scale-out,qos1-clean,"QoS 1, clean sessions",1.3.0 candidate edfdb49,2026-10-28,3,12,green,0,152000,docs/benchmarks/RIG2-RESULTS.md,"3 nodes / QoS 1, clean sessions",ack p99 67 ms
-scale-out,qos1-clean,"QoS 1, clean sessions",1.3.0 candidate edfdb49,2026-10-28,3,12,yellow,0,270800,docs/benchmarks/RIG2-RESULTS.md,"3 nodes / QoS 1, clean sessions",maximum lossless; ack p99 3.31 s
-scale-out,qos1-clean,"QoS 1, clean sessions",1.3.0 candidate edfdb49,2026-10-27,10,40,green,0,303800,docs/benchmarks/RIG2-RESULTS.md,"10 nodes / QoS 1, clean sessions",ack p99 85 ms
-scale-out,qos1-clean,"QoS 1, clean sessions",1.3.0 candidate edfdb49,2026-10-27,10,40,yellow,0,875900,docs/benchmarks/RIG2-RESULTS.md,"10 nodes / QoS 1, clean sessions",maximum lossless; ack p99 4.54 s
-scale-out,qos0,QoS 0,1.3.0 candidate + #1146 9520b33,2026-10-28,1,4,green,0,123100,docs/benchmarks/RIG2-RESULTS.md,1 node / QoS 0,maximum lossless; end-to-end p99 136 ms
-scale-out,qos0,QoS 0,1.3.0 candidate edfdb49,2026-10-28,3,12,green,0,253200,docs/benchmarks/RIG2-RESULTS.md,3 nodes / QoS 0,end-to-end p99 547 ms
-scale-out,qos0,QoS 0,1.3.0 candidate edfdb49,2026-10-28,3,12,yellow,0,340300,docs/benchmarks/RIG2-RESULTS.md,3 nodes / QoS 0,maximum lossless; end-to-end p99 2.52 s
-scale-out,qos0,QoS 0,1.3.0 candidate edfdb49,2026-10-28,10,40,green,0,506300,docs/benchmarks/RIG2-RESULTS.md,10 nodes / QoS 0,end-to-end p99 395 ms
-scale-out,qos0,QoS 0,1.3.0 candidate edfdb49,2026-10-28,10,40,yellow,0,973200,docs/benchmarks/RIG2-RESULTS.md,10 nodes / QoS 0,maximum lossless; end-to-end p99 4.49 s
-durable-per-vcpu,mqttd,mqttd 1.3.0 candidate,1.3.0 candidate edfdb49,2026-10-28,3,12,green,0,114200,docs/benchmarks/RIG2-RESULTS.md,3 nodes / Durable QoS 1,"3 x Hetzner CCX23, AMD EPYC Milan, a vCPU is an SMT thread; 2 copies; the highest step at ack p99 <= 1 s"
-durable-per-vcpu,hivemq,"HiveMQ 4.18 (published)",4.18,2023,3,96,published,0,270000,docs/benchmarks/data/per-vcpu.csv,cluster-durable-qos1,"3 x AWS m6a.8xlarge, AMD EPYC Milan, a vCPU is an SMT thread; default config: persistence on, replica-count 2; payload not published; https://www.hivemq.com/blog/hivemq-4-18-delivers-higher-mqtt-throughput/"
+# The scale-out chart has one column per vcpu count: where two shapes were measured at one count
+# (96 vCPU: 6 x m6i.4xlarge and 3 x m6i.8xlarge; 32 vCPU: m6i and m7a) the higher is the row here
+# and the card has both; the per-vCPU chart lists the shapes.
+chart,series,label,build,date,nodes,vcpu,host,state,floor,msg_per_s,source,section,note
+scale-out,durable,Durable QoS 1,1.3.0 candidate + #1146 9520b33,2026-10-28,1,4,Hetzner CCX23,green,0,92900,docs/benchmarks/RIG2-RESULTS.md,1 node / Durable QoS 1,"maximum lossless; ack p99 744 ms; 1 copy, fsync only"
+scale-out,durable,Durable QoS 1,1.3.0 candidate edfdb49,2026-10-28,3,12,Hetzner CCX23,green,0,114200,docs/benchmarks/RIG2-RESULTS.md,3 nodes / Durable QoS 1,ack p99 708 ms
+scale-out,durable,Durable QoS 1,1.3.0 candidate edfdb49,2026-10-28,3,12,Hetzner CCX23,yellow,0,117800,docs/benchmarks/RIG2-RESULTS.md,3 nodes / Durable QoS 1,maximum lossless; ack p99 1.35 s
+scale-out,durable,Durable QoS 1,main 19f36004,2026-10-30,1,32,AWS m6i.8xlarge,green,0,88700,docs/benchmarks/RIG2-RESULTS.md,"AWS, 32 vCPU / 1 × m6i.8xlarge","maximum lossless; ack p99 300 ms; 1 copy, fsync only"
+scale-out,durable,Durable QoS 1,1.3.0 candidate edfdb49,2026-10-27,10,40,Hetzner CCX23,green,0,228000,docs/benchmarks/RIG2-RESULTS.md,10 nodes / Durable QoS 1,ack p99 59 ms
+scale-out,durable,Durable QoS 1,1.3.0 candidate edfdb49,2026-10-27,10,40,Hetzner CCX23,yellow,0,292200,docs/benchmarks/RIG2-RESULTS.md,10 nodes / Durable QoS 1,maximum lossless; ack p99 1.37 s
+scale-out,durable,Durable QoS 1,main 19f36004,2026-10-31,6,96,AWS m6i.4xlarge,green,0,390300,docs/benchmarks/RIG2-RESULTS.md,"AWS, 96 vCPU / 6 × m6i.4xlarge","maximum lossless; ack p99 112 ms; the next step, 400,800, lost 4,145 (append-backlog-full) in one round of 3"
+scale-out,durable,HiveMQ 4.18 (published),4.18,2023,3,96,AWS m6a.8xlarge,published,0,270000,docs/benchmarks/data/per-vcpu.csv,cluster-durable-qos1,"default config: persistence on, replica-count 2; payload not published; https://www.hivemq.com/blog/hivemq-4-18-delivers-higher-mqtt-throughput/"
+scale-out,qos1-clean,"QoS 1, clean sessions",1.3.0 candidate + #1146 9520b33,2026-10-28,1,4,Hetzner CCX23,green,0,114000,docs/benchmarks/RIG2-RESULTS.md,"1 node / QoS 1, clean sessions",maximum lossless; ack p99 315 ms
+scale-out,qos1-clean,"QoS 1, clean sessions",1.3.0 candidate edfdb49,2026-10-28,3,12,Hetzner CCX23,green,0,152000,docs/benchmarks/RIG2-RESULTS.md,"3 nodes / QoS 1, clean sessions",ack p99 67 ms
+scale-out,qos1-clean,"QoS 1, clean sessions",1.3.0 candidate edfdb49,2026-10-28,3,12,Hetzner CCX23,yellow,0,270800,docs/benchmarks/RIG2-RESULTS.md,"3 nodes / QoS 1, clean sessions",maximum lossless; ack p99 3.31 s
+scale-out,qos1-clean,"QoS 1, clean sessions",1.3.0 candidate edfdb49,2026-10-27,10,40,Hetzner CCX23,green,0,303800,docs/benchmarks/RIG2-RESULTS.md,"10 nodes / QoS 1, clean sessions",ack p99 85 ms
+scale-out,qos1-clean,"QoS 1, clean sessions",1.3.0 candidate edfdb49,2026-10-27,10,40,Hetzner CCX23,yellow,0,875900,docs/benchmarks/RIG2-RESULTS.md,"10 nodes / QoS 1, clean sessions",maximum lossless; ack p99 4.54 s
+scale-out,qos0,QoS 0,1.3.0 candidate + #1146 9520b33,2026-10-28,1,4,Hetzner CCX23,green,0,123100,docs/benchmarks/RIG2-RESULTS.md,1 node / QoS 0,maximum lossless; end-to-end p99 136 ms
+scale-out,qos0,QoS 0,1.3.0 candidate edfdb49,2026-10-28,3,12,Hetzner CCX23,green,0,253200,docs/benchmarks/RIG2-RESULTS.md,3 nodes / QoS 0,end-to-end p99 547 ms
+scale-out,qos0,QoS 0,1.3.0 candidate edfdb49,2026-10-28,3,12,Hetzner CCX23,yellow,0,340300,docs/benchmarks/RIG2-RESULTS.md,3 nodes / QoS 0,maximum lossless; end-to-end p99 2.52 s
+scale-out,qos0,QoS 0,1.3.0 candidate edfdb49,2026-10-28,10,40,Hetzner CCX23,green,0,506300,docs/benchmarks/RIG2-RESULTS.md,10 nodes / QoS 0,end-to-end p99 395 ms
+scale-out,qos0,QoS 0,1.3.0 candidate edfdb49,2026-10-28,10,40,Hetzner CCX23,yellow,0,973200,docs/benchmarks/RIG2-RESULTS.md,10 nodes / QoS 0,maximum lossless; end-to-end p99 4.49 s
+durable-per-vcpu,mqttd,mqttd on 4-vCPU nodes,1.3.0 candidate edfdb49,2026-10-28,3,12,Hetzner CCX23,yellow,0,117800,docs/benchmarks/RIG2-RESULTS.md,3 nodes / Durable QoS 1,"maximum lossless; ack p99 1.35 s; 114,200 at ack p99 <= 1 s; 2 copies"
+durable-per-vcpu,mqttd,mqttd on 16-vCPU nodes,main 19f36004,2026-10-31,6,96,AWS m6i.4xlarge,green,0,390300,docs/benchmarks/RIG2-RESULTS.md,"AWS, 96 vCPU / 6 × m6i.4xlarge","maximum lossless; ack p99 112 ms; the next step, 400,800, lost 4,145 (append-backlog-full) in one round of 3; 2 copies"
+durable-per-vcpu,mqttd,mqttd on 32-vCPU nodes,main 19f36004,2026-10-30,3,96,AWS m6i.8xlarge,yellow,0,270800,docs/benchmarks/RIG2-RESULTS.md,"AWS, 96 vCPU / 3 × m6i.8xlarge","maximum lossless; ack p99 1.17 s; 256,500 at ack p99 <= 1 s; 2 copies; HiveMQ's shape"
+durable-per-vcpu,hivemq,HiveMQ 4.18 (published),4.18,2023,3,96,AWS m6a.8xlarge,published,0,270000,docs/benchmarks/data/per-vcpu.csv,cluster-durable-qos1,"default config: persistence on, replica-count 2; payload not published; https://www.hivemq.com/blog/hivemq-4-18-delivers-higher-mqtt-throughput/"

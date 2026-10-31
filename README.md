@@ -10,19 +10,23 @@
 An MQTT 3.1.1 and 5.0 broker in Rust that clusters, replicates durable sessions by
 default, and ships every feature under Apache-2.0.
 
-> - **Durable QoS 1** (acked after fsync and a quorum copy on another node): 292,200 msg/s
->   with no message lost on 10 nodes, 228k at ack p99 ≤ 1 s.
-> - **QoS 1 with clean sessions:** 876k msg/s on 10 nodes. **QoS 0:** 973k.
+> - **Durable QoS 1** (acked after fsync and a quorum copy on another node): 390,300 msg/s
+>   with no message lost on 96 vCPU, at ack p99 112 ms; HiveMQ 4.18 publishes 270,000 on the
+>   same 96 vCPU.
+> - **On ten 4-vCPU nodes:** 292,200 durable, 876k with clean sessions, 973k at QoS 0.
 > - **Every feature, no paid tier:** clustering, durable replication, OIDC, audit, operator.
 
 ## Why mqttd
 
 - **Cost per message.** At the same cloud price per vCPU, a durable QoS 1 cluster with 2
-  copies costs 2.0–3.4× less to run than HiveMQ 4.18's published run, and HiveMQ's
+  copies costs 1.45–3.5× less to run than HiveMQ 4.18's published run, and HiveMQ's
   licence comes on top. Clustering needs their commercial edition, whose price isn't
-  published. Per vCPU, mqttd carries 9,517 msg/s against HiveMQ's 2,812, on the same AMD
-  EPYC Milan threads. HiveMQ's figure is its own: we haven't reproduced it, and its
-  payload isn't published. [The results](docs/benchmarks/RIG2-RESULTS.md)
+  published. Per vCPU, mqttd carries 9,817 msg/s on 4-vCPU nodes against HiveMQ's 2,812;
+  on HiveMQ's own shape, 3 × 32 vCPU, it carries 2,821, the same, because a node's
+  throughput is bound by its one hub task. The hardware behind a million msg/s costs
+  $3,212 a month on 4-vCPU nodes and $7,757 on 16-vCPU nodes, against $11,213 at
+  HiveMQ's published rate. HiveMQ's figure is its own: we haven't
+  reproduced it, and its payload isn't published. [The results](docs/benchmarks/RIG2-RESULTS.md)
 - **No paid tier.** HiveMQ sells clustering in its commercial edition (the Community
   Edition is single-node), EMQX licenses production clustering under BSL 1.1 since 5.9,
   and VerneMQ's official binaries need a paid licence for commercial production. In
@@ -48,27 +52,36 @@ mqttd has no production users yet. The evidence below is what it offers instead.
 Durable QoS 1 is the hardest path a broker serves: every acknowledgement waits for
 fsync and a quorum copy on another node. It is the one we measure first.
 
-![Cluster msg/s as columns at 1, 3 and 10 nodes on a linear node axis, one panel each for durable QoS 1, QoS 1 with clean sessions and QoS 0, with the per-node rate and a linear-scaling line, measured on the 1.3.0 candidate](docs/benchmarks/img/readme-scale-out.svg)
+![Cluster msg/s as columns from 4 to 96 vCPU on a linear vCPU axis, each column labelled with its shape as nodes × vCPU each and what its hardware costs a month per million msg/s, one panel each for durable QoS 1, QoS 1 with clean sessions and QoS 0, with HiveMQ 4.18's published point beside mqttd's at 96 vCPU, measured on the 1.3.0 candidate](docs/benchmarks/img/readme-scale-out.svg)
 
-- **Durable QoS 1** carries 117,800 msg/s on 3 nodes (39.3k per node) and 292,200 on
-  10 (29.2k per node), with no message lost. At ack p99 ≤ 1 s it carries 114k and 228k.
-- **QoS 1 with clean sessions** carries 271k on 3 nodes and 876k on 10.
-- **QoS 0** carries 340k on 3 nodes and 973k on 10.
-- **One node** carries 92,900 durable (one copy, fsync only), 114,000 clean QoS 1 and
-  123,100 QoS 0, all at p99 ≤ 1 s.
+- **Durable QoS 1** carries 117,800 msg/s on 3 × 4 vCPU (9.8k per vCPU), 292,200 on
+  10 × 4 (7.3k) and 390,300 on 6 × 16 vCPU on AWS (4.1k), with no message lost; at ack
+  p99 ≤ 1 s, 114k, 228k and the same 390,300.
+- **HiveMQ's shape,** 3 × 32 vCPU on AWS: 270,800 msg/s with no message lost, where
+  HiveMQ 4.18 publishes 270,000. Six 16-vCPU nodes carry 45% more on the same 96 vCPU.
+- **QoS 1 with clean sessions** carries 271k on 3 × 4 vCPU and 876k on 10 × 4; **QoS 0**
+  340k and 973k.
+- **One node** carries 92,900 durable on 4 vCPU and 88,700 on 32 (one copy, fsync only):
+  a node's throughput is bound by its one hub task, not by its vCPU.
 
-![Monthly infrastructure cost against durable QoS 1 throughput: mqttd's measured points against HiveMQ 4.18's published run, both at AWS m6a.8xlarge prices, licence not included](docs/benchmarks/img/readme-durable-cost.svg)
+![What the hardware behind a million msg/s of durable QoS 1 costs a month: mqttd's measured range across node sizes as one bar, HiveMQ 4.18's published run as a dashed bar, both at AWS m6a.8xlarge prices, licence not included](docs/benchmarks/img/readme-durable-cost.svg)
 
 - **What it costs.** Both brokers are priced per vCPU at AWS `m6a.8xlarge` on-demand rates,
-  the instance HiveMQ's run used. Hetzner charges about the same per vCPU.
-  - **3 nodes:** mqttd's durable cluster costs 3.4× less than HiveMQ at the same traffic.
-  - **10 nodes:** it costs 2.0× less, because mqttd's per-node durable rate falls.
-  - **At HiveMQ's published 270k:** extending mqttd's line on its 3-to-10-node slope, it
-    needs about 13 nodes, $1,640 a month against HiveMQ's $3,027: 1.8× less. That rate is
-    an estimate, not a measurement.
+  the instance HiveMQ's run used. Hetzner charges about the same per vCPU. Every mqttd
+  point is its run's maximum lossless step.
+  - **3 nodes:** mqttd's durable cluster costs 3.5× less than HiveMQ at the same traffic.
+  - **10 nodes:** it costs 2.6× less, because mqttd's per-node durable rate falls.
+  - **At HiveMQ's own vCPU count and price,** 96 vCPU for $3,027 a month: six 16-vCPU
+    nodes carry 390,300 msg/s against HiveMQ's published 270,000, 45% more, so 1.45× less
+    per message.
+  - **HiveMQ's traffic, 270,000 msg/s,** fits on ten 4-vCPU nodes: they carry 292,200 for
+    $1,261 a month, 2.4× less than HiveMQ's $3,027. Measured, no line drawn.
+  - **Per million msg/s,** the hardware costs $3,212 a month on 3 × 4 vCPU, $4,317 on 10 × 4
+    and $7,757 on 6 × 16, against $11,213 at HiveMQ's published rate; the chart above
+    prints it under every column.
   - **The licence:** HiveMQ's clustering licence comes on top, at a price not published.
 
-![Durable QoS 1 per vCPU: mqttd against HiveMQ 4.18's published figure](docs/benchmarks/img/readme-durable-per-vcpu.svg)
+![Durable QoS 1 per vCPU: mqttd on 4-, 16- and 32-vCPU nodes against HiveMQ 4.18's published figure](docs/benchmarks/img/readme-durable-per-vcpu.svg)
 
 ![Durable QoS 1 on 10 nodes: ack p99 by offered msg/s, the mean of 3 rounds per step](docs/benchmarks/img/rig2/n10-durable-qos1.svg)
 
