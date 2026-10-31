@@ -5,15 +5,17 @@ adr_status: Accepted
 tasks:
   - id: 0092-T1
     title: "The hub model as a script: µs per publish and per consumer PUBACK, and the time lost to wake-ups, from a rig run's scrapes; the report cites it"
-    status: in-progress
+    status: done
     issue: 1159
     date: 2026-10-31
+    evidence: "#1165: bench/scale/rig2/hub-model.py; test-hub-model.py (9 tests, in CI); verdict.py cites it under every ladder of report.md; the five AWS runs' baseline under Progress, and the T2 run read with it."
     notes: "Size S. bench/scale/rig2/hub-model.py reads a run's 2 s scrapes (mqttd_hub_dispatch_seconds by class, the received counter, mqttd_runtime_wake_seconds, mqttd_hub_queue_depth) over each round's measured window and prints, per step, the busiest node's busy share, the hub-µs per received message, the publish and ack (consumer PUBACK) µs with their dispatches per message, the wake probe's lateness, the queue and the saturated nodes, then the loop's busy ceiling; verdict.py cites it under every ladder of report.md; test-hub-model.py (6 tests) runs in CI. The yardstick for T2–T4; the five AWS runs' figures are under Progress."
   - id: 0092-T2
     title: "The hub loop on its own OS thread, pinned to a core where the host allows (D1): MQTTD_HUB_THREAD and MQTTD_HUB_CORE, named on /statusz and a gauge; the shared runtime keeps everything else"
-    status: in-progress
+    status: done
     issue: 1160
     date: 2026-10-31
+    evidence: "#1167: Hub::spawn_dedicated, node.hub_thread / MQTTD_HUB_THREAD and node.hub_core / MQTTD_HUB_CORE, mqttd_hub_thread_info and the /statusz hub block, five tests; measured on run h3-20261031T155400Z against the baseline h3-20261030T171933Z (a regression, under Progress): shipped off by default, D1 withdrawn by ADR 0092 Amendment 1."
     notes: "Size M. The maintainer's item 1. The three tokio::spawn(hub.run()) sites in crates/mqttd/src/main.rs; a std thread with a current-thread runtime or LocalSet; rustix sched_setaffinity (no unsafe); mqtt-config, CONFIGURATION, OPERATIONS. Built: Hub::spawn_dedicated (a std thread with a current-thread runtime, rustix sched_setaffinity for the pin), every hub-internal spawn routed to the shared runtime through Hub::spawner, node.hub_thread / MQTTD_HUB_THREAD and node.hub_core / MQTTD_HUB_CORE, mqttd_hub_thread_info and the /statusz hub block, placed in one place_hub in main.rs. Measured with T1 on one m6i.8xlarge (run h3-20261031T155400Z, see Progress): a regression, the knee 68,600 against 88,700, so the thread ships OFF by default and D1 is withdrawn by the ADR's Amendment 1. The pinned arm and the Genoa host were not run: they cannot change the mechanism."
   - id: 0092-T3
     title: "Less work per message on the hub loop, in the order the frame-pointer profile gives (D2): the hasher, one clock read per dispatch, batched metric observes, the payload and per-delivery allocations; no behaviour change"
@@ -44,8 +46,8 @@ above; the table below is generated from it.
 <!-- status-table:0092 -->
 | Task | Status | Issue | When | Evidence / notes |
 |------|--------|-------|------|------------------|
-| 0092-T1 | 🚧 in-progress | [#1159](https://github.com/mbilling/fss-mqtt-broker/issues/1159) | 2026-10-31 | "Size S. bench/scale/rig2/hub-model.py reads a run's 2 s scrapes (mqttd_hub_dispatch_seconds by class, the received counter, mqttd_runtime_wake_seconds, mqttd_hub_queue_depth) over each round's measured window and prints, per step, the busiest node's busy share, the hub-µs per received message, the publish and ack (consumer PUBACK) µs with their dispatches per message, the wake probe's lateness, the queue and the saturated nodes, then the loop's busy ceiling; verdict.py cites it under every ladder of report.md; test-hub-model.py (6 tests) runs in CI. The yardstick for T2–T4; the five AWS runs' figures are under Progress." |
-| 0092-T2 | 🚧 in-progress | [#1160](https://github.com/mbilling/fss-mqtt-broker/issues/1160) | 2026-10-31 | "Size M. The maintainer's item 1. The three tokio::spawn(hub.run()) sites in crates/mqttd/src/main.rs; a std thread with a current-thread runtime or LocalSet; rustix sched_setaffinity (no unsafe); mqtt-config, CONFIGURATION, OPERATIONS. Built: Hub::spawn_dedicated (a std thread with a current-thread runtime, rustix sched_setaffinity for the pin), every hub-internal spawn routed to the shared runtime through Hub::spawner, node.hub_thread / MQTTD_HUB_THREAD and node.hub_core / MQTTD_HUB_CORE, mqttd_hub_thread_info and the /statusz hub block, placed in one place_hub in main.rs. Measured with T1 on one m6i.8xlarge (run h3-20261031T155400Z, see Progress): a regression, the knee 68,600 against 88,700, so the thread ships OFF by default and D1 is withdrawn by the ADR's Amendment 1. The pinned arm and the Genoa host were not run: they cannot change the mechanism." |
+| 0092-T1 | ✅ done | [#1159](https://github.com/mbilling/fss-mqtt-broker/issues/1159) | 2026-10-31 | "#1165: bench/scale/rig2/hub-model.py; test-hub-model.py (9 tests, in CI); verdict.py cites it under every ladder of report.md; the five AWS runs' baseline under Progress, and the T2 run read with it." |
+| 0092-T2 | ✅ done | [#1160](https://github.com/mbilling/fss-mqtt-broker/issues/1160) | 2026-10-31 | "#1167: Hub::spawn_dedicated, node.hub_thread / MQTTD_HUB_THREAD and node.hub_core / MQTTD_HUB_CORE, mqttd_hub_thread_info and the /statusz hub block, five tests; measured on run h3-20261031T155400Z against the baseline h3-20261030T171933Z (a regression, under Progress): shipped off by default, D1 withdrawn by ADR 0092 Amendment 1." |
 | 0092-T3 | ⬜ planned | [#1161](https://github.com/mbilling/fss-mqtt-broker/issues/1161) | — | "Size M–L. The maintainer's item 2. First the frame-pointer profile run (the build exists; about $0.6 of rig time), then the items in profile order. Target about 7 → about 5 µs per publish on m6i, each change re-fitted with T1 on the rig; hub tests green." |
 | 0092-T4 | ⬜ planned | [#1162](https://github.com/mbilling/fss-mqtt-broker/issues/1162) | — | "Size L. The maintainer's item 3. hub/mod.rs dispatch_pub_ack and complete_pending; the connection task's outbound state. Tests first: ADR 0089 T1's order tests, inflight_durability (#124), cluster_proc and false_dead_delivery with elision on. Done when the ack class is below 5% of hub time by T1 and no acknowledged message is lost on the fault suites." |
 | 0092-T5 | ⬜ planned | [#1163](https://github.com/mbilling/fss-mqtt-broker/issues/1163) | — | "Size M for the ADR, after a two-shard prototype of size M. The maintainer's item 4, sequenced after items 1–3 (2026-10-31). Contents in #1163: shard ownership by placement group, immutable snapshots from the control task, hand-off and completion cost, hot-group dealing and # subscribers, shard failure modes, the node's ceilings as functions of ADR 0091's numbers with the ENA packet-rate ceiling from netprobe." |
@@ -118,3 +120,5 @@ wait by giving the loop a runtime with nothing else to run.
   0.83 to 0.85. Every hand-off out of the loop had become a remote wake. The maintainer:
   ship it off by default and withdraw D1 (ADR 0092 Amendment 1). The pinned arm and the
   Genoa host were not run.
+- **2026-10-31** — T1 done (#1165 merged) and T2 done (#1167 merged, the thread off by
+  default under Amendment 1); #1159 and #1160 closed.
