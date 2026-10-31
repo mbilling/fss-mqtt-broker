@@ -153,6 +153,67 @@ messages to each other pay this same wake unless the hand-off is batched and the
 receiver already running. Pinning (A') and the Genoa host (B, B') were not run: they
 cannot change the mechanism.
 
+## Amendment 2 (2026-10-31): D2 in its profile's order, measured; the ceiling; what is not yet measured
+
+D2 named its work from the flat profile of 2026-10-30: the hasher, one clock read per
+dispatch, batched observes, the allocations. The frame-pointer call graph of the hub task
+(run `h3-20261031T205637Z`, one `m6i.8xlarge`, 97,159 samples with the hub task on 21% of
+them; the whole breakdown is in the delivery doc) orders it differently, and the two
+largest items were not on D2's list:
+
+| share of the hub task at 84,400 msg/s | what |
+|---|---|
+| 13.5% | `memcpy`: the command's dispatch future, 5,832 B, built and moved once per command — `dispatch`'s future carries the locals of every arm |
+| 11% | the `$share` plan: `plan_shared` and the shared table's index walk |
+| 10% | SipHash on the `ClientId`, `NodeId`, filter and topic-level keys |
+| 7–9% | allocation: `Box<Outgoing>`, the `Message` topic copies, the index's level vector, the per-session hold queue rebuilt on every publish |
+| 5.3% | the sub-id walk over every subscription of a subscriber, per delivery, for identifiers it does not carry |
+| 3.5% | the prometheus observes with their label `String`s |
+| 0.5% | clock reads |
+
+**The first batch** — the dispatch future to 2,488 B with the PUBACK taking none and the
+rare arms boxed, the metric handles resolved once, the sub-id walk only for subscriptions
+that carry an identifier, the elision key and queues, the empty-backlog drain (#1170) —
+measured the way D4 requires, on run `h3-20261031T215218Z` against main re-measured the
+same day (`h3-20261031T194739Z`): a publish dispatch 6.7 → 5.3 µs at 67,500 msg/s, the
+hub's busy share there 0.58 → 0.48, the publisher's ack p99 at 84,400 msg/s 103–119 ms →
+5.3 ms, the knee 92,400 → 105,500 msg/s on one `m6i.8xlarge`, bracketed at 107,200. The
+busy ceiling did not move: 0.83. The second batch — the hasher and the filter trie's
+wildcard children as fields (#1171) — is measured next, and its figures are recorded here.
+
+**D2 changes in three places.**
+
+1. The order is the table's; the clock reads are struck from it.
+2. A stop rule, which D2 lacked: T3 ends when the next item on the profile is under 2% of
+   the hub task, or when a batch moves the knee by less than the rig's 3% bracket. What is
+   left after the second batch — the plan's scratch allocations, the topic copies, the
+   stale hold deadlines, about 1% each — is below that line and not worth a rig run.
+3. The yardstick gains the ceiling. A node's limit is the loop's busy ceiling divided by
+   (a + b × PUBACKs per message), not 1 divided by it: 0.83 ÷ (5.6 + 1.9) µs is about
+   110,000 msg/s on `m6i`, which is where the knee is. ADR 0091's per-node CPU limit takes
+   this form.
+
+**What the profile adds to D3 and D5.** The ceiling did not follow the per-message cost
+down, so it is now the larger of the two levers. The 17% the loop does not dispatch is the
+work it wakes (Amendment 1): two wakes per message, the delivery to the subscriber's
+connection task and the publisher's ack through its oneshot, 3.4% of the hub task on the
+loop's side and the rest on the receivers'. D3 removes the PUBACK's crossing; the delivery
+and the ack crossings have no decision, and batching them per connection is the next lever
+on the ceiling — the same cost D5's shards pay for every hand-off, in the same measure.
+The kernel's receive softirq also runs on whichever core the loop is on, 8.6% of the hub
+task's stacks; nothing steers it while the hub is an unpinned task, and D5's shards, if
+pinned, could have it steered away. The "different runtime" alternative was answered by
+Amendment 1, not by D1: the loop gains from this runtime's LIFO slot, and a runtime
+without it would pay what the dedicated thread paid.
+
+**What is not yet measured.** The profile and both batches are one node under the h3
+`$share` workload, where the shared plan is 52% of a publish's time: a and b are for that
+shape, and the ordinary-subscriber path, which builds a set of matching clients per
+publish, has no profile. In a cluster, peer frames are about 45% of the commands and that
+path now runs boxed (one allocation per frame); D4's before-and-after on the shapes in
+RIG2-RESULTS — three `m6i.8xlarge`, six `m6i.4xlarge` — is owed, and the README's cluster
+figures do not move before it. The per-node figure moves with #1170.
+
 ## Consequences
 
 - **The hub stays where it was.** No core is reserved; `/statusz` and the gauge say so
