@@ -24,6 +24,10 @@ permissions:
 
 jobs:
   publish:
+    # Isolated on 2026-10-31 (ADR 0056, deprecated): the rolling bundle exists for
+    # `mqttui update`, and mqttui is neither built nor released until its remake. Skipped,
+    # not removed; the remake drops the condition.
+    if: false
     permissions:
       contents: write # create/update the rolling release
       id-token: write # keyless cosign signing via GitHub OIDC
