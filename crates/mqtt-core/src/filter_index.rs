@@ -26,27 +26,90 @@
 
 use crate::{FastMap, FilterKey};
 
-/// One topic level in the match index. `+` and `#` are stored as ordinary keys;
-/// their wildcard meaning lives in the walk, not the structure.
+/// One topic level in the match index. The two wildcard children are fields of their
+/// own, the literal levels a map: the match walk asks every node on its path for `#`
+/// and `+`, and asking a map meant hashing those two keys at every level of every
+/// publish (ADR 0092 T3). Their wildcard meaning still lives in the walk.
 #[derive(Debug, Default)]
 struct TrieNode {
+    /// The literal levels below this one.
     children: FastMap<String, TrieNode>,
+    /// The `+` child: one level, any value.
+    plus: Option<Box<TrieNode>>,
+    /// The `#` child: this level and everything below it.
+    hash: Option<Box<TrieNode>>,
     /// Set when a registered filter ends at this node: **the same allocation**
     /// `by_filter` is keyed by, not a copy of it. This used to be an owned
     /// `String`, so every distinct filter was stored twice.
     terminal: Option<FilterKey>,
 }
 
+impl TrieNode {
+    fn child(&self, level: &str) -> Option<&TrieNode> {
+        match level {
+            "+" => self.plus.as_deref(),
+            "#" => self.hash.as_deref(),
+            _ => self.children.get(level),
+        }
+    }
+
+    fn child_mut(&mut self, level: &str) -> Option<&mut TrieNode> {
+        match level {
+            "+" => self.plus.as_deref_mut(),
+            "#" => self.hash.as_deref_mut(),
+            _ => self.children.get_mut(level),
+        }
+    }
+
+    fn child_or_insert(&mut self, level: &str) -> &mut TrieNode {
+        match level {
+            "+" => self.plus.get_or_insert_with(Default::default),
+            "#" => self.hash.get_or_insert_with(Default::default),
+            _ => self.children.entry(level.to_string()).or_default(),
+        }
+    }
+
+    fn remove_child(&mut self, level: &str) {
+        match level {
+            "+" => self.plus = None,
+            "#" => self.hash = None,
+            _ => {
+                self.children.remove(level);
+            }
+        }
+    }
+
+    fn child_count(&self) -> usize {
+        self.children.len() + usize::from(self.plus.is_some()) + usize::from(self.hash.is_some())
+    }
+
+    fn has_children(&self) -> bool {
+        self.child_count() > 0
+    }
+
+    /// Move every child out, for the iterative drop.
+    fn take_children(&mut self, into: &mut Vec<TrieNode>) {
+        into.extend(self.children.drain().map(|(_, n)| n));
+        if let Some(p) = self.plus.take() {
+            into.push(*p);
+        }
+        if let Some(h) = self.hash.take() {
+            into.push(*h);
+        }
+    }
+}
+
 impl Drop for TrieNode {
     /// Dismantle the subtree iteratively. Node depth tracks the (client-supplied)
-    /// filter length, so the derived recursive drop of nested `HashMap`s would
+    /// filter length, so the derived recursive drop of nested nodes would
     /// otherwise overflow the stack and abort the broker when a deep filter's
     /// path is pruned or the table is torn down — the same hazard the insert,
     /// match, and remove walks avoid by staying iterative.
     fn drop(&mut self) {
-        let mut stack: Vec<TrieNode> = self.children.drain().map(|(_, n)| n).collect();
+        let mut stack: Vec<TrieNode> = Vec::new();
+        self.take_children(&mut stack);
         while let Some(mut node) = stack.pop() {
-            stack.extend(node.children.drain().map(|(_, n)| n));
+            node.take_children(&mut stack);
             // `node` now has no children; its own drop recurses no further.
         }
     }
@@ -55,7 +118,7 @@ impl Drop for TrieNode {
 fn trie_insert(root: &mut TrieNode, filter: &FilterKey) {
     let mut node = root;
     for level in filter.split('/') {
-        node = node.children.entry(level.to_string()).or_default();
+        node = node.child_or_insert(level);
     }
     // Share the caller's allocation rather than copying the filter a second time.
     node.terminal = Some(FilterKey::clone(filter));
@@ -74,17 +137,17 @@ fn trie_remove(root: &mut TrieNode, filter: &str) {
     let mut node = &*root;
     let mut cut = 0usize; // index, on the path, of the deepest surviving node
     for (depth, level) in levels.iter().enumerate() {
-        let Some(child) = node.children.get(*level) else {
+        let Some(child) = node.child(level) else {
             return; // filter not registered — nothing to remove
         };
-        if depth == 0 || node.terminal.is_some() || node.children.len() > 1 {
+        if depth == 0 || node.terminal.is_some() || node.child_count() > 1 {
             cut = depth;
         }
         node = child;
     }
     // `node` is the leaf (index `levels.len()`); it outlives the removal iff it
     // still has children once we drop this terminal.
-    if !node.children.is_empty() {
+    if node.has_children() {
         cut = levels.len();
     }
     // Pass 2 (mutable): clear the terminal if the leaf survives, else detach the
@@ -92,20 +155,14 @@ fn trie_remove(root: &mut TrieNode, filter: &str) {
     let mut node = &mut *root;
     if cut == levels.len() {
         for level in &levels {
-            node = node
-                .children
-                .get_mut(*level)
-                .expect("path verified in pass 1");
+            node = node.child_mut(level).expect("path verified in pass 1");
         }
         node.terminal = None;
     } else {
         for level in &levels[..cut] {
-            node = node
-                .children
-                .get_mut(*level)
-                .expect("path verified in pass 1");
+            node = node.child_mut(level).expect("path verified in pass 1");
         }
-        node.children.remove(levels[cut]);
+        node.remove_child(levels[cut]);
     }
 }
 
@@ -145,7 +202,7 @@ impl FilterIndex {
     /// already guarded.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.root.children.is_empty() && self.root.terminal.is_none()
+        !self.root.has_children() && self.root.terminal.is_none()
     }
 
     /// Every registered filter matching `topic`, via one walk of the topic's
@@ -158,7 +215,7 @@ impl FilterIndex {
         // can discover there is nothing to match. Measured: without this guard,
         // indexing the peer population cost a PEERLESS node 48% of its publish
         // dispatch, trading a win at 4+ peers for a regression at 0.
-        if self.root.children.is_empty() && self.root.terminal.is_none() {
+        if self.is_empty() {
             return;
         }
         let levels: Vec<&str> = topic.split('/').collect();
@@ -174,10 +231,8 @@ impl FilterIndex {
                 // A `#` child matches from its parent's level down — INCLUDING the
                 // parent level itself: "a/#" matches "a" (its terminal, checked
                 // here, not its subtree).
-                if let Some(h) = node.children.get("#") {
-                    if let Some(f) = &h.terminal {
-                        cb(f);
-                    }
+                if let Some(f) = node.hash.as_ref().and_then(|h| h.terminal.as_ref()) {
+                    cb(f);
                 }
             }
             if i == levels.len() {
@@ -187,7 +242,7 @@ impl FilterIndex {
                 continue;
             }
             if !skip_wildcards {
-                if let Some(p) = node.children.get("+") {
+                if let Some(p) = node.plus.as_deref() {
                     stack.push((p, i + 1, false));
                 }
             }
