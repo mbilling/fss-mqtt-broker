@@ -21,7 +21,7 @@ tasks:
     title: "Less work per message on the hub loop, in the order the frame-pointer profile gives (D2): the hasher, one clock read per dispatch, batched metric observes, the payload and per-delivery allocations; no behaviour change"
     status: in-progress
     issue: 1161
-    notes: "Size M–L. The maintainer's item 2. The frame-pointer profile (run h3-20261031T205637Z, under Progress) ordered the work: the per-command dispatch future's copies (memcpy, 14% of the hub task), the shared-subscription plan (11%), SipHash (10%), allocations (7–9%), the sub-id walk per delivery (5%), the metric label building (~1.5%); clock reads are 0.5% and stay. First batch: the hot commands on a small dispatch future and the rare arms boxed (dispatch_timed 5,832 → 2,488 B, the PUBACK with no future at all; pinned by a test), the labelled metric handles resolved once, the sub-id walk only for subscriptions that carry one, the elision write key built only while a write is in flight, the emptied per-session hold queues pooled, the empty-backlog drain one lookup. Target about 7 → about 5 µs per publish on m6i, each batch re-fitted with T1 on the rig; hub tests green."
+    notes: "Size M–L. The maintainer's item 2. The frame-pointer profile (run h3-20261031T205637Z, under Progress) ordered the work: the per-command dispatch future's copies (memcpy, 14% of the hub task), the shared-subscription plan (11%), SipHash (10%), allocations (7–9%), the sub-id walk per delivery (5%), the metric label building (~1.5%); clock reads are 0.5% and stay. First batch: the hot commands on a small dispatch future and the rare arms boxed (dispatch_timed 5,832 → 2,488 B, the PUBACK with no future at all; pinned by a test), the labelled metric handles resolved once, the sub-id walk only for subscriptions that carry one, the elision write key built only while a write is in flight, the emptied per-session hold queues pooled, the empty-backlog drain one lookup — measured on run h3-20261031T215218Z: the knee 92,400 → 105,500 msg/s on one m6i.8xlarge, a publish 6.7 → 5.3 µs at 67,500 msg/s (under Progress). Target about 7 → about 5 µs per publish on m6i, each batch re-fitted with T1 on the rig; hub tests green."
   - id: 0092-T4
     title: "Consumer PUBACKs complete on the connection task (D3): it owns the session's outbound in-flight state; the hub learns of acknowledgements in batches only for durable truncation, elision discharge and the obligation ledger; QoS 2 unchanged"
     status: planned
@@ -48,7 +48,7 @@ above; the table below is generated from it.
 |------|--------|-------|------|------------------|
 | 0092-T1 | ✅ done | [#1159](https://github.com/mbilling/fss-mqtt-broker/issues/1159) | 2026-10-31 | "#1165: bench/scale/rig2/hub-model.py; test-hub-model.py (9 tests, in CI); verdict.py cites it under every ladder of report.md; the five AWS runs' baseline under Progress, and the T2 run read with it." |
 | 0092-T2 | ✅ done | [#1160](https://github.com/mbilling/fss-mqtt-broker/issues/1160) | 2026-10-31 | "#1167: Hub::spawn_dedicated, node.hub_thread / MQTTD_HUB_THREAD and node.hub_core / MQTTD_HUB_CORE, mqttd_hub_thread_info and the /statusz hub block, five tests; measured on run h3-20261031T155400Z against the baseline h3-20261030T171933Z (a regression, under Progress): shipped off by default, D1 withdrawn by ADR 0092 Amendment 1." |
-| 0092-T3 | 🚧 in-progress | [#1161](https://github.com/mbilling/fss-mqtt-broker/issues/1161) | — | "Size M–L. The maintainer's item 2. The frame-pointer profile (run h3-20261031T205637Z, under Progress) ordered the work: the per-command dispatch future's copies (memcpy, 14% of the hub task), the shared-subscription plan (11%), SipHash (10%), allocations (7–9%), the sub-id walk per delivery (5%), the metric label building (~1.5%); clock reads are 0.5% and stay. First batch: the hot commands on a small dispatch future and the rare arms boxed (dispatch_timed 5,832 → 2,488 B, the PUBACK with no future at all; pinned by a test), the labelled metric handles resolved once, the sub-id walk only for subscriptions that carry one, the elision write key built only while a write is in flight, the emptied per-session hold queues pooled, the empty-backlog drain one lookup. Target about 7 → about 5 µs per publish on m6i, each batch re-fitted with T1 on the rig; hub tests green." |
+| 0092-T3 | 🚧 in-progress | [#1161](https://github.com/mbilling/fss-mqtt-broker/issues/1161) | — | "Size M–L. The maintainer's item 2. The frame-pointer profile (run h3-20261031T205637Z, under Progress) ordered the work: the per-command dispatch future's copies (memcpy, 14% of the hub task), the shared-subscription plan (11%), SipHash (10%), allocations (7–9%), the sub-id walk per delivery (5%), the metric label building (~1.5%); clock reads are 0.5% and stay. First batch: the hot commands on a small dispatch future and the rare arms boxed (dispatch_timed 5,832 → 2,488 B, the PUBACK with no future at all; pinned by a test), the labelled metric handles resolved once, the sub-id walk only for subscriptions that carry one, the elision write key built only while a write is in flight, the emptied per-session hold queues pooled, the empty-backlog drain one lookup — measured on run h3-20261031T215218Z: the knee 92,400 → 105,500 msg/s on one m6i.8xlarge, a publish 6.7 → 5.3 µs at 67,500 msg/s (under Progress). Target about 7 → about 5 µs per publish on m6i, each batch re-fitted with T1 on the rig; hub tests green." |
 | 0092-T4 | ⬜ planned | [#1162](https://github.com/mbilling/fss-mqtt-broker/issues/1162) | — | "Size L. The maintainer's item 3. hub/mod.rs dispatch_pub_ack and complete_pending; the connection task's outbound state. Tests first: ADR 0089 T1's order tests, inflight_durability (#124), cluster_proc and false_dead_delivery with elision on. Done when the ack class is below 5% of hub time by T1 and no acknowledged message is lost on the fault suites." |
 | 0092-T5 | ⬜ planned | [#1163](https://github.com/mbilling/fss-mqtt-broker/issues/1163) | — | "Size M for the ADR, after a two-shard prototype of size M. The maintainer's item 4, sequenced after items 1–3 (2026-10-31). Contents in #1163: shard ownership by placement group, immutable snapshots from the control task, hand-off and completion cost, hot-group dealing and # subscribers, shard failure modes, the node's ceilings as functions of ADR 0091's numbers with the ENA packet-rate ceiling from netprobe." |
 <!-- /status-table:0092 -->
@@ -97,6 +97,8 @@ ingest, the yield it takes every 64 commands and the wake it then waits for, mig
 | 3 × `m6i.8xlarge` | 270,800 | 0.81 | 9.0 | 7.0 | 1.9 | 28 | 0.83 | 17% |
 | 6 × `m6i.4xlarge`, first ladder | 337,500 | 0.75 | 12.7 | 9.7 | 2.9 | 30 | 0.82 | 18% |
 | 6 × `m6i.4xlarge`, bisect | 390,300 | 0.82 | 12.5 | 9.7 | 2.7 | 40 | 0.82 | 18% |
+| 1 × `m6i.8xlarge`, main `d4afe97d` re-measured (`h3-20261031T194739Z`) | 92,400 | 0.82 | 8.8 | 6.8 | 2.0 | 25 | 0.83 | 17% |
+| 1 × `m6i.8xlarge`, **T3 first batch** (`h3-20261031T215218Z`) | 105,500 | 0.79 | 7.5 | 5.6 | 1.9 | 37 | 0.83 | 17% |
 
 Two readings the script settles. The Genoa node's loss is 30% at its ceiling, not the
 41% read off its carried step (0.57 busy): its ceiling rises with the offer, from 0.57 at
@@ -129,6 +131,15 @@ clock reads 0.5%. Also on the hub's stacks: the kernel's network softirqs 8.6%, 
 receive path running on whichever core the loop happens to be on. The order of the work
 is that list, largest first; the clock reads the plan named are not worth a change.
 
+**T3, first batch, measured** (run `h3-20261031T215218Z`, one `m6i.8xlarge`, the h3
+ladder, binary `1db8c42e`): the knee moved from 92,400 msg/s (main, re-measured the same
+day) and 88,700 (the baseline) to 105,500, bracketed at 107,200 (a 1.6% gap): 14% more
+than main. At 67,500 msg/s a publish dispatch went from 6.7 to 5.3 µs and the hub's
+busy share from 0.58 to 0.48; at 84,400 the publisher's ack p99 went from 103–119 ms to
+5.3 ms, and at the knee a publish costs 5.6 µs against 7.0 before. The loop's busy
+ceiling is unchanged at 0.83: the 17% it does not dispatch is the work it wakes
+(Amendment 1), not the per-message cost, and is what T4 and D5 are for.
+
 ## Changelog
 
 - **2026-10-31** — Delivery doc created with T1–T5 planned, issues #1159–#1163, from the
@@ -158,3 +169,6 @@ is that list, largest first; the clock reads the plan named are not worth a chan
   boxed, the labelled metric handles resolved once, the sub-id walk only for subscriptions
   carrying an identifier, the elision write key built only while a write is in flight, the
   emptied hold queues pooled, the empty-backlog drain one lookup.
+- **2026-10-31** — T3 first batch measured (run `h3-20261031T215218Z`, under Progress): the
+  per-node knee 92,400 → 105,500 msg/s on one `m6i.8xlarge`, a publish dispatch 6.7 → 5.3 µs
+  at 67,500 msg/s, the busy ceiling unchanged at 0.83.
