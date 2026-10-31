@@ -131,6 +131,16 @@ clock reads 0.5%. Also on the hub's stacks: the kernel's network softirqs 8.6%, 
 receive path running on whichever core the loop happens to be on. The order of the work
 is that list, largest first; the clock reads the plan named are not worth a change.
 
+**T3, the evidence per batch.** Every batch is measured on both shapes the README cites,
+one `m6i.8xlarge` and three, against the previous row; a batch's run and its figures are
+the row, and a cell is filled only by a run.
+
+| step | binary | 1 node: knee, publish µs at 67,500 | 3 nodes: knee | runs |
+|---|---|---|---|---|
+| main before T3 | `19f36004` / `d4afe97d` | 88,700 / 92,400; 6.6 / 6.7 µs | 270,800 | `h3-20261030T171933Z`, `h3-20261031T194739Z`; `h3-20261030T183536Z` |
+| batch 1: the dispatch future, metric handles, the sub-id walk, the elision key and queues, the empty-backlog drain (#1170) | `1db8c42e` | 105,500 (+14%); 5.3 µs | not yet run | `h3-20261031T215218Z` |
+| batch 2: the hasher, the trie's wildcard children as fields (#1171) | `1f58398b` | running | not yet run | |
+
 **T3, first batch, measured** (run `h3-20261031T215218Z`, one `m6i.8xlarge`, the h3
 ladder, binary `1db8c42e`): the knee moved from 92,400 msg/s (main, re-measured the same
 day) and 88,700 (the baseline) to 105,500, bracketed at 107,200 (a 1.6% gap): 14% more
