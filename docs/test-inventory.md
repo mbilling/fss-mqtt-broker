@@ -1537,7 +1537,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 888 test(s)
+## `crates/mqttd/src/lib.rs` — 889 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1860,6 +1860,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_discharge_clears_the_missed_windows`
 - `hub::tests::a_discharged_tombstone_is_reaped_after_the_roster_converges`
 - `hub::tests::a_disconnect_revising_to_never_expire_is_recorded`
+- `hub::tests::a_dispatch_future_stays_small`
 - `hub::tests::a_divergent_retained_value_is_detected_and_counted`
 - `hub::tests::a_drain_gated_message_is_not_handed_to_a_member_whose_node_was_declared_dead`
 - `hub::tests::a_dropped_replay_entry_does_not_pin_the_log`
