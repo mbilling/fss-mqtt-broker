@@ -247,6 +247,11 @@ impl Hub {
             return Vec::new();
         };
         subs.iter()
+            // Only a subscription that carries an identifier can contribute one, so the
+            // filter match — a `$share` parse and a topic walk per subscription — runs
+            // for those alone (ADR 0092 T3): a client without identifiers, the common
+            // case, costs one scan of its entries and no allocation.
+            .filter(|e| e.sub_id.is_some())
             .filter(|e| {
                 // A shared subscription matches through its INNER filter; resolving
                 // it here is what keeps a `$share` grant from attaching its id to
@@ -318,7 +323,9 @@ impl Hub {
                 expires_at: message_expiry.map(|s| self.clock.now_epoch_secs() + u64::from(s)),
             };
             self.retained_may_expire |= message.expires_at.is_some();
-            if let Err(e) = self.retained.set(&message).await {
+            // Boxed: the retained store's write future is the rare path's, and it must
+            // not size every publish's future (ADR 0092 T3).
+            if let Err(e) = Box::pin(self.retained.set(&message)).await {
                 // Fail closed (audit #203): a failed retained write must NOT be acked as
                 // durable. The store is write-through fsync'd, so a QoS≥1 publisher told its
                 // retained value was stored, when it was not, would lose it on the next
@@ -2137,6 +2144,25 @@ impl Hub {
     /// by the two off-loop completions that re-open their gates (issue #242 finding A:
     /// an outbound-id record landing, a packet-id block arriving).
     pub(super) fn drain_backlog(&mut self, client: &ClientId) {
+        let Some(online) = self.online.get(client) else {
+            return;
+        };
+        // Issue #504: a closed outbound is reaped first, whatever the backlog holds, so
+        // a persistent session's backlog still spills via `flush_backlog_to_store`.
+        if online.tx.is_closed() {
+            self.reap_closed_connection(client, true);
+            return;
+        }
+        // Nothing to drain is the common case — every PUBACK lands here — and it costs
+        // one lookup: no outbound handle cloned, no in-flight entry created for a
+        // session that has none (ADR 0092 T3).
+        if self
+            .inflight
+            .get(client)
+            .is_none_or(|inf| inf.backlog.is_empty())
+        {
+            return;
+        }
         let Some(tx) = self.online.get(client).map(|s| s.tx.clone()) else {
             return;
         };

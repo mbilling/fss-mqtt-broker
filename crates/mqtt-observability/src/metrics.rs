@@ -157,6 +157,68 @@ struct CommandLabel {
     command: String,
 }
 
+/// Every `{command}` class the hub records, in the order of [`Metrics::hub_dispatch_cache`]
+/// (ADR 0092 T3: the hub loop observes one of these per command, so each handle is
+/// resolved once; a class outside this set still works, through the family lookup).
+const HUB_COMMAND_CLASSES: [&str; 7] = [
+    "attach",
+    "publish",
+    "ack",
+    "subscribe",
+    "control",
+    "cluster",
+    "sweep",
+];
+
+/// The `{qos}` label values, indexed by the `QoS` number: the per-publish counters
+/// resolve their handle once per value (ADR 0092 T3).
+const QOS_LABELS: [&str; 3] = ["0", "1", "2"];
+
+/// The `{tier}` label values (ADR 0072), one handle each (ADR 0092 T3).
+const TIER_LABELS: [&str; 3] = ["quorum", "local", "relaxed"];
+
+/// The `{probe}` label values of `mqttd_runtime_wake_seconds` (#662), one handle each.
+const PROBE_LABELS: [&str; 2] = ["yield", "channel"];
+
+/// The `{locality}` label values of `mqttd_shared_selected_total`, one handle each:
+/// counted once per `$share` selection, i.e. per publish on a shared-subscription
+/// workload (ADR 0092 T3).
+const LOCALITY_LABELS: [&str; 2] = ["local", "remote"];
+
+/// The index of `value` in `table`, for the handle caches below.
+fn label_index(table: &[&'static str], value: &str) -> Option<usize> {
+    table.iter().position(|v| *v == value)
+}
+
+/// Count one event on the `{qos}` counter for `qos`, through the handle resolved once
+/// per `QoS` number (ADR 0092 T3); a value outside 0..=2 is counted through the family
+/// as before. Returns the `OTel` attribute, built without an allocation for a cached value.
+fn inc_by_qos(
+    family: &Family<QosLabel, Counter>,
+    cache: &[std::sync::OnceLock<Counter>; QOS_LABELS.len()],
+    qos: u8,
+) -> KeyValue {
+    if let Some(label) = QOS_LABELS.get(usize::from(qos)) {
+        cache[usize::from(qos)]
+            .get_or_init(|| {
+                family
+                    .get_or_create(&QosLabel {
+                        qos: (*label).to_string(),
+                    })
+                    .clone()
+            })
+            .inc();
+        KeyValue::new("qos", *label)
+    } else {
+        family
+            .get_or_create(&QosLabel {
+                qos: qos.to_string(),
+            })
+            .inc();
+        KeyValue::new("qos", qos.to_string())
+    }
+}
+
 /// `{locality}` label for `mqttd_shared_selected_total` (issue #613 item 3.5) —
 /// exactly two values: `local`, `remote`.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -628,11 +690,20 @@ pub struct Metrics {
     connection_errors_total: Family<ReasonLabel, Counter>,
     publish_received_total: Family<QosLabel, Counter>,
     publish_delivered_total: Family<QosLabel, Counter>,
+    /// ADR 0092 T3: the per-publish handles of the two families above, by `QoS`
+    /// number, resolved once. The hub counts every publish it routes and every
+    /// delivery it hands over; building a `{qos}` label and probing the family under
+    /// its lock each time was two allocations and a hash per message.
+    publish_received_cache: [std::sync::OnceLock<Counter>; QOS_LABELS.len()],
+    publish_delivered_cache: [std::sync::OnceLock<Counter>; QOS_LABELS.len()],
     publish_dropped_total: Family<ReasonLabel, Counter>,
     publish_resolved_undeliverable_total: Family<ReasonLabel, Counter>,
     publish_forwarded_total: Family<ReasonLabel, Counter>,
     deliver_latency_seconds: Histogram,
     hub_dispatch_seconds: Family<CommandLabel, Histogram>,
+    /// ADR 0092 T3: one resolved handle per [`HUB_COMMAND_CLASSES`] entry, so the
+    /// hub loop's per-command observation is a histogram update and nothing else.
+    hub_dispatch_cache: [std::sync::OnceLock<Histogram>; HUB_COMMAND_CLASSES.len()],
     /// Issue #613 item 1.6: the peer fan-out's own time and the number of peer
     /// links it visited, split out of `hub_dispatch_seconds` so "a fan-out walked
     /// zero links" and "no fan-outs happened" are different readings.
@@ -662,6 +733,8 @@ pub struct Metrics {
     /// Issue #613 item 3.5: shared selections by locality, incremented exactly
     /// once per DELIVERED message.
     shared_selected_total: Family<LocalityLabel, Counter>,
+    /// One resolved handle per [`LOCALITY_LABELS`] entry (ADR 0092 T3).
+    shared_selected_cache: [std::sync::OnceLock<Counter>; LOCALITY_LABELS.len()],
     append_lane_jobs: Gauge,
     pending_publishes: Gauge,
     pending_publish_bytes: Gauge,
@@ -699,6 +772,8 @@ pub struct Metrics {
     publish_ack_seconds: Histogram,
     /// Async-runtime scheduling delay, sampled by `mqttd::runtime_probe`.
     runtime_wake_seconds: Family<ProbeLabel, Histogram>,
+    /// One resolved handle per [`PROBE_LABELS`] entry (ADR 0092 T3).
+    runtime_wake_cache: [std::sync::OnceLock<Histogram>; PROBE_LABELS.len()],
     /// HTTP auth hook round-trip latency in seconds (ADR 0004 T16). On the CONNECT path,
     /// so its tail IS connection-setup latency.
     http_auth_latency_seconds: Histogram,
@@ -764,6 +839,8 @@ pub struct Metrics {
     /// tier (`quorum`, `local`, `relaxed`) — non-default tiers appear only
     /// under the operator's `MQTTD_ALLOW_RELAXED_PUBLISH` opt-in.
     publish_tier_total: Family<TierLabel, Counter>,
+    /// One resolved handle per [`TIER_LABELS`] entry (ADR 0092 T3): counted per publish.
+    publish_tier_cache: [std::sync::OnceLock<Counter>; TIER_LABELS.len()],
     /// Durable-write serializer (ADR 0071): fsync'd batches committed and ops
     /// applied across them (owner appends + follower replica applies share one
     /// writer). ops/batches = mean group-commit batch size.
@@ -1930,11 +2007,14 @@ impl Metrics {
             connection_errors_total,
             publish_received_total,
             publish_delivered_total,
+            publish_received_cache: Default::default(),
+            publish_delivered_cache: Default::default(),
             publish_dropped_total,
             publish_resolved_undeliverable_total,
             publish_forwarded_total,
             deliver_latency_seconds,
             hub_dispatch_seconds,
+            hub_dispatch_cache: Default::default(),
             hub_fanout_seconds,
             hub_fanout_peer_visits_total,
             hub_queue_depth,
@@ -1947,6 +2027,7 @@ impl Metrics {
             sessions_quarantined,
             publish_held_for_unreachable,
             shared_selected_total,
+            shared_selected_cache: Default::default(),
             append_lane_jobs,
             pending_publishes,
             pending_publish_bytes,
@@ -1976,6 +2057,7 @@ impl Metrics {
             durable_stage_cache: Default::default(),
             publish_ack_seconds,
             runtime_wake_seconds,
+            runtime_wake_cache: Default::default(),
             http_auth_latency_seconds,
             http_auth_outcomes_total,
             durable_append_failures_total,
@@ -2007,6 +2089,7 @@ impl Metrics {
             retained_queue_dropped_total,
             audit_export_dropped_total,
             publish_tier_total,
+            publish_tier_cache: Default::default(),
             durable_writer_batches_total,
             durable_writer_commit_micros_total,
             store_barrier_floor,
@@ -2140,26 +2223,22 @@ impl Metrics {
 
     /// A PUBLISH was received from a client at `qos` (0/1/2).
     pub fn publish_received(&self, qos: u8) {
-        self.publish_received_total
-            .get_or_create(&QosLabel {
-                qos: qos.to_string(),
-            })
-            .inc();
-        self.otel
-            .publish_received
-            .add(1, &[KeyValue::new("qos", qos.to_string())]);
+        let qos = inc_by_qos(
+            &self.publish_received_total,
+            &self.publish_received_cache,
+            qos,
+        );
+        self.otel.publish_received.add(1, &[qos]);
     }
 
     /// A PUBLISH was delivered to a subscriber at `qos` (0/1/2).
     pub fn publish_delivered(&self, qos: u8) {
-        self.publish_delivered_total
-            .get_or_create(&QosLabel {
-                qos: qos.to_string(),
-            })
-            .inc();
-        self.otel
-            .publish_delivered
-            .add(1, &[KeyValue::new("qos", qos.to_string())]);
+        let qos = inc_by_qos(
+            &self.publish_delivered_total,
+            &self.publish_delivered_cache,
+            qos,
+        );
+        self.otel.publish_delivered.add(1, &[qos]);
     }
 
     /// A message was dropped. `reason` is a **bounded** class — the label set is fixed by
@@ -2263,14 +2342,31 @@ impl Metrics {
     /// quorum await, the defect issue #242 removed) shows up here as tail mass. Alert:
     /// p99 over ~100ms sustained for 5m (docs/OPERATIONS.md).
     pub fn observe_hub_dispatch(&self, command: &str, seconds: f64) {
-        self.hub_dispatch_seconds
-            .get_or_create(&CommandLabel {
-                command: command.to_string(),
-            })
-            .observe(seconds);
-        self.otel
-            .hub_dispatch
-            .record(seconds, &[KeyValue::new("command", command.to_string())]);
+        // ADR 0092 T3: the hub loop lands here once per command, so the known classes
+        // go through a handle resolved once and an attribute that allocates nothing.
+        if let Some(i) = label_index(&HUB_COMMAND_CLASSES, command) {
+            self.hub_dispatch_cache[i]
+                .get_or_init(|| {
+                    self.hub_dispatch_seconds
+                        .get_or_create(&CommandLabel {
+                            command: HUB_COMMAND_CLASSES[i].to_string(),
+                        })
+                        .clone()
+                })
+                .observe(seconds);
+            self.otel
+                .hub_dispatch
+                .record(seconds, &[KeyValue::new("command", HUB_COMMAND_CLASSES[i])]);
+        } else {
+            self.hub_dispatch_seconds
+                .get_or_create(&CommandLabel {
+                    command: command.to_string(),
+                })
+                .observe(seconds);
+            self.otel
+                .hub_dispatch
+                .record(seconds, &[KeyValue::new("command", command.to_string())]);
+        }
     }
 
     /// Observe one publish's PEER fan-out: the time it spent on the hub loop and
@@ -2412,14 +2508,29 @@ impl Metrics {
     /// "exactly one member per group" invariant this counter is supposed to
     /// corroborate.
     pub fn shared_selected(&self, locality: &str) {
-        self.shared_selected_total
-            .get_or_create(&LocalityLabel {
-                locality: locality.to_string(),
-            })
-            .inc();
-        self.otel
-            .shared_selected
-            .add(1, &[KeyValue::new("locality", locality.to_string())]);
+        if let Some(i) = label_index(&LOCALITY_LABELS, locality) {
+            self.shared_selected_cache[i]
+                .get_or_init(|| {
+                    self.shared_selected_total
+                        .get_or_create(&LocalityLabel {
+                            locality: LOCALITY_LABELS[i].to_string(),
+                        })
+                        .clone()
+                })
+                .inc();
+            self.otel
+                .shared_selected
+                .add(1, &[KeyValue::new("locality", LOCALITY_LABELS[i])]);
+        } else {
+            self.shared_selected_total
+                .get_or_create(&LocalityLabel {
+                    locality: locality.to_string(),
+                })
+                .inc();
+            self.otel
+                .shared_selected
+                .add(1, &[KeyValue::new("locality", locality.to_string())]);
+        }
     }
 
     /// Set the current count of admitted-but-uncompleted durable-append lane jobs,
@@ -2678,11 +2789,18 @@ impl Metrics {
     /// Observe one gated publish's server-side publish → ack release.
     /// Observe one runtime scheduling-delay sample (`probe` is `yield` or `channel`).
     pub fn observe_runtime_wake(&self, probe: &'static str, seconds: f64) {
-        self.runtime_wake_seconds
-            .get_or_create(&ProbeLabel {
-                probe: probe.to_string(),
-            })
-            .observe(seconds);
+        let label = || ProbeLabel {
+            probe: probe.to_string(),
+        };
+        match label_index(&PROBE_LABELS, probe) {
+            Some(i) => self.runtime_wake_cache[i]
+                .get_or_init(|| self.runtime_wake_seconds.get_or_create(&label()).clone())
+                .observe(seconds),
+            None => self
+                .runtime_wake_seconds
+                .get_or_create(&label())
+                .observe(seconds),
+        }
     }
 
     pub fn observe_publish_ack(&self, seconds: f64) {
@@ -3540,11 +3658,19 @@ impl Metrics {
 
     /// One gated publish at `tier` (ADR 0072): `quorum`, `local`, or `relaxed`.
     pub fn publish_tier(&self, tier: &str) {
-        self.publish_tier_total
-            .get_or_create(&TierLabel {
-                tier: tier.to_string(),
-            })
-            .inc();
+        let label = || TierLabel {
+            tier: tier.to_string(),
+        };
+        match label_index(&TIER_LABELS, tier) {
+            Some(i) => {
+                self.publish_tier_cache[i]
+                    .get_or_init(|| self.publish_tier_total.get_or_create(&label()).clone())
+                    .inc();
+            }
+            None => {
+                self.publish_tier_total.get_or_create(&label()).inc();
+            }
+        }
     }
 
     /// Advance the durable-write serializer's counters (ADR 0071) by the deltas a

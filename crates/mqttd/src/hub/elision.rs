@@ -85,12 +85,35 @@ pub(super) struct ElisionState {
     /// Writes in flight whose live send waits for them, per session, connection and
     /// topic (Amendment 1 A5): a hold may not overtake one on its own topic.
     pub(super) writing: HashMap<(ClientId, u64, String), usize>,
+    /// Emptied per-session queues kept for the next session that holds a delivery
+    /// (ADR 0092 T3): a session's queue empties on nearly every PUBACK, and building
+    /// it again on the next hold was one allocation per publish. Bounded by
+    /// [`SPARE_QUEUES`]; past that an emptied queue is freed as before.
+    pub(super) spare: Vec<VecDeque<Elided>>,
 }
+
+/// How many emptied per-session queues [`ElisionState::spare`] keeps.
+const SPARE_QUEUES: usize = 1024;
 
 impl Hub {
     /// Switch write elision on with this window (ADR 0089). `0` keeps it off.
     pub fn set_write_elision_ms(&mut self, ms: u32) {
         self.elision.window = (ms > 0).then(|| Duration::from_millis(u64::from(ms)));
+    }
+
+    /// `client`'s queue emptied: out of the map, its buffer kept for reuse up to
+    /// [`SPARE_QUEUES`] (ADR 0092 T3).
+    fn recycle_elided_queue(&mut self, client: &ClientId) {
+        if let Some(queue) = self.elision.by_client.remove(client) {
+            self.keep_spare_queue(queue);
+        }
+    }
+
+    fn keep_spare_queue(&mut self, mut queue: VecDeque<Elided>) {
+        if self.elision.spare.len() < SPARE_QUEUES {
+            queue.clear();
+            self.elision.spare.push(queue);
+        }
     }
 
     /// Whether a delivery to online persistent session `client` may be held instead of
@@ -133,13 +156,19 @@ impl Hub {
         // A write in flight on this topic: its delivery goes on the wire after the
         // write, and a held one would overtake it. Other topics' writes do not block:
         // MQTT orders a topic, not a session (Amendment 1 A5).
-        let conn = self.online.get(client).map(|o| o.conn_id);
-        if conn.is_some_and(|c| {
-            self.elision
-                .writing
-                .contains_key(&(client.clone(), c, message.topic.clone()))
-        }) {
-            return false;
+        // The key is built only while some write is in flight at all: with the window
+        // discharging nearly every delivery, `writing` is empty most of the time, and
+        // building the key was a topic `String` and a tuple hash per delivery for an
+        // answer the emptiness already gave (ADR 0092 T3).
+        if !self.elision.writing.is_empty() {
+            let conn = self.online.get(client).map(|o| o.conn_id);
+            if conn.is_some_and(|c| {
+                self.elision
+                    .writing
+                    .contains_key(&(client.clone(), c, message.topic.clone()))
+            }) {
+                return false;
+            }
         }
         if let Some(inf) = self.inflight.get(client) {
             // A packet id and a send slot free now: a delivery that would wait in the
@@ -200,10 +229,12 @@ impl Hub {
         let deadline = sent + window_in_force(window, self.elision.entries, self.elision.bytes);
         self.elision.entries += 1;
         self.elision.bytes += message.payload.len();
-        self.elision
-            .by_client
+        let ElisionState {
+            by_client, spare, ..
+        } = &mut *self.elision;
+        by_client
             .entry(client.clone())
-            .or_default()
+            .or_insert_with(|| spare.pop().unwrap_or_default())
             .push_back(Elided {
                 pkid,
                 message: message.clone(),
@@ -227,7 +258,7 @@ impl Hub {
         };
         let e = queue.remove(at).expect("position found it");
         if queue.is_empty() {
-            self.elision.by_client.remove(client);
+            self.recycle_elided_queue(client);
         }
         self.elision.entries -= 1;
         self.elision.bytes -= e.message.payload.len();
@@ -243,10 +274,10 @@ impl Hub {
     /// Fall back every delivery `client` holds, in send order (D3, D5). `reason` is
     /// the bounded class the fallback is counted under.
     pub(super) fn flush_elided(&mut self, client: &ClientId, reason: &'static str) {
-        let Some(queue) = self.elision.by_client.remove(client) else {
+        let Some(mut queue) = self.elision.by_client.remove(client) else {
             return;
         };
-        for e in queue {
+        for e in queue.drain(..) {
             self.elision.entries -= 1;
             self.elision.bytes -= e.message.payload.len();
             self.elision.fallbacks += 1;
@@ -258,6 +289,7 @@ impl Hub {
                 self.fallback_write(client, &e.message, e.message_expiry, &e.gate, Some(e.pkid));
             self.release_registration(&then);
         }
+        self.keep_spare_queue(queue);
     }
 
     /// A delivery on `topic` takes the durable path: what `client` holds on that topic is
