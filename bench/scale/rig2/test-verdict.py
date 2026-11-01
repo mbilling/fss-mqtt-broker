@@ -808,7 +808,7 @@ class DropReasons(unittest.TestCase):
                   "outbound-id-write-failed"):
             self.assertFalse(V.drop_is_loss(r), r)
         for r in ("outbound-full", "append-backlog-full", "queue-overflow", "backlog-overflow", "no-shared-member",
-                  "peer-unreachable", "brownout", "hub-ingress"):
+                  "peer-unreachable", "brownout", "hub-ingress", "shard-member-gone"):
             self.assertTrue(V.drop_is_loss(r), r)
         self.assertTrue(V.drop_is_loss("never-heard-of-it"))
 

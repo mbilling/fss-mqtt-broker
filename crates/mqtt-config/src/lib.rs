@@ -3840,6 +3840,9 @@ mod tests {
             // change nothing and the totality sweep would read as a missing mapping.
             // MQTTD_REPLICAS (ADR 0080): a valid factor that is not the default (2).
             "MQTTD_BACKUP_KEEP" | "MQTTD_RESTORE_TIMEOUT" | "MQTTD_REPLICAS" => "3",
+            // MQTTD_HUB_SHARDS (ADR 0092 T5): the default is one loop, and the node refuses
+            // more than four, so "7" would not start a node.
+            "MQTTD_HUB_SHARDS" => "2",
             // Paths / addresses / lists / keys.
             _ => "x-sentinel",
         }
@@ -4058,8 +4061,9 @@ mod tests {
             // plus MQTTD_TLS_END_SESSIONS_AT_CERT_EXPIRY (ADR 0088 O2),
             // plus MQTTD_DURABLE_WRITE_ELISION_MS (ADR 0089),
             // plus MQTTD_WRITE_STALL_KEEPALIVES and MQTTD_WRITE_STALL_TIMEOUT (#1117),
-            // plus MQTTD_HUB_THREAD and MQTTD_HUB_CORE (ADR 0092 D1).
-            131,
+            // plus MQTTD_HUB_THREAD and MQTTD_HUB_CORE (ADR 0092 D1),
+            // plus MQTTD_HUB_SHARDS (ADR 0092 T5).
+            132,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never
