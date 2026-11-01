@@ -6,7 +6,7 @@ Source of truth: `mqtt_config::ENV_VARS` and `Config::overlay_from` in `crates/m
 
 The annotated template is [`mqttd.example.toml`](mqttd.example.toml). Capacity arithmetic lives in [SIZING.md](SIZING.md); day-2 procedures in [OPERATIONS.md](OPERATIONS.md). This page is the inventory of knobs, not the runbook.
 
-Documented overlay variables: **131** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) and any experimental side-channel knobs below.
+Documented overlay variables: **132** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) and any experimental side-channel knobs below.
 
 ## Node identity
 
@@ -18,6 +18,7 @@ Documented overlay variables: **131** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) 
 | `MQTTD_FAILURE_DOMAINS` | `node.failure_domains` | Static `node-id → domain` failure-domain topology (`MQTTD_FAILURE_DOMAINS`). |
 | `MQTTD_HUB_THREAD` | `node.hub_thread` | Run the hub loop on an OS thread of its own (`MQTTD_HUB_THREAD`, ADR 0092 D1, withdrawn by its Amendment 1). Default `false`: measured on the rig, the thread made every hand-off out of the hub a remote wake and cost a lone m6i.8xlarge 23% of its durable `QoS` 1 knee. `true` keeps the experiment available. Restart-scoped. |
 | `MQTTD_HUB_CORE` | `node.hub_core` | Pin the hub's thread to this CPU (`MQTTD_HUB_CORE`, ADR 0092 D1; Linux only, a warning elsewhere). Unset = not pinned. The runtime's workers are not kept off that CPU: for a core of the hub's own, keep the rest of the process off it too (a `taskset`, a cpuset). Ignored with `hub_thread = false`. Restart-scoped. |
+| `MQTTD_HUB_SHARDS` | `node.hub_shards` | How many hub loops ("data shards") the node runs (`MQTTD_HUB_SHARDS`, ADR 0092 T5's prototype): each owns the clients of disjoint placement groups, and a publish matched on one shard is handed to the others for the subscribers they own. Default `1`, the one loop; `2` to `4` is the one-node prototype, refused on a node that names peers (`cluster.peers`, `cluster.swim.seeds`) and run with a warning on a node alone in its cluster. With `hub_thread = true`, shard `k` is pinned to `hub_core + k`. Restart-scoped. |
 
 ## Listeners
 

@@ -26,7 +26,7 @@
 //! here: they are never a hub command and wait in none of the hub's lanes.
 
 use crate::conn::ConnPolicy;
-use crate::hub::{HubCommand, PeerOutbound};
+use crate::hub::{HubCommand, HubTx, PeerOutbound};
 use crate::ingress::{IngressCredit, IngressPermit};
 use crate::rule_state::{StateLink, Store as RuleState};
 use bytes::BytesMut;
@@ -426,7 +426,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Counted<'_, T> {
 pub async fn serve_listener(
     listener: TcpListener,
     local: NodeId,
-    hub: mpsc::UnboundedSender<HubCommand>,
+    hub: HubTx,
     tls: Option<PeerTls>,
     client_policy: Option<Arc<ConnPolicy>>,
     plane: Option<DurablePlane>,
@@ -442,7 +442,7 @@ pub async fn serve_listener(
 pub async fn serve_listener_with_ingress(
     listener: TcpListener,
     local: NodeId,
-    hub: mpsc::UnboundedSender<HubCommand>,
+    hub: HubTx,
     tls: Option<PeerTls>,
     client_policy: Option<Arc<ConnPolicy>>,
     plane: Option<DurablePlane>,
@@ -536,7 +536,7 @@ pub async fn serve_listener_with_ingress(
 pub async fn dial_forever(
     addr: String,
     local: NodeId,
-    hub: mpsc::UnboundedSender<HubCommand>,
+    hub: HubTx,
     tls: Option<PeerTls>,
     plane: Option<DurablePlane>,
 ) {
@@ -549,7 +549,7 @@ pub async fn dial_forever(
 pub async fn dial_forever_with_ingress(
     addr: String,
     local: NodeId,
-    hub: mpsc::UnboundedSender<HubCommand>,
+    hub: HubTx,
     tls: Option<PeerTls>,
     plane: Option<DurablePlane>,
     ingress: Option<Arc<IngressCredit>>,
@@ -600,7 +600,7 @@ pub async fn dial_forever_with_ingress(
 pub async fn dial_member(
     addr: String,
     local: NodeId,
-    hub: mpsc::UnboundedSender<HubCommand>,
+    hub: HubTx,
     tls: Option<PeerTls>,
     plane: Option<DurablePlane>,
     ingress: Option<Arc<IngressCredit>>,
@@ -892,7 +892,7 @@ async fn serve_dialed_tls<'a>(
     name: &tokio_rustls::rustls::pki_types::ServerName<'static>,
     t: &PeerTls,
     local: &'a NodeId,
-    hub: &'a mpsc::UnboundedSender<HubCommand>,
+    hub: &'a HubTx,
     plane: Option<&'a DurablePlane>,
     ingress: Option<&'a Arc<IngressCredit>>,
     state: Option<&'a Arc<RuleState>>,
@@ -970,7 +970,7 @@ async fn serve_dialed_tls<'a>(
 async fn dial(
     addr: String,
     local: NodeId,
-    hub: mpsc::UnboundedSender<HubCommand>,
+    hub: HubTx,
     tls: Option<PeerTls>,
     plane: Option<DurablePlane>,
     ingress: Option<Arc<IngressCredit>>,
@@ -1244,7 +1244,7 @@ fn negotiated_proto(node_id: &str, proto_min: u32, proto_max: u32) -> Option<u32
 async fn handle<S>(
     stream: S,
     local: NodeId,
-    hub: mpsc::UnboundedSender<HubCommand>,
+    hub: HubTx,
     initiated: bool,
     expected_cn: Option<String>,
     dialed: Option<Dialed<'_>>,
@@ -1511,7 +1511,7 @@ async fn pump<R, W>(
     rh: &mut R,
     wh: &mut W,
     buf: &mut BytesMut,
-    hub: &mpsc::UnboundedSender<HubCommand>,
+    hub: &HubTx,
     remote: &NodeId,
     conn_id: u64,
     ctl_rx: &mut mpsc::UnboundedReceiver<PeerMessage>,
@@ -1688,7 +1688,7 @@ fn peer_credit(
 #[allow(clippy::too_many_arguments)] // the link's handles, as `pump` holds them
 fn forward_inbound(
     msg: PeerMessage,
-    hub: &mpsc::UnboundedSender<HubCommand>,
+    hub: &HubTx,
     remote: &NodeId,
     conn_id: u64,
     plane: Option<&DurablePlane>,
@@ -2288,6 +2288,7 @@ mod tests {
     async fn control_frames_jump_the_bulk_queue() {
         let (mut ours, theirs) = tokio::io::duplex(1 << 20);
         let (hub_tx, _hub_rx) = mpsc::unbounded_channel();
+        let hub_tx = HubTx::from(hub_tx);
         let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel();
         let (out_tx, mut out_rx) = mpsc::unbounded_channel();
 
@@ -2368,6 +2369,7 @@ mod tests {
         async fn wait_ns(capacity: usize, filter: String, hold: Duration) -> u64 {
             let (mut ours, theirs) = tokio::io::duplex(capacity);
             let (hub_tx, _hub_rx) = mpsc::unbounded_channel();
+            let hub_tx = HubTx::from(hub_tx);
             let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<PeerMessage>();
             let (out_tx, mut out_rx) = mpsc::unbounded_channel();
             out_tx
@@ -2470,6 +2472,7 @@ mod tests {
             app: WireAppProps::default(),
         };
         let (hub, mut rx) = mpsc::unbounded_channel();
+        let hub = HubTx::from(hub);
         let (ctl, _ctl_rx) = mpsc::unbounded_channel::<PeerMessage>();
         let (bulk, _bulk_rx) = mpsc::unbounded_channel::<PeerMessage>();
         let (ctl, bulk) = (ctl.downgrade(), bulk.downgrade());
@@ -2570,6 +2573,7 @@ mod tests {
             (stream_b, b.clone(), "b", "a"),
         ] {
             let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+            let hub_tx = HubTx::from(hub_tx);
             let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel();
             let (out_tx, mut out_rx) = mpsc::unbounded_channel::<PeerMessage>();
             let (reply_ctl, reply_bulk) = (ctl_tx.downgrade(), out_tx.downgrade());
@@ -2654,6 +2658,7 @@ mod tests {
             set(&*namespace, "before");
             let (mut ours, theirs) = tokio::io::duplex(1 << 20);
             let (hub_tx, mut hub_rx) = mpsc::unbounded_channel();
+            let hub_tx = HubTx::from(hub_tx);
             let link = tokio::spawn(handle(
                 theirs,
                 NodeId("a".into()),
@@ -2769,6 +2774,7 @@ mod tests {
         mpsc::UnboundedReceiver<HubCommand>,
     ) {
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let hub_tx = HubTx::from(hub_tx);
         let dialer = tokio::spawn(dial(
             addr.to_string(),
             NodeId("a".into()),

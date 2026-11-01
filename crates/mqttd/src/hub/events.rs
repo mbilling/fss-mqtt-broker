@@ -122,8 +122,12 @@ impl Hub {
         let mut watch = rules.message_watch();
         self.events.wants = watch.wants();
         self.events.watch = Some(watch);
-        self.events.notes = Some(rules.spawn_notes(self.self_tx.clone()));
-        self.events.expiry = rules.spawn_expiry(self.self_tx.clone());
+        // The notes and expiry tasks are the node's, not a loop's: one shard runs them
+        // (ADR 0092 T5), or every rule-state event would be raised once per shard.
+        if self.shard == 0 {
+            self.events.notes = Some(rules.spawn_notes(super::HubTx::from(self.self_tx.clone())));
+            self.events.expiry = rules.spawn_expiry(super::HubTx::from(self.self_tx.clone()));
+        }
         // The memory watermark may have been passed before the rules were attached.
         if let Some(state) = rules.state() {
             state.set_brownout(

@@ -18,7 +18,7 @@ use mqtt_cluster::NodeId;
 use mqtt_codec::packet::{Connect, Subscribe, SubscribeFilter};
 use mqtt_codec::{Packet, Properties, Property as P, ProtocolVersion, QoS, SubscriptionOptions};
 use mqtt_storage::{MemorySessionStore, OverflowPolicy, QueueLimits};
-use mqttd::hub::{Hub, HubCommand};
+use mqttd::hub::{Hub, HubCommand, HubTx};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
@@ -52,7 +52,7 @@ const NONE: &str = "";
 
 struct Broker {
     addr: SocketAddr,
-    hub_tx: tokio::sync::mpsc::UnboundedSender<HubCommand>,
+    hub_tx: HubTx,
 }
 
 /// Admits any username (with any password) and no credentials.

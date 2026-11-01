@@ -405,7 +405,7 @@ async fn the_running_rules_are_read_whole_by_an_operator_and_redacted_for_a_view
     tokio::spawn(mqttd::rules_sys::run_stats(
         n.rules.clone(),
         Some(n.metrics.clone()),
-        hub_tx,
+        hub_tx.into(),
         Arc::new(IngressCredit::new(64 << 20, 1 << 20, OverloadMode::Pause)),
         Arc::new(LastReload::default()),
         std::time::SystemTime::now(),

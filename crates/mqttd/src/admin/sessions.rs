@@ -13,14 +13,14 @@ use super::http::Request;
 use super::routes::{error, Answer};
 use super::AdminState;
 use crate::hub::admin::{AdminRequest, SessionFilter};
-use crate::hub::HubCommand;
+use crate::hub::{HubCommand, HubTx};
 use mqtt_cluster::placement::Placement;
 use mqtt_core::ClientId;
 use mqtt_storage::SessionStore;
 use serde_json::{json, Value};
 use std::fmt::Write;
 use std::sync::{Arc, RwLock};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 /// Default page size when a request names none.
 pub(super) const DEFAULT_LIMIT: usize = 100;
@@ -32,7 +32,7 @@ const QUEUE_COUNT_CAP: usize = 10_000;
 #[derive(Clone)]
 pub struct SessionAccess {
     /// The hub's command channel.
-    pub hub: mpsc::UnboundedSender<HubCommand>,
+    pub hub: HubTx,
     /// The session store, for an offline session's queued messages.
     pub store: Arc<dyn SessionStore>,
     /// Placement, for a session's owning node (`None` on a standalone node).
@@ -76,7 +76,7 @@ fn non_empty(req: &Request, name: &str) -> Option<String> {
 
 /// Send a request to the hub and wait for its answer.
 async fn ask<T>(
-    hub: &mpsc::UnboundedSender<HubCommand>,
+    hub: &HubTx,
     build: impl FnOnce(oneshot::Sender<T>) -> AdminRequest,
 ) -> Result<T, Answer> {
     let (tx, rx) = oneshot::channel();

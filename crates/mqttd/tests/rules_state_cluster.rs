@@ -22,7 +22,7 @@ use common::Client;
 use mqtt_cluster::NodeId;
 use mqtt_codec::{Packet, QoS};
 use mqtt_storage::MemorySessionStore;
-use mqttd::hub::{Hub, HubCommand};
+use mqttd::hub::{Hub, HubCommand, HubTx};
 use mqttd::rule_state::Store;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -61,7 +61,7 @@ struct Node {
     id: NodeId,
     addr: SocketAddr,
     peer_addr: SocketAddr,
-    hub_tx: tokio::sync::mpsc::UnboundedSender<HubCommand>,
+    hub_tx: HubTx,
     state: Arc<Store>,
 }
 

@@ -393,6 +393,10 @@ pub(super) struct PendingPublish {
     /// reconnect storm). Relaxed grants latency below congestion, not
     /// immunity from capacity.
     pub(super) congested: bool,
+    /// ADR 0092 T5: the shards still owed a [`HubCommand::ShardDone`] for this publish,
+    /// a bit per shard; the ack waits for every one of them, as it waits for a peer's
+    /// answer. Fits the entry's padding.
+    pub(super) shard_outstanding: u8,
 }
 
 impl PendingPublish {
@@ -767,6 +771,7 @@ impl Hub {
         }
         let reached: FastSet<ClientId> = self
             .ordinary_targets(&topic, None, retain)
+            .0
             .into_iter()
             .map(|(c, _, _)| c)
             .collect();
@@ -1558,6 +1563,7 @@ impl Hub {
                 ack_awaits_settle: self.routing_unsettled(),
                 relaxed: false,
                 congested: false,
+                shard_outstanding: 0,
             },
         );
         id
@@ -4363,7 +4369,7 @@ mod zone_fwd_proofs {
             let link_manager = tokio::spawn(crate::cluster::maintain_peer_links(
                 event_rx,
                 NodeId("z".into()),
-                to_hub,
+                crate::hub::HubTx::from(to_hub),
                 None,
                 None,
                 None,

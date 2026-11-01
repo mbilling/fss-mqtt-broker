@@ -84,4 +84,4 @@ caller changes this file and the gate fails until it is regenerated and re-read.
 | `crates/mqttd/tests/v5_protocol.rs` | `v5_session_expires_after_interval` | `v5-session-expiry-wire` | 4s | in the test itself |
 | `crates/mqttd/tests/v5_protocol.rs` | `v5_disconnect_session_expiry_overrides_the_connect_value` | `v5-disconnect-expiry-override` | 4s | in the test itself |
 | `crates/mqttd/tests/wire.rs` | `a_split_between_the_type_byte_and_the_length_is_parsed` | `wire-split-read-events` | 50ms | in the test itself |
-| `crates/mqttd/tests/write_stall.rs` | `ping` | `ping-cadence` | ? | helper, 68 call site(s) |
+| `crates/mqttd/tests/write_stall.rs` | `ping` | `ping-cadence` | ? | helper, 70 call site(s) |

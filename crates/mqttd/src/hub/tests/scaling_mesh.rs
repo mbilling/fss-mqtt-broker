@@ -95,7 +95,7 @@ struct Mesh {
     _ctl: Vec<mpsc::UnboundedReceiver<PeerMessage>>,
     probe: std::sync::Arc<crate::hub::probe::HubProbe>,
     /// Kept so the hub's own command channel never reports "closed".
-    _tx: mpsc::UnboundedSender<HubCommand>,
+    _tx: HubTx,
 }
 
 impl Mesh {

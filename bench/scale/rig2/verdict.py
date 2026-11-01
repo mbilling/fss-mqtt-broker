@@ -169,6 +169,8 @@ DROP_IS_LOSS = {
     "peer-backlog": True,            # hub/forwarding.rs, hub/mod.rs: QoS 0 forward shed at a backlogged peer link
     "peer-unreachable": True,        # hub/forwarding.rs: ungated forward not sent to an interested peer with no link
     "no-shared-member": True,        # hub/delivery.rs, hub/mod.rs: a $share group none of whose members was reachable
+    "shard-member-gone": True,       # hub/shards.rs (ADR 0092 T5): the $share member the origin shard dealt to had left
+                                     # its shard before the hand-off arrived; withheld when gated, a genuine drop for QoS 0
     "too-large": True,               # conn.rs: over that subscriber's Maximum Packet Size (per spec, still not delivered)
     # A message the broker had stored or acknowledged, gone for its subscriber.
     "queue-overflow": True,          # hub/lanes.rs: durable session queue at its cap (evict-oldest / reject-newest)

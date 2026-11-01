@@ -21,10 +21,9 @@ use mqtt_codec::packet::{Ack, Connect, Publish, Subscribe, SubscribeFilter};
 use mqtt_codec::{Packet, Properties, Property, ProtocolVersion, QoS, SubscriptionOptions};
 use mqtt_observability::metrics::Metrics;
 use mqttd::conn::ConnPolicy;
-use mqttd::hub::{Hub, HubCommand};
+use mqttd::hub::{Hub, HubTx};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 const V5: ProtocolVersion = ProtocolVersion::V5;
@@ -66,7 +65,7 @@ fn policy(metrics: &Arc<Metrics>) -> Arc<ConnPolicy> {
 
 struct Broker {
     addr: std::net::SocketAddr,
-    hub_tx: mpsc::UnboundedSender<HubCommand>,
+    hub_tx: HubTx,
     metrics: Arc<Metrics>,
 }
 

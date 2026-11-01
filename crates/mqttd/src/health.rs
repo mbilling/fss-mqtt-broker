@@ -27,7 +27,7 @@
 //! secret material, all of it on the same unauthenticated ops-network trust model as
 //! the probes (ADR 0020 §2).
 
-use crate::hub::HubCommand;
+use crate::hub::{HubCommand, HubTx};
 use mqtt_cluster::decommission::DrainStatus;
 use mqtt_cluster::durable_plane::DurablePlane;
 use mqtt_cluster::placement::Placement;
@@ -35,7 +35,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tracing::debug;
 
 /// How long the liveness probe waits for the hub to answer its ping before
@@ -114,7 +114,7 @@ const MAX_REQUEST_HEAD: usize = 32 * 1024;
 /// readiness inputs (live membership and, when durable, the lease-group endpoint).
 #[derive(Clone)]
 pub struct HealthState {
-    hub: mpsc::UnboundedSender<HubCommand>,
+    hub: HubTx,
     placement: Option<Arc<RwLock<Placement>>>,
     durable: Option<DurablePlane>,
     min_members: usize,
@@ -261,7 +261,7 @@ impl HealthState {
     /// membership gate).
     #[must_use]
     pub fn new(
-        hub: mpsc::UnboundedSender<HubCommand>,
+        hub: HubTx,
         placement: Option<Arc<RwLock<Placement>>>,
         durable: Option<DurablePlane>,
         min_members: usize,
@@ -1044,7 +1044,7 @@ async fn write_response(
 #[cfg(test)]
 mod tests {
     use super::{parse_request_line, HealthState, LIVE_TIMEOUT};
-    use crate::hub::HubCommand;
+    use crate::hub::{HubCommand, HubTx};
     use mqtt_cluster::placement::{Placement, DEFAULT_REPLICAS};
     use mqtt_cluster::NodeId;
     use std::sync::{Arc, RwLock};
@@ -1054,7 +1054,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     /// A hub stand-in that answers pings, so `live()` succeeds.
-    fn spawn_live_hub() -> mpsc::UnboundedSender<HubCommand> {
+    fn spawn_live_hub() -> HubTx {
         let (tx, mut rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             while let Some(cmd) = rx.recv().await {
@@ -1063,7 +1063,7 @@ mod tests {
                 }
             }
         });
-        tx
+        HubTx::from(tx)
     }
 
     fn placement(members: usize) -> Arc<RwLock<Placement>> {
@@ -1107,7 +1107,7 @@ mod tests {
         // A hub whose receiver is dropped is not live.
         let (tx, rx) = mpsc::unbounded_channel();
         drop(rx);
-        let dead = HealthState::new(tx, None, None, 1);
+        let dead = HealthState::new(HubTx::from(tx), None, None, 1);
         assert_eq!(super::route(&dead, "/livez").await.0, 503);
     }
 

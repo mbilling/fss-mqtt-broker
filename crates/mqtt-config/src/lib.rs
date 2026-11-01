@@ -81,6 +81,14 @@ pub struct Node {
     /// CPU: for a core of the hub's own, keep the rest of the process off it too (a
     /// `taskset`, a cpuset). Ignored with `hub_thread = false`. Restart-scoped.
     pub hub_core: Option<u32>,
+    /// How many hub loops ("data shards") the node runs (`MQTTD_HUB_SHARDS`, ADR 0092 T5's
+    /// prototype): each owns the clients of disjoint placement groups, and a publish
+    /// matched on one shard is handed to the others for the subscribers they own. Default
+    /// `1`, the one loop; `2` to `4` is the one-node prototype, refused on a node that
+    /// names peers (`cluster.peers`, `cluster.swim.seeds`) and run with a warning on a
+    /// node alone in its cluster. With `hub_thread = true`, shard `k` is pinned to
+    /// `hub_core + k`. Restart-scoped.
+    pub hub_shards: u8,
 }
 
 /// The node id a broker uses when the operator sets none.
@@ -99,6 +107,7 @@ impl Default for Node {
             failure_domains: BTreeMap::new(),
             hub_thread: false,
             hub_core: None,
+            hub_shards: 1,
         }
     }
 }
@@ -1417,6 +1426,10 @@ impl Config {
         on!("MQTTD_HUB_CORE", v, {
             self.node.hub_core = Some(num("MQTTD_HUB_CORE", &v)?);
         });
+        // ADR 0092 T5: the node's data shards (the prototype); 1 is the one loop.
+        on!("MQTTD_HUB_SHARDS", v, {
+            self.node.hub_shards = num("MQTTD_HUB_SHARDS", &v)?;
+        });
         on!("MQTTD_FAILURE_DOMAINS", v, {
             let mut m = BTreeMap::new();
             for pair in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -2555,6 +2568,7 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_SHARED_LOCAL_BIAS",
     "MQTTD_HUB_THREAD",
     "MQTTD_HUB_CORE",
+    "MQTTD_HUB_SHARDS",
     "MQTTD_OWNERSHIP_DOMAIN",
     // limits
     "MQTTD_MAX_CONNECTIONS",
@@ -2804,21 +2818,26 @@ mod tests {
         let d = Config::default().node;
         assert!(!d.hub_thread);
         assert_eq!(d.hub_core, None);
+        // ADR 0092 T5: one loop unless the prototype's shards are asked for.
+        assert_eq!(d.hub_shards, 1);
         let c = Config::from_toml(
-            "[node]\nhub_thread = true\nhub_core = 3\n[durable]\nallow_ephemeral = true\n",
+            "[node]\nhub_thread = true\nhub_core = 3\nhub_shards = 2\n[durable]\nallow_ephemeral = true\n",
         )
         .unwrap();
         assert!(c.node.hub_thread);
         assert_eq!(c.node.hub_core, Some(3));
+        assert_eq!(c.node.hub_shards, 2);
 
         let mut c = Config::default();
         c.overlay_from(getter(&[
             ("MQTTD_HUB_THREAD", "on"),
             ("MQTTD_HUB_CORE", "2"),
+            ("MQTTD_HUB_SHARDS", "2"),
         ]))
         .unwrap();
         assert!(c.node.hub_thread);
         assert_eq!(c.node.hub_core, Some(2));
+        assert_eq!(c.node.hub_shards, 2);
 
         // An explicit on/off, never a guess; a core is a number.
         let mut c = Config::default();
@@ -3823,6 +3842,9 @@ mod tests {
             // change nothing and the totality sweep would read as a missing mapping.
             // MQTTD_REPLICAS (ADR 0080): a valid factor that is not the default (2).
             "MQTTD_BACKUP_KEEP" | "MQTTD_RESTORE_TIMEOUT" | "MQTTD_REPLICAS" => "3",
+            // MQTTD_HUB_SHARDS (ADR 0092 T5): the default is one loop, and the node refuses
+            // more than four, so "7" would not start a node; four is the most it runs.
+            "MQTTD_HUB_SHARDS" => "4",
             // Paths / addresses / lists / keys.
             _ => "x-sentinel",
         }
@@ -4041,8 +4063,9 @@ mod tests {
             // plus MQTTD_TLS_END_SESSIONS_AT_CERT_EXPIRY (ADR 0088 O2),
             // plus MQTTD_DURABLE_WRITE_ELISION_MS (ADR 0089),
             // plus MQTTD_WRITE_STALL_KEEPALIVES and MQTTD_WRITE_STALL_TIMEOUT (#1117),
-            // plus MQTTD_HUB_THREAD and MQTTD_HUB_CORE (ADR 0092 D1).
-            131,
+            // plus MQTTD_HUB_THREAD and MQTTD_HUB_CORE (ADR 0092 D1),
+            // plus MQTTD_HUB_SHARDS (ADR 0092 T5).
+            132,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never

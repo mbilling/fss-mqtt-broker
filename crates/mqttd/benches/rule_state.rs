@@ -1015,7 +1015,7 @@ impl Pair {
             let serve = tokio::spawn(mqttd::peer::serve_listener_with_ingress(
                 listener,
                 NodeId("node-b".into()),
-                hub_b,
+                hub_b.into(),
                 None,
                 None,
                 None,
@@ -1025,7 +1025,7 @@ impl Pair {
             let dial = tokio::spawn(mqttd::peer::dial_forever_with_ingress(
                 addr.to_string(),
                 NodeId("node-a".into()),
-                hub_a,
+                hub_a.into(),
                 None,
                 None,
                 None,

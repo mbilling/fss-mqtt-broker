@@ -327,7 +327,7 @@ pub struct Reloader {
     /// Set by [`attach_identity_sweep`](Self::attach_identity_sweep): after a
     /// successful swap, the hub sweeps live sessions against the new policy
     /// (ADR 0040 T2).
-    sweep_hub: Option<tokio::sync::mpsc::UnboundedSender<crate::hub::HubCommand>>,
+    sweep_hub: Option<crate::hub::HubTx>,
     /// Re-reads the client-listener CRL's revoked serials for the sweep; `None` when
     /// no `MQTTD_TLS_CRL` is configured (the sweep then checks users + connect-ACL only).
     client_crl_build: Option<Box<dyn Fn() -> ClientCrlBuildResult + Send + Sync>>,
@@ -479,7 +479,7 @@ impl Reloader {
     /// policy did not change).
     pub fn attach_identity_sweep(
         &mut self,
-        hub: tokio::sync::mpsc::UnboundedSender<crate::hub::HubCommand>,
+        hub: crate::hub::HubTx,
         client_crl_build: Option<Box<dyn Fn() -> ClientCrlBuildResult + Send + Sync>>,
     ) {
         self.sweep_hub = Some(hub);
@@ -1044,6 +1044,7 @@ mod tests {
         let initial = ok_build().unwrap();
         let (mut reloader, _handles) = Reloader::new(initial, audit(), ok_build);
         let (hub_tx, mut hub_rx) = tokio::sync::mpsc::unbounded_channel();
+        let hub_tx = crate::hub::HubTx::from(hub_tx);
         reloader.attach_identity_sweep(
             hub_tx,
             Some(Box::new(|| Ok(RevocationList::from_serials([vec![0x42]])))),
@@ -1063,6 +1064,7 @@ mod tests {
             Err("acl: parse error".into())
         });
         let (hub_tx, mut hub_rx) = tokio::sync::mpsc::unbounded_channel();
+        let hub_tx = crate::hub::HubTx::from(hub_tx);
         reloader.attach_identity_sweep(hub_tx, None);
         assert!(!reloader.reload("signal"));
         assert!(
@@ -1073,6 +1075,7 @@ mod tests {
         // A bad client CRL rejects the whole reload — and no sweep fires.
         let (mut reloader, handles) = Reloader::new(ok_build().unwrap(), audit(), ok_build);
         let (hub_tx, mut hub_rx) = tokio::sync::mpsc::unbounded_channel();
+        let hub_tx = crate::hub::HubTx::from(hub_tx);
         reloader.attach_identity_sweep(
             hub_tx,
             Some(Box::new(|| Err("client crl: parse error".into()))),

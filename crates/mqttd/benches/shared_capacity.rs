@@ -11,14 +11,14 @@ use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use mqtt_codec::{Packet, ProtocolVersion, QoS};
 use mqtt_core::{AppProperties, ClientId};
-use mqttd::hub::{Admission, AttachOutcome, AuthMethod, Hub, Outbound, MAX_OUTBOUND_QUEUE};
+use mqttd::hub::{Admission, AttachOutcome, AuthMethod, Hub, HubTx, Outbound, MAX_OUTBOUND_QUEUE};
 use mqttd::HubCommand;
 use tokio::sync::{mpsc, oneshot, Notify};
 
 const BURST: usize = 2_000;
 
 struct Rig {
-    tx: mpsc::UnboundedSender<HubCommand>,
+    tx: HubTx,
     received: Arc<AtomicUsize>,
     changed: Arc<Notify>,
     tasks: Vec<tokio::task::JoinHandle<()>>,

@@ -15,7 +15,7 @@ use common::Client;
 use mqtt_codec::{packet::Ack, Packet, QoS};
 use mqtt_observability::metrics::Metrics;
 use mqttd::health::HealthState;
-use mqttd::hub::{Hub, HubCommand};
+use mqttd::hub::{Hub, HubCommand, HubTx};
 use mqttd::ingress::{IngressCredit, OverloadMode};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -61,11 +61,7 @@ fn paused(metrics: &Metrics) -> u64 {
 async fn start(
     credit: &Arc<IngressCredit>,
     metrics: &Arc<Metrics>,
-) -> (
-    SocketAddr,
-    SocketAddr,
-    tokio::sync::mpsc::UnboundedSender<HubCommand>,
-) {
+) -> (SocketAddr, SocketAddr, HubTx) {
     let (mut hub, hub_tx) = Hub::new();
     hub.attach_ingress(credit.clone());
     hub.attach_metrics(metrics.clone());

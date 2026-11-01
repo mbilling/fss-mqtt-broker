@@ -76,10 +76,7 @@ async fn start_two_node_cluster() -> (SocketAddr, SocketAddr) {
     (caddr_a, caddr_b)
 }
 
-fn spawn_client_loop(
-    listener: TcpListener,
-    tx: tokio::sync::mpsc::UnboundedSender<mqttd::HubCommand>,
-) {
+fn spawn_client_loop(listener: TcpListener, tx: mqttd::hub::HubTx) {
     tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
@@ -339,7 +336,7 @@ async fn build_durable_retained_node(
     NodeId,
     SocketAddr, // client addr
     SocketAddr, // peer addr
-    tokio::sync::mpsc::UnboundedSender<mqttd::HubCommand>,
+    mqttd::hub::HubTx,
     std::sync::Arc<std::sync::RwLock<mqtt_cluster::placement::Placement>>,
 ) {
     use mqtt_cluster::placement::{Placement, DEFAULT_REPLICAS};
@@ -638,8 +635,7 @@ async fn divergent_retained_writes_across_a_partition_converge_after_heal() {
     let (id_b, cli_b, peer_b, tx_b, _) = build_durable_retained_node("part-b", "part-a").await;
 
     // A severable full-mesh link (mirrors common::link/sever).
-    let link = |tx_a: &tokio::sync::mpsc::UnboundedSender<mqttd::HubCommand>,
-                tx_b: &tokio::sync::mpsc::UnboundedSender<mqttd::HubCommand>| {
+    let link = |tx_a: &mqttd::hub::HubTx, tx_b: &mqttd::hub::HubTx| {
         vec![
             tokio::spawn(mqttd::peer::dial_forever(
                 peer_b.to_string(),

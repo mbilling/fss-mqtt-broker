@@ -180,7 +180,7 @@ struct NodeHandles {
     client_addr: SocketAddr,
     peer_addr: SocketAddr,
     peer_listener: Option<TcpListener>,
-    hub_tx: tokio::sync::mpsc::UnboundedSender<mqttd::HubCommand>,
+    hub_tx: mqttd::hub::HubTx,
     node_id: NodeId,
 }
 
@@ -535,12 +535,7 @@ impl Seen {
 /// A sender that counts links and verdicts on their way to `hub`. A command is
 /// counted once it has been handed on, so a count read here is of commands the hub
 /// already holds.
-fn tapped(
-    hub: tokio::sync::mpsc::UnboundedSender<mqttd::HubCommand>,
-) -> (
-    tokio::sync::mpsc::UnboundedSender<mqttd::HubCommand>,
-    std::sync::Arc<Seen>,
-) {
+fn tapped(hub: mqttd::hub::HubTx) -> (mqttd::hub::HubTx, std::sync::Arc<Seen>) {
     use std::sync::atomic::Ordering::SeqCst;
     let (tap_tx, mut tap_rx) = tokio::sync::mpsc::unbounded_channel();
     let seen = std::sync::Arc::new(Seen::default());
@@ -562,7 +557,7 @@ fn tapped(
             }
         }
     });
-    (tap_tx, seen)
+    (tap_tx.into(), seen)
 }
 
 /// The membership event a SWIM driver raises about node `id` at `peer_addr`.

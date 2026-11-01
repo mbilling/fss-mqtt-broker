@@ -96,7 +96,7 @@ use mqtt_rules::{
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
 
-use crate::hub::{DerivedPublish, HubCommand, PublishBatch, PublishOutcome};
+use crate::hub::{DerivedPublish, HubCommand, HubTx, PublishBatch, PublishOutcome};
 
 /// The live rule set, swapped by a reload (ADR 0032 validate-before-swap).
 pub type RulesWatch = watch::Receiver<Arc<RuleSet>>;
@@ -730,10 +730,7 @@ impl Rules {
     /// when the sender is dropped. It evaluates like a connection does, off the hub
     /// loop, and posts what the rules derive to `hub`.
     #[must_use]
-    pub fn spawn_notes(
-        &self,
-        hub: mpsc::UnboundedSender<HubCommand>,
-    ) -> mpsc::Sender<Box<MessageNote>> {
+    pub fn spawn_notes(&self, hub: HubTx) -> mpsc::Sender<Box<MessageNote>> {
         let (tx, mut rx) = mpsc::channel::<Box<MessageNote>>(NOTE_QUEUE);
         // No connection's task: each note is evaluated on an empty dictionary.
         let rules = ConnRules {
@@ -774,10 +771,7 @@ impl Rules {
     /// keys are held for it, or not), again at every reload. While no loaded rule
     /// keeps state it waits for the next reload and sets no timer.
     #[must_use]
-    pub fn spawn_expiry(
-        &self,
-        hub: mpsc::UnboundedSender<HubCommand>,
-    ) -> Option<oneshot::Sender<()>> {
+    pub fn spawn_expiry(&self, hub: HubTx) -> Option<oneshot::Sender<()>> {
         let store = self.state.clone()?;
         let rules = ConnRules {
             keeps_dictionary: false,
@@ -1037,7 +1031,7 @@ impl ConnRules {
         &self,
         note: &MessageNote,
         receiver: Option<&mqtt_rules::ClientInfo<'_>>,
-        hub: &mpsc::UnboundedSender<HubCommand>,
+        hub: &HubTx,
     ) {
         let kind = match note.event {
             NoteEvent::Dropped { .. } => EventKind::MessageDropped,
@@ -1082,13 +1076,7 @@ impl ConnRules {
     /// publish its session refuses (`emqx_session:on_dropped_qos2_msg/3`),
     /// `packet_identifier_inuse` and `receive_maximum_exceeded`. `dup` is the packet's
     /// DUP flag.
-    pub fn fire_dropped(
-        &self,
-        f: &PublishFacts<'_>,
-        dup: bool,
-        reason: &str,
-        hub: &mpsc::UnboundedSender<HubCommand>,
-    ) {
+    pub fn fire_dropped(&self, f: &PublishFacts<'_>, dup: bool, reason: &str, hub: &HubTx) {
         if !self.wants(EventKind::MessageDropped) {
             return;
         }
@@ -1112,7 +1100,7 @@ impl ConnRules {
     /// Evaluate a client, session or message event and publish what its rules produce
     /// ([`Rules::send_derived`]). A message event's rules get the budget its message's
     /// payload earns, and what they republish continues the message's republish chain.
-    pub fn fire_event(&self, input: &EventInput, hub: &mpsc::UnboundedSender<HubCommand>) {
+    pub fn fire_event(&self, input: &EventInput, hub: &HubTx) {
         let metrics = self.engine.metrics.as_deref();
         let observe = self.engine.observe.as_deref();
         let node = &self.engine.node;
@@ -1168,7 +1156,7 @@ impl ConnRules {
         &self,
         store: &crate::rule_state::Store,
         pace: &mut crate::rule_state::Pace,
-        hub: &mpsc::UnboundedSender<HubCommand>,
+        hub: &HubTx,
     ) -> Option<std::time::Duration> {
         /// The keys removed between two yields while no event is owed.
         const CHUNK: usize = 4096;
@@ -2415,6 +2403,7 @@ mod tests {
             .with_functions(functions)
             .with_state(Some(store.clone()));
         let (hub, mut posted) = mpsc::unbounded_channel();
+        let hub = crate::hub::HubTx::from(hub);
         let running = rules.spawn_expiry(hub).expect("rule state is on");
         assert!(store.expiry_events());
 
@@ -2449,6 +2438,7 @@ mod tests {
 
         let (off, _tx) = rules_of("");
         let (hub, _posted) = mpsc::unbounded_channel();
+        let hub = crate::hub::HubTx::from(hub);
         assert!(off.spawn_expiry(hub).is_none(), "no store, no task");
     }
 

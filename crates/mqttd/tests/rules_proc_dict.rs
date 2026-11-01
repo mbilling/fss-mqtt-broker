@@ -40,13 +40,13 @@ use common::Client;
 use mqtt_cluster::NodeId;
 use mqtt_codec::{Packet, QoS};
 use mqtt_storage::MemorySessionStore;
-use mqttd::hub::{BrownoutAxis, Hub, HubCommand};
+use mqttd::hub::{BrownoutAxis, Hub, HubCommand, HubTx};
 use mqttd::rule_state::Store;
 use tokio::net::TcpListener;
 
 struct Broker {
     addr: SocketAddr,
-    hub_tx: tokio::sync::mpsc::UnboundedSender<HubCommand>,
+    hub_tx: HubTx,
     /// The store whose ceiling the connections' dictionaries count against.
     state: Arc<Store>,
     /// The rules are never reloaded here; the watch lives as long as the broker.

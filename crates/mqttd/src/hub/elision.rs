@@ -153,7 +153,9 @@ impl Hub {
         // the publish; a Will or a back-fill has nobody to answer.
         if !matches!(
             gate,
-            AppendGate::Pending(_) | AppendGate::Peer { replay: false, .. }
+            AppendGate::Pending(_)
+                | AppendGate::Peer { replay: false, .. }
+                | AppendGate::Shard { .. }
         ) {
             return false;
         }
@@ -489,6 +491,7 @@ impl Hub {
                     });
                 g.awaiting += 1;
             }
+            AppendThen::Shard(origin, id) => self.register_shard_gate(*origin, *id),
             AppendThen::Ungated => {}
         }
     }
@@ -503,6 +506,7 @@ impl Hub {
                 self.try_complete_pending(*id);
             }
             AppendThen::Peer(node, seq) => self.settle_peer(node, *seq, DurableOutcome::Ok, false),
+            AppendThen::Shard(_, id) => self.settle_shard(*id, DurableOutcome::Ok, false),
             AppendThen::Ungated => {}
         }
     }
@@ -518,6 +522,7 @@ impl Hub {
                 self.try_complete_pending(*id);
             }
             AppendThen::Peer(node, seq) => self.settle_peer(node, *seq, DurableOutcome::Ok, true),
+            AppendThen::Shard(_, id) => self.settle_shard(*id, DurableOutcome::Ok, true),
             AppendThen::Ungated => {}
         }
     }
@@ -533,6 +538,7 @@ impl Hub {
             AppendThen::Peer(node, seq) => {
                 self.settle_peer(node, *seq, DurableOutcome::Failed, false);
             }
+            AppendThen::Shard(_, id) => self.settle_shard(*id, DurableOutcome::Failed, false),
             AppendThen::Ungated => {}
         }
     }

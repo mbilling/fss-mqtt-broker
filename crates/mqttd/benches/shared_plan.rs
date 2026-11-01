@@ -58,7 +58,7 @@ use mqtt_codec::ProtocolVersion;
 use mqtt_codec::QoS;
 use mqtt_core::{AppProperties, ClientId};
 use mqtt_storage::MemorySessionStore;
-use mqttd::hub::{Admission, AuthMethod, Hub, Outbound, RemoteSharedGroup};
+use mqttd::hub::{Admission, AuthMethod, Hub, HubTx, Outbound, RemoteSharedGroup};
 use mqttd::HubCommand;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
@@ -80,11 +80,7 @@ fn peer_groups(node: usize, groups_per_node: usize) -> Vec<RemoteSharedGroup> {
         .collect()
 }
 
-fn hub_with_peers(
-    rt: &tokio::runtime::Runtime,
-    peers: usize,
-    groups_per_node: usize,
-) -> mpsc::UnboundedSender<HubCommand> {
+fn hub_with_peers(rt: &tokio::runtime::Runtime, peers: usize, groups_per_node: usize) -> HubTx {
     let (hub, tx) = Hub::with_config(NodeId("bench".into()), Arc::new(MemorySessionStore::new()));
     rt.spawn(hub.run());
     for n in 0..peers {
@@ -130,7 +126,7 @@ fn hub_with_subscribers(
     rt: &tokio::runtime::Runtime,
     drain: &tokio::runtime::Runtime,
     subs: usize,
-) -> mpsc::UnboundedSender<HubCommand> {
+) -> HubTx {
     let (hub, tx) = Hub::with_config(NodeId("bench".into()), Arc::new(MemorySessionStore::new()));
     rt.spawn(hub.run());
     rt.block_on(async {
@@ -178,7 +174,7 @@ fn hub_with_subscribers(
 /// processes its queue in order, so the final completion means every earlier one
 /// was dispatched too — this measures dispatch throughput rather than per-message
 /// round-trip latency.
-async fn publish_burst(tx: &mpsc::UnboundedSender<HubCommand>, count: usize) {
+async fn publish_burst(tx: &HubTx, count: usize) {
     let payload = Bytes::from_static(&[0u8; 200]);
     for i in 0..count {
         let last = i + 1 == count;

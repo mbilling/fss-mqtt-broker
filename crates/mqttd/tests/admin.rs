@@ -141,10 +141,7 @@ struct Node<'a> {
     peers: Option<PeerAccess>,
     /// A running hub (and its store) to serve the session endpoints from; `None` spawns
     /// a bare hub with no session endpoints.
-    hub: Option<(
-        tokio::sync::mpsc::UnboundedSender<mqttd::HubCommand>,
-        Arc<MemorySessionStore>,
-    )>,
+    hub: Option<(mqttd::hub::HubTx, Arc<MemorySessionStore>)>,
     /// The live authorizer for the dry run.
     authz: Option<mqttd::admin::authz::LiveAuthorizer>,
     /// The reloader and config stamp for the config and reload endpoints, and the live

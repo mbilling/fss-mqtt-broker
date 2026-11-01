@@ -277,7 +277,7 @@ struct StressNode {
     scan_hold: Arc<std::sync::atomic::AtomicBool>,
     /// The hub's command channel — the harness drives brownout entry/exit
     /// through it (ADR 0041 T5), exactly like the store-size watcher does.
-    hub_tx: mpsc::UnboundedSender<mqttd::hub::HubCommand>,
+    hub_tx: mqttd::hub::HubTx,
     aborts: Vec<AbortHandle>,
 }
 
