@@ -16730,7 +16730,9 @@ mod tests {
                 acks: vec![crate::hub::AckedDelivery::plain(pkid)],
             }))
             .unwrap();
-            // SETTLE(window): past the window the hub prunes the settled hold.
+            // SETTLE(window): a fallback write wrongly owed for the settled hold would be
+            // submitted only when its window ends, so nothing observable says "none"
+            // before the window has passed; a slow machine only lengthens the wait.
             tokio::time::sleep(Duration::from_millis(u64::from(COST_WINDOW_MS) + 40)).await;
             assert_eq!(
                 store.appends.load(std::sync::atomic::Ordering::SeqCst),
@@ -16785,6 +16787,9 @@ mod tests {
         };
         // c settles on its connection task; the publisher still waits for d.
         hold_c.expect("held").acked(None);
+        // SETTLE(fan-out-arming): the hub arms the gate after its fan-out pass, which
+        // nothing outside the loop can observe; 20 ms is far above one dispatch on any
+        // machine, and a slower one only weakens this negative check, never fails it.
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(
             matches!(done.try_recv(), Err(oneshot::error::TryRecvError::Empty)),

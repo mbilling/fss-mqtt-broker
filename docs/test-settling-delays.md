@@ -44,6 +44,8 @@ caller changes this file and the gate fails until it is regenerated and re-read.
 | `crates/mqttd/src/hub/mod.rs` | `enqueue_with_expiry` | `append-hold` | 10ms | helper, 8 call site(s) |
 | `crates/mqttd/src/hub/mod.rs` | `enqueue_with_expiry` | `write-delay` | ? | helper, 8 call site(s) |
 | `crates/mqttd/src/hub/mod.rs` | `publisher_wait` | `subscriber-ack-delay` | ? | helper, 4 call site(s) |
+| `crates/mqttd/src/hub/mod.rs` | `a_held_delivery_settled_on_the_connection_task_answers_the_publisher_off_the_loop` | `window` | COST_WINDOW_MS | in the test itself |
+| `crates/mqttd/src/hub/mod.rs` | `a_fan_out_held_for_two_subscribers_is_answered_after_both_wherever_they_settle` | `fan-out-arming` | 20ms | in the test itself |
 | `crates/mqttd/src/hub/mod.rs` | `successor_hub` | `successor-scan-cadence` | EXPIRY_RECONCILE_EVERY | helper, 3 call site(s) |
 | `crates/mqttd/src/hub/mod.rs` | `enqueue_with_expiry` | `store-slow-first-enqueue` | ? | helper, 8 call site(s) |
 | `crates/mqttd/src/hub/mod.rs` | `an_uncongested_relaxed_forward_is_answered_at_submit` | `early-verdict-uniqueness` | 100ms | in the test itself |
