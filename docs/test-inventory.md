@@ -887,12 +887,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_whole_env_surface_overlays_without_collision`
 - `tests::warn_mode_boots_a_newer_config_and_reports_the_ignored_keys`
 
-## `crates/mqtt-core/src/lib.rs` — 60 test(s)
+## `crates/mqtt-core/src/lib.rs` — 56 test(s)
 
-- `filter_index::tests::a_deep_wildcard_chain_drops_without_recursion`
-- `filter_index::tests::a_trie_node_stays_small`
-- `filter_index::tests::a_wildcard_only_node_survives_its_siblings_removal`
-- `filter_index::tests::removing_a_wildcard_filter_leaves_its_siblings`
 - `retry::tests::delays_ramp_within_jitter_bounds_and_cap`
 - `retry::tests::reset_returns_to_base`
 - `secrets::tests::passes_clean_and_empty_input_through`
