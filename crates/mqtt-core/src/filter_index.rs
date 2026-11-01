@@ -246,15 +246,83 @@ impl FilterIndex {
                     stack.push((p, i + 1, false));
                 }
             }
-            let level = levels[i];
-            // A topic level spelled "+" or "#" was already answered by the wildcard
-            // arms above (those keys ARE the wildcard children); looking it up as a
-            // literal would visit the same node twice.
-            if level != "+" && level != "#" {
-                if let Some(c) = node.children.get(level) {
-                    stack.push((c, i + 1, false));
-                }
+            // `children` holds literal levels only — the wildcards live in their own
+            // fields — so a level spelled "+" or "#" simply finds nothing here.
+            if let Some(c) = node.children.get(levels[i]) {
+                stack.push((c, i + 1, false));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FilterIndex, TrieNode};
+    use crate::FilterKey;
+
+    fn key(s: &str) -> FilterKey {
+        FilterKey::from(s)
+    }
+
+    fn matches(index: &FilterIndex, topic: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        index.for_each_matching(topic, |f| out.push(String::from(&**f)));
+        out.sort();
+        out
+    }
+
+    /// The wildcard children are fields: removing `a/+` while `a/#` and `a/b` remain
+    /// cuts only the `+` field, and the other two keep matching.
+    #[test]
+    fn removing_a_wildcard_filter_leaves_its_siblings() {
+        let mut index = FilterIndex::new();
+        for f in ["a/+", "a/#", "a/b"] {
+            index.insert(&key(f));
+        }
+        assert_eq!(matches(&index, "a/b"), ["a/#", "a/+", "a/b"]);
+        index.remove("a/+");
+        assert_eq!(matches(&index, "a/b"), ["a/#", "a/b"]);
+        assert_eq!(matches(&index, "a/c"), ["a/#"]);
+        index.remove("a/#");
+        assert_eq!(matches(&index, "a/c"), Vec::<String>::new());
+        assert!(!index.is_empty());
+        index.remove("a/b");
+        assert!(
+            index.is_empty(),
+            "every filter removed leaves an empty index"
+        );
+    }
+
+    /// A node whose only child is a wildcard still counts as having children, so it is
+    /// not pruned under a filter that goes through it.
+    #[test]
+    fn a_wildcard_only_node_survives_its_siblings_removal() {
+        let mut index = FilterIndex::new();
+        index.insert(&key("a/+/c"));
+        index.insert(&key("a"));
+        index.remove("a");
+        assert_eq!(matches(&index, "a/x/c"), ["a/+/c"]);
+        assert_eq!(matches(&index, "a"), Vec::<String>::new());
+    }
+
+    /// A deep chain of `+` levels is dropped iteratively through the fields, like a
+    /// deep chain of literals through the map.
+    #[test]
+    fn a_deep_wildcard_chain_drops_without_recursion() {
+        let mut index = FilterIndex::new();
+        let deep = vec!["+"; 50_000].join("/");
+        index.insert(&key(&deep));
+        assert_eq!(matches(&index, &vec!["x"; 50_000].join("/")).len(), 1);
+        drop(index);
+    }
+
+    /// One node's size is paid per registered topic level; the keyed hasher's state and
+    /// the two wildcard fields are in it (ADR 0092 T3). Measured 2026-11-01 under the
+    /// test profile; a change that grows it past the pin shows up here.
+    #[test]
+    fn a_trie_node_stays_small() {
+        let actual = std::mem::size_of::<TrieNode>();
+        println!("TrieNode = {actual} B");
+        assert!(actual <= 128, "TrieNode grew to {actual} B (pinned at 128)");
     }
 }

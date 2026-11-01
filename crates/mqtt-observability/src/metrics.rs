@@ -160,6 +160,11 @@ struct CommandLabel {
 /// Every `{command}` class the hub records, in the order of [`Metrics::hub_dispatch_cache`]
 /// (ADR 0092 T3: the hub loop observes one of these per command, so each handle is
 /// resolved once; a class outside this set still works, through the family lookup).
+///
+/// Every handle cache below (`*_cache`) holds a clone of a family's metric, so it assumes
+/// that family is never cleared and never has a label set removed: an observation through
+/// a stale handle would go on counting a series the family no longer exports. Only the
+/// rule-state and TLS families are ever removed from, and none of them is cached.
 const HUB_COMMAND_CLASSES: [&str; 7] = [
     "attach",
     "publish",

@@ -3824,19 +3824,21 @@ impl Hub {
         let class = cmd.class();
         let started = Instant::now();
         // ADR 0092 T3: a command's dispatch future is built and moved once per command,
-        // and `dispatch`'s carries the locals of every arm — 5.3 KB on 2026-10-31, set
+        // and `dispatch`'s carried the locals of every arm — 5.3 KB on 2026-10-31, set
         // by the attach, cluster and sweep paths, copied for every publish and every
         // PUBACK (memcpy was 14% of the hub task). A publish takes its own path here
-        // (1.9 KB, the fan-out's), the PUBACK takes none at all (in `run`), and
-        // everything else runs boxed: one allocation per rare command instead of a
-        // 5 KB copy per frequent one. (`dispatch` starts with `refresh_message_wants`;
-        // so do the fast paths.)
+        // (1.9 KB, the fan-out's), the PUBACK takes none at all (in `run`), and the
+        // rare arms of `dispatch` and `dispatch_cluster` run boxed inside them, so the
+        // commands that come once per message on other workloads — an append's
+        // completion, a QoS 2 ack, a peer's frame — ride a small future with no
+        // allocation. (`dispatch` starts with `refresh_message_wants`; so does the
+        // publish path.) `a_dispatch_future_stays_small` pins the sizes.
         match cmd {
             cmd @ HubCommand::Publish { .. } => {
                 self.refresh_message_wants();
                 self.dispatch_publish(cmd).await;
             }
-            cmd => Box::pin(self.dispatch(cmd)).await,
+            cmd => self.dispatch(cmd).await,
         }
         self.dispatched(class, started);
     }
@@ -3961,7 +3963,7 @@ impl Hub {
                 );
             }
             HubCommand::SessionRecovered { pending, recovery } => {
-                self.session_recovered(*pending, recovery).await;
+                Box::pin(self.session_recovered(*pending, recovery)).await;
             }
             HubCommand::Subscribe {
                 client,
@@ -3972,7 +3974,7 @@ impl Hub {
                 retain_handling,
                 reply,
             } => {
-                self.subscribe(
+                Box::pin(self.subscribe(
                     &client,
                     filters,
                     no_local_filters,
@@ -3980,7 +3982,7 @@ impl Hub {
                     rap_filters,
                     retain_handling,
                     reply,
-                )
+                ))
                 .await;
             }
             HubCommand::SetQuotas(quotas) => {
@@ -4004,7 +4006,7 @@ impl Hub {
                             .map(|e| e.qos)
                     })
                     .collect();
-                let existed = self.unsubscribe(&client, &filters).await;
+                let existed = Box::pin(self.unsubscribe(&client, &filters)).await;
                 if let Some(reply) = reply {
                     // A dropped receiver means the connection died mid-unsubscribe;
                     // the removal itself already happened either way.
@@ -4027,7 +4029,7 @@ impl Hub {
                     credit: _credit,
                     derived_credit: _derived_credit,
                 } = *batch;
-                let routed = self.dispatch_publish(original).await;
+                let routed = Box::pin(self.dispatch_publish(original)).await;
                 for DerivedPublish {
                     rule,
                     publish,
@@ -4046,7 +4048,7 @@ impl Hub {
                     // Not routed: the command is dropped, its gate (if any) closes, and
                     // the publisher hears the original's own answer.
                     if routed {
-                        self.dispatch_publish(publish).await;
+                        Box::pin(self.dispatch_publish(publish)).await;
                     }
                 }
             }
@@ -4067,7 +4069,7 @@ impl Hub {
                     }
                 }
                 self.drain_gating = gate;
-                let routed = self.dispatch_publish(publish).await;
+                let routed = Box::pin(self.dispatch_publish(publish)).await;
                 self.drain_gating = false;
                 if !routed {
                     debug!(rule = %rule, "a message derived from an event or a Will was refused");
@@ -4087,7 +4089,7 @@ impl Hub {
                     content_type: Some("application/json".to_string()),
                     ..AppProperties::default()
                 };
-                self.route_publish(
+                Box::pin(self.route_publish(
                     HubCommand::Publish {
                         topic,
                         payload,
@@ -4101,7 +4103,7 @@ impl Hub {
                         credit,
                     },
                     true,
-                )
+                ))
                 .await;
             }
             HubCommand::RestoreRetained {
@@ -4121,12 +4123,12 @@ impl Hub {
                     self.count_reserved_drop();
                     let _ = done.send(PublishOutcome::Accepted);
                 } else {
-                    self.restore_retained(topic, payload, qos, message_expiry, app, done)
+                    Box::pin(self.restore_retained(topic, payload, qos, message_expiry, app, done))
                         .await;
                 }
             }
             HubCommand::RetainedExportSnapshot { done } => {
-                let snapshot = self.retained_export_snapshot().await;
+                let snapshot = Box::pin(self.retained_export_snapshot()).await;
                 let _ = done.send(snapshot);
             }
             HubCommand::AppendDone { job, outcome } => {
@@ -4160,17 +4162,16 @@ impl Hub {
                 self.flush_elided(&client, "disconnect");
                 self.forget_backoff(&client);
                 self.forget_writing(&client, conn_id);
-                self.detach(&client, conn_id, graceful, session_expiry_override)
-                    .await;
+                Box::pin(self.detach(&client, conn_id, graceful, session_expiry_override)).await;
             }
             HubCommand::Evict { client, reason } => {
-                self.evict(&client, &reason).await;
+                Box::pin(self.evict(&client, &reason)).await;
             }
             HubCommand::SweepIdentities(policy) => {
-                let identities = self.sweep_identities(&policy).await;
-                let grants = self.sweep_grants(&policy).await;
+                let identities = Box::pin(self.sweep_identities(&policy)).await;
+                let grants = Box::pin(self.sweep_grants(&policy)).await;
                 let peers = self.sweep_peers(&policy);
-                let relays = self.sweep_relays(&policy).await;
+                let relays = Box::pin(self.sweep_relays(&policy)).await;
                 // One summary record per sweep (ADR 0040 T5), zeros included — the
                 // proof the sweep ran is as valuable as what it did.
                 policy.audit.record(
@@ -4655,7 +4656,7 @@ impl Hub {
                 // 0014-T6): it pulls the (chunked) snapshot only if the sets differ,
                 // so a steady-state link-up or flap costs one small frame, not the
                 // whole retained set.
-                self.send_retained_digest(&node).await;
+                Box::pin(self.send_retained_digest(&node)).await;
                 // A heal trigger (ADR 0037 §5): the new link may be — or reach — the
                 // owner that queued retained mutations have been waiting for.
                 self.kick_retained_queue();
@@ -4701,7 +4702,7 @@ impl Hub {
                 // prober timed out; that is fine.
                 let _ = reply.send(());
             }
-            HubCommand::Admin(request) => self.admin(request).await,
+            HubCommand::Admin(request) => Box::pin(self.admin(request)).await,
             HubCommand::RemoteMessageEvents { node, wanted } => {
                 self.remote_message_events(&node, wanted);
             }
@@ -4724,7 +4725,7 @@ impl Hub {
                 }
             }
             HubCommand::RemoteRetainedSnapshot { node, messages } => {
-                self.apply_retained_snapshot(&node, messages).await;
+                Box::pin(self.apply_retained_snapshot(&node, messages)).await;
             }
             HubCommand::RemoteRetainedDigest {
                 node,
@@ -4732,11 +4733,10 @@ impl Hub {
                 hash,
                 value_hash,
             } => {
-                self.handle_retained_digest(&node, count, hash, value_hash)
-                    .await;
+                Box::pin(self.handle_retained_digest(&node, count, hash, value_hash)).await;
             }
             HubCommand::RemoteRetainedRequest { node } => {
-                self.send_retained_snapshot(&node).await;
+                Box::pin(self.send_retained_snapshot(&node)).await;
             }
             HubCommand::RemoteRetainedCommit {
                 node,
@@ -4803,7 +4803,7 @@ impl Hub {
                     // converges via the P5 back-fill on the next link-up), and drive
                     // the next queued mutation. Application properties travel with
                     // the value everywhere (ADR 0038 T3).
-                    self.apply_committed_retained(
+                    Box::pin(self.apply_committed_retained(
                         &topic,
                         &payload,
                         qos,
@@ -4812,7 +4812,7 @@ impl Hub {
                         expires_at,
                         // A restore delivers to nobody (see `RetainedMutation::restore`).
                         !restore,
-                    )
+                    ))
                     .await;
                     for peer in self.peers.values() {
                         let _ = peer.tx.send(PeerMessage::RetainedUpdate {
@@ -4869,14 +4869,14 @@ impl Hub {
                 app,
                 expires_at,
             } => {
-                self.apply_retained_update(
+                Box::pin(self.apply_retained_update(
                     &topic,
                     &payload,
                     qos,
                     &app,
                     (epoch, offset),
                     expires_at,
-                )
+                ))
                 .await;
             }
             HubCommand::RemoteSharedDeliver {
@@ -11059,9 +11059,13 @@ mod tests {
 
     /// ADR 0092 T3: a command's dispatch future is built and moved once per command, so
     /// its size is `memcpy` per message. `dispatch_timed`'s was 5,832 B on 2026-10-31
-    /// (14% of the hub task's time), set by `dispatch`'s rare arms; those run boxed now
-    /// and the publish rides a 1.9 KB future of its own. A change that grows it past
-    /// the pin fails here: box the cold await, or keep its locals off the hot arm.
+    /// (14% of the hub task's time), set by `dispatch`'s rare arms. Those arms, and
+    /// `dispatch_cluster`'s, run boxed inside their functions now, so `dispatch` is
+    /// 2,736 B, `dispatch_cluster` 1,192 B and `dispatch_timed` 3,304 B, and no
+    /// per-message command allocates: a publish rides `dispatch_publish` (1,920 B),
+    /// the rest ride `dispatch` unboxed. A change that grows one past its pin fails
+    /// here: box the cold await, or keep its locals off the hot arm. The sizes are the
+    /// test build's (debug in CI); a release layout differs a little.
     #[tokio::test]
     async fn a_dispatch_future_stays_small() {
         let store = std::sync::Arc::new(mqtt_storage::MemorySessionStore::new());
@@ -11078,20 +11082,16 @@ mod tests {
             v5: false,
             credit: None,
         };
-        let ack = || HubCommand::PubAck {
-            client: ClientId(std::sync::Arc::from("c1")),
-            pkid: 1,
-            received: tokio::time::Instant::now(),
+        let peer = || HubCommand::PeerAlive {
+            node: NodeId("peer".into()),
         };
         let f = hub.dispatch_timed(publish());
         let timed = std::mem::size_of_val(&f);
         println!("dispatch_timed future = {timed} B");
         drop(f);
         let f = hub.dispatch(publish());
-        println!(
-            "dispatch future = {} B (boxed per rare command)",
-            std::mem::size_of_val(&f)
-        );
+        let dispatch = std::mem::size_of_val(&f);
+        println!("dispatch future = {dispatch} B");
         drop(f);
         let f = hub.dispatch_publish(publish());
         let publish_fut = std::mem::size_of_val(&f);
@@ -11100,19 +11100,30 @@ mod tests {
         let f = hub.route_publish(publish(), false);
         println!("route_publish future = {} B", std::mem::size_of_val(&f));
         drop(f);
-        let f = hub.dispatch_cluster(ack());
-        println!("dispatch_cluster future = {} B", std::mem::size_of_val(&f));
+        let f = hub.dispatch_cluster(peer());
+        let cluster = std::mem::size_of_val(&f);
+        println!("dispatch_cluster future = {cluster} B");
         drop(f);
         let f = hub.run_sweep();
         println!("run_sweep future = {} B", std::mem::size_of_val(&f));
         drop(f);
         assert!(
-            timed <= 3072,
-            "dispatch_timed's future grew to {timed} B (pinned at 3,072)"
+            timed <= 3584,
+            "dispatch_timed's future grew to {timed} B (pinned at 3,584)"
         );
         assert!(
             publish_fut <= 2560,
             "dispatch_publish's future grew to {publish_fut} B (pinned at 2,560)"
+        );
+        // `dispatch` and `dispatch_cluster` are awaited unboxed, so their size is every
+        // non-publish command's copy: the arms that would grow them run boxed inside.
+        assert!(
+            dispatch <= 3072,
+            "dispatch's future grew to {dispatch} B (pinned at 3,072)"
+        );
+        assert!(
+            cluster <= 2048,
+            "dispatch_cluster's future grew to {cluster} B (pinned at 2,048)"
         );
     }
 

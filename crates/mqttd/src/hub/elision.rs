@@ -92,8 +92,12 @@ pub(super) struct ElisionState {
     pub(super) spare: Vec<VecDeque<Elided>>,
 }
 
-/// How many emptied per-session queues [`ElisionState::spare`] keeps.
+/// How many emptied per-session queues [`ElisionState::spare`] keeps, and the largest
+/// buffer it keeps: the per-publish case holds one entry, while a session that once
+/// held thousands (a slow consumer before its backoff, a brownout flush) hands back a
+/// buffer the pool must not carry for the life of the process.
 const SPARE_QUEUES: usize = 1024;
+const SPARE_QUEUE_CAPACITY: usize = 16;
 
 impl Hub {
     /// Switch write elision on with this window (ADR 0089). `0` keeps it off.
@@ -110,7 +114,7 @@ impl Hub {
     }
 
     fn keep_spare_queue(&mut self, mut queue: VecDeque<Elided>) {
-        if self.elision.spare.len() < SPARE_QUEUES {
+        if queue.capacity() <= SPARE_QUEUE_CAPACITY && self.elision.spare.len() < SPARE_QUEUES {
             queue.clear();
             self.elision.spare.push(queue);
         }
@@ -307,7 +311,7 @@ impl Hub {
             .into_iter()
             .partition(|e| e.message.topic == topic);
         if rest.is_empty() {
-            self.elision.by_client.remove(client);
+            self.recycle_elided_queue(client);
         } else {
             *self
                 .elision
