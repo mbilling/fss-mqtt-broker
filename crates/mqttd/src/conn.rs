@@ -2651,6 +2651,54 @@ fn negotiate_v5_properties(
     )
 }
 
+/// A subscriber's PUBACKs on their way to the hub (ADR 0092 T4): one command per batch
+/// instead of one per ack. A batch is what one read of the connection decoded — the
+/// serve loop flushes it before it waits for the socket again — or [`ACK_BATCH_MAX`]
+/// acks, whichever comes first, so no ack waits for another read. Dropping the batch
+/// flushes it too, so a connection that ends mid-read loses no ack.
+struct AckBatch<'a> {
+    hub: &'a mpsc::UnboundedSender<HubCommand>,
+    client: ClientId,
+    acks: Vec<(u16, Instant)>,
+}
+
+/// The most acks one [`AckBatch`] carries before it is sent.
+const ACK_BATCH_MAX: usize = 32;
+
+impl<'a> AckBatch<'a> {
+    fn new(hub: &'a mpsc::UnboundedSender<HubCommand>, client: ClientId) -> Self {
+        Self {
+            hub,
+            client,
+            acks: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, pkid: u16) {
+        self.acks.push((pkid, Instant::now()));
+        if self.acks.len() >= ACK_BATCH_MAX {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.acks.is_empty() {
+            return;
+        }
+        let acks = std::mem::take(&mut self.acks);
+        let _ = self.hub.send(HubCommand::PubAcks {
+            client: self.client.clone(),
+            acks,
+        });
+    }
+}
+
+impl Drop for AckBatch<'_> {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // a connection's full serving context
 /// One inbound `QoS` 1 publish whose durability round trip is still in flight
 /// (ADR 0075): the PUBACK is written by `serve`'s drain branch — strictly in
@@ -2955,8 +3003,15 @@ where
     tokio::pin!(stall);
     // Reply bytes queued since the writer was last empty (see `REPLY_BACKLOG_MAX`).
     let mut reply_bytes: usize = 0;
+    // The subscriber's PUBACKs on their way to the hub, a batch per read (ADR 0092 T4).
+    let mut acks = AckBatch::new(hub, client.clone());
 
     loop {
+        // Nothing left to decode from the last read: the next read waits for the
+        // socket, so the acks it decoded go to the hub now, as one command.
+        if !reader.has_buffered() {
+            acks.flush();
+        }
         if current.is_none() {
             current = pending_pubacks.pop_front();
         }
@@ -3038,7 +3093,7 @@ where
                         // [MQTT-3.14.4-3]); so is a v5 DISCONNECT with a non-zero
                         // reason, where the CLIENT asks for its Will (issue #265,
                         // [MQTT-3.1.2-10]).
-                        match handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, &mut qos2_inflight, &mut pending_pubacks, &mut current, is_v5, inbound_aliases, session_expiry, session_expiry_override, admission, credit.as_ref(), rule_conn).await? {
+                        match handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, &mut qos2_inflight, &mut pending_pubacks, &mut current, &mut acks, is_v5, inbound_aliases, session_expiry, session_expiry_override, admission, credit.as_ref(), rule_conn).await? {
                             PacketOutcome::Continue => {}
                             end => return Ok(rule_conn.ended(end)),
                         }
@@ -3067,7 +3122,7 @@ where
                 writer.restart_stall_clock();
                 match resume {
                     Resume::Packet(packet) => {
-                        match handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, &mut qos2_inflight, &mut pending_pubacks, &mut current, is_v5, inbound_aliases, session_expiry, session_expiry_override, IngressAdmit::Credit(Some(permit)), credit.as_ref(), rule_conn).await? {
+                        match handle_inbound(packet, writer, hub, client, &principal, policy, &mut qos2_inbound, &mut qos2_inflight, &mut pending_pubacks, &mut current, &mut acks, is_v5, inbound_aliases, session_expiry, session_expiry_override, IngressAdmit::Credit(Some(permit)), credit.as_ref(), rule_conn).await? {
                             PacketOutcome::Continue => {}
                             end => return Ok(rule_conn.ended(end)),
                         }
@@ -4140,6 +4195,7 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
     qos2_inflight: &mut usize,
     pending_pubacks: &mut AckQueue,
     current_puback: &mut Option<PendingPuback>,
+    acks: &mut AckBatch<'_>,
     is_v5: bool,
     inbound_aliases: &mut InboundAliases,
     // The interval agreed at CONNECT, needed to spot the zero-to-non-zero
@@ -4201,11 +4257,8 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
             // `$events/message/acked` (ADR 0083), when a rule selects it: raised here,
             // on the subscriber's connection task, from the delivery it remembered.
             rule_conn.acked(&ack, QoS::AtLeastOnce, client, hub);
-            let _ = hub.send(HubCommand::PubAck {
-                client: client.clone(),
-                pkid: ack.pkid,
-                received: Instant::now(),
-            });
+            // To the hub with the rest of this read's acks (ADR 0092 T4).
+            acks.push(ack.pkid);
         }
         Packet::PubRec(ack) => {
             // A `QoS` 2 delivery is acked at its PUBREC, as in EMQX.
