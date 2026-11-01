@@ -10,7 +10,7 @@
 
 use crate::aliases::{InboundAliases, OutboundAliases};
 use crate::hub::{
-    Acked, AckedDelivery, Admission, AttachOutcome, AuthMethod, Hold, HubCommand, Outbound, Will,
+    AckedDelivery, Admission, AttachOutcome, AuthMethod, Hold, HubCommand, Outbound, Will,
 };
 use bytes::Bytes;
 use mqtt_auth::{
@@ -2695,14 +2695,12 @@ impl<'a> AckBatch<'a> {
     /// answer fires from this task when it was the last one owed — and the ack joins
     /// the batch for the hub's in-flight entry.
     fn acked(&mut self, pkid: u16) {
-        let on_hub = self
-            .holds
-            .remove(&pkid)
-            .is_some_and(|h| h.acked(self.metrics) == Acked::OnHub);
+        if let Some(hold) = self.holds.remove(&pkid) {
+            hold.acked(self.metrics);
+        }
         self.acks.push(AckedDelivery {
             pkid,
             received: Instant::now(),
-            on_hub,
         });
         if self.acks.len() >= ACK_BATCH_MAX {
             self.flush();
@@ -7430,9 +7428,9 @@ mod tests {
     }
 
     /// ADR 0092 T4: a held delivery's PUBACK settles the hold on this task — the
-    /// publisher's answer fires from here — and the ack reaches the hub in the batch
-    /// with nothing marked for the hub to settle. A hold with no gate (a peer's
-    /// forward) is the hub's, and the ack says so.
+    /// publisher's answer fires from here — and the ack reaches the hub in the batch,
+    /// where the hold leaves the queue. A hold with no gate (a peer's forward) is left
+    /// to the hub, which discharges it from the same batch.
     #[tokio::test]
     async fn a_held_delivery_is_settled_at_its_puback_on_the_connection_task() {
         let (mut reader, mut writer, mut hub_rx) = v5_pipe();
@@ -7479,7 +7477,8 @@ mod tests {
 
         // A local publish's hold: settled here.
         let (done_tx, done_rx) = oneshot::channel();
-        let (hold, mut retired) = crate::hub::armed_hold_for_test(Some(done_tx));
+        let (hold, armed) = crate::hub::armed_hold_for_test(Some(done_tx));
+        assert_eq!(armed.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(out.send_held(held_publish(7), None, Some(hold)));
         match recv(&mut reader).await {
             Some(Packet::Publish(p)) => assert_eq!(p.pkid, Some(7)),
@@ -7494,12 +7493,9 @@ mod tests {
             "the publisher is answered from the subscriber's connection task"
         );
         assert_eq!(
-            timeout(Duration::from_millis(500), retired.recv())
-                .await
-                .ok()
-                .flatten(),
-            Some(1),
-            "and the hub is told to retire the entry"
+            armed.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "and the node has no armed gate left"
         );
         match timeout(Duration::from_millis(500), cmd_rx.recv())
             .await
@@ -7508,13 +7504,12 @@ mod tests {
             Some(HubCommand::PubAcks { acks, .. }) => {
                 assert_eq!(acks.len(), 1);
                 assert_eq!(acks[0].pkid, 7);
-                assert!(!acks[0].on_hub, "nothing left for the hub to settle");
             }
             other => panic!("expected PubAcks, got {other:?}"),
         }
 
         // A hold with no gate (a peer's forward): the hub's to settle.
-        let (hold, _retired) = crate::hub::armed_hold_for_test(None);
+        let (hold, _armed) = crate::hub::armed_hold_for_test(None);
         assert!(out.send_held(held_publish(8), None, Some(hold)));
         match recv(&mut reader).await {
             Some(Packet::Publish(p)) => assert_eq!(p.pkid, Some(8)),
@@ -7526,8 +7521,7 @@ mod tests {
             .expect("the ack batch")
         {
             Some(HubCommand::PubAcks { acks, .. }) => {
-                assert_eq!(acks[0].pkid, 8);
-                assert!(acks[0].on_hub, "the hub settles a peer's hold");
+                assert_eq!(acks[0].pkid, 8, "a hold with no gate is left to the hub");
             }
             other => panic!("expected PubAcks, got {other:?}"),
         }

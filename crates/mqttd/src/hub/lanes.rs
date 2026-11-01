@@ -13,6 +13,7 @@
 //! Workers spawn via `Hub::spawn_owned` into the hub's owned `JoinSet` — a task
 //! holding the store past node stop keeps redb's exclusive lock (ADR 0061 §8).
 
+use super::hold::PublishGate;
 use super::qos2::exec_qos2_lane_op;
 #[allow(clippy::wildcard_imports)] // an intra-hub module split (#258): the five
 // siblings share one type/state vocabulary by design, and enumerating it would
@@ -61,6 +62,10 @@ pub enum AppendThen {
     /// A peer awaits a durability verdict for forward `seq` (0041-T12): resolve this
     /// job in the `(node, seq)` aggregate and answer when its last job lands.
     Peer(NodeId, u64),
+    /// A held delivery's fallback write (ADR 0089, ADR 0092 T4): the publish's gate
+    /// holds the obligation — its pending entry may be retired already — and the
+    /// write's landing releases the hold's place in it; a failed write withholds.
+    Hold(Arc<PublishGate>),
     /// Nobody is owed an answer (a Will, an unanswerable forward, a `QoS` 0 order mark).
     Ungated,
 }
@@ -269,6 +274,15 @@ pub(super) enum AppendGate {
         /// A takeover re-route (#784): skip a session already holding the publish.
         replay: bool,
     },
+    /// A held delivery's fallback write for local publish `id` (ADR 0092 T4): gated
+    /// like [`Pending`](Self::Pending), through the publish's gate rather than its
+    /// pending entry, which may be retired already.
+    Hold {
+        /// The publish's gate.
+        gate: Arc<PublishGate>,
+        /// The pending publish's id, for the copy's origin (#784).
+        id: u64,
+    },
     /// Nobody is told (a Will, a plain forward, a retained-window back-fill): a
     /// refused durable copy is a counted drop and the live delivery still happens
     /// (issue #238).
@@ -291,6 +305,7 @@ impl AppendGate {
         match self {
             Self::Pending(id) | Self::Replay(id) => AppendThen::Gate(*id),
             Self::Peer { node, seq, .. } => AppendThen::Peer(node.clone(), *seq),
+            Self::Hold { gate, .. } => AppendThen::Hold(gate.clone()),
             Self::None | Self::LiveOnly => AppendThen::Ungated,
         }
     }
@@ -300,7 +315,7 @@ impl AppendGate {
     /// node, the origin of its own pending publishes.
     pub(super) fn origin(&self, me: &NodeId) -> (Option<PublishOrigin>, bool) {
         match self {
-            Self::Pending(id) => (
+            Self::Pending(id) | Self::Hold { id, .. } => (
                 Some(PublishOrigin {
                     node: me.0.clone(),
                     id: *id,
@@ -995,7 +1010,8 @@ impl Hub {
                     g.congested = true;
                 }
             }
-            AppendThen::Ungated => {}
+            // The gate already counts the hold this write replaces.
+            AppendThen::Hold(_) | AppendThen::Ungated => {}
         }
         Submitted::Queued
     }
@@ -1105,14 +1121,6 @@ impl Hub {
                         // (issue #238).
                         p.stored = true;
                     }
-                    // A held delivery's fallback write (ADR 0089) landed: the hold's
-                    // place in the gate is owed no more (ADR 0092 T4). A failed one
-                    // withholds below, gate and all.
-                    if job.delivered.is_some() && !matches!(outcome, LaneOutcome::Failed) {
-                        if let Some(g) = &p.holds {
-                            g.write_landed();
-                        }
-                    }
                 }
                 match outcome {
                     // Fail closed like the inline path did (ADR 0041 T5): withhold.
@@ -1120,6 +1128,13 @@ impl Hub {
                     _ => self.try_complete_pending(id),
                 }
             }
+            // A held delivery's fallback write (ADR 0089, ADR 0092 T4): the copy is
+            // owed no more once it landed; a failed one withholds, like a failed
+            // gated append.
+            AppendThen::Hold(gate) => match outcome {
+                LaneOutcome::Failed => gate.cancel(),
+                _ => gate.write_landed(),
+            },
             AppendThen::Peer(node, seq) => {
                 let out = match outcome {
                     LaneOutcome::Failed => DurableOutcome::Failed,

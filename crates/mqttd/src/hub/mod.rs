@@ -77,8 +77,7 @@ mod elision;
 mod hold;
 #[cfg(test)]
 pub(crate) use hold::armed_hold_for_test;
-pub(crate) use hold::Acked;
-pub use hold::Hold;
+pub use hold::{Hold, PublishGate};
 /// The rule engine's message events, as far as the hub decides them (ADR 0083).
 mod events;
 pub(crate) use events::origin_from_wire;
@@ -1421,20 +1420,15 @@ pub struct AckedDelivery {
     pub pkid: u16,
     /// When the connection read the PUBACK (`puback_hub_wait_seconds`).
     pub received: Instant,
-    /// Whether a hold on it is the hub's to settle (ADR 0089): a peer's forward, whose
-    /// verdict the hub sends. A hold the connection task settled itself, or a delivery
-    /// never held, leaves this clear and the hub only completes the in-flight entry.
-    pub on_hub: bool,
 }
 
 impl AckedDelivery {
-    /// An ack with nothing held on it, read now.
+    /// An ack read now.
     #[must_use]
     pub fn plain(pkid: u16) -> Self {
         Self {
             pkid,
             received: Instant::now(),
-            on_hub: false,
         }
     }
 }
@@ -3118,6 +3112,9 @@ pub struct Hub {
     /// connection task answered the publisher, and the entry is retired here.
     retire_rx: mpsc::UnboundedReceiver<u64>,
     retire_tx: mpsc::UnboundedSender<u64>,
+    /// Gates armed and not yet fired (ADR 0092 T4): publishers still waiting on a
+    /// held delivery's PUBACK, whose entries are gone; a drain barrier waits for them.
+    gates_armed: Arc<AtomicUsize>,
     /// Receiver side of acked forwards (issue #648): per origin, the forwards
     /// recently applied and the answer each got, so a retransmission is answered
     /// again instead of applied again. Bounded per origin by
@@ -3421,6 +3418,7 @@ impl Hub {
                 elision: Box::default(),
                 retire_rx,
                 retire_tx,
+                gates_armed: Arc::new(AtomicUsize::new(0)),
                 forward_windows: HashMap::default(),
                 held_dead: HashMap::default(),
                 node_id,
@@ -3965,6 +3963,7 @@ impl Hub {
     /// answered, and does not hold the barrier.)
     fn wake_drained(&mut self) {
         if self.append_lanes.values().all(|lane| lane.outstanding == 0)
+            && self.gates_armed.load(Ordering::SeqCst) == 0
             && self.pending_publishes.iter().all(|(_, p)| p.ack_released())
         {
             for reply in self.drained_waiters.drain(..) {
@@ -3976,6 +3975,12 @@ impl Hub {
     /// The once-a-second sweep: expiry, cleanup, gauges, retransmits, lane reaping.
     async fn run_sweep(&mut self) {
         let started = Instant::now();
+        // A gate that fired off the loop with no command behind it (ADR 0092 T4): a
+        // drain barrier waiting on it is answered here at the latest.
+        self.retire_fired_gates();
+        if !self.drained_waiters.is_empty() {
+            self.wake_drained();
+        }
         // An idle hub still tells its peers, within a tick, that a reload changed
         // whether its rules select a message event (ADR 0083).
         self.refresh_message_wants();
@@ -8814,17 +8819,18 @@ impl Hub {
         // `reroute_grace` stays in `obligations_done` deliberately: an unanswered
         // forward whose target died is doubt about the EVIDENCE, not about the
         // routing view, and item 2.1 does not widen into it.
+        let mut retire_at_arming = false;
         if let Some(p) = self.pending_publishes.get_mut(id) {
             // ADR 0092 T4: held deliveries still owed answer for the hub. The gate takes
             // the publisher's answer and the last PUBACK fires it, on whichever
-            // connection task reads it; the entry stays until then (`ack_released`).
+            // connection task reads it. The entry goes now: nothing else is owed, and
+            // the holds' fallback writes carry the gate, not the entry. Only an entry
+            // the settle window still claims stays, and is told when the gate fires.
             if !p.ack_awaits_settle {
                 if let Some(gate) = p.holds.as_ref().filter(|g| g.pending()) {
-                    // The hub does not answer here: the gate does, when its last hold
-                    // settles — on the subscriber's connection task, or on this loop
-                    // when a fallback write lands.
                     if let Some(done) = p.done.take() {
-                        gate.arm(done);
+                        gate.arm(done, p.awaiting_settle);
+                        retire_at_arming = !p.awaiting_settle;
                     }
                 } else if p.answer(PublishOutcome::Accepted) {
                     debug!(publish = id, topic = %p.topic, "pending publish complete; ack released");
@@ -8833,6 +8839,10 @@ impl Hub {
                     }
                 }
             }
+        }
+        if retire_at_arming {
+            self.pending_publishes.remove(id);
+            return;
         }
         // Retire the entry only when the settle window is done with it AND its
         // publisher has been answered. The second condition is structural, not a
@@ -16706,7 +16716,7 @@ mod tests {
             let pkid = pkid_of(&packet);
             let hold = hold.expect("a durable QoS 1 delivery to an online subscriber is held");
             // The subscriber's connection task settles the hold at the PUBACK...
-            assert_eq!(hold.acked(None), crate::hub::Acked::Settled);
+            hold.acked(None);
             assert!(
                 matches!(
                     timeout(Duration::from_secs(3), done).await,
@@ -16774,10 +16784,7 @@ mod tests {
             panic!("a packet");
         };
         // c settles on its connection task; the publisher still waits for d.
-        assert_eq!(
-            hold_c.expect("held").acked(None),
-            crate::hub::Acked::Settled
-        );
+        hold_c.expect("held").acked(None);
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(
             matches!(done.try_recv(), Err(oneshot::error::TryRecvError::Empty)),

@@ -271,11 +271,9 @@ impl Hub {
             if let Some(m) = &self.metrics {
                 m.puback_hub_wait(a.received.elapsed().as_secs_f64());
             }
-            // A hold the connection task settled itself is not looked up again: the
-            // hub prunes it at its deadline (ADR 0092 T4).
-            if a.on_hub {
-                self.elided_acked(client, a.pkid);
-            }
+            // A hold the connection task settled itself leaves the queue here; one it
+            // left to the hub (a peer's forward) is discharged here (ADR 0092 T4).
+            self.elided_acked(client, a.pkid);
             completed |= self.complete_pending(client, a.pkid, OutState::AwaitingPubAck);
         }
         if completed {

@@ -1541,7 +1541,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 902 test(s)
+## `crates/mqttd/src/lib.rs` — 903 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1827,6 +1827,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::hold::tests::a_hold_is_settled_once_by_whoever_comes_first`
 - `hub::hold::tests::a_hold_taken_for_its_write_is_not_discharged_by_a_late_ack`
 - `hub::hold::tests::a_hold_without_a_gate_is_the_hubs_to_settle`
+- `hub::hold::tests::a_kept_entry_is_told_of_the_firing`
 - `hub::hold::tests::an_armed_gate_fires_on_the_last_discharge_and_only_then`
 - `hub::hold::tests::settling_below_zero_is_not_a_fire`
 - `hub::hold::tests::the_hub_answers_through_an_armed_gate`
