@@ -136,7 +136,7 @@ async fn drive_until<T>(hub: &mut Hub, mut wait: oneshot::Receiver<T>) -> T {
 /// internal selection plan.
 struct Rig {
     hub: Hub,
-    tx: mpsc::UnboundedSender<HubCommand>,
+    tx: HubTx,
     local: crate::hub::OutboundRx,
     peer: mpsc::UnboundedReceiver<PeerMessage>,
     metrics: Arc<mqtt_observability::metrics::Metrics>,

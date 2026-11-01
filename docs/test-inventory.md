@@ -1541,7 +1541,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 890 test(s)
+## `crates/mqttd/src/lib.rs` — 898 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1835,6 +1835,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::settle::tests::a_settled_view_never_holds`
 - `hub::settle::tests::a_shared_placement_is_evidence`
 - `hub::settle::tests::a_zero_match_fan_out_on_an_unsettled_view_still_holds`
+- `hub::shards::tests::a_client_keyed_command_goes_to_its_shard`
+- `hub::shards::tests::a_command_naming_no_client_goes_first_and_a_setting_goes_everywhere`
+- `hub::shards::tests::a_joined_command_is_answered_once_every_shard_has`
+- `hub::shards::tests::one_shard_owns_everything`
 - `hub::tests::a_backlogged_peer_link_sheds_qos0_forwards_but_never_retained_broadcasts`
 - `hub::tests::a_backlogged_peer_link_sheds_qos0_shared_deliveries_until_it_drains`
 - `hub::tests::a_batch_of_pubacks_completes_each_and_drains_once`
@@ -2145,6 +2149,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::settle_gate::leaving_the_settle_window_answers_a_restore_shaped_entry`
 - `hub::tests::settle_gate::no_periodic_inherited_scan_runs_without_a_durable_plane`
 - `hub::tests::settle_gate::the_interest_authoritative_backstop_fires_on_its_own_constant`
+- `hub::tests::sharded::a_publish_reaches_a_subscriber_the_other_shard_owns_and_is_acked_after_its_write`
+- `hub::tests::sharded::a_qos0_publish_is_handed_off_ungated`
+- `hub::tests::sharded::a_shared_group_split_across_shards_takes_every_publish_under_the_window`
+- `hub::tests::sharded::an_unsubscribe_is_mirrored_to_the_other_shard`
 - `hub::tests::share_obligations::a_drain_gated_share_delivery_behind_a_lost_link_does_not_hold_the_drain`
 - `hub::tests::share_obligations::a_drain_gated_share_delivery_with_nobody_to_hand_it_to_is_dropped_and_counted`
 - `hub::tests::share_obligations::a_node_whose_view_is_unsettled_does_not_call_a_share_member_gone`

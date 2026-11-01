@@ -47,7 +47,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::hub::HubCommand;
+use crate::hub::{HubCommand, HubTx};
 use crate::ingress::IngressCredit;
 use crate::reload::LastReload;
 use crate::rule_state::report::NamespaceReport;
@@ -96,7 +96,7 @@ pub fn rfc3339_millis(t: SystemTime) -> String {
 /// Send one `$SYS` message that expires after `message_expiry` seconds, charged to the
 /// node pool; `false` when the pool is short.
 fn sys_publish(
-    hub: &mpsc::UnboundedSender<HubCommand>,
+    hub: &HubTx,
     ingress: &IngressCredit,
     topic: String,
     payload: String,
@@ -127,7 +127,7 @@ async fn until(at: Option<Instant>) {
 pub async fn run_stats(
     rules: Rules,
     metrics: Option<Arc<Metrics>>,
-    hub: mpsc::UnboundedSender<HubCommand>,
+    hub: HubTx,
     ingress: Arc<IngressCredit>,
     last_reload: Arc<LastReload>,
     started_at: SystemTime,
@@ -494,7 +494,7 @@ impl Stats {
 pub async fn run_trace(
     mut rx: mpsc::Receiver<TraceRecord>,
     rules: Rules,
-    hub: mpsc::UnboundedSender<HubCommand>,
+    hub: HubTx,
     ingress: Arc<IngressCredit>,
     shutdown: CancellationToken,
 ) {

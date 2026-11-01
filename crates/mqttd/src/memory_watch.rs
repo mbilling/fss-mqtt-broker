@@ -47,11 +47,10 @@
 //! so this is the platform that matters; elsewhere the sampler returns `None` and the
 //! watcher **logs once and exits** rather than silently pretending to enforce a bound.
 
-use crate::hub::{BrownoutAxis, HubCommand};
+use crate::hub::{BrownoutAxis, HubCommand, HubTx};
 use crate::store_watch::WatermarkPoll;
 use mqtt_observability::metrics::Metrics;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 /// This process's resident set size in bytes, or `None` where it cannot be read.
@@ -80,7 +79,7 @@ fn parse_vm_rss(status: &str) -> Option<u64> {
 /// gigabytes; production passes [`resident_bytes`].
 pub async fn watch(
     max_bytes: Option<u64>,
-    hub: mpsc::UnboundedSender<HubCommand>,
+    hub: HubTx,
     metrics: Option<Arc<Metrics>>,
     poll: Option<WatermarkPoll>,
     sample: Option<Box<dyn Fn() -> Option<u64> + Send>>,
@@ -141,6 +140,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
+    use tokio::sync::mpsc;
 
     /// The real format, verbatim from a Linux box — including the surrounding lines, so
     /// the parser is proven to pick the right one rather than the first number it sees.
@@ -187,6 +187,7 @@ Threads:\t8
     async fn the_watcher_drives_brownout_on_watermark_transitions() {
         static RSS: AtomicU64 = AtomicU64::new(10);
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let tx = crate::hub::HubTx::from(tx);
         let _watch = tokio::spawn(watch(
             Some(100),
             tx,
@@ -242,6 +243,7 @@ Threads:\t8
     async fn nearing_the_watermark_shortens_the_poll() {
         static RSS: AtomicU64 = AtomicU64::new(95); // 95 of a 100-byte mark: near, under
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let tx = crate::hub::HubTx::from(tx);
         let _watch = tokio::spawn(watch(
             Some(100),
             tx,
@@ -269,6 +271,7 @@ Threads:\t8
     #[tokio::test(start_paused = true)]
     async fn without_a_watermark_nothing_is_ever_browned_out() {
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let tx = crate::hub::HubTx::from(tx);
         let _watch = tokio::spawn(watch(
             None,
             tx,
@@ -290,6 +293,7 @@ Threads:\t8
     #[tokio::test]
     async fn an_unreadable_rss_stops_the_watcher_instead_of_reporting_zero() {
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let tx = crate::hub::HubTx::from(tx);
         let handle = tokio::spawn(watch(
             Some(100),
             tx,

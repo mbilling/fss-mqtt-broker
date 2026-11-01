@@ -1465,7 +1465,7 @@ fn listener_policy(
 #[allow(clippy::too_many_lines)]
 async fn start_client_listeners(
     config: &Config,
-    hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
+    hub_tx: hub::HubTx,
     policy: Arc<conn::ConnPolicy>,
     reloader: &mut reload::Reloader,
     shutdown: &tokio_util::sync::CancellationToken,
@@ -2085,7 +2085,7 @@ fn jwt_config(config: &Config) -> mqtt_auth::token::TokenConfig {
 /// session's log. `MQTTD_DURABLE_SESSIONS=0|false|off|no` opts out to the bounded
 /// in-memory backend (ADR 0001 §6). The effective mode is loudly logged.
 type HubHandle = (
-    mpsc::UnboundedSender<hub::HubCommand>,
+    hub::HubTx,
     Arc<dyn SessionStore>,
     // The retained store the hub reads and writes, shared (not cloned) with the online
     // backup task so an export reads the live handle instead of opening a second one over
@@ -2344,40 +2344,41 @@ async fn start_hub(
                 )),
             )
             .await;
-        let (mut hub, hub_tx) = hub::Hub::with_config_and_placement(
-            node_id.clone(),
-            store.clone(),
-            Some(placement.clone()),
-        );
-        if cluster_configured {
-            hub.set_cluster_configured();
-        }
         // Keep a plane clone for the health endpoint's lease-group readiness signal.
         let plane_for_health = plane.clone();
-        hub.set_replication_capable(replication_capable);
-        hub.set_ownership_domain(
-            ownership_domain_all,
-            config.durable.ownership_domain == OwnershipDomain::Members,
-        );
-        hub.attach_durable_plane(plane);
-        // Durable retained (ADR 0037): retained mutations also commit through the
-        // topic's group lease-owner, so retained state converges instead of diverging.
-        hub.attach_durable_retained(durable_retained);
-        let mut retained_handle = None;
-        if let Some(dir) = &data_dir {
-            let retained = persistent_retained(dir)?; // ADR 0018 phase 4
-            hub.attach_retained_store(retained.clone());
-            retained_handle = Some(retained);
-        }
-        wire_hub(
-            &mut hub,
+        let retained_handle: Option<Arc<dyn RetainedStore>> = match &data_dir {
+            Some(dir) => Some(persistent_retained(dir)?), // ADR 0018 phase 4
+            None => None,
+        };
+        let members = config.durable.ownership_domain == OwnershipDomain::Members;
+        let hub_tx = start_shards(
             config,
+            cluster_configured,
             metrics,
             brownout_status,
             session_quarantine,
             ingress,
+            || {
+                hub::Hub::with_config_and_placement(
+                    node_id.clone(),
+                    store.clone(),
+                    Some(placement.clone()),
+                )
+                .0
+            },
+            |hub| {
+                hub.set_replication_capable(replication_capable.clone());
+                hub.set_ownership_domain(ownership_domain_all.clone(), members);
+                hub.attach_durable_plane(plane.clone());
+                // Durable retained (ADR 0037): retained mutations also commit through the
+                // topic's group lease-owner, so retained state converges instead of
+                // diverging.
+                hub.attach_durable_retained(durable_retained.clone());
+                if let Some(retained) = &retained_handle {
+                    hub.attach_retained_store(retained.clone());
+                }
+            },
         )?;
-        place_hub(hub, config, metrics)?;
         Ok((
             hub_tx,
             store,
@@ -2400,50 +2401,49 @@ async fn start_hub(
             log,
             queue_limits_from_config(config)?,
         ));
-        let (mut hub, hub_tx) = hub::Hub::with_config_and_placement(
-            node_id.clone(),
-            store.clone(),
-            Some(placement.clone()),
-        );
-        if cluster_configured {
-            hub.set_cluster_configured();
-        }
         // #241's `wire_hub` does the metrics/brownout wiring for all three arms (it exists
         // precisely so a knob cannot be wired into two of the three); the local binding stays
         // because this arm returns the retained handle for the backup exporter (#249).
         let retained = persistent_retained(&dir)?; // ADR 0018 phase 4
-        hub.attach_retained_store(retained.clone());
-        wire_hub(
-            &mut hub,
+        let hub_tx = start_shards(
             config,
+            cluster_configured,
             metrics,
             brownout_status,
             session_quarantine,
             ingress,
+            || {
+                hub::Hub::with_config_and_placement(
+                    node_id.clone(),
+                    store.clone(),
+                    Some(placement.clone()),
+                )
+                .0
+            },
+            |hub| hub.attach_retained_store(retained.clone()),
         )?;
-        place_hub(hub, config, metrics)?;
         Ok((hub_tx, store, Some(retained), None, None))
     } else {
         let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::with_limits(
             queue_limits_from_config(config)?,
         ));
-        let (mut hub, hub_tx) = hub::Hub::with_config_and_placement(
-            node_id.clone(),
-            store.clone(),
-            Some(placement.clone()),
-        );
-        if cluster_configured {
-            hub.set_cluster_configured();
-        }
-        wire_hub(
-            &mut hub,
+        let hub_tx = start_shards(
             config,
+            cluster_configured,
             metrics,
             brownout_status,
             session_quarantine,
             ingress,
+            || {
+                hub::Hub::with_config_and_placement(
+                    node_id.clone(),
+                    store.clone(),
+                    Some(placement.clone()),
+                )
+                .0
+            },
+            |_| {},
         )?;
-        place_hub(hub, config, metrics)?;
         Ok((hub_tx, store, None, None, None))
     }
 }
@@ -2464,7 +2464,7 @@ async fn run_restore(
     from: &str,
     config: &Config,
     store: &Arc<dyn SessionStore>,
-    hub_tx: &mpsc::UnboundedSender<hub::HubCommand>,
+    hub_tx: &hub::HubTx,
     status: &Arc<mqttd::backup::BackupStatus>,
     metrics: &Arc<mqtt_observability::metrics::Metrics>,
     plane: &Option<mqtt_cluster::durable_plane::DurablePlane>,
@@ -2614,7 +2614,7 @@ async fn run_restore(
 /// `QoS` the subscription granted. Retained state is written as retained state; the only
 /// outward traffic is the token-carrying fan-out to peer caches.
 struct HubRetainedSink {
-    hub: mpsc::UnboundedSender<hub::HubCommand>,
+    hub: hub::HubTx,
     /// How long one retained write may wait for the hub's answer before the restore fails
     /// (`backup.restore_timeout_secs`, issue #799). Without it a stalled commit, like the
     /// retained-handoff deadlock of #739, left the node `in-progress` forever with nothing
@@ -2697,7 +2697,7 @@ impl mqttd::backup::RetainedSink for HubRetainedSink {
 /// honesty: a hub too busy to answer produces a failed run (the RPO alert fires) rather than
 /// an export that quietly waits forever or ships values with no ordering evidence.
 struct HubRetainedSource {
-    hub: mpsc::UnboundedSender<hub::HubCommand>,
+    hub: hub::HubTx,
 }
 
 /// How long the exporter waits for the hub's retained snapshot before failing the run.
@@ -2741,7 +2741,7 @@ fn persistent_retained(dir: &str) -> Result<Arc<dyn RetainedStore>, Box<dyn std:
 #[allow(clippy::too_many_arguments)] // a wiring seam: one call site, named handles
 async fn start_health(
     config: &Config,
-    hub_tx: &mpsc::UnboundedSender<hub::HubCommand>,
+    hub_tx: &hub::HubTx,
     placement: &Arc<RwLock<Placement>>,
     durable_plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
     metrics: Arc<mqtt_observability::metrics::Metrics>,
@@ -3165,23 +3165,92 @@ fn ingress_from_config(config: &Config) -> Arc<mqttd::ingress::IngressCredit> {
 /// `node.hub_thread = false`. The `mqttd_hub_thread_info` gauge and `/statusz` say which.
 fn place_hub(
     hub: hub::Hub,
+    shard: usize,
     config: &Config,
     metrics: &Arc<mqtt_observability::metrics::Metrics>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // ADR 0092 T5: shard `k` of a pinned node takes the core after the first's.
+    let core = config
+        .node
+        .hub_core
+        .map(|c| c.saturating_add(u32::try_from(shard).unwrap_or(u32::MAX)));
     let placed = if config.node.hub_thread {
-        hub.spawn_dedicated(config.node.hub_core)?
+        hub.spawn_dedicated(core)?
     } else {
         tokio::spawn(hub.run());
         hub::HubThread::SHARED
     };
-    metrics.set_hub_thread(placed.dedicated, placed.core);
+    if shard == 0 {
+        metrics.set_hub_thread(placed.dedicated, placed.core);
+    }
     info!(
+        shard,
         dedicated = placed.dedicated,
         core = ?placed.core,
-        requested_core = ?config.node.hub_core,
+        requested_core = ?core,
         "hub loop placed (ADR 0092 D1)"
     );
     Ok(())
+}
+
+/// Build the node's hub loops — one, or `node.hub_shards` data shards behind one
+/// sender (ADR 0092 T5) — configure each the same way, wire and place them. The
+/// prototype is for one node: a cluster node with more than one shard is refused, so a
+/// peer's forward is never answered by a loop that owns half the sessions.
+#[allow(clippy::too_many_arguments)] // the three construction arms' shared wiring
+fn start_shards(
+    config: &Config,
+    cluster_configured: bool,
+    metrics: &Arc<mqtt_observability::metrics::Metrics>,
+    brownout_status: &Arc<mqttd::health::BrownoutStatus>,
+    session_quarantine: &Arc<mqttd::health::SessionQuarantine>,
+    ingress: &Arc<mqttd::ingress::IngressCredit>,
+    make: impl Fn() -> hub::Hub,
+    configure: impl Fn(&mut hub::Hub),
+) -> Result<hub::HubTx, Box<dyn std::error::Error>> {
+    let shards = usize::from(config.node.hub_shards.max(1));
+    if shards > hub::MAX_SHARDS {
+        return Err(format!(
+            "node.hub_shards = {shards}: at most {} (ADR 0092 T5)",
+            hub::MAX_SHARDS
+        )
+        .into());
+    }
+    if shards > 1 && cluster_configured {
+        return Err(format!(
+            "node.hub_shards = {shards} on a cluster node: the sharded hub is the one-node \
+             prototype of ADR 0092 T5; a cluster node runs one hub loop"
+        )
+        .into());
+    }
+    let mut hubs: Vec<hub::Hub> = (0..shards).map(|_| make()).collect();
+    let txs: Vec<_> = hubs.iter().map(hub::Hub::sender).collect();
+    for (k, hub) in hubs.iter_mut().enumerate() {
+        hub.set_shards(u8::try_from(k).expect("at most MAX_SHARDS"), txs.clone());
+        if cluster_configured {
+            hub.set_cluster_configured();
+        }
+        configure(hub);
+        wire_hub(
+            hub,
+            config,
+            metrics,
+            brownout_status,
+            session_quarantine,
+            ingress,
+        )?;
+    }
+    for (k, hub) in hubs.into_iter().enumerate() {
+        place_hub(hub, k, config, metrics)?;
+    }
+    if shards > 1 {
+        info!(
+            shards,
+            "hub shards (ADR 0092 T5 prototype): each owns the clients of its placement \
+             groups; a publish matched on one is handed to the others for theirs"
+        );
+    }
+    Ok(hub::HubTx::sharded(txs))
 }
 
 fn wire_hub(
@@ -3694,7 +3763,7 @@ async fn start_swim(
     config: &Config,
     node_id: &NodeId,
     peer_bind: Option<String>,
-    hub_tx: &mpsc::UnboundedSender<hub::HubCommand>,
+    hub_tx: &hub::HubTx,
     peer_tls: Option<&peer::PeerTls>,
     placement: Arc<RwLock<Placement>>,
     shutdown: &tokio_util::sync::CancellationToken,
@@ -4004,7 +4073,7 @@ async fn serve_tls_clients(
     gate: admission::AdmissionGate,
     listener: TcpListener,
     acceptor_rx: tokio::sync::watch::Receiver<TlsAcceptor>,
-    hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
+    hub_tx: hub::HubTx,
     policy: Arc<conn::ConnPolicy>,
     shutdown: tokio_util::sync::CancellationToken,
     connections: tokio_util::task::TaskTracker,
@@ -4065,7 +4134,7 @@ async fn serve_tls_clients(
 async fn serve_plaintext_clients(
     gate: admission::AdmissionGate,
     listener: TcpListener,
-    hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
+    hub_tx: hub::HubTx,
     policy: Arc<conn::ConnPolicy>,
     shutdown: tokio_util::sync::CancellationToken,
     connections: tokio_util::task::TaskTracker,
@@ -4111,7 +4180,7 @@ async fn serve_plaintext_clients(
 async fn serve_ws_clients(
     gate: admission::AdmissionGate,
     listener: TcpListener,
-    hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
+    hub_tx: hub::HubTx,
     policy: Arc<conn::ConnPolicy>,
     shutdown: tokio_util::sync::CancellationToken,
     connections: tokio_util::task::TaskTracker,
@@ -4169,7 +4238,7 @@ async fn serve_wss_clients(
     gate: admission::AdmissionGate,
     listener: TcpListener,
     acceptor_rx: tokio::sync::watch::Receiver<TlsAcceptor>,
-    hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
+    hub_tx: hub::HubTx,
     policy: Arc<conn::ConnPolicy>,
     shutdown: tokio_util::sync::CancellationToken,
     connections: tokio_util::task::TaskTracker,
@@ -4243,7 +4312,7 @@ async fn serve_wss_clients(
 async fn serve_quic_clients(
     gate: admission::AdmissionGate,
     endpoint: quinn::Endpoint,
-    hub_tx: mpsc::UnboundedSender<hub::HubCommand>,
+    hub_tx: hub::HubTx,
     policy: Arc<conn::ConnPolicy>,
     shutdown: tokio_util::sync::CancellationToken,
     connections: tokio_util::task::TaskTracker,
@@ -4604,7 +4673,7 @@ fn requires_restart(old: &Config, new: &Config) -> Vec<&'static str> {
 fn apply_live_config(
     old: &Config,
     new: &Config,
-    hub: &mpsc::UnboundedSender<hub::HubCommand>,
+    hub: &hub::HubTx,
     audit: &Arc<dyn AuditSink>,
     replica_change: Option<&mqtt_cluster::replica_change::ReplicaChangeControl>,
     rules: Option<&mqttd::rules::RulesObserve>,
@@ -6112,7 +6181,7 @@ async fn graceful_shutdown(
     grace: Duration,
     shutdown: &tokio_util::sync::CancellationToken,
     connections: &tokio_util::task::TaskTracker,
-    hub: &mpsc::UnboundedSender<hub::HubCommand>,
+    hub: &hub::HubTx,
     draining: &std::sync::atomic::AtomicBool,
     plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
     lease_driver: Option<tokio::task::JoinHandle<()>>,
@@ -6387,7 +6456,7 @@ mod tests {
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = super::HubRetainedSink {
-            hub: tx,
+            hub: tx.into(),
             timeout: Duration::from_mins(5),
             warn_every: Duration::from_secs(15),
         };
@@ -6425,7 +6494,7 @@ mod tests {
             }
         });
         let sink = super::HubRetainedSink {
-            hub: tx,
+            hub: tx.into(),
             timeout: Duration::from_mins(5),
             warn_every: Duration::from_secs(15),
         };
@@ -6809,11 +6878,25 @@ mod tests {
         let recorder = std::sync::Arc::new(mqtt_observability::RecordingAuditSink::new());
         let audit: std::sync::Arc<dyn mqtt_observability::AuditSink> = recorder.clone();
         let control = mqtt_cluster::replica_change::ReplicaChangeControl::new();
-        super::apply_live_config(&base, &base, &hub, &audit, Some(&control), None);
+        super::apply_live_config(
+            &base,
+            &base,
+            &hub::HubTx::from(hub.clone()),
+            &audit,
+            Some(&control),
+            None,
+        );
         assert_eq!(control.proposed(), None);
         let mut changed = base.clone();
         changed.durable.replicas = 3;
-        super::apply_live_config(&base, &changed, &hub, &audit, Some(&control), None);
+        super::apply_live_config(
+            &base,
+            &changed,
+            &hub::HubTx::from(hub.clone()),
+            &audit,
+            Some(&control),
+            None,
+        );
         assert_eq!(control.proposed(), Some(3));
         assert_eq!(recorder.kinds(), vec!["config.reload".to_string()]);
     }

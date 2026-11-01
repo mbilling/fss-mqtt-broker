@@ -39,10 +39,9 @@ use bytes::{Bytes, BytesMut};
 use mqtt_codec::packet::{Connect, Publish, Subscribe, SubscribeFilter};
 use mqtt_codec::{Packet, Properties, Property, ProtocolVersion, QoS, SubscriptionOptions};
 use mqttd::conn::ConnPolicy;
-use mqttd::hub::{Hub, HubCommand};
+use mqttd::hub::{Hub, HubTx};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
 
 const V5: ProtocolVersion = ProtocolVersion::V5;
 /// Within the subscriber's Receive Maximum (so all of them go out unacked at once),
@@ -79,7 +78,7 @@ fn policy() -> Arc<ConnPolicy> {
 
 async fn start_broker() -> (
     std::net::SocketAddr,
-    mpsc::UnboundedSender<HubCommand>,
+    HubTx,
     Arc<mqtt_observability::metrics::Metrics>,
 ) {
     let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("ad"));

@@ -61,6 +61,10 @@ pub enum AppendThen {
     /// A peer awaits a durability verdict for forward `seq` (0041-T12): resolve this
     /// job in the `(node, seq)` aggregate and answer when its last job lands.
     Peer(NodeId, u64),
+    /// Another shard of this node awaits the answer for its pending publish `id`
+    /// (ADR 0092 T5): resolve this job in the hand-off's aggregate and answer when its
+    /// last obligation settles. The first field is the origin shard.
+    Shard(u8, u64),
     /// Nobody is owed an answer (a Will, an unanswerable forward, a `QoS` 0 order mark).
     Ungated,
 }
@@ -269,6 +273,15 @@ pub(super) enum AppendGate {
         /// A takeover re-route (#784): skip a session already holding the publish.
         replay: bool,
     },
+    /// Another shard of this node awaits the answer for its pending publish `id`
+    /// (ADR 0092 T5): the hand-off's deliveries here are gated as that publish's own
+    /// would be, and the origin hears their composed outcome once.
+    Shard {
+        /// The shard the publish entered on.
+        origin: u8,
+        /// Its pending publish there.
+        id: u64,
+    },
     /// Nobody is told (a Will, a plain forward, a retained-window back-fill): a
     /// refused durable copy is a counted drop and the live delivery still happens
     /// (issue #238).
@@ -291,6 +304,7 @@ impl AppendGate {
         match self {
             Self::Pending(id) | Self::Replay(id) => AppendThen::Gate(*id),
             Self::Peer { node, seq, .. } => AppendThen::Peer(node.clone(), *seq),
+            Self::Shard { origin, id } => AppendThen::Shard(*origin, *id),
             Self::None | Self::LiveOnly => AppendThen::Ungated,
         }
     }
@@ -300,7 +314,9 @@ impl AppendGate {
     /// node, the origin of its own pending publishes.
     pub(super) fn origin(&self, me: &NodeId) -> (Option<PublishOrigin>, bool) {
         match self {
-            Self::Pending(id) => (
+            // A hand-off carries the origin shard's pending id, under this node's name:
+            // the identity the origin records for the copies it queues itself (ADR 0092 T5).
+            Self::Pending(id) | Self::Shard { id, .. } => (
                 Some(PublishOrigin {
                     node: me.0.clone(),
                     id: *id,
@@ -995,6 +1011,7 @@ impl Hub {
                     g.congested = true;
                 }
             }
+            AppendThen::Shard(origin, id) => self.register_shard_gate(origin, id),
             AppendThen::Ungated => {}
         }
         Submitted::Queued
@@ -1159,6 +1176,13 @@ impl Hub {
                         }
                     }
                 }
+            }
+            AppendThen::Shard(_, id) => {
+                let out = match outcome {
+                    LaneOutcome::Failed => DurableOutcome::Failed,
+                    _ => DurableOutcome::Ok,
+                };
+                self.settle_shard(id, out, false);
             }
             AppendThen::Ungated => {}
         }

@@ -20,14 +20,14 @@ use common::Client;
 use mqtt_cluster::NodeId;
 use mqtt_codec::{Packet, QoS};
 use mqtt_storage::MemorySessionStore;
-use mqttd::hub::{BrownoutAxis, Hub, HubCommand};
+use mqttd::hub::{BrownoutAxis, Hub, HubCommand, HubTx};
 use mqttd::rule_state::Store;
 use tokio::net::TcpListener;
 
 /// A broker whose connections, and whose hub, run rules that keep state in `state`.
 struct Broker {
     addr: SocketAddr,
-    hub_tx: tokio::sync::mpsc::UnboundedSender<HubCommand>,
+    hub_tx: HubTx,
     state: Arc<Store>,
     functions: mqtt_rules::Functions,
     /// What a reload sends the new rules through.

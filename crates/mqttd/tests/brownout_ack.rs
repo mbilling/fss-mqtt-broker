@@ -19,7 +19,7 @@ use common::{Client, Recv};
 use mqtt_cluster::NodeId;
 use mqtt_codec::{Packet, QoS};
 use mqtt_storage::MemorySessionStore;
-use mqttd::hub::{BrownoutAxis, Hub, HubCommand};
+use mqttd::hub::{BrownoutAxis, Hub, HubCommand, HubTx};
 use tokio::net::TcpListener;
 
 /// MQTT 5.0 reason code 0x97 — the honest answer to "I cannot durably take this".
@@ -27,7 +27,7 @@ use mqtt_codec::reason::QUOTA_EXCEEDED;
 
 struct Broker {
     addr: std::net::SocketAddr,
-    hub_tx: tokio::sync::mpsc::UnboundedSender<HubCommand>,
+    hub_tx: HubTx,
 }
 
 impl Broker {

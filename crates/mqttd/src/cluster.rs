@@ -62,7 +62,7 @@
 //! not the end of anything the hub is holding: the member's link and its interest
 //! are those of a member, and the new life's link carries a fresh snapshot.
 
-use crate::hub::HubCommand;
+use crate::hub::{HubCommand, HubTx};
 use crate::peer::{self, DialStanding, DialTarget};
 use mqtt_cluster::placement::Placement;
 use mqtt_cluster::swim::MemberState;
@@ -83,7 +83,7 @@ use tracing::{info, warn};
 pub async fn maintain_peer_links(
     events: mpsc::UnboundedReceiver<MembershipEvent>,
     local: NodeId,
-    hub: mpsc::UnboundedSender<HubCommand>,
+    hub: HubTx,
     tls: Option<peer::PeerTls>,
     placement: Option<Arc<RwLock<Placement>>>,
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
@@ -112,7 +112,7 @@ struct Dialer {
 pub async fn maintain_peer_links_with_ingress(
     events: mpsc::UnboundedReceiver<MembershipEvent>,
     local: NodeId,
-    hub: mpsc::UnboundedSender<HubCommand>,
+    hub: HubTx,
     tls: Option<peer::PeerTls>,
     placement: Option<Arc<RwLock<Placement>>>,
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
@@ -132,7 +132,7 @@ pub async fn maintain_peer_links_with_ingress(
 async fn maintain(
     mut events: mpsc::UnboundedReceiver<MembershipEvent>,
     local: NodeId,
-    hub: mpsc::UnboundedSender<HubCommand>,
+    hub: HubTx,
     tls: Option<peer::PeerTls>,
     placement: Option<Arc<RwLock<Placement>>>,
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
@@ -339,7 +339,7 @@ fn publish_member_gauges(
 #[cfg(test)]
 mod tests {
     use super::maintain_peer_links;
-    use crate::hub::HubCommand;
+    use crate::hub::{HubCommand, HubTx};
     use mqtt_cluster::swim::MemberState;
     use mqtt_cluster::swim_driver::MembershipEvent;
     use mqtt_cluster::NodeId;
@@ -378,6 +378,7 @@ mod tests {
     ) {
         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let hub_tx = HubTx::from(hub_tx);
         tokio::spawn(maintain_peer_links(
             ev_rx,
             NodeId(local.into()),
@@ -398,6 +399,7 @@ mod tests {
         let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("t"));
         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
         let (hub_tx, _hub_rx) = mpsc::unbounded_channel();
+        let hub_tx = HubTx::from(hub_tx);
         tokio::spawn(maintain_peer_links(
             ev_rx,
             NodeId("a".into()),

@@ -104,6 +104,9 @@ mod quarantine;
 /// item 2.1).
 mod settle;
 pub use quarantine::QUARANTINE_LISTED;
+/// ADR 0092 T5: the node's data shards and the sender in front of them.
+pub mod shards;
+pub use shards::{shard_of, HubTx, ShardDeliver, ShardTarget, MAX_SHARDS};
 
 /// Maximum number of queued messages replayed to a reconnecting session at once.
 const REPLAY_LIMIT: usize = 10_000;
@@ -768,6 +771,7 @@ pub struct Admission {
 /// the identity sweep (ADR 0040 T2). Carries `Arc`s to exactly the values the
 /// reload swapped into the live `watch` channels, so the sweep and the next
 /// admission see the same policy.
+#[derive(Clone)]
 pub struct SweepPolicy {
     /// The new authorizer (connect-ACL re-check).
     pub authorizer: Arc<dyn mqtt_auth::Authorizer>,
@@ -1053,7 +1057,7 @@ enum QosSend {
 /// refuses the whole publish — which is why these compose with [`and`](Self::and)
 /// rather than being reported individually.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DurableOutcome {
+pub enum DurableOutcome {
     /// Every obligation this fan-out took on is met: release the ack.
     Ok,
     /// Refused under a stated policy — answerable per protocol version.
@@ -1728,6 +1732,32 @@ pub enum HubCommand {
     /// originates for a client: the Will. Client publishes are evaluated on their
     /// connection tasks, never here. Sent once at startup, before any listener accepts.
     AttachRules(crate::rules::Rules),
+    /// ADR 0092 T5: what a client of another shard subscribes to, and whether it is
+    /// connected, as its shard holds it now — this shard matches on it and hands the
+    /// deliveries back. Sent shard to shard, never by a connection.
+    ShardRoute {
+        /// The client, owned by another shard.
+        client: ClientId,
+        /// Every filter it holds, `$share/<group>/` prefix included, with its granted `QoS`.
+        filters: Vec<(String, QoS)>,
+        /// Whether it is connected there (a `$share` group's online prefix).
+        online: bool,
+    },
+    /// ADR 0092 T5: a publish another shard matched, for the subscribers this shard
+    /// owns. Boxed (#835).
+    ShardDeliver(Box<shards::ShardDeliver>),
+    /// ADR 0092 T5: shard `shard` settled every delivery of pending publish `id` it was
+    /// handed — stored, held and acknowledged, or not.
+    ShardDone {
+        /// The answering shard.
+        shard: u8,
+        /// The pending publish on this (the origin) shard.
+        id: u64,
+        /// What its deliveries came to.
+        outcome: DurableOutcome,
+        /// Whether a subscriber there took it (fan-out evidence, as a peer's `Reached`).
+        reached: bool,
+    },
 
     /// A peer node's link came up; register it and send our interest snapshot.
     PeerConnected {
@@ -2173,6 +2203,7 @@ impl HubCommand {
             | Self::DurableFrame { .. }
             | Self::Ping { .. }
             | Self::Draining
+            | Self::ShardDone { .. }
             | Self::Admin(_) => Lane::Control,
             Self::Publish { .. }
             | Self::PublishBatch(_)
@@ -2211,6 +2242,8 @@ impl HubCommand {
             | Self::RemoteMessageEvents { .. }
             | Self::RemoteSharedInterest { .. }
             | Self::InheritedSessions { .. }
+            | Self::ShardRoute { .. }
+            | Self::ShardDeliver(_)
             | Self::Flush { .. }
             | Self::Drained { .. } => Lane::Data,
             #[cfg(test)]
@@ -2246,6 +2279,9 @@ impl HubCommand {
             | Self::Flush { .. }
             | Self::Drained { .. }
             | Self::Draining => "control",
+            // ADR 0092 T5: the hand-offs between a node's shards, their own class so
+            // the hub model reads what the split costs.
+            Self::ShardRoute { .. } | Self::ShardDeliver(_) | Self::ShardDone { .. } => "shard",
             #[cfg(test)]
             Self::Ordered(inner) => inner.class(),
             _ => "cluster",
@@ -3095,6 +3131,18 @@ pub struct Hub {
     /// no second verdict follows, and this entry is what starts the hold again
     /// ([`peer_disconnected`](Self::peer_disconnected)).
     held_dead: FastMap<NodeId, VerdictHold>,
+    /// ADR 0092 T5: which data shard of the node this loop is (0 of 1 unless
+    /// `node.hub_shards` says otherwise), how many there are, and every shard's command
+    /// sender — its own included — for the hand-offs ([`shards`]).
+    shard: u8,
+    shard_count: u8,
+    shard_txs: Vec<mpsc::UnboundedSender<HubCommand>>,
+    /// Receiver side of the hand-offs: per origin pending id, what is still owed
+    /// before the origin can be answered ([`shards::ShardGate`]).
+    shard_append_pending: FastMap<u64, shards::ShardGate>,
+    /// Scratch: the subscribers of the publish being dispatched that other shards own,
+    /// taken by [`Hub::flush_handoffs`] at the end of its fan-out.
+    handoff: Vec<shards::ShardTarget>,
     /// Prometheus metrics (ADR 0020), when enabled. Updated on the publish/deliver paths.
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
     /// The node's ingress credit (ADR 0082 T3), held only to export its gauges: the hub
@@ -3313,21 +3361,25 @@ impl Hub {
     /// Create the hub (default node id and in-memory stores) and the sender
     /// that connection tasks use to reach it.
     #[must_use]
-    pub fn new() -> (Self, mpsc::UnboundedSender<HubCommand>) {
+    pub fn new() -> (Self, HubTx) {
         Self::with_config(
             NodeId("node-local".to_string()),
             Arc::new(MemorySessionStore::new()),
         )
     }
 
+    /// This loop's own command sender: what another shard of the node, or a hand-off
+    /// from one, reaches it by (ADR 0092 T5).
+    #[must_use]
+    pub fn sender(&self) -> mpsc::UnboundedSender<HubCommand> {
+        self.self_tx.clone()
+    }
+
     /// Create the hub with an explicit node id and [`SessionStore`] backend.
     /// Retained messages use an in-memory store; a pluggable backend arrives
     /// with the persistence phase.
     #[must_use]
-    pub fn with_config(
-        node_id: NodeId,
-        store: Arc<dyn SessionStore>,
-    ) -> (Self, mpsc::UnboundedSender<HubCommand>) {
+    pub fn with_config(node_id: NodeId, store: Arc<dyn SessionStore>) -> (Self, HubTx) {
         Self::with_config_and_placement(node_id, store, None)
     }
 
@@ -3341,7 +3393,7 @@ impl Hub {
         node_id: NodeId,
         store: Arc<dyn SessionStore>,
         placement: Option<Arc<RwLock<Placement>>>,
-    ) -> (Self, mpsc::UnboundedSender<HubCommand>) {
+    ) -> (Self, HubTx) {
         let (tx, rx) = mpsc::unbounded_channel();
         (
             Self {
@@ -3366,6 +3418,11 @@ impl Hub {
                 qos2_retire_inflight: HashSet::default(),
                 qos2_epoch: HashMap::default(),
                 remote_append_pending: HashMap::default(),
+                shard: 0,
+                shard_count: 1,
+                shard_txs: Vec::new(),
+                shard_append_pending: HashMap::default(),
+                handoff: Vec::new(),
                 held_forwards: Vec::new(),
                 elision: Box::default(),
                 forward_windows: HashMap::default(),
@@ -3466,7 +3523,7 @@ impl Hub {
                 #[cfg(test)]
                 probe: std::sync::Arc::default(),
             },
-            tx,
+            HubTx::from(tx),
         )
     }
 
@@ -3874,7 +3931,7 @@ impl Hub {
     /// drain barrier that may have come due.
     fn dispatched(&mut self, class: &'static str, started: Instant) {
         if let Some(m) = &self.metrics {
-            m.observe_hub_dispatch(class, started.elapsed().as_secs_f64());
+            m.observe_hub_dispatch(self.shard, class, started.elapsed().as_secs_f64());
         }
         // An append's completion arrives as a command, so this is where a drain
         // barrier can come due.
@@ -3944,7 +4001,7 @@ impl Hub {
             self.wake_drained();
         }
         if let Some(m) = &self.metrics {
-            m.observe_hub_dispatch("sweep", started.elapsed().as_secs_f64());
+            m.observe_hub_dispatch(self.shard, "sweep", started.elapsed().as_secs_f64());
         }
     }
 
@@ -4214,6 +4271,19 @@ impl Hub {
             HubCommand::AttachRules(rules) => {
                 self.attach_rules(rules);
             }
+            // ADR 0092 T5: the hand-offs between the node's shards.
+            HubCommand::ShardRoute {
+                client,
+                filters,
+                online,
+            } => self.apply_shard_route(&client, filters, online),
+            HubCommand::ShardDeliver(d) => self.dispatch_shard_deliver(*d),
+            HubCommand::ShardDone {
+                shard,
+                id,
+                outcome,
+                reached,
+            } => self.shard_done(shard, id, outcome, reached),
             // Peer- and cluster-facing commands.
             other => self.dispatch_cluster(other).await,
         }
@@ -5603,6 +5673,7 @@ impl Hub {
         }
         // Its groups' online prefixes must include it from here on (ADR 0015).
         self.shared.set_client_online(&client, true);
+        self.mirror_routing(&client);
         info!(client = %client.0, persistent = session_expiry != 0, session_present, "client attached");
 
         // Issue #284 round 3: a session becomes misplaced by ARRIVING, not only by an
@@ -6074,6 +6145,7 @@ impl Hub {
                 // exactly, options and identifiers included.
                 self.subs.insert(client.clone(), prior);
             }
+            self.mirror_routing(client);
             if let Some(tx) = reply {
                 let _ = tx.send(vec![false; verdicts.len()]);
             }
@@ -6082,6 +6154,7 @@ impl Hub {
         if let Some(tx) = reply {
             let _ = tx.send(verdicts);
         }
+        self.mirror_routing(client);
         self.gossip_interest();
 
         // #219: the advertisement above takes a hop to reach every peer, and a
@@ -6162,6 +6235,7 @@ impl Hub {
         // in-memory removal above already answered the client's question
         // ("did I hold this subscription?"), which is all `0x00`/`0x11` claim.
         let _ = self.persist_subscriptions(client).await;
+        self.mirror_routing(client);
         self.gossip_interest();
         existed
     }
@@ -6826,6 +6900,7 @@ impl Hub {
         // Out of every group's online prefix: a member offline here is not
         // immediately deliverable, which is what the selection reads.
         self.shared.set_client_online(client, false);
+        self.mirror_routing(client);
         // Deliveries still staged behind an outbound-id record never reached this
         // connection's wire (issue #242 finding A): drop them — the durable copy
         // owns delivery on reattach, and their offsets stay owed (untouched in
@@ -6956,6 +7031,7 @@ impl Hub {
         );
         let departed = self.online.remove(client);
         self.shared.set_client_online(client, false);
+        self.mirror_routing(client);
         if let Some(inf) = self.inflight.get_mut(client) {
             inf.pending
                 .retain(|_, p| p.state != OutState::AwaitingIdRecord);
@@ -7204,6 +7280,7 @@ impl Hub {
     /// clean-start attach, ADR 0017).
     fn discard_session_local(&mut self, client: &ClientId) {
         self.drop_subscriptions(client);
+        self.mirror_routing(client);
         self.inflight.remove(client);
         self.session_expiry.remove(client);
         self.expiring.remove(client);
@@ -7731,6 +7808,7 @@ impl Hub {
                 .entry(client.clone())
                 .or_insert(expiry_interval.unwrap_or(SESSION_EXPIRY_NEVER));
             debug!(client = %client.0, "inherited session materialized before re-attach (ADR 0042 T9)");
+            self.mirror_routing(&client);
             registered = true;
         }
         if registered || self.interest_authoritative {
@@ -8374,6 +8452,11 @@ impl Hub {
     /// Whether this node is the placement owner of `client`'s session. Outside a cluster
     /// (no placement, or a single member) every session is local, so it is always owned.
     fn owns_session(&self, client: &ClientId) -> bool {
+        // ADR 0092 T5: another shard's client is another shard's session, whatever
+        // the placement says about the node.
+        if !self.owns(client) {
+            return false;
+        }
         match &self.placement {
             None => true,
             Some(p) => p
@@ -8639,11 +8722,14 @@ impl Hub {
         m.set_publish_held_for_unreachable(self.publishes_held_for_unreachable());
         // Issue #613 item 3.5: the hub is ONE task, so the depth of its inbound
         // queue is its saturation, full stop.
-        m.set_hub_queue_depth(self.rx.len() + self.control_q.len() + self.data_q.len());
+        m.set_hub_queue_depth(
+            self.shard,
+            self.rx.len() + self.control_q.len() + self.data_q.len(),
+        );
         // ADR 0082 T2: the sorted lanes. Commands still on the channel are unsorted
         // and counted in the total only.
-        m.set_hub_lane_depth("control", self.control_q.len());
-        m.set_hub_lane_depth("data", self.data_q.len());
+        m.set_hub_lane_depth(self.shard, "control", self.control_q.len());
+        m.set_hub_lane_depth(self.shard, "data", self.data_q.len());
         if let Some(credit) = &self.ingress {
             m.set_ingress_credit(credit.in_use(), credit.pool_bytes());
             // ADR 0082 T4: peer readers shed `QoS` 0 without the metrics handle; the
@@ -8713,6 +8799,9 @@ impl Hub {
         // nothing that later drops it can be read as a withhold.
         let obligations_done = self.pending_publishes.get(id).is_some_and(|p| {
             p.local_done
+                // ADR 0092 T5: a hand-off to another shard is awaited as a peer's
+                // answer is, relaxed or not.
+                && p.shard_outstanding == 0
                 // ADR 0072: relaxed acks at submit; obligations still run.
                 // Issue #399 carves two exceptions, both congestion valves:
                 // a CONGESTED publish (its own lane was deep at submit) falls
@@ -10067,6 +10156,7 @@ mod tests {
     mod scaling_locality;
     mod scaling_mesh;
     pub(super) mod settle_gate;
+    mod sharded;
     mod share_obligations;
     mod shared_capacity;
     mod truncate_flusher;
@@ -10113,7 +10203,7 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
     use tokio::time::timeout;
 
-    type HubTx = mpsc::UnboundedSender<HubCommand>;
+    use super::HubTx;
 
     fn start_hub() -> HubTx {
         start_hub_with_store(MemorySessionStore::new())
@@ -24220,7 +24310,7 @@ mod tests {
         // inline await would land in the top buckets).
         let out = metrics.render();
         assert!(
-            out.contains("mqttd_hub_dispatch_seconds_count{command=\"publish\"} 1"),
+            out.contains("mqttd_hub_dispatch_seconds_count{command=\"publish\",shard=\"0\"} 1"),
             "the publish dispatch must be observed exactly once while its append is \
              still parked:\n{out}"
         );
@@ -24246,8 +24336,9 @@ mod tests {
 
     /// Parse one cumulative bucket count from the exposition.
     fn bucket_count(exposition: &str, command: &str, le: &str) -> u64 {
-        let needle =
-            format!("mqttd_hub_dispatch_seconds_bucket{{le=\"{le}\",command=\"{command}\"}} ");
+        let needle = format!(
+            "mqttd_hub_dispatch_seconds_bucket{{le=\"{le}\",command=\"{command}\",shard=\"0\"}} "
+        );
         exposition
             .lines()
             .find_map(|l| l.strip_prefix(&needle))

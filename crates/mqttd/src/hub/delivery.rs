@@ -126,6 +126,9 @@ pub(super) struct DeliveryTerms {
     pub granted: QoS,
     pub no_local: bool,
     pub retain_as_published: bool,
+    /// Whether any of the client's filters matched at all (ADR 0092 T5: a hand-off
+    /// skips a subscriber that unsubscribed since its shard's mirror was sent).
+    pub matched: bool,
 }
 
 /// The denominator the shared-locality bias is measured in
@@ -294,8 +297,8 @@ impl Hub {
         // refused publish receives nothing, because the publisher still owns the message
         // and is expected to retry it (there is no way to say "delivered to two of your
         // three subscribers" on one PUBACK).
-        let targets = self.ordinary_targets(topic, publisher, retain);
-        let matched = targets.len();
+        let (targets, foreign) = self.ordinary_targets(topic, publisher, retain);
+        let matched = targets.len() + foreign.len();
         if gate.answerable() {
             let owes = targets
                 .iter()
@@ -346,6 +349,12 @@ impl Hub {
         // therefore dominates any refusal).
         let (durable, _matched) =
             self.deliver_local(topic, payload, qos, message_expiry, app, targets, gate);
+        // ADR 0092 T5: the subscribers other shards own are handed to them — after the
+        // plan pass, so a refused publish hands off nothing.
+        for c in foreign {
+            self.hand_off(super::shards::ShardTarget::Ordinary(c));
+        }
+        self.flush_handoffs(topic, payload, qos, retain, message_expiry, app, gate);
         let durable = if retained_ok {
             durable
         } else {
@@ -394,11 +403,13 @@ impl Hub {
             granted: QoS::AtMostOnce,
             no_local: false,
             retain_as_published: false,
+            matched: false,
         };
         for e in self.subs.get(client).into_iter().flat_map(ClientSubs::iter) {
             if !topic_matches(&e.filter, topic) {
                 continue;
             }
+            terms.matched = true;
             if e.qos as u8 > terms.granted as u8 {
                 terms.granted = e.qos;
             }
@@ -409,7 +420,9 @@ impl Hub {
     }
 
     /// The ordinary (non-shared) local recipients of `topic` and each one's delivery
-    /// terms: `(client, granted QoS, wire retain flag)`.
+    /// terms: `(client, granted QoS, wire retain flag)` — and, second, the matched
+    /// subscribers other shards of this node own (ADR 0092 T5), whose terms are their
+    /// shard's to compute.
     ///
     /// Pure and I/O-free, so it can be computed in the PLAN pass — before any side
     /// effect — and handed to the COMMIT pass unchanged (issue #238).
@@ -418,11 +431,17 @@ impl Hub {
         topic: &str,
         publisher: Option<&ClientId>,
         source_retain: bool,
-    ) -> Vec<(ClientId, QoS, bool)> {
-        self.table
+    ) -> (Vec<(ClientId, QoS, bool)>, Vec<ClientId>) {
+        let mut foreign = Vec::new();
+        let own = self
+            .table
             .matching_clients(topic)
             .into_iter()
             .filter_map(|c| {
+                if !self.owns(&c) {
+                    foreign.push(c);
+                    return None;
+                }
                 let terms = self.delivery_terms(&c, topic);
                 // No Local suppresses only the publisher's own copy (#198).
                 if publisher == Some(&c) && terms.no_local {
@@ -431,7 +450,8 @@ impl Hub {
                 let retain = source_retain && terms.retain_as_published;
                 Some((c, terms.granted, retain))
             })
-            .collect()
+            .collect();
+        (own, foreign)
     }
 
     /// Whether delivering to `client` at `delivered_qos` OWES a durable append: a
@@ -782,6 +802,7 @@ impl Hub {
     /// becomes a `ForwardObligation` the publisher's ack already waits on. The
     /// proto-6 remote case is the documented skew residual, unchanged either way.
     #[allow(clippy::too_many_arguments)] // the delivery fields, plus the gate and live-only
+    #[allow(clippy::too_many_lines)] // one commit pass per plan; the shard arm is part of it
     pub(super) fn deliver_shared(
         &mut self,
         topic: &str,
@@ -863,6 +884,14 @@ impl Hub {
             placed = true;
             match chosen.node {
                 None => {
+                    // ADR 0092 T5: a member another shard owns is delivered there.
+                    if !self.owns(&chosen.client) {
+                        self.hand_off(super::shards::ShardTarget::Shared {
+                            client: chosen.client,
+                            qos: delivered_qos,
+                        });
+                        continue;
+                    }
                     // Item 3.5, counted where the target is COMMITTED. NOT in
                     // `plan_shared`: `shared_plan_owes_durable` (hub/policy.rs) also
                     // calls that as a pure peek under brownout, so counting there
@@ -929,6 +958,15 @@ impl Hub {
                 }
             }
         }
+        self.flush_handoffs(
+            topic,
+            payload,
+            qos,
+            false,
+            message_expiry,
+            app,
+            &append_gate,
+        );
         // The second element is `shared_placed` (issue #613 item 2.1): true iff at
         // least one iteration above reached a `Some(chosen)` and attempted a
         // delivery or a forward for it. It must be FALSE for the
@@ -1425,12 +1463,20 @@ impl Hub {
                 continue;
             }
             let entry = by_key.entry((group, filter)).or_default();
-            for (client, qos) in members.iter() {
+            let online_prefix = members.online_count();
+            for (i, (client, qos)) in members.iter().enumerate() {
                 entry.push(SharedCandidateRef {
                     node: None,
                     client,
                     qos: *qos,
-                    online: self.online.contains_key(client),
+                    // ADR 0092 T5: a member another shard owns is online as its shard
+                    // last mirrored it (the group's online prefix); one of ours, as
+                    // this shard holds it.
+                    online: if self.owns(client) {
+                        self.online.contains_key(client)
+                    } else {
+                        i < online_prefix
+                    },
                 });
             }
         }

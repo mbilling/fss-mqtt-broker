@@ -6,6 +6,7 @@
 //! credit exists to bound, measured exactly rather than sampled from a gauge.
 
 use super::*;
+use crate::hub::HubTx;
 use crate::ingress::{IngressCredit, OverloadMode, COMMAND_OVERHEAD};
 use mqtt_observability::metrics::Metrics;
 
@@ -13,6 +14,12 @@ const TOPIC: &str = "load/t";
 const PAYLOAD: usize = 200;
 /// What one test publish costs: topic, payload and the fixed overhead.
 const COST: usize = TOPIC.len() + PAYLOAD + COMMAND_OVERHEAD;
+
+/// A fake hub's end of the command channel, as the connections see it (ADR 0092 T5).
+fn hub_channel() -> (HubTx, mpsc::UnboundedReceiver<HubCommand>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    (HubTx::from(tx), rx)
+}
 
 fn policy(credit: Option<Arc<IngressCredit>>, metrics: Option<Arc<Metrics>>) -> Arc<ConnPolicy> {
     let base = permissive();
@@ -24,11 +31,7 @@ fn policy(credit: Option<Arc<IngressCredit>>, metrics: Option<Arc<Metrics>>) -> 
     })
 }
 
-fn open(
-    policy: &Arc<ConnPolicy>,
-    hub_tx: &mpsc::UnboundedSender<HubCommand>,
-    version: ProtocolVersion,
-) -> (Reader, Writer) {
+fn open(policy: &Arc<ConnPolicy>, hub_tx: &HubTx, version: ProtocolVersion) -> (Reader, Writer) {
     let (client, server) = tokio::io::duplex(4096);
     tokio::spawn(handle_stream(
         server,
@@ -157,7 +160,7 @@ async fn overload(credit: Option<OverloadMode>, qos: QoS, per: usize) -> Overloa
     let credit = credit.map(|mode| Arc::new(IngressCredit::new(POOL, CONN_CAP, mode)));
     let metrics = Arc::new(Metrics::new("test"));
     let policy = policy(credit, Some(metrics.clone()));
-    let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+    let (hub_tx, hub_rx) = hub_channel();
     let (mut queue, _outbound) = stalled_hub(hub_rx);
 
     let acked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -347,7 +350,7 @@ async fn a_paused_publisher_resumes_and_still_receives_while_paused() {
     const TOTAL: usize = 200;
     let credit = Arc::new(IngressCredit::new(3 * COST, 3 * COST, OverloadMode::Pause));
     let policy = policy(Some(credit.clone()), None);
-    let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+    let (hub_tx, hub_rx) = hub_channel();
     let (mut queue, mut outbound) = stalled_hub(hub_rx);
     let (mut reader, mut writer) = open(&policy, &hub_tx, V5);
     writer.send(&connect_v5("paused", vec![])).await.unwrap();
@@ -424,7 +427,7 @@ async fn a_paused_publisher_resumes_and_still_receives_while_paused() {
 async fn keepalive_is_not_enforced_while_the_broker_pauses_the_connection() {
     let credit = Arc::new(IngressCredit::new(COST, COST, OverloadMode::Pause));
     let policy = policy(Some(credit), None);
-    let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+    let (hub_tx, hub_rx) = hub_channel();
     let (mut queue, _outbound) = stalled_hub(hub_rx);
     let (mut reader, mut writer) = open(&policy, &hub_tx, V4);
     writer
@@ -539,7 +542,7 @@ fn policy_with_copies(credit: Arc<IngressCredit>, copies: usize) -> Arc<ConnPoli
 async fn a_publishs_derived_messages_are_charged_to_its_credit() {
     let credit = Arc::new(IngressCredit::new(POOL, CONN_CAP, OverloadMode::Pause));
     let policy = policy_with_copies(credit.clone(), 3);
-    let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+    let (hub_tx, hub_rx) = hub_channel();
     let (mut queue, _outbound) = stalled_hub(hub_rx);
     let (mut reader, mut writer) = open(&policy, &hub_tx, V4);
     writer.send(&connect_packet("copier", true)).await.unwrap();
@@ -564,7 +567,7 @@ async fn a_derived_charge_beyond_the_connection_cap_is_clamped_and_proceeds() {
     let cap = 2 * COST;
     let credit = Arc::new(IngressCredit::new(POOL, cap, OverloadMode::Pause));
     let policy = policy_with_copies(credit.clone(), 5);
-    let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+    let (hub_tx, hub_rx) = hub_channel();
     let (mut queue, _outbound) = stalled_hub(hub_rx);
     let (mut reader, mut writer) = open(&policy, &hub_tx, V4);
     writer
@@ -639,7 +642,7 @@ async fn a_batch_waiting_for_derived_credit_waits_parked_and_keeps_delivering() 
     let credit = Arc::new(IngressCredit::new(4 * COST, 4 * COST, OverloadMode::Pause));
     let filler_policy = policy(Some(credit.clone()), None);
     let copier_policy = policy_with_copies(credit.clone(), 3);
-    let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+    let (hub_tx, hub_rx) = hub_channel();
     let (mut queue, mut outbound) = stalled_hub(hub_rx);
 
     // A publish without rules holds one cost of the pool of four.
@@ -718,7 +721,7 @@ async fn a_qos2_batch_waiting_for_credit_is_not_closed_for_the_brokers_wait() {
             ..(*p).clone()
         })
     };
-    let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+    let (hub_tx, hub_rx) = hub_channel();
     let (mut queue, mut outbound) = stalled_hub(hub_rx);
 
     let (mut filler_reader, mut filler_writer) = open(&filler_policy, &hub_tx, V4);
@@ -787,7 +790,7 @@ async fn a_resumed_qos2_publish_waiting_for_derived_credit_is_not_closed_for_it(
             ..(*p).clone()
         })
     };
-    let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+    let (hub_tx, hub_rx) = hub_channel();
     let (mut queue, mut outbound) = stalled_hub(hub_rx);
 
     // The filler takes the whole pool, one cost per publish.
@@ -858,7 +861,7 @@ async fn a_parked_batch_keeps_its_place_in_the_puback_order() {
     let credit = Arc::new(IngressCredit::new(8 * COST, 8 * COST, OverloadMode::Pause));
     let filler_policy = policy(Some(credit.clone()), None);
     let copier_policy = policy_with_copies(credit.clone(), 3);
-    let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+    let (hub_tx, hub_rx) = hub_channel();
     let (mut queue, mut outbound) = stalled_hub(hub_rx);
 
     let (mut filler_reader, mut filler_writer) = open(&filler_policy, &hub_tx, V4);
@@ -995,7 +998,7 @@ async fn a_batch_waiting_for_credit_releases_its_originals_credit_first() {
         publisher: Some(client),
         credit: None,
     };
-    let (hub_tx, mut hub_rx) = mpsc::unbounded_channel();
+    let (hub_tx, mut hub_rx) = hub_channel();
     let (rx, holds) = send_forwarded(
         Forwarded::Batch(Box::new(PendingBatch {
             original,

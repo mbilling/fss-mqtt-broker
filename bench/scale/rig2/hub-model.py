@@ -22,6 +22,10 @@ one verdict.py judges the round on), the 2-second scrapes give:
              time that went to something other than dispatching: ingest, yields, wake-ups
              and migrations. On the AWS runs of 2026-10-30 that share was 17% on Ice Lake
              (busy 0.83) and 30% on EPYC Genoa (busy 0.70), read on the saturated node.
+  shards     ADR 0092 T5: a node of several hub loops reports each loop's busy share and
+             queue (the `shard` label); the node's busy is then its busiest loop's, its
+             hub-seconds per message are every loop's, and the `shard` class is the
+             hand-offs between them (ShardDeliver, ShardDone, the routing mirror).
 
 Figures are per broker from that broker's own clock (differences of its scrapes), then
 summed or averaged over the cluster weighted by the messages each broker received.
@@ -64,7 +68,7 @@ PLACEMENT = "mqttd_hub_thread_info"
 # window above 100,000 (213,000 at 400,800 there, 240,000 on one m6i.8xlarge at 101,300).
 HUB_SATURATED = 10_000
 ROUND_DIR = re.compile(r"^round-(\d+)(?:-a(\d+))?$")
-CLASSES = ("publish", "ack", "control", "attach", "subscribe", "cluster", "sweep")
+CLASSES = ("publish", "ack", "control", "attach", "subscribe", "cluster", "sweep", "shard")
 
 
 # ── scrapes ─────────────────────────────────────────────────────────────────────────
@@ -142,19 +146,35 @@ def broker_model(samples: list[tuple[int, dict]], lo_ms: float, hi_ms: float, ma
                         "per_msg": dn / rx if rx > 0 else None,
                         "share": ds / dt}
     seconds = sum(c["seconds"] for c in classes.values())
-    busy = seconds / dt
+    # Per hub loop (ADR 0092 T5, the `shard` label; a scrape from before it has one
+    # unlabelled loop, read as shard 0): its busy share and its queue. A loop's queue
+    # at the window's end above HUB_SATURATED is that loop not keeping up.
+    sh_a, sh_z = E.by_label(a, DISPATCH_SUM, "shard"), E.by_label(z, DISPATCH_SUM, "shard")
+    q_series = [E.by_label(p, QUEUE, "shard") for _, p in inside]
+    shards: dict[str, dict] = {}
+    for k in sorted(set(sh_z) | set(q_series[-1])):
+        ds = sh_z.get(k, 0.0) - sh_a.get(k, 0.0)
+        qs = [q.get(k, 0.0) for q in q_series]
+        shards[k or "0"] = {"busy": ds / dt, "queue_end": qs[-1], "queue_max": max(qs),
+                            "saturated": qs[-1] > HUB_SATURATED}
+    # The node's busy is its busiest loop's share of wall-clock; `busy_sum` is every
+    # loop's hub-seconds per wall second (equal with one loop, up to K with K).
+    busy_sum = seconds / dt
+    busy = max((s["busy"] for s in shards.values()), default=busy_sum)
     ws, wc = _probe(z, WAKE_SUM) - _probe(a, WAKE_SUM), _probe(z, WAKE_COUNT) - _probe(a, WAKE_COUNT)
-    queues = [p.get((QUEUE, ""), 0.0) for _, p in inside]
+    queues = [sum(q.values()) for q in q_series]
     # Where the loop ran (ADR 0092 D1, mqttd_hub_thread_info): one live series per node.
     placement = None
     for (name, labels), v in z.items():
         if name == PLACEMENT and v:
             got = dict(re.findall(r'(\w+)="([^"]*)"', labels))
             placement = {"thread": got.get("thread", "?"), "core": got.get("core", "?")}
-    return {"window_s": dt, "received": rx, "received_rate": rx / dt, "busy": busy, "placement": placement,
+    return {"window_s": dt, "received": rx, "received_rate": rx / dt, "busy": busy, "busy_sum": busy_sum,
+            "shards": shards, "placement": placement,
             "us_per_msg": seconds / rx * 1e6 if rx > 0 else None, "classes": classes,
             "wake_us": ws / wc * 1e6 if wc > 0 else None,
-            "queue_end": queues[-1], "queue_max": max(queues), "saturated": queues[-1] > HUB_SATURATED,
+            "queue_end": queues[-1], "queue_max": max(queues),
+            "saturated": any(s["saturated"] for s in shards.values()),
             "scrapes": len(inside)}
 
 
@@ -209,8 +229,16 @@ def merge_brokers(rounds: list[dict]) -> dict[int, dict]:
                             "us": _wmean([(c["us"], c["dispatches"]) for c, _ in cs]),
                             "per_msg": _wmean([(c["per_msg"], rx) for c, rx in cs]),
                             "share": _wmean([(c["share"], rx) for c, rx in cs])}
+        shards = {}
+        for k in sorted({k for m in ms for k in m.get("shards", {})}):
+            ss = [(m["shards"][k], m["received"]) for m in ms if k in m.get("shards", {})]
+            shards[k] = {"busy": _wmean([(s["busy"], rx) for s, rx in ss]),
+                         "queue_max": max(s["queue_max"] for s, _ in ss),
+                         "saturated": any(s["saturated"] for s, _ in ss)}
         out[idx] = {"rounds": len(ms), "received_rate": _wmean([(m["received_rate"], rx) for m, rx in w]),
                     "busy": _wmean([(m["busy"], rx) for m, rx in w]),
+                    "busy_sum": _wmean([(m.get("busy_sum", m["busy"]), rx) for m, rx in w]),
+                    "shards": shards,
                     "us_per_msg": _wmean([(m["us_per_msg"], rx) for m, rx in w]),
                     "wake_us": _wmean([(m["wake_us"], rx) for m, rx in w]), "classes": classes,
                     "queue_max": max(m["queue_max"] for m in ms),
@@ -285,8 +313,11 @@ def ladder_model(ladder: Path) -> dict:
             continue
         for i in s["cluster"]["saturated"]:
             m = s["brokers"][i]
-            if m["busy"] is not None and (best is None or m["busy"] > best["busy"]):
-                best = {"step": s["id"], "busy": m["busy"], "node": i, "wake_us": m["wake_us"]}
+            # On a sharded node the ceiling is the loop that did not keep up (ADR 0092 T5).
+            behind = [sh["busy"] for sh in m.get("shards", {}).values() if sh["saturated"] and sh["busy"] is not None]
+            busy = max(behind) if behind else m["busy"]
+            if busy is not None and (best is None or busy > best["busy"]):
+                best = {"step": s["id"], "busy": busy, "node": i, "wake_us": m["wake_us"]}
     out["ceiling"] = best
     return out
 
@@ -329,21 +360,35 @@ def render_ladder_md(lm: dict) -> list[str]:
              "lateness, and the nodes whose queue ended the window above "
              f"{HUB_SATURATED:,}: there 1 − busy is the loop's time not spent dispatching.", "",
              "| step | offered msg/s | verdict | busy, busiest node | µs per message | publish µs × per msg | "
-             "ack µs × per msg | wake µs | queue max | saturated nodes |",
-             "|---|---|---|---|---|---|---|---|---|---|"]
+             "ack µs × per msg | shard µs × per msg | wake µs | queue max | saturated nodes |",
+             "|---|---|---|---|---|---|---|---|---|---|---|"]
     for s in lm["steps"]:
         c = s["cluster"]
         if not c:
-            lines.append(f"| {s['step']} | {_n(s['rate'])} | {s['verdict'] or '—'} | — | — | — | — | — | — | "
+            lines.append(f"| {s['step']} | {_n(s['rate'])} | {s['verdict'] or '—'} | — | — | — | — | — | — | — | "
                          f"{'; '.join(s['problems']) or 'no figures'} |")
             continue
         pub, ack = c["classes"].get("publish", {}), c["classes"].get("ack", {})
+        shard = c["classes"].get("shard", {})
         sat = ", ".join(str(i) for i in c["saturated"]) or "none"
         lines.append(f"| {s['step']} | {_n(s['rate'])} | {s['verdict'] or '—'} | {_busy(c)} | "
                      f"{_us(c['us_per_msg'])} | {_us(pub.get('us'))} × {_us(pub.get('per_msg'))} | "
-                     f"{_us(ack.get('us'))} × {_us(ack.get('per_msg'))} | {_n(c['wake_us_max'])} | "
+                     f"{_us(ack.get('us'))} × {_us(ack.get('per_msg'))} | "
+                     f"{_us(shard.get('us'))} × {_us(shard.get('per_msg'))} | {_n(c['wake_us_max'])} | "
                      f"{_n(c['queue_max'])} | {sat} |")
     lines.append("")
+    # ADR 0092 T5: a node of several hub loops, each loop's busy share and queue per step.
+    for s in lm["steps"]:
+        sharded = {i: m for i, m in sorted(s["brokers"].items()) if len(m.get("shards", {})) > 1}
+        if sharded:
+            lines.append(f"- {s['id']}, per shard: " + " · ".join(
+                f"node {i} " + ", ".join(
+                    f"s{k} busy {sh['busy']:.2f} (queue max {_n(sh['queue_max'])}{', behind' if sh['saturated'] else ''})"
+                    for k, sh in sorted(m["shards"].items()))
+                + f" — all loops {m['busy_sum']:.2f}"
+                for i, m in sharded.items()))
+    if any(len(m.get("shards", {})) > 1 for s in lm["steps"] for m in s["brokers"].values()):
+        lines.append("")
     placed = next((s for s in lm["steps"] if any(m.get("placement") for m in s["brokers"].values())), None)
     if placed:
         lines.append("- hub loop per node (ADR 0092 D1): " + " · ".join(

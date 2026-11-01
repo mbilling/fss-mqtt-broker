@@ -92,7 +92,7 @@ pub struct Node {
     /// Address peers dial to establish the cluster bus link.
     pub peer_addr: SocketAddr,
     id: mqtt_cluster::NodeId,
-    tx: tokio::sync::mpsc::UnboundedSender<mqttd::HubCommand>,
+    tx: mqttd::hub::HubTx,
 }
 
 /// Start a standalone cluster node (hub + client listener + peer listener), not yet
@@ -355,10 +355,7 @@ impl PersistentNode {
     }
 }
 
-fn spawn_client_loop(
-    listener: TcpListener,
-    tx: tokio::sync::mpsc::UnboundedSender<mqttd::HubCommand>,
-) {
+fn spawn_client_loop(listener: TcpListener, tx: mqttd::hub::HubTx) {
     tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();

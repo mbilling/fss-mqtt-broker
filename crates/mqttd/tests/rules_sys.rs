@@ -107,6 +107,7 @@ fn spawn_stats(
     last_reload: Arc<LastReload>,
 ) -> (mpsc::UnboundedReceiver<HubCommand>, CancellationToken) {
     let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+    let hub_tx = mqttd::hub::HubTx::from(hub_tx);
     let stop = CancellationToken::new();
     tokio::spawn(run_stats(
         w.rules.clone(),
@@ -426,6 +427,7 @@ async fn every_sys_message_carries_a_message_expiry() {
     let mut w = watched(TRACED, &settings(0, true, 20));
     publish(&w.rules.for_connection(), "t/1", br#"{"v":"x"}"#);
     let (hub_tx, mut hub_rx) = mpsc::unbounded_channel();
+    let hub_tx = mqttd::hub::HubTx::from(hub_tx);
     tokio::spawn(run_trace(
         w.trace_rx.take().unwrap(),
         w.rules.clone(),
@@ -769,7 +771,7 @@ fn fire_every_trigger(w: &mut Watched) -> Vec<Value> {
             },
             0,
         ),
-        &mpsc::unbounded_channel().0,
+        &mqttd::hub::HubTx::from(mpsc::unbounded_channel().0),
     );
     drain(w.trace_rx.as_mut().unwrap())
         .iter()
@@ -937,6 +939,7 @@ actions = []
     }
     assert_eq!(w.observe.trace_dropped(), 0, "all 300 queued");
     let (hub_tx, mut hub_rx) = mpsc::unbounded_channel();
+    let hub_tx = mqttd::hub::HubTx::from(hub_tx);
     tokio::spawn(run_trace(
         w.trace_rx.take().unwrap(),
         w.rules.clone(),
@@ -1132,6 +1135,7 @@ async fn records_queued_before_the_trace_turned_off_are_not_published() {
     publish(&w.rules.for_connection(), "t/1", br#"{"v":"x"}"#);
     w.observe.apply(&settings(0, false, 20), None);
     let (hub_tx, mut hub_rx) = mpsc::unbounded_channel();
+    let hub_tx = mqttd::hub::HubTx::from(hub_tx);
     tokio::spawn(run_trace(
         w.trace_rx.take().unwrap(),
         w.rules.clone(),

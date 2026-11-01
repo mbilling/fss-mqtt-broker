@@ -65,7 +65,7 @@ use mqtt_cluster::swim_driver::MembershipEvent;
 use mqtt_cluster::{swim_driver, NodeId};
 use mqtt_codec::{Packet, QoS};
 use mqtt_storage::{MemorySessionStore, SessionStore};
-use mqttd::hub::{Hub, HubCommand};
+use mqttd::hub::{Hub, HubCommand, HubTx};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch};
 
@@ -149,7 +149,7 @@ struct Node {
     metrics: Arc<mqtt_observability::metrics::Metrics>,
     plane: Option<mqtt_cluster::durable_plane::DurablePlane>,
     /// The hub, to ask it whether it has caught up ([`HubCommand::Flush`]).
-    hub: mpsc::UnboundedSender<HubCommand>,
+    hub: HubTx,
     /// How many `Dead` verdicts — and confirmations that a peer is gone — this
     /// node's link manager has handed its hub.
     verdicts_handed_to_the_hub: Arc<AtomicUsize>,
@@ -443,7 +443,7 @@ async fn start_node(id: &str, seeds: Vec<String>, mode: Mode) -> Node {
     tokio::spawn(mqttd::cluster::maintain_peer_links(
         event_rx,
         node_id.clone(),
-        to_hub,
+        mqttd::hub::HubTx::from(to_hub),
         None,
         Some(placement.clone()),
         Some(metrics.clone()),

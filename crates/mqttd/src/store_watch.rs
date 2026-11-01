@@ -66,12 +66,11 @@
 //! store's growth is not gated locally at all, so headroom below the mark must cover
 //! peer-driven growth for the whole detect-and-recover window.
 
-use crate::hub::{BrownoutAxis, HubCommand};
+use crate::hub::{BrownoutAxis, HubCommand, HubTx};
 use mqtt_observability::metrics::Metrics;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
 
 /// The redb store files a node may hold (ADR 0018): gauge label per store.
 ///
@@ -273,7 +272,7 @@ pub fn scan(dir: &Path) -> (Vec<(&'static str, u64)>, u64) {
 pub async fn watch(
     dir: std::path::PathBuf,
     max_bytes: Option<u64>,
-    hub: mpsc::UnboundedSender<HubCommand>,
+    hub: HubTx,
     metrics: Option<Arc<Metrics>>,
     poll: Option<WatermarkPoll>,
     snapshot: Option<Arc<StoreSnapshot>>,
@@ -338,6 +337,7 @@ pub async fn watch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::mpsc;
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("mqttd-watch-{}-{tag}", std::process::id()));
@@ -414,6 +414,7 @@ mod tests {
         // 95 of a 100-byte mark: inside the band, still under it.
         std::fs::write(dir.join("sessions.redb"), vec![0u8; 95]).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let tx = crate::hub::HubTx::from(tx);
         let _watch = tokio::spawn(watch(
             dir.clone(),
             Some(100),
@@ -446,6 +447,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("sessions.redb"), vec![0u8; 200]).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let tx = crate::hub::HubTx::from(tx);
         let _watch = tokio::spawn(watch(
             dir.clone(),
             Some(100),
@@ -557,6 +559,7 @@ mod tests {
         let dir = temp_dir("edge");
         std::fs::write(dir.join("sessions.redb"), vec![0u8; 10]).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let tx = crate::hub::HubTx::from(tx);
         // The shared snapshot (ADR 0054) fills alongside the metrics/brownout path.
         let snapshot = Arc::new(StoreSnapshot::default());
         let _watch = tokio::spawn(watch(

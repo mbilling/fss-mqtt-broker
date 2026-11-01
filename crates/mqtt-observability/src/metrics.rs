@@ -108,10 +108,12 @@ struct ReasonLabel {
     reason: String,
 }
 
-/// `{lane}` label — a bounded set: `control`, `data` (ADR 0082 T2).
+/// `{lane, shard}` labels — a bounded set: `control`, `data` (ADR 0082 T2), per hub
+/// loop (ADR 0092 T5).
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct LaneLabel {
     lane: String,
+    shard: String,
 }
 
 /// `{listener}` label — a bounded set: `tls`, `plaintext`.
@@ -149,13 +151,27 @@ const DURABLE_STAGES: [&str; 10] = [
     "ack_queue",
 ];
 
-/// `{command}` label for `mqttd_hub_dispatch_seconds` (issue #242) — the COARSE hub
-/// command classes, a bounded 7-value set (`attach`, `publish`, `ack`, `subscribe`,
-/// `control`, `cluster`, `sweep`), never per-variant.
+/// `{command, shard}` labels for `mqttd_hub_dispatch_seconds` (issue #242) — the COARSE
+/// hub command classes, a bounded 8-value set (`attach`, `publish`, `ack`, `subscribe`,
+/// `control`, `cluster`, `sweep`, `shard`), never per-variant; and which of the node's
+/// hub loops dispatched (ADR 0092 T5: `0` with the one loop).
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct CommandLabel {
     command: String,
+    shard: String,
 }
+
+/// `{shard}` label for the per-loop gauges (ADR 0092 T5).
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct ShardLabel {
+    shard: String,
+}
+
+/// The most hub loops a node runs (`node.hub_shards`, ADR 0092 T5), and each one's
+/// label value — resolved once, like the classes, so the loop's per-command
+/// observation allocates nothing.
+pub const HUB_SHARDS: usize = 4;
+const SHARD_LABELS: [&str; HUB_SHARDS] = ["0", "1", "2", "3"];
 
 /// Every `{command}` class the hub records, in the order of [`Metrics::hub_dispatch_cache`]
 /// (ADR 0092 T3: the hub loop observes one of these per command, so each handle is
@@ -165,7 +181,7 @@ struct CommandLabel {
 /// that family is never cleared and never has a label set removed: an observation through
 /// a stale handle would go on counting a series the family no longer exports. Only the
 /// rule-state and TLS families are ever removed from, and none of them is cached.
-const HUB_COMMAND_CLASSES: [&str; 7] = [
+const HUB_COMMAND_CLASSES: [&str; 8] = [
     "attach",
     "publish",
     "ack",
@@ -173,6 +189,7 @@ const HUB_COMMAND_CLASSES: [&str; 7] = [
     "control",
     "cluster",
     "sweep",
+    "shard",
 ];
 
 /// The `{qos}` label values, indexed by the `QoS` number: the per-publish counters
@@ -708,15 +725,15 @@ pub struct Metrics {
     hub_dispatch_seconds: Family<CommandLabel, Histogram>,
     /// ADR 0092 T3: one resolved handle per [`HUB_COMMAND_CLASSES`] entry, so the
     /// hub loop's per-command observation is a histogram update and nothing else.
-    hub_dispatch_cache: [std::sync::OnceLock<Histogram>; HUB_COMMAND_CLASSES.len()],
+    hub_dispatch_cache: [[std::sync::OnceLock<Histogram>; HUB_SHARDS]; HUB_COMMAND_CLASSES.len()],
     /// Issue #613 item 1.6: the peer fan-out's own time and the number of peer
     /// links it visited, split out of `hub_dispatch_seconds` so "a fan-out walked
     /// zero links" and "no fan-outs happened" are different readings.
     hub_fanout_seconds: Histogram,
     hub_fanout_peer_visits_total: Counter,
-    /// Issue #613 item 3.5: the hub's inbound queue depth. The hub is a single
-    /// task, so this is its saturation, full stop.
-    hub_queue_depth: Gauge,
+    /// Issue #613 item 3.5: the hub's inbound queue depth, per loop (ADR 0092 T5). A
+    /// loop is a single task, so this is its saturation, full stop.
+    hub_queue_depth: Family<ShardLabel, Gauge>,
     /// ADR 0082 T2: the hub's queued commands by lane, `control` and `data`.
     hub_lane_depth: Family<LaneLabel, Gauge>,
     /// ADR 0082 T3: client connections that stopped reading for want of ingress
@@ -1106,12 +1123,12 @@ impl Metrics {
              1.6). Divided by hub_fanout_seconds_count it is the average number of \
              links one publish walks — the quantity items 1.3 and 1.4 reduce",
         );
-        let hub_queue_depth = register_gauge(
+        let hub_queue_depth = register_gauge_family(
             &mut registry,
             "hub_queue_depth",
             "Commands queued for the single-threaded hub loop (issue #613 item \
-             3.5). The hub is one task, so this IS the statement \"work is arriving \
-             faster than it is retired\"",
+             3.5), per loop (`shard`, ADR 0092 T5). A loop is one task, so this IS \
+             the statement \"work is arriving faster than it is retired\"",
         );
         let hub_lane_depth = register_gauge_family(
             &mut registry,
@@ -2346,31 +2363,42 @@ impl Metrics {
     /// client on the node from one loop, so a dispatch that blocks (an inline store or
     /// quorum await, the defect issue #242 removed) shows up here as tail mass. Alert:
     /// p99 over ~100ms sustained for 5m (docs/OPERATIONS.md).
-    pub fn observe_hub_dispatch(&self, command: &str, seconds: f64) {
+    pub fn observe_hub_dispatch(&self, shard: u8, command: &str, seconds: f64) {
+        let s = usize::from(shard).min(HUB_SHARDS - 1);
         // ADR 0092 T3: the hub loop lands here once per command, so the known classes
         // go through a handle resolved once and an attribute that allocates nothing.
         if let Some(i) = label_index(&HUB_COMMAND_CLASSES, command) {
-            self.hub_dispatch_cache[i]
+            self.hub_dispatch_cache[i][s]
                 .get_or_init(|| {
                     self.hub_dispatch_seconds
                         .get_or_create(&CommandLabel {
                             command: HUB_COMMAND_CLASSES[i].to_string(),
+                            shard: SHARD_LABELS[s].to_string(),
                         })
                         .clone()
                 })
                 .observe(seconds);
-            self.otel
-                .hub_dispatch
-                .record(seconds, &[KeyValue::new("command", HUB_COMMAND_CLASSES[i])]);
+            self.otel.hub_dispatch.record(
+                seconds,
+                &[
+                    KeyValue::new("command", HUB_COMMAND_CLASSES[i]),
+                    KeyValue::new("shard", SHARD_LABELS[s]),
+                ],
+            );
         } else {
             self.hub_dispatch_seconds
                 .get_or_create(&CommandLabel {
                     command: command.to_string(),
+                    shard: SHARD_LABELS[s].to_string(),
                 })
                 .observe(seconds);
-            self.otel
-                .hub_dispatch
-                .record(seconds, &[KeyValue::new("command", command.to_string())]);
+            self.otel.hub_dispatch.record(
+                seconds,
+                &[
+                    KeyValue::new("command", command.to_string()),
+                    KeyValue::new("shard", SHARD_LABELS[s]),
+                ],
+            );
         }
     }
 
@@ -2402,22 +2430,35 @@ impl Metrics {
     ///
     /// Fed from one `rx.len()` read per sweep tick: reading it twice would export
     /// a number the broker never acted on.
-    pub fn set_hub_queue_depth(&self, n: usize) {
-        self.hub_queue_depth.set(clamp_gauge(n));
-        self.otel.hub_queue_depth.record(clamp_gauge(n), &[]);
-    }
-
-    /// Set one lane of `hub_lane_depth` (ADR 0082 T2). `lane` is `control` or `data`;
-    /// the caller sets both on every refresh.
-    pub fn set_hub_lane_depth(&self, lane: &str, n: usize) {
-        self.hub_lane_depth
-            .get_or_create(&LaneLabel {
-                lane: lane.to_string(),
+    pub fn set_hub_queue_depth(&self, shard: u8, n: usize) {
+        let s = usize::from(shard).min(HUB_SHARDS - 1);
+        self.hub_queue_depth
+            .get_or_create(&ShardLabel {
+                shard: SHARD_LABELS[s].to_string(),
             })
             .set(clamp_gauge(n));
         self.otel
-            .hub_lane_depth
-            .record(clamp_gauge(n), &[KeyValue::new("lane", lane.to_string())]);
+            .hub_queue_depth
+            .record(clamp_gauge(n), &[KeyValue::new("shard", SHARD_LABELS[s])]);
+    }
+
+    /// Set one lane of `hub_lane_depth` (ADR 0082 T2) for one hub loop (ADR 0092 T5).
+    /// `lane` is `control` or `data`; the caller sets both on every refresh.
+    pub fn set_hub_lane_depth(&self, shard: u8, lane: &str, n: usize) {
+        let s = usize::from(shard).min(HUB_SHARDS - 1);
+        self.hub_lane_depth
+            .get_or_create(&LaneLabel {
+                lane: lane.to_string(),
+                shard: SHARD_LABELS[s].to_string(),
+            })
+            .set(clamp_gauge(n));
+        self.otel.hub_lane_depth.record(
+            clamp_gauge(n),
+            &[
+                KeyValue::new("lane", lane.to_string()),
+                KeyValue::new("shard", SHARD_LABELS[s]),
+            ],
+        );
     }
 
     /// A client connection paused for want of ingress credit (ADR 0082 T3).
@@ -4318,12 +4359,12 @@ mod tests {
     #[test]
     fn hub_dispatch_and_append_lane_metrics_render() {
         let m = Metrics::new("t");
-        m.observe_hub_dispatch("publish", 0.0004);
+        m.observe_hub_dispatch(0, "publish", 0.0004);
         m.set_append_lane_jobs(3);
         m.publish_dropped("append-backlog-full");
         let out = m.render();
         assert!(
-            out.contains("mqttd_hub_dispatch_seconds_count{command=\"publish\"} 1"),
+            out.contains("mqttd_hub_dispatch_seconds_count{command=\"publish\",shard=\"0\"} 1"),
             "{out}"
         );
         assert!(out.contains("mqttd_append_lane_jobs 3"), "{out}");
@@ -4346,7 +4387,7 @@ mod tests {
         let m = Metrics::new("t");
         m.observe_hub_fanout(4e-6, 7);
         m.observe_hub_fanout(1e-6, 0);
-        m.set_hub_queue_depth(12);
+        m.set_hub_queue_depth(0, 12);
         for (reason, on) in [
             ("takeover", true),
             ("scan", false),
@@ -4392,7 +4433,10 @@ mod tests {
                 .any(|l| l.ends_with(" 1")),
             "micro buckets missing — the O(N) term is unresolvable:\n{out}"
         );
-        assert!(out.contains("mqttd_hub_queue_depth 12"), "{out}");
+        assert!(
+            out.contains("mqttd_hub_queue_depth{shard=\"0\"} 12"),
+            "{out}"
+        );
         // Every term is published, including the false ones — a gauge only ever set
         // to 1 never comes back down.
         assert!(

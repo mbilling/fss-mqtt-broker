@@ -11,7 +11,7 @@ use mqtt_codec::{packet::Publish, Packet, ProtocolVersion, QoS};
 use mqtt_core::{AppProperties, ClientId};
 use mqtt_storage::MemorySessionStore;
 use mqttd::hub::{
-    Admission, AttachOutcome, AuthMethod, Hub, Outbound, PublishOutcome, RemoteSharedGroup,
+    Admission, AttachOutcome, AuthMethod, Hub, HubTx, Outbound, PublishOutcome, RemoteSharedGroup,
 };
 use mqttd::HubCommand;
 use tokio::runtime::Runtime;
@@ -105,7 +105,7 @@ impl<T: Send + 'static> Collector<T> {
 }
 
 pub struct Rig {
-    tx: mpsc::UnboundedSender<HubCommand>,
+    tx: HubTx,
     workers: Vec<(Outbound, Collector<(u64, u64)>)>,
     peers: Vec<Collector<PeerMessage>>,
     tasks: Vec<JoinHandle<()>>,
@@ -134,7 +134,7 @@ impl Rig {
             .expect("peer setup deadline")
     }
 
-    pub fn sender(&self) -> mpsc::UnboundedSender<HubCommand> {
+    pub fn sender(&self) -> HubTx {
         self.tx.clone()
     }
 

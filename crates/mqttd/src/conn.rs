@@ -9,7 +9,7 @@
 //! publishes the client's will; a clean DISCONNECT discards it.
 
 use crate::aliases::{InboundAliases, OutboundAliases};
-use crate::hub::{Admission, AttachOutcome, AuthMethod, HubCommand, Outbound, Will};
+use crate::hub::{Admission, AttachOutcome, AuthMethod, HubCommand, HubTx, Outbound, Will};
 use bytes::Bytes;
 use mqtt_auth::{
     basic::BasicAuthenticator, mtls::IdentitySource, AllowAll, AuthError, AuthSession, AuthStep,
@@ -647,7 +647,7 @@ impl<'c> RuleConn<'c> {
         too_large: bool,
         wants: crate::rules::MessageWants,
         client: &ClientId,
-        hub: &mpsc::UnboundedSender<HubCommand>,
+        hub: &HubTx,
     ) {
         let Some(rules) = &self.rules else { return };
         let info = self.client(rules, &client.0);
@@ -691,13 +691,7 @@ impl<'c> RuleConn<'c> {
     /// remembered ([`sent`](Self::sent)). EMQX raises it at the PUBREC for `QoS` 2, and
     /// not again at the PUBCOMP. An acknowledgement of the other kind than the
     /// delivery's `QoS` calls for is not one, and raises nothing.
-    fn acked(
-        &self,
-        ack: &mqtt_codec::packet::Ack,
-        qos: QoS,
-        client: &ClientId,
-        hub: &mpsc::UnboundedSender<HubCommand>,
-    ) {
+    fn acked(&self, ack: &mqtt_codec::packet::Ack, qos: QoS, client: &ClientId, hub: &HubTx) {
         if self.unacked_len.load(std::sync::atomic::Ordering::Relaxed) == 0 {
             return;
         }
@@ -732,12 +726,7 @@ impl<'c> RuleConn<'c> {
     /// Raise a message event the hub decided ([`crate::rules::MessageNote`]): about a
     /// publish of this client's, or a delivery to it — then it is the subscriber, and
     /// the event names its username and address.
-    fn note(
-        &self,
-        note: &crate::rules::MessageNote,
-        client: &ClientId,
-        hub: &mpsc::UnboundedSender<HubCommand>,
-    ) {
+    fn note(&self, note: &crate::rules::MessageNote, client: &ClientId, hub: &HubTx) {
         let Some(rules) = &self.rules else { return };
         let info = self.client(rules, &client.0);
         let own = matches!(&note.event,
@@ -774,13 +763,7 @@ impl<'c> RuleConn<'c> {
 
     /// `$events/client/connack` for a CONNACK carrying `reason_code` (EMQX's name);
     /// `connected_at` only for a success.
-    fn connack(
-        &self,
-        hub: &mpsc::UnboundedSender<HubCommand>,
-        clientid: &str,
-        reason_code: &str,
-        connected_at: Option<i64>,
-    ) {
+    fn connack(&self, hub: &HubTx, clientid: &str, reason_code: &str, connected_at: Option<i64>) {
         if let Some(rules) = self.wants(mqtt_rules::EventKind::ClientConnack) {
             let ev = mqtt_rules::EventInput::client_connack(
                 &self.client(rules, clientid),
@@ -794,13 +777,7 @@ impl<'c> RuleConn<'c> {
 
     /// `$events/auth/check_authn_complete`: `reason_code` is `success` or EMQX's name
     /// for why authentication failed.
-    fn authn_complete(
-        &self,
-        hub: &mpsc::UnboundedSender<HubCommand>,
-        clientid: &str,
-        reason_code: &str,
-        is_anonymous: bool,
-    ) {
+    fn authn_complete(&self, hub: &HubTx, clientid: &str, reason_code: &str, is_anonymous: bool) {
         if let Some(rules) = self.wants(mqtt_rules::EventKind::CheckAuthnComplete) {
             let ev = mqtt_rules::EventInput::check_authn_complete(
                 &self.client(rules, clientid),
@@ -818,7 +795,7 @@ impl<'c> RuleConn<'c> {
     /// of its rules did, `default` when none matched (EMQX's `authorization.no_match`).
     fn authorize_publish(
         &self,
-        hub: &mpsc::UnboundedSender<HubCommand>,
+        hub: &HubTx,
         policy: &ConnPolicy,
         principal: &Identity,
         client: &ClientId,
@@ -856,7 +833,7 @@ impl<'c> RuleConn<'c> {
     /// [`authorize_publish`](Self::authorize_publish) for a SUBSCRIBE filter.
     fn authorize_subscribe(
         &self,
-        hub: &mpsc::UnboundedSender<HubCommand>,
+        hub: &HubTx,
         policy: &ConnPolicy,
         principal: &Identity,
         client: &ClientId,
@@ -978,7 +955,7 @@ pub fn authz_handle(a: Arc<dyn Authorizer>) -> watch::Receiver<Arc<dyn Authorize
 /// Test-only convenience path: anonymous clients are permitted, no transport
 /// identity is attached, and authorization is open. Production listeners go
 /// through [`handle_stream`] with the operator-configured [`ConnPolicy`].
-pub async fn handle(stream: TcpStream, hub: mpsc::UnboundedSender<HubCommand>) {
+pub async fn handle(stream: TcpStream, hub: HubTx) {
     let peer = stream.peer_addr().ok();
     let policy = Arc::new(ConnPolicy {
         anonymous: None,
@@ -1021,7 +998,7 @@ pub async fn handle_stream<S>(
     peer: Option<SocketAddr>,
     cert: Option<CertAdmission>,
     policy: Arc<ConnPolicy>,
-    hub: mpsc::UnboundedSender<HubCommand>,
+    hub: HubTx,
 ) -> ConnOutcome
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1039,7 +1016,7 @@ pub async fn handle_stream_watched<S>(
     arrival: Arrival,
     cert: Option<CertAdmission>,
     policy: Arc<ConnPolicy>,
-    hub: mpsc::UnboundedSender<HubCommand>,
+    hub: HubTx,
     watch: Option<PeerClosedWatch>,
 ) -> ConnOutcome
 where
@@ -1072,7 +1049,7 @@ async fn run<S>(
     arrival: Arrival,
     cert: Option<CertAdmission>,
     policy: &ConnPolicy,
-    hub: mpsc::UnboundedSender<HubCommand>,
+    hub: HubTx,
     auth_failed: &std::sync::atomic::AtomicBool,
     watch: Option<&PeerClosedWatch>,
 ) -> Result<(), NetError>
@@ -1296,7 +1273,7 @@ async fn will_rejected<W: AsyncWrite + Unpin>(
     principal: &Identity,
     policy: &ConnPolicy,
     rule_conn: &RuleConn<'_>,
-    hub: &mpsc::UnboundedSender<HubCommand>,
+    hub: &HubTx,
 ) -> Result<bool, NetError> {
     let Some(w) = &connect.last_will else {
         return Ok(false);
@@ -1358,7 +1335,7 @@ async fn run_framed<R, W>(
     arrival: Arrival,
     cert: Option<CertAdmission>,
     policy: &ConnPolicy,
-    hub: mpsc::UnboundedSender<HubCommand>,
+    hub: HubTx,
     allow_proxy: bool,
     via: Option<String>,
     auth_failed: &std::sync::atomic::AtomicBool,
@@ -1410,6 +1387,9 @@ where
         );
         return Ok(());
     };
+    // ADR 0092 T5: from here on this connection's commands go to the shard that owns
+    // its client, with nothing routed on its message path.
+    let hub = hub.pin(&client);
 
     // Authentication gate: verify credentials BEFORE attaching to the hub, so a
     // rejected client never touches session state (enhanced exchange or single-shot).
@@ -1793,7 +1773,7 @@ async fn proxy_to_owner<R, W>(
     principal: &Identity,
     proxy: &ProxyContext,
     addr: &str,
-    hub: &mpsc::UnboundedSender<HubCommand>,
+    hub: &HubTx,
 ) -> Result<(), NetError>
 where
     R: AsyncRead + Unpin,
@@ -1907,7 +1887,7 @@ pub async fn serve_proxied<R, W>(
     peer: Option<SocketAddr>,
     identity: Option<Identity>,
     policy: Arc<ConnPolicy>,
-    hub: mpsc::UnboundedSender<HubCommand>,
+    hub: HubTx,
     prefix: bytes::BytesMut,
     via: Option<String>,
     relay: Option<crate::hub::LinkCert>,
@@ -2494,7 +2474,7 @@ async fn reauthenticate<R, W>(
     principal: &mut Identity,
     policy: &ConnPolicy,
     rule_conn: &RuleConn<'_>,
-    hub: &mpsc::UnboundedSender<HubCommand>,
+    hub: &HubTx,
 ) -> Result<bool, NetError>
 where
     R: AsyncRead + Unpin,
@@ -2657,7 +2637,7 @@ fn negotiate_v5_properties(
 /// acks, whichever comes first, so no ack waits for another read. Dropping the batch
 /// flushes it too, so a connection that ends mid-read loses no ack.
 struct AckBatch<'a> {
-    hub: &'a mpsc::UnboundedSender<HubCommand>,
+    hub: &'a HubTx,
     client: ClientId,
     acks: Vec<(u16, Instant)>,
 }
@@ -2666,7 +2646,7 @@ struct AckBatch<'a> {
 const ACK_BATCH_MAX: usize = 32;
 
 impl<'a> AckBatch<'a> {
-    fn new(hub: &'a mpsc::UnboundedSender<HubCommand>, client: ClientId) -> Self {
+    fn new(hub: &'a HubTx, client: ClientId) -> Self {
         Self {
             hub,
             client,
@@ -2849,7 +2829,7 @@ const CLOSE_FLUSH_MAX: Duration = Duration::from_secs(5);
 async fn serve<R, W>(
     reader: &mut FrameReader<R>,
     writer: &mut FrameWriter<W>,
-    hub: &mpsc::UnboundedSender<HubCommand>,
+    hub: &HubTx,
     client: &ClientId,
     principal: Identity,
     auth_method: Option<String>,
@@ -2916,7 +2896,7 @@ where
 async fn serve_loop<R, W>(
     reader: &mut FrameReader<R>,
     writer: &mut FrameWriter<W>,
-    hub: &mpsc::UnboundedSender<HubCommand>,
+    hub: &HubTx,
     client: &ClientId,
     mut principal: Identity,
     auth_method: Option<String>,
@@ -3498,7 +3478,7 @@ struct PendingBatch {
 /// holds no credit, so the publisher's resend is the only copy.
 async fn send_forwarded(
     forwarded: Forwarded,
-    hub: &mpsc::UnboundedSender<HubCommand>,
+    hub: &HubTx,
     conn_credit: Option<&crate::ingress::ConnCredit>,
     rule_conn: &RuleConn<'_>,
     qos: QoS,
@@ -3583,7 +3563,7 @@ fn give_batch_credit(batch: &mut HubCommand, permit: crate::ingress::IngressPerm
 async fn handle_publish<W: AsyncWrite + Unpin>(
     publish: Publish,
     writer: &mut FrameWriter<W>,
-    hub: &mpsc::UnboundedSender<HubCommand>,
+    hub: &HubTx,
     client: &ClientId,
     principal: &Identity,
     policy: &ConnPolicy,
@@ -3734,7 +3714,7 @@ async fn handle_publish<W: AsyncWrite + Unpin>(
     //
     // Returns the receiver and how many hub acknowledgement gates the publish holds
     // (its own, plus one per gated message its rules derived — ADR 0083).
-    let forward = |hub: &mpsc::UnboundedSender<HubCommand>| -> Forwarded {
+    let forward = |hub: &HubTx| -> Forwarded {
         if !authorized {
             return Forwarded::Sent(None, 0);
         }
@@ -4187,7 +4167,7 @@ impl PacketOutcome {
 async fn handle_inbound<W: AsyncWrite + Unpin>(
     packet: Packet,
     writer: &mut FrameWriter<W>,
-    hub: &mpsc::UnboundedSender<HubCommand>,
+    hub: &HubTx,
     client: &ClientId,
     principal: &Identity,
     policy: &ConnPolicy,
@@ -4540,6 +4520,7 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::{assigned_client_id, AckQueue, NodeId, PendingPuback};
+    use crate::hub::HubTx;
 
     /// The parked-ack pipeline counts the hub acknowledgement gates its entries hold
     /// (ADR 0083): a publish whose rules derived gated messages takes one slot per
@@ -4671,6 +4652,7 @@ mod tests {
     fn start_conn() -> (Reader, Writer, mpsc::UnboundedReceiver<HubCommand>) {
         let (client, server) = tokio::io::duplex(4096);
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let hub_tx = HubTx::from(hub_tx);
         tokio::spawn(handle_stream(server, None, None, permissive(), hub_tx));
         let (rh, wh) = tokio::io::split(client);
         (FrameReader::new(rh, V4), FrameWriter::new(wh, V4), hub_rx)
@@ -4683,6 +4665,7 @@ mod tests {
     ) -> (Reader, Writer, mpsc::UnboundedReceiver<HubCommand>) {
         let (client, server) = tokio::io::duplex(4096);
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let hub_tx = HubTx::from(hub_tx);
         let policy = Arc::new(ConnPolicy {
             anonymous: None,
             auth: auth_handle(Arc::new(BasicAuthenticator {
@@ -4900,6 +4883,7 @@ mod tests {
     ) -> (Reader, Writer, mpsc::UnboundedReceiver<HubCommand>) {
         let (client, server) = tokio::io::duplex(4096);
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let hub_tx = HubTx::from(hub_tx);
         let policy = Arc::new(ConnPolicy {
             anonymous: None,
             auth: auth_handle(Arc::new(BasicAuthenticator {
@@ -5052,6 +5036,7 @@ mod tests {
         let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("test"));
         let (client, server) = tokio::io::duplex(4096);
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let hub_tx = HubTx::from(hub_tx);
         stub_hub(hub_rx);
         let policy = Arc::new(ConnPolicy {
             anonymous: None,
@@ -5108,6 +5093,7 @@ mod tests {
         let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("test"));
         let (client, server) = tokio::io::duplex(4096);
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let hub_tx = HubTx::from(hub_tx);
         stub_hub(hub_rx);
         let policy = Arc::new(ConnPolicy {
             anonymous: None,
@@ -5198,6 +5184,7 @@ mod tests {
     fn v5_pipe() -> (Reader, Writer, mpsc::UnboundedReceiver<HubCommand>) {
         let (client, server) = tokio::io::duplex(4096);
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let hub_tx = HubTx::from(hub_tx);
         tokio::spawn(handle_stream(server, None, None, permissive(), hub_tx));
         let (rh, wh) = tokio::io::split(client);
         (FrameReader::new(rh, V5), FrameWriter::new(wh, V5), hub_rx)
@@ -5208,6 +5195,7 @@ mod tests {
     fn enhanced_conn() -> (Reader, Writer) {
         let (client, server) = tokio::io::duplex(4096);
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let hub_tx = HubTx::from(hub_tx);
         let _seen = stub_hub(hub_rx);
         let mut secrets = std::collections::HashMap::new();
         secrets.insert("alice".to_string(), b"alice-secret".to_vec());
@@ -5441,6 +5429,7 @@ mod tests {
     async fn a_failed_connack_still_detaches_the_attached_session() {
         let (client, server) = tokio::io::duplex(4096);
         let (hub_tx, mut hub_rx) = mpsc::unbounded_channel();
+        let hub_tx = HubTx::from(hub_tx);
         let policy = Arc::new(ConnPolicy {
             anonymous: None,
             auth: auth_handle(Arc::new(BasicAuthenticator {
@@ -5600,6 +5589,7 @@ mod tests {
         let (client, owner_side) = tokio::io::duplex(4096);
         let (owner_read, owner_write) = tokio::io::split(owner_side);
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let hub_tx = HubTx::from(hub_tx);
         let _seen = stub_hub(hub_rx);
 
         // The owner serves a session "node-a" relayed here, vouching "device-7".
@@ -5674,6 +5664,7 @@ mod tests {
             let (client, owner_side) = tokio::io::duplex(4096);
             let (owner_read, owner_write) = tokio::io::split(owner_side);
             let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+            let hub_tx = HubTx::from(hub_tx);
             let _seen = stub_hub(hub_rx);
             tokio::spawn(super::serve_proxied(
                 owner_read,
@@ -5743,6 +5734,7 @@ mod tests {
     async fn unknown_protocol_version_closes_without_connack() {
         let (client, server) = tokio::io::duplex(4096);
         let (hub_tx, _hub_rx) = mpsc::unbounded_channel();
+        let hub_tx = HubTx::from(hub_tx);
         tokio::spawn(handle_stream(server, None, None, permissive(), hub_tx));
         let (rh, mut wh) = tokio::io::split(client);
 
@@ -5776,6 +5768,7 @@ mod tests {
     async fn v5_client_connects_subscribes_and_disconnects() {
         let (client, server) = tokio::io::duplex(4096);
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let hub_tx = HubTx::from(hub_tx);
         let _seen = stub_hub(hub_rx);
         tokio::spawn(handle_stream(server, None, None, permissive(), hub_tx));
         let (rh, wh) = tokio::io::split(client);
@@ -6294,6 +6287,7 @@ mod tests {
     ) -> (Reader, Writer, mpsc::UnboundedReceiver<HubCommand>) {
         let (client, server) = tokio::io::duplex(4096);
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let hub_tx = HubTx::from(hub_tx);
         let policy = Arc::new(ConnPolicy {
             anonymous: None,
             auth: auth_handle(Arc::new(BasicAuthenticator {
@@ -6581,6 +6575,7 @@ mod tests {
         Arc<mqtt_observability::RecordingAuditSink>,
     ) {
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let hub_tx = HubTx::from(hub_tx);
         let (reader, writer, audit) = conn_denying_secret_to(hub_tx, version, store);
         (reader, writer, hub_rx, audit)
     }
@@ -6588,7 +6583,7 @@ mod tests {
     /// [`conn_denying_secret`] that talks to `hub` — a real one, for a test that follows
     /// a message from one client to another.
     fn conn_denying_secret_to(
-        hub_tx: mpsc::UnboundedSender<HubCommand>,
+        hub_tx: HubTx,
         version: ProtocolVersion,
         store: Option<Arc<dyn mqtt_storage::SessionStore>>,
     ) -> (Reader, Writer, Arc<mqtt_observability::RecordingAuditSink>) {
