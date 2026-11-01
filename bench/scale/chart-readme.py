@@ -439,6 +439,15 @@ def same_money(pts: dict):
     return next(((rate, v, r) for rate, v, r in pts["mqttd"] if v == hv_vcpu), None)
 
 
+def same_shape_text(shape_hive: dict, hv_cost: float) -> str:
+    """mqttd's cost per million msg/s on HiveMQ's own shape against HiveMQ's: "level" within
+    5%, otherwise the ratio — derived, so the chart cannot keep a word its figures outgrew."""
+    x = hv_cost / usd_per_million(shape_hive["vcpu"], shape_hive["msg_per_s"])
+    if 0.95 <= x <= 1.05:
+        return "level"
+    return f"{ratio_text(x)} less" if x > 1 else f"{ratio_text(1 / x)} more"
+
+
 def same_traffic(pts: dict):
     """The cheapest measured cluster that carries at least HiveMQ's published rate, or None."""
     hv_rate, _ = pts["hivemq"]
@@ -495,7 +504,8 @@ def draw_cost(rows: list[dict]) -> str:
             f"brokers priced at AWS m6a.8xlarge on-demand (${USD_PER_VCPU_H:.4f} per vCPU-hour, {MONTH_H} hours a "
             f"month), no licence. mqttd, measured, as a range across node sizes: {shapes} (the maximum lossless step "
             f"of each run), {rng} less than HiveMQ"
-            + (f"; on HiveMQ's own shape, {shape(shape_hive)} vCPU, ${usd_per_million(shape_hive['vcpu'], shape_hive['msg_per_s']):,.0f}, level"
+            + (f"; on HiveMQ's own shape, {shape(shape_hive)} vCPU, ${usd_per_million(shape_hive['vcpu'], shape_hive['msg_per_s']):,.0f}, "
+               f"{same_shape_text(shape_hive, hv_cost)}"
                if shape_hive else "")
             + f". HiveMQ 4.18, published: ${hv_cost:,.0f} ({hive_words}). " + " ".join(sentences))
     o = cs.open_svg(w, h, f"Durable QoS 1: the hardware behind a million msg/s costs {rng} less than HiveMQ's",
@@ -520,7 +530,8 @@ def draw_cost(rows: list[dict]) -> str:
     o.append(cs.text(X(hi) + 10, y + 27, f"{rng} less than HiveMQ, by node size", size=11, role="ink2", num=True))
     o.append(cs.text(bx, y + 44, shapes
                      + (f" · on HiveMQ's shape, {shape(shape_hive)} vCPU, "
-                        f"${usd_per_million(shape_hive['vcpu'], shape_hive['msg_per_s']):,.0f}: level"
+                        f"${usd_per_million(shape_hive['vcpu'], shape_hive['msg_per_s']):,.0f}: "
+                        f"{same_shape_text(shape_hive, hv_cost)}"
                         if shape_hive else ""), size=11, role="muted", num=True))
     # HiveMQ: a dashed outline.
     y = 236

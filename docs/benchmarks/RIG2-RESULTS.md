@@ -421,7 +421,7 @@ Run `h3-20261030T171933Z` · 1 × m6i.8xlarge broker (32 vCPU in all), 1 × m6i.
 
 ![Durable QoS 1, 1 × m6i.8xlarge after ADR 0092 T3: ack p99 by offered msg/s](img/rig2/aws-1x-m6i8xl-durable-qos1-t3.svg)
 
-Run `h3-20261031T225644Z` · 1 × m6i.8xlarge broker (32 vCPU in all), 1 × m6i.4xlarge generator · 3 rounds a step · 200 B payload · latency is the ack p99, the mean of the rounds ± their standard deviation. The binary is ADR 0092 T3's second batch (`1f58398b`, on main as `854fabb5`): the row above with the hub loop's per-message work cut in the order its profile gave; the delivery doc's evidence table has the step by step, 88,700 → 105,500 → 112,100, and the model's figures (a publish dispatch 6.7 → 4.8 µs).
+Run `h3-20261031T225644Z` · 1 × m6i.8xlarge broker (32 vCPU in all), 1 × m6i.4xlarge generator · 3 rounds a step · 200 B payload · latency is the ack p99, the mean of the rounds ± their standard deviation. The binary is ADR 0092 T3's second batch (`1f58398b`, on main as `854fabb5`): the row above with the hub loop's per-message work cut in the order its profile gave; the delivery doc's evidence table has the step by step — 88,700 on 2026-10-30 and 92,400 when main was re-measured on 2026-10-31, then 105,500 and 112,100 — and the model's figures (a publish dispatch 6.7 → 4.8 µs).
 
 - **Maximum lossless:** 112,100 msg/s offered, 112.1k per node and 3,503 per vCPU (brokers received 112,052), ack p99 353.9 ± 230.6 ms
 - **ack p99 ≤ 1 s:** 112,100 msg/s (353.9 ± 230.6 ms)
