@@ -26,7 +26,7 @@ tasks:
     title: "Consumer PUBACKs complete on the connection task (D3): it owns the session's outbound in-flight state; the hub learns of acknowledgements in batches only for durable truncation, elision discharge and the obligation ledger; QoS 2 unchanged"
     status: in-progress
     issue: 1162
-    notes: "Size L. The maintainer's item 3. hub/mod.rs dispatch_pub_ack and complete_pending; the connection task's outbound state. Tests first: ADR 0089 T1's order tests, inflight_durability (#124), cluster_proc and false_dead_delivery with elision on. Done when the ack class is below 5% of hub time by T1 and no acknowledged message is lost on the fault suites. Plan (2026-11-01), two steps each measured with T1: (1) the connection task hands the hub its PUBACKs in batches — one HubCommand::PubAcks per drained read buffer, so no ack waits — and the hub completes a batch in one dispatch with the per-session lookups hoisted out of the loop, the truncation and the drain once per batch; the state stays where it is, so no invariant moves. (2) If the ack class is still above 5%: the in-flight table, the packet-id block and the receive-maximum quota move to the connection task (D3 proper), and the hub keeps only the elision discharge, the truncation watermark and the obligation ledger, fed by the same batches."
+    notes: "Size L. The maintainer's item 3. hub/mod.rs dispatch_pub_ack and complete_pending; the connection task's outbound state. Tests first: ADR 0089 T1's order tests, inflight_durability (#124), cluster_proc and false_dead_delivery with elision on. Done when the ack class is below 5% of hub time by T1 and no acknowledged message is lost on the fault suites. Plan (2026-11-01), two steps each measured with T1: (1) the connection task hands the hub its PUBACKs in batches — one HubCommand::PubAcks per drained read buffer, so no ack waits — and the hub completes a batch in one dispatch with the per-session lookups hoisted out of the loop, the truncation and the drain once per batch; the state stays where it is, so no invariant moves. (2) Planned 2026-11-01 from step 1's reading — a read carries one ack on h3, so a batch cannot amortize the ack's command: its cost is the loop's ingest, two clock reads and two histograms, five cold lookups (the hold queue, the backoff, the in-flight entry, the online entry twice) and the publisher's wake. Two slices, each measured with T1 on one node and three. (2a) A held delivery's obligation settles on the subscriber's connection task: the hub hands the task a Hold with the held packet (hub/hold.rs); the PUBACK settles it there — one compare-and-swap decides between the ack and the window's fallback write, never both — and fires the publisher's answer through the PublishGate the publish's pending entry shares with every hold of its fan-out, armed by the hub once nothing else is owed; the hub retires the armed entry at the arming and drops the hold when the ack batch reaches it, on its existing per-ack work; a peer's forward still settles on the hub, its verdict being the hub's to send. A first cut that told the hub of each firing through a channel and pruned settled holds at their deadlines measured 105,500 on run h3-20261101T105009Z (−6% on T3): the ack dispatch fell 1.8 → 0.7 µs, but 1.2 µs moved into the loop's own passes, the busy ceiling fell 0.82 → 0.71 and the queue burst to 17,000 at 60% busy — the second cut moves nothing out of the dispatch's timing, and measured 100,300 on run h3-20261101T121633Z with the same ceiling: the loop gets 60% of the wall-clock where T3's got 76%, read as the publisher's wake from the subscriber's task landing in that worker's LIFO slot, unstealable, behind which the hub waits. The same binary with the hub on its own thread (MQTTD_HUB_THREAD=true, run h3-20261101T131207Z) measured 78,100: the loop's share came back (ceiling 0.88) but every hand-off out of the hub became a remote wake, 10.4 µs per message. D3's discharge off the loop withdrawn (Amendment 3); #1175 not merged; step 1 stays. (2b) The in-flight table, the packet-id block, the receive-maximum quota, the backlog and the truncation watermark move to the connection task and are handed back at detach; then no QoS 1 PUBACK reaches the loop on the local path at all."
   - id: 0092-T5
     title: "The control-plane/data-plane ADR (D5): K data shards per node and one control task, with the two-shard hand-off cost measured before it is written; not started before T2–T4 are measured"
     status: planned
@@ -49,7 +49,7 @@ above; the table below is generated from it.
 | 0092-T1 | ✅ done | [#1159](https://github.com/mbilling/fss-mqtt-broker/issues/1159) | 2026-10-31 | "#1165: bench/scale/rig2/hub-model.py; test-hub-model.py (9 tests, in CI); verdict.py cites it under every ladder of report.md; the five AWS runs' baseline under Progress, and the T2 run read with it." |
 | 0092-T2 | ✅ done | [#1160](https://github.com/mbilling/fss-mqtt-broker/issues/1160) | 2026-10-31 | "#1167: Hub::spawn_dedicated, node.hub_thread / MQTTD_HUB_THREAD and node.hub_core / MQTTD_HUB_CORE, mqttd_hub_thread_info and the /statusz hub block, five tests; measured on run h3-20261031T155400Z against the baseline h3-20261030T171933Z (a regression, under Progress): shipped off by default, D1 withdrawn by ADR 0092 Amendment 1." |
 | 0092-T3 | 🚧 in-progress | [#1161](https://github.com/mbilling/fss-mqtt-broker/issues/1161) | — | "Size M–L. The maintainer's item 2. The frame-pointer profile (run h3-20261031T205637Z, under Progress) ordered the work: the per-command dispatch future's copies (memcpy, 14% of the hub task), the shared-subscription plan (11%), SipHash (10%), allocations (7–9%), the sub-id walk per delivery (5%), the metric label building (~1.5%); clock reads are 0.5% and stay. First batch: the hot commands on a small dispatch future and the rare arms boxed (dispatch_timed 5,832 → 2,488 B, the PUBACK with no future at all; pinned by a test), the labelled metric handles resolved once, the sub-id walk only for subscriptions that carry one, the elision write key built only while a write is in flight, the emptied per-session hold queues pooled, the empty-backlog drain one lookup — measured on run h3-20261031T215218Z: the knee 92,400 → 105,500 msg/s on one m6i.8xlarge, a publish 6.7 → 5.3 µs at 67,500 msg/s (under Progress). Second batch (the hasher, the trie's wildcard children as fields) measured on run h3-20261031T225644Z: the knee 105,500 → 112,100, a publish 5.3 → 4.8 µs at 67,500 msg/s. Target about 7 → about 5 µs per publish on m6i, each batch re-fitted with T1 on the rig; hub tests green." |
-| 0092-T4 | 🚧 in-progress | [#1162](https://github.com/mbilling/fss-mqtt-broker/issues/1162) | — | "Size L. The maintainer's item 3. hub/mod.rs dispatch_pub_ack and complete_pending; the connection task's outbound state. Tests first: ADR 0089 T1's order tests, inflight_durability (#124), cluster_proc and false_dead_delivery with elision on. Done when the ack class is below 5% of hub time by T1 and no acknowledged message is lost on the fault suites. Plan (2026-11-01), two steps each measured with T1: (1) the connection task hands the hub its PUBACKs in batches — one HubCommand::PubAcks per drained read buffer, so no ack waits — and the hub completes a batch in one dispatch with the per-session lookups hoisted out of the loop, the truncation and the drain once per batch; the state stays where it is, so no invariant moves. (2) If the ack class is still above 5%: the in-flight table, the packet-id block and the receive-maximum quota move to the connection task (D3 proper), and the hub keeps only the elision discharge, the truncation watermark and the obligation ledger, fed by the same batches." |
+| 0092-T4 | 🚧 in-progress | [#1162](https://github.com/mbilling/fss-mqtt-broker/issues/1162) | — | "Size L. The maintainer's item 3. hub/mod.rs dispatch_pub_ack and complete_pending; the connection task's outbound state. Tests first: ADR 0089 T1's order tests, inflight_durability (#124), cluster_proc and false_dead_delivery with elision on. Done when the ack class is below 5% of hub time by T1 and no acknowledged message is lost on the fault suites. Plan (2026-11-01), two steps each measured with T1: (1) the connection task hands the hub its PUBACKs in batches — one HubCommand::PubAcks per drained read buffer, so no ack waits — and the hub completes a batch in one dispatch with the per-session lookups hoisted out of the loop, the truncation and the drain once per batch; the state stays where it is, so no invariant moves. (2) Planned 2026-11-01 from step 1's reading — a read carries one ack on h3, so a batch cannot amortize the ack's command: its cost is the loop's ingest, two clock reads and two histograms, five cold lookups (the hold queue, the backoff, the in-flight entry, the online entry twice) and the publisher's wake. Two slices, each measured with T1 on one node and three. (2a) A held delivery's obligation settles on the subscriber's connection task: the hub hands the task a Hold with the held packet (hub/hold.rs); the PUBACK settles it there — one compare-and-swap decides between the ack and the window's fallback write, never both — and fires the publisher's answer through the PublishGate the publish's pending entry shares with every hold of its fan-out, armed by the hub once nothing else is owed; the hub retires the armed entry at the arming and drops the hold when the ack batch reaches it, on its existing per-ack work; a peer's forward still settles on the hub, its verdict being the hub's to send. A first cut that told the hub of each firing through a channel and pruned settled holds at their deadlines measured 105,500 on run h3-20261101T105009Z (−6% on T3): the ack dispatch fell 1.8 → 0.7 µs, but 1.2 µs moved into the loop's own passes, the busy ceiling fell 0.82 → 0.71 and the queue burst to 17,000 at 60% busy — the second cut moves nothing out of the dispatch's timing, and measured 100,300 on run h3-20261101T121633Z with the same ceiling: the loop gets 60% of the wall-clock where T3's got 76%, read as the publisher's wake from the subscriber's task landing in that worker's LIFO slot, unstealable, behind which the hub waits. The same binary with the hub on its own thread (MQTTD_HUB_THREAD=true, run h3-20261101T131207Z) measured 78,100: the loop's share came back (ceiling 0.88) but every hand-off out of the hub became a remote wake, 10.4 µs per message. D3's discharge off the loop withdrawn (Amendment 3); #1175 not merged; step 1 stays. (2b) The in-flight table, the packet-id block, the receive-maximum quota, the backlog and the truncation watermark move to the connection task and are handed back at detach; then no QoS 1 PUBACK reaches the loop on the local path at all." |
 | 0092-T5 | ⬜ planned | [#1163](https://github.com/mbilling/fss-mqtt-broker/issues/1163) | — | "Size M for the ADR, after a two-shard prototype of size M. The maintainer's item 4, sequenced after items 1–3 (2026-10-31). Contents in #1163: shard ownership by placement group, immutable snapshots from the control task, hand-off and completion cost, hot-group dealing and # subscribers, shard failure modes, the node's ceilings as functions of ADR 0091's numbers with the ENA packet-rate ceiling from netprobe." |
 <!-- /status-table:0092 -->
 
@@ -102,6 +102,9 @@ ingest, the yield it takes every 64 commands and the wake it then waits for, mig
 | 1 × `m6i.8xlarge`, **T3 second batch** (`h3-20261031T225644Z`) | 112,100 | 0.78 | 6.9 | 5.1 | 1.8 | 53 | 0.82 | 18% |
 | 3 × `m6i.8xlarge`, **T3 first batch** (`h3-20261031T234941Z`) | 299,300 | 0.81 | 8.1 | 6.2 | 1.9 | 31 | 0.83 | 17% |
 | 3 × `m6i.8xlarge`, **T3 second batch** (`h3-20261101T012140Z`) | 306,400 | 0.78 | 7.6 | 5.6 | 1.9 | 37 | 0.80 | 20% |
+| 1 × `m6i.8xlarge`, **T4 step 2a, first cut** (`h3-20261101T105009Z`) | 105,500 | 0.62 | 5.8 | 5.1 | 0.7 | 46 | 0.71 | 29% |
+| 1 × `m6i.8xlarge`, **T4 step 2a, second cut** (`h3-20261101T121633Z`) | 100,300 | 0.64 | 6.3 | 5.3 | 1.0 | 70 | 0.71 | 29% |
+| 1 × `m6i.8xlarge`, **T4 step 2a, second cut, hub on its own thread** (`h3-20261101T131207Z`) | 78,100 | 0.82 | 10.4 | 5.2 × 1.6 | 2.0 | 6,868 | 0.88 | 12% |
 
 Two readings the script settles. The Genoa node's loss is 30% at its ceiling, not the
 41% read off its carried step (0.57 busy): its ceiling rises with the offer, from 0.57 at
@@ -143,6 +146,57 @@ the row, and a cell is filled only by a run.
 | main before T3 | `19f36004` / `d4afe97d` | 88,700 / 92,400; 6.6 / 6.7 µs | 270,800 | `h3-20261030T171933Z`, `h3-20261031T194739Z`; `h3-20261030T183536Z` |
 | batch 1: the dispatch future, metric handles, the sub-id walk, the elision key and queues, the empty-backlog drain (#1170) | `1db8c42e` | 105,500 (+14%); 5.3 µs | 299,300 (+10.5%), ack p99 270 ms; a publish 7.0 → 6.2 µs at the knee | `h3-20261031T215218Z`; `h3-20261031T234941Z` |
 | batch 2: the hasher, the trie's wildcard children as fields (#1171) | `1f58398b` | 112,100 (+6% on batch 1, +21% on main); 4.8 µs | 306,400 (+2.4% on batch 1, +13% on main), ack p99 92 ms; a publish 6.2 → 5.6 µs at the knee | `h3-20261031T225644Z`; `h3-20261101T012140Z` |
+| T4 step 1 + 2a, first cut: the discharge off the loop, the entry retired through a channel, holds pruned at their deadlines (#1175, `356c6c2a`) | `356c6c2a` | 105,500 (−6% on batch 2); 5.3 µs | not run: a regression is not carried to three nodes | `h3-20261101T105009Z` |
+| T4 step 1 + 2a, second cut: the entry retired at the arming, the hold dropped with the ack batch, the bounds on the hub (#1175, `f954a6fe`) | `f954a6fe` | 100,300 (−10% on batch 2); 5.3 µs | not run: held, see the reading below | `h3-20261101T121633Z` |
+| T4 step 1 + 2a, second cut, with the hub on its own thread (`MQTTD_HUB_THREAD=true`, T2's mechanism) | `f954a6fe` | 78,100 (−30% on batch 2); 5.2 µs × 1.6 dispatches | not run | `h3-20261101T131207Z` |
+
+**T4 step 2a, first cut, measured** (run `h3-20261101T105009Z`, one `m6i.8xlarge`, the h3
+ladder, binary `356c6c2a`): the mechanism worked — 50.8 million deliveries discharged on
+the connection tasks over the run, 78 fallback writes — and the `ack` dispatch fell
+from 1.8 to 0.7 µs, the hub-µs per message from 7.2 to 5.8 at 105,500. The knee still
+fell, 112,100 → 105,500, because the work had moved rather than gone: retiring each
+fired gate's entry through a channel and pruning settled holds at their deadlines ran
+in the loop's own passes, outside the dispatch timing, and the busy ceiling fell from
+0.82 to 0.71 (29% of the loop's time not dispatching); the bounds counters shared with
+the connection tasks added 0.3–0.5 µs to a publish; and the queue burst to 17,000
+commands at 60% busy where T3's stayed under 500, with the pending-publish cap
+evicting answered entries at every rung above the knee. The second cut retires the
+armed entry at the arming (fallback writes carry the gate, `AppendThen::Hold`), drops
+the hold from the queue when the ack batch reaches the hub, on the per-ack work that
+exists anyway, and keeps the bounds on the hub: nothing is deferred to a pass of its
+own, and the connection task touches only the gate and the hold's state.
+
+**T4 step 2a, second cut, measured** (run `h3-20261101T121633Z`, one `m6i.8xlarge`, the
+h3 ladder, binary `f954a6fe`): the knee 100,300, bracketed at 102,900 — 10% under T3's
+112,100 — with the same busy ceiling of 0.71. The dispatch cost is lower than T3's at
+every rung (6.3 µs per message at 100,300 against 7.2; the `ack` dispatch 1.0 µs against
+1.8), so the loss is not in the dispatching: at 105,500 the loop dispatched 195,000
+commands a second at 60% busy while its queue grew by 15,000 every two seconds from the
+step's first second, until the cap at 235,800 and the spiral behind it (publishers time
+out, reconnect, open a takeover window; every later publish is then kept for the settle
+window and the pending-publish cap evicts them as `pending-cap-replay`). The loop is
+not overloaded; it is not being run: it gets about 60% of the wall-clock where T3's got
+76%, in both cuts alike. The one thing both cuts do and T3 does not is to wake the
+publisher from the subscriber's connection task: a wake from a running task lands in
+that worker's LIFO slot and runs next, unstealable, so when the hub's worker runs a
+subscriber task after the hub's yield it runs the publisher behind it too, and the hub
+comes back later; when the hub woke both (T3) they sat in the worker's stealable queue
+and the idle workers took most of them. The state move (slice 2b) would not change
+this.
+
+**The same binary with the hub on its own thread, measured** (run
+`h3-20261101T131207Z`, `MQTTD_HUB_THREAD=true`, T2's mechanism; the gauge confirms
+`thread="dedicated"`): the knee 78,100, bracketed at 80,200 — 30% under T3. No
+subscriber task runs on the hub's thread there, and the loop's share came back (busy
+0.82 at the knee, the ceiling 0.88), but what the loop then does per message costs
+more than the discharge saved: 10.4 µs per received message against 6.3 on the shared
+runtime, a publish dispatched 1.6 times per message (the retransmissions of a
+reconnect storm behind 2.4 s of ack latency), the wake probe 6.9 ms late. Every hand-off
+out of the hub is a remote wake on its own thread, as Amendment 1 found for T2 alone,
+and the gate removes one hand-off per message where the thread adds the cost to every
+other. Two placements, three runs, all below T3: D3's discharge off the loop is
+withdrawn (ADR 0092 Amendment 3). The PUBACK stays a hub command; step 1's batch stays
+(it pays where a consumer acks tens of deliveries a read); #1175 is not merged.
 
 **T3, first batch, measured** (run `h3-20261031T215218Z`, one `m6i.8xlarge`, the h3
 ladder, binary `1db8c42e`): the knee moved from 92,400 msg/s (main, re-measured the same
@@ -191,6 +245,23 @@ ceiling is unchanged at 0.83: the 17% it does not dispatch is the work it wakes
   truncation and the drain once per batch; the state stays where it is. Measured next with T1;
   on the h3 shape (20,000 subscribers at a few messages a second each) a read carries one ack,
   so the step is the transport for step 2 more than a gain of its own.
+- **2026-11-01** — T4 step 2 planned from that reading (a batch of one cannot amortize the
+  ack's command): slice 2a settles a held delivery's obligation on the subscriber's
+  connection task through a `PublishGate` shared with the publish's pending entry
+  (`hub/hold.rs`), slice 2b moves the outbound in-flight state there; the plan is in T4's
+  notes. Its first cut measured 105,500 on run `h3-20261101T105009Z`, a regression on
+  T3's 112,100 with the ack dispatch down to 0.7 µs: the entry's retirement through a
+  channel and the holds' pruning at their deadlines ran outside the dispatch timing and
+  took the busy ceiling to 0.71; reworked the same day to retire at the arming and drop
+  the hold with the ack batch. The second cut measured 100,300 on run
+  `h3-20261101T121633Z`, the same ceiling: the loop gets 60% of the wall-clock where
+  T3's got 76%, read as the publisher's wake landing in the subscriber worker's LIFO
+  slot. #1172, #1173 and #1174 merged the same day. The same binary with the hub on its
+  own thread then measured 78,100 (run `h3-20261101T131207Z`): the loop's share came
+  back and every hand-off out of it became a remote wake. D3's discharge off the loop
+  withdrawn, ADR 0092 Amendment 3; #1175 not merged; step 1 stays. The fan-in workload `fanin-qos1` added for the consumer-heavy shape, EMQX's
+  `mqttbs` shared-subscription scenario at the h3 client count: 20,000 publishers into one
+  `$share` group of 108 persistent consumers.
 - **2026-10-31** — T3 second batch, on the profile's next two items: the hub's maps keyed
   by a client, a node, a filter or an id, the ordinary and shared subscription tables and
   the filter trie on a keyed fast hasher (`mqtt_core::FastMap`, `ahash`; SipHash was 10% of
