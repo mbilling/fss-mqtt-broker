@@ -223,6 +223,54 @@ path now runs boxed (one allocation per frame); D4's before-and-after on the sha
 RIG2-RESULTS — three `m6i.8xlarge`, six `m6i.4xlarge` — is owed, and the README's cluster
 figures do not move before it. The per-node figure moves with #1170.
 
+## Amendment 3 (2026-11-01): D3's discharge off the loop withdrawn on its own measurement
+
+**What T4 built.** Step 1 (#1174, merged): the connection task hands the hub its PUBACKs
+as one command per read. Step 2a (#1175, not merged): a held delivery's obligation (ADR
+0089) settled on the subscriber's connection task — a `Hold` handed over with the packet,
+a `PublishGate` shared with the publish's pending entry, armed by the hub once nothing
+else was owed, fired by the last PUBACK wherever it was read — in two cuts, the second
+retiring the entry at the arming and dropping the hold with the ack batch, so that
+nothing was deferred to a pass of the loop's own.
+
+**What was measured** (one `m6i.8xlarge`, the h3 ladder, read with T1's model; T3's
+binary for comparison):
+
+| binary | run | knee | `ack` dispatch | hub µs per message | the loop's busy ceiling |
+|---|---|---|---|---|---|
+| T3 (`1f58398b`, main) | `h3-20261031T225644Z` | 112,100 | 1.8 µs | 6.9 | 0.82 |
+| step 2a, first cut (`356c6c2a`) | `h3-20261101T105009Z` | 105,500 | 0.7 µs | 5.8 | 0.71 |
+| step 2a, second cut (`f954a6fe`) | `h3-20261101T121633Z` | 100,300 | 1.0 µs | 6.3 | 0.71 |
+| the second cut, the hub on its own thread | `h3-20261101T131207Z` | 78,100 | 2.0 µs | 10.4 | 0.88 |
+
+**The reading.** The discharge left the loop as designed — 50.8 million deliveries
+discharged on connection tasks in one run, the `ack` dispatch halved — and the loop's
+cost per message fell below T3's at every rung. What it lost was its share of the
+wall-clock: 60% where T3's loop had 76% at the same offer, with the queue growing from a
+step's first second. A wake from a running task lands in that worker's LIFO slot and
+runs next, unstealable: the publisher's wake, now issued by the subscriber's task, ran
+on the hub's worker behind every subscriber task that worker ran, and the hub came back
+later. When the hub woke both tasks itself they sat in its worker's stealable queue, and
+the idle workers took them. On its own thread the loop got its share back and paid more
+per message than the discharge had saved: every hand-off out of the hub a remote wake,
+as Amendment 1 found for T2 alone. The two findings are one. This runtime's LIFO slot is
+what makes the hub's hand-offs cheap, and it makes them cheap only for the task that
+issues them.
+
+**D3, withdrawn.** The consumer PUBACK stays a hub command, completed on the loop. Step
+1's batch stays: one command per read costs nothing on h3 and pays on the shapes where a
+consumer acks tens of deliveries a read (`fanin-qos1`). The in-flight state does not
+move either, since the state move would still issue the publisher's wake off the loop.
+T4 ends with what step 1 is; the ack's cost on the loop — 1.8 of 6.9 µs on h3 — is D5's
+to share across cores, not the connection tasks' to take.
+
+**What this adds to D5.** The split's hand-off cost per message, which D5's prototype
+must measure before the ADR is written, has a floor this amendment can state: a
+hand-off between tasks is cheap only when the receiver runs in the sender's LIFO slot —
+next, on the same worker — and a shard that hands a message to another shard's task
+pays a remote wake unless the two share a worker. The prototype measures that on the h3
+shape and on the fan-in shape both.
+
 ## Consequences
 
 - **The hub stays where it was.** No core is reserved; `/statusz` and the gauge say so
