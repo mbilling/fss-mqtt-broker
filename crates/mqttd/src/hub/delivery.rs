@@ -1932,7 +1932,8 @@ impl Hub {
                 self.drain_backlog(client);
             }
         } else {
-            let _ = self.send_qos_publish(client, tx, message, retain, message_expiry, offset);
+            let _ =
+                self.send_qos_publish(client, tx, message, retain, message_expiry, offset, None);
         }
         true
     }
@@ -1977,6 +1978,9 @@ impl Hub {
     /// the single choke point every `QoS` > 0 wire send passes through — the
     /// completion-handler live send, the ack-triggered drain, and the attach replay —
     /// so the staging below covers all three.
+    // `hold` rides along with the send because the packet and its hold leave for the
+    // connection task in one channel item (ADR 0092 T4).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn send_qos_publish(
         &mut self,
         client: &ClientId,
@@ -1985,6 +1989,7 @@ impl Hub {
         retain: bool,
         message_expiry: Option<u32>,
         offset: Option<Offset>,
+        hold: Option<Arc<Hold>>,
     ) -> QosSend {
         if tx.is_closed() {
             self.reap_closed_connection(client, true);
@@ -2062,7 +2067,7 @@ impl Hub {
                 offset,
             },
         );
-        let _ = tx.send_from(
+        let _ = tx.send_held(
             publish_packet(
                 &message.topic,
                 message.payload.clone(),
@@ -2075,6 +2080,7 @@ impl Hub {
                 &self.matching_sub_ids(client, &message.topic),
             ),
             self.delivery_origin(&message.app),
+            hold,
         );
         QosSend::Sent
     }
@@ -2191,6 +2197,7 @@ impl Hub {
                 entry.retain,
                 entry.message_expiry,
                 entry.offset,
+                None,
             ) {
                 QosSend::Sent => {
                     if !self.online.contains_key(client) {

@@ -74,6 +74,11 @@ mod forwarding;
 use forwarding::{ForwardKind, ForwardObligation, InterestIndex, PendingPublish, Reselect};
 mod delivery;
 mod elision;
+mod hold;
+#[cfg(test)]
+pub(crate) use hold::armed_hold_for_test;
+pub(crate) use hold::Acked;
+pub use hold::Hold;
 /// The rule engine's message events, as far as the hub decides them (ADR 0083).
 mod events;
 pub(crate) use events::origin_from_wire;
@@ -318,6 +323,9 @@ pub enum Outgoing {
         /// When the hub queued it: the connection's task reports a `QoS` >= 1
         /// PUBLISH's wait (`delivery_outbound_wait_seconds`).
         queued: Instant,
+        /// A `QoS` 1 delivery held instead of written first (ADR 0089): the
+        /// connection task settles it when the PUBACK comes (ADR 0092 T4).
+        hold: Option<Arc<Hold>>,
     },
     /// A message event the hub decided, for this connection's task to raise (ADR
     /// 0083): nothing is written to the client.
@@ -488,6 +496,17 @@ impl Outbound {
     /// [`send`](Self::send) a PUBLISH with who published its message, for the message
     /// events the connection raises (see [`Outgoing::Packet`]).
     pub fn send_from(&self, packet: Packet, origin: Option<Arc<Origin>>) -> bool {
+        self.send_held(packet, origin, None)
+    }
+
+    /// [`send_from`](Self::send_from) a held `QoS` 1 PUBLISH with its [`Hold`], for the
+    /// connection task to settle at the PUBACK (ADR 0092 T4).
+    pub fn send_held(
+        &self,
+        packet: Packet,
+        origin: Option<Arc<Origin>>,
+        hold: Option<Arc<Hold>>,
+    ) -> bool {
         let n = packet_bytes(&packet);
         self.shared.depth.fetch_add(1, Ordering::Relaxed);
         self.shared.bytes.fetch_add(n, Ordering::Relaxed);
@@ -505,6 +524,7 @@ impl Outbound {
                 packet,
                 origin,
                 queued: Instant::now(),
+                hold,
             }))
             .is_err()
         {
@@ -1393,6 +1413,32 @@ pub struct DerivedPublish {
     pub gated: bool,
 }
 
+/// One `QoS` 1 delivery a subscriber acknowledged, as its connection task reports it
+/// in a [`HubCommand::PubAcks`] batch (ADR 0092 T4).
+#[derive(Debug, Clone, Copy)]
+pub struct AckedDelivery {
+    /// The packet id acknowledged.
+    pub pkid: u16,
+    /// When the connection read the PUBACK (`puback_hub_wait_seconds`).
+    pub received: Instant,
+    /// Whether a hold on it is the hub's to settle (ADR 0089): a peer's forward, whose
+    /// verdict the hub sends. A hold the connection task settled itself, or a delivery
+    /// never held, leaves this clear and the hub only completes the in-flight entry.
+    pub on_hub: bool,
+}
+
+impl AckedDelivery {
+    /// An ack with nothing held on it, read now.
+    #[must_use]
+    pub fn plain(pkid: u16) -> Self {
+        Self {
+            pkid,
+            received: Instant::now(),
+            on_hub: false,
+        }
+    }
+}
+
 /// A message from a connection task to the hub.
 #[derive(Debug)]
 pub enum HubCommand {
@@ -1652,8 +1698,8 @@ pub enum HubCommand {
     PubAcks {
         /// The acknowledging client.
         client: ClientId,
-        /// The packet ids acknowledged, each with when the connection read it.
-        acks: Vec<(u16, Instant)>,
+        /// The deliveries acknowledged, in the order read.
+        acks: Vec<AckedDelivery>,
     },
     /// A subscriber acknowledged receipt of a `QoS` 2 delivery (step 1 of 2).
     PubRec {
@@ -3068,6 +3114,10 @@ pub struct Hub {
     /// Deliveries held unwritten for the write-elision window (ADR 0089); empty and
     /// unused while `durable.write_elision_ms` is 0.
     elision: Box<elision::ElisionState>,
+    /// Pending publishes whose gate fired off the loop (ADR 0092 T4): a subscriber's
+    /// connection task answered the publisher, and the entry is retired here.
+    retire_rx: mpsc::UnboundedReceiver<u64>,
+    retire_tx: mpsc::UnboundedSender<u64>,
     /// Receiver side of acked forwards (issue #648): per origin, the forwards
     /// recently applied and the answer each got, so a retransmission is answered
     /// again instead of applied again. Bounded per origin by
@@ -3343,6 +3393,7 @@ impl Hub {
         placement: Option<Arc<RwLock<Placement>>>,
     ) -> (Self, mpsc::UnboundedSender<HubCommand>) {
         let (tx, rx) = mpsc::unbounded_channel();
+        let (retire_tx, retire_rx) = mpsc::unbounded_channel();
         (
             Self {
                 rx,
@@ -3368,6 +3419,8 @@ impl Hub {
                 remote_append_pending: HashMap::default(),
                 held_forwards: Vec::new(),
                 elision: Box::default(),
+                retire_rx,
+                retire_tx,
                 forward_windows: HashMap::default(),
                 held_dead: HashMap::default(),
                 node_id,
@@ -3740,6 +3793,7 @@ impl Hub {
             // longer waits behind the whole backlog (2.5M commands, ~10 s, on the #504
             // cloud run).
             let closed = self.ingest();
+            self.retire_fired_gates();
             if let Some(cmd) = self.next_command() {
                 // ADR 0092 T3: a consumer's PUBACK — one of the two commands of nearly
                 // every message cycle — is handled with no future at all. `dispatch_timed`'s
@@ -3772,7 +3826,7 @@ impl Hub {
                     if futures_util::FutureExt::now_or_never(sweep.tick()).is_some() {
                         self.run_sweep().await;
                     }
-                    if self.elision.entries > 0 {
+                    if !self.elision.deadlines.is_empty() {
                         self.expire_elided();
                     }
                     tokio::task::yield_now().await;
@@ -3789,8 +3843,16 @@ impl Hub {
                 },
                 _ = sweep.tick() => self.run_sweep().await,
                 // ADR 0089: the earliest held delivery's window, only while one is held.
-                () = elision_wake(&self.elision), if self.elision.entries > 0 => {
+                () = elision_wake(&self.elision), if !self.elision.deadlines.is_empty() => {
                     self.expire_elided();
+                }
+                // ADR 0092 T4: a gate fired on a connection task while the loop was idle.
+                Some(id) = self.retire_rx.recv() => {
+                    self.try_complete_pending(id);
+                    self.retire_fired_gates();
+                    if !self.drained_waiters.is_empty() {
+                        self.wake_drained();
+                    }
                 }
             }
         }
@@ -3868,6 +3930,20 @@ impl Hub {
             m.puback_hub_wait(received.elapsed().as_secs_f64());
         }
         self.dispatch_pub_ack(client, pkid);
+    }
+
+    /// Retire the pending publishes whose gate fired on a connection task since the
+    /// loop last looked (ADR 0092 T4): the publisher was answered there; the entry
+    /// leaves the table here, on the loop's own pass, with no command and no wake.
+    fn retire_fired_gates(&mut self) {
+        let mut any = false;
+        while let Ok(id) = self.retire_rx.try_recv() {
+            self.try_complete_pending(id);
+            any = true;
+        }
+        if any && !self.drained_waiters.is_empty() {
+            self.wake_drained();
+        }
     }
 
     /// After one command's dispatch: its time on the loop by class (issue #242), and a
@@ -8739,10 +8815,22 @@ impl Hub {
         // forward whose target died is doubt about the EVIDENCE, not about the
         // routing view, and item 2.1 does not widen into it.
         if let Some(p) = self.pending_publishes.get_mut(id) {
-            if !p.ack_awaits_settle && p.answer(PublishOutcome::Accepted) {
-                debug!(publish = id, topic = %p.topic, "pending publish complete; ack released");
-                if let Some(m) = &self.metrics {
-                    m.observe_publish_ack(p.created_at.elapsed().as_secs_f64());
+            // ADR 0092 T4: held deliveries still owed answer for the hub. The gate takes
+            // the publisher's answer and the last PUBACK fires it, on whichever
+            // connection task reads it; the entry stays until then (`ack_released`).
+            if !p.ack_awaits_settle {
+                if let Some(gate) = p.holds.as_ref().filter(|g| g.pending()) {
+                    // The hub does not answer here: the gate does, when its last hold
+                    // settles — on the subscriber's connection task, or on this loop
+                    // when a fallback write lands.
+                    if let Some(done) = p.done.take() {
+                        gate.arm(done);
+                    }
+                } else if p.answer(PublishOutcome::Accepted) {
+                    debug!(publish = id, topic = %p.topic, "pending publish complete; ack released");
+                    if let Some(m) = &self.metrics {
+                        m.observe_publish_ack(p.created_at.elapsed().as_secs_f64());
+                    }
                 }
             }
         }
@@ -9104,7 +9192,10 @@ impl Hub {
                 (p.awaiting_settle
                     || p.reroute_grace.is_some()
                     || forwarding::owes_ordinary_to(p, &unreachable))
-                    && !p.acked_nodes.iter().any(|a| a == node)
+                    && !p
+                        .acked_nodes
+                        .as_ref()
+                        .is_some_and(|acked| acked.iter().any(|a| a == node))
                     && !p.awaiting.values().any(|o| &o.node == node)
                     && self.interest.nodes_matching(&p.topic).contains(node)
             })
@@ -15682,10 +15773,12 @@ mod tests {
             "the third publish is held until the quota frees"
         );
 
-        let now = tokio::time::Instant::now();
         tx.send(ordered(HubCommand::PubAcks {
             client: ClientId("c".into()),
-            acks: vec![(pkid_of(&p1), now), (pkid_of(&p2), now)],
+            acks: vec![
+                crate::hub::AckedDelivery::plain(pkid_of(&p1)),
+                crate::hub::AckedDelivery::plain(pkid_of(&p2)),
+            ],
         }))
         .unwrap();
         let p3 = recv_packet(&mut rx).await.unwrap();
@@ -16591,6 +16684,116 @@ mod tests {
     fn median(mut v: Vec<Duration>) -> Duration {
         v.sort();
         v[v.len() / 2]
+    }
+
+    /// ADR 0092 T4: a held delivery acknowledged on the subscriber's connection task
+    /// answers the publisher from there — no PUBACK command reaches the hub for the
+    /// hold — and the copy the hub keeps for the window is pruned at its deadline,
+    /// unwritten. The next publish is held and answered the same way.
+    #[tokio::test]
+    async fn a_held_delivery_settled_on_the_connection_task_answers_the_publisher_off_the_loop() {
+        let (store, tx, mut rx) = cost_hub(COST_WINDOW_MS).await;
+        let writes_before = store.appends.load(std::sync::atomic::Ordering::SeqCst);
+        for payload in [&b"m1"[..], &b"m2"[..]] {
+            let done = publish_gated(&tx, "t", payload, QoS::AtLeastOnce, false);
+            let out = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("the delivery")
+                .expect("the subscriber's channel is open");
+            let crate::hub::Outgoing::Packet { packet, hold, .. } = *out else {
+                panic!("a packet, not a note");
+            };
+            let pkid = pkid_of(&packet);
+            let hold = hold.expect("a durable QoS 1 delivery to an online subscriber is held");
+            // The subscriber's connection task settles the hold at the PUBACK...
+            assert_eq!(hold.acked(None), crate::hub::Acked::Settled);
+            assert!(
+                matches!(
+                    timeout(Duration::from_secs(3), done).await,
+                    Ok(Ok(PublishOutcome::Accepted))
+                ),
+                "the publisher is answered from the connection task"
+            );
+            // ...and the ack reaches the hub for the in-flight entry only.
+            tx.send(ordered(HubCommand::PubAcks {
+                client: ClientId("c".into()),
+                acks: vec![crate::hub::AckedDelivery::plain(pkid)],
+            }))
+            .unwrap();
+            // SETTLE(window): past the window the hub prunes the settled hold.
+            tokio::time::sleep(Duration::from_millis(u64::from(COST_WINDOW_MS) + 40)).await;
+            assert_eq!(
+                store.appends.load(std::sync::atomic::Ordering::SeqCst),
+                writes_before,
+                "acknowledged inside the window: nothing written"
+            );
+        }
+    }
+
+    /// ADR 0092 T4: a fan-out held for two subscribers is answered once, after both —
+    /// one settled on its connection task, the other on the hub (as a peer's forward
+    /// would be) — and never before either.
+    #[tokio::test]
+    async fn a_fan_out_held_for_two_subscribers_is_answered_after_both_wherever_they_settle() {
+        let store = FlakyStore::new(0);
+        let tx = start_hub_eliding(store.clone(), COST_WINDOW_MS);
+        let (mut rx_c, _) = attach_full(&tx, "c", 1, false, u32::MAX, 16).await;
+        let (mut rx_d, _) = attach_full(&tx, "d", 2, false, u32::MAX, 16).await;
+        subscribe_qos(&tx, "c", "t", QoS::AtLeastOnce);
+        subscribe_qos(&tx, "d", "t", QoS::AtLeastOnce);
+        let _ = attach(&tx, "barrier", 99, true).await;
+        // One warm-up publish reaches both: each acknowledges its own copy, so each
+        // session's packet-id block is reserved and nothing is left on either wire.
+        let warm = publish_gated(&tx, "t", b"warm", QoS::AtLeastOnce, false);
+        let warm_c = recv_packet(&mut rx_c).await.expect("c's warm-up delivery");
+        let warm_d = recv_packet(&mut rx_d).await.expect("d's warm-up delivery");
+        pub_ack(&tx, "c", pkid_of(&warm_c));
+        pub_ack(&tx, "d", pkid_of(&warm_d));
+        assert!(matches!(
+            timeout(Duration::from_secs(2), warm).await,
+            Ok(Ok(PublishOutcome::Accepted))
+        ));
+        let writes_before = store.appends.load(std::sync::atomic::Ordering::SeqCst);
+
+        let mut done = publish_gated(&tx, "t", b"m", QoS::AtLeastOnce, false);
+        let out_c = timeout(Duration::from_secs(2), rx_c.recv())
+            .await
+            .expect("c's delivery")
+            .expect("open");
+        let out_d = timeout(Duration::from_secs(2), rx_d.recv())
+            .await
+            .expect("d's delivery")
+            .expect("open");
+        let crate::hub::Outgoing::Packet { hold: hold_c, .. } = *out_c else {
+            panic!("a packet");
+        };
+        let crate::hub::Outgoing::Packet {
+            packet: packet_d, ..
+        } = *out_d
+        else {
+            panic!("a packet");
+        };
+        // c settles on its connection task; the publisher still waits for d.
+        assert_eq!(
+            hold_c.expect("held").acked(None),
+            crate::hub::Acked::Settled
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            matches!(done.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "one of two held deliveries is still owed"
+        );
+        // d's PUBACK reaches the hub, which settles that hold itself.
+        pub_ack(&tx, "d", pkid_of(&packet_d));
+        assert!(matches!(
+            timeout(Duration::from_secs(3), done).await,
+            Ok(Ok(PublishOutcome::Accepted))
+        ));
+        assert_eq!(
+            store.appends.load(std::sync::atomic::Ordering::SeqCst),
+            writes_before,
+            "both acknowledged inside the window: nothing written"
+        );
     }
 
     /// A subscriber that keeps up (A of about 0, far under W): holding is faster than

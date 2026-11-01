@@ -16,6 +16,7 @@
 //! `durable.write_elision_ms = 0` (the default) builds none of this state, and every
 //! delivery takes the path it took before.
 
+use super::hold::{ElisionCounters, Hold, PublishGate};
 #[allow(clippy::wildcard_imports)] // an intra-hub module split (#258).
 use super::*;
 use std::collections::VecDeque;
@@ -59,8 +60,9 @@ pub(super) struct Elided {
     pub(super) message_expiry: Option<u32>,
     pub(super) gate: AppendGate,
     pub(super) deadline: Instant,
-    /// When it went on the wire: the hold time a discharge reports.
-    pub(super) sent: Instant,
+    /// Shared with the subscriber's connection task, which settles it at the PUBACK
+    /// (ADR 0092 T4); a settled hold is pruned here at its deadline.
+    pub(super) hold: Arc<Hold>,
 }
 
 /// The node's held deliveries.
@@ -73,11 +75,10 @@ pub(super) struct ElisionState {
     /// `(deadline, session)`, oldest first: the window is fixed, so arrival order is
     /// deadline order. A session may appear more than once, or after it was flushed.
     pub(super) deadlines: VecDeque<(Instant, ClientId)>,
-    pub(super) entries: usize,
-    pub(super) bytes: usize,
-    /// Deliveries discharged by the subscriber's PUBACK, and fallbacks (exported by
-    /// reason as `mqttd_durable_elision_fallback_total`).
-    pub(super) discharged: u64,
+    /// The entries and bytes held, and the deliveries discharged by a PUBACK — counted
+    /// by the hub and by the connection tasks that settle holds (ADR 0092 T4).
+    pub(super) counters: Arc<ElisionCounters>,
+    /// Fallbacks (exported by reason as `mqttd_durable_elision_fallback_total`).
     pub(super) fallbacks: u64,
     /// Sessions that have missed the window lately (Amendment 1 A3). An entry goes when
     /// its session is discharged again or detaches.
@@ -193,8 +194,8 @@ impl Hub {
         } else {
             return false;
         }
-        self.elision.entries < MAX_ELIDED
-            && self.elision.bytes + message.payload.len() <= MAX_ELIDED_BYTES
+        self.elision.counters.entries() < MAX_ELIDED
+            && self.elision.counters.bytes() + message.payload.len() <= MAX_ELIDED_BYTES
     }
 
     /// Send `message` to `client` now and hold its obligation for the window. The
@@ -209,30 +210,67 @@ impl Hub {
         gate: &AppendGate,
     ) -> DurableOutcome {
         let window = self.elision.window.expect("may_elide checked the window");
-        self.register_obligation(&gate.then());
+        let then = gate.then();
+        // The obligation (ADR 0092 T4): a local publish's goes into its gate, which the
+        // subscriber's connection task settles; a peer's forward stays the hub's, on
+        // the forward's aggregate, its verdict being the hub's to send.
+        let publish_gate = match &then {
+            AppendThen::Gate(id) => {
+                let retire = self.retire_tx.clone();
+                let metrics = self.metrics.clone();
+                self.pending_publishes.get_mut(*id).map(|p| {
+                    let g = p.holds.get_or_insert_with(|| {
+                        PublishGate::new(*id, p.created_at, retire, metrics)
+                    });
+                    g.register();
+                    g.clone()
+                })
+            }
+            AppendThen::Peer(..) | AppendThen::Ungated => {
+                self.register_obligation(&then);
+                None
+            }
+        };
+        let hold = Hold::new(publish_gate, message.payload.len(), &self.elision.counters);
         let before = self.inflight.get(client).map(|i| i.next_pkid);
-        let _ = self.send_qos_publish(client, tx, message, retain, message_expiry, None);
+        let _ = self.send_qos_publish(
+            client,
+            tx,
+            message,
+            retain,
+            message_expiry,
+            None,
+            Some(hold.clone()),
+        );
         let pkid = self.inflight.get(client).and_then(|inf| {
             let id = inf.next_pkid;
             (Some(id) != before && inf.pending.contains_key(&id)).then_some(id)
         });
         let Some(pkid) = pkid else {
             // Not in flight after all (the connection had just closed): write it as an
-            // offline delivery, and let that write carry the obligation.
+            // offline delivery, and let that write carry the obligation. The hold is
+            // taken back with its place in the gate — inside the fan-out nothing is
+            // armed, so nothing fires.
             if let Some(m) = &self.metrics {
                 m.durable_elision_fallback("disconnect");
             }
+            hold.take_for_write();
             let out = self.fallback_write(client, message, message_expiry, gate, None);
-            self.release_registration(&gate.then());
+            match hold.gate() {
+                Some(g) => g.write_landed(),
+                None => self.release_registration(&then),
+            }
             return out;
         };
         if let Some(m) = &self.metrics {
             m.publish_delivered(qos_num(message.qos));
         }
-        let sent = Instant::now();
-        let deadline = sent + window_in_force(window, self.elision.entries, self.elision.bytes);
-        self.elision.entries += 1;
-        self.elision.bytes += message.payload.len();
+        let deadline = hold.sent()
+            + window_in_force(
+                window,
+                self.elision.counters.entries(),
+                self.elision.counters.bytes(),
+            );
         let ElisionState {
             by_client, spare, ..
         } = &mut *self.elision;
@@ -245,7 +283,7 @@ impl Hub {
                 message_expiry,
                 gate: gate.clone(),
                 deadline,
-                sent,
+                hold,
             });
         self.elision.deadlines.push_back((deadline, client.clone()));
         DurableOutcome::Ok
@@ -264,14 +302,15 @@ impl Hub {
         if queue.is_empty() {
             self.recycle_elided_queue(client);
         }
-        self.elision.entries -= 1;
-        self.elision.bytes -= e.message.payload.len();
-        self.elision.discharged += 1;
         self.elision.backoff.remove(client);
-        if let Some(m) = &self.metrics {
-            m.durable_elided(e.sent.elapsed().as_secs_f64());
+        // Settled on the connection task already (ADR 0092 T4): pruned, nothing more.
+        if !e.hold.acked_on_hub() {
+            return true;
         }
-        self.settle_discharged(&e.gate.then());
+        if let Some(m) = &self.metrics {
+            m.durable_elided(e.hold.sent().elapsed().as_secs_f64());
+        }
+        self.settle_discharged(&e.gate.then(), e.hold.gate());
         true
     }
 
@@ -282,18 +321,30 @@ impl Hub {
             return;
         };
         for e in queue.drain(..) {
-            self.elision.entries -= 1;
-            self.elision.bytes -= e.message.payload.len();
-            self.elision.fallbacks += 1;
-            if let Some(m) = &self.metrics {
-                m.durable_elision_fallback(reason);
-            }
-            let then = e.gate.then();
-            let _ =
-                self.fallback_write(client, &e.message, e.message_expiry, &e.gate, Some(e.pkid));
-            self.release_registration(&then);
+            self.fallback_held(client, &e, reason);
         }
         self.keep_spare_queue(queue);
+    }
+
+    /// Write one held delivery — its window ran out, its session detached, or its topic
+    /// took the durable path — unless its PUBACK settled it on the connection task
+    /// first (ADR 0092 T4), in which case nothing is owed and nothing is written.
+    fn fallback_held(&mut self, client: &ClientId, e: &Elided, reason: &'static str) {
+        if !e.hold.take_for_write() {
+            return;
+        }
+        self.elision.fallbacks += 1;
+        if let Some(m) = &self.metrics {
+            m.durable_elision_fallback(reason);
+        }
+        let then = e.gate.then();
+        let _ = self.fallback_write(client, &e.message, e.message_expiry, &e.gate, Some(e.pkid));
+        // The write carries the obligation now. A peer's hold registration is taken back
+        // here; a local publish's place in its gate is released when the write lands,
+        // so an armed gate cannot fire before the copy is durable.
+        if e.hold.gate().is_none() {
+            self.release_registration(&then);
+        }
     }
 
     /// A delivery on `topic` takes the durable path: what `client` holds on that topic is
@@ -320,16 +371,7 @@ impl Hub {
                 .expect("present above") = rest;
         }
         for e in same {
-            self.elision.entries -= 1;
-            self.elision.bytes -= e.message.payload.len();
-            self.elision.fallbacks += 1;
-            if let Some(m) = &self.metrics {
-                m.durable_elision_fallback("head");
-            }
-            let then = e.gate.then();
-            let _ =
-                self.fallback_write(client, &e.message, e.message_expiry, &e.gate, Some(e.pkid));
-            self.release_registration(&then);
+            self.fallback_held(client, &e, "head");
         }
     }
 
@@ -359,8 +401,7 @@ impl Hub {
     /// The window ended for the oldest held deliveries; also, under brownout or a
     /// drain, nothing may stay held.
     pub(super) fn expire_elided(&mut self) {
-        if self.elision.entries == 0 {
-            self.elision.deadlines.clear();
+        if self.elision.deadlines.is_empty() {
             return;
         }
         if self.brownout || self.draining {
@@ -378,13 +419,27 @@ impl Hub {
                 break;
             }
             let (_, client) = self.elision.deadlines.pop_front().expect("front exists");
-            let expired = self
-                .elision
-                .by_client
-                .get(&client)
-                .and_then(VecDeque::front)
-                .is_some_and(|e| e.deadline <= now);
-            if expired {
+            // A hold its PUBACK settled on the connection task is pruned here, at its
+            // deadline and in queue order (ADR 0092 T4); a discharge since the last
+            // timeout starts the session's strikes over (Amendment 1 A3). What the
+            // front then holds past its deadline falls back, the session's holds
+            // together (D5).
+            let Some(queue) = self.elision.by_client.get_mut(&client) else {
+                continue;
+            };
+            let mut pruned = false;
+            while queue.front().is_some_and(|e| e.hold.settled()) {
+                queue.pop_front();
+                pruned = true;
+            }
+            if pruned {
+                self.elision.backoff.remove(&client);
+            }
+            if queue.is_empty() {
+                self.recycle_elided_queue(&client);
+                continue;
+            }
+            if queue.front().is_some_and(|e| e.deadline <= now) {
                 self.flush_elided(&client, "timeout");
                 self.note_timeout(&client);
             }
@@ -493,26 +548,25 @@ impl Hub {
         }
     }
 
-    /// Take back an obligation another one has replaced (the fallback write's).
+    /// Take back a peer's hold registration that a fallback write has replaced. A
+    /// local publish's hold lives in its gate (ADR 0092 T4) and is released by the
+    /// write's landing, never here.
     fn release_registration(&mut self, then: &AppendThen) {
         match then {
-            AppendThen::Gate(id) => {
-                if let Some(p) = self.pending_publishes.get_mut(*id) {
-                    p.appends_outstanding = p.appends_outstanding.saturating_sub(1);
-                }
-                self.try_complete_pending(*id);
-            }
             AppendThen::Peer(node, seq) => self.settle_peer(node, *seq, DurableOutcome::Ok, false),
-            AppendThen::Ungated => {}
+            AppendThen::Gate(_) | AppendThen::Ungated => {}
         }
     }
 
-    /// The subscriber's PUBACK settled this obligation: delivered and acknowledged.
-    fn settle_discharged(&mut self, then: &AppendThen) {
+    /// The subscriber's PUBACK settled this obligation on the hub: delivered and
+    /// acknowledged. `gate` is the hold's, when the publish is local.
+    fn settle_discharged(&mut self, then: &AppendThen, gate: Option<&Arc<PublishGate>>) {
         match then {
             AppendThen::Gate(id) => {
+                if let Some(g) = gate {
+                    g.discharge();
+                }
                 if let Some(p) = self.pending_publishes.get_mut(*id) {
-                    p.appends_outstanding = p.appends_outstanding.saturating_sub(1);
                     p.stored = true;
                 }
                 self.try_complete_pending(*id);

@@ -15,6 +15,7 @@
 //! arms them (issues #294/#305 document the covered windows and the stated
 //! residuals).
 
+use super::hold::PublishGate;
 #[allow(clippy::wildcard_imports)] // an intra-hub module split (#258): the five
 // siblings share one type/state vocabulary by design, and enumerating it would
 // re-couple every future hub change to six import lists. Scoped to these files.
@@ -258,6 +259,10 @@ pub(super) struct PendingPublish {
     /// answer must be at-most-once, and every terminal path has to be able to ask
     /// whether it still has anything to say.
     pub(super) done: Option<oneshot::Sender<PublishOutcome>>,
+    /// The publish's held deliveries (ADR 0089), settled on the subscribers' connection
+    /// tasks (ADR 0092 T4): created by the first hold, armed with `done` by
+    /// `try_complete_pending` once the hub owes nothing else.
+    pub(super) holds: Option<Arc<PublishGate>>,
     /// The forwarded frame, kept for retransmission and takeover re-routing.
     pub(super) topic: String,
     pub(super) payload: Bytes,
@@ -295,7 +300,11 @@ pub(super) struct PendingPublish {
     /// message path) and written in one (`forward_answered`), and the 24 bytes it
     /// gives back are what pay for `done` becoming an `Option` without breaking the
     /// entry's size budget (issue #613 item 2.1 — measured: 216 -> 224 -> 200).
-    pub(super) acked_nodes: Vec<NodeId>,
+    /// Boxed since ADR 0092 T4, like `reached`: 8 bytes on the entry, where the
+    /// `Vec` (24) plus the gate's pointer broke the budget; it is empty on a single
+    /// node and written once per peer ack on a cluster.
+    #[allow(clippy::box_collection)] // deliberate: the box is what keeps the entry small
+    pub(super) acked_nodes: Option<Box<Vec<NodeId>>>,
     /// Whether the retained authority commit is still outstanding (exhibit ⑦).
     pub(super) awaiting_retained: bool,
     /// Set once the on-loop local fan-out pass completed OK — every owed durable
@@ -412,7 +421,16 @@ impl PendingPublish {
                 let _ = tx.send(outcome);
                 true
             }
-            None => false,
+            // The gate holds the answer while held deliveries are owed (ADR 0092 T4).
+            None => self.holds.as_ref().is_some_and(|g| g.answer(outcome)),
+        }
+    }
+
+    /// Withhold whatever answer this entry still holds — its own, or the gate's.
+    /// Dropping the entry does this for its own sender; the gate's needs saying.
+    pub(super) fn withhold(&self) {
+        if let Some(g) = &self.holds {
+            g.cancel();
         }
     }
 
@@ -420,7 +438,13 @@ impl PendingPublish {
     /// thing that makes dropping this entry harmless, and what the cap uses to
     /// count an evicted entry as `pending-cap-replay` rather than a withhold.
     pub(super) fn ack_released(&self) -> bool {
-        self.done.is_none()
+        self.done.is_none() && !self.holds.as_ref().is_some_and(|g| g.armed())
+    }
+
+    /// Whether a subscriber's PUBACK discharged a held copy of this publish: it was
+    /// delivered and acknowledged, so a refusal may only withhold (issue #238).
+    pub(super) fn discharged(&self) -> bool {
+        self.holds.as_ref().is_some_and(|g| g.discharged() > 0)
     }
 
     /// Take this publish out of the settle window: it owes the window no replay
@@ -1200,7 +1224,9 @@ impl Hub {
         self.peers
             .iter()
             .filter(|(n, _)| {
-                !p.acked_nodes.iter().any(|a| a == *n)
+                !p.acked_nodes
+                    .as_ref()
+                    .is_some_and(|acked| acked.iter().any(|a| a == *n))
                     && !p.awaiting.values().any(|o| &o.node == *n)
                     && interested_nodes.contains(*n)
             })
@@ -1480,6 +1506,7 @@ impl Hub {
                 break;
             };
             self.forget_forwards(&old);
+            old.withhold();
             // Issue #613 item 2.1 makes a second kind of entry possible: one
             // already ANSWERED and kept only for the settle window's replay. The
             // oldest-first policy is unchanged, but dropping such an entry
@@ -1528,6 +1555,7 @@ impl Hub {
             PendingPublish {
                 cost: 0, // charged by `PendingTable::insert`
                 done: Some(done),
+                holds: None,
                 topic: topic.to_string(),
                 payload: payload.clone(),
                 qos,
@@ -1536,7 +1564,7 @@ impl Hub {
                 app: (!app.is_empty()).then(|| Box::new(app.clone())),
                 awaiting: HashMap::default(),
                 stored: false,
-                acked_nodes: Vec::new(),
+                acked_nodes: None,
                 awaiting_retained: false,
                 local_done: false,
                 appends_outstanding: 0,
@@ -1622,6 +1650,7 @@ impl Hub {
     /// of fail-closed: the publisher's connection sees no ack and retries).
     pub(super) fn drop_pending(&mut self, id: u64) {
         if let Some(p) = self.pending_publishes.remove(id) {
+            p.withhold();
             self.forget_forwards(&p);
             // Issue #613 item 2.1: this entry may have been answered already and
             // be alive only for the settle window's replay. Dropping it then
@@ -1711,13 +1740,14 @@ impl Hub {
         // refusal against its own in-flight local append loses the actionable 0x97
         // and sees a close instead; a false refusal would be a defect, a withhold
         // is not (ADR 0061).
-        if p.stored || p.appends_outstanding > 0 {
+        if p.stored || p.appends_outstanding > 0 || p.discharged() {
             warn!(
                 publish = id, topic = %p.topic, refusal = r.as_str(),
                 "a later fan-out pass was refused for a publish already stored durably \
                  (or with an append still in flight); ack WITHHELD rather than claiming \
                  nothing was stored (issue #238)"
             );
+            p.withhold();
             return; // dropping `p.done` withholds
         }
         warn!(
@@ -1879,8 +1909,9 @@ impl Hub {
                 if verdict == ForwardVerdict::Reached {
                     p.ack_awaits_settle = false;
                 }
-                if !p.acked_nodes.iter().any(|a| a == node) {
-                    p.acked_nodes.push(node.clone());
+                let acked = p.acked_nodes.get_or_insert_with(Box::default);
+                if !acked.iter().any(|a| a == node) {
+                    acked.push(node.clone());
                 }
                 self.try_complete_pending(id);
             }

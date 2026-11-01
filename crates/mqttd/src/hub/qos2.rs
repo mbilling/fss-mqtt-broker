@@ -265,18 +265,18 @@ impl Hub {
     /// truncation, the `QoS` 2 retirement check and the drain once for the batch — the
     /// drain sends until the quota is full either way, and the truncation advances to
     /// the same watermark.
-    pub(super) fn dispatch_pub_acks(
-        &mut self,
-        client: &ClientId,
-        acks: &[(u16, tokio::time::Instant)],
-    ) {
+    pub(super) fn dispatch_pub_acks(&mut self, client: &ClientId, acks: &[AckedDelivery]) {
         let mut completed = false;
-        for &(pkid, received) in acks {
+        for a in acks {
             if let Some(m) = &self.metrics {
-                m.puback_hub_wait(received.elapsed().as_secs_f64());
+                m.puback_hub_wait(a.received.elapsed().as_secs_f64());
             }
-            self.elided_acked(client, pkid);
-            completed |= self.complete_pending(client, pkid, OutState::AwaitingPubAck);
+            // A hold the connection task settled itself is not looked up again: the
+            // hub prunes it at its deadline (ADR 0092 T4).
+            if a.on_hub {
+                self.elided_acked(client, a.pkid);
+            }
+            completed |= self.complete_pending(client, a.pkid, OutState::AwaitingPubAck);
         }
         if completed {
             self.truncate_acked(client);

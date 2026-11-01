@@ -1105,6 +1105,14 @@ impl Hub {
                         // (issue #238).
                         p.stored = true;
                     }
+                    // A held delivery's fallback write (ADR 0089) landed: the hold's
+                    // place in the gate is owed no more (ADR 0092 T4). A failed one
+                    // withholds below, gate and all.
+                    if job.delivered.is_some() && !matches!(outcome, LaneOutcome::Failed) {
+                        if let Some(g) = &p.holds {
+                            g.write_landed();
+                        }
+                    }
                 }
                 match outcome {
                     // Fail closed like the inline path did (ADR 0041 T5): withhold.

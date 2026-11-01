@@ -9,7 +9,9 @@
 //! publishes the client's will; a clean DISCONNECT discards it.
 
 use crate::aliases::{InboundAliases, OutboundAliases};
-use crate::hub::{Admission, AttachOutcome, AuthMethod, HubCommand, Outbound, Will};
+use crate::hub::{
+    Acked, AckedDelivery, Admission, AttachOutcome, AuthMethod, Hold, HubCommand, Outbound, Will,
+};
 use bytes::Bytes;
 use mqtt_auth::{
     basic::BasicAuthenticator, mtls::IdentitySource, AllowAll, AuthError, AuthSession, AuthStep,
@@ -21,7 +23,7 @@ use mqtt_codec::{
     packet::{Auth, ConnAck, Connect, Disconnect, Publish, SubAck},
     reason, Packet, ProtocolVersion, QoS,
 };
-use mqtt_core::{is_shared_filter, parse_shared, AppProperties, ClientId, Message};
+use mqtt_core::{is_shared_filter, parse_shared, AppProperties, ClientId, FastMap, Message};
 use mqtt_net::{FrameReader, FrameWriter, NetError};
 use mqtt_observability::{AuditLog, AuditSink};
 use mqtt_storage::InboundSighting;
@@ -2659,23 +2661,49 @@ fn negotiate_v5_properties(
 struct AckBatch<'a> {
     hub: &'a mpsc::UnboundedSender<HubCommand>,
     client: ClientId,
-    acks: Vec<(u16, Instant)>,
+    metrics: Option<&'a mqtt_observability::metrics::Metrics>,
+    acks: Vec<AckedDelivery>,
+    /// The held deliveries on the wire (ADR 0089), by packet id: settled here at the
+    /// PUBACK, with no hub command for it (ADR 0092 T4).
+    holds: FastMap<u16, Arc<Hold>>,
 }
 
 /// The most acks one [`AckBatch`] carries before it is sent.
 const ACK_BATCH_MAX: usize = 32;
 
 impl<'a> AckBatch<'a> {
-    fn new(hub: &'a mpsc::UnboundedSender<HubCommand>, client: ClientId) -> Self {
+    fn new(
+        hub: &'a mpsc::UnboundedSender<HubCommand>,
+        client: ClientId,
+        metrics: Option<&'a mqtt_observability::metrics::Metrics>,
+    ) -> Self {
         Self {
             hub,
             client,
+            metrics,
             acks: Vec::new(),
+            holds: FastMap::default(),
         }
     }
 
-    fn push(&mut self, pkid: u16) {
-        self.acks.push((pkid, Instant::now()));
+    /// A held `QoS` 1 PUBLISH went on the wire under `pkid`.
+    fn hold(&mut self, pkid: u16, hold: Arc<Hold>) {
+        self.holds.insert(pkid, hold);
+    }
+
+    /// The client acknowledged `pkid`: a hold on it is settled here — the publisher's
+    /// answer fires from this task when it was the last one owed — and the ack joins
+    /// the batch for the hub's in-flight entry.
+    fn acked(&mut self, pkid: u16) {
+        let on_hub = self
+            .holds
+            .remove(&pkid)
+            .is_some_and(|h| h.acked(self.metrics) == Acked::OnHub);
+        self.acks.push(AckedDelivery {
+            pkid,
+            received: Instant::now(),
+            on_hub,
+        });
         if self.acks.len() >= ACK_BATCH_MAX {
             self.flush();
         }
@@ -3004,7 +3032,7 @@ where
     // Reply bytes queued since the writer was last empty (see `REPLY_BACKLOG_MAX`).
     let mut reply_bytes: usize = 0;
     // The subscriber's PUBACKs on their way to the hub, a batch per read (ADR 0092 T4).
-    let mut acks = AckBatch::new(hub, client.clone());
+    let mut acks = AckBatch::new(hub, client.clone(), policy.metrics.as_deref());
 
     loop {
         // Nothing left to decode from the last read: the next read waits for the
@@ -3220,15 +3248,15 @@ where
                     // then the same pure function of the same packet, which is
                     // what keeps the byte counter from drifting (issue #241).
                     out_meter.drained(&out);
-                    let (pkt, origin) = match &mut *out {
-                        crate::hub::Outgoing::Packet { packet, origin, queued } => {
+                    let (pkt, origin, hold) = match &mut *out {
+                        crate::hub::Outgoing::Packet { packet, origin, queued, hold } => {
                             if let (Some(m), Packet::Publish(p)) = (&policy.metrics, &*packet) {
                                 if p.pkid.is_some() {
                                     m.delivery_outbound_wait(queued.elapsed().as_secs_f64());
                                     oldest_queued = Some(oldest_queued.map_or(*queued, |o| o.min(*queued)));
                                 }
                             }
-                            (packet, origin.take())
+                            (packet, origin.take(), hold.take())
                         }
                         // A drop the hub decided, for this task to raise: nothing to
                         // write.
@@ -3288,6 +3316,14 @@ where
                     }
                     if let Some((sent, pkid)) = sent {
                         rule_conn.sent(sent, pkid, too_large, events, client, hub);
+                    }
+                    // A held delivery (ADR 0089) is settled here at its PUBACK (ADR
+                    // 0092 T4). One the client never sees is left to the hub's window,
+                    // which writes it as an offline delivery.
+                    if let (Some(h), false, Packet::Publish(p)) = (hold, too_large, &*pkt) {
+                        if let Some(pkid) = p.pkid {
+                            acks.hold(pkid, h);
+                        }
                     }
                     if batched == OUTBOUND_BATCH_MAX {
                         break;
@@ -4257,8 +4293,9 @@ async fn handle_inbound<W: AsyncWrite + Unpin>(
             // `$events/message/acked` (ADR 0083), when a rule selects it: raised here,
             // on the subscriber's connection task, from the delivery it remembered.
             rule_conn.acked(&ack, QoS::AtLeastOnce, client, hub);
-            // To the hub with the rest of this read's acks (ADR 0092 T4).
-            acks.push(ack.pkid);
+            // A hold on it settles here; to the hub with the rest of this read's acks
+            // (ADR 0092 T4).
+            acks.acked(ack.pkid);
         }
         Packet::PubRec(ack) => {
             // A `QoS` 2 delivery is acked at its PUBREC, as in EMQX.
@@ -7389,6 +7426,110 @@ mod tests {
                 assert_eq!(p.properties.topic_alias(), Some(1));
             }
             other => panic!("expected PUBLISH, got {other:?}"),
+        }
+    }
+
+    /// ADR 0092 T4: a held delivery's PUBACK settles the hold on this task — the
+    /// publisher's answer fires from here — and the ack reaches the hub in the batch
+    /// with nothing marked for the hub to settle. A hold with no gate (a peer's
+    /// forward) is the hub's, and the ack says so.
+    #[tokio::test]
+    async fn a_held_delivery_is_settled_at_its_puback_on_the_connection_task() {
+        let (mut reader, mut writer, mut hub_rx) = v5_pipe();
+        // Answer the attach here and keep every later command for the assertions.
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let (out_tx, out_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let mut sender = Some(out_tx);
+            let mut keep_alive = Vec::new();
+            while let Some(cmd) = hub_rx.recv().await {
+                match cmd {
+                    HubCommand::Attach {
+                        outbound, reply, ..
+                    } => {
+                        let _ = reply.send(AttachOutcome::Present(false));
+                        if let Some(s) = sender.take() {
+                            let _ = s.send(outbound.clone());
+                        }
+                        keep_alive.push(outbound);
+                    }
+                    other => {
+                        let _ = cmd_tx.send(other);
+                    }
+                }
+            }
+        });
+        writer.send(&connect_v5("c", vec![])).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+        let out = timeout(Duration::from_millis(500), out_rx)
+            .await
+            .expect("attach")
+            .expect("outbound sender");
+        let held_publish = |pkid: u16| {
+            Packet::Publish(Publish {
+                properties: Properties::new(),
+                dup: false,
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                topic: "t".into(),
+                pkid: Some(pkid),
+                payload: Bytes::from_static(b"p"),
+            })
+        };
+
+        // A local publish's hold: settled here.
+        let (done_tx, done_rx) = oneshot::channel();
+        let (hold, mut retired) = crate::hub::armed_hold_for_test(Some(done_tx));
+        assert!(out.send_held(held_publish(7), None, Some(hold)));
+        match recv(&mut reader).await {
+            Some(Packet::Publish(p)) => assert_eq!(p.pkid, Some(7)),
+            other => panic!("expected PUBLISH, got {other:?}"),
+        }
+        writer.send(&Packet::PubAck(7.into())).await.unwrap();
+        assert!(
+            matches!(
+                timeout(Duration::from_millis(500), done_rx).await,
+                Ok(Ok(crate::hub::PublishOutcome::Accepted))
+            ),
+            "the publisher is answered from the subscriber's connection task"
+        );
+        assert_eq!(
+            timeout(Duration::from_millis(500), retired.recv())
+                .await
+                .ok()
+                .flatten(),
+            Some(1),
+            "and the hub is told to retire the entry"
+        );
+        match timeout(Duration::from_millis(500), cmd_rx.recv())
+            .await
+            .expect("the ack batch")
+        {
+            Some(HubCommand::PubAcks { acks, .. }) => {
+                assert_eq!(acks.len(), 1);
+                assert_eq!(acks[0].pkid, 7);
+                assert!(!acks[0].on_hub, "nothing left for the hub to settle");
+            }
+            other => panic!("expected PubAcks, got {other:?}"),
+        }
+
+        // A hold with no gate (a peer's forward): the hub's to settle.
+        let (hold, _retired) = crate::hub::armed_hold_for_test(None);
+        assert!(out.send_held(held_publish(8), None, Some(hold)));
+        match recv(&mut reader).await {
+            Some(Packet::Publish(p)) => assert_eq!(p.pkid, Some(8)),
+            other => panic!("expected PUBLISH, got {other:?}"),
+        }
+        writer.send(&Packet::PubAck(8.into())).await.unwrap();
+        match timeout(Duration::from_millis(500), cmd_rx.recv())
+            .await
+            .expect("the ack batch")
+        {
+            Some(HubCommand::PubAcks { acks, .. }) => {
+                assert_eq!(acks[0].pkid, 8);
+                assert!(acks[0].on_hub, "the hub settles a peer's hold");
+            }
+            other => panic!("expected PubAcks, got {other:?}"),
         }
     }
 

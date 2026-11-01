@@ -1541,7 +1541,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 890 test(s)
+## `crates/mqttd/src/lib.rs` — 902 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1663,6 +1663,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `conn::tests::a_client_disconnect_is_still_reported_as_graceful`
 - `conn::tests::a_denied_qos0_publish_stays_a_silent_drop_in_both_versions`
 - `conn::tests::a_failed_connack_still_detaches_the_attached_session`
+- `conn::tests::a_held_delivery_is_settled_at_its_puback_on_the_connection_task`
 - `conn::tests::a_keepalive_expiry_detaches_ungracefully_so_the_will_fires`
 - `conn::tests::a_mosquitto_bridge_state_will_is_accepted`
 - `conn::tests::a_protocol_violation_close_detaches_ungracefully_so_the_will_fires`
@@ -1820,6 +1821,15 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::forwarding::zone_fwd_proofs::with_a_durable_plane_the_hold_ends_at_the_countdown_and_is_counted`
 - `hub::forwarding::zone_fwd_proofs::without_a_durable_plane_a_client_reconnecting_here_from_the_unreachable_peer_is_not_handed_the_held_publish`
 - `hub::forwarding::zone_fwd_proofs::without_a_durable_plane_nothing_stands_in_for_what_an_unreachable_peer_is_owed`
+- `hub::hold::tests::a_cancelled_gate_withholds_and_a_late_discharge_fires_nothing`
+- `hub::hold::tests::a_fallback_write_landing_settles_like_a_discharge_but_counts_none`
+- `hub::hold::tests::a_gate_discharged_before_it_is_armed_fires_at_the_arming`
+- `hub::hold::tests::a_hold_is_settled_once_by_whoever_comes_first`
+- `hub::hold::tests::a_hold_taken_for_its_write_is_not_discharged_by_a_late_ack`
+- `hub::hold::tests::a_hold_without_a_gate_is_the_hubs_to_settle`
+- `hub::hold::tests::an_armed_gate_fires_on_the_last_discharge_and_only_then`
+- `hub::hold::tests::settling_below_zero_is_not_a_fire`
+- `hub::hold::tests::the_hub_answers_through_an_armed_gate`
 - `hub::mesh::tests::a_moved_membership_invalidates_a_positive_answer`
 - `hub::mesh::tests::an_unstamped_cache_is_never_whole_on_a_cluster`
 - `hub::mesh::tests::standalone_reads_true_from_an_untouched_cache`
@@ -1880,6 +1890,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_failed_retained_store_write_leaves_the_topic_repairable`
 - `hub::tests::a_failed_retained_store_write_withholds_the_publishers_ack`
 - `hub::tests::a_failed_shared_enqueue_withholds_the_publishers_ack`
+- `hub::tests::a_fan_out_held_for_two_subscribers_is_answered_after_both_wherever_they_settle`
 - `hub::tests::a_foreign_topics_retained_publish_routes_the_commit_to_its_owner`
 - `hub::tests::a_forward_for_a_just_released_moved_session_is_not_answered_stored`
 - `hub::tests::a_forward_is_answered_only_when_its_hold_is_discharged`
@@ -1890,6 +1901,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_handoff_is_retransmitted_until_the_owner_acks`
 - `hub::tests::a_handoff_retransmitted_before_its_ack_is_not_a_second_mutation`
 - `hub::tests::a_held_delivery_is_written_before_a_later_durable_one_on_its_topic`
+- `hub::tests::a_held_delivery_settled_on_the_connection_task_answers_the_publisher_off_the_loop`
 - `hub::tests::a_hold_behind_a_written_delivery_replays_after_it`
 - `hub::tests::a_hub_command_slot_stays_publish_sized`
 - `hub::tests::a_hub_on_its_own_thread_answers_commands`
