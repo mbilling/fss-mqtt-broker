@@ -183,8 +183,12 @@ wildcard children as fields (#1171) — measured on run `h3-20261031T225644Z` th
 a publish 5.3 → 4.8 µs at 67,500 msg/s, the busy share there 0.48 → 0.44, the knee
 105,500 → 112,100 msg/s, bracketed at 115,400; the ceiling 0.82. Against main, the two
 batches together: a publish 6.7 → 4.8 µs, the knee 92,400 → 112,100 (+21%) — D2's
-target, about 5 µs, reached. The three-node shape follows, batch by batch, in the delivery
-doc's evidence table.
+target, about 5 µs, reached. On three `m6i.8xlarge` (runs `h3-20261031T234941Z` and
+`h3-20261101T012140Z`) the knee went 270,800 → 299,300 → 306,400 msg/s, at ack p99
+1.17 s → 270 ms → 92 ms, and a publish at the knee 7.0 → 6.2 → 5.6 µs: 13% against the
+node's 21%, because a cluster's per-message work includes the peer frames, which the two
+batches touched only through the hasher. The delivery doc's evidence table holds the four
+runs.
 
 **D2 changes in three places.**
 

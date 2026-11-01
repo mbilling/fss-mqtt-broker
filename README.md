@@ -57,8 +57,9 @@ fsync and a quorum copy on another node. It is the one we measure first.
 - **Durable QoS 1** carries 117,800 msg/s on 3 × 4 vCPU (9.8k per vCPU), 292,200 on
   10 × 4 (7.3k) and 390,300 on 6 × 16 vCPU on AWS (4.1k), with no message lost; at ack
   p99 ≤ 1 s, 114k, 228k and the same 390,300.
-- **HiveMQ's shape,** 3 × 32 vCPU on AWS: 270,800 msg/s with no message lost, where
-  HiveMQ 4.18 publishes 270,000. Six 16-vCPU nodes carry 45% more on the same 96 vCPU.
+- **HiveMQ's shape,** 3 × 32 vCPU on AWS: 306,400 msg/s with no message lost, where
+  HiveMQ 4.18 publishes 270,000. Six 16-vCPU nodes carried 390,300 on the same 96 vCPU
+  before ADR 0092 T3 cut the hub's work per message; they are not re-measured yet.
 - **QoS 1 with clean sessions** carries 271k on 3 × 4 vCPU and 876k on 10 × 4; **QoS 0**
   340k and 973k.
 - **One node** carries 92,900 durable on 4 vCPU and 112,100 on 32 (one copy, fsync only):
