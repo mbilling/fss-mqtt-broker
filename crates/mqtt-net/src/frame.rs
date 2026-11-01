@@ -42,6 +42,13 @@ pub struct FrameReader<R> {
 }
 
 impl<R: AsyncRead + Unpin> FrameReader<R> {
+    /// Whether bytes read from the transport are still waiting to be decoded: when
+    /// false, the next [`next_packet`](Self::next_packet) waits for the transport.
+    #[must_use]
+    pub fn has_buffered(&self) -> bool {
+        !self.buf.is_empty()
+    }
+
     /// Create a reader over `inner` for the given protocol `version`.
     pub fn new(inner: R, version: ProtocolVersion) -> Self {
         Self {

@@ -1541,7 +1541,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 889 test(s)
+## `crates/mqttd/src/lib.rs` — 890 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1837,6 +1837,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::settle::tests::a_zero_match_fan_out_on_an_unsettled_view_still_holds`
 - `hub::tests::a_backlogged_peer_link_sheds_qos0_forwards_but_never_retained_broadcasts`
 - `hub::tests::a_backlogged_peer_link_sheds_qos0_shared_deliveries_until_it_drains`
+- `hub::tests::a_batch_of_pubacks_completes_each_and_drains_once`
 - `hub::tests::a_brownout_refusal_delivers_to_nobody_even_when_a_subscriber_owed_no_durability`
 - `hub::tests::a_brownout_refusal_is_counted_as_a_quota_rejection_not_a_drop`
 - `hub::tests::a_brownout_refused_will_does_not_overtake_an_inflight_qos1_append`

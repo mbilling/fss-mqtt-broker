@@ -1646,6 +1646,15 @@ pub enum HubCommand {
         /// When the connection read it (`puback_hub_wait_seconds`).
         received: Instant,
     },
+    /// A subscriber's PUBACKs, as many as one read of its connection decoded (ADR 0092
+    /// T4): one command and one dispatch for the batch, the per-session work — the
+    /// truncation, the drain — once for all of them.
+    PubAcks {
+        /// The acknowledging client.
+        client: ClientId,
+        /// The packet ids acknowledged, each with when the connection read it.
+        acks: Vec<(u16, Instant)>,
+    },
     /// A subscriber acknowledged receipt of a `QoS` 2 delivery (step 1 of 2).
     PubRec {
         /// The acknowledging client.
@@ -2154,6 +2163,7 @@ impl HubCommand {
             | Self::Qos2OpDone { .. }
             | Self::PkidBlockReserved { .. }
             | Self::PubAck { .. }
+            | Self::PubAcks { .. }
             | Self::PubRec { .. }
             | Self::PubComp { .. }
             | Self::RemotePublishAck { .. }
@@ -2218,6 +2228,7 @@ impl HubCommand {
             | Self::AppendDone { .. }
             | Self::PkidBlockReserved { .. } => "publish",
             Self::PubAck { .. }
+            | Self::PubAcks { .. }
             | Self::PubRec { .. }
             | Self::PubComp { .. }
             | Self::Qos2OpDone { .. } => "ack",
@@ -3735,17 +3746,23 @@ impl Hub {
                 // is 2.5 KB and is moved into this loop's state for every command it
                 // takes, needed or not.
                 let class = cmd.class();
-                if let HubCommand::PubAck {
-                    client,
-                    pkid,
-                    received,
-                } = cmd
-                {
-                    let started = Instant::now();
-                    self.dispatch_pub_ack_command(&client, pkid, received);
-                    self.dispatched(class, started);
-                } else {
-                    self.dispatch_timed(cmd).await;
+                match cmd {
+                    HubCommand::PubAck {
+                        client,
+                        pkid,
+                        received,
+                    } => {
+                        let started = Instant::now();
+                        self.dispatch_pub_ack_command(&client, pkid, received);
+                        self.dispatched(class, started);
+                    }
+                    HubCommand::PubAcks { client, acks } => {
+                        let started = Instant::now();
+                        self.refresh_message_wants();
+                        self.dispatch_pub_acks(&client, &acks);
+                        self.dispatched(class, started);
+                    }
+                    cmd => self.dispatch_timed(cmd).await,
                 }
                 since_yield += 1;
                 if since_yield >= HUB_YIELD_EVERY {
@@ -4150,6 +4167,7 @@ impl Hub {
                 }
                 self.dispatch_pub_ack(&client, pkid);
             }
+            HubCommand::PubAcks { client, acks } => self.dispatch_pub_acks(&client, &acks),
             HubCommand::PubRec { client, pkid } => self.dispatch_pub_rec(&client, pkid),
             HubCommand::PubComp { client, pkid } => self.dispatch_pub_comp(&client, pkid),
             HubCommand::Detach {
@@ -15640,6 +15658,51 @@ mod tests {
         pub_ack(&tx, "c", pkid_of(&p1));
         let p2 = recv_packet(&mut rx).await.unwrap();
         assert_eq!(payload_of(&p2), b"m2", "acking drains the backlog");
+    }
+
+    /// ADR 0092 T4: a connection hands the hub the PUBACKs one read decoded as one
+    /// command. Each is completed as a lone PUBACK would be, and the drain runs once for
+    /// the batch: with a quota of 2 and three publishes, acking the first two together
+    /// releases the third.
+    #[tokio::test]
+    async fn a_batch_of_pubacks_completes_each_and_drains_once() {
+        let tx = start_hub();
+        let (mut rx, _) = attach_full(&tx, "c", 1, true, 0, 2).await;
+        subscribe_qos(&tx, "c", "t", QoS::AtLeastOnce);
+
+        publish_qos1(&tx, "t", b"m1");
+        publish_qos1(&tx, "t", b"m2");
+        publish_qos1(&tx, "t", b"m3");
+
+        let p1 = recv_packet(&mut rx).await.unwrap();
+        let p2 = recv_packet(&mut rx).await.unwrap();
+        assert_eq!((payload_of(&p1), payload_of(&p2)), (&b"m1"[..], &b"m2"[..]));
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "the third publish is held until the quota frees"
+        );
+
+        let now = tokio::time::Instant::now();
+        tx.send(ordered(HubCommand::PubAcks {
+            client: ClientId("c".into()),
+            acks: vec![(pkid_of(&p1), now), (pkid_of(&p2), now)],
+        }))
+        .unwrap();
+        let p3 = recv_packet(&mut rx).await.unwrap();
+        assert_eq!(payload_of(&p3), b"m3", "the batch drains the backlog");
+
+        // Both slots are free again: two more publishes go straight out.
+        publish_qos1(&tx, "t", b"m4");
+        publish_qos1(&tx, "t", b"m5");
+        pub_ack(&tx, "c", pkid_of(&p3));
+        let got: Vec<Vec<u8>> = [
+            recv_packet(&mut rx).await.unwrap(),
+            recv_packet(&mut rx).await.unwrap(),
+        ]
+        .iter()
+        .map(|p| payload_of(p).to_vec())
+        .collect();
+        assert_eq!(got, [b"m4".to_vec(), b"m5".to_vec()]);
     }
 
     /// `QoS` 0 is never throttled by Receive Maximum, even with the `QoS` > 0 quota full.

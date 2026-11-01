@@ -260,6 +260,33 @@ impl Hub {
         }
     }
 
+    /// A batch of PUBACKs from one connection (ADR 0092 T4): each one discharged and
+    /// completed exactly as [`dispatch_pub_ack`](Self::dispatch_pub_ack) does, then the
+    /// truncation, the `QoS` 2 retirement check and the drain once for the batch — the
+    /// drain sends until the quota is full either way, and the truncation advances to
+    /// the same watermark.
+    pub(super) fn dispatch_pub_acks(
+        &mut self,
+        client: &ClientId,
+        acks: &[(u16, tokio::time::Instant)],
+    ) {
+        let mut completed = false;
+        for &(pkid, received) in acks {
+            if let Some(m) = &self.metrics {
+                m.puback_hub_wait(received.elapsed().as_secs_f64());
+            }
+            self.elided_acked(client, pkid);
+            completed |= self.complete_pending(client, pkid, OutState::AwaitingPubAck);
+        }
+        if completed {
+            self.truncate_acked(client);
+            if self.qos2_cleanup.contains(client) {
+                self.submit_qos2_retire(client);
+            }
+            self.drain_backlog(client);
+        }
+    }
+
     /// Actor-path PUBREC: the durable phase write runs on the session lane;
     /// PUBREL is sent only when that write succeeds (ADR 0057).
     pub(super) fn dispatch_pub_rec(&mut self, client: &ClientId, pkid: u16) {
