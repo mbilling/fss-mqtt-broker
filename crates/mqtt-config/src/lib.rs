@@ -3841,8 +3841,8 @@ mod tests {
             // MQTTD_REPLICAS (ADR 0080): a valid factor that is not the default (2).
             "MQTTD_BACKUP_KEEP" | "MQTTD_RESTORE_TIMEOUT" | "MQTTD_REPLICAS" => "3",
             // MQTTD_HUB_SHARDS (ADR 0092 T5): the default is one loop, and the node refuses
-            // more than four, so "7" would not start a node.
-            "MQTTD_HUB_SHARDS" => "2",
+            // more than four, so "7" would not start a node; four is the most it runs.
+            "MQTTD_HUB_SHARDS" => "4",
             // Paths / addresses / lists / keys.
             _ => "x-sentinel",
         }
