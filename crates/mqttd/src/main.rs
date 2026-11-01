@@ -3195,8 +3195,9 @@ fn place_hub(
 
 /// Build the node's hub loops — one, or `node.hub_shards` data shards behind one
 /// sender (ADR 0092 T5) — configure each the same way, wire and place them. The
-/// prototype is for one node: a cluster node with more than one shard is refused, so a
-/// peer's forward is never answered by a loop that owns half the sessions.
+/// prototype is for one node: a node that names peers is refused more than one shard,
+/// so a peer's forward is never answered by a loop that owns half the sessions; a node
+/// alone in its cluster (the rig's one-node bootstrap) runs them with a warning.
 #[allow(clippy::too_many_arguments)] // the three construction arms' shared wiring
 fn start_shards(
     config: &Config,
@@ -3216,12 +3217,20 @@ fn start_shards(
         )
         .into());
     }
-    if shards > 1 && cluster_configured {
+    let peers_named = !config.cluster.peers.is_empty() || !config.cluster.swim.seeds.is_empty();
+    if shards > 1 && peers_named {
         return Err(format!(
-            "node.hub_shards = {shards} on a cluster node: the sharded hub is the one-node \
-             prototype of ADR 0092 T5; a cluster node runs one hub loop"
+            "node.hub_shards = {shards} on a node that names peers: the sharded hub is the \
+             one-node prototype of ADR 0092 T5; a node with peers runs one hub loop"
         )
         .into());
+    }
+    if shards > 1 && cluster_configured {
+        tracing::warn!(
+            shards,
+            "the sharded hub is ADR 0092 T5's one-node prototype: a member that joins this \
+             node is served by its first shard alone"
+        );
     }
     let mut hubs: Vec<hub::Hub> = (0..shards).map(|_| make()).collect();
     let txs: Vec<_> = hubs.iter().map(hub::Hub::sender).collect();

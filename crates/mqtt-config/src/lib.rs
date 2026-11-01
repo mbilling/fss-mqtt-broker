@@ -84,8 +84,10 @@ pub struct Node {
     /// How many hub loops ("data shards") the node runs (`MQTTD_HUB_SHARDS`, ADR 0092 T5's
     /// prototype): each owns the clients of disjoint placement groups, and a publish
     /// matched on one shard is handed to the others for the subscribers they own. Default
-    /// `1`, the one loop; `2` to `4` is the one-node prototype, refused on a cluster node.
-    /// With `hub_thread = true`, shard `k` is pinned to `hub_core + k`. Restart-scoped.
+    /// `1`, the one loop; `2` to `4` is the one-node prototype, refused on a node that
+    /// names peers (`cluster.peers`, `cluster.swim.seeds`) and run with a warning on a
+    /// node alone in its cluster. With `hub_thread = true`, shard `k` is pinned to
+    /// `hub_core + k`. Restart-scoped.
     pub hub_shards: u8,
 }
 
