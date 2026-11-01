@@ -887,8 +887,12 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_whole_env_surface_overlays_without_collision`
 - `tests::warn_mode_boots_a_newer_config_and_reports_the_ignored_keys`
 
-## `crates/mqtt-core/src/lib.rs` — 56 test(s)
+## `crates/mqtt-core/src/lib.rs` — 60 test(s)
 
+- `filter_index::tests::a_deep_wildcard_chain_drops_without_recursion`
+- `filter_index::tests::a_trie_node_stays_small`
+- `filter_index::tests::a_wildcard_only_node_survives_its_siblings_removal`
+- `filter_index::tests::removing_a_wildcard_filter_leaves_its_siblings`
 - `retry::tests::delays_ramp_within_jitter_bounds_and_cap`
 - `retry::tests::reset_returns_to_base`
 - `secrets::tests::passes_clean_and_empty_input_through`
@@ -1537,7 +1541,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 889 test(s)
+## `crates/mqttd/src/lib.rs` — 890 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1833,6 +1837,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::settle::tests::a_zero_match_fan_out_on_an_unsettled_view_still_holds`
 - `hub::tests::a_backlogged_peer_link_sheds_qos0_forwards_but_never_retained_broadcasts`
 - `hub::tests::a_backlogged_peer_link_sheds_qos0_shared_deliveries_until_it_drains`
+- `hub::tests::a_batch_of_pubacks_completes_each_and_drains_once`
 - `hub::tests::a_brownout_refusal_delivers_to_nobody_even_when_a_subscriber_owed_no_durability`
 - `hub::tests::a_brownout_refusal_is_counted_as_a_quota_rejection_not_a_drop`
 - `hub::tests::a_brownout_refused_will_does_not_overtake_an_inflight_qos1_append`
