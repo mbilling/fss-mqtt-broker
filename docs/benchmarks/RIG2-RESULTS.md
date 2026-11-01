@@ -361,6 +361,32 @@ Run `h3-20261030T183536Z` · 3 × m6i.8xlarge brokers (96 vCPU in all), 6 × m6i
 | 10 | 270,800 | CARRIED | 3 | 269,950 | 1.17 ± 0.67 s |
 | 11 | 277,900 | OFFER NOT TAKEN | 1 | 262,779 | 8.72 s |
 
+### 3 × m6i.8xlarge, after ADR 0092 T3
+
+![Durable QoS 1, 3 × m6i.8xlarge after ADR 0092 T3: ack p99 by offered msg/s](img/rig2/aws-3x-m6i8xl-durable-qos1-t3.svg)
+
+Run `h3-20261101T012140Z` · 3 × m6i.8xlarge brokers (96 vCPU in all), 6 × m6i.2xlarge generators · 3 rounds a step · 200 B payload · latency is the ack p99, the mean of the rounds ± their standard deviation. The binary is ADR 0092 T3's second batch (`1f58398b`, on main as `854fabb5`): the row above with the hub loop's per-message work cut in the order its profile gave; the delivery doc's evidence table has the step by step, 270,800 → 299,300 → 306,400, and the model's figures (a publish dispatch at the knee 7.0 → 5.6 µs).
+
+- **Maximum lossless:** 306,400 msg/s offered, 102.1k per node and 3,192 per vCPU (brokers received 306,355), ack p99 91.6 ± 3.0 ms
+- **ack p99 ≤ 1 s:** 306,400 msg/s (91.6 ± 3.0 ms)
+- **ack p99 ≤ 250 ms:** 306,400 msg/s (91.6 ± 3.0 ms)
+- **ack p99 ≤ 100 ms:** 306,400 msg/s (91.6 ± 3.0 ms)
+- ladder ended: knee bracketed: good at 306400, not at 313500 msg/s (2.3% gap)
+
+| step | offered msg/s | verdict | rounds | brokers received (mean) | ack p99 (mean ± sd) |
+|---|---|---|---|---|---|
+| 1 | 30,000 | CARRIED | 3 | 30,000 | 0.4 ± 0.0 ms |
+| 2 | 45,000 | CARRIED | 3 | 45,000 | 0.5 ± 0.0 ms |
+| 3 | 67,500 | CARRIED | 3 | 67,500 | 0.5 ± 0.0 ms |
+| 4 | 101,300 | CARRIED | 3 | 101,300 | 0.6 ± 0.0 ms |
+| 5 | 152,000 | CARRIED | 3 | 152,000 | 0.8 ± 0.0 ms |
+| 6 | 228,000 | CARRIED | 3 | 228,004 | 14.0 ± 7.6 ms |
+| 7 | 342,000 | DISCONNECTED | 1 | 245,741 | 8.27 s |
+| 8 | 285,000 | CARRIED | 3 | 285,002 | 82.9 ± 49.5 ms |
+| 9 | 313,500 | OFFER NOT TAKEN | 3 | 306,278 | 3.22 ± 5.30 s |
+| 10 | 299,300 | CARRIED | 3 | 299,357 | 90.6 ± 3.0 ms |
+| 11 | 306,400 | CARRIED | 3 | 306,355 | 91.6 ± 3.0 ms |
+
 ## AWS, 32 vCPU
 
 One broker on 2026-10-30, the same binary, generator shape and 20,000 clients as the 96-vCPU
@@ -390,6 +416,28 @@ Run `h3-20261030T171933Z` · 1 × m6i.8xlarge broker (32 vCPU in all), 1 × m6i.
 | 6 | 92,900 | OFFER NOT TAKEN | 2 | 91,589 | 1.33 ± 0.56 s |
 | 7 | 88,700 | CARRIED | 3 | 88,665 | 300.5 ± 147.5 ms |
 | 8 | 90,800 | OFFER NOT TAKEN | 3 | 90,690 | 779.3 ± 491.5 ms |
+
+### 1 × m6i.8xlarge, after ADR 0092 T3
+
+![Durable QoS 1, 1 × m6i.8xlarge after ADR 0092 T3: ack p99 by offered msg/s](img/rig2/aws-1x-m6i8xl-durable-qos1-t3.svg)
+
+Run `h3-20261031T225644Z` · 1 × m6i.8xlarge broker (32 vCPU in all), 1 × m6i.4xlarge generator · 3 rounds a step · 200 B payload · latency is the ack p99, the mean of the rounds ± their standard deviation. The binary is ADR 0092 T3's second batch (`1f58398b`, on main as `854fabb5`): the row above with the hub loop's per-message work cut in the order its profile gave; the delivery doc's evidence table has the step by step — 88,700 on 2026-10-30 and 92,400 when main was re-measured on 2026-10-31, then 105,500 and 112,100 — and the model's figures (a publish dispatch 6.7 → 4.8 µs).
+
+- **Maximum lossless:** 112,100 msg/s offered, 112.1k per node and 3,503 per vCPU (brokers received 112,052), ack p99 353.9 ± 230.6 ms
+- **ack p99 ≤ 1 s:** 112,100 msg/s (353.9 ± 230.6 ms)
+- **ack p99 ≤ 250 ms:** 105,500 msg/s (45.6 ± 7.3 ms)
+- **ack p99 ≤ 100 ms:** 105,500 msg/s (45.6 ± 7.3 ms)
+- ladder ended: knee bracketed: good at 112100, not at 115400 msg/s (2.9% gap)
+
+| step | offered msg/s | verdict | rounds | brokers received (mean) | ack p99 (mean ± sd) |
+|---|---|---|---|---|---|
+| 1 | 67,500 | CARRIED | 3 | 67,500 | 1.4 ± 0.0 ms |
+| 2 | 84,400 | CARRIED | 3 | 84,400 | 2.7 ± 0.4 ms |
+| 3 | 105,500 | CARRIED | 3 | 105,498 | 45.6 ± 7.3 ms |
+| 4 | 131,900 | OFFER NOT TAKEN | 1 | 107,478 | 13.92 s |
+| 5 | 118,700 | OFFER NOT TAKEN | 1 | 102,450 | 9.08 s |
+| 6 | 112,100 | CARRIED | 3 | 112,052 | 353.9 ± 230.6 ms |
+| 7 | 115,400 | OFFER NOT TAKEN | 1 | 105,118 | 6.39 s |
 
 ### 1 × m7a.8xlarge
 

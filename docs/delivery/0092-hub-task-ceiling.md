@@ -100,6 +100,8 @@ ingest, the yield it takes every 64 commands and the wake it then waits for, mig
 | 1 × `m6i.8xlarge`, main `d4afe97d` re-measured (`h3-20261031T194739Z`) | 92,400 | 0.82 | 8.8 | 6.8 | 2.0 | 25 | 0.83 | 17% |
 | 1 × `m6i.8xlarge`, **T3 first batch** (`h3-20261031T215218Z`) | 105,500 | 0.79 | 7.5 | 5.6 | 1.9 | 37 | 0.83 | 17% |
 | 1 × `m6i.8xlarge`, **T3 second batch** (`h3-20261031T225644Z`) | 112,100 | 0.78 | 6.9 | 5.1 | 1.8 | 53 | 0.82 | 18% |
+| 3 × `m6i.8xlarge`, **T3 first batch** (`h3-20261031T234941Z`) | 299,300 | 0.81 | 8.1 | 6.2 | 1.9 | 31 | 0.83 | 17% |
+| 3 × `m6i.8xlarge`, **T3 second batch** (`h3-20261101T012140Z`) | 306,400 | 0.78 | 7.6 | 5.6 | 1.9 | 37 | 0.80 | 20% |
 
 Two readings the script settles. The Genoa node's loss is 30% at its ceiling, not the
 41% read off its carried step (0.57 busy): its ceiling rises with the offer, from 0.57 at
@@ -139,8 +141,8 @@ the row, and a cell is filled only by a run.
 | step | binary | 1 node: knee, publish µs at 67,500 | 3 nodes: knee | runs |
 |---|---|---|---|---|
 | main before T3 | `19f36004` / `d4afe97d` | 88,700 / 92,400; 6.6 / 6.7 µs | 270,800 | `h3-20261030T171933Z`, `h3-20261031T194739Z`; `h3-20261030T183536Z` |
-| batch 1: the dispatch future, metric handles, the sub-id walk, the elision key and queues, the empty-backlog drain (#1170) | `1db8c42e` | 105,500 (+14%); 5.3 µs | not yet run | `h3-20261031T215218Z` |
-| batch 2: the hasher, the trie's wildcard children as fields (#1171) | `1f58398b` | 112,100 (+6% on batch 1, +21% on main); 4.8 µs | not yet run | `h3-20261031T225644Z` |
+| batch 1: the dispatch future, metric handles, the sub-id walk, the elision key and queues, the empty-backlog drain (#1170) | `1db8c42e` | 105,500 (+14%); 5.3 µs | 299,300 (+10.5%), ack p99 270 ms; a publish 7.0 → 6.2 µs at the knee | `h3-20261031T215218Z`; `h3-20261031T234941Z` |
+| batch 2: the hasher, the trie's wildcard children as fields (#1171) | `1f58398b` | 112,100 (+6% on batch 1, +21% on main); 4.8 µs | 306,400 (+2.4% on batch 1, +13% on main), ack p99 92 ms; a publish 6.2 → 5.6 µs at the knee | `h3-20261031T225644Z`; `h3-20261101T012140Z` |
 
 **T3, first batch, measured** (run `h3-20261031T215218Z`, one `m6i.8xlarge`, the h3
 ladder, binary `1db8c42e`): the knee moved from 92,400 msg/s (main, re-measured the same
@@ -191,3 +193,10 @@ ceiling is unchanged at 0.83: the 17% it does not dispatch is the work it wakes
   `h3-20261031T225644Z` (one `m6i.8xlarge`): the knee 105,500 → 112,100 msg/s, bracketed
   at 115,400; a publish 5.3 → 4.8 µs at 67,500 msg/s, the hub's busy share there
   0.48 → 0.44; the busy ceiling 0.82.
+- **2026-11-01** — T3 on three nodes, both batches (runs `h3-20261031T234941Z` and
+  `h3-20261101T012140Z`, 3 × `m6i.8xlarge`, the h3 ladder, under Progress): the knee
+  270,800 → 299,300 → 306,400 msg/s, at ack p99 1.17 s → 270 ms → 92 ms; a publish
+  dispatch at the knee 7.0 → 6.2 → 5.6 µs. The cluster gains less than one node (13%
+  against 21%): a cluster's per-message work includes the peer frames, which the batches
+  touched only through the hasher. The README's three-node and one-node figures move to
+  306,400 and 112,100 (RIG2-RESULTS has both cards).

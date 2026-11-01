@@ -22,7 +22,7 @@ default, and ships every feature under Apache-2.0.
   copies costs 1.45–3.5× less to run than HiveMQ 4.18's published run, and HiveMQ's
   licence comes on top. Clustering needs their commercial edition, whose price isn't
   published. Per vCPU, mqttd carries 9,817 msg/s on 4-vCPU nodes against HiveMQ's 2,812;
-  on HiveMQ's own shape, 3 × 32 vCPU, it carries 2,821, the same, because a node's
+  on HiveMQ's own shape, 3 × 32 vCPU, it carries 3,192, 1.13× HiveMQ's, because a node's
   throughput is bound by its one hub task. The hardware behind a million msg/s costs
   $3,212 a month on 4-vCPU nodes and $7,757 on 16-vCPU nodes, against $11,213 at
   HiveMQ's published rate. HiveMQ's figure is its own: we haven't
@@ -57,12 +57,13 @@ fsync and a quorum copy on another node. It is the one we measure first.
 - **Durable QoS 1** carries 117,800 msg/s on 3 × 4 vCPU (9.8k per vCPU), 292,200 on
   10 × 4 (7.3k) and 390,300 on 6 × 16 vCPU on AWS (4.1k), with no message lost; at ack
   p99 ≤ 1 s, 114k, 228k and the same 390,300.
-- **HiveMQ's shape,** 3 × 32 vCPU on AWS: 270,800 msg/s with no message lost, where
-  HiveMQ 4.18 publishes 270,000. Six 16-vCPU nodes carry 45% more on the same 96 vCPU.
+- **HiveMQ's shape,** 3 × 32 vCPU on AWS: 306,400 msg/s with no message lost, where
+  HiveMQ 4.18 publishes 270,000. Six 16-vCPU nodes carried 390,300 on the same 96 vCPU
+  before ADR 0092 T3 cut the hub's work per message; they are not re-measured yet.
 - **QoS 1 with clean sessions** carries 271k on 3 × 4 vCPU and 876k on 10 × 4; **QoS 0**
   340k and 973k.
-- **One node** carries 92,900 durable on 4 vCPU and 88,700 on 32 (one copy, fsync only):
-  a node's throughput is bound by its one hub task, not by its vCPU.
+- **One node** carries 92,900 durable on 4 vCPU and 112,100 on 32 (one copy, fsync only):
+  a node's throughput is bound by its one hub task far more than by its vCPU.
 
 ![What the hardware behind a million msg/s of durable QoS 1 costs a month: mqttd's measured range across node sizes as one bar, HiveMQ 4.18's published run as a dashed bar, both at AWS m6a.8xlarge prices, licence not included](docs/benchmarks/img/readme-durable-cost.svg)
 
