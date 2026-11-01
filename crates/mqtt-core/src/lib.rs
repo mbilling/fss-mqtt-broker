@@ -38,6 +38,14 @@ pub fn hex_lower(bytes: &[u8]) -> String {
 /// A normalized topic name (no wildcards) as published.
 pub type TopicName = String;
 
+/// A map keyed by a client id, a node id, a filter or a topic level, hashed with a keyed
+/// fast hasher (ADR 0092 T3). SipHash-1-3 on those keys was 10% of the hub task's time,
+/// a dozen lookups per message; `ahash` seeds every map at construction, so a client
+/// that chooses its id cannot predict its bucket.
+pub type FastMap<K, V> = std::collections::HashMap<K, V, ahash::RandomState>;
+/// The set form of [`FastMap`].
+pub type FastSet<K> = std::collections::HashSet<K, ahash::RandomState>;
+
 /// A topic filter that may contain `+` (single level) or `#` (multi level) wildcards.
 pub type TopicFilter = String;
 

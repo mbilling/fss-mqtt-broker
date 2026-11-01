@@ -42,6 +42,7 @@ toml.workspace = true
 x509-parser = { workspace = true }
 
 tokio.workspace = true
+ahash.workspace = true
 # CancellationToken + TaskTracker for graceful shutdown (ADR 0019)
 tokio-util = { version = "0.7", features = ["rt"] }
 # QUIC client listener (ADR 0036): the accept loop drives quinn Endpoint/Connection directly.

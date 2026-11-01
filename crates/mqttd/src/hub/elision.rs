@@ -69,7 +69,7 @@ pub(super) struct ElisionState {
     /// `None`: elision off (`durable.write_elision_ms = 0`).
     pub(super) window: Option<Duration>,
     /// Per session, in send order.
-    pub(super) by_client: HashMap<ClientId, VecDeque<Elided>>,
+    pub(super) by_client: FastMap<ClientId, VecDeque<Elided>>,
     /// `(deadline, session)`, oldest first: the window is fixed, so arrival order is
     /// deadline order. A session may appear more than once, or after it was flushed.
     pub(super) deadlines: VecDeque<(Instant, ClientId)>,
@@ -81,10 +81,10 @@ pub(super) struct ElisionState {
     pub(super) fallbacks: u64,
     /// Sessions that have missed the window lately (Amendment 1 A3). An entry goes when
     /// its session is discharged again or detaches.
-    pub(super) backoff: HashMap<ClientId, Backoff>,
+    pub(super) backoff: FastMap<ClientId, Backoff>,
     /// Writes in flight whose live send waits for them, per session, connection and
     /// topic (Amendment 1 A5): a hold may not overtake one on its own topic.
-    pub(super) writing: HashMap<(ClientId, u64, String), usize>,
+    pub(super) writing: FastMap<(ClientId, u64, String), usize>,
     /// Emptied per-session queues kept for the next session that holds a delivery
     /// (ADR 0092 T3): a session's queue empties on nearly every PUBACK, and building
     /// it again on the next hold was one allocation per publish. Bounded by

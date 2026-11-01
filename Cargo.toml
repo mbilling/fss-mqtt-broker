@@ -56,6 +56,9 @@ module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 
 [workspace.dependencies]
+# ADR 0092 T3: the keyed hasher of the hub's per-client maps (SipHash was 10% of the hub
+# task); already in-tree transitively, so a direct dep adds no new crates.
+ahash = "0.8"
 # OIDC JWKS fetching (ADR 0050): already in-tree transitively via opentelemetry-otlp —
 # a direct dep adds no new crates. rustls + webpki roots only (no system TLS).
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }

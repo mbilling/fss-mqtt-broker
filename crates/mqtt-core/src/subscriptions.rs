@@ -24,14 +24,14 @@
 //! did under the linear scan.
 
 use crate::filter_index::FilterIndex;
-use crate::{ClientId, FilterKey, TopicFilter};
+use crate::{ClientId, FastMap, FastSet, FilterKey, TopicFilter};
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 /// Maps topic filters to the set of clients subscribed to each.
 #[derive(Debug, Default)]
 pub struct SubscriptionTable {
-    by_filter: HashMap<FilterKey, HashSet<ClientId>>,
+    by_filter: FastMap<FilterKey, FastSet<ClientId>>,
     /// The derived match index (issue #445). Lives in [`crate::filter_index`] so
     /// the local and remote `$share` populations can share one walk rather than
     /// each scanning their filters per publish.
@@ -54,7 +54,7 @@ impl SubscriptionTable {
         match self.by_filter.entry(filter) {
             Entry::Vacant(v) => {
                 self.index.insert(v.key());
-                v.insert(HashSet::from([client]));
+                v.insert(FastSet::from_iter([client]));
             }
             Entry::Occupied(mut o) => {
                 o.get_mut().insert(client);
@@ -136,7 +136,7 @@ impl SubscriptionTable {
     /// that walk plus the set, so the two can never answer differently.
     #[must_use]
     pub fn matching_clients(&self, topic: &str) -> HashSet<ClientId> {
-        let mut out = HashSet::new();
+        let mut out = HashSet::default();
         self.for_each_matching_client(topic, |client| {
             out.insert(client.clone());
         });
@@ -399,7 +399,7 @@ mod tests {
 
         for topic in &topics {
             let got = table.matching_clients(topic);
-            let mut want: HashSet<ClientId> = HashSet::new();
+            let mut want: HashSet<ClientId> = HashSet::default();
             for (i, f) in filters.iter().enumerate() {
                 if topic_matches(f, topic) {
                     if i % 3 != 0 {

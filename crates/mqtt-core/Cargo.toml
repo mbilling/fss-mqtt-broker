@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+ahash.workspace = true
 mqtt-codec = { path = "../mqtt-codec", version = "1.0.0" }
 bytes.workspace = true
 thiserror.workspace = true

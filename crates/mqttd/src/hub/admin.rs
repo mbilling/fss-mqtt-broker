@@ -357,7 +357,7 @@ impl Hub {
     /// Every client id this node holds a session for: connected, persistent, or with
     /// materialized subscriptions.
     fn admin_known_clients(&self) -> impl Iterator<Item = &ClientId> {
-        let mut seen: HashSet<&ClientId> = HashSet::new();
+        let mut seen: HashSet<&ClientId> = HashSet::default();
         self.online
             .keys()
             .chain(self.session_expiry.keys())
@@ -497,7 +497,7 @@ impl Hub {
         let limit = limit.clamp(1, MAX_LIMIT);
         // Candidates from the routing indexes (ordinary and shared), then the exact
         // entries from each client's own subscription list.
-        let mut candidates: HashSet<&ClientId> = HashSet::new();
+        let mut candidates: HashSet<&ClientId> = HashSet::default();
         self.table.for_each_matching_client(&topic, |c| {
             candidates.insert(c);
         });

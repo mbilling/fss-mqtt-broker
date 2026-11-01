@@ -8,7 +8,7 @@
 //! reports matching groups and their members via [`SharedSubscriptionTable::matching`].
 
 use crate::filter_index::FilterIndex;
-use crate::{ClientId, FilterKey, QoS, TopicFilter};
+use crate::{ClientId, FastMap, FilterKey, QoS, TopicFilter};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
@@ -205,13 +205,13 @@ impl GroupMembers {
 #[derive(Debug, Default)]
 pub struct SharedSubscriptionTable {
     /// Source of truth: filter → share-name → members, online ones first.
-    groups: HashMap<FilterKey, HashMap<String, GroupMembers>>,
+    groups: FastMap<FilterKey, FastMap<String, GroupMembers>>,
     /// Which groups each client belongs to. Attaching or detaching flips one
     /// client's liveness in every group it is in, and without this that meant
     /// walking every group in the table; with it, it costs only the handful of
     /// groups that client actually joined. It also makes `remove_client` a
     /// targeted removal rather than a full scan.
-    by_client: HashMap<ClientId, Vec<(FilterKey, String)>>,
+    by_client: FastMap<ClientId, Vec<(FilterKey, String)>>,
     /// Derived match index over `groups`' keys. A filter enters when its first
     /// group appears and leaves when its last one goes, so the two cannot
     /// disagree about which filters exist.
@@ -245,7 +245,7 @@ impl SharedSubscriptionTable {
         let by_group = match self.groups.entry(FilterKey::from(filter)) {
             Entry::Vacant(v) => {
                 index.insert(v.key());
-                v.insert(HashMap::new())
+                v.insert(HashMap::default())
             }
             Entry::Occupied(o) => o.into_mut(),
         };
