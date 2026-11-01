@@ -391,6 +391,28 @@ Run `h3-20261030T171933Z` · 1 × m6i.8xlarge broker (32 vCPU in all), 1 × m6i.
 | 7 | 88,700 | CARRIED | 3 | 88,665 | 300.5 ± 147.5 ms |
 | 8 | 90,800 | OFFER NOT TAKEN | 3 | 90,690 | 779.3 ± 491.5 ms |
 
+### 1 × m6i.8xlarge, after ADR 0092 T3
+
+![Durable QoS 1, 1 × m6i.8xlarge after ADR 0092 T3: ack p99 by offered msg/s](img/rig2/aws-1x-m6i8xl-durable-qos1-t3.svg)
+
+Run `h3-20261031T225644Z` · 1 × m6i.8xlarge broker (32 vCPU in all), 1 × m6i.4xlarge generator · 3 rounds a step · 200 B payload · latency is the ack p99, the mean of the rounds ± their standard deviation. The binary is ADR 0092 T3's second batch (`1f58398b`, on main as `854fabb5`): the row above with the hub loop's per-message work cut in the order its profile gave; the delivery doc's evidence table has the step by step, 88,700 → 105,500 → 112,100, and the model's figures (a publish dispatch 6.7 → 4.8 µs).
+
+- **Maximum lossless:** 112,100 msg/s offered, 112.1k per node and 3,503 per vCPU (brokers received 112,052), ack p99 353.9 ± 230.6 ms
+- **ack p99 ≤ 1 s:** 112,100 msg/s (353.9 ± 230.6 ms)
+- **ack p99 ≤ 250 ms:** 105,500 msg/s (45.6 ± 7.3 ms)
+- **ack p99 ≤ 100 ms:** 105,500 msg/s (45.6 ± 7.3 ms)
+- ladder ended: knee bracketed: good at 112100, not at 115400 msg/s (2.9% gap)
+
+| step | offered msg/s | verdict | rounds | brokers received (mean) | ack p99 (mean ± sd) |
+|---|---|---|---|---|---|
+| 1 | 67,500 | CARRIED | 3 | 67,500 | 1.4 ± 0.0 ms |
+| 2 | 84,400 | CARRIED | 3 | 84,400 | 2.7 ± 0.4 ms |
+| 3 | 105,500 | CARRIED | 3 | 105,498 | 45.6 ± 7.3 ms |
+| 4 | 131,900 | OFFER NOT TAKEN | 1 | 107,478 | 13.92 s |
+| 5 | 118,700 | OFFER NOT TAKEN | 1 | 102,450 | 9.08 s |
+| 6 | 112,100 | CARRIED | 3 | 112,052 | 353.9 ± 230.6 ms |
+| 7 | 115,400 | OFFER NOT TAKEN | 1 | 105,118 | 6.39 s |
+
 ### 1 × m7a.8xlarge
 
 An AMD EPYC 9R14 node (Genoa), for the CPU comparison: slower than the Ice Lake node above at the same vCPU. The hub task's work per message is 8% cheaper on it, but the task loses 41% of its time (18% on `m6i`) to wake-ups and migrations across the EPYC's four L3 domains, so it saturates at 59% busy against 82%.

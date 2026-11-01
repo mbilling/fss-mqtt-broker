@@ -61,7 +61,7 @@ fsync and a quorum copy on another node. It is the one we measure first.
   HiveMQ 4.18 publishes 270,000. Six 16-vCPU nodes carry 45% more on the same 96 vCPU.
 - **QoS 1 with clean sessions** carries 271k on 3 × 4 vCPU and 876k on 10 × 4; **QoS 0**
   340k and 973k.
-- **One node** carries 92,900 durable on 4 vCPU and 88,700 on 32 (one copy, fsync only):
+- **One node** carries 92,900 durable on 4 vCPU and 112,100 on 32 (one copy, fsync only):
   a node's throughput is bound by its one hub task, not by its vCPU.
 
 ![What the hardware behind a million msg/s of durable QoS 1 costs a month: mqttd's measured range across node sizes as one bar, HiveMQ 4.18's published run as a dashed bar, both at AWS m6a.8xlarge prices, licence not included](docs/benchmarks/img/readme-durable-cost.svg)
