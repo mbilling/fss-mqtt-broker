@@ -289,6 +289,54 @@ broker: run 1's mechanism at twice its rate, an ingress pool deeper than the sta
 once the queues are that long. That bound is the open overload item (D3's time bound),
 not a limit of the pair. The fan-in runs are the next measurement.
 
+**Four shards, measured on h3** (2026-11-02, `h3-20261102T214752Z`, commit `573ea754` in
+the standard build, `MQTTD_HUB_SHARDS=4`, the ladder from 206,100; the first run with the
+rig's host samples, #1188):
+
+| offered | verdict | received | ack p99 |
+|---|---|---|---|
+| **164,900** | **carried, the knee** (3 rounds) | 164,900 | 2.5 ms |
+| 167,500 | disconnected in the second round (the first carried at 68.5 ms) | 137,941 | 1.7 s |
+| 170,100 | disconnected | 121,315 | 2.0 s |
+| 175,200 | disconnected, twice | 133,037–146,427 | 2.5–3.1 s |
+| 185,500 | disconnected, twice | 29,754–58,065 | — |
+| 206,100 | disconnected | 112,948 | 1.7 s |
+
+The knee is 164,900, below the pair's 206,100, and no resource sets it. At the knee the
+broker uses 7.2 of the host's 32 CPUs (43.7 µs of CPU a message; the machine 10.9 busy),
+each loop is 0.37 busy, and the data disk writes 2 MB/s; at 206,100, before its round
+failed, the broker used 9.05. Below the knee four shards are quicker than two (ack p99
+2.5 ms at 164,900 against the pair's 11.3 ms). Every failed round goes the same way, and
+it starts on a 30-second clock. Every `EXPIRY_RECONCILE_EVERY` sweep ticks each shard
+spawns the inherited-session scan, a full enumeration of the sessions through the store,
+and while it is in flight `takeover_open()` is true (the rig's lone node is `clustered()`:
+peer networking is configured), so `may_elide` refuses every hold and every delivery is
+written for the scan's duration. Every round shows it, one `cluster` command a shard and a
+burst of 8,000–16,000 appends every 30 s; the pair absorbs it, and so do four shards at
+164,900. From 167,500 the burst does not end: four scans read the store the writer is
+filling, the writer takes 70,000–165,000 appends a second, its commits take 0.1–0.7 s, the
+data disk (gp3, 125 MB/s provisioned) writes 109–180 MB/s, and an append takes about a
+second. A session with a write in flight on a topic has its next delivery there written
+too (ADR 0089 Amendment 1, A5), so with the offer above what the writer can do it never
+catches up: at
+175,200 the flood held to the end of the round. The pending entries pass the stall
+budget, the bound evicts the oldest with the acks withheld, and the generator drops
+thousands of its 20,000 clients (4,868 at 206,100, 6,870 at 185,500); the broker closes
+none.
+
+What would stop it is the order of the bounds, not their size. The pending table is
+bounded (65,536 entries a shard, past them the 1 s budget, under a hard 64 MiB) and so is
+elision (16,384 holds and 64 MiB a shard), but nothing between them pushes back on the
+publishers: a publish's ingress credit returns to the pool when the hub dispatches it, not
+when it is answered, so a stalled durable path keeps every socket read at the full offer
+until the pending bound evicts. Three changes, not decided yet: hold the credit until the
+PUBACK goes out (the ack path takes none, so there is no cycle; the hand-offs already hold
+theirs, D3); size the pool to run dry before an entry can reach the budget (a shard's
+64 MiB is about 58,000 publishes, 1.2 s here); and stop the periodic scan from opening a
+takeover for elision, only a real takeover window should, with one scan a node rather than
+one a shard. The same scan writes every delivery for its duration on one loop too; there
+it is absorbed.
+
 ## Changelog
 
 - **2026-11-02** — ADR 0093 written from the prototype's four runs (ADR 0092 T5, #1163),
@@ -318,3 +366,10 @@ not a limit of the pair. The fan-in runs are the next measurement.
   loop at one loop's busy ceiling (1.52 summed). At 25% over the knee the pending bound
   evicts with the acks withheld and the clients disconnect, as in run 1: the pool as a
   time bound is the open overload item.
+- **2026-11-02** — Four shards measured on h3 (under Progress), the first run with the
+  rig's host samples: the knee is 164,900, with 7.2 of 32 CPUs busy and each loop at 0.37.
+  The 30-second inherited-session scan opens a takeover on every shard, which turns
+  elision off; from 167,500 the writes swamp the writer and the data disk, the pending
+  bound evicts with the acks withheld, and clients disconnect. Holding the ingress credit
+  until the PUBACK, a pool that runs dry before the stall budget, and a scan that leaves
+  elision on are the changes to decide.
