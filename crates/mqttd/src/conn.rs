@@ -2983,6 +2983,22 @@ where
     let stall_bound = wire_limits().write_stall_bound(keep_alive);
     let stall = tokio::time::sleep_until(Instant::now() + stall_bound);
     tokio::pin!(stall);
+    // The graceful-shutdown wait (ADR 0019), made ONCE per connection, on a child of the
+    // node's token: the same discipline as the keepalive timer above. The previous shape
+    // built `cancelled()` on the node's token afresh on every turn of the loop, and
+    // tokio's `Notify` locks its waiter list to register that waiter, again on every
+    // poll of it, and again to drop it — one mutex, shared by every connection on every
+    // worker, taken two or three times per pass. The CPU profile of ADR 0093's two-shard
+    // node found it the most contended lock in the process: 5.4% of the samples in its
+    // slow path at 84,400 msg/s, and above the knee the futex parks and wakes it caused
+    // took a third of the CPU. A child token has its own `Notify`, so a poll takes a lock
+    // no other connection takes; cancelling the node's token still cancels every child.
+    let drain_token = policy
+        .shutdown
+        .as_ref()
+        .map(tokio_util::sync::CancellationToken::child_token);
+    let drain = drain_signal(drain_token.as_ref());
+    tokio::pin!(drain);
     // Reply bytes queued since the writer was last empty (see `REPLY_BACKLOG_MAX`).
     let mut reply_bytes: usize = 0;
     // The subscriber's PUBACKs on their way to the hub, a batch per read (ADR 0092 T4).
@@ -3338,7 +3354,7 @@ where
                     }
                 }
             }
-            () = drain_signal(policy) => {
+            () = &mut drain => {
                 // Graceful shutdown (ADR 0019): close cleanly without firing the will —
                 // the server is going away, not the client; its session is retained.
                 // v5 clients are told *why* with a Server-shutting-down DISCONNECT so they
@@ -3417,10 +3433,11 @@ fn admit(
     Err(Box::pin(credit.clone().acquire(cost)))
 }
 
-/// Resolve to ready once the policy's shutdown token is cancelled; pends forever when no
-/// token is set (so the `select!` arm is a no-op outside graceful shutdown).
-async fn drain_signal(policy: &ConnPolicy) {
-    match &policy.shutdown {
+/// Resolve to ready once `token` is cancelled; pends forever when there is none (so the
+/// `select!` arm is a no-op outside graceful shutdown). `serve_loop` pins one of these
+/// per connection, on the connection's own child token.
+async fn drain_signal(token: Option<&tokio_util::sync::CancellationToken>) {
+    match token {
         Some(token) => token.cancelled().await,
         None => std::future::pending().await,
     }
@@ -4960,6 +4977,62 @@ mod tests {
             recv(&mut reader).await.is_none(),
             "the connection closes after the DISCONNECT"
         );
+    }
+
+    /// ADR 0019, with the drain wait made once per connection: a connection busy with
+    /// traffic — many turns of its loop after the wait was pinned — still drains when the
+    /// token is cancelled in the middle of the stream.
+    #[tokio::test]
+    async fn graceful_shutdown_drains_a_connection_in_the_middle_of_traffic() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (mut reader, mut writer, hub_rx) = start_conn_with_shutdown(shutdown.clone(), V4);
+        stub_hub(hub_rx);
+
+        writer.send(&connect_packet("busy", true)).await.unwrap();
+        assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+        for _ in 0..50 {
+            writer.send(&Packet::PingReq).await.unwrap();
+            assert_eq!(recv(&mut reader).await, Some(Packet::PingResp));
+        }
+
+        shutdown.cancel();
+        // A ping already on its way may still be answered; then the socket closes.
+        let _ = writer.send(&Packet::PingReq).await;
+        loop {
+            match recv(&mut reader).await {
+                None => break,
+                Some(Packet::PingResp) => {}
+                Some(other) => {
+                    panic!("only a PINGRESP may precede the drain's close, got {other:?}")
+                }
+            }
+        }
+    }
+
+    /// Every connection waits on its own child of the node's shutdown token, and one
+    /// cancel of the node's token drains them all.
+    #[tokio::test]
+    async fn graceful_shutdown_drains_every_connection_through_its_child_token() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut conns = Vec::new();
+        for i in 0..3 {
+            let (mut reader, mut writer, hub_rx) = start_conn_with_shutdown(shutdown.clone(), V4);
+            stub_hub(hub_rx);
+            writer
+                .send(&connect_packet(&format!("drain-{i}"), true))
+                .await
+                .unwrap();
+            assert!(matches!(recv(&mut reader).await, Some(Packet::ConnAck(_))));
+            conns.push((reader, writer));
+        }
+
+        shutdown.cancel();
+        for (i, (reader, _writer)) in conns.iter_mut().enumerate() {
+            assert!(
+                recv(reader).await.is_none(),
+                "connection {i} drained and closed on the node's cancel"
+            );
+        }
     }
 
     /// [MQTT-3.1.2-24] Deterministic keepalive enforcement via paused virtual time:

@@ -1542,7 +1542,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 904 test(s)
+## `crates/mqttd/src/lib.rs` — 906 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1689,7 +1689,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `conn::tests::connection_lifecycle_moves_the_metrics_counters`
 - `conn::tests::empty_client_id_with_clean_session_gets_auto_id`
 - `conn::tests::empty_client_id_with_persistent_session_is_rejected`
+- `conn::tests::graceful_shutdown_drains_a_connection_in_the_middle_of_traffic`
 - `conn::tests::graceful_shutdown_drains_an_established_connection`
+- `conn::tests::graceful_shutdown_drains_every_connection_through_its_child_token`
 - `conn::tests::graceful_shutdown_sends_v5_server_shutting_down_disconnect`
 - `conn::tests::idle_connection_is_closed_after_keepalive_grace`
 - `conn::tests::ingress_credit::a_batch_waiting_for_credit_releases_its_originals_credit_first`
