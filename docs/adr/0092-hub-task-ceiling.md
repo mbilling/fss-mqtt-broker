@@ -302,5 +302,6 @@ shape and on the fan-in shape both.
 
 Five tasks: the model as a script (T1), the dedicated pinned thread (T2, built and
 measured, shipped off by default under Amendment 1), the per-message work (T3), PUBACKs
-off the loop (T4), and the control-plane/data-plane ADR after T3 and T4 are measured (T5).
-Status in the delivery doc.
+off the loop (T4), and the control-plane/data-plane ADR after T3 and T4 are measured (T5,
+written as [ADR 0093](0093-data-shards-and-a-control-task.md) from the two-shard
+prototype's four runs). Status in the delivery doc.
