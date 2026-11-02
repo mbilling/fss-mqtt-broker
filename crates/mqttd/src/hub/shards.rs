@@ -30,6 +30,15 @@ use super::{min_qos, parse_shared, ClientSubs, DurableOutcome, Hub, HubCommand};
 /// the width of [`super::forwarding::PendingPublish::shard_outstanding`]'s bits.
 pub const MAX_SHARDS: usize = 4;
 
+/// ADR 0093 D3, the per-pair credit's default (`node.hub_handoff_inflight`): how many
+/// gated hand-offs one shard may owe another an answer for before the origin stops
+/// taking its publishers' commands. In ADR 0091 D6's form it is a time: at about 10 µs a
+/// dispatch on the target, 16,384 hand-offs are some 0.16 s of its queue, a sixth of
+/// the 1 s stall budget, so a hand-off's pending entry is answered long before the
+/// bound would evict it; and by Little's law a round trip of 0.2 s lets 16,384 in flight
+/// carry 80,000 crossing messages a second, above what one m6i.8xlarge pair deals across.
+pub const DEFAULT_HANDOFF_INFLIGHT: u32 = 16_384;
+
 /// The shard that owns `client`: its placement group (ADR 0007 §1), folded onto the
 /// node's shards. Every shard and every connection computes the same answer from the
 /// client id alone.
@@ -468,9 +477,11 @@ impl Hub {
         );
         self.shard = shard;
         self.shard_count = u8::try_from(txs.len()).expect("at most MAX_SHARDS");
-        // ADR 0093 D3: one batch of hand-offs and one of answers per shard.
+        // ADR 0093 D3: one batch of hand-offs and one of answers per shard, and the
+        // per-pair count of hand-offs still owed an answer.
         self.handoff_batches = (0..txs.len()).map(|_| Vec::new()).collect();
         self.shard_done_batches = (0..txs.len()).map(|_| Vec::new()).collect();
+        self.handoff_inflight = vec![0; txs.len()];
         self.shard_txs = txs;
         if self.shard_count > 1 {
             // A publish's identity on the node is `(node, id)` (#784), recorded with
@@ -481,6 +492,23 @@ impl Hub {
             self.publish_ids = (self.publish_ids & low) | tag;
             self.forward_seq = (self.forward_seq & low) | tag;
         }
+    }
+
+    /// ADR 0093 D3: the per-pair credit's cap (`node.hub_handoff_inflight`), see
+    /// [`DEFAULT_HANDOFF_INFLIGHT`]. `0` means no cap.
+    pub fn set_handoff_inflight_cap(&mut self, cap: u32) {
+        self.handoff_inflight_cap = cap;
+    }
+
+    /// Whether a target shard is at its hand-off cap, so this loop's data lane waits
+    /// (ADR 0093 D3). Never with one shard or no cap.
+    pub(super) fn handoff_gated(&self) -> bool {
+        self.shard_count > 1
+            && self.handoff_inflight_cap > 0
+            && self
+                .handoff_inflight
+                .iter()
+                .any(|&owed| owed >= self.handoff_inflight_cap)
     }
 
     /// ADR 0093 D4's second arm: every shard's mailbox and the mailman that wakes a shard
@@ -637,6 +665,10 @@ impl Hub {
                 }
                 if let Some(credit) = self.publish_credit.take() {
                     self.pending_publishes.hold_credit(id, credit);
+                }
+                // The per-pair credit: one more answer owed by `shard`.
+                if let Some(owed) = self.handoff_inflight.get_mut(shard) {
+                    *owed = owed.saturating_add(1);
                 }
                 None
             } else {
@@ -865,6 +897,11 @@ impl Hub {
         }
         p.shard_outstanding &= !bit;
         let last = p.shard_outstanding == 0;
+        // The per-pair credit: one answer fewer owed by `shard`; the data lane may
+        // move again (`next_command`).
+        if let Some(owed) = self.handoff_inflight.get_mut(usize::from(shard)) {
+            *owed = owed.saturating_sub(1);
+        }
         if let DurableOutcome::Ok = outcome {
             p.stored = true;
             if reached {

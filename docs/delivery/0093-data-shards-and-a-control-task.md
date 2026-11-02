@@ -100,12 +100,20 @@ at the batch's end — at the yield every 64 commands and before the loop parks
 the hand-off: a gated publish's is held beside its pending entry
 (`PendingTable::hold_credit`) until the last shard answers or the entry goes, an ungated
 one's inside the batch until the target has dispatched it, so the pool is charged for the
-hand-off's lifetime and a shard that answers late parks the publishers that feed it — the
-per-pair credit the record describes is the pool's share the publishers of one origin
-hold, bounded by their connection caps, not a second semaphore; the measurement says
-whether that is enough. The pending-publish bound is ADR 0091 D6's form: the count a
-floor, an entry over it evicted only once it has waited past the stall budget of 1 s
-(`PENDING_STALL_BUDGET`), the byte bound hard. T3, the two arms, both in the same binary:
+hand-off's lifetime and a shard that answers late parks the publishers that feed it. The
+per-pair credit (`node.hub_handoff_inflight`, 16,384 by default, `0` for none): each
+shard counts the gated hand-offs every other shard still owes it an answer for, and a
+target at the cap parks the origin's data lane — its publishers' commands wait with
+their credit, and the pool parks the connections behind them — until an answer comes;
+the hand-off batches and their answers travel on the control lane, so two parked lanes
+can never wait for each other's batches. Built second, after run 1 of 2026-11-02 showed
+the pool alone does not bound the right thing: 256 MiB of credit is 2.5 s of offer, a
+hand-off crosses two queues of it, its pending entry ages past the stall budget, and the
+bound evicts with the acks withheld — which closes the publishers (a withheld
+acknowledgement closes the connection, v5 and v3.1.1 alike, by ADR 0042's design). The
+pending-publish bound is ADR 0091 D6's form: the count a floor, an entry over it evicted
+only once it has waited past the stall budget of 1 s (`PENDING_STALL_BUDGET`), the byte
+bound hard. T3, the two arms, both in the same binary:
 `MQTTD_HUB_LIFO_SLOT=off` builds the runtime without tokio's LIFO slot — the process
 entry builds the runtime itself now, reading that one setting from the environment
 before the config exists, and the option is tokio's unstable API, so it takes effect only

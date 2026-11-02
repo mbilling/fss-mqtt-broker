@@ -6,7 +6,7 @@ Source of truth: `mqtt_config::ENV_VARS` and `Config::overlay_from` in `crates/m
 
 The annotated template is [`mqttd.example.toml`](mqttd.example.toml). Capacity arithmetic lives in [SIZING.md](SIZING.md); day-2 procedures in [OPERATIONS.md](OPERATIONS.md). This page is the inventory of knobs, not the runbook.
 
-Documented overlay variables: **133** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) and any experimental side-channel knobs below.
+Documented overlay variables: **134** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) and any experimental side-channel knobs below.
 
 ## Node identity
 
@@ -20,6 +20,7 @@ Documented overlay variables: **133** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) 
 | `MQTTD_HUB_CORE` | `node.hub_core` | Pin the hub's thread to this CPU (`MQTTD_HUB_CORE`, ADR 0092 D1; Linux only, a warning elsewhere). Unset = not pinned. The runtime's workers are not kept off that CPU: for a core of the hub's own, keep the rest of the process off it too (a `taskset`, a cpuset). Ignored with `hub_thread = false`. Restart-scoped. |
 | `MQTTD_HUB_SHARDS` | `node.hub_shards` | How many hub loops ("data shards") the node runs (`MQTTD_HUB_SHARDS`, ADR 0092 T5's prototype): each owns the clients of disjoint placement groups, and a publish matched on one shard is handed to the others for the subscribers they own. Default `1`, the one loop; `2` to `4` is the one-node prototype, refused on a node that names peers (`cluster.peers`, `cluster.swim.seeds`) and run with a warning on a node alone in its cluster. With `hub_thread = true`, shard `k` is pinned to `hub_core + k`. Restart-scoped. |
 | `MQTTD_HUB_HANDOFF_WAKE` | `node.hub_handoff_wake` | ADR 0093 D4: how a shard wakes another for a batch of hand-offs (`MQTTD_HUB_HANDOFF_WAKE`). `"local"` (the default): the batch goes on the other shard's channel and the wake is this worker's, which on this runtime puts the woken shard in the sender's worker's LIFO slot, to run next on it. `"remote"`: the batch is posted to the shard's mailbox and a thread of the node's own wakes it, through the runtime's injection queue, for an idle worker to take. The arm the ADR measures; nothing with one shard. Restart-scoped. |
+| `MQTTD_HUB_HANDOFF_INFLIGHT` | `node.hub_handoff_inflight` | ADR 0093 D3, the per-pair credit (`MQTTD_HUB_HANDOFF_INFLIGHT`): how many acknowledged publishes one shard may have handed to another and not yet been answered for before it stops taking its own publishers' commands until an answer comes — the ingress credit then parks those publishers. A time in ADR 0091 D6's form: 16,384 (the default) is about 0.16 s of the target's queue at 10 µs a dispatch, well inside the 1 s stall budget that evicts a pending publish. `0` removes the cap (the prototype's behaviour: the pair collapses above its knee). Nothing with one shard. Restart-scoped. |
 
 ## Listeners
 

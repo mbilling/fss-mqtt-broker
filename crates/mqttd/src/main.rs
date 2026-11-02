@@ -3306,6 +3306,7 @@ fn start_shards(
     let txs: Vec<_> = hubs.iter().map(hub::Hub::sender).collect();
     for (k, hub) in hubs.iter_mut().enumerate() {
         hub.set_shards(u8::try_from(k).expect("at most MAX_SHARDS"), txs.clone());
+        hub.set_handoff_inflight_cap(config.node.hub_handoff_inflight);
         if let Some((boxes, mailman)) = &mailboxes {
             hub.set_shard_mailboxes(boxes.clone(), mailman.clone());
         }

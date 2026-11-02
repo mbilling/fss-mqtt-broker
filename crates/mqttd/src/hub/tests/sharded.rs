@@ -264,6 +264,62 @@ async fn a_burst_of_hand_offs_goes_over_in_batches_and_every_publish_is_answered
     );
 }
 
+/// ADR 0093 D3, the per-pair credit: a target shard at its hand-off cap parks the
+/// origin's publishers — the data lane waits, the control lane, where the hand-offs and
+/// their answers travel, does not — and the target's answer reopens it.
+#[tokio::test]
+async fn a_target_at_its_hand_off_cap_parks_the_origins_data_lane_until_it_answers() {
+    let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
+    let mut a = Hub::with_config(NodeId("hub-test".into()), store.clone()).0;
+    let b = Hub::with_config(NodeId("hub-test".into()), store).0;
+    a.set_shards(0, vec![a.sender(), b.sender()]);
+    a.set_handoff_inflight_cap(2);
+    // A pending publish handed to shard 1, and the pair at its cap.
+    let (done, _rx) = oneshot::channel();
+    let id = a.register_pending(
+        done,
+        "t",
+        &Bytes::from_static(b"owed"),
+        QoS::AtLeastOnce,
+        false,
+        None,
+        &mqtt_core::AppProperties::default(),
+    );
+    a.pending_publishes.get_mut(id).unwrap().shard_outstanding = 1 << 1;
+    a.handoff_inflight[1] = 2;
+    a.enqueue(HubCommand::ShardRoute {
+        client: ClientId("elsewhere".into()),
+        filters: vec![],
+        online: true,
+    });
+    a.enqueue(HubCommand::Draining);
+    assert!(
+        matches!(a.next_command(), Some(HubCommand::Draining)),
+        "the control lane moves whatever the cap"
+    );
+    assert!(
+        a.next_command().is_none(),
+        "the data lane waits while shard 1 is at its cap"
+    );
+    a.shard_done(1, id, crate::hub::DurableOutcome::Ok, true);
+    assert_eq!(a.handoff_inflight[1], 1, "one answer fewer owed");
+    assert!(
+        matches!(a.next_command(), Some(HubCommand::ShardRoute { .. })),
+        "answered: the data lane moves again"
+    );
+    assert!(
+        matches!(
+            HubCommand::ShardDeliver(Box::new(crate::hub::ShardBatch {
+                origin: 1,
+                messages: Vec::new()
+            }))
+            .lane(),
+            crate::hub::Lane::Control
+        ),
+        "a batch of hand-offs travels on the control lane, never behind a parked data lane"
+    );
+}
+
 /// ADR 0093 D4's second arm: with the hand-off's wake issued by the mailman from
 /// outside the runtime, the batch still reaches the other shard and the publisher is
 /// still answered by that shard's write.

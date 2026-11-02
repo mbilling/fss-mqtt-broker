@@ -2204,6 +2204,11 @@ impl HubCommand {
             | Self::Ping { .. }
             | Self::Draining
             | Self::ShardDone { .. }
+            // ADR 0093 D3: a batch of hand-offs is work another shard already admitted
+            // and bounded by its per-pair cap, and it must never wait behind this
+            // shard's data lane — which parks while a target is at ITS cap: two shards
+            // each waiting for the other's batches on a parked lane would never answer.
+            | Self::ShardDeliver(_)
             | Self::Admin(_) => Lane::Control,
             Self::Publish { .. }
             | Self::PublishBatch(_)
@@ -2243,7 +2248,6 @@ impl HubCommand {
             | Self::RemoteSharedInterest { .. }
             | Self::InheritedSessions { .. }
             | Self::ShardRoute { .. }
-            | Self::ShardDeliver(_)
             | Self::Flush { .. }
             | Self::Drained { .. } => Lane::Data,
             #[cfg(test)]
@@ -3150,6 +3154,13 @@ pub struct Hub {
     /// ADR 0093 D3: the hand-offs this shard settled during the batch, per origin,
     /// answered as one [`HubCommand::ShardDone`] each at the batch's end.
     shard_done_batches: Vec<Vec<shards::ShardAnswer>>,
+    /// ADR 0093 D3, the per-pair credit: how many gated hand-offs each target shard still
+    /// owes this one an answer for, and the cap at which this loop stops taking its
+    /// publishers' commands (the data lane) until a target answers — so a shard that
+    /// answers late parks the publishers that feed it, and no shard's queue of hand-offs
+    /// grows past what it settles within the stall budget.
+    handoff_inflight: Vec<u32>,
+    handoff_inflight_cap: u32,
     /// ADR 0093 D3: the ingress credit of the publish being dispatched (ADR 0082 T3),
     /// for a hand-off to take with it; what is left when the dispatch ends is released
     /// then, as it always was.
@@ -3446,6 +3457,8 @@ impl Hub {
                 handoff: Vec::new(),
                 handoff_batches: Vec::new(),
                 shard_done_batches: Vec::new(),
+                handoff_inflight: Vec::new(),
+                handoff_inflight_cap: shards::DEFAULT_HANDOFF_INFLIGHT,
                 publish_credit: None,
                 shard_mailboxes: None,
                 mailman: None,
@@ -3892,9 +3905,17 @@ impl Hub {
     /// The next command to dispatch: the oldest control command, else the oldest data
     /// command (ADR 0082 T2). Within a lane, arrival order is kept.
     fn next_command(&mut self) -> Option<HubCommand> {
-        self.control_q
-            .pop_front()
-            .or_else(|| self.data_q.pop_front())
+        if let Some(cmd) = self.control_q.pop_front() {
+            return Some(cmd);
+        }
+        // ADR 0093 D3: a target shard at its hand-off cap parks this loop's publishers:
+        // their commands wait in the data lane, their credit with them, and the pool
+        // parks the connections behind them; the hand-offs and the answers that reopen
+        // the lane travel on the control lane above.
+        if self.handoff_gated() {
+            return None;
+        }
+        self.data_q.pop_front()
     }
 
     /// Move up to [`HUB_INGEST_BATCH`] commands from the channel into their lanes.

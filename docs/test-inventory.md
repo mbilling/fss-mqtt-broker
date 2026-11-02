@@ -1541,7 +1541,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 901 test(s)
+## `crates/mqttd/src/lib.rs` — 902 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -2155,6 +2155,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::sharded::a_publish_reaches_a_subscriber_the_other_shard_owns_and_is_acked_after_its_write`
 - `hub::tests::sharded::a_qos0_publish_is_handed_off_ungated`
 - `hub::tests::sharded::a_shared_group_split_across_shards_takes_every_publish_under_the_window`
+- `hub::tests::sharded::a_target_at_its_hand_off_cap_parks_the_origins_data_lane_until_it_answers`
 - `hub::tests::sharded::an_unsubscribe_is_mirrored_to_the_other_shard`
 - `hub::tests::share_obligations::a_drain_gated_share_delivery_behind_a_lost_link_does_not_hold_the_drain`
 - `hub::tests::share_obligations::a_drain_gated_share_delivery_with_nobody_to_hand_it_to_is_dropped_and_counted`
