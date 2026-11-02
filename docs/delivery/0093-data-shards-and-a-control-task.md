@@ -137,6 +137,65 @@ and starved, both loops fell to 0.35 busy, and the pair took 72,000. Per shard, 
 behind parks only its own publishers. Test: one shard holding its whole pool leaves the
 other's untouched.
 
+**T2 and T3 measured, h3** (2026-11-02, one `m6i.8xlarge`, two shards, read with T1's
+model per shard; the ladders start at 105,500 msg/s, a rung of the usual grid, and step
+down when it does not carry). Against the prototype's 118,700 at 835 ms and the one loop's
+112,100 at 354:
+
+| run | build and arm | knee | ack p99 at the knee | above the knee | the loops at the knee | wake at the knee |
+|---|---|---|---|---|---|---|
+| `h3-20261102T104739Z` | T2 first cut (`2936491b`): batching, the credit on the pending entry, the pending floor | 108,800 | 552 ms | DISCONNECTED: the floor evicts, the publishers close | 0.52 each (1.04) | 267 µs |
+| `h3-20261102T112127Z` | the same, the pool at 32 MB | 97,700 | 170 ms | OFFER NOT TAKEN at ~76,000 | 0.47 each (0.93) | 233 µs |
+| `h3-20261102T115730Z` | + the per-pair gate (`e4d3d5ef`, 16,384) | 95,000 | 74 ms | OFFER NOT TAKEN at ~72,000 | 0.45 each (0.90) | 194 µs |
+| `h3-20261102T123158Z` | the same, no gate, `MQTTD_HUB_LIFO_SLOT=off` | 97,700 | 972 ms | OFFER NOT TAKEN at ~72,000–80,000 | 0.44 and 0.45 (0.89) | 315 µs |
+| `h3-20261102T131047Z` | + one pool per shard (`d36204c0`), the gate, the slot on | 100,300 | 383 ms | OFFER NOT TAKEN at ~70,000 | 0.46 each (0.92) | 271 µs |
+| `h3-20261102T134730Z` | the same, `MQTTD_HUB_HANDOFF_WAKE=remote` | 100,300 | 397 ms | OFFER NOT TAKEN at ~71,000–74,000 | 0.46 and 0.47 (0.93) | 298 µs |
+
+What they show. **The collapse is gone** once a shard's backlog parks its publishers
+before the pending bound can evict for it: every run after the first holds its
+connections above the knee (OFFER NOT TAKEN, never DISCONNECTED). The first cut kept the
+default 256 MiB pool, which is 2.5 s of offer; a hand-off crosses two queues of it, its
+pending entry aged past the 1 s budget, the floor evicted 42,661 entries in one round with
+the acks withheld, and a withheld acknowledgement closes the publisher's connection — 9,763
+of 10,000 in seconds. **But the pair does not hold its knee above it**: past the knee it
+drops to a plateau of 70,000–77,000 instead of taking what it can, as the one loop takes
+105,000–107,000 at its own. With one shared pool the shard that falls behind keeps the
+credit and starves its partner (runs 3 and 4, with and without the gate: one data lane at
+235,000 commands, the other at zero); one pool per shard ends that (run 5: both lanes at
+their half), and the plateau stays. **The limiter is the scheduling, not the
+back-pressure.** At every knee the two loops sum to one worker's worth (0.89–1.04), and in
+the plateau each sits at 0.35 with its queue full: it dispatches its 64 commands, about
+0.3 ms, yields, and its wake comes 0.4–0.56 ms late — 0.3 ÷ (0.3 + 0.56) is the 0.35
+measured. A shard that hands a batch to the other wakes it onto its own worker, so the two
+take turns there. **Turning the LIFO slot off (D4's first arm) does not separate them** —
+the woken task still lands on the waker's worker, at the back of its queue instead of
+next — and costs 10% (97,700 against 108,800, though that binary also moved the hand-off
+batches to the control lane). **Waking the other shard from outside the runtime (D4's
+second arm) does not separate them either**: the mailman's wake goes through the injection
+queue, and run 6 measured exactly what run 5 did — the same knee, the same 0.46 a loop,
+the same plateau at 0.37 with the wake 499 µs late. So the cross-shard wake is not what
+holds the pair on one worker. Two loops that never park at load only ever yield
+(`yield_now` every 64 commands), and a yielded task goes back on its own worker's queue;
+once both are there they alternate, and neither arm changes that. The batching made the
+hand-off no cheaper: 9.1–9.6 hub-µs a message across the six runs' carried steps, against
+the prototype's 8.6–9.0 at the same offers.
+
+**What T2 and T3 leave.** T2's acceptance on h3 holds with one pool per shard: above the
+knee the pair keeps every connection (OFFER NOT TAKEN), where the prototype collapsed. It
+does not hold its knee: 100,300 against the prototype's 118,700 and the one loop's
+112,100, and a plateau near 70,000 above it. T3's acceptance — two shards summing toward
+2 × 0.82 — is not met by either arm: every knee sums to 0.89–1.04. On this runtime the
+split as built does not scale a node, and the next lever is where a loop yields and on
+which worker it resumes, not how a hand-off wakes its target: a yield by time or by
+tokio's cooperative budget instead of every 64 commands, or a worker (or runtime) per
+shard that its own connection tasks share. That is a decision for the ADR (an amendment
+to D4) before more is built. Separately, at overload the pending table sits at its
+65,536 floor full of answered entries kept for the settle window's replay, and each
+eviction logs a warning — journald suppressed some 80,000 a minute from one broker; the
+one-loop baseline does the same (235,000–657,000 such evictions a round at 115,400–131,900)
+and still holds its knee, so it is a log flood to fix on its own, not the pair's limit.
+The fan-in runs wait for that decision.
+
 ## Changelog
 
 - **2026-11-02** — ADR 0093 written from the prototype's four runs (ADR 0092 T5, #1163),
@@ -145,3 +204,9 @@ other's untouched.
   under Progress): hand-offs batched per dispatch batch and carrying the publish's
   ingress credit, the pending bound as a time bound, and the two wake arms behind
   `MQTTD_HUB_LIFO_SLOT` and `MQTTD_HUB_HANDOFF_WAKE`. Their rig runs follow.
+- **2026-11-02** — Six h3 runs of T2 and T3 (under Progress); the per-pair hand-off credit
+  and one ingress pool per shard built on the way. The collapse is gone — the pair holds
+  its connections above the knee — but the knee is 100,300 against the prototype's
+  118,700, and neither wake arm lifts the pair above one worker's worth (0.89–1.04 summed
+  at every knee). The yield's placement is the open question, for an amendment to D4;
+  the fan-in runs wait for it.
