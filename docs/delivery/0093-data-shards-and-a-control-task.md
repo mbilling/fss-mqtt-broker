@@ -202,6 +202,34 @@ one-loop baseline does the same (235,000–657,000 such evictions a round at 115
 and still holds its knee, so it is a log flood to fix on its own, not the pair's limit.
 The fan-in runs wait for that decision.
 
+**T9, shard-local `$share` dealing, measured on h3** (2026-11-02, Amendment 1, commit
+`7f7219e2`). Two runs, one built as T2 and T3's were and one without the flag they all
+carried:
+
+| run | build | knee | ack p99 at the knee | hub-µs a message at the knee | the loops at the knee | wake at the knee |
+|---|---|---|---|---|---|---|
+| `h3-20261102T145322Z` | `--cfg tokio_unstable`, as runs 1–6 | 92,400 | 145 ms | 8.3 (hand-off 0) | 0.35 each (0.70) | 503 µs |
+| `h3-20261102T153403Z` | the standard build | 97,700 | 90 ms | 7.6 (hand-off 0) | 0.37 and 0.38 (0.75) | 339 µs |
+
+The deal stays local as built — the `shard` class is zero, the consumers' spread 1.09–1.22×
+where every earlier run read 1.00× — and the work a message costs falls by the hand-off's
+1.5 µs. The knee does not rise: it falls, 97,700 against run 5's 100,300 (and run 5 carried
+the flag). **The flag itself**, which every T2 and T3 binary carried for the LIFO-slot arm
+and neither the prototype nor the one loop did, costs about 5% of a message (8.8 against 9.2
+µs at the same plateau) and most of the latency below the knee: 84,400 at 9 ms against 25.
+So runs 1–6 understate their builds by about that much; their order stands.
+
+**What the eight runs say together.** Take the hand-off's time out of each knee and the
+pair does the same amount of other hub work at every one of them: 0.74 worker-seconds a
+second in the prototype, 0.76 in run 1, 0.68 in run 5, 0.75 in run 8 — about what one loop
+does alone (0.78 at its knee). The knee then follows the rest of a message's cost: 6.3 µs
+in the prototype, the cheapest, and its 118,700 the highest; 7.6 in run 8 and 97,700. The
+hand-off's own time rides on top, which is why the summed busy reached 1.02 with it and
+0.75 without. Two loops on this runtime do one loop's work between them, whatever deals,
+wakes or pools they use, and a lever on the hand-off cannot move that. The question is now
+what the two loops share — a lock, the store, a cache line, the workers they wake onto —
+and a CPU profile of the process at the knee is the next measurement, not another arm.
+
 ## Changelog
 
 - **2026-11-02** — ADR 0093 written from the prototype's four runs (ADR 0092 T5, #1163),
@@ -216,3 +244,8 @@ The fan-in runs wait for that decision.
   118,700, and neither wake arm lifts the pair above one worker's worth (0.89–1.04 summed
   at every knee). The yield's placement is the open question, for an amendment to D4;
   the fan-in runs wait for it.
+- **2026-11-02** — Amendment 1 (shard-local `$share` dealing, T9) built and measured on h3
+  in two builds (under Progress): the deal stays local and a message costs 1.5 µs less, but
+  the knee falls to 97,700 on the standard build. The `tokio_unstable` flag every T2 and T3
+  binary carried costs about 5%. Across the eight runs the pair does one loop's worth of
+  non-hand-off work at every knee; a CPU profile is the next measurement.
