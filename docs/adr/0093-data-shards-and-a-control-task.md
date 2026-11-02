@@ -287,6 +287,44 @@ summed busy measured so far, the knee is 133,000–150,000. The cross-shard wake
 suspect for the loops sharing one worker, go with the hand-offs, so the busy may rise too.
 One h3 run and one fan-in run against T2 and T3's rows (task T9).
 
+## Amendment 2 (2026-11-02): the bounds that push back come before the ones that drop
+
+**What was measured.** Four shards on h3 (`h3-20261102T214752Z`, the first run with the
+rig's host samples; rows in the delivery doc): the knee is 164,900, with the broker at 7.2
+of the host's 32 CPUs and each loop at 0.37 busy, so no resource set it. Every failed round
+went the same way. Each shard's periodic inherited-session scan turned write elision off for
+its flight (ADR 0089 Amendment 2), every 30 s; from 167,500 the writes swamped the writer
+and the data disk (gp3, 125 MB/s provisioned), an append took about a second, the pending
+entries passed the stall budget, and the bound evicted them with their acks withheld. The
+generator then dropped thousands of its 20,000 clients. Nothing pushed back first: a
+publish's ingress credit returned to the pool when the hub had dispatched it, so every
+socket was read at the full offer until the bound dropped acks. The maintainer's rule, the
+same evening: no time bound without a buffer bound that pushes back before it.
+
+**The decision changes in three places.**
+
+- **D3: the credit is held until the answer.** A publish whose publisher waits for an
+  answer keeps its ingress credit on its pending entry until that answer goes out, through
+  the append lanes, the elision window, the hand-offs and a peer's verdict alike; one nobody
+  waits for releases it at dispatch, as before. Nothing an answer waits for takes credit (an
+  append, a subscriber's PUBACK, a shard's or a peer's answer), so there is no cycle. A
+  durable path that falls behind now parks the publishers at their sockets, OFFER NOT
+  TAKEN, where it filled the pending table.
+- **D3: the pool is sized to the pending table's floor.** A pool nobody configured (256 MiB,
+  or 1/8 of the memory watermark) is at most 65,536 × the per-publish overhead a shard,
+  about 55 MiB. A full pool of the cheapest publishes is then the table's count floor, and
+  the stall budget, which evicts only over the floor, cannot drop a client publish's ack.
+  A configured pool is used as given, with a warning at startup when it is larger.
+- **The periodic scan runs on each shard in turn.** Shard `k` of `K` runs it at `k × 30 / K`
+  seconds into the 30-second reconcile cycle, so a node's shards no longer enumerate the
+  store at once. One scan a node, its results routed to the shards, was the other way. It
+  would move every shard's scan state, the flag #1053's held forwards wait on among it, into
+  a shared path, to save store reads alone once the scan leaves elision on.
+
+**What it should buy, to be measured.** The four-shard knee rising from 164,900 toward the
+loops' ceiling, and a durable path that falls behind shown as OFFER NOT TAKEN, never
+DISCONNECTED: one h3 run with four shards and one with two (task T10).
+
 ## Consequences
 
 - **The split's cost is known before it is built:** about 2 µs a message for the hand-off,

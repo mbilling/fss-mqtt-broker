@@ -48,6 +48,11 @@ tasks:
     status: in-progress
     issue: 1180
     notes: "Size S to build, two rig runs. mqtt-core shared.rs: GroupMembers keeps three regions (own online, another shard's online, offline) and select_own_online; the table records another shard's members (subscribe_member with own = false, from the routing mirror). hub delivery.rs plan_local_fast deals among own online members when the node runs shards. Tests: the region invariant checked against a model after every subscribe, attach, detach, mirror and leave; a group with a member on each shard deals on the publisher's shard and crosses only when it has no member online; a group wholly on the other shard still takes every publish under the window."
+  - id: 0093-T10
+    title: "The bounds that push back before the ones that drop (Amendment 2): a publish's ingress credit held on its pending entry until its publisher is answered; an unconfigured pool at most the pending table's floor a shard (65,536 × the per-publish overhead); the periodic reconcile scan out of write elision's takeover window (ADR 0089 Amendment 2) and run by each shard at its own phase of the cycle; measured on h3 with four shards and with two"
+    status: in-progress
+    issue: 1180
+    notes: "Size S to build, two rig runs. hub/mod.rs route_publish holds the credit (hold_credit) and try_complete_pending releases it at the answer; ingress.rs MAX_SHARD_POOL_BYTES caps pool_from_config's derived pool; hub/mod.rs takeover_window_open and periodic_scan_phase, elision.rs may_elide on the window. Tests (hub/tests/held_credit.rs): the credit held through a parked durable write and an elision hold and returned at the answer, at dispatch for a publish nobody waits on, at the answer for an entry a settle window keeps; the window open for the boot, a takeover's scan and the eager window and closed for the periodic scan; a delivery eligible through the periodic scan; each shard's phase. Measured: the four-shard knee above 164,900 and a durable path that falls behind shown as OFFER NOT TAKEN, never DISCONNECTED."
 ---
 
 # Delivery 0093 — K data shards per node and one control task
@@ -86,6 +91,7 @@ measurement is in this doc, whatever the number (ADR 0092 D4).
 | 0093-T7 | ⬜ planned | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | — | "Size S, two rig runs. After T2, T3 and T4. The default stays hub_shards = 1 until two shards carry more than one loop at an ack p99 within the one loop's band, holding their connections above the knee." |
 | 0093-T8 | ⬜ planned | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | — | "Size M: two rig2 workloads (a hot-group arm of fanin-qos1 with the members' placement groups spread; a wildcard arm with one # subscriber) and two runs. A broad subscriber's capacity is one shard's delivery capacity (ADR 0093 D6); the measurement states the number." |
 | 0093-T9 | 🚧 in-progress | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | — | "Size S to build, two rig runs. mqtt-core shared.rs: GroupMembers keeps three regions (own online, another shard's online, offline) and select_own_online; the table records another shard's members (subscribe_member with own = false, from the routing mirror). hub delivery.rs plan_local_fast deals among own online members when the node runs shards. Tests: the region invariant checked against a model after every subscribe, attach, detach, mirror and leave; a group with a member on each shard deals on the publisher's shard and crosses only when it has no member online; a group wholly on the other shard still takes every publish under the window." |
+| 0093-T10 | 🚧 in-progress | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | — | "Size S to build, two rig runs. hub/mod.rs route_publish holds the credit (hold_credit) and try_complete_pending releases it at the answer; ingress.rs MAX_SHARD_POOL_BYTES caps pool_from_config's derived pool; hub/mod.rs takeover_window_open and periodic_scan_phase, elision.rs may_elide on the window. Tests (hub/tests/held_credit.rs): the credit held through a parked durable write and an elision hold and returned at the answer, at dispatch for a publish nobody waits on, at the answer for an entry a settle window keeps; the window open for the boot, a takeover's scan and the eager window and closed for the periodic scan; a delivery eligible through the periodic scan; each shard's phase. Measured: the four-shard knee above 164,900 and a durable path that falls behind shown as OFFER NOT TAKEN, never DISCONNECTED." |
 <!-- /status-table:0093 -->
 
 ## Progress
@@ -337,6 +343,21 @@ takeover for elision, only a real takeover window should, with one scan a node r
 one a shard. The same scan writes every delivery for its duration on one loop too; there
 it is absorbed.
 
+**T10 built** (Amendment 2, the maintainer's "fix"; branch `0093-t2-t3`). The publish's
+ingress credit stays on its pending entry until its publisher is answered
+(`route_publish`, released in `try_complete_pending` or with the entry), so the pool now
+covers the answer as well as the queue. A pool nobody configured is at most
+`MAX_SHARD_POOL_BYTES` a shard, 65,536 × `COMMAND_OVERHEAD` (about 55 MiB): with one shard
+the default falls from 256 MiB to that, with four from 256 MiB to 220 MiB, and a full pool
+of the cheapest publishes is the pending table's floor. Write elision's takeover window is
+`takeover_window_open`: the eager window, the boot scan or a scan the window started, never
+the periodic reconcile; the forwards #1053 holds still wait on any scan. Shard `k` of `K`
+runs the periodic scan at tick `k × 30 / K` of the cycle. The one scan a node proposed
+above became this stagger: routing one scan's results to every shard would put the scan
+state #1053's forwards wait on behind a shared path, for store reads alone once elision
+stays on. Tests in `hub/tests/held_credit.rs`; with the three changes undone, the four
+tests aimed at them fail. The rig run is next.
+
 ## Changelog
 
 - **2026-11-02** — ADR 0093 written from the prototype's four runs (ADR 0092 T5, #1163),
@@ -373,3 +394,8 @@ it is absorbed.
   bound evicts with the acks withheld, and clients disconnect. Holding the ingress credit
   until the PUBACK, a pool that runs dry before the stall budget, and a scan that leaves
   elision on are the changes to decide.
+- **2026-11-02** — Amendment 2 accepted ("fix") and T10 built (under Progress): a
+  publish's ingress credit held until its publisher is answered, an unconfigured pool at
+  most the pending table's floor a shard, and the periodic reconcile scan out of write
+  elision's takeover window (ADR 0089 Amendment 2) and staggered over the shards. The
+  four-shard and two-shard rig runs are next.
