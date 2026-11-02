@@ -164,6 +164,16 @@ class HostLoad(unittest.TestCase):
         self.assertAlmostEqual(d["flushes_s"], 10)
         self.assertAlmostEqual(d["busy"], 0.2)
 
+    def test_tick_counts_that_overrun_are_read_as_shares(self):
+        # A host's columns add up to 110% of its CPUs a second (tick accounting), and
+        # the figures are their shares of it: 4 CPUs at 55% busy are 2.2 busy CPUs.
+        step = write_step(self.tmp)
+        write_round(step, 1, samples=lambda i: host(i, per_cpu=(66, 0, 44, 99, 0, 0, 11, 0)))
+        m = L.round_host(step / "round-1")["brokers"][0]
+        self.assertAlmostEqual(m["host_busy"], 2.2)
+        self.assertAlmostEqual(m["softirq"], 0.2)
+        self.assertAlmostEqual(m["busiest_cpu"], 0.55)
+
     def test_a_restarted_broker_has_no_cpu_figure(self):
         step = write_step(self.tmp)
         write_round(step, 1, samples=lambda i: host(i, pid=4242 if i < 3 else 5151, start=777 if i < 3 else 999))

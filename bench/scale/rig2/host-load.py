@@ -14,8 +14,9 @@ sample inside give:
                 kernel's part of them (`system`: syscalls and the socket path they run)
   µs per msg    broker CPU µs per message the broker received (its own scrapes)
   host busy     the machine's busy CPUs (every column but idle and iowait) of the CPUs
-                it has; softirq (mostly the network's receive path) and steal beside it,
-                and the busiest single CPU's busy share
+                it has, as the busy share of every jiffy counted (the tick counts of a
+                32-CPU host add up to 29–36 CPUs a second); softirq (mostly the network's
+                receive path) and steal beside it, and the busiest single CPU's busy share
   ctxt/s        context switches a second, machine-wide
   disk          the busiest whole disk: writes/s, MB written/s, flushes/s (what an fsync
                 sends a disk with a write cache; 0 on one without) and its busy share
@@ -87,17 +88,28 @@ def broker_host(host: list[tuple[int, dict]], scrapes: list[tuple[int, dict]],
     if any(v < 0 for v in tot):
         raise ValueError("the machine's CPU counters went backwards inside the window (a reboot?)")
 
-    def cores(name: str) -> float:
-        return tot[col[name]] / hz / dt if name in col and col[name] < len(tot) else 0.0
+    ncpu = len(z.get("per_cpu", [])) or None
+    whole = sum(tot)
+
+    def cores(name_or_cols) -> float:
+        """CPUs' worth of the named columns: their share of every jiffy the machine
+        counted, times its CPUs. The tick counts of an idle CPU lag and lead, so the
+        columns of a 32-CPU host add up to 29–36 CPUs a second; their shares do not."""
+        cols = [col[n] for n in name_or_cols if n in col] if isinstance(name_or_cols, list) \
+            else ([col[name_or_cols]] if name_or_cols in col else [])
+        part = sum(tot[i] for i in cols if i < len(tot))
+        if ncpu and whole > 0:
+            return part / whole * ncpu
+        return part / hz / dt
 
     per_cpu = []
     for x, y in zip(a.get("per_cpu", []), z.get("per_cpu", [])):
         d = [q - p for p, q in zip(x, y)]
         # Each CPU's own total, not hz × dt: the tick accounting of an idle CPU lags.
-        whole = sum(d)
-        per_cpu.append(sum(d[i] for i in busy_cols if i < len(d)) / whole if whole > 0 else 0.0)
-    out = {"window_s": dt, "cpus": len(z.get("per_cpu", [])) or None,
-           "host_busy": sum(tot[i] for i in busy_cols if i < len(tot)) / hz / dt,
+        own = sum(d)
+        per_cpu.append(sum(d[i] for i in busy_cols if i < len(d)) / own if own > 0 else 0.0)
+    out = {"window_s": dt, "cpus": ncpu,
+           "host_busy": cores([n for n in fields if n not in ("idle", "iowait")]),
            "softirq": cores("softirq"), "steal": cores("steal"), "iowait": cores("iowait"),
            "busiest_cpu": max(per_cpu) if per_cpu else None,
            "ctxt_s": (z["ctxt"] - a["ctxt"]) / dt if "ctxt" in a and "ctxt" in z else None,
