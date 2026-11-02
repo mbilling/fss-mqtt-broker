@@ -458,3 +458,6 @@ ceiling is unchanged at 0.83: the 17% it does not dispatch is the work it wakes
   `append-backlog-full` with the loops at half busy — the lanes' workers behind a remote
   wake. The four runs are in; the hand-off costs 1.6–2.3 µs a message on the runtime's
   workers and the shards' loops belong there. The ADR (#1163) is next.
+- **2026-11-02** — The ADR written from the four runs: [ADR 0093](../adr/0093-data-shards-and-a-control-task.md),
+  K data shards per node and one control task, as Proposed, with its own delivery doc and
+  eight tasks under #1180. T5 is done when it merges.
