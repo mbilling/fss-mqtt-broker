@@ -1056,11 +1056,16 @@ pub struct Limits {
     /// over minutes degrades to read-mostly with a metric and a log line, instead of
     /// arriving as an OOM kill.
     pub memory_max_bytes: Option<u64>,
-    /// Bytes of client publishes that may wait for the hub at once, node-wide
-    /// (`MQTTD_HUB_INGRESS_BYTES`, ADR 0082 T3). Each publish holds credit for its topic,
-    /// payload and a fixed per-command overhead from the moment it is read until the hub
-    /// has dispatched it. Unset = 1/8 of [`Limits::memory_max_bytes`] when that is set,
-    /// otherwise 256 MiB. At least 4096. Restart-scoped.
+    /// Bytes of client publishes that may wait for the hub or for their answer at once,
+    /// node-wide (`MQTTD_HUB_INGRESS_BYTES`, ADR 0082 T3), split evenly over the hub
+    /// shards. Each publish holds credit for its topic, payload and a fixed per-command
+    /// overhead from the moment it is read until its publisher is answered, or until the
+    /// hub has dispatched it when nobody waits for an answer (ADR 0093 Amendment 2).
+    /// Unset = 1/8 of [`Limits::memory_max_bytes`] when that is set, otherwise 256 MiB,
+    /// and then at most about 55 MiB a hub shard: as many of the cheapest publishes as a
+    /// shard's pending table holds before its eviction bound applies, so a full pool parks
+    /// publishers at their sockets before that bound would drop an ack. A value set here
+    /// is used as given. At least 4096. Restart-scoped.
     pub hub_ingress_bytes: Option<u64>,
     /// The most of [`Limits::hub_ingress_bytes`] one connection may hold
     /// (`MQTTD_CONN_INGRESS_BYTES`, ADR 0082 T3), so one hot publisher cannot take the

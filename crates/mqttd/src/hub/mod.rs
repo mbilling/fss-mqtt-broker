@@ -2915,6 +2915,10 @@ pub struct Hub {
     /// Whether an off-loop inherited-session scan is running (ADR 0042 T9,
     /// exhibit ⑥) — one at a time.
     inherited_scan_inflight: bool,
+    /// Whether that scan is the boot scan or one a takeover window started, not the
+    /// periodic reconcile: only those keep write elision's takeover window open
+    /// ([`takeover_window_open`](Self::takeover_window_open), ADR 0089 Amendment 2).
+    scan_is_takeover: bool,
     /// How many inherited-session scans this hub has started, and the committed
     /// ownership epoch the latest one started at (issue #1031). One scan runs at a
     /// time, so the scan that lands is always the latest started; a forward held for
@@ -3266,7 +3270,7 @@ const RETAINED_QUEUE_CAP: usize = 1024;
 /// entry is evicted only once it has waited past `PENDING_STALL_BUDGET` (1 s, in
 /// `forwarding.rs`); a table of young entries over the count is a hand-off or a peer
 /// answering within the budget, and is admitted. The byte bound below stays hard.
-const PENDING_PUBLISH_CAP: usize = 65_536;
+pub(crate) const PENDING_PUBLISH_CAP: usize = 65_536;
 
 /// The BYTE bound on the same table (see [`forwarding::PendingTable`]), under the
 /// same overflow policy. 64 MiB holds the full 65,536 entries of telemetry-sized
@@ -3528,6 +3532,7 @@ impl Hub {
                 forward_index: HashMap::default(),
                 durable_writes: 0,
                 inherited_scan_inflight: false,
+                scan_is_takeover: false,
                 scan_started: (0, None),
                 interest_authoritative: false,
                 interest_suppressed_ticks: 0,
@@ -3828,7 +3833,7 @@ impl Hub {
         // The boot window's FIRST inherited-session scan runs immediately, not a
         // sweep tick later: on a fresh or restarted node it completes in
         // milliseconds and releases any publish acks gated on it (ADR 0042 T9).
-        self.spawn_inherited_session_scan();
+        self.spawn_inherited_session_scan(true);
         let mut since_yield = 0usize;
         loop {
             // ADR 0082 T2: sort what has arrived into the two lanes, then take the next
@@ -4511,8 +4516,22 @@ impl Hub {
                 live_only,
             )
             .await;
-        // Not taken by a hand-off: released here, as before ADR 0093.
-        self.publish_credit = None;
+        // Not taken by a hand-off: held on the pending entry until the publisher is
+        // answered (ADR 0093 Amendment 2), so a publish whose ack waits on its durable
+        // appends, a subscriber's PUBACK or a peer keeps its bytes in the pool, and a
+        // durable path that falls behind parks the publishers at their sockets before
+        // the pending table's bound would evict with the acks withheld. Released at
+        // the answer (`try_complete_pending`, `refuse_pending`), or with the entry; at
+        // once for a publish nobody waits on.
+        if let Some(credit) = self.publish_credit.take() {
+            if let Some(id) = gate.filter(|id| {
+                self.pending_publishes
+                    .get(*id)
+                    .is_some_and(|p| !p.ack_released())
+            }) {
+                self.pending_publishes.hold_credit(id, credit);
+            }
+        }
         if let Some(m) = &self.metrics {
             m.observe_deliver_latency(started.elapsed().as_secs_f64());
         }
@@ -7514,9 +7533,9 @@ impl Hub {
         self.expiry_reconcile_tick = self.expiry_reconcile_tick.wrapping_add(1);
         if self.takeover_reconcile_ticks > 0 {
             self.takeover_reconcile_ticks -= 1;
-            self.spawn_inherited_session_scan();
+            self.spawn_inherited_session_scan(true);
         } else if self.periodic_scan_wanted()
-            && self.expiry_reconcile_tick % EXPIRY_RECONCILE_EVERY == 0
+            && self.expiry_reconcile_tick % EXPIRY_RECONCILE_EVERY == self.periodic_scan_phase()
         {
             // The `routing_unsettled()` half is the LIVENESS condition item 2.2
             // must not drop (issue #613 item 2.2 follow-up). `last_scan_complete`
@@ -7549,7 +7568,12 @@ impl Hub {
             // deadlines and subscriptions from, and it is what releases the acks
             // gated on it (ADR 0042 T9). So does the takeover-window arm above —
             // arming it at all already means something moved.
-            self.spawn_inherited_session_scan();
+            //
+            // This arm is the periodic reconcile, not a takeover: its scan leaves
+            // write elision on (ADR 0089 Amendment 2), and each shard runs it at its
+            // own phase of the cycle (`periodic_scan_phase`), so a node's shards never
+            // enumerate the store all at once (ADR 0093 Amendment 2).
+            self.spawn_inherited_session_scan(false);
         }
 
         // Drive the settle pass from the SWEEP, not from a scan completion
@@ -7679,6 +7703,33 @@ impl Hub {
             && (self.takeover_reconcile_ticks > 0 || self.inherited_scan_inflight)
     }
 
+    /// Whether a takeover WINDOW is open for write elision (ADR 0089 D2, Amendment 2):
+    /// the eager migration window is armed, or the boot scan or a scan that window
+    /// started is still materialising sessions. Narrower than
+    /// [`takeover_open`](Self::takeover_open), which a forward's answer waits on
+    /// (#1053): the periodic reconcile scan is not a takeover. It runs every
+    /// [`EXPIRY_RECONCILE_EVERY`] ticks on a settled node, the sessions it materialises
+    /// are offline (never held), and a move it might find can land in any of the
+    /// seconds between two scans, while elision runs anyway; turning elision off for
+    /// its flight wrote every delivery of the node for that time, every 30 s (the h3
+    /// runs of 2026-11-02 with four shards, ADR 0093 Amendment 2).
+    fn takeover_window_open(&self) -> bool {
+        self.sessions_can_move()
+            && self.clustered()
+            && (self.takeover_reconcile_ticks > 0
+                || (self.inherited_scan_inflight && self.scan_is_takeover))
+    }
+
+    /// The tick of each [`EXPIRY_RECONCILE_EVERY`] at which this shard runs its periodic
+    /// scan (ADR 0093 Amendment 2): shard `k` of `K` at `k × EVERY / K`, so a node's
+    /// shards spread their enumerations of the store over the cycle instead of running
+    /// them together. `0` with one shard, as before.
+    fn periodic_scan_phase(&self) -> u32 {
+        let k = u32::from(self.shard);
+        let shards = u32::from(self.shard_count.max(1));
+        EXPIRY_RECONCILE_EVERY * k / shards
+    }
+
     /// Whether a session can move to this node: it has a durable plane (with
     /// node-local storage a session never changes owner).
     #[cfg(not(test))]
@@ -7695,10 +7746,16 @@ impl Hub {
                 .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn spawn_inherited_session_scan(&mut self) {
+    /// `takeover`: the boot scan or one the takeover window starts, which keeps write
+    /// elision's window open until it lands; `false` for the periodic reconcile. A
+    /// takeover's request while a periodic scan is in flight makes that scan the
+    /// takeover's: one scan at a time, and the window must last until it lands.
+    fn spawn_inherited_session_scan(&mut self, takeover: bool) {
         if self.inherited_scan_inflight {
+            self.scan_is_takeover |= takeover;
             return;
         }
+        self.scan_is_takeover = takeover;
         #[cfg(test)]
         self.probe
             .scans_started
@@ -7812,6 +7869,7 @@ impl Hub {
     /// [`inherited_deadline`](Self::inherited_deadline).
     fn inherit_sessions(&mut self, sessions: Vec<mqtt_storage::ScannedSession>, complete: bool) {
         self.inherited_scan_inflight = false;
+        self.scan_is_takeover = false;
         self.last_scan_complete = complete;
         // The interest-authoritative transition (0043-P4 exhibit ②): once one
         // COMPLETE scan has landed over a WHOLE mesh, this hub's routing table
@@ -8900,13 +8958,20 @@ impl Hub {
         // `reroute_grace` stays in `obligations_done` deliberately: an unanswered
         // forward whose target died is doubt about the EVIDENCE, not about the
         // routing view, and item 2.1 does not widen into it.
+        let mut answered = false;
         if let Some(p) = self.pending_publishes.get_mut(id) {
             if !p.ack_awaits_settle && p.answer(PublishOutcome::Accepted) {
+                answered = true;
                 debug!(publish = id, topic = %p.topic, "pending publish complete; ack released");
                 if let Some(m) = &self.metrics {
                     m.observe_publish_ack(p.created_at.elapsed().as_secs_f64());
                 }
             }
+        }
+        // Answered: its ingress credit goes back now, though a settle window may keep
+        // the entry for its replay (ADR 0093 Amendment 2).
+        if answered {
+            self.pending_publishes.release_credit(id);
         }
         // Retire the entry only when the settle window is done with it AND its
         // publisher has been answered. The second condition is structural, not a
@@ -10222,6 +10287,7 @@ mod tests {
     mod cert_expiry;
     mod elision_late_ack;
     mod forward_repeat;
+    mod held_credit;
     mod message_events;
     mod pending_gauges;
     mod qos2_retirement;

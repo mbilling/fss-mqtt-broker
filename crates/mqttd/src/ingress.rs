@@ -8,9 +8,13 @@
 //! - A node-wide **pool** of bytes, and a **per-connection cap** so one hot publisher
 //!   cannot hold the whole pool.
 //! - A client publish acquires [`cost`] bytes from both before it is handed to the hub.
-//!   The [`IngressPermit`] travels **inside** `HubCommand::Publish` and is released when
-//!   the hub drops the command after dispatching it. The hub never acquires credit, so
-//!   no wait here can depend on the hub's own progress: there is no credit cycle.
+//!   The [`IngressPermit`] travels **inside** `HubCommand::Publish`. A publish whose
+//!   publisher waits for an answer keeps it on its pending entry until that answer
+//!   (ADR 0093 Amendment 2), so a durable path that falls behind parks the publishers
+//!   here; any other is released when the hub drops the command after dispatching it.
+//!   The hub never acquires credit, and nothing an answer waits for (an append, a
+//!   subscriber's PUBACK, a shard's or a peer's answer) does either, so no wait here
+//!   can depend on its own release: there is no credit cycle.
 //! - A connection without credit **stops reading its socket** (TCP backpressure) — for
 //!   `QoS` 0 too under [`OverloadMode::Pause`]; under [`OverloadMode::ShedQos0`] a `QoS`
 //!   0 publish is dropped and counted instead. `QoS` 1 and 2 always wait: a publish the
@@ -45,8 +49,18 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// to 248 B (#835): 256-412 B on the channel, up to 552 B in a lane.
 pub const COMMAND_OVERHEAD: usize = 2 * std::mem::size_of::<crate::hub::HubCommand>() + 384;
 
-/// The pool when neither it nor a memory watermark is configured (ADR 0082 §5).
+/// The pool when neither it nor a memory watermark is configured (ADR 0082 §5), before
+/// [`MAX_SHARD_POOL_BYTES`] applies.
 pub const DEFAULT_POOL_BYTES: usize = 256 * 1024 * 1024;
+
+/// The most one hub shard's pool gets when the pool is not configured (ADR 0093
+/// Amendment 2): as many publishes as the shard's pending table holds before it is past
+/// its count floor, at the least a publish can cost. A publish keeps its credit until
+/// its publisher is answered, so a full pool parks the shard's publishers at their
+/// sockets before that table holds more than its floor of them, and the stall budget,
+/// which only ever evicts over the floor, never drops a client publish's ack. About
+/// 55 MiB: 65,536 × [`COMMAND_OVERHEAD`].
+pub const MAX_SHARD_POOL_BYTES: usize = crate::hub::PENDING_PUBLISH_CAP * COMMAND_OVERHEAD;
 
 /// The per-connection cap when unconfigured (ADR 0082 §5).
 pub const DEFAULT_CONN_BYTES: usize = 1024 * 1024;
@@ -128,14 +142,22 @@ impl IngressCredit {
         self.pools.len()
     }
 
-    /// The pool size from config: explicit, else 1/8 of the memory watermark, else
-    /// [`DEFAULT_POOL_BYTES`].
+    /// The pool size from config for `shards` hub shards: explicit, as given; else 1/8 of
+    /// the memory watermark, else [`DEFAULT_POOL_BYTES`], either at most
+    /// [`MAX_SHARD_POOL_BYTES`] a shard (ADR 0093 Amendment 2).
     #[must_use]
-    pub fn pool_from_config(explicit: Option<u64>, memory_max: Option<u64>) -> usize {
-        let bytes = explicit
-            .or_else(|| memory_max.map(|m| m / 8))
-            .map_or(DEFAULT_POOL_BYTES as u64, |b| b.max(4096));
-        usize::try_from(bytes).unwrap_or(usize::MAX)
+    pub fn pool_from_config(
+        explicit: Option<u64>,
+        memory_max: Option<u64>,
+        shards: usize,
+    ) -> usize {
+        let bytes = explicit.unwrap_or_else(|| {
+            let derived = memory_max.map_or(DEFAULT_POOL_BYTES as u64, |m| m / 8);
+            let cap = (MAX_SHARD_POOL_BYTES as u64)
+                .saturating_mul(u64::try_from(shards.max(1)).unwrap_or(u64::MAX));
+            derived.min(cap)
+        });
+        usize::try_from(bytes.max(4096)).unwrap_or(usize::MAX)
     }
 
     /// The overload mode.
@@ -303,16 +325,54 @@ mod tests {
     #[test]
     fn the_pool_follows_the_config_then_the_watermark_then_the_default() {
         assert_eq!(
-            IngressCredit::pool_from_config(Some(65_536), Some(8 << 30)),
+            IngressCredit::pool_from_config(Some(65_536), Some(8 << 30), 1),
             65_536
         );
         assert_eq!(
-            IngressCredit::pool_from_config(None, Some(1_500_000_000)),
+            IngressCredit::pool_from_config(None, Some(200_000_000), 4),
+            25_000_000
+        );
+        assert_eq!(
+            IngressCredit::pool_from_config(None, Some(1_500_000_000), 4),
             187_500_000
         );
         assert_eq!(
-            IngressCredit::pool_from_config(None, None),
+            IngressCredit::pool_from_config(None, None, 8),
             DEFAULT_POOL_BYTES
+        );
+    }
+
+    /// ADR 0093 Amendment 2: a pool nobody sized is at most `MAX_SHARD_POOL_BYTES` a
+    /// shard, so a full pool of the cheapest publishes is the pending table's count
+    /// floor and no more; a configured pool is used as given.
+    #[test]
+    fn an_unconfigured_pool_is_at_most_the_pending_floor_a_shard() {
+        let floor = crate::hub::PENDING_PUBLISH_CAP;
+        assert_eq!(MAX_SHARD_POOL_BYTES / COMMAND_OVERHEAD, floor);
+        for shards in [1, 2, 4] {
+            let pool = IngressCredit::pool_from_config(None, None, shards);
+            assert_eq!(pool, MAX_SHARD_POOL_BYTES * shards, "{shards} shard(s)");
+            assert!(pool <= DEFAULT_POOL_BYTES);
+            let watermark = IngressCredit::pool_from_config(None, Some(64 << 30), shards);
+            assert_eq!(
+                watermark,
+                MAX_SHARD_POOL_BYTES * shards,
+                "{shards} shard(s)"
+            );
+            let credit =
+                IngressCredit::sharded(pool, DEFAULT_CONN_BYTES, OverloadMode::Pause, shards);
+            // The cheapest publish costs the overhead and a one-byte topic: one shard's
+            // pool holds fewer of them than the floor.
+            let cheapest = credit.cost(1, 0) as usize;
+            assert!(
+                credit.pool_bytes() / shards / cheapest < floor,
+                "{shards} shard(s)"
+            );
+        }
+        assert_eq!(
+            IngressCredit::pool_from_config(Some(1 << 30), None, 1),
+            1 << 30,
+            "a configured pool is the operator's"
         );
     }
 

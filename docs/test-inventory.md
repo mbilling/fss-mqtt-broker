@@ -1542,7 +1542,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 906 test(s)
+## `crates/mqttd/src/lib.rs` — 914 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -2044,6 +2044,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::forwarding_is_counted_and_local_delivery_is_not`
 - `hub::tests::gauge_refresh_snapshots_sessions_and_subscriptions`
 - `hub::tests::growth_releases_moved_sessions_on_the_old_owner`
+- `hub::tests::held_credit::a_delivery_stays_eligible_for_elision_through_the_periodic_scan`
+- `hub::tests::held_credit::a_held_delivery_keeps_the_credit_until_the_subscribers_puback`
+- `hub::tests::held_credit::a_publish_keeps_its_credit_until_its_durable_write_lands`
+- `hub::tests::held_credit::a_publish_nobody_waits_for_returns_its_credit_at_dispatch`
+- `hub::tests::held_credit::an_answered_entry_the_settle_window_keeps_returns_its_credit`
+- `hub::tests::held_credit::each_shard_runs_its_periodic_scan_at_its_own_phase`
+- `hub::tests::held_credit::only_a_takeover_closes_write_elision_and_the_periodic_scan_does_not`
 - `hub::tests::held_deliveries_fall_back_in_order_when_the_subscriber_leaves`
 - `hub::tests::hub_dispatch_time_is_exported_and_stays_flat_while_a_store_is_parked`
 - `hub::tests::inherited_session_expiry_is_swept_after_takeover`
@@ -2237,6 +2244,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::while_draining_a_rule_derived_forward_holds_the_barrier_until_the_peer_answers`
 - `hub::tests::without_no_local_a_publisher_receives_its_own_delivery`
 - `ingress::tests::a_shard_that_holds_its_whole_pool_leaves_the_other_shards_pool_untouched`
+- `ingress::tests::an_unconfigured_pool_is_at_most_the_pending_floor_a_shard`
 - `ingress::tests::credit_is_returned_when_the_permit_drops_and_the_cap_bounds_one_connection`
 - `ingress::tests::peer_credit_draws_on_the_pool_alone_and_counts_what_it_sheds`
 - `ingress::tests::the_pool_follows_the_config_then_the_watermark_then_the_default`

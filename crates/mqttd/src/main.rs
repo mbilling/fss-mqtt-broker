@@ -3189,18 +3189,31 @@ fn subscriber_limits_from_config(
 }
 
 /// The node's ingress credit from config (ADR 0082 T3): the pool (explicit, else 1/8 of
-/// the memory watermark, else 256 MiB), the per-connection cap and the overload mode.
+/// the memory watermark, else 256 MiB, then at most `MAX_SHARD_POOL_BYTES` a shard), the
+/// per-connection cap and the overload mode.
 fn ingress_from_config(config: &Config) -> Arc<mqttd::ingress::IngressCredit> {
-    use mqttd::ingress::{IngressCredit, OverloadMode, DEFAULT_CONN_BYTES};
+    use mqttd::ingress::{IngressCredit, OverloadMode, DEFAULT_CONN_BYTES, MAX_SHARD_POOL_BYTES};
     let limits = &config.limits;
-    let pool = IngressCredit::pool_from_config(limits.hub_ingress_bytes, limits.memory_max_bytes);
+    // ADR 0093 D3: one pool per hub shard, so a shard behind parks only its own
+    // publishers instead of holding the node's whole pool.
+    let shards = usize::from(config.node.hub_shards.max(1));
+    let pool =
+        IngressCredit::pool_from_config(limits.hub_ingress_bytes, limits.memory_max_bytes, shards);
+    if limits.hub_ingress_bytes.is_some() && pool / shards > MAX_SHARD_POOL_BYTES {
+        warn!(
+            pool_bytes = pool,
+            shards,
+            shard_cap = MAX_SHARD_POOL_BYTES,
+            "the configured ingress pool holds more publishes a shard than the pending \
+             table's floor: under a durable path that falls behind, its stall budget can \
+             evict with the acks withheld before the pool parks the publishers (ADR 0093 \
+             Amendment 2)"
+        );
+    }
     let conn = limits.conn_ingress_bytes.map_or(DEFAULT_CONN_BYTES, |b| {
         usize::try_from(b).unwrap_or(usize::MAX)
     });
     let mode = OverloadMode::from_config(limits.ingress_overload.as_deref());
-    // ADR 0093 D3: one pool per hub shard, so a shard behind parks only its own
-    // publishers instead of holding the node's whole pool.
-    let shards = usize::from(config.node.hub_shards.max(1));
     info!(
         pool_bytes = pool,
         conn_bytes = conn,
