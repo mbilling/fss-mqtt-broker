@@ -1,7 +1,7 @@
 # ADR 0093 — K data shards per node and one control task: the hub's split
 
-- **Status:** Proposed
-- **Date:** 2026-11-02
+- **Status:** Accepted
+- **Date:** 2026-11-02 (accepted the same day)
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0093-data-shards-and-a-control-task.md](../delivery/0093-data-shards-and-a-control-task.md) — plan, progress, and changelog
 - **Issues:** [#1163](https://github.com/mbilling/fss-mqtt-broker/issues/1163) (this record, ADR 0092 T5),

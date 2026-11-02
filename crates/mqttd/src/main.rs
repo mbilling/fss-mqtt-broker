@@ -240,11 +240,58 @@ impl std::fmt::Debug for StartupError {
     }
 }
 
+/// The process entry: the runtime first — ADR 0093 D4's first arm is an option of the
+/// runtime, so it cannot wait for the configuration — then the startup sequence on it.
+fn main() -> Result<(), StartupError> {
+    let runtime = build_runtime().map_err(|e| StartupError(Box::new(e)))?;
+    runtime.block_on(serve())
+}
+
+/// Whether the runtime was built without tokio's LIFO slot, for the startup log.
+static LIFO_SLOT_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether `MQTTD_HUB_LIFO_SLOT` asks for the runtime without tokio's LIFO slot (`off`,
+/// `false`, `0` or `no`). Read from the environment, not the typed config, because the
+/// runtime exists before the config is loaded: the one `MQTTD_*` setting read this way,
+/// and an experiment (ADR 0093 D4).
+fn hub_lifo_slot_off() -> bool {
+    std::env::var("MQTTD_HUB_LIFO_SLOT").is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "off" | "false" | "0" | "no"
+        )
+    })
+}
+
+/// The runtime every task of the broker runs on: what `#[tokio::main]` built, plus ADR
+/// 0093 D4's first arm. With `MQTTD_HUB_LIFO_SLOT=off` the runtime has no LIFO slot, so
+/// a task woken from a worker is queued for any worker instead of running next on the
+/// waker's — the slot is what let the prototype's two shards take turns on one worker,
+/// and what makes the one loop's own wakes cheap; which outweighs which is the
+/// measurement. The option is tokio's unstable API: it takes effect in a build with
+/// `--cfg tokio_unstable` (the rig's) and is reported and ignored in any other.
+fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    if hub_lifo_slot_off() {
+        #[cfg(tokio_unstable)]
+        {
+            builder.disable_lifo_slot();
+            LIFO_SLOT_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        #[cfg(not(tokio_unstable))]
+        eprintln!(
+            "MQTTD_HUB_LIFO_SLOT=off: this build keeps tokio's LIFO slot (not built with \
+             --cfg tokio_unstable); ignored"
+        );
+    }
+    builder.build()
+}
+
 // Startup is a linear wiring sequence; splitting it would only scatter the order it
 // documents.
 #[allow(clippy::too_many_lines)]
-#[tokio::main]
-async fn main() -> Result<(), StartupError> {
+async fn serve() -> Result<(), StartupError> {
     // Validate the entire invocation before even help/version dispatch. A typo,
     // stray value or misplaced option must never start a broker or signal one.
     reject_invalid_cli();
@@ -267,6 +314,12 @@ async fn main() -> Result<(), StartupError> {
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "info".to_string()),
     );
+    if LIFO_SLOT_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        info!(
+            "the runtime runs without tokio's LIFO slot (MQTTD_HUB_LIFO_SLOT=off, ADR 0093 \
+             D4): a task woken from a worker is queued for any worker"
+        );
+    }
 
     // `--version` / `-V` and `--help` / `-h`: local, print-and-exit, before any subcommand
     // or config work (#169). `--version` in particular MUST exist — an operator typing it
@@ -3232,10 +3285,30 @@ fn start_shards(
              node is served by its first shard alone"
         );
     }
+    // ADR 0093 D4: how a shard wakes another for a batch of hand-offs.
+    let remote_wake = match config.node.hub_handoff_wake.as_str() {
+        "local" => false,
+        "remote" => true,
+        other => {
+            return Err(format!(
+                "node.hub_handoff_wake = {other:?}: \"local\" or \"remote\" (ADR 0093 D4)"
+            )
+            .into());
+        }
+    };
+    let mailboxes = (shards > 1 && remote_wake).then(|| {
+        let boxes: Arc<[hub::ShardMailbox]> =
+            (0..shards).map(|_| hub::ShardMailbox::default()).collect();
+        let mailman = hub::spawn_mailman(boxes.clone());
+        (boxes, mailman)
+    });
     let mut hubs: Vec<hub::Hub> = (0..shards).map(|_| make()).collect();
     let txs: Vec<_> = hubs.iter().map(hub::Hub::sender).collect();
     for (k, hub) in hubs.iter_mut().enumerate() {
         hub.set_shards(u8::try_from(k).expect("at most MAX_SHARDS"), txs.clone());
+        if let Some((boxes, mailman)) = &mailboxes {
+            hub.set_shard_mailboxes(boxes.clone(), mailman.clone());
+        }
         if cluster_configured {
             hub.set_cluster_configured();
         }
@@ -3255,8 +3328,10 @@ fn start_shards(
     if shards > 1 {
         info!(
             shards,
-            "hub shards (ADR 0092 T5 prototype): each owns the clients of its placement \
-             groups; a publish matched on one is handed to the others for theirs"
+            handoff_wake = %config.node.hub_handoff_wake,
+            "hub shards (ADR 0092 T5 prototype, ADR 0093 D3): each owns the clients of its \
+             placement groups; a publish matched on one is handed to the others for theirs, \
+             once per dispatch batch, carrying its ingress credit"
         );
     }
     Ok(hub::HubTx::sharded(txs))
@@ -5444,7 +5519,7 @@ async fn probe_health() -> ! {
         .replace("0.0.0.0:", "127.0.0.1:")
         .replace("[::]:", "[::1]:");
 
-    // `main` is already `#[tokio::main]`, so this awaits on the existing runtime rather
+    // `serve` already runs on the process runtime, so this awaits on it rather
     // than building a nested one (which panics).
     match probe_once(&target, &path).await {
         Ok(200) => {

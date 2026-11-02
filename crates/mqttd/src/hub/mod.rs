@@ -106,7 +106,10 @@ mod settle;
 pub use quarantine::QUARANTINE_LISTED;
 /// ADR 0092 T5: the node's data shards and the sender in front of them.
 pub mod shards;
-pub use shards::{shard_of, HubTx, ShardDeliver, ShardTarget, MAX_SHARDS};
+pub use shards::{
+    shard_of, spawn_mailman, HubTx, ShardAnswer, ShardBatch, ShardDeliver, ShardMailbox,
+    ShardTarget, MAX_SHARDS,
+};
 
 /// Maximum number of queued messages replayed to a reconnecting session at once.
 const REPLAY_LIMIT: usize = 10_000;
@@ -1743,20 +1746,17 @@ pub enum HubCommand {
         /// Whether it is connected there (a `$share` group's online prefix).
         online: bool,
     },
-    /// ADR 0092 T5: a publish another shard matched, for the subscribers this shard
-    /// owns. Boxed (#835).
-    ShardDeliver(Box<shards::ShardDeliver>),
-    /// ADR 0092 T5: shard `shard` settled every delivery of pending publish `id` it was
-    /// handed — stored, held and acknowledged, or not.
+    /// ADR 0092 T5 / ADR 0093 D3: the publishes another shard matched during one of its
+    /// dispatch batches, for the subscribers this shard owns. Boxed (#835).
+    ShardDeliver(Box<shards::ShardBatch>),
+    /// ADR 0092 T5 / ADR 0093 D3: shard `shard` settled every delivery of each of these
+    /// pending publishes of this (the origin) shard — stored, held and acknowledged, or
+    /// not — one answer per hand-off, sent once per dispatch batch.
     ShardDone {
         /// The answering shard.
         shard: u8,
-        /// The pending publish on this (the origin) shard.
-        id: u64,
-        /// What its deliveries came to.
-        outcome: DurableOutcome,
-        /// Whether a subscriber there took it (fan-out evidence, as a peer's `Reached`).
-        reached: bool,
+        /// The settled hand-offs, in the order they settled.
+        answers: Vec<shards::ShardAnswer>,
     },
 
     /// A peer node's link came up; register it and send our interest snapshot.
@@ -3143,6 +3143,22 @@ pub struct Hub {
     /// Scratch: the subscribers of the publish being dispatched that other shards own,
     /// taken by [`Hub::flush_handoffs`] at the end of its fan-out.
     handoff: Vec<shards::ShardTarget>,
+    /// ADR 0093 D3: the hand-offs collected during this dispatch batch, per target shard,
+    /// sent as one [`HubCommand::ShardDeliver`] each at the batch's end
+    /// ([`Hub::flush_shard_batches`]).
+    handoff_batches: Vec<Vec<shards::ShardDeliver>>,
+    /// ADR 0093 D3: the hand-offs this shard settled during the batch, per origin,
+    /// answered as one [`HubCommand::ShardDone`] each at the batch's end.
+    shard_done_batches: Vec<Vec<shards::ShardAnswer>>,
+    /// ADR 0093 D3: the ingress credit of the publish being dispatched (ADR 0082 T3),
+    /// for a hand-off to take with it; what is left when the dispatch ends is released
+    /// then, as it always was.
+    publish_credit: Option<crate::ingress::IngressPermit>,
+    /// ADR 0093 D4's second arm (`node.hub_handoff_wake = "remote"`): every shard's
+    /// mailbox, and the mailman that wakes a shard for what was posted to it. `None`:
+    /// a batch goes on the shard's channel and the wake is this worker's.
+    shard_mailboxes: Option<Arc<[shards::ShardMailbox]>>,
+    mailman: Option<std::sync::mpsc::Sender<u8>>,
     /// Prometheus metrics (ADR 0020), when enabled. Updated on the publish/deliver paths.
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
     /// The node's ingress credit (ADR 0082 T3), held only to export its gauges: the hub
@@ -3234,6 +3250,11 @@ const RETAINED_QUEUE_CAP: usize = 1024;
 /// retransmission: 65,536 entries is ~28 MiB of 200-byte telemetry and ~4 GiB of
 /// 64 KiB messages, and a bound that depends on what clients choose to send is
 /// not a bound.
+///
+/// ADR 0093 D3, since the two-shard runs: a FLOOR, not a cliff. Over it the oldest
+/// entry is evicted only once it has waited past `PENDING_STALL_BUDGET` (1 s, in
+/// `forwarding.rs`); a table of young entries over the count is a hand-off or a peer
+/// answering within the budget, and is admitted. The byte bound below stays hard.
 const PENDING_PUBLISH_CAP: usize = 65_536;
 
 /// The BYTE bound on the same table (see [`forwarding::PendingTable`]), under the
@@ -3423,6 +3444,11 @@ impl Hub {
                 shard_txs: Vec::new(),
                 shard_append_pending: HashMap::default(),
                 handoff: Vec::new(),
+                handoff_batches: Vec::new(),
+                shard_done_batches: Vec::new(),
+                publish_credit: None,
+                shard_mailboxes: None,
+                mailman: None,
                 held_forwards: Vec::new(),
                 elision: Box::default(),
                 forward_windows: HashMap::default(),
@@ -3832,6 +3858,9 @@ impl Hub {
                     if self.elision.entries > 0 {
                         self.expire_elided();
                     }
+                    // ADR 0093 D3: the batch's hand-offs and answers go to their shards
+                    // now, once per batch, before this loop gives up its worker.
+                    self.flush_shard_batches();
                     tokio::task::yield_now().await;
                 }
                 continue;
@@ -3839,6 +3868,9 @@ impl Hub {
             if closed {
                 break;
             }
+            // Nothing left to dispatch: what this batch owes other shards goes out
+            // before the loop parks (ADR 0093 D3).
+            self.flush_shard_batches();
             tokio::select! {
                 cmd = self.rx.recv() => match cmd {
                     Some(cmd) => self.enqueue(cmd),
@@ -3849,6 +3881,10 @@ impl Hub {
                 () = elision_wake(&self.elision), if self.elision.entries > 0 => {
                     self.expire_elided();
                 }
+                // ADR 0093 D4: another shard posted to this one's mailbox and the mailman
+                // woke this loop for it; `ingest` takes it next round.
+                () = shards::mailbox_wake(self.shard_mailboxes.as_deref(), self.shard),
+                    if self.shard_mailboxes.is_some() => {}
             }
         }
     }
@@ -3864,6 +3900,18 @@ impl Hub {
     /// Move up to [`HUB_INGEST_BATCH`] commands from the channel into their lanes.
     /// Returns `true` when the channel is closed (every sender gone).
     fn ingest(&mut self) -> bool {
+        // ADR 0093 D4: what another shard left in this one's mailbox, ahead of the
+        // channel — the mailman woke this loop for it, or it was found here anyway.
+        let posted = self
+            .shard_mailboxes
+            .as_deref()
+            .and_then(|boxes| boxes.get(usize::from(self.shard)))
+            .map(shards::ShardMailbox::take);
+        if let Some(posted) = posted {
+            for cmd in posted {
+                self.enqueue(cmd);
+            }
+        }
         for _ in 0..HUB_INGEST_BATCH {
             match self.rx.try_recv() {
                 Ok(cmd) => self.enqueue(cmd),
@@ -4277,13 +4325,12 @@ impl Hub {
                 filters,
                 online,
             } => self.apply_shard_route(&client, filters, online),
-            HubCommand::ShardDeliver(d) => self.dispatch_shard_deliver(*d),
-            HubCommand::ShardDone {
-                shard,
-                id,
-                outcome,
-                reached,
-            } => self.shard_done(shard, id, outcome, reached),
+            HubCommand::ShardDeliver(b) => self.dispatch_shard_batch(*b),
+            HubCommand::ShardDone { shard, answers } => {
+                for a in answers {
+                    self.shard_done(shard, a.id, a.outcome, a.reached);
+                }
+            }
             // Peer- and cluster-facing commands.
             other => self.dispatch_cluster(other).await,
         }
@@ -4357,9 +4404,11 @@ impl Hub {
             done,
             v5,
             publisher,
-            // Held to the end of this dispatch, then dropped: the publish's
-            // ingress credit returns to its connection and the pool (ADR 0082 T3).
-            credit: _credit,
+            // Held through the fan-out, where a hand-off to another shard may take it
+            // along (ADR 0093 D3); what is left is dropped when this dispatch ends, and
+            // the publish's ingress credit returns to its connection and the pool
+            // (ADR 0082 T3).
+            credit,
         } = cmd
         else {
             debug_assert!(false, "route_publish routes Publish commands only");
@@ -4427,6 +4476,7 @@ impl Hub {
         // 0020-T4; since issue #242 the durable appends themselves run
         // off-loop and are timed by `durable_append_latency_seconds`).
         let started = Instant::now();
+        self.publish_credit = credit;
         let durable = self
             .publish(
                 &topic,
@@ -4440,6 +4490,8 @@ impl Hub {
                 live_only,
             )
             .await;
+        // Not taken by a hand-off: released here, as before ADR 0093.
+        self.publish_credit = None;
         if let Some(m) = &self.metrics {
             m.observe_deliver_latency(started.elapsed().as_secs_f64());
         }

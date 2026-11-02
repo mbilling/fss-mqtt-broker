@@ -9,19 +9,61 @@ use std::collections::BTreeSet;
 
 /// Two shards of one node over one store, with `elision_ms` as the write-elision window.
 fn start_shards(elision_ms: u32) -> HubTx {
-    let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
+    start_shards_with(elision_ms, false, None, None, None)
+}
+
+/// As [`start_shards`], with ADR 0093 D4's remote wake (the mailboxes and the mailman)
+/// when `remote_wake`, the node's ingress credit attached, the metrics attached, and
+/// the store given (an in-memory one otherwise).
+fn start_shards_with(
+    elision_ms: u32,
+    remote_wake: bool,
+    ingress: Option<&Arc<crate::ingress::IngressCredit>>,
+    metrics: Option<&Arc<mqtt_observability::metrics::Metrics>>,
+    store: Option<Arc<dyn SessionStore>>,
+) -> HubTx {
+    let store: Arc<dyn SessionStore> = store.unwrap_or_else(|| Arc::new(MemorySessionStore::new()));
     let mut hubs: Vec<Hub> = (0..2)
         .map(|_| Hub::with_config(NodeId("hub-test".into()), store.clone()).0)
         .collect();
     let txs: Vec<_> = hubs.iter().map(Hub::sender).collect();
+    let mailboxes = remote_wake.then(|| {
+        let boxes: Arc<[crate::hub::ShardMailbox]> = (0..2)
+            .map(|_| crate::hub::ShardMailbox::default())
+            .collect();
+        let mailman = crate::hub::spawn_mailman(boxes.clone());
+        (boxes, mailman)
+    });
     for (k, hub) in hubs.iter_mut().enumerate() {
         hub.set_shards(u8::try_from(k).unwrap(), txs.clone());
         hub.set_write_elision_ms(elision_ms);
+        if let Some((boxes, mailman)) = &mailboxes {
+            hub.set_shard_mailboxes(boxes.clone(), mailman.clone());
+        }
+        if let Some(ingress) = ingress {
+            hub.attach_ingress(ingress.clone());
+        }
+        if let Some(metrics) = metrics {
+            hub.attach_metrics(metrics.clone());
+        }
     }
     for hub in hubs {
         tokio::spawn(hub.run());
     }
     HubTx::sharded(txs)
+}
+
+/// The `shard`-class dispatches of both shards so far: one per hand-off batch and one
+/// per batch of answers (ADR 0093 D3), never one per message.
+fn shard_dispatches(metrics: &mqtt_observability::metrics::Metrics) -> u64 {
+    metrics
+        .render()
+        .lines()
+        .filter(|l| {
+            l.starts_with("mqttd_hub_dispatch_seconds_count{") && l.contains("command=\"shard\"")
+        })
+        .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+        .sum()
 }
 
 /// The `n`th client id (of the `prefix` family) that shard `shard` of two owns.
@@ -107,6 +149,144 @@ async fn a_publish_reaches_a_subscriber_the_other_shard_owns_and_is_acked_after_
         received: tokio::time::Instant::now(),
     })
     .unwrap();
+    settle(&tx).await;
+}
+
+/// ADR 0093 D3: a hand-off carries the publish's ingress credit, which returns to the
+/// pool when the other shard answers — not when the origin's dispatch ends — so a shard
+/// that answers late keeps the pool charged and parks the publishers that feed it. The
+/// other shard's write is parked by the store until the test releases it.
+#[tokio::test]
+async fn a_hand_off_holds_the_publishers_credit_until_the_other_shard_answers() {
+    let node = Arc::new(crate::ingress::IngressCredit::new(
+        1 << 20,
+        1 << 16,
+        crate::ingress::OverloadMode::Pause,
+    ));
+    let store = super::ParkingStore::new();
+    let as_store: Arc<dyn SessionStore> = store.clone();
+    let tx = start_shards_with(0, false, Some(&node), None, Some(as_store));
+    let a = client_on(0, "pub-", 0);
+    let b = client_on(1, "sub-", 0);
+    let _ = attach_full(&tx, &a, 1, true, 0, 256).await;
+    let (mut brx, _) = attach_full(&tx, &b, 2, false, 30, 256).await;
+    subscribe_qos(&tx, &b, "t", QoS::AtLeastOnce);
+    settle(&tx).await;
+    // The subscriber's write on the other shard parks: that shard's answer, and the
+    // publisher's acknowledgement, wait on it.
+    let release = store.park(&b);
+
+    let permit = node
+        .try_acquire_pool(node.cost(1, 6))
+        .expect("an empty pool has credit");
+    let charged = node.in_use();
+    assert!(charged > 0);
+    let (done_tx, mut done_rx) = oneshot::channel();
+    tx.send(HubCommand::Publish {
+        topic: "t".into(),
+        payload: Bytes::from_static(b"credit"),
+        qos: QoS::AtLeastOnce,
+        retain: false,
+        message_expiry: None,
+        app: mqtt_core::AppProperties::default(),
+        done: Some(done_tx),
+        v5: true,
+        publisher: Some(ClientId(a.as_str().into())),
+        credit: Some(permit),
+    })
+    .unwrap();
+    settle(&tx).await;
+    assert!(
+        matches!(done_rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+        "the publisher is not answered while the other shard's write is parked"
+    );
+    assert_eq!(
+        node.in_use(),
+        charged,
+        "handed off and unanswered: the credit is held, not released by the origin's dispatch"
+    );
+    release.send(true).expect("the parked write is waiting");
+    let p = next_publish(&mut brx).await;
+    assert_eq!(&p.payload[..], b"credit");
+    assert_eq!(
+        timeout(Duration::from_secs(5), done_rx)
+            .await
+            .expect("acked within 5 s")
+            .unwrap(),
+        PublishOutcome::Accepted
+    );
+    settle(&tx).await;
+    assert_eq!(
+        node.in_use(),
+        0,
+        "the last shard answered: the credit is back in the pool"
+    );
+}
+
+/// ADR 0093 D3: a burst of publishes to the other shard goes over as batches, not as
+/// one command per message — the `shard` class dispatches far fewer times than there are
+/// messages — and every publish is delivered and answered.
+#[tokio::test]
+async fn a_burst_of_hand_offs_goes_over_in_batches_and_every_publish_is_answered() {
+    const MESSAGES: usize = 40;
+    let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("batched"));
+    let tx = start_shards_with(0, false, None, Some(&metrics), None);
+    let a = client_on(0, "pub-", 0);
+    let b = client_on(1, "sub-", 0);
+    let _ = attach_full(&tx, &a, 1, true, 0, 256).await;
+    let (mut brx, _) = attach_full(&tx, &b, 2, false, 30, 256).await;
+    subscribe_qos(&tx, &b, "t", QoS::AtLeastOnce);
+    settle(&tx).await;
+    let before = shard_dispatches(&metrics);
+
+    let dones: Vec<_> = (0..MESSAGES)
+        .map(|i| publish_from(&tx, &a, "t", format!("m{i}").as_bytes()))
+        .collect();
+    let mut seen = BTreeSet::new();
+    for _ in 0..MESSAGES {
+        seen.insert(next_publish(&mut brx).await.payload.to_vec());
+    }
+    assert_eq!(seen.len(), MESSAGES, "every publish delivered once");
+    for done in dones {
+        assert_eq!(
+            timeout(Duration::from_secs(5), done)
+                .await
+                .expect("acked within 5 s")
+                .unwrap(),
+            PublishOutcome::Accepted
+        );
+    }
+    settle(&tx).await;
+    let dispatches = shard_dispatches(&metrics) - before;
+    assert!(
+        dispatches < MESSAGES as u64,
+        "{MESSAGES} messages went over in {dispatches} shard dispatches: batched, not one each"
+    );
+}
+
+/// ADR 0093 D4's second arm: with the hand-off's wake issued by the mailman from
+/// outside the runtime, the batch still reaches the other shard and the publisher is
+/// still answered by that shard's write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hand_off_through_the_mailbox_and_the_mailman_is_delivered_and_answered() {
+    let tx = start_shards_with(0, true, None, None, None);
+    let a = client_on(0, "pub-", 0);
+    let b = client_on(1, "sub-", 0);
+    let _ = attach_full(&tx, &a, 1, true, 0, 256).await;
+    let (mut brx, _) = attach_full(&tx, &b, 2, false, 30, 256).await;
+    subscribe_qos(&tx, &b, "t", QoS::AtLeastOnce);
+    settle(&tx).await;
+
+    let done = publish_from(&tx, &a, "t", b"by mail");
+    let p = next_publish(&mut brx).await;
+    assert_eq!(&p.payload[..], b"by mail");
+    assert_eq!(
+        timeout(Duration::from_secs(5), done)
+            .await
+            .expect("acked within 5 s")
+            .unwrap(),
+        PublishOutcome::Accepted
+    );
     settle(&tx).await;
 }
 

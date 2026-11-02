@@ -345,6 +345,97 @@ pub struct ShardDeliver {
     pub app: AppProperties,
     /// The subscribers this shard owns.
     pub targets: Vec<ShardTarget>,
+    /// ADR 0093 D3: an ungated publish's ingress credit (ADR 0082 T3), released once
+    /// this shard has dispatched it; a gated publish's stays on its pending entry until
+    /// the last shard answers.
+    pub credit: Option<crate::ingress::IngressPermit>,
+}
+
+/// The hand-offs one shard owes another from one of its dispatch batches, sent as one
+/// [`HubCommand::ShardDeliver`] at the batch's end (ADR 0093 D3): the target is woken
+/// once per batch, not once per message.
+#[derive(Debug)]
+pub struct ShardBatch {
+    /// The shard the publishes entered on.
+    pub origin: u8,
+    /// The publishes, in dispatch order.
+    pub messages: Vec<ShardDeliver>,
+}
+
+/// One settled hand-off, answered to its origin in a [`HubCommand::ShardDone`].
+#[derive(Debug, Clone, Copy)]
+pub struct ShardAnswer {
+    /// The pending publish on the origin shard.
+    pub id: u64,
+    /// What its deliveries on the answering shard came to.
+    pub outcome: DurableOutcome,
+    /// Whether a subscriber there took it (fan-out evidence, as a peer's `Reached`).
+    pub reached: bool,
+}
+
+/// ADR 0093 D4, the second arm (`node.hub_handoff_wake = "remote"`): where a shard's
+/// batches are left for it without waking it from the sender's worker — a wake issued
+/// by a running task puts the woken task in that worker's LIFO slot, to run next on it
+/// behind the sender, which is how the prototype's pair took turns on one worker — and
+/// the mailman, a thread of the node's own, wakes it instead: a wake from outside the
+/// runtime goes through its injection queue to an idle worker.
+#[derive(Debug, Default)]
+pub struct ShardMailbox {
+    queue: std::sync::Mutex<Vec<HubCommand>>,
+    notify: tokio::sync::Notify,
+}
+
+impl ShardMailbox {
+    /// Leave a command for the shard, waking nobody.
+    pub(super) fn post(&self, cmd: HubCommand) {
+        self.queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(cmd);
+    }
+
+    /// Everything posted since the last take, in order.
+    pub(super) fn take(&self) -> Vec<HubCommand> {
+        let mut queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if queue.is_empty() {
+            Vec::new()
+        } else {
+            std::mem::take(&mut *queue)
+        }
+    }
+}
+
+/// Wait until the mailman wakes shard `shard`'s mailbox; forever when there is none.
+pub(super) async fn mailbox_wake(boxes: Option<&[ShardMailbox]>, shard: u8) {
+    match boxes.and_then(|b| b.get(usize::from(shard))) {
+        Some(mailbox) => mailbox.notify.notified().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Start the mailman: a thread that wakes shard `k` of `mailboxes` for every `k` sent
+/// to it, and ends when every sender is gone.
+///
+/// # Panics
+///
+/// When the thread cannot be started, at the node's start.
+#[must_use]
+pub fn spawn_mailman(mailboxes: Arc<[ShardMailbox]>) -> std::sync::mpsc::Sender<u8> {
+    let (tx, rx) = std::sync::mpsc::channel::<u8>();
+    std::thread::Builder::new()
+        .name("mqttd-hub-mailman".to_string())
+        .spawn(move || {
+            while let Ok(k) = rx.recv() {
+                if let Some(mailbox) = mailboxes.get(usize::from(k)) {
+                    mailbox.notify.notify_one();
+                }
+            }
+        })
+        .expect("the hub mailman thread starts");
+    tx
 }
 
 /// The receiving shard's aggregate for one [`ShardDeliver`] (what
@@ -377,6 +468,9 @@ impl Hub {
         );
         self.shard = shard;
         self.shard_count = u8::try_from(txs.len()).expect("at most MAX_SHARDS");
+        // ADR 0093 D3: one batch of hand-offs and one of answers per shard.
+        self.handoff_batches = (0..txs.len()).map(|_| Vec::new()).collect();
+        self.shard_done_batches = (0..txs.len()).map(|_| Vec::new()).collect();
         self.shard_txs = txs;
         if self.shard_count > 1 {
             // A publish's identity on the node is `(node, id)` (#784), recorded with
@@ -387,6 +481,18 @@ impl Hub {
             self.publish_ids = (self.publish_ids & low) | tag;
             self.forward_seq = (self.forward_seq & low) | tag;
         }
+    }
+
+    /// ADR 0093 D4's second arm: every shard's mailbox and the mailman that wakes a shard
+    /// for what was posted to it. Without this, a batch goes on the shard's channel and
+    /// the wake is the sender's worker's.
+    pub fn set_shard_mailboxes(
+        &mut self,
+        mailboxes: Arc<[ShardMailbox]>,
+        mailman: std::sync::mpsc::Sender<u8>,
+    ) {
+        self.shard_mailboxes = Some(mailboxes);
+        self.mailman = Some(mailman);
     }
 
     /// Which shard this loop is, and how many the node runs.
@@ -470,10 +576,12 @@ impl Hub {
         self.handoff.push(target);
     }
 
-    /// Send the subscribers collected by [`hand_off`](Self::hand_off) to their shards,
-    /// one [`HubCommand::ShardDeliver`] each, and owe the publisher's acknowledgement
-    /// their answers when the publish is gated. A settle-window re-delivery hands off
-    /// nothing: the other shard was told the publish once.
+    /// Put the subscribers collected by [`hand_off`](Self::hand_off) into their shards'
+    /// batches — sent at the dispatch batch's end by
+    /// [`flush_shard_batches`](Self::flush_shard_batches), ADR 0093 D3 — and owe the
+    /// publisher's acknowledgement their answers when the publish is gated. A
+    /// settle-window re-delivery hands off nothing: the other shard was told the
+    /// publish once.
     #[allow(clippy::too_many_arguments)] // the publish's fields
     pub(super) fn flush_handoffs(
         &mut self,
@@ -517,28 +625,100 @@ impl Hub {
             if batch.is_empty() {
                 continue;
             }
-            if let Some(id) = gated {
+            // ADR 0093 D3: the publish's ingress credit travels with its hand-off — on
+            // the pending entry until the last shard answers when it is gated, inside
+            // the batch until the target has dispatched it when it is not — so the pool
+            // is charged for the hand-off's lifetime, and a shard that answers late
+            // parks the publishers that feed it as a loop that dispatches late parks
+            // its own (ADR 0082).
+            let credit = if let Some(id) = gated {
                 if let Some(p) = self.pending_publishes.get_mut(id) {
                     p.shard_outstanding |= 1 << shard;
                 }
-            }
+                if let Some(credit) = self.publish_credit.take() {
+                    self.pending_publishes.hold_credit(id, credit);
+                }
+                None
+            } else {
+                self.publish_credit.take()
+            };
             if let Some(m) = &self.metrics {
                 m.publish_forwarded("shard");
             }
-            let _ = self.shard_txs[shard].send(HubCommand::ShardDeliver(Box::new(ShardDeliver {
-                origin: self.shard,
-                gate: gated,
-                topic: topic.to_string(),
-                payload: payload.clone(),
-                qos,
-                retain,
-                message_expiry,
-                app: app.clone(),
-                targets: batch,
-            })));
+            if let Some(pending) = self.handoff_batches.get_mut(shard) {
+                pending.push(ShardDeliver {
+                    origin: self.shard,
+                    gate: gated,
+                    topic: topic.to_string(),
+                    payload: payload.clone(),
+                    qos,
+                    retain,
+                    message_expiry,
+                    app: app.clone(),
+                    targets: batch,
+                    credit,
+                });
+            }
         }
         if targets.capacity() > 0 && targets.is_empty() {
             self.handoff = targets;
+        }
+    }
+
+    /// Send what this dispatch batch collected (ADR 0093 D3): one
+    /// [`HubCommand::ShardDeliver`] per shard owed a hand-off and one
+    /// [`HubCommand::ShardDone`] per origin owed answers, at the batch's end — so a
+    /// shard is woken once per batch, not once per message. Nothing with one shard.
+    pub(super) fn flush_shard_batches(&mut self) {
+        if self.shard_count <= 1 {
+            return;
+        }
+        for target in 0..usize::from(self.shard_count) {
+            let messages = match self.handoff_batches.get_mut(target) {
+                Some(batch) if !batch.is_empty() => std::mem::take(batch),
+                _ => Vec::new(),
+            };
+            if !messages.is_empty() {
+                let cmd = HubCommand::ShardDeliver(Box::new(ShardBatch {
+                    origin: self.shard,
+                    messages,
+                }));
+                self.send_to_shard(target, cmd);
+            }
+            let answers = match self.shard_done_batches.get_mut(target) {
+                Some(batch) if !batch.is_empty() => std::mem::take(batch),
+                _ => Vec::new(),
+            };
+            if !answers.is_empty() {
+                let cmd = HubCommand::ShardDone {
+                    shard: self.shard,
+                    answers,
+                };
+                self.send_to_shard(target, cmd);
+            }
+        }
+    }
+
+    /// One command to shard `target`: on its channel, which wakes it from this worker,
+    /// or into its mailbox with the mailman asked to wake it (ADR 0093 D4's second arm).
+    fn send_to_shard(&self, target: usize, cmd: HubCommand) {
+        if let (Some(boxes), Some(mailman)) = (&self.shard_mailboxes, &self.mailman) {
+            if let Some(mailbox) = boxes.get(target) {
+                mailbox.post(cmd);
+                let _ = mailman.send(u8::try_from(target).unwrap_or(u8::MAX));
+                return;
+            }
+        }
+        if let Some(tx) = self.shard_txs.get(target) {
+            let _ = tx.send(cmd);
+        }
+    }
+
+    /// One batch of hand-offs from another shard (ADR 0093 D3): each publish delivered
+    /// to the subscribers this shard owns, each answered when its deliveries settle.
+    pub(super) fn dispatch_shard_batch(&mut self, b: ShardBatch) {
+        for d in b.messages {
+            self.dispatch_shard_deliver(d);
         }
     }
 
@@ -654,16 +834,17 @@ impl Hub {
         }
     }
 
-    fn answer_shard(&self, origin: u8, id: u64, outcome: DurableOutcome, reached: bool) {
-        let Some(tx) = self.shard_txs.get(usize::from(origin)) else {
-            return;
-        };
-        let _ = tx.send(HubCommand::ShardDone {
-            shard: self.shard,
-            id,
-            outcome,
-            reached,
-        });
+    /// Answer the origin for one settled hand-off: queued for the batch's end
+    /// ([`flush_shard_batches`](Self::flush_shard_batches)), one command per origin per
+    /// batch (ADR 0093 D3).
+    fn answer_shard(&mut self, origin: u8, id: u64, outcome: DurableOutcome, reached: bool) {
+        if let Some(batch) = self.shard_done_batches.get_mut(usize::from(origin)) {
+            batch.push(ShardAnswer {
+                id,
+                outcome,
+                reached,
+            });
+        }
     }
 
     /// Shard `shard` settled every delivery of pending publish `id` it was handed. A
@@ -683,14 +864,20 @@ impl Hub {
             return;
         }
         p.shard_outstanding &= !bit;
-        match outcome {
-            DurableOutcome::Ok => {
-                p.stored = true;
-                if reached {
-                    p.ack_awaits_settle = false;
-                }
-                self.try_complete_pending(id);
+        let last = p.shard_outstanding == 0;
+        if let DurableOutcome::Ok = outcome {
+            p.stored = true;
+            if reached {
+                p.ack_awaits_settle = false;
             }
+        }
+        if last {
+            // ADR 0093 D3: the last shard answered; the publish's credit returns to the
+            // pool now, whatever else the entry still waits for.
+            self.pending_publishes.release_credit(id);
+        }
+        match outcome {
+            DurableOutcome::Ok => self.try_complete_pending(id),
             DurableOutcome::Failed => self.drop_pending(id),
             DurableOutcome::Refused(r) => self.refuse_pending(id, r),
         }

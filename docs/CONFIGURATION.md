@@ -6,7 +6,7 @@ Source of truth: `mqtt_config::ENV_VARS` and `Config::overlay_from` in `crates/m
 
 The annotated template is [`mqttd.example.toml`](mqttd.example.toml). Capacity arithmetic lives in [SIZING.md](SIZING.md); day-2 procedures in [OPERATIONS.md](OPERATIONS.md). This page is the inventory of knobs, not the runbook.
 
-Documented overlay variables: **132** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) and any experimental side-channel knobs below.
+Documented overlay variables: **133** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) and any experimental side-channel knobs below.
 
 ## Node identity
 
@@ -19,6 +19,7 @@ Documented overlay variables: **132** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) 
 | `MQTTD_HUB_THREAD` | `node.hub_thread` | Run the hub loop on an OS thread of its own (`MQTTD_HUB_THREAD`, ADR 0092 D1, withdrawn by its Amendment 1). Default `false`: measured on the rig, the thread made every hand-off out of the hub a remote wake and cost a lone m6i.8xlarge 23% of its durable `QoS` 1 knee. `true` keeps the experiment available. Restart-scoped. |
 | `MQTTD_HUB_CORE` | `node.hub_core` | Pin the hub's thread to this CPU (`MQTTD_HUB_CORE`, ADR 0092 D1; Linux only, a warning elsewhere). Unset = not pinned. The runtime's workers are not kept off that CPU: for a core of the hub's own, keep the rest of the process off it too (a `taskset`, a cpuset). Ignored with `hub_thread = false`. Restart-scoped. |
 | `MQTTD_HUB_SHARDS` | `node.hub_shards` | How many hub loops ("data shards") the node runs (`MQTTD_HUB_SHARDS`, ADR 0092 T5's prototype): each owns the clients of disjoint placement groups, and a publish matched on one shard is handed to the others for the subscribers they own. Default `1`, the one loop; `2` to `4` is the one-node prototype, refused on a node that names peers (`cluster.peers`, `cluster.swim.seeds`) and run with a warning on a node alone in its cluster. With `hub_thread = true`, shard `k` is pinned to `hub_core + k`. Restart-scoped. |
+| `MQTTD_HUB_HANDOFF_WAKE` | `node.hub_handoff_wake` | ADR 0093 D4: how a shard wakes another for a batch of hand-offs (`MQTTD_HUB_HANDOFF_WAKE`). `"local"` (the default): the batch goes on the other shard's channel and the wake is this worker's, which on this runtime puts the woken shard in the sender's worker's LIFO slot, to run next on it. `"remote"`: the batch is posted to the shard's mailbox and a thread of the node's own wakes it, through the runtime's injection queue, for an idle worker to take. The arm the ADR measures; nothing with one shard. Restart-scoped. |
 
 ## Listeners
 
@@ -223,6 +224,7 @@ Documented overlay variables: **132** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) 
 | `MQTTD_STORE_LINGER` | `—` | read via `std::env::var` (not `mqtt_config::overlay_from`). Source: `crates/mqtt-cluster/src/durable_plane.rs`. Experimental; warned loudly when engaged (ADR 0076: K>1 sharding and linger were measured slower and stay off by default). |
 | `MQTTD_DIAG_SIMULATED_FSYNC_US` | `—` | read via `std::env::var` (not `mqtt_config::overlay_from`). Source: `crates/mqtt-cluster/src/stage_timing.rs`. DIAGNOSTIC, and inert unless the binary was built with the `diag-simulated-fsync` feature (release builds are not): every segment-log sync becomes a sleep of this many microseconds, for fsync-latency sweeps on one machine. Such a build is NOT durable; it warns on stderr. |
 | `MQTTD_CONFIG` | `—` | read via `std::env::var` (not `mqtt_config::overlay_from`). Source: `crates/mqttd/src/main.rs`. Experimental; warned loudly when engaged (ADR 0076: K>1 sharding and linger were measured slower and stay off by default). |
+| `MQTTD_HUB_LIFO_SLOT` | `—` | read via `std::env::var` (not `mqtt_config::overlay_from`). Source: `crates/mqttd/src/main.rs`. Experimental; warned loudly when engaged (ADR 0076: K>1 sharding and linger were measured slower and stay off by default). |
 | `MQTTD_REPLICA_STORE` | `—` | read via `std::env::var` (not `mqtt_config::overlay_from`). Source: `crates/mqttd/src/main.rs`. `log` or `redb` — the replica store's engine (ADR 0078). Unset (the default since 1.3.0), a fresh data dir gets `log`, the append-only segment log, and a data dir that already holds a store keeps it, so an upgrade changes nothing on disk. `log` on a redb data dir imports it once (the redb files are kept as `*.imported`) and there is no conversion back. |
 | `MQTTD_STORE_SHARDS` | `—` | read via `std::env::var` (not `mqtt_config::overlay_from`). Source: `crates/mqttd/src/main.rs`. Experimental; warned loudly when engaged (ADR 0076: K>1 sharding and linger were measured slower and stay off by default). |
 
