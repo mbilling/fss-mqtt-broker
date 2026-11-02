@@ -230,6 +230,40 @@ wakes or pools they use, and a lever on the hand-off cannot move that. The quest
 what the two loops share — a lock, the store, a cache line, the workers they wake onto —
 and a CPU profile of the process at the knee is the next measurement, not another arm.
 
+**The CPU profile** (2026-11-02, `h3-20261102T165107Z`, commit `bd3d62ad` in the standard
+build with frame pointers, `MQTTD_HUB_SHARDS=2` as run 8). perf sampled the whole process
+at 999 Hz with call graphs inside the measured window, beside every thread's schedstat and
+the machine's counters. 84,400 carried (ack p99 14.2 ms with the profiler attached); 97,700
+did not, twice (74,787 and 72,111 received, ack p99 15–16 s: the plateau), where run 8
+carried it without the profiler, so recording costs a few percent of the knee. The one-loop
+column is the 2026-10-31 profile of an older build (main `19f36004`) at the same rate:
+
+| | one loop, 84,400 | two loops, 84,400 | two loops, 97,700 offered |
+|---|---|---|---|
+| mqttd CPU | 3.9 cores | 5.5 cores | 10.1–10.2 cores |
+| the hub loops on CPU, both | 0.83 | 0.81 | 0.74–0.75 |
+| a contended lock's slow path (all of it from the connection loop) | 0.7% | 5.4% | 9.2–9.5% |
+| the kernel's context-switch and wake paths | 12.3% | 18.7% | 34% |
+| the workers' voluntary context switches | — | 170,000/s | 586,000–592,000/s |
+
+The machine is never short of CPU (8 and 13 of its 32 cores busy), the store is idle (the
+durable writer commits about 2,000 ops a second at every knee, one loop or two, because
+elision keeps the rest out of it), and the hub loops are not the limit: above the knee each
+is on CPU about 37% of the time while the rest of the process burns nine cores. What the
+pair shares is a lock every connection takes. `serve_loop`'s `select!` builds
+`drain_signal(policy)` — `cancelled()` on the graceful-shutdown token in the policy every
+connection shares — afresh on every pass, and tokio's `Notify` locks its waiter list to
+register that future, again on every poll of it, and again to drop it. The token has one
+`Notify`, so that is one mutex taken two or three times per pass of every connection's loop
+on all 32 workers. One loop leaves it mostly uncontended; two loops at the same 84,400
+contend it eight times as hard, and above the knee its waits become a storm of futex parks
+and wakes that takes a third of the CPU and slows every connection task, which leaves the
+pair at 72,000–75,000. The prototype carried 118,700 with the same connection code; whether
+it simply stayed below the point where the convoy starts is not measured. The fix is per
+connection: a child token made once when the connection starts, its `cancelled()` future
+pinned outside the loop, so a poll takes a lock no other connection takes. The knee with it
+is the next measurement, before any amendment to D4.
+
 ## Changelog
 
 - **2026-11-02** — ADR 0093 written from the prototype's four runs (ADR 0092 T5, #1163),
@@ -249,3 +283,8 @@ and a CPU profile of the process at the knee is the next measurement, not anothe
   the knee falls to 97,700 on the standard build. The `tokio_unstable` flag every T2 and T3
   binary carried costs about 5%. Across the eight runs the pair does one loop's worth of
   non-hand-off work at every knee; a CPU profile is the next measurement.
+- **2026-11-02** — The CPU profile at the knee (under Progress): the hub loops are not the
+  limit. Every connection locks the graceful-shutdown token's one `Notify` on every pass of
+  its loop; two loops contend it eight times as hard as one at the same rate, and above
+  the knee its futex waits take a third of the CPU. A child token per connection is the
+  fix to measure next.
