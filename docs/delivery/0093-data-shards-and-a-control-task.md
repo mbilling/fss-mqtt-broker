@@ -43,6 +43,11 @@ tasks:
     status: planned
     issue: 1180
     notes: "Size M: two rig2 workloads (a hot-group arm of fanin-qos1 with the members' placement groups spread; a wildcard arm with one # subscriber) and two runs. A broad subscriber's capacity is one shard's delivery capacity (ADR 0093 D6); the measurement states the number."
+  - id: 0093-T9
+    title: "Shard-local $share dealing (Amendment 1): with locality on, a shard deals among the online members it owns — own online members a prefix of each group's online prefix, so the deal stays one index — and hands across only when it owns none online; measured on h3 and fan-in against T2 and T3's rows"
+    status: in-progress
+    issue: 1180
+    notes: "Size S to build, two rig runs. mqtt-core shared.rs: GroupMembers keeps three regions (own online, another shard's online, offline) and select_own_online; the table records another shard's members (subscribe_member with own = false, from the routing mirror). hub delivery.rs plan_local_fast deals among own online members when the node runs shards. Tests: the region invariant checked against a model after every subscribe, attach, detach, mirror and leave; a group with a member on each shard deals on the publisher's shard and crosses only when it has no member online; a group wholly on the other shard still takes every publish under the window."
 ---
 
 # Delivery 0093 — K data shards per node and one control task
@@ -80,6 +85,7 @@ measurement is in this doc, whatever the number (ADR 0092 D4).
 | 0093-T6 | ⬜ planned | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | — | "Size M. Tests: a target shard held busy parks the origin's publishers and nothing else on the node waits; a shard's panic ends the process as the one loop's does (ADR 0061 §8)." |
 | 0093-T7 | ⬜ planned | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | — | "Size S, two rig runs. After T2, T3 and T4. The default stays hub_shards = 1 until two shards carry more than one loop at an ack p99 within the one loop's band, holding their connections above the knee." |
 | 0093-T8 | ⬜ planned | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | — | "Size M: two rig2 workloads (a hot-group arm of fanin-qos1 with the members' placement groups spread; a wildcard arm with one # subscriber) and two runs. A broad subscriber's capacity is one shard's delivery capacity (ADR 0093 D6); the measurement states the number." |
+| 0093-T9 | 🚧 in-progress | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | — | "Size S to build, two rig runs. mqtt-core shared.rs: GroupMembers keeps three regions (own online, another shard's online, offline) and select_own_online; the table records another shard's members (subscribe_member with own = false, from the routing mirror). hub delivery.rs plan_local_fast deals among own online members when the node runs shards. Tests: the region invariant checked against a model after every subscribe, attach, detach, mirror and leave; a group with a member on each shard deals on the publisher's shard and crosses only when it has no member online; a group wholly on the other shard still takes every publish under the window." |
 <!-- /status-table:0093 -->
 
 ## Progress

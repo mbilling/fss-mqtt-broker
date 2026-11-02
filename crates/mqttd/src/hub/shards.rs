@@ -590,8 +590,11 @@ impl Hub {
         self.shared.remove_client(client);
         for (f, qos) in filters {
             if let Some((group, filter)) = parse_shared(&f) {
+                // Another shard's member: past this shard's own prefix, dealt to only
+                // when this shard has no online member of its own (ADR 0093
+                // Amendment 1).
                 self.shared
-                    .subscribe(client.clone(), group, filter, qos, online);
+                    .subscribe_member(client.clone(), group, filter, qos, online, false);
             } else {
                 let key = self.table.intern(&f);
                 self.table.subscribe(client.clone(), key);

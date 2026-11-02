@@ -258,6 +258,35 @@ two shards carry more than one loop at an ack p99 within the one loop's band, ho
 their connections above the knee; then the README's per-node figures move, by the rig's
 numbers only.
 
+## Amendment 1 (2026-11-02): a shard deals `$share` among its own members first
+
+**What was measured.** T2 and T3's six h3 runs (one `m6i.8xlarge`, two shards; the rows
+are in the delivery doc) fit one ratio at every step to within 1%: the knee is the two
+loops' summed busy divided by the hub-µs a message. The prototype reached 118,700 at 1.02
+busy and 8.6 µs; T2's builds stayed at 0.92–1.04 busy and paid 9.2–9.5 µs, against the
+one loop's 6.9. About 2.4 µs of every message is the hand-off, and under D6 as written half
+of all deals cross shards on h3 and on `fanin-qos1`: a publish is dealt among every member
+of the node, and half of any group's members sit on the other shard.
+
+**The decision changes in one place, D6.** With locality on (`cluster.shared_prefer_local`,
+the default), a shard deals a `$share` publish among the online members it owns, by the
+same constant-time index — its own online members are kept as a prefix of the group's
+online prefix — and hands the publish to the other shard's members only when it owns no
+member online. Each shard turns its own cursor, so its members take equal turns: fairness
+is kept within a shard and given up across shards, the trade ADR 0077's prefer-local makes
+across nodes. Members split unevenly over the shards (a 500-member group about 250 ± 11 a
+shard, a 108-member one 54 ± 5), so a member on the less populated side takes a few
+percent more, up to about 10% in a small group; ADR 0091 D4's skip of a member that
+cannot keep up is unchanged. With locality off, dealing is the node-wide round-robin of
+D6. An ordinary subscriber, or a `#` subscriber, on the other shard still takes a
+hand-off: D6's limit for a broad subscriber stands.
+
+**What it should buy, to be measured.** On h3 and on `fanin-qos1` no `$share` deal
+crosses, so the pair's cost per message falls toward the one loop's 6.9 µs; at the 0.92–1.04
+summed busy measured so far, the knee is 133,000–150,000. The cross-shard wakes, the main
+suspect for the loops sharing one worker, go with the hand-offs, so the busy may rise too.
+One h3 run and one fan-in run against T2 and T3's rows (task T9).
+
 ## Consequences
 
 - **The split's cost is known before it is built:** about 2 µs a message for the hand-off,
@@ -300,8 +329,8 @@ numbers only.
 
 ## Delivery
 
-Eight tasks: the control task and its snapshots (T1), hand-offs with credit and batching
+Nine tasks: the control task and its snapshots (T1), hand-offs with credit and batching
 (T2), the worker capture removed by measurement (T3), the ENA packet-rate probe on AWS
 (T4), the cluster paths on shards (T5), a shard's failure modes (T6), the four-shard knee
-against D8 (T7), and the hot-group and `#`-subscriber shapes (T8). Status in the delivery
-doc.
+against D8 (T7), the hot-group and `#`-subscriber shapes (T8), and shard-local `$share`
+dealing (T9, Amendment 1). Status in the delivery doc.
