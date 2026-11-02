@@ -1541,7 +1541,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 898 test(s)
+## `crates/mqttd/src/lib.rs` — 901 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -2149,6 +2149,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::settle_gate::leaving_the_settle_window_answers_a_restore_shaped_entry`
 - `hub::tests::settle_gate::no_periodic_inherited_scan_runs_without_a_durable_plane`
 - `hub::tests::settle_gate::the_interest_authoritative_backstop_fires_on_its_own_constant`
+- `hub::tests::sharded::a_burst_of_hand_offs_goes_over_in_batches_and_every_publish_is_answered`
+- `hub::tests::sharded::a_hand_off_holds_the_publishers_credit_until_the_other_shard_answers`
+- `hub::tests::sharded::a_hand_off_through_the_mailbox_and_the_mailman_is_delivered_and_answered`
 - `hub::tests::sharded::a_publish_reaches_a_subscriber_the_other_shard_owns_and_is_acked_after_its_write`
 - `hub::tests::sharded::a_qos0_publish_is_handed_off_ungated`
 - `hub::tests::sharded::a_shared_group_split_across_shards_takes_every_publish_under_the_window`
