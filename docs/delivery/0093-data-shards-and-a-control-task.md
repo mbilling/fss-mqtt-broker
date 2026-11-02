@@ -124,8 +124,18 @@ node's own, wake it through the runtime's injection queue, once per batch. Tests
 `hub/tests/sharded.rs` — the credit held until the other shard answers (its write parked
 by the store), a burst of 40 going over in fewer `shard` dispatches than messages, a
 hand-off through the mailbox and the mailman — and the pending-table bound test
-rewritten for the floor. Not measured yet: the four rig runs (h3 and fan-in, each arm)
-against the prototype's rows are next.
+rewritten for the floor.
+
+**One ingress pool per shard** (2026-11-02, the third cut): the node's credit is `K`
+pools of a `K`-th of the configured bytes (`IngressCredit::sharded`), and a client
+connection draws on the pool of the shard that owns its client (`connection_for`); peer
+links draw on the first shard's, where their traffic enters (D5). Built after runs 3 and 4
+of the same day showed, with and without the per-pair gate, that one shared pool goes to
+whichever shard falls behind: about 70 s into the round at 105,500 msg/s, one shard's data
+lane grew to 235,000 commands — the whole 256 MiB — while its partner's drained to zero
+and starved, both loops fell to 0.35 busy, and the pair took 72,000. Per shard, a shard
+behind parks only its own publishers. Test: one shard holding its whole pool leaves the
+other's untouched.
 
 ## Changelog
 

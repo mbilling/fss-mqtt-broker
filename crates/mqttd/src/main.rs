@@ -3198,13 +3198,17 @@ fn ingress_from_config(config: &Config) -> Arc<mqttd::ingress::IngressCredit> {
         usize::try_from(b).unwrap_or(usize::MAX)
     });
     let mode = OverloadMode::from_config(limits.ingress_overload.as_deref());
+    // ADR 0093 D3: one pool per hub shard, so a shard behind parks only its own
+    // publishers instead of holding the node's whole pool.
+    let shards = usize::from(config.node.hub_shards.max(1));
     info!(
         pool_bytes = pool,
         conn_bytes = conn,
         mode = ?mode,
+        shards,
         "ingress credit (ADR 0082 T3): client publishes wait at the socket past these bounds"
     );
-    Arc::new(IngressCredit::new(pool, conn, mode))
+    Arc::new(IngressCredit::sharded(pool, conn, mode, shards))
 }
 
 /// Everything every hub-construction arm must do before [`hub::Hub::run`] (issue #241).

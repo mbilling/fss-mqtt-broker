@@ -73,9 +73,16 @@ impl OverloadMode {
 }
 
 /// The node's ingress credit: the pool, the per-connection cap and the overload mode.
+///
+/// ADR 0093 D3: with `K` hub shards the pool is `K` pools of a `K`-th each, and a client
+/// connection draws on its own shard's (`connection_for`). One shared pool goes to
+/// whichever shard falls behind: its queued publishes hold the credit, the other shard's
+/// publishers find none, and the other shard starves — measured on 2026-11-02, a lagging
+/// shard's queue holding the whole 256 MiB while its partner idled and the pair took 72,000
+/// of 105,500 msg/s. Per shard, a shard behind parks only its own publishers.
 #[derive(Debug)]
 pub struct IngressCredit {
-    pool: Arc<Semaphore>,
+    pools: Vec<Arc<Semaphore>>,
     pool_bytes: usize,
     conn_bytes: usize,
     mode: OverloadMode,
@@ -88,14 +95,37 @@ impl IngressCredit {
     /// pool).
     #[must_use]
     pub fn new(pool_bytes: usize, conn_bytes: usize, mode: OverloadMode) -> Self {
-        let pool_bytes = pool_bytes.clamp(1, Semaphore::MAX_PERMITS);
+        Self::sharded(pool_bytes, conn_bytes, mode, 1)
+    }
+
+    /// As [`new`](Self::new), split into `shards` pools of `pool_bytes / shards` each
+    /// (ADR 0093 D3); a client connection draws on its own shard's. The per-connection
+    /// cap is clamped to one shard's pool.
+    #[must_use]
+    pub fn sharded(
+        pool_bytes: usize,
+        conn_bytes: usize,
+        mode: OverloadMode,
+        shards: usize,
+    ) -> Self {
+        let shards = shards.max(1);
+        let pool_bytes = pool_bytes.clamp(shards, Semaphore::MAX_PERMITS);
+        let each = (pool_bytes / shards).max(1);
         Self {
-            pool: Arc::new(Semaphore::new(pool_bytes)),
-            pool_bytes,
-            conn_bytes: conn_bytes.clamp(1, pool_bytes),
+            pools: (0..shards)
+                .map(|_| Arc::new(Semaphore::new(each)))
+                .collect(),
+            pool_bytes: each * shards,
+            conn_bytes: conn_bytes.clamp(1, each),
             mode,
             peer_shed: AtomicU64::new(0),
         }
+    }
+
+    /// How many shard pools the credit is split into.
+    #[must_use]
+    pub fn shards(&self) -> usize {
+        self.pools.len()
     }
 
     /// The pool size from config: explicit, else 1/8 of the memory watermark, else
@@ -120,27 +150,41 @@ impl IngressCredit {
         self.pool_bytes
     }
 
-    /// Bytes currently held by queued publishes.
+    /// Bytes currently held by queued publishes, every shard's pool together.
     #[must_use]
     pub fn in_use(&self) -> usize {
-        self.pool_bytes
-            .saturating_sub(self.pool.available_permits())
+        let available: usize = self.pools.iter().map(|p| p.available_permits()).sum();
+        self.pool_bytes.saturating_sub(available)
     }
 
-    /// A connection's view: its own cap over the shared pool.
+    /// A connection's view: its own cap over the first shard's pool (the one pool with
+    /// one shard).
     #[must_use]
     pub fn connection(self: &Arc<Self>) -> ConnCredit {
+        self.connection_on(0)
+    }
+
+    /// A client connection's view (ADR 0093 D3): its own cap over the pool of the shard
+    /// that owns `client`.
+    #[must_use]
+    pub fn connection_for(self: &Arc<Self>, client: &str) -> ConnCredit {
+        self.connection_on(crate::hub::shard_of(client, self.pools.len()))
+    }
+
+    fn connection_on(self: &Arc<Self>, shard: usize) -> ConnCredit {
         ConnCredit {
             node: self.clone(),
+            pool: self.pools[shard.min(self.pools.len() - 1)].clone(),
             conn: Arc::new(Semaphore::new(self.conn_bytes)),
         }
     }
 
     /// Take `cost` bytes from the pool alone, now, or nothing (ADR 0082 T4). Peer links
-    /// have no per-link cap: one link carries many publishers' traffic.
+    /// have no per-link cap: one link carries many publishers' traffic. With shards, the
+    /// first shard's pool: peer traffic enters there (ADR 0093 D5).
     #[must_use]
     pub fn try_acquire_pool(&self, cost: u32) -> Option<IngressPermit> {
-        let pool = self.pool.clone().try_acquire_many_owned(cost).ok()?;
+        let pool = self.pools[0].clone().try_acquire_many_owned(cost).ok()?;
         Some(IngressPermit {
             _conn: None,
             _pool: pool,
@@ -190,10 +234,11 @@ impl IngressCredit {
     }
 }
 
-/// One connection's credit: its cap, and the node pool behind it.
+/// One connection's credit: its cap, and the pool behind it (its shard's).
 #[derive(Debug, Clone)]
 pub struct ConnCredit {
     node: Arc<IngressCredit>,
+    pool: Arc<Semaphore>,
     conn: Arc<Semaphore>,
 }
 
@@ -208,7 +253,7 @@ impl ConnCredit {
     #[must_use]
     pub fn try_acquire(&self, cost: u32) -> Option<IngressPermit> {
         let conn = self.conn.clone().try_acquire_many_owned(cost).ok()?;
-        let pool = self.node.pool.clone().try_acquire_many_owned(cost).ok()?;
+        let pool = self.pool.clone().try_acquire_many_owned(cost).ok()?;
         Some(IngressPermit {
             _conn: Some(conn),
             _pool: pool,
@@ -229,7 +274,6 @@ impl ConnCredit {
             .await
             .expect("the per-connection credit is never closed");
         let pool = self
-            .node
             .pool
             .clone()
             .acquire_many_owned(cost)
@@ -295,6 +339,37 @@ mod tests {
         drop(b_held);
         // A message larger than the cap is clamped to it, so it can still proceed.
         assert_eq!(node.cost(10, 1 << 20) as usize, 4 * unit);
+    }
+
+    /// ADR 0093 D3: with two shards, each has its own half of the pool, so one shard's
+    /// publishers holding all of theirs leave the other shard's untouched.
+    #[test]
+    fn a_shard_that_holds_its_whole_pool_leaves_the_other_shards_pool_untouched() {
+        let node = Arc::new(IngressCredit::sharded(4_000, 1_000, OverloadMode::Pause, 2));
+        assert_eq!(node.shards(), 2);
+        assert_eq!(node.pool_bytes(), 4_000);
+        let on = |shard: usize, n: usize| {
+            (0..100_000)
+                .map(|i| format!("c{i}"))
+                .filter(|id| crate::hub::shard_of(id, 2) == shard)
+                .nth(n)
+                .expect("the hash spreads ids over both shards")
+        };
+        // Shard 0's two connections take its whole 2,000.
+        let a = node.connection_for(&on(0, 0));
+        let b = node.connection_for(&on(0, 1));
+        let held = [a.try_acquire(1_000).unwrap(), b.try_acquire(1_000).unwrap()];
+        assert_eq!(node.in_use(), 2_000);
+        assert!(
+            node.connection_for(&on(0, 2)).try_acquire(1).is_none(),
+            "shard 0's pool is full"
+        );
+        let c = node.connection_for(&on(1, 0));
+        assert!(
+            c.try_acquire(1_000).is_some(),
+            "shard 1's publishers draw on their own pool"
+        );
+        drop(held);
     }
 
     #[test]

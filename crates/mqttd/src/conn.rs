@@ -2966,10 +2966,12 @@ where
     // Ingress credit (ADR 0082 T3): this connection's cap over the node pool. A
     // publish that finds none is parked with the socket unread, so the publisher backs
     // up in TCP, while acks, deliveries and shutdown keep flowing below.
+    // ADR 0093 D3: the pool of the shard that owns this client, so a shard behind
+    // parks only its own publishers.
     let credit = policy
         .ingress
         .as_ref()
-        .map(crate::ingress::IngressCredit::connection);
+        .map(|ingress| ingress.connection_for(&client.0));
     let mut parked: Option<Parked> = None;
     // The hub's hand-off time of the oldest `QoS` >= 1 delivery in the writer's buffer,
     // reported when the write that carries it completes (`delivery_flushed_seconds`).
