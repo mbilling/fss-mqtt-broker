@@ -264,6 +264,31 @@ connection: a child token made once when the connection starts, its `cancelled()
 pinned outside the loop, so a poll takes a lock no other connection takes. The knee with it
 is the next measurement, before any amendment to D4.
 
+**The drain fix, measured on h3** (2026-11-02, `h3-20261102T192407Z`, commit `573ea754` in
+the standard build, `MQTTD_HUB_SHARDS=2` as run 8):
+
+| offered | verdict | ack p99 | the loops' busy | µs a message | wake |
+|---|---|---|---|---|---|
+| 105,500 | carried | 1.6 ms | 0.38 and 0.37 | 7.1 | 25 µs |
+| 131,900 | carried | 2.3 ms | 0.48 and 0.48 | 7.3 | 37 µs |
+| 164,900 | carried | 11.3 ms | 0.62 and 0.62 | 7.5 | 37 µs |
+| **206,100** | **carried, the knee** | 303 ms | 0.76 and 0.76 | 7.4 | 75 µs |
+| 209,400–231,900 | offer not taken | 1.5–7.9 s | 0.76–0.79 each | 7.4–7.7 | 60–90 µs |
+| 257,600 | disconnected | 7.9 s | 0.47 each | 8.1 | 95 µs |
+
+The knee is 206,100: run 8 carried 97,700 on the same code without the fix, the prototype
+118,700 and one loop 112,100. The pair now does what D1 set out to buy. Each loop reaches
+one loop's busy ceiling, 0.76–0.79, so the summed busy at the knee is 1.52, twice one
+loop's 0.78; a message still costs 7.4 µs, and 1.52 ÷ 7.4 µs is the knee. Wake lateness
+stays under 100 µs all the way up, where run 8's was 339 µs at its knee, so the wake arms'
+question does not arise on h3. Above the knee the pair refuses the offer and takes
+201,000–205,000 up to 231,900. At 257,600, 25% over, the pending table reaches its count
+bound (171,537 evictions at the cap and 227,284 of answered entries) with the acks
+withheld, and the generator's 10,000 clients disconnect, none of them closed by the
+broker: run 1's mechanism at twice its rate, an ingress pool deeper than the stall budget
+once the queues are that long. That bound is the open overload item (D3's time bound),
+not a limit of the pair. The fan-in runs are the next measurement.
+
 ## Changelog
 
 - **2026-11-02** — ADR 0093 written from the prototype's four runs (ADR 0092 T5, #1163),
@@ -288,3 +313,8 @@ is the next measurement, before any amendment to D4.
   its loop; two loops contend it eight times as hard as one at the same rate, and above
   the knee its futex waits take a third of the CPU. A child token per connection is the
   fix to measure next.
+- **2026-11-02** — The drain fix (a child token per connection, `573ea754`) measured on h3
+  (under Progress): the knee is 206,100, twice run 8's 97,700 on the same code, with each
+  loop at one loop's busy ceiling (1.52 summed). At 25% over the knee the pending bound
+  evicts with the acks withheld and the clients disconnect, as in run 1: the pool as a
+  time bound is the open overload item.
