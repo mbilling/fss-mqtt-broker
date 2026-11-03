@@ -2442,8 +2442,12 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tls_expiry::tests::the_log_warns_past_the_threshold_and_errors_at_expiry_at_a_bounded_rate`
 - `tls_expiry::tests::what_is_loaded_follows_the_listeners_and_the_admin_paths_follow_the_live_config`
 
-## `crates/mqttd/src/main.rs` — 22 test(s)
+## `crates/mqttd/src/main.rs` — 26 test(s)
 
+- `runtime_workers_tests::a_sysfs_cpu_list_names_its_cpus`
+- `runtime_workers_tests::an_explicit_count_wins_as_given`
+- `runtime_workers_tests::physical_cores_are_the_distinct_package_core_pairs_of_the_online_cpus`
+- `runtime_workers_tests::the_physical_cores_are_the_default_clamped_to_the_available_parallelism`
 - `tests::a_non_durable_node_resolves_no_write_floor`
 - `tests::a_reload_proposes_a_changed_replication_factor`
 - `tests::a_restore_retained_write_fails_at_its_deadline_instead_of_hanging`

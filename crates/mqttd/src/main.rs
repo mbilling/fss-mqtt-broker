@@ -240,11 +240,119 @@ impl std::fmt::Debug for StartupError {
     }
 }
 
+fn main() -> Result<(), StartupError> {
+    let runtime = build_runtime().map_err(|e| StartupError(Box::new(e)))?;
+    runtime.block_on(serve())
+}
+
+/// The runtime every task of the broker runs on: what `#[tokio::main]` built, with the
+/// worker count of ADR 0092 Amendment 4 — the physical cores by default, measured on h3
+/// against one worker per vCPU: +9.8% at the knee for 17% less CPU a message, because
+/// thirty-two workers on sixteen cores thrash where sixteen batch.
+fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    builder.worker_threads(runtime_workers().0);
+    builder.build()
+}
+
+/// The runtime's worker count and where it came from (ADR 0092 Amendment 4):
+/// `MQTTD_WORKERS`, else tokio's own `TOKIO_WORKER_THREADS` (the builder reads it only
+/// when no count is set, so it is read here to keep working), else the physical cores,
+/// else the available parallelism. Read from the environment, not the typed config,
+/// because the runtime exists before the config is loaded. An unusable value is reported
+/// on stderr (logging is not up yet) and ignored.
+fn runtime_workers() -> (usize, &'static str) {
+    let explicit = |var: &str, value: Option<String>| -> Option<usize> {
+        let value = value?;
+        match value.trim().parse::<usize>() {
+            Ok(n) if n > 0 => Some(n),
+            _ => {
+                eprintln!("{var}={value:?} is not a positive count of worker threads; ignored");
+                None
+            }
+        }
+    };
+    workers_from(
+        explicit("MQTTD_WORKERS", std::env::var("MQTTD_WORKERS").ok()),
+        explicit(
+            "TOKIO_WORKER_THREADS",
+            std::env::var("TOKIO_WORKER_THREADS").ok(),
+        ),
+        physical_cores(),
+        std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
+    )
+}
+
+/// [`runtime_workers`]'s choice, from its inputs: an explicit count wins as given; the
+/// physical cores are clamped to the available parallelism (a container's CPU quota
+/// counts, its host's cores do not).
+fn workers_from(
+    explicit: Option<usize>,
+    tokio_env: Option<usize>,
+    physical: Option<usize>,
+    available: usize,
+) -> (usize, &'static str) {
+    if let Some(n) = explicit {
+        return (n, "MQTTD_WORKERS");
+    }
+    if let Some(n) = tokio_env {
+        return (n, "TOKIO_WORKER_THREADS");
+    }
+    match physical {
+        Some(cores) => (cores.min(available).max(1), "the physical cores"),
+        None => (available.max(1), "the available parallelism"),
+    }
+}
+
+/// This machine's physical cores on Linux: the distinct (package, core) pairs of the
+/// online CPUs, from sysfs. `None` elsewhere, or when sysfs says nothing.
+fn physical_cores() -> Option<usize> {
+    physical_cores_in(std::path::Path::new("/sys/devices/system/cpu"))
+}
+
+/// [`physical_cores`] under `root`, which has sysfs's `online` list and each CPU's
+/// `topology/{physical_package_id,core_id}`.
+fn physical_cores_in(root: &std::path::Path) -> Option<usize> {
+    let online = std::fs::read_to_string(root.join("online")).ok()?;
+    let mut pairs = std::collections::HashSet::new();
+    for cpu in cpu_list(online.trim()) {
+        let read = |name: &str| -> Option<u32> {
+            std::fs::read_to_string(root.join(format!("cpu{cpu}/topology/{name}")))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        };
+        if let (Some(package), Some(core)) = (read("physical_package_id"), read("core_id")) {
+            pairs.insert((package, core));
+        }
+    }
+    (!pairs.is_empty()).then_some(pairs.len())
+}
+
+/// The CPUs a sysfs list names: `0-3,8,10-11` is 0, 1, 2, 3, 8, 10, 11. Malformed
+/// pieces are skipped.
+fn cpu_list(spec: &str) -> Vec<usize> {
+    spec.split(',')
+        .filter(|piece| !piece.trim().is_empty())
+        .flat_map(|piece| {
+            let piece = piece.trim();
+            match piece.split_once('-') {
+                Some((lo, hi)) => match (lo.parse::<usize>(), hi.parse::<usize>()) {
+                    (Ok(lo), Ok(hi)) if lo <= hi => (lo..=hi).collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                },
+                None => piece.parse::<usize>().ok().into_iter().collect(),
+            }
+        })
+        .collect()
+}
+
 // Startup is a linear wiring sequence; splitting it would only scatter the order it
 // documents.
 #[allow(clippy::too_many_lines)]
-#[tokio::main]
-async fn main() -> Result<(), StartupError> {
+async fn serve() -> Result<(), StartupError> {
     // Validate the entire invocation before even help/version dispatch. A typo,
     // stray value or misplaced option must never start a broker or signal one.
     reject_invalid_cli();
@@ -267,6 +375,13 @@ async fn main() -> Result<(), StartupError> {
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "info".to_string()),
     );
+    {
+        let (workers, why) = runtime_workers();
+        info!(
+            workers,
+            "runtime: {workers} worker threads ({why}; ADR 0092 Amendment 4)"
+        );
+    }
 
     // `--version` / `-V` and `--help` / `-h`: local, print-and-exit, before any subcommand
     // or config work (#169). `--version` in particular MUST exist — an operator typing it
@@ -7159,5 +7274,69 @@ mod tests {
                 "{kind:?} must yield a bounded pause, never an exit"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod runtime_workers_tests {
+    use super::{cpu_list, physical_cores_in, workers_from};
+
+    #[test]
+    fn an_explicit_count_wins_as_given() {
+        assert_eq!(
+            workers_from(Some(3), Some(8), Some(16), 32),
+            (3, "MQTTD_WORKERS")
+        );
+        assert_eq!(
+            workers_from(None, Some(8), Some(16), 32),
+            (8, "TOKIO_WORKER_THREADS")
+        );
+        assert_eq!(
+            workers_from(Some(48), None, Some(16), 32),
+            (48, "MQTTD_WORKERS")
+        );
+    }
+
+    #[test]
+    fn the_physical_cores_are_the_default_clamped_to_the_available_parallelism() {
+        assert_eq!(
+            workers_from(None, None, Some(16), 32),
+            (16, "the physical cores")
+        );
+        assert_eq!(
+            workers_from(None, None, Some(16), 4),
+            (4, "the physical cores")
+        );
+        assert_eq!(
+            workers_from(None, None, None, 32),
+            (32, "the available parallelism")
+        );
+    }
+
+    #[test]
+    fn a_sysfs_cpu_list_names_its_cpus() {
+        assert_eq!(cpu_list("0-3,8,10-11"), vec![0, 1, 2, 3, 8, 10, 11]);
+        assert_eq!(cpu_list("0"), vec![0]);
+        assert_eq!(cpu_list(""), Vec::<usize>::new());
+        assert_eq!(cpu_list("x,2-1,4"), vec![4]);
+    }
+
+    #[test]
+    fn physical_cores_are_the_distinct_package_core_pairs_of_the_online_cpus() {
+        let root = std::env::temp_dir().join(format!("mqttd-sysfs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // Four online CPUs on one package, two cores with a sibling each; CPU 4 is a
+        // third core but offline, so it does not count.
+        std::fs::write(root.join("online"), "0-3\n").unwrap();
+        for (cpu, core) in [(0, 0), (1, 1), (2, 0), (3, 1), (4, 2)] {
+            let dir = root.join(format!("cpu{cpu}/topology"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("physical_package_id"), "0\n").unwrap();
+            std::fs::write(dir.join("core_id"), format!("{core}\n")).unwrap();
+        }
+        assert_eq!(physical_cores_in(&root), Some(2));
+        assert_eq!(physical_cores_in(&root.join("missing")), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
