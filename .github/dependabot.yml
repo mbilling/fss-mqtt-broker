@@ -39,6 +39,13 @@ updates:
       # together with the EMQX/OTP version the rule engine tracks.
       - dependency-name: unicode-segmentation
         versions: [">=1.13"]
+      # k8s-openapi moves with kube, not alone: the operator's kube (4.2.0, the newest)
+      # depends on k8s-openapi 0.28, and a 0.29 bump of ours puts two copies in the
+      # build, the 0.28 one without a version feature ("None of the v1_* features are
+      # enabled" in build, test, lint and the helm chart job; #1186, 2026-11-03). Its
+      # 0.x minors are its majors, so they arrive with kube's own bump, in that PR.
+      - dependency-name: k8s-openapi
+        update-types: ["version-update:semver-minor"]
     open-pull-requests-limit: 5
 
   - package-ecosystem: cargo
