@@ -45,6 +45,15 @@ on the cloud tiers; `NET_PORT=` turns it off): `<unix_ms>.net.json` beside each
 (`ss -ti`), softnet's per-CPU dropped and squeezed counts, per-CPU softirq time, and the
 NICs' packet counters, queue counts and RPS masks. The judge does not read them.
 
+It also samples the broker host's CPUs and disks (`scrape-loop.py --host mqttd`, on the
+cloud tiers; `HOST_PROC=` turns it off): `<unix_ms>.host.json` beside each scrape, with
+/proc/stat's jiffies for the machine and per CPU, the broker process's utime and stime,
+context switches, and every whole disk's I/O counters. The judge does not read them
+either. `host-load.py <run | ladder | step>` prints, per step and for the busiest broker
+host, the broker's CPU cores and CPU µs per message, the machine's busy CPUs with softirq
+and steal, the busiest CPU, and the busiest disk's writes, MB/s, flushes and busy share
+(`--json` the figures): whether a knee is the broker's CPU, the host's, or the disk's.
+
 **Generator hosts are checked before they measure anything.**
 
 - **RPS at bring-up.** Every generator host gets RPS/RFS over all its CPUs, as the brokers
@@ -496,7 +505,10 @@ lossless step is labelled, and the title states it.
 Tests: `python3 bench/scale/rig2/test-verdict.py` (offline; CI runs it; it includes
 `chart-ramp.py --self-test`), `python3 bench/scale/rig2/test-hub-model.py` (offline; CI
 runs it: one broker's figures over a round's window, a step's rounds merged, the ladder's
-ceiling, the markdown) and `python3 bench/scale/rig2/test-run-sh.py` (offline; CI
+ceiling, the markdown), `python3 bench/scale/rig2/test-host-load.py` (offline; CI runs
+it: `scrape-loop.py --host`'s reading of a fake /proc, one broker host's figures over a
+round's window, a restarted broker, rounds merged, the markdown) and
+`python3 bench/scale/rig2/test-run-sh.py` (offline; CI
 runs it): the real `run.sh` at `TIER=local` against fake brokers, for a flaky scrape, the
 wall-clock budget, a broker that never answers, a background counter tick (no hold), a
 drain (held, and named), a settle that runs out on an idle pass (the reason still named),
