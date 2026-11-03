@@ -655,11 +655,27 @@ impl Hub {
             if persistent && qos != QoS::AtMostOnce {
                 // ADR 0089: sent now and held; the subscriber's PUBACK or the fallback
                 // write discharges the publisher's obligation, whichever comes first.
-                if self.may_elide(client, &message, gate) {
-                    return self.elide(client, &tx, &message, message_expiry, retain, gate);
+                // Behind a write in flight on its topic it waits for that write instead
+                // of being written too (Amendment 3).
+                match self.elidable(client, &message, gate) {
+                    super::elision::Elidable::Now => {
+                        return self.elide(client, &tx, &message, message_expiry, retain, gate);
+                    }
+                    super::elision::Elidable::Behind => {
+                        return self.queue_behind(
+                            client,
+                            conn_id,
+                            &message,
+                            message_expiry,
+                            retain,
+                            gate,
+                        );
+                    }
+                    super::elision::Elidable::No => {}
                 }
-                // Written instead: what this session still holds on the topic is
-                // written first, so the store keeps the wire's order (Amendment 1 A5).
+                // Written instead: what this session still holds on the topic, and what
+                // waits behind a write on it, is written first, so the store keeps the
+                // wire's order (Amendment 1 A5, Amendment 3).
                 self.flush_elided_topic(client, &message.topic);
                 return match self.submit_append(
                     client,

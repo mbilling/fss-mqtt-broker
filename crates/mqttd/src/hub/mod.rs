@@ -10147,6 +10147,7 @@ async fn recover_once(
 #[cfg(test)]
 mod tests {
     mod cert_expiry;
+    mod elision_behind;
     mod elision_late_ack;
     mod forward_repeat;
     mod message_events;

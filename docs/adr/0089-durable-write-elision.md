@@ -30,6 +30,10 @@
 > subscriber that keeps missing the window stops being held; the window shrinks only for
 > memory. See [Amendment 1](#amendment-1--the-window-the-head-rule-and-slow-subscribers).
 > On 2026-10-22 the maintainer added A5: the head rule applies per topic.
+>
+> **Amended 2026-11-03** by the maintainer on ADR 0093's h3 runs: a delivery behind a write
+> in flight on its topic waits for that write, unsent, instead of being written too. See
+> [Amendment 3](#amendment-3--a-delivery-behind-a-write-in-flight-waits-for-it-2026-11-03).
 
 ## Context
 
@@ -146,7 +150,10 @@ ADR 0072 (`local`, `relaxed`) keep their behaviour. The `quorum` tier keeps its 
 
 - `mqttd_durable_elided_total`: deliveries discharged without a write;
 - `mqttd_durable_elision_fallback_total{reason}`: `timeout`, `disconnect`, `ownership`,
-  `brownout`, `drain`, `bound`, `head`;
+  `brownout`, `drain`, `bound`, `head`; for a delivery that waited behind a write
+  (Amendment 3) also `behind` and `failed`;
+- `mqttd_durable_elision_behind_total`: deliveries that waited behind a write in flight on
+  their topic instead of being written too (Amendment 3);
 - a histogram of the time a discharged delivery was held (the subscriber's acknowledgement
   latency);
 - the elided share on `/statusz`.
@@ -281,6 +288,49 @@ a full receive quota or the D7 bound. A replay could then deliver the later one 
 What it buys depends on how many publishers share a topic. In the T5 sweep every publisher
 has its own topic, so a (session, topic) pair sees about 0.5 msg/s against 300 msg/s for
 the session. Where many publishers share one topic, the rule stays close to per session.
+
+## Amendment 3 — a delivery behind a write in flight waits for it (2026-11-03)
+
+Decided by the maintainer on the h3 runs of ADR 0093 (its delivery doc, "Sixteen workers
+measured on h3" and "The combined build measured on h3") and the withdrawal of ADR 0075
+Amendment 1.
+
+**What they showed.** A5's first point, that a write in flight blocks a hold on its own
+topic, was built as "written too". On a topic that sees a delivery every 1.7 ms, as a
+session's does at 300,000 msg/s, that is the gain of Amendment 1's bistable path: once one
+delivery is written, the next finds its write in flight and is written, the writer's batch
+deepens, its commit lengthens, and every delivery on every busy topic is written until the
+offer drops. Two rounds of 24 fell in within their first seconds and stayed there to the
+drain, with commits of 35,000–73,000 ops at about 550 ms and acks of 9–11 s. Bounding the
+writer's batch (ADR 0075 Amendment 1) cannot open the loop: no commit is shorter than the
+gap between two deliveries on a busy topic, and a shallower batch clears a backlog slower.
+
+**The rule.** A delivery that is eligible under D2 but for a write in flight on its session,
+connection and topic **waits behind that write**: unsent, unwritten, its obligation
+registered, counted against D7's bound. When the last write in flight on the key lands and
+its delivery goes on the wire, what waited goes after it, in order, each sent and held for
+the window as any hold is, and its publisher is answered by the subscriber's PUBACK or the
+fallback write, as D1 says. Order holds: nothing goes on the wire ahead of the write it
+waited behind, and nothing waiting is in the store, so a replay cannot reorder it.
+
+What waits is written instead, in order, when it cannot wait:
+
+- a later delivery on the topic takes the durable path: what waits is written first, as
+  A5's second point writes what is held (reason `head`), so the store keeps the order;
+- the session detaches: written as offline deliveries, for the replay (reason `disconnect`);
+- brownout or a drain, as for holds (reasons `brownout`, `drain`);
+- at the write's landing the session is no longer eligible (its quota full, the bound
+  reached, backed off, a record in flight): written on its connection, and what waited
+  after it waits again, behind that write (reason `behind`);
+- the write it waited behind failed: it fails with it, as a lane's tail does (ADR 0075),
+  so the publishers retry in their order (reason `failed`).
+
+**What it changes.** Under load a busy topic sees one write per spell of ineligibility, not
+one per delivery, and the writer idles again as soon as the subscriber acknowledges: write
+mode ends by itself. A delivery waits at most one write's flight before its window starts,
+which is what the written delivery itself waited, unless its session has become ineligible
+meanwhile. `mqttd_durable_elision_behind_total` counts what waited; `/statusz`'s
+`write_elision` block reports it as `behind`.
 
 ## Open questions
 

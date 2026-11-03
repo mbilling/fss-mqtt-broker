@@ -1028,13 +1028,22 @@ impl Hub {
         if let Some(lane) = self.append_lanes.get_mut(&job.client) {
             lane.outstanding = lane.outstanding.saturating_sub(1);
         }
-        if job.topic_counted {
-            self.write_landed(&job);
-        }
+        // The last write in flight on its topic, with deliveries waiting behind it (ADR
+        // 0089 Amendment 3): they go once this one's live send is done, at the end.
+        let landed = if job.topic_counted {
+            self.write_landed(&job)
+        } else {
+            None
+        };
+        let failed = matches!(outcome, LaneOutcome::Failed);
         // The second lane stage — ADR 0057's outbound-id record (issue #242
         // finding A) — has its own completion contract: the post-record wire send.
         if let LaneWork::RecordOutbound { pkid, offset } = job.work {
-            return self.outbound_record_done(job, pkid, offset, outcome);
+            self.outbound_record_done(job, pkid, offset, outcome);
+            if let Some(key) = landed {
+                self.release_behind(key, failed);
+            }
+            return;
         }
         let offset = match outcome {
             LaneOutcome::Stored(o) => {
@@ -1185,6 +1194,9 @@ impl Hub {
                 self.settle_shard(id, out, false);
             }
             AppendThen::Ungated => {}
+        }
+        if let Some(key) = landed {
+            self.release_behind(key, failed);
         }
     }
 
