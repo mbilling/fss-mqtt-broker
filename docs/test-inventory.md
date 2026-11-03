@@ -1542,7 +1542,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 915 test(s)
+## `crates/mqttd/src/lib.rs` — 919 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -2025,6 +2025,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::commands_sort_into_the_control_and_data_lanes`
 - `hub::tests::durable_failure_reasons_are_bounded`
 - `hub::tests::durable_off_keeps_the_adr_0014_behaviour_with_no_retained_commit`
+- `hub::tests::elision_behind::a_delivery_behind_a_write_in_flight_on_its_topic_waits_for_it_and_is_then_held`
+- `hub::tests::elision_behind::what_waits_behind_a_write_is_written_at_the_landing_when_its_session_cannot_take_it`
+- `hub::tests::elision_behind::what_waits_behind_a_write_is_written_before_a_later_durable_delivery_on_its_topic`
+- `hub::tests::elision_behind::what_waits_behind_a_write_is_written_for_the_replay_when_its_session_detaches`
 - `hub::tests::elision_costs_nothing_when_the_subscriber_is_offline`
 - `hub::tests::elision_is_faster_than_writing_first_when_the_subscriber_keeps_up`
 - `hub::tests::elision_late_ack::late_pubacks_into_a_shared_group_lose_nothing_a_publisher_was_acked_for`

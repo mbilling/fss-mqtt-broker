@@ -332,24 +332,36 @@ async fn a_delivery_stays_eligible_for_elision_through_the_periodic_scan() {
     };
     let gate = super::super::AppendGate::Pending(1);
     assert!(
-        hub.may_elide(&client, &message, &gate),
+        matches!(
+            hub.elidable(&client, &message, &gate),
+            super::super::elision::Elidable::Now
+        ),
         "eligible with no scan"
     );
 
     hub.spawn_inherited_session_scan(false);
     assert!(
-        hub.may_elide(&client, &message, &gate),
+        matches!(
+            hub.elidable(&client, &message, &gate),
+            super::super::elision::Elidable::Now
+        ),
         "the periodic scan leaves the delivery eligible"
     );
     hub.inherit_sessions(Vec::new(), true);
 
     hub.spawn_inherited_session_scan(true);
     assert!(
-        !hub.may_elide(&client, &message, &gate),
+        !matches!(
+            hub.elidable(&client, &message, &gate),
+            super::super::elision::Elidable::Now
+        ),
         "a takeover's scan writes the delivery"
     );
     hub.inherit_sessions(Vec::new(), true);
-    assert!(hub.may_elide(&client, &message, &gate));
+    assert!(matches!(
+        hub.elidable(&client, &message, &gate),
+        super::super::elision::Elidable::Now
+    ));
 }
 
 /// ADR 0093 Amendment 2: shard `k` of `K` runs its periodic scan at `k × EVERY / K` of

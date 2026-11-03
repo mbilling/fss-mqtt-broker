@@ -1709,19 +1709,25 @@ not its mean.
   half the window.
 - At the bound, new deliveries are written.
 - Under brownout or a drain, everything held is written at once.
+- A delivery whose topic has a write in flight for the same session waits behind it,
+  unsent, and is sent and held when that write lands (ADR 0089 Amendment 3). It is
+  written instead when a later delivery on the topic takes the durable path, when its
+  session detaches, under brownout or a drain, or when its session is no longer eligible
+  at the landing.
 
 **What to watch:**
 
 | signal | reading |
 |---|---|
 | `mqttd_durable_elided_total` | deliveries the subscriber acknowledged inside the window, never written |
-| `mqttd_durable_elision_fallback_total{reason}` | held deliveries written after all: `timeout` (the window ended), `disconnect`, `brownout`, `drain`, `head` (written before a later durable delivery on the same topic) |
+| `mqttd_durable_elision_fallback_total{reason}` | held deliveries written after all: `timeout` (the window ended), `disconnect`, `brownout`, `drain`, `head` (written before a later durable delivery on the same topic); and deliveries that waited behind a write and were written after all: `head`, `disconnect`, `brownout`, `drain` as above, `behind` (the session was no longer eligible when the write landed), `failed` (the write they waited behind failed; the publisher retries) |
 | `mqttd_durable_elision_hold_seconds` | how long a discharged delivery was held: the subscribers' acknowledgement latency, censored at the window |
 | `mqttd_durable_elision_backoff_total` | sessions backed off for missing the window |
+| `mqttd_durable_elision_behind_total` | deliveries that waited, unsent, behind a write in flight on their topic instead of being written too (Amendment 3) |
 | `mqttd_delivery_outbound_wait_seconds` | how long a QoS 1 or 2 delivery waited in its subscriber's outbound queue before the connection took it for the socket |
 | `mqttd_delivery_flushed_seconds` | how long from the hub's hand-off of a QoS 1 or 2 delivery until the socket write carrying it completed (one sample per write, its oldest delivery): the broker's whole part of the hold on the way out. A hold far above it and `puback_hub_wait` is spent on the wire or in the subscriber |
 | `mqttd_puback_hub_wait_seconds` | how long a subscriber's PUBACK waited between its connection reading it and the hub acting on it: the broker's part of the hold on the way back |
-| `/statusz` → `write_elision` | `window_ms`, `elided`, `written`, `discharged_x100` (the share of held deliveries discharged, ×100), `backoffs` |
+| `/statusz` → `write_elision` | `window_ms`, `elided`, `written`, `discharged_x100` (the share of held deliveries discharged, ×100), `backoffs`, `behind` |
 
 **If most deliveries are still written:**
 - **Mostly `timeout` fallbacks:** the window is shorter than the subscribers' tail. Look at

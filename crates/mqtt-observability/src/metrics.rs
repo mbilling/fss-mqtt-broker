@@ -101,6 +101,8 @@ pub struct ElisionSnapshot {
     pub written: u64,
     /// Sessions backed off for missing the window (Amendment 1 A3).
     pub backoffs: u64,
+    /// Deliveries that waited behind a write in flight on their topic (Amendment 3).
+    pub behind: u64,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -446,6 +448,7 @@ struct OtelInstruments {
     delivery_flushed: OtelHistogram<f64>,
     puback_hub_wait: OtelHistogram<f64>,
     durable_elision_backoffs: OtelCounter<u64>,
+    durable_elision_behind: OtelCounter<u64>,
     durable_recovery_failures: OtelCounter<u64>,
     lease_quorum_ack_ms: OtelGauge<i64>,
     gossip_rejected: OtelCounter<u64>,
@@ -620,6 +623,7 @@ impl OtelInstruments {
             delivery_flushed: meter.f64_histogram("delivery_flushed_seconds").build(),
             puback_hub_wait: meter.f64_histogram("puback_hub_wait_seconds").build(),
             durable_elision_backoffs: meter.u64_counter("durable_elision_backoff").build(),
+            durable_elision_behind: meter.u64_counter("durable_elision_behind").build(),
             durable_recovery_failures: meter.u64_counter("durable_recovery_failures").build(),
             lease_quorum_ack_ms: meter.i64_gauge("lease_quorum_ack_ms").build(),
             gossip_rejected: meter.u64_counter("gossip_rejected").build(),
@@ -811,6 +815,7 @@ pub struct Metrics {
     durable_elision_fallback_total: Family<ReasonLabel, Counter>,
     durable_elision_hold_seconds: Histogram,
     durable_elision_backoff_total: Counter,
+    durable_elision_behind_total: Counter,
     delivery_outbound_wait_seconds: Histogram,
     delivery_flushed_seconds: Histogram,
     puback_hub_wait_seconds: Histogram,
@@ -1504,6 +1509,13 @@ impl Metrics {
             "Sessions that kept missing the write-elision window and were written directly \
              for a while instead of held (ADR 0089 Amendment 1 A3)",
         );
+        let durable_elision_behind_total = register_counter(
+            &mut registry,
+            "durable_elision_behind",
+            "Durable QoS 1 deliveries that waited, unsent and unwritten, behind a write in \
+             flight on their topic until it landed, instead of being written too (ADR 0089 \
+             Amendment 3)",
+        );
         let durable_recovery_failures_total = register_family(
             &mut registry,
             "durable_recovery_failures",
@@ -2100,6 +2112,7 @@ impl Metrics {
             durable_elision_fallback_total,
             durable_elision_hold_seconds,
             durable_elision_backoff_total,
+            durable_elision_behind_total,
             delivery_outbound_wait_seconds,
             delivery_flushed_seconds,
             puback_hub_wait_seconds,
@@ -2922,8 +2935,9 @@ impl Metrics {
         self.otel.puback_hub_wait.record(seconds, &[]);
     }
 
-    /// A held delivery fell back to a durable write; `reason` is a bounded class
-    /// (`"timeout"`, `"disconnect"`, `"brownout"`, `"drain"`).
+    /// A held delivery fell back to a durable write, or one that waited behind a write
+    /// was written after all; `reason` is a bounded class (`"timeout"`, `"disconnect"`,
+    /// `"brownout"`, `"drain"`, `"head"`, `"behind"`, `"failed"`).
     pub fn durable_elision_fallback(&self, reason: &str) {
         self.durable_elision_fallback_total
             .get_or_create(&ReasonLabel {
@@ -2937,24 +2951,41 @@ impl Metrics {
 
     /// Write elision's totals for `/statusz` (ADR 0089 D9): held deliveries the
     /// subscriber acknowledged (never written), held deliveries written after all
-    /// (every reason), and sessions backed off for missing the window.
+    /// (every reason), sessions backed off for missing the window, and deliveries that
+    /// waited behind a write in flight on their topic (Amendment 3).
     #[must_use]
     pub fn elision_snapshot(&self) -> ElisionSnapshot {
-        let written = ["timeout", "disconnect", "brownout", "drain", "head"]
-            .iter()
-            .map(|r| {
-                self.durable_elision_fallback_total
-                    .get_or_create(&ReasonLabel {
-                        reason: (*r).to_string(),
-                    })
-                    .get()
-            })
-            .sum();
+        let written = [
+            "timeout",
+            "disconnect",
+            "brownout",
+            "drain",
+            "head",
+            "behind",
+            "failed",
+        ]
+        .iter()
+        .map(|r| {
+            self.durable_elision_fallback_total
+                .get_or_create(&ReasonLabel {
+                    reason: (*r).to_string(),
+                })
+                .get()
+        })
+        .sum();
         ElisionSnapshot {
             elided: self.durable_elided_total.get(),
             written,
             backoffs: self.durable_elision_backoff_total.get(),
+            behind: self.durable_elision_behind_total.get(),
         }
+    }
+
+    /// A delivery waited behind a write in flight on its topic instead of being written
+    /// too (ADR 0089 Amendment 3).
+    pub fn durable_elision_behind(&self) {
+        self.durable_elision_behind_total.inc();
+        self.otel.durable_elision_behind.add(1, &[]);
     }
 
     /// A session kept missing the write-elision window and is written directly for a

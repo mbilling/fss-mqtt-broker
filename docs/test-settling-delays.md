@@ -48,6 +48,7 @@ caller changes this file and the gate fails until it is regenerated and re-read.
 | `crates/mqttd/src/hub/mod.rs` | `enqueue_with_expiry` | `store-slow-first-enqueue` | ? | helper, 8 call site(s) |
 | `crates/mqttd/src/hub/mod.rs` | `an_uncongested_relaxed_forward_is_answered_at_submit` | `early-verdict-uniqueness` | 100ms | in the test itself |
 | `crates/mqttd/src/hub/mod.rs` | `the_durability_property_is_inert_without_the_operator_opt_in` | `inert-property-negative-window` | 300ms | in the test itself |
+| `crates/mqttd/src/hub/tests/elision_behind.rs` | `a_write_in_flight_on_t` | `elision-behind-record` | 30ms | helper, 3 call site(s) |
 | `crates/mqttd/src/hub/tests/elision_late_ack.rs` | `pub_ack_after` | `elision-late-puback` | ? | helper, 1 call site(s) |
 | `crates/mqttd/src/hub/tests/elision_late_ack.rs` | `late_pubacks_into_a_shared_group_lose_nothing_a_publisher_was_acked_for` | `elision-late-ack-pacing` | 1ms | in the test itself |
 | `crates/mqttd/src/peer.rs` | `wait_ns` | `peer-write-wait-hold` | ? | helper, 2 call site(s) |

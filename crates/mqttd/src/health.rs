@@ -708,8 +708,8 @@ impl HealthState {
             let _ = write!(
                 s,
                 ",\"write_elision\":{{\"window_ms\":{},\"elided\":{},\"written\":{},\
-                 \"discharged_x100\":{discharged_x100},\"backoffs\":{}}}",
-                self.write_elision_ms, e.elided, e.written, e.backoffs
+                 \"discharged_x100\":{discharged_x100},\"backoffs\":{},\"behind\":{}}}",
+                self.write_elision_ms, e.elided, e.written, e.backoffs, e.behind
             );
         }
         // The hub loop's placement (ADR 0092 D1): an OS thread of its own or a task of
@@ -1423,6 +1423,8 @@ mod tests {
         }
         metrics.durable_elision_fallback("timeout");
         metrics.durable_elision_backoff();
+        metrics.durable_elision_behind();
+        metrics.durable_elision_behind();
 
         let off = status(
             HealthState::new(spawn_live_hub(), Some(placement(1)), None, 1)
@@ -1440,7 +1442,7 @@ mod tests {
         assert!(
             body.contains(
                 "\"write_elision\":{\"window_ms\":50,\"elided\":3,\"written\":1,\
-                 \"discharged_x100\":7500,\"backoffs\":1}"
+                 \"discharged_x100\":7500,\"backoffs\":1,\"behind\":2}"
             ),
             "{body}"
         );
