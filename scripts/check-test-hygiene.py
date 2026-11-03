@@ -392,7 +392,12 @@ WAIT = re.compile(
     r"|\brecv_timeout\s*\("
     r"|\brecv_deadline\s*\("
     r"|\.\s*tick\s*\(\s*\)"
-    r"|\btimeout\s*\([^;]{0,200}?\bpending\s*(?:::<[^>]*>)?\s*\("
+    # `pending` here is the free function (`pending()`, `std::future::pending::<T>()`), never a
+    # method: `[^;]` reaches past the `timeout(...)` call into a `matches!` arm that has no `;`
+    # in it, and a `store.pending(` in the NEXT function then read as this wait (the hub's
+    # elision_behind.rs, 2026-11-03). A `.` or an identifier character before the word rules
+    # it out; `::pending` and `(pending` still count.
+    r"|\btimeout\s*\([^;]{0,200}?(?<![.\w])pending\s*(?:::<[^>]*>)?\s*\("
 )
 # `use tokio::time::sleep as pause;` renames the wait, and `pause(d).await` then carries no
 # `sleep` token at all — a proven, working bypass of the whole of check A (issue #260 round 2,

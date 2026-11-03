@@ -271,6 +271,40 @@ next, on the same worker — and a shard that hands a message to another shard's
 pays a remote wake unless the two share a worker. The prototype measures that on the h3
 shape and on the fan-in shape both.
 
+## Amendment 4 (2026-11-03): the runtime's workers default to the physical cores
+
+Decided by the maintainer on the h3 run `h3-20261103T103426Z` (ADR 0093's delivery doc,
+"Sixteen workers measured on h3"). The runtime had tokio's default, one worker per vCPU:
+32 on the m6i.8xlarge, whose 32 vCPUs are 16 cores with two hardware threads each. The
+same binary, four shards, with `TOKIO_WORKER_THREADS=16`: the knee 327,100 against
+297,900 (+9.8%, 10,222 msg/s a vCPU), and at 322,000, which 32 workers refused, the loops
+cost 8.6 µs a message against 9.3, the broker 36.7 µs of CPU a message against 49.0 (11.8
+cores against 14.7), the host switched context 161,000 times a second against 224,500,
+and a yielded loop was back on a worker in 79 µs against 112. Below the knee the tail is
+fatter (45 ms against 25 at 257,600), where a yield waits longer and nothing else is
+saturated.
+
+The reading: the broker has no compute-bound stream to pair with a memory-bound one on a
+core's second thread — the hub loops, the connection tasks and the kernel's network path
+are all memory-latency-bound — so a second worker on a core's sibling mostly shares its
+L1/L2 and its issue slots with the first, and thirty-two workers on sixteen cores thrash
+where sixteen batch. The second thread is best left to softirq and bursts. The scheduler
+still spread the 16 workers over both siblings (at the knee 12.3 vCPUs were busy, both
+siblings of a core active for 0.4–2.8 core-equivalents of the time), so the
+one-thread-a-core case (`CPUAffinity=0-15` on the unit) is unmeasured and may add a
+little.
+
+The decision: the runtime's workers default to the machine's physical cores — on Linux
+the distinct (package, core) pairs of the online CPUs in sysfs, clamped to the available
+parallelism so a container's CPU quota still counts; elsewhere the available parallelism,
+as before. `MQTTD_WORKERS` sets the count explicitly, `TOKIO_WORKER_THREADS` keeps
+working (the broker reads it now, since tokio reads it only when no count is set), and
+the choice is logged at startup. The published numbers' rule (DURABLE-PATH.md: real
+hosts run the shipped default) is unchanged in words and changed in substance: the
+shipped default is now the physical cores. Not decided: anything for a machine without
+SMT (there the physical cores are the vCPUs, and the default is the old one), and the
+affinity case.
+
 ## Consequences
 
 - **The hub stays where it was.** No core is reserved; `/statusz` and the gauge say so

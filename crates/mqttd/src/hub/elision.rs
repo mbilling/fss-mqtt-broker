@@ -6,12 +6,14 @@
 //! the window falls back to. A node that dies inside a window has acknowledged nobody
 //! for that delivery, so the publisher resends it; nothing acknowledged is lost.
 //!
-//! **Order (D5, Amendment 1 A2).** A held delivery has no offset. A session's held
-//! deliveries therefore fall back TOGETHER and in send order, and while one is held every
-//! later delivery is written, so nothing written can overtake a delivery still held. A
-//! session with a write still in flight is not eligible either: that delivery goes on the
-//! wire after its write, and a held one would overtake it. One already written and sent,
-//! still unacknowledged, does not block: it is ahead on the wire and in the store.
+//! **Order (D5, Amendment 1 A2 and A5, Amendment 3).** A held delivery has no offset. A
+//! session's held deliveries therefore fall back TOGETHER and in send order, and while one
+//! is held every later delivery is written, so nothing written can overtake a delivery
+//! still held. A write still in flight on the delivery's topic goes on the wire first: the
+//! delivery waits behind it, unsent and unwritten, and is sent and held once the write has
+//! landed (Amendment 3; written too, it was the gain of the bistable path). One already
+//! written and sent, still unacknowledged, does not block: it is ahead on the wire and in
+//! the store.
 //!
 //! `durable.write_elision_ms = 0` (the default) builds none of this state, and every
 //! delivery takes the path it took before.
@@ -33,7 +35,7 @@ pub(super) const BACKOFF: Duration = Duration::from_secs(2);
 
 /// The window a new hold gets: the configured one, halved once the node holds more than
 /// three quarters of the D7 bound in entries or bytes (Amendment 1 A4). At the bound
-/// itself `may_elide` stops new holds.
+/// itself `elidable` stops new holds.
 pub(super) fn window_in_force(window: Duration, entries: usize, bytes: usize) -> Duration {
     if entries > MAX_ELIDED / 4 * 3 || bytes > MAX_ELIDED_BYTES / 4 * 3 {
         window / 2
@@ -63,6 +65,28 @@ pub(super) struct Elided {
     pub(super) sent: Instant,
 }
 
+/// One delivery waiting behind a write in flight on its session, connection and topic
+/// (Amendment 3): eligible but for that write, unsent and unwritten, its obligation
+/// registered. Sent and held when the write lands; written when it cannot wait.
+#[derive(Debug)]
+pub(super) struct Behind {
+    pub(super) message: Message,
+    pub(super) message_expiry: Option<u32>,
+    pub(super) retain: bool,
+    pub(super) gate: AppendGate,
+}
+
+/// What [`Hub::elidable`] found for a delivery (D2, Amendment 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Elidable {
+    /// Sent now and held.
+    Now,
+    /// Eligible but for a write in flight on its topic: waits behind it (Amendment 3).
+    Behind,
+    /// Written, as before ADR 0089.
+    No,
+}
+
 /// The node's held deliveries.
 #[derive(Debug, Default)]
 pub(super) struct ElisionState {
@@ -85,6 +109,9 @@ pub(super) struct ElisionState {
     /// Writes in flight whose live send waits for them, per session, connection and
     /// topic (Amendment 1 A5): a hold may not overtake one on its own topic.
     pub(super) writing: FastMap<(ClientId, u64, String), usize>,
+    /// Deliveries waiting behind the writes in flight on their key (Amendment 3), in
+    /// arrival order; counted in `entries` and `bytes` like holds.
+    pub(super) behind: FastMap<(ClientId, u64, String), VecDeque<Behind>>,
     /// Emptied per-session queues kept for the next session that holds a delivery
     /// (ADR 0092 T3): a session's queue empties on nearly every PUBACK, and building
     /// it again on the next hold was one allocation per publish. Bounded by
@@ -121,13 +148,14 @@ impl Hub {
     }
 
     /// Whether a delivery to online persistent session `client` may be held instead of
-    /// written first (ADR 0089 D2).
-    pub(super) fn may_elide(
+    /// written first (ADR 0089 D2), or must wait behind a write in flight on its topic
+    /// first (Amendment 3).
+    pub(super) fn elidable(
         &self,
         client: &ClientId,
         message: &Message,
         gate: &AppendGate,
-    ) -> bool {
+    ) -> Elidable {
         if self.elision.window.is_none()
             || message.qos != QoS::AtLeastOnce
             || self.brownout
@@ -137,7 +165,7 @@ impl Hub {
             // elision on (Amendment 2, see `takeover_window_open`).
             || self.takeover_window_open()
         {
-            return false;
+            return Elidable::No;
         }
         // A subscriber that keeps missing the window is written directly for a while,
         // so its publishers pay the write, not the window on top (Amendment 1 A3).
@@ -148,7 +176,7 @@ impl Hub {
             .and_then(|b| b.until)
             .is_some_and(|until| Instant::now() < until)
         {
-            return false;
+            return Elidable::No;
         }
         // Only a delivery somebody is waiting on: a local publish, or a peer's first
         // forward. A re-delivery or re-route (#784) may find the session already holds
@@ -159,25 +187,24 @@ impl Hub {
                 | AppendGate::Peer { replay: false, .. }
                 | AppendGate::Shard { .. }
         ) {
-            return false;
+            return Elidable::No;
         }
         // A write in flight on this topic: its delivery goes on the wire after the
-        // write, and a held one would overtake it. Other topics' writes do not block:
-        // MQTT orders a topic, not a session (Amendment 1 A5).
+        // write, and a held one would overtake it, so this one waits behind it
+        // (Amendment 3). Other topics' writes do not block: MQTT orders a topic, not a
+        // session (Amendment 1 A5).
         // The key is built only while some write is in flight at all: with the window
         // discharging nearly every delivery, `writing` is empty most of the time, and
         // building the key was a topic `String` and a tuple hash per delivery for an
         // answer the emptiness already gave (ADR 0092 T3).
-        if !self.elision.writing.is_empty() {
-            let conn = self.online.get(client).map(|o| o.conn_id);
-            if conn.is_some_and(|c| {
-                self.elision
-                    .writing
-                    .contains_key(&(client.clone(), c, message.topic.clone()))
-            }) {
-                return false;
-            }
-        }
+        let behind = !self.elision.writing.is_empty()
+            && self.online.get(client).is_some_and(|o| {
+                self.elision.writing.contains_key(&(
+                    client.clone(),
+                    o.conn_id,
+                    message.topic.clone(),
+                ))
+            });
         if let Some(inf) = self.inflight.get(client) {
             // A packet id and a send slot free now: a delivery that would wait in the
             // backlog or for a packet-id block is written as before. (A session's first
@@ -185,24 +212,33 @@ impl Hub {
             // from the next one.) A delivery already written and on the wire, still
             // unacknowledged, does not block (Amendment 1 A2): it is ahead of this one
             // on the wire and in the store, so a replay keeps the order. Only a write
-            // still in flight does (the lane check above): its delivery is sent after
-            // the write, and a held one would overtake it.
+            // still in flight makes it wait (the check above): its delivery is sent
+            // after the write, and a held one would overtake it.
             if inf.quota_full()
                 || !inf.backlog.is_empty()
                 || inf.records_pending > 0
                 || (inf.block_remaining == 0 && inf.banked_base.is_none())
             {
-                return false;
+                return Elidable::No;
             }
         } else {
-            return false;
+            return Elidable::No;
         }
-        self.elision.entries < MAX_ELIDED
+        if self.elision.entries < MAX_ELIDED
             && self.elision.bytes + message.payload.len() <= MAX_ELIDED_BYTES
+        {
+            if behind {
+                Elidable::Behind
+            } else {
+                Elidable::Now
+            }
+        } else {
+            Elidable::No
+        }
     }
 
     /// Send `message` to `client` now and hold its obligation for the window. The
-    /// caller has checked [`may_elide`](Self::may_elide).
+    /// caller has checked [`elidable`](Self::elidable).
     pub(super) fn elide(
         &mut self,
         client: &ClientId,
@@ -212,8 +248,22 @@ impl Hub {
         retain: bool,
         gate: &AppendGate,
     ) -> DurableOutcome {
-        let window = self.elision.window.expect("may_elide checked the window");
         self.register_obligation(&gate.then());
+        self.elide_registered(client, tx, message, message_expiry, retain, gate)
+    }
+
+    /// [`elide`](Self::elide) for a delivery whose obligation is registered already: one
+    /// that waited behind a write (Amendment 3).
+    fn elide_registered(
+        &mut self,
+        client: &ClientId,
+        tx: &Outbound,
+        message: &Message,
+        message_expiry: Option<u32>,
+        retain: bool,
+        gate: &AppendGate,
+    ) -> DurableOutcome {
+        let window = self.elision.window.expect("elidable checked the window");
         let before = self.inflight.get(client).map(|i| i.next_pkid);
         let _ = self.send_qos_publish(client, tx, message, retain, message_expiry, None);
         let pkid = self.inflight.get(client).and_then(|inf| {
@@ -302,9 +352,14 @@ impl Hub {
 
     /// A delivery on `topic` takes the durable path: what `client` holds on that topic is
     /// written first, in send order, so its appends sit ahead in the lane and the store
-    /// keeps the wire's order (Amendment 1 A5; fallback reason `head`). Held deliveries
-    /// on other topics stay held.
+    /// keeps the wire's order (Amendment 1 A5; fallback reason `head`), and so is what
+    /// waits behind a write on it (Amendment 3). Held deliveries on other topics stay held.
     pub(super) fn flush_elided_topic(&mut self, client: &ClientId, topic: &str) {
+        self.flush_held_topic(client, topic);
+        self.flush_behind_topic(client, topic);
+    }
+
+    fn flush_held_topic(&mut self, client: &ClientId, topic: &str) {
         let Some(queue) = self.elision.by_client.get_mut(client) else {
             return;
         };
@@ -337,27 +392,204 @@ impl Hub {
         }
     }
 
-    /// A counted write landed (Amendment 1 A5).
-    pub(super) fn write_landed(&mut self, job: &AppendJob) {
+    /// What `client` has waiting behind a write on `topic` is written now, in order
+    /// (Amendment 3, reason `head`): the delivery about to be written would otherwise
+    /// land, and go on the wire, ahead of it.
+    fn flush_behind_topic(&mut self, client: &ClientId, topic: &str) {
+        if self.elision.behind.is_empty() {
+            return;
+        }
+        let Some(conn) = self.online.get(client).map(|o| o.conn_id) else {
+            return;
+        };
+        let Some(queue) = self
+            .elision
+            .behind
+            .remove(&(client.clone(), conn, topic.to_string()))
+        else {
+            return;
+        };
+        for b in queue {
+            self.elision.entries -= 1;
+            self.elision.bytes -= b.message.payload.len();
+            self.write_behind(client, Some(conn), &b, "head");
+        }
+    }
+
+    /// `message` is eligible but for a write in flight on its topic (Amendment 3): it
+    /// waits behind that write on `client`'s connection `conn`, unsent and unwritten,
+    /// with its obligation registered, until [`release_behind`](Self::release_behind)
+    /// sends it or a flush writes it.
+    pub(super) fn queue_behind(
+        &mut self,
+        client: &ClientId,
+        conn: u64,
+        message: &Message,
+        message_expiry: Option<u32>,
+        retain: bool,
+        gate: &AppendGate,
+    ) -> DurableOutcome {
+        self.register_obligation(&gate.then());
+        self.elision.entries += 1;
+        self.elision.bytes += message.payload.len();
+        if let Some(m) = &self.metrics {
+            m.durable_elision_behind();
+        }
+        self.elision
+            .behind
+            .entry((client.clone(), conn, message.topic.clone()))
+            .or_default()
+            .push_back(Behind {
+                message: message.clone(),
+                message_expiry,
+                retain,
+                gate: gate.clone(),
+            });
+        DurableOutcome::Ok
+    }
+
+    /// A counted write landed (Amendment 1 A5). Returns its key when it was the last
+    /// write in flight on it and something waits behind: the caller releases that once
+    /// the landed delivery is on the wire ([`release_behind`](Self::release_behind)).
+    pub(super) fn write_landed(&mut self, job: &AppendJob) -> Option<(ClientId, u64, String)> {
         let key = (
             job.client.clone(),
             job.planned_conn.unwrap_or_default(),
             job.message.topic.clone(),
         );
-        if let Some(n) = self.elision.writing.get_mut(&key) {
-            *n -= 1;
-            if *n == 0 {
-                self.elision.writing.remove(&key);
+        let n = self.elision.writing.get_mut(&key)?;
+        *n -= 1;
+        if *n > 0 {
+            return None;
+        }
+        self.elision.writing.remove(&key);
+        self.elision.behind.contains_key(&key).then_some(key)
+    }
+
+    /// The last write in flight on `key` landed and its delivery is on the wire, or it
+    /// `failed`: what waited behind it goes now, in order (Amendment 3). Each is sent and
+    /// held while its session is still eligible; one that is not is written instead, and
+    /// what waited after it waits again, behind that write. After a failed write they
+    /// fail with it, as a lane's tail does (ADR 0075), so the publishers retry in their
+    /// order.
+    pub(super) fn release_behind(&mut self, key: (ClientId, u64, String), failed: bool) {
+        let Some(mut queue) = self.elision.behind.remove(&key) else {
+            return;
+        };
+        let (client, conn, _) = &key;
+        while let Some(b) = queue.pop_front() {
+            self.elision.entries -= 1;
+            self.elision.bytes -= b.message.payload.len();
+            if failed {
+                self.elision.fallbacks += 1;
+                if let Some(m) = &self.metrics {
+                    m.durable_elision_fallback("failed");
+                }
+                self.settle_failed(&b.gate.then());
+                continue;
             }
+            let tx = self
+                .online
+                .get(client)
+                .filter(|o| o.conn_id == *conn)
+                .map(|o| o.tx.clone());
+            let Some(tx) = tx else {
+                // The connection it was to go out on is gone: written as an offline
+                // delivery, for the replay.
+                self.write_behind(client, None, &b, "disconnect");
+                continue;
+            };
+            if self.elidable(client, &b.message, &b.gate) == Elidable::Now {
+                let _ = self.elide_registered(
+                    client,
+                    &tx,
+                    &b.message,
+                    b.message_expiry,
+                    b.retain,
+                    &b.gate,
+                );
+                continue;
+            }
+            self.write_behind(client, Some(*conn), &b, "behind");
+            if !queue.is_empty() {
+                self.elision.behind.insert(key, queue);
+            }
+            return;
         }
     }
 
-    /// Connection `conn_id` of `client` detached: its writes in flight no longer gate
-    /// a hold. A later connection counts its own.
+    /// `b` waited behind a write and is written after all: a plain append whose live
+    /// send waits for it on `planned_conn`, or an offline delivery (`None`). `reason` is
+    /// the fallback class it is counted under. The append's own obligation replaces the
+    /// one registered for the wait, or that one ends Failed when the append is refused.
+    fn write_behind(
+        &mut self,
+        client: &ClientId,
+        planned_conn: Option<u64>,
+        b: &Behind,
+        reason: &'static str,
+    ) {
+        self.elision.fallbacks += 1;
+        if let Some(m) = &self.metrics {
+            m.durable_elision_fallback(reason);
+        }
+        let then = b.gate.then();
+        let submitted = if self.brownout {
+            Submitted::Refused(PublishRefusal::Brownout)
+        } else {
+            self.submit_append(client, &b.message, b.message_expiry, &b.gate, planned_conn)
+        };
+        match submitted {
+            Submitted::Queued => self.release_registration(&then),
+            Submitted::Refused(_) | Submitted::Full => self.settle_failed(&then),
+        }
+    }
+
+    /// Connection `conn_id` of `client` detached: its writes in flight no longer gate a
+    /// hold, and what waited behind them is written as offline deliveries, for the
+    /// replay (Amendment 3). A later connection counts its own.
     pub(super) fn forget_writing(&mut self, client: &ClientId, conn_id: u64) {
         self.elision
             .writing
             .retain(|(c, conn, _), _| !(c == client && *conn == conn_id));
+        if self.elision.behind.is_empty() {
+            return;
+        }
+        let keys: Vec<(ClientId, u64, String)> = self
+            .elision
+            .behind
+            .keys()
+            .filter(|(c, conn, _)| c == client && *conn == conn_id)
+            .cloned()
+            .collect();
+        for key in keys {
+            let Some(queue) = self.elision.behind.remove(&key) else {
+                continue;
+            };
+            for b in queue {
+                self.elision.entries -= 1;
+                self.elision.bytes -= b.message.payload.len();
+                self.write_behind(client, None, &b, "disconnect");
+            }
+        }
+    }
+
+    /// Nothing waits behind a write under brownout or a drain either (Amendment 3):
+    /// written now, on its connection where that is still the one it waited on.
+    fn flush_all_behind(&mut self, reason: &'static str) {
+        let behind = std::mem::take(&mut self.elision.behind);
+        for ((client, conn, _), queue) in behind {
+            let planned = self
+                .online
+                .get(&client)
+                .filter(|o| o.conn_id == conn)
+                .map(|o| o.conn_id);
+            for b in queue {
+                self.elision.entries -= 1;
+                self.elision.bytes -= b.message.payload.len();
+                self.write_behind(&client, planned, &b, reason);
+            }
+        }
     }
 
     /// The window ended for the oldest held deliveries; also, under brownout or a
@@ -373,6 +605,7 @@ impl Hub {
             for c in clients {
                 self.flush_elided(&c, reason);
             }
+            self.flush_all_behind(reason);
             self.elision.deadlines.clear();
             return;
         }
