@@ -47,6 +47,9 @@ authors = ["mqtt-broker contributors"]
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_debug_implementations = "warn"
+# ADR 0093 D4: `MQTTD_HUB_LIFO_SLOT=off` needs tokio's unstable runtime option, built
+# with `RUSTFLAGS="--cfg tokio_unstable"` for the rig; every other build keeps the slot.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tokio_unstable)"] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
