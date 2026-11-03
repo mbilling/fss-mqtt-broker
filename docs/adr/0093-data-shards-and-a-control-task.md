@@ -325,6 +325,42 @@ same evening: no time bound without a buffer bound that pushes back before it.
 loops' ceiling, and a durable path that falls behind shown as OFFER NOT TAKEN, never
 DISCONNECTED: one h3 run with four shards and one with two (task T10).
 
+## Amendment 3 (2026-11-03): a deep queue yields less often; eight shards
+
+**What was measured.** Four shards on h3 with sixteen workers (`h3-20261103T103426Z`, the
+rows in the delivery doc): the knee 327,100, each loop 0.70 busy at 8.5 µs a message, so
+4 / 8.5 µs × 0.70 is the knee. The other 30% of a loop's time is not dispatch: the loop
+hands its worker back every 64 commands (ADR 0082 T2) whether its queue holds a hundred
+commands or fifty thousand, and each hand-back costs the wake that brings it back, 22–27%
+of the loop's time at the knee (the T2 and T3 runs read the same share with two shards).
+The hand-off is not where the time goes: with Amendment 1's dealing the `shard` class is
+0.9% of the publishes at the knee, so dealing to the publisher's own shard, listed as a
+lever on 2026-11-03, is already the case and is withdrawn as one. The machine had 12 of its
+16 cores busy at the knee.
+
+**The decision changes in two places.**
+
+- **The loop yields by its queue's depth.** With fewer than `node.hub_yield_deep` commands
+  queued (`MQTTD_HUB_YIELD_DEEP`, 1,024 by default: one ingest batch) the loop yields every
+  64 commands, as it did, so a command that reaches a quiet loop waits at most a batch.
+  With that many or more queued it keeps its worker for 1,024 commands between yields: the
+  queue is the latency then, and a yield buys nothing but its wake. The housekeeping a
+  yield point carries (the sweep's tick, the elision expiry, the hand-off batches) still
+  runs every 64 commands. `0` turns the rule off. `mqttd_hub_yields_total{shard}` counts
+  the yields, so a run can read the rule working. Restart-scoped. The rule is the shared
+  multi-thread runtime's, where a yield costs the wake that brings the loop back on some
+  worker; on a current-thread runtime (a test's, or the loop's own thread of ADR 0092 D1)
+  a yield is how every other task runs at all, so the loop yields every 64 commands there
+  whatever its queue holds.
+- **Eight shards.** `MAX_SHARDS` rises from four to eight (`node.hub_shards`). The hand-off
+  mask is a byte and the mailboxes an array; nothing else named four. The deal stays
+  shard-local (Amendment 1), so a hot group spreads over eight origins as it did over four.
+
+**What it should buy, to be measured.** Each loop's ceiling from 0.70 toward 0.85 of a
+worker, +10–20% on the four-shard knee, in the run that also measures ADR 0089 Amendment 3
+(a delivery behind a write in flight waits for it); then eight shards, whose wall is the
+sixteen cores at about 400,000–450,000 (D8). Tasks T11 and T12.
+
 ## Consequences
 
 - **The split's cost is known before it is built:** about 2 µs a message for the hand-off,
@@ -367,8 +403,9 @@ DISCONNECTED: one h3 run with four shards and one with two (task T10).
 
 ## Delivery
 
-Nine tasks: the control task and its snapshots (T1), hand-offs with credit and batching
+Twelve tasks: the control task and its snapshots (T1), hand-offs with credit and batching
 (T2), the worker capture removed by measurement (T3), the ENA packet-rate probe on AWS
 (T4), the cluster paths on shards (T5), a shard's failure modes (T6), the four-shard knee
-against D8 (T7), the hot-group and `#`-subscriber shapes (T8), and shard-local `$share`
-dealing (T9, Amendment 1). Status in the delivery doc.
+against D8 (T7), the hot-group and `#`-subscriber shapes (T8), shard-local `$share`
+dealing (T9, Amendment 1), the bounds that push back (T10, Amendment 2), the yield by the
+queue's depth (T11) and eight shards (T12, both Amendment 3). Status in the delivery doc.
