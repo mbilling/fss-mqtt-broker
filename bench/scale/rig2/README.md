@@ -352,7 +352,15 @@ more than 10% in received msg/s ((max − min) / min) or more than 2× in p99 (m
    `--drain-quiet-factor`): run 2's clean-qos1 152,000 step, its deliveries 17.9 s behind,
    was cut off after 5 s of silence. The summary's `drain` says how it ended, the quiet
    window it applied, and what was still owed (`outstanding_deliveries`,
-   `outstanding_acks`).
+   `outstanding_acks`). Then the publishers close first, so nothing new enters the
+   brokers, and the consumers **settle**: they read what the brokers still hold for them
+   until every expected delivery is in, nothing arrives for the quiet window, every
+   consumer's connection has already ended, or another `DRAIN_TIMEOUT`. The ledger is
+   reconciled at the settle's end and the consumers close after it (`drain.settle`:
+   how it ended, the deliveries it received, its end). Closing the consumers with the
+   publishers had durable consumers end their sessions while the brokers still held
+   their deliveries: on h3 durable-qos1 (2026-11-03) two cut-off rounds failed on
+   18,285 and 235,383 drops, all in the teardown's last seconds (#1194).
 5. **Judgment** (`verdict.py judge`). The brokers' window is the overlap of every
    generator's measured span (on the wall clock, from the summary's
    `schedule_start_unix_ms`). For each broker, the first and last scrape inside it (less
@@ -380,7 +388,7 @@ Judged on the broker only (ADR 0090 D1), for every round. In order:
 | **FAILED** | a generator's ledger did not close (missing, unexpected, unacked), a broker dropped a message by a reason that is loss (`mqttd_publish_dropped_total`, see below), or a broker restarted | stops the ladder (`BISECT_ON_FAIL=1` keeps bisecting below it) |
 | **VOID** | a generator saturated in 2 or more of its measured windows (CPU, a worker thread, scheduling lag, or more than 50 softnet squeezes/s; a single such window is a pause and only a note), a generator's gated p99 above 5 × the other generators' median + 50 ms, a generator left no summary, the generators' windows overlap less than 90%, a broker of the run has no scrapes of the round or its scrapes do not cover the window, or the cluster was not idle (unreset: VOID before any other verdict, FAILED included) | the round is rerun (`VOID_RETRIES`, 1); never counted against the broker |
 | **DISCONNECTED** | connections were lost during the step. mqtt-load does not reconnect, so its ledger cannot be read after that | not carried; the ramp treats it as above the knee |
-| **NOT DRAINED** | the ledger misses deliveries, no broker dropped any as loss, the drain ended before it was complete, and the brokers' own gauges at their last scrape before the drain's end (`mqttd_inflight_messages` + `mqttd_pending_publishes`) hold at least what the ledger misses: the messages were still queued, not lost | not carried, not loss; above the knee |
+| **NOT DRAINED** | the ledger misses deliveries, no broker dropped any as loss, the drain ended before it was complete, and the brokers' own gauges at their last scrape before the ledger was reconciled (the settle's end) (`mqttd_inflight_messages` + `mqttd_pending_publishes`) hold at least what the ledger misses: the messages were still queued, not lost | not carried, not loss; above the knee |
 | **OFFER NOT TAKEN** | the brokers received less than 99% of the offered msg/s (`OFFER_TAKEN` from `../summarize-curve.py`) | above the knee |
 | **CARRIED** | none of the above | at or below the knee, whatever its latency |
 

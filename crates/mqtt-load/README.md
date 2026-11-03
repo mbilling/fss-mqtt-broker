@@ -43,7 +43,9 @@ never linked into `mqttd`.
 - **Consumers** use `$share/<group>/<topic>` groups (`--shape share`) or plain fan-out
   subscribers (`--shape fanout`). Their sessions are durable (`clean_start=false` plus a
   session expiry) or clean. Durable sessions are ended with a DISCONNECT carrying session
-  expiry 0, unless `--keep-sessions` is given.
+  expiry 0, unless `--keep-sessions` is given. They close last: after the drain the
+  publishers close first, and the consumers read what the broker still holds for them
+  (the settle) before the ledger is reconciled and they close too.
 - **Endpoints.** Every topic's publishers and every stream's consumers are spread over
   all `--broker` endpoints: publisher `i` publishes to topic `i % topics` on broker
   `(i % topics + i / topics) % brokers`, and member `j` of stream `s` connects to broker
@@ -83,7 +85,7 @@ The ledger keeps one bit per identity (publisher, sequence) in three sets:
   fan-out subscriber.
 
 The schedule fixes every publisher's message count in advance, so the bitsets are sized
-once and loss is exact. After the drain:
+once and loss is exact. After the drain and the settle:
 
 - `missing`: sent, and not received on a stream that should have had it.
 - `missing_acked`: the part of `missing` whose publish was positively acknowledged (QoS 1).
@@ -227,8 +229,14 @@ windows[]         one per warm-up, measured window and drain, in time order:
 phases[]          per phase over its measured windows: {index, target_rate, <aggregate>, saturated}
 totals            <aggregate> over every measured window
 drain             {duration_s, ended_by: complete|quiet|timeout, quiet_s, outstanding_deliveries,
-                   outstanding_acks, since_progress_s}: quiet_s is the window applied;
-                  outstanding_* what was still owed when the drain ended (0 when complete)
+                   outstanding_acks, since_progress_s, settle}: quiet_s is the window applied;
+                  outstanding_* what was still owed when the drain ended (0 when complete);
+                  settle {duration_s, ended_by: complete|quiet|closed|timeout, received,
+                   end_s}: after the drain the publishers close and the consumers read on,
+                   until every expected delivery is in, the quiet window passes with
+                   nothing, every consumer's connection has ended, or the drain's timeout;
+                   received is how many of outstanding_deliveries still arrived, end_s
+                   (from the schedule's start) is when the ledger was reconciled
 ledger            {sent, acked, received, unique_received, expected, missing, missing_acked, unexpected,
                    unacked, unexpected_acks, negative_acks, duplicates, other_run, foreign, closed}
 generator         {saturated, saturated_windows[], thresholds{cpu_fraction, thread_fraction,

@@ -115,6 +115,9 @@ fn assert_closed(s: &Summary, broker: &Broker) {
     assert_eq!(l.unique_received, l.expected, "{}", ctx());
     assert_eq!(s.drain.ended_by, "complete", "{}", ctx());
     assert_eq!(s.drain.outstanding_deliveries, 0, "{}", ctx());
+    // A complete drain settles at once: nothing was still owed.
+    assert_eq!(s.drain.settle.ended_by, "complete", "{}", ctx());
+    assert_eq!(s.drain.settle.received, 0, "{}", ctx());
 }
 
 /// Durable `QoS` 1 through `$share` groups: the ledger closes and the latencies are
@@ -366,8 +369,70 @@ async fn a_lost_consumer_opens_the_ledger() {
     assert_eq!(s.drain.outstanding_deliveries, l.missing, "{}", report());
     assert_eq!(s.drain.outstanding_acks, 0, "{}", report());
     assert!(s.drain.quiet_s >= 2.0, "{}", report());
+    // The cut consumer's task had ended, so the settle did not wait another quiet
+    // window for deliveries nobody could read.
+    assert_eq!(s.drain.settle.ended_by, "closed", "{}", report());
     assert!(s.errors.disconnects >= 1, "{}", report());
     assert_eq!(s.outcome, Outcome::Error, "{}", report());
+}
+
+/// A drain cut short does not cut the consumers off what the broker still holds for
+/// them. The publishers close first and the consumers read on (the settle) before the
+/// ledger is reconciled: here member 1 of the `$share` group reaches the broker through
+/// a proxy that holds every chunk for 500 ms, the drain gets no time at all, and the
+/// deliveries still in the proxy at its end arrive in the settle. When the ledger was
+/// reconciled at the drain's end, and the consumers closed with the publishers, those
+/// deliveries were missing — acknowledged ones counted as loss — and a durable member's
+/// closing (its session ended with expiry 0) discarded what the broker still queued.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cut_drain_settles_what_the_broker_holds_before_the_ledger_is_reconciled() {
+    let dir = common::TempDir::new();
+    let broker = spawn_broker(dir.path()).await;
+    let delayed = proxy(broker.client, Duration::from_millis(500), None).await;
+    // The one publisher and member 0 are direct (broker 0); member j of stream 0 is on
+    // broker j, so member 1 is behind the proxy.
+    let mut c = workload(broker.client, 200.0, 1);
+    c.brokers = vec![broker.client, delayed];
+    c.qos = 1;
+    c.topics = 1;
+    c.shape = Shape::Share;
+    c.consumers = 2;
+    c.groups = 1;
+    c.sessions = Sessions::Durable;
+    c.drain_timeout_ns = 0;
+    // The two endpoints are one broker, so it deals between the members evenly; the
+    // generator's skew guard assumes a broker per endpoint and would refuse the shape.
+    c.max_skew = 0.0;
+    let s = mqtt_load::run(c).await.expect("run");
+    let l = &s.ledger;
+    let report = || {
+        format!(
+            "{}\n--- mqttd log ---\n{}",
+            serde_json::to_string_pretty(&s).unwrap(),
+            proc_common::log_tail(&broker.log)
+        )
+    };
+    assert_eq!(s.drain.ended_by, "timeout", "{}", report());
+    assert!(
+        s.drain.outstanding_deliveries > 0,
+        "the drain ended with deliveries still in the proxy: {}",
+        report()
+    );
+    assert_eq!(s.drain.settle.ended_by, "complete", "{}", report());
+    assert_eq!(
+        s.drain.settle.received,
+        s.drain.outstanding_deliveries,
+        "every delivery the drain left owed arrived in the settle: {}",
+        report()
+    );
+    assert_eq!(
+        (l.missing, l.missing_acked, l.unexpected),
+        (0, 0, 0),
+        "{}",
+        report()
+    );
+    assert_eq!(l.unique_received, l.expected, "{}", report());
+    assert_eq!(s.errors.disconnects, 0, "{}", report());
 }
 
 /// Publishers keep their connections through a drain longer than the broker's

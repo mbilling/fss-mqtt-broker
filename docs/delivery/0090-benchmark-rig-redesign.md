@@ -38,6 +38,13 @@ tasks:
     status: in-progress
     issue: 1109
     notes: "Size S plus rig time (about EUR 3 a release confirmation). Only this rig's figures are reported; no comparison with earlier measurements. Done in substance (the issue stays open for T2, T4 and T6): measured 2026-10-27/28 on the 1.3.0 candidate edfdb49 (3 rounds a step, calibrated generators): maximum lossless at 3 / 10 nodes, durable QoS 1 117,800 / 292,200 msg/s (ack p99 <= 1 s: 114,200 / 228,000), QoS 1 clean 270,800 / 875,900, QoS 0 340,300 / 973,200 (docs/benchmarks/RIG2-RESULTS.md). The README and its charts carry them (headline.csv), as do EVIDENCE.md and the 1.3.0 release notes."
+  - id: 0090-T8
+    title: "The generator's teardown closes the publishers first: the consumers settle, the ledger is reconciled at the settle's end, and the verdict reads the brokers' gauges there"
+    status: in-progress
+    issue: 1194
+    date: 2026-11-03
+    evidence: "Built: crates/mqtt-load run.rs (publishers closed, then the settle, then the ledger, then the consumers), ctx.rs (publishers_stopping, so a consumer the broker closes during the settle is still an error), summary.rs (drain.settle); bench/scale/rig2 verdict.py (ledger_ms: the held gauges at the settle's end), run.sh (the generator bound allows a second DRAIN_TIMEOUT). Tests: loadgen.rs a_cut_drain_settles_what_the_broker_holds_before_the_ledger_is_reconciled (a member behind a 500 ms proxy, the drain given no time: every owed delivery arrives in the settle, missing 0), the settle asserted in assert_closed and a_lost_consumer_opens_the_ledger; test-verdict.py test_what_the_brokers_held_is_read_at_the_settles_end."
+    notes: "Size S. The maintainer's decision of 2026-11-03 on the h3 run h3-20261103T103426Z, where two cut-off rounds failed on 18,285 and 235,383 drops, every one in the teardown's last seconds."
 ---
 
 # Delivery 0090 — the benchmark rig redesign
@@ -59,10 +66,16 @@ above; the table below is generated from it.
 | 0090-T5 | 🚧 in-progress | [#1109](https://github.com/mbilling/fss-mqtt-broker/issues/1109) | — | "Size M. Hetzner snapshot built by a script in the tree; the broker binary is still fetched per run and checked by sha256. The tiers are in bench/scale/rig2/run.sh: TIER=n3 (3 x CCX23 + 1 x CCX33, EUR 0.79/h) and TIER=n10 (10 x CCX23 + 4 x CCX33, EUR 2.83/h; 3 generators until 2026-10-27), counts and types overridable, the price and expected duration printed before provisioning. Provisioning, host bring-up (await_fleet, factored out of bench/scale/run.sh into lib.sh), the durable bootstrap and teardown with its label audit are the lane E rig's; the generator hosts get a static musl mqtt-load over SSH (build-mqtt-load.sh, Docker linux/amd64) and no Docker or emqtt-bench (terraform driver_emqtt_bench=false); no clock setup. TIER=local runs the same ramp on a 3-node local cluster (local-cluster.sh). Live Grafana on by default (OBSERVE=0 disables): bench/scale/observe.sh's stack on the operator's machine, the curl bridge on generator host 0 (curl + python3, no Docker) reading every broker's /metrics and every mqtt-load --metrics over the private network, through an ssh tunnel; a mqtt-load dashboard beside the broker overview; TIER=local scrapes directly (observe.sh attach-local). No cloud resource added. First paid n3 run 2026-10-26. Generator hosts get RPS at bring-up and are calibrated before the first ladder (the same QoS 0 load on each; a host that saturates or whose end-to-end p99 is above 5 x the others' median + 50 ms is replaced, at most twice); mqtt-load counts softnet squeezes as saturation (> 50/s). Open: the snapshot image." |
 | 0090-T6 | ⬜ planned | [#1109](https://github.com/mbilling/fss-mqtt-broker/issues/1109) | — | "Size S-M." |
 | 0090-T7 | 🚧 in-progress | [#1109](https://github.com/mbilling/fss-mqtt-broker/issues/1109) | — | "Size S plus rig time (about EUR 3 a release confirmation). Only this rig's figures are reported; no comparison with earlier measurements. Done in substance (the issue stays open for T2, T4 and T6): measured 2026-10-27/28 on the 1.3.0 candidate edfdb49 (3 rounds a step, calibrated generators): maximum lossless at 3 / 10 nodes, durable QoS 1 117,800 / 292,200 msg/s (ack p99 <= 1 s: 114,200 / 228,000), QoS 1 clean 270,800 / 875,900, QoS 0 340,300 / 973,200 (docs/benchmarks/RIG2-RESULTS.md). The README and its charts carry them (headline.csv), as do EVIDENCE.md and the 1.3.0 release notes." |
+| 0090-T8 | 🚧 in-progress | [#1194](https://github.com/mbilling/fss-mqtt-broker/issues/1194) | 2026-11-03 | "Built: crates/mqtt-load run.rs (publishers closed, then the settle, then the ledger, then the consumers), ctx.rs (publishers_stopping, so a consumer the broker closes during the settle is still an error), summary.rs (drain.settle); bench/scale/rig2 verdict.py (ledger_ms: the held gauges at the settle's end), run.sh (the generator bound allows a second DRAIN_TIMEOUT). Tests: loadgen.rs a_cut_drain_settles_what_the_broker_holds_before_the_ledger_is_reconciled (a member behind a 500 ms proxy, the drain given no time: every owed delivery arrives in the settle, missing 0), the settle asserted in assert_closed and a_lost_consumer_opens_the_ledger; test-verdict.py test_what_the_brokers_held_is_read_at_the_settles_end." |
 <!-- /status-table:0090 -->
 
 ## Changelog
 
+- 2026-11-03: T8 in progress (#1194): mqtt-load closes its publishers first, lets its
+  consumers settle, reconciles the ledger at the settle's end and closes the consumers
+  last; the verdict reads the brokers' held gauges at the settle's end. On h3
+  (`h3-20261103T103426Z`) two cut-off rounds had failed on drops made by the teardown:
+  durable consumers ended their sessions while the brokers still held their deliveries.
 - 2026-10-26: T3, after the second n3 run: transient retries (a bad step right above a
   flat carried step, p99 < 50 ms, is retried once after a full settle), a priming run per
   ladder, a settle that waits for the brokers' pipes, replication, routing and a quiet

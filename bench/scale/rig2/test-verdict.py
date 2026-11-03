@@ -35,7 +35,8 @@ def hist(samples_us: dict[int, int]) -> dict:
 
 def summary(rate, *, p99_us=50_000, saturated=False, missing=0, outcome=None, start_shift_s=0.0,
             measure_s=60.0, warmup_s=20.0, errors=None, drain="complete", unexpected=0,
-            missing_acked=None, unacked=0, session_skew=1.0, spread=None, stalled_windows=0):
+            missing_acked=None, unacked=0, session_skew=1.0, spread=None, stalled_windows=0,
+            settle=None):
     """A minimal mqtt-load.summary.v2 with one phase: `rate` msg/s offered; ack and e2e
     histograms whose p99 is `p99_us` (98 % at 1 ms, 1.5 % at p99, 0.5 % at 2 x p99)."""
     n = int(rate * measure_s)
@@ -68,8 +69,12 @@ def summary(rate, *, p99_us=50_000, saturated=False, missing=0, outcome=None, st
                    "unacked": unacked, "unexpected_acks": 0,
                    "closed": closed and not unexpected and not unacked,
                    **({} if missing_acked is None else {"missing_acked": missing_acked})},
+        # `settle`: (how it ended, seconds, deliveries received, end_s) of the consumers'
+        # settle after the drain, from a generator that closes its publishers first.
         "drain": {"duration_s": 0.05 if drain == "complete" else 10.0, "ended_by": drain, "quiet_s": 10.0,
-                  "outstanding_deliveries": missing, "outstanding_acks": 0, "since_progress_s": 10.0},
+                  "outstanding_deliveries": missing, "outstanding_acks": 0, "since_progress_s": 10.0,
+                  **({} if settle is None else {"settle": dict(zip(("ended_by", "duration_s", "received", "end_s"),
+                                                                    settle))})},
         "errors": errors or {"connect": 0, "disconnects": 0, "server_disconnects": 0, "protocol": 0, "write": 0},
         "generator": {"saturated": saturated or stalled_windows > 0, "sent_per_cpu_second": 40000.0},
         "outcome": outcome or ("void" if saturated else ("ok" if closed else "loss")),
@@ -89,7 +94,7 @@ def prom(received, delivered, dropped=None, start=1700000000.0, gauges=None):
 
 
 def make_step(root: Path, rate, gens, *, brokers=3, received_share=1.0, drops=None, idle=True, gate="ack",
-              restart=False, coverage_s=None, held=None, unfetched=(), short=()):
+              restart=False, coverage_s=None, held=None, held_span_s=(70, 80), unfetched=(), short=()):
     """A step directory: `gens` summaries, and brokers whose received counters grew at
     received_share x rate in total over the measured window (scrapes every 2 s).
     `unfetched`: brokers whose scrapes never came back (no directory); `short`: brokers
@@ -117,11 +122,13 @@ def make_step(root: Path, rate, gens, *, brokers=3, received_share=1.0, drops=No
             secs = max(0.0, (t - first) / 1000)
             dropped = {k: (v if t == stamps[-1] else 0) for k, v in (drops or {}).items()} if b == 0 else None
             st = 1700000001.0 if (restart and b == 1 and t == stamps[-1]) else 1700000000.0
-            # `held`: what broker 0's gauges hold over the generators' drain (its last 10 s,
-            # to the drain end at 80 s). After it they read 0, as on a real run: mqtt-load
-            # disconnects its clients at the drain end, durable consumers with session
-            # expiry 0, and the broker discards their sessions' unacked deliveries.
-            g = held if (held and b == 0 and T0 + 70_000 <= t <= T0 + 80_000) else None
+            # `held`: what broker 0's gauges hold over `held_span_s` (by default the
+            # generators' drain, its last 10 s to the drain end at 80 s). After it they
+            # read 0, as on a real run: mqtt-load closes its consumers once its ledger is
+            # reconciled, durable ones with session expiry 0, and the broker discards
+            # their sessions' unacked deliveries.
+            lo_s, hi_s = held_span_s
+            g = held if (held and b == 0 and T0 + lo_s * 1000 <= t <= T0 + hi_s * 1000) else None
             (d / f"{t}.prom").write_text(prom(per_broker * secs, per_broker * secs, dropped, st, g))
     return step
 
@@ -423,6 +430,23 @@ class Verdicts(unittest.TestCase):
         self.assertEqual(v["drain"]["unexplained"], 0)
         self.assertEqual(v["drain"]["unexplained_acked"], 0)
         self.assertEqual(v["verdict"], V.NOT_DRAINED, v)
+
+    def test_what_the_brokers_held_is_read_at_the_settles_end(self):
+        # A generator that closes its publishers first lets its consumers read on after
+        # the drain, reconciles its ledger at the settle's end (95 s here, 15 s after the
+        # drain's) and closes the consumers after it: the broker's gauges are read there.
+        # At the drain's end they had not been read yet in this fixture, so a cut-off
+        # left at the drain's end would find nothing held and call the 297 unexplained.
+        v = verdict_of(make_step(self.root, 30000, [summary(30000, missing=297, missing_acked=297, drain="timeout",
+                                                            settle=("quiet", 14.0, 1200, 95.0))],
+                                 brokers=1, held={"mqttd_inflight_messages": 297}, held_span_s=(86, 95)))
+        self.assertEqual(v["drain"]["held_at_cutoff"]["mqttd_inflight_messages"], 297)
+        self.assertEqual(v["drain"]["queued_at_cutoff"], 297)
+        self.assertEqual(v["drain"]["unexplained_acked"], 0)
+        self.assertEqual(v["verdict"], V.NOT_DRAINED, v)
+        self.assertIn("the publishers closed and the consumers settled (quiet after 14.0 s), receiving 1,200 more",
+                      v["notes"][0])
+        self.assertEqual(v["drain"]["generators"][0]["settle_ended_by"], "quiet")
 
     def test_a_drain_cut_off_with_drops_fails_and_reconciles_missing(self):
         # Run 2's clean-qos1 152,000: missing = loss drops + what the brokers still held.

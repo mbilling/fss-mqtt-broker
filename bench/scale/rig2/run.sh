@@ -115,7 +115,9 @@ PRIME_SECS="${PRIME_SECS:-$DEF_PRIME}"
 # The drain: it ends when every expected delivery and ack is in, or after a quiet window
 # with nothing arriving: DRAIN_QUIET s, or DRAIN_QUIET_FACTOR x the slowest measured p99
 # if longer (mqtt-load --drain-quiet-factor), or at the hard DRAIN_TIMEOUT. A step whose
-# deliveries ran 17.9 s behind was cut off after 5 s of silence in run 2.
+# deliveries ran 17.9 s behind was cut off after 5 s of silence in run 2. Then the
+# publishers close and the consumers settle, by the same rules and at most another
+# DRAIN_TIMEOUT, before the ledger is reconciled (#1194).
 DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-120}"
 DRAIN_QUIET="${DRAIN_QUIET:-10}"
 DRAIN_QUIET_FACTOR="${DRAIN_QUIET_FACTOR:-2}"
@@ -783,7 +785,7 @@ launch_gens() { # launch_gens <local-dir> <host-id> <per-gen rate> <warmup> <mea
 		--ready-file "steps/$hid/gen.ready" --start-file "steps/$hid/gen.start" --start-wait "$GEN_START_WAIT")
 	[ "$SESSIONS" != durable ] || args+=(--session-expiry "$SESSION_EXPIRY")
 	[ -z "$PUBLISHERS_N" ] || args+=(--publishers "$PUBLISHERS_N")
-	bound=$((START_SYNC_WAIT + GEN_START_WAIT + warmup + measure + DRAIN_TIMEOUT + 180))
+	bound=$((START_SYNC_WAIT + GEN_START_WAIT + warmup + measure + 2 * DRAIN_TIMEOUT + 180))
 	for ((g = 0; g < GENERATORS; g++)); do
 		metrics=""
 		[ "$OBSERVE" != 1 ] || metrics="--metrics $(gen_metrics_addr "$g")"
