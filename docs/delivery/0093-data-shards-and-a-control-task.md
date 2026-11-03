@@ -472,12 +472,15 @@ credit held by writes. Below the ceiling the broker is unharmed: 122,900 and 138
 at 1.7–1.9 ms with every delivery elided, and a collapsed round left no hangover for the
 next. #1190 is to be withdrawn, its evidence recorded in ADR 0075. The way out of write mode
 is A5 itself — a delivery behind a write in flight queued behind it, still elided — which is
-the next decision, with the levers for the knee: dealing a `$share` publish to a member on
-the publisher's own shard (three of four publishes take a hand-off with four shards: 8.5 µs
-a message against 7.7 with two), yielding less often when the loop's queue is deep (22–27%
-of a loop's time is the yield every 64 commands and its wake), and eight shards (the config
-caps at four; the hand-off bitmask allows eight), with the connection path's 28 of the 36.6
-µs of CPU a message after that.
+the next decision, with the levers for the knee: yielding less often when the loop's queue
+is deep (22–27% of a loop's time is the yield every 64 commands and its wake), and eight
+shards (the config caps at four; the hand-off bitmask allows eight), with the connection
+path's 28 of the 36.6 µs of CPU a message after that. Dealing a `$share` publish to a
+member on the publisher's own shard was listed here too, on the reading that three of four
+publishes take a hand-off with four shards; the knee's counters say otherwise (the `shard`
+class is 0.009 dispatches a publish at 327,100, round 1), since Amendment 1's dealing
+already keeps the deal on the origin's shard, so the 8.5 µs a message against 7.7 with two
+shards is the dispatches themselves, not the hand-off, and that lever is withdrawn.
 
 The other two held up. The runtime found the 16 physical cores on its own (`runtime: 16
 worker threads (the physical cores)` in the broker's log; one bug: the line prints before
