@@ -1404,24 +1404,37 @@ impl Hub {
         if !self.prefer_local_now(cursor) {
             return None;
         }
-        let chosen = members
-            .select_online(cursor)
-            .map(|(client, qos)| SharedCandidate {
-                node: None,
-                client: client.clone(),
-                qos: *qos,
-                online: true,
-            });
+        // ADR 0093 Amendment 1: with shards, a group with an online member this shard
+        // owns deals among those alone — the delivery stays on this shard, no hand-off
+        // — and reaches the other shard's members only when it owns none online. Each
+        // shard keeps its own cursor, so its members take equal turns.
+        let own = if self.shard_count > 1 {
+            members.own_online_count()
+        } else {
+            0
+        };
+        let (pick, rotation) = if own > 0 {
+            (members.select_own_online(cursor), own)
+        } else {
+            (members.select_online(cursor), members.online_count())
+        };
+        let chosen = pick.map(|(client, qos)| SharedCandidate {
+            node: None,
+            client: client.clone(),
+            qos: *qos,
+            online: true,
+        });
         Some(SharedPlan {
             key_hash,
             key_if_new: existing
                 .is_none()
                 .then(|| (group.to_string(), filter.to_string())),
             // Rotation is over the ONLINE members, so an offline member never
-            // consumes a turn. Site 1 of 4 on the one stored-cursor definition
-            // (item 3.4); `select_online` reduces the start it is given, so a
-            // widened value indexes identically.
-            next_cursor: self.next_stored_cursor(cursor.wrapping_add(1), members.online_count()),
+            // consumes a turn — over this shard's own online members when the deal
+            // stays on it. Site 1 of 4 on the one stored-cursor definition (item
+            // 3.4); `select_online` reduces the start it is given, so a widened value
+            // indexes identically.
+            next_cursor: self.next_stored_cursor(cursor.wrapping_add(1), rotation),
             chosen,
         })
     }

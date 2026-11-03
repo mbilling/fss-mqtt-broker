@@ -141,3 +141,39 @@ holding the store) is upheld by construction.
 - **A per-log driver task instead of lane-driven futures:** another owned
   task and channel for no behavioral difference; lane-driven inherits the
   right lifecycle for free.
+
+## Amendment 1 (2026-11-03): a bound on the writer's batch, built, measured and withdrawn
+
+Proposed by the maintainer on the h3 runs of ADR 0093 ("Sixteen workers measured on h3"
+in its delivery doc), built as #1190, measured once the same day and withdrawn.
+
+**The proposal.** The writer takes everything queued into one fsync'd batch. In two
+rounds of 24 on h3 the batches grew to 35,000–73,000 ops and committed in about 550 ms,
+and ADR 0089 Amendment 1's A5 (a delivery whose topic has a write in flight is written
+too) then kept every busy topic in write mode for the whole commit, which kept the writer
+saturated: the bistable path of ADR 0089 Amendment 1, with the batch depth as the loop's
+gain. The bound: at most 1,024 ops or 4 MiB of records a batch, the rest the next batch,
+on the estimate that a 12 ms commit sits under the 30 ms between two deliveries on one
+topic, so a topic's next delivery finds its write landed and is held instead.
+
+**What it measured** (run `h3-20261103T130326Z`: the bound with ADR 0092 Amendment 4's
+worker default and ADR 0090 T8's drain order, four shards; the rows in ADR 0093's delivery
+doc, "The combined build measured on h3"). Every round from 153,600 msg/s up fell into
+write mode in its first seconds and stayed there to the drain: the bounded writer
+committed 1,024-op batches at 11–13 ms, about 102,000 ops/s, where the unbounded one had
+cleared a backlog at 120,000–165,000, so no round above about 120,000 msg/s could catch
+up. The knee fell from 327,100 to between 138,300 and 153,600; 122,900 and 138,300 carried
+at 1.7–1.9 ms with every delivery held and the writer idle.
+
+**Why it was wrong.** The 30 ms was one publisher's interval. A session's topic sees a
+delivery about every 1.7 ms at 300,000 msg/s, and a commit of any depth costs more than
+that (the barrier's fixed cost alone is about 0.5 ms), so no bound is short enough to let
+a topic's next delivery find its write landed. What a bound does change is the writer's
+throughput once in write mode, and in the wrong direction: a backlog is cleared by ops a
+second, which the deeper batch maximises. A bound lengthens write mode; it cannot end it.
+
+**Withdrawn.** The writer stays as decided above: everything queued, one fsync. A batch
+holds what arrived during the previous commit, which the publishers' in-flight windows
+bound in turn; its depth is not a knee lever. The hold A5 imposes on a topic is ADR 0089's
+to shorten (its Amendment 3: a delivery that finds a write in flight on its topic waits
+behind it, held, instead of being written), not the writer's.

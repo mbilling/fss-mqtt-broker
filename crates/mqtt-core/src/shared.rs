@@ -8,7 +8,7 @@
 //! reports matching groups and their members via [`SharedSubscriptionTable::matching`].
 
 use crate::filter_index::FilterIndex;
-use crate::{ClientId, FastMap, FilterKey, QoS, TopicFilter};
+use crate::{ClientId, FastMap, FastSet, FilterKey, QoS, TopicFilter};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
@@ -76,12 +76,22 @@ pub type MatchedGroup<'a> = (&'a str, &'a str, &'a GroupMembers);
 /// online. Selection is then an index into that prefix, constant time at any
 /// size. A member changing state is one swap across the boundary; a member
 /// leaving is one `swap_remove`. Nothing here is per-publish work.
+///
+/// ADR 0093 Amendment 1: the online prefix is itself split, `all[..own_online]` being
+/// the online members this table's hub shard owns and `all[own_online..online]` the
+/// online members another shard of the node owns (mirrored here so this shard can
+/// match on them). A shard deals among its own online members by the same one index,
+/// and reaches across only when it owns none. With one shard every member is its own
+/// and the two prefixes are the same.
 #[derive(Debug, Clone, Default)]
 pub struct GroupMembers {
-    /// Every member. `all[..online]` are online; the rest are not.
+    /// Every member. `all[..own_online]` are online and this shard's,
+    /// `all[own_online..online]` online and another shard's, the rest offline.
     all: Vec<(ClientId, QoS)>,
     /// How many of the leading entries are online.
     online: usize,
+    /// How many of the leading entries are online and this shard's own.
+    own_online: usize,
 }
 
 impl std::ops::Deref for GroupMembers {
@@ -115,34 +125,71 @@ impl GroupMembers {
         self.all.get(start % self.online)
     }
 
+    /// How many online members this table's hub shard owns (ADR 0093 Amendment 1);
+    /// [`online_count`](Self::online_count) with one shard.
+    #[must_use]
+    pub fn own_online_count(&self) -> usize {
+        self.own_online
+    }
+
+    /// The `start`-th online member this shard owns, rotating within them — the
+    /// shard-local deal, in constant time (ADR 0093 Amendment 1).
+    #[must_use]
+    pub fn select_own_online(&self, start: usize) -> Option<&(ClientId, QoS)> {
+        if self.own_online == 0 {
+            return None;
+        }
+        self.all.get(start % self.own_online)
+    }
+
     /// Whether `client` is a member, and if so where it sits.
     fn position(&self, client: &ClientId) -> Option<usize> {
         self.all.iter().position(|(c, _)| c == client)
     }
 
-    /// Move the member at `i` across the online boundary, keeping the partition.
+    /// Move the member at `i` to the region its state names — own online, another
+    /// shard's online, or offline — keeping the partition: each step is one swap
+    /// across one boundary.
     ///
     /// Returns where that member ENDED UP. A swap moves it, and every caller then
     /// needs its new index — returning it is what lets them avoid a second
     /// `position` scan of the group (issue #525).
-    fn set_at(&mut self, i: usize, online: bool) -> usize {
-        let is_online = i < self.online;
-        if is_online == online {
-            return i;
-        }
-        if online {
-            // Offline -> online: swap it to the first offline slot, which then
-            // becomes the last online one.
-            self.all.swap(i, self.online);
-            let now = self.online;
-            self.online += 1;
-            now
-        } else {
+    fn set_at(&mut self, mut i: usize, online: bool, own: bool) -> usize {
+        if !online {
+            if i >= self.online {
+                return i;
+            }
+            if i < self.own_online {
+                // Own online -> another's online: swap with the last own slot and
+                // shrink the own prefix.
+                self.own_online -= 1;
+                self.all.swap(i, self.own_online);
+                i = self.own_online;
+            }
             // Online -> offline: swap it with the last online slot and shrink.
             self.online -= 1;
             self.all.swap(i, self.online);
-            self.online
+            return self.online;
         }
+        if i >= self.online {
+            // Offline -> online: swap it to the first offline slot, which then
+            // becomes the last online one.
+            self.all.swap(i, self.online);
+            i = self.online;
+            self.online += 1;
+        }
+        if own && i >= self.own_online {
+            // Another's online -> own online: swap it to the first slot past the own
+            // prefix, which then becomes the last own one.
+            self.all.swap(i, self.own_online);
+            i = self.own_online;
+            self.own_online += 1;
+        } else if !own && i < self.own_online {
+            self.own_online -= 1;
+            self.all.swap(i, self.own_online);
+            i = self.own_online;
+        }
+        i
     }
 
     /// Add `client` at `max_qos`, or update the granted `QoS` if already a member.
@@ -152,15 +199,15 @@ impl GroupMembers {
     /// whether to record the membership in the reverse index, and used to answer
     /// it with its own `position` scan immediately before calling here — two
     /// walks of the group per SUBSCRIBE (issue #525).
-    fn insert(&mut self, client: ClientId, max_qos: QoS, online: bool) -> bool {
+    fn insert(&mut self, client: ClientId, max_qos: QoS, online: bool, own: bool) -> bool {
         if let Some(i) = self.position(&client) {
             self.all[i].1 = max_qos;
-            self.set_at(i, online);
+            self.set_at(i, online, own);
             return false;
         }
         self.all.push((client, max_qos));
         if online {
-            self.set_at(self.all.len() - 1, true);
+            self.set_at(self.all.len() - 1, true, own);
         }
         true
     }
@@ -174,16 +221,16 @@ impl GroupMembers {
         // always in the offline region and `swap_remove` cannot move an online
         // member across the boundary. `set_at` reports where the member landed,
         // so this no longer rescans the group to find it again (issue #525).
-        let i = self.set_at(i, false);
+        let i = self.set_at(i, false, false);
         self.all.swap_remove(i);
         true
     }
 
     /// Mark `client` online or offline. Returns whether it was a member.
-    fn set_online(&mut self, client: &ClientId, online: bool) -> bool {
+    fn set_online(&mut self, client: &ClientId, online: bool, own: bool) -> bool {
         match self.position(client) {
             Some(i) => {
-                self.set_at(i, online);
+                self.set_at(i, online, own);
                 true
             }
             None => false,
@@ -194,8 +241,9 @@ impl GroupMembers {
     #[cfg(debug_assertions)]
     fn assert_partitioned(&self) {
         debug_assert!(
-            self.online <= self.all.len(),
-            "online count {} exceeds {} members",
+            self.own_online <= self.online && self.online <= self.all.len(),
+            "own online {} / online {} / members {} out of order",
+            self.own_online,
             self.online,
             self.all.len()
         );
@@ -216,6 +264,11 @@ pub struct SharedSubscriptionTable {
     /// group appears and leaves when its last one goes, so the two cannot
     /// disagree about which filters exist.
     index: FilterIndex,
+    /// ADR 0093 Amendment 1: the members another hub shard owns, added through
+    /// [`subscribe_member`](Self::subscribe_member) with `own = false`. Their online
+    /// entries sit past each group's own prefix, so a shard deals among its own.
+    /// Empty with one shard.
+    foreign: FastSet<ClientId>,
 }
 
 impl SharedSubscriptionTable {
@@ -236,6 +289,27 @@ impl SharedSubscriptionTable {
         max_qos: QoS,
         online: bool,
     ) {
+        self.subscribe_member(client, group, filter, max_qos, online, true);
+    }
+
+    /// As [`subscribe`](Self::subscribe), saying whether `client` is this hub
+    /// shard's own (ADR 0093 Amendment 1): another shard's member is matched on but
+    /// dealt to only when this shard has no online member of its own in the group.
+    /// A client is the same shard's for its whole life, so `own` only ever repeats.
+    pub fn subscribe_member(
+        &mut self,
+        client: ClientId,
+        group: &str,
+        filter: &str,
+        max_qos: QoS,
+        online: bool,
+        own: bool,
+    ) {
+        if own {
+            self.foreign.remove(&client);
+        } else {
+            self.foreign.insert(client.clone());
+        }
         // Disjoint field borrows let the index be updated from inside the entry,
         // exactly as `SubscriptionTable::subscribe` does — the filter enters the
         // index precisely when its first group appears, so the two cannot
@@ -251,7 +325,7 @@ impl SharedSubscriptionTable {
         };
         let key = FilterKey::from(filter);
         let members = by_group.entry(group.to_string()).or_default();
-        let fresh = members.insert(client.clone(), max_qos, online);
+        let fresh = members.insert(client.clone(), max_qos, online, own);
         #[cfg(debug_assertions)]
         members.assert_partitioned();
         if fresh {
@@ -272,13 +346,14 @@ impl SharedSubscriptionTable {
         let Some(memberships) = self.by_client.get(client) else {
             return;
         };
+        let own = !self.foreign.contains(client);
         for (filter, group) in memberships.clone() {
             if let Some(members) = self
                 .groups
                 .get_mut(&filter)
                 .and_then(|by_group| by_group.get_mut(&group))
             {
-                members.set_online(client, online);
+                members.set_online(client, online, own);
                 #[cfg(debug_assertions)]
                 members.assert_partitioned();
             }
@@ -296,6 +371,7 @@ impl SharedSubscriptionTable {
                     m.retain(|(f, g)| &**f != filter || g != group);
                     if m.is_empty() {
                         self.by_client.remove(client);
+                        self.foreign.remove(client);
                     }
                 }
             }
@@ -315,6 +391,7 @@ impl SharedSubscriptionTable {
     pub fn remove_client(&mut self, client: &ClientId) {
         // Targeted: the reverse index names exactly the groups this client is
         // in, so a disconnect no longer walks every group in the table.
+        self.foreign.remove(client);
         let Some(memberships) = self.by_client.remove(client) else {
             return;
         };
@@ -621,6 +698,144 @@ mod tests {
         t.unsubscribe(&cid("d"), "g", "sport/#");
         let (online, total, _) = members(&t).unwrap();
         assert_eq!((online, total), (0, 2));
+    }
+
+    /// The model of one group's members for the region test below: who is a member,
+    /// who is online, and whose shard each one is.
+    struct RegionModel {
+        clients: Vec<(ClientId, bool)>,
+        online: std::collections::BTreeMap<String, bool>,
+        member: std::collections::BTreeMap<String, bool>,
+    }
+
+    impl RegionModel {
+        fn mine(&self, c: &ClientId) -> bool {
+            self.clients.iter().find(|(x, _)| x == c).unwrap().1
+        }
+
+        fn live(&self, c: &ClientId) -> bool {
+            self.member[&c.0.to_string()] && self.online[&c.0.to_string()]
+        }
+
+        /// The table's group has exactly the three regions the model says, and the
+        /// own selection never leaves the first.
+        fn check(&self, t: &SharedSubscriptionTable) {
+            let Some((_, _, m)) = t.matching_refs("t").next() else {
+                assert!(self.member.values().all(|m| !m), "no group, no members");
+                return;
+            };
+            let own = self
+                .clients
+                .iter()
+                .filter(|(c, mine)| *mine && self.live(c))
+                .count();
+            let online = self.clients.iter().filter(|(c, _)| self.live(c)).count();
+            assert_eq!(m.own_online_count(), own, "own online count");
+            assert_eq!(m.online_count(), online, "online count");
+            for (i, (c, _)) in m.iter().enumerate() {
+                if i < m.own_online_count() {
+                    assert!(self.live(c) && self.mine(c), "{} in the own prefix", c.0);
+                } else if i < m.online_count() {
+                    assert!(self.live(c) && !self.mine(c), "{} in the other span", c.0);
+                } else {
+                    assert!(!self.live(c), "{} in the offline tail", c.0);
+                }
+            }
+            for start in 0..20 {
+                if let Some((c, _)) = m.select_own_online(start) {
+                    assert!(self.mine(c) && self.live(c), "own selection picked {}", c.0);
+                }
+            }
+        }
+    }
+
+    /// ADR 0093 Amendment 1: with members of two hub shards in one group, the online
+    /// prefix splits into this shard's own online members and the other shard's,
+    /// through every order of subscribe, attach, detach, mirror and unsubscribe —
+    /// checked against a model after every step.
+    #[test]
+    fn the_own_prefix_holds_through_every_transition_and_selection_stays_inside_it() {
+        // (client, own) — own members are this shard's, the rest mirrored from another.
+        let mut model = RegionModel {
+            clients: (0..8)
+                .map(|i| (cid(&format!("m{i}")), i % 2 == 0))
+                .collect(),
+            online: std::collections::BTreeMap::new(),
+            member: std::collections::BTreeMap::new(),
+        };
+        let clients = model.clients.clone();
+        let mut t = SharedSubscriptionTable::new();
+        for (c, _) in &clients {
+            model.online.insert(c.0.to_string(), false);
+            model.member.insert(c.0.to_string(), false);
+        }
+        // A fixed, varied order of the four operations over the eight members:
+        // (member, op), op 0 subscribe, 1 online, 2 offline, 3 leave.
+        let ops: [(usize, u8); 24] = [
+            (0, 0),
+            (1, 0),
+            (2, 0),
+            (3, 0),
+            (4, 0),
+            (5, 0),
+            (0, 1),
+            (1, 1),
+            (3, 1),
+            (6, 0),
+            (2, 1),
+            (0, 2),
+            (5, 1),
+            (4, 1),
+            (1, 2),
+            (7, 0),
+            (7, 1),
+            (6, 1),
+            (3, 3),
+            (2, 2),
+            (0, 1),
+            (4, 3),
+            (5, 2),
+            (1, 1),
+        ];
+        for (k, op) in ops {
+            let (c, own) = &clients[k];
+            let key = c.0.to_string();
+            match op {
+                // Subscribe offline: own through `subscribe`, another's through the mirror.
+                0 => {
+                    if *own {
+                        t.subscribe(c.clone(), "g", "t", QoS::AtLeastOnce, false);
+                    } else {
+                        t.subscribe_member(c.clone(), "g", "t", QoS::AtLeastOnce, false, false);
+                    }
+                    model.member.insert(key.clone(), true);
+                    model.online.insert(key, false);
+                }
+                // Online: an own client attaches; another's is mirrored online.
+                1 => {
+                    if *own {
+                        t.set_client_online(c, true);
+                    } else if model.member[&key] {
+                        t.subscribe_member(c.clone(), "g", "t", QoS::AtLeastOnce, true, false);
+                    }
+                    if model.member[&key] {
+                        model.online.insert(key, true);
+                    }
+                }
+                // Offline.
+                2 => {
+                    t.set_client_online(c, false);
+                    model.online.insert(key, false);
+                }
+                // Leave.
+                _ => {
+                    t.unsubscribe(c, "g", "t");
+                    model.member.insert(key.clone(), false);
+                    model.online.insert(key, false);
+                }
+            }
+            model.check(&t);
+        }
     }
 
     /// `insert` reports whether it ADDED, and `subscribe` records the reverse-index

@@ -106,7 +106,10 @@ mod settle;
 pub use quarantine::QUARANTINE_LISTED;
 /// ADR 0092 T5: the node's data shards and the sender in front of them.
 pub mod shards;
-pub use shards::{shard_of, HubTx, ShardDeliver, ShardTarget, MAX_SHARDS};
+pub use shards::{
+    shard_of, spawn_mailman, HubTx, ShardAnswer, ShardBatch, ShardDeliver, ShardMailbox,
+    ShardTarget, MAX_SHARDS,
+};
 
 /// Maximum number of queued messages replayed to a reconnecting session at once.
 const REPLAY_LIMIT: usize = 10_000;
@@ -1743,20 +1746,17 @@ pub enum HubCommand {
         /// Whether it is connected there (a `$share` group's online prefix).
         online: bool,
     },
-    /// ADR 0092 T5: a publish another shard matched, for the subscribers this shard
-    /// owns. Boxed (#835).
-    ShardDeliver(Box<shards::ShardDeliver>),
-    /// ADR 0092 T5: shard `shard` settled every delivery of pending publish `id` it was
-    /// handed — stored, held and acknowledged, or not.
+    /// ADR 0092 T5 / ADR 0093 D3: the publishes another shard matched during one of its
+    /// dispatch batches, for the subscribers this shard owns. Boxed (#835).
+    ShardDeliver(Box<shards::ShardBatch>),
+    /// ADR 0092 T5 / ADR 0093 D3: shard `shard` settled every delivery of each of these
+    /// pending publishes of this (the origin) shard — stored, held and acknowledged, or
+    /// not — one answer per hand-off, sent once per dispatch batch.
     ShardDone {
         /// The answering shard.
         shard: u8,
-        /// The pending publish on this (the origin) shard.
-        id: u64,
-        /// What its deliveries came to.
-        outcome: DurableOutcome,
-        /// Whether a subscriber there took it (fan-out evidence, as a peer's `Reached`).
-        reached: bool,
+        /// The settled hand-offs, in the order they settled.
+        answers: Vec<shards::ShardAnswer>,
     },
 
     /// A peer node's link came up; register it and send our interest snapshot.
@@ -2204,6 +2204,11 @@ impl HubCommand {
             | Self::Ping { .. }
             | Self::Draining
             | Self::ShardDone { .. }
+            // ADR 0093 D3: a batch of hand-offs is work another shard already admitted
+            // and bounded by its per-pair cap, and it must never wait behind this
+            // shard's data lane — which parks while a target is at ITS cap: two shards
+            // each waiting for the other's batches on a parked lane would never answer.
+            | Self::ShardDeliver(_)
             | Self::Admin(_) => Lane::Control,
             Self::Publish { .. }
             | Self::PublishBatch(_)
@@ -2243,7 +2248,6 @@ impl HubCommand {
             | Self::RemoteSharedInterest { .. }
             | Self::InheritedSessions { .. }
             | Self::ShardRoute { .. }
-            | Self::ShardDeliver(_)
             | Self::Flush { .. }
             | Self::Drained { .. } => Lane::Data,
             #[cfg(test)]
@@ -2911,6 +2915,10 @@ pub struct Hub {
     /// Whether an off-loop inherited-session scan is running (ADR 0042 T9,
     /// exhibit ⑥) — one at a time.
     inherited_scan_inflight: bool,
+    /// Whether that scan is the boot scan or one a takeover window started, not the
+    /// periodic reconcile: only those keep write elision's takeover window open
+    /// ([`takeover_window_open`](Self::takeover_window_open), ADR 0089 Amendment 2).
+    scan_is_takeover: bool,
     /// How many inherited-session scans this hub has started, and the committed
     /// ownership epoch the latest one started at (issue #1031). One scan runs at a
     /// time, so the scan that lands is always the latest started; a forward held for
@@ -3143,6 +3151,29 @@ pub struct Hub {
     /// Scratch: the subscribers of the publish being dispatched that other shards own,
     /// taken by [`Hub::flush_handoffs`] at the end of its fan-out.
     handoff: Vec<shards::ShardTarget>,
+    /// ADR 0093 D3: the hand-offs collected during this dispatch batch, per target shard,
+    /// sent as one [`HubCommand::ShardDeliver`] each at the batch's end
+    /// ([`Hub::flush_shard_batches`]).
+    handoff_batches: Vec<Vec<shards::ShardDeliver>>,
+    /// ADR 0093 D3: the hand-offs this shard settled during the batch, per origin,
+    /// answered as one [`HubCommand::ShardDone`] each at the batch's end.
+    shard_done_batches: Vec<Vec<shards::ShardAnswer>>,
+    /// ADR 0093 D3, the per-pair credit: how many gated hand-offs each target shard still
+    /// owes this one an answer for, and the cap at which this loop stops taking its
+    /// publishers' commands (the data lane) until a target answers — so a shard that
+    /// answers late parks the publishers that feed it, and no shard's queue of hand-offs
+    /// grows past what it settles within the stall budget.
+    handoff_inflight: Vec<u32>,
+    handoff_inflight_cap: u32,
+    /// ADR 0093 D3: the ingress credit of the publish being dispatched (ADR 0082 T3),
+    /// for a hand-off to take with it; what is left when the dispatch ends is released
+    /// then, as it always was.
+    publish_credit: Option<crate::ingress::IngressPermit>,
+    /// ADR 0093 D4's second arm (`node.hub_handoff_wake = "remote"`): every shard's
+    /// mailbox, and the mailman that wakes a shard for what was posted to it. `None`:
+    /// a batch goes on the shard's channel and the wake is this worker's.
+    shard_mailboxes: Option<Arc<[shards::ShardMailbox]>>,
+    mailman: Option<std::sync::mpsc::Sender<u8>>,
     /// Prometheus metrics (ADR 0020), when enabled. Updated on the publish/deliver paths.
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
     /// The node's ingress credit (ADR 0082 T3), held only to export its gauges: the hub
@@ -3234,7 +3265,12 @@ const RETAINED_QUEUE_CAP: usize = 1024;
 /// retransmission: 65,536 entries is ~28 MiB of 200-byte telemetry and ~4 GiB of
 /// 64 KiB messages, and a bound that depends on what clients choose to send is
 /// not a bound.
-const PENDING_PUBLISH_CAP: usize = 65_536;
+///
+/// ADR 0093 D3, since the two-shard runs: a FLOOR, not a cliff. Over it the oldest
+/// entry is evicted only once it has waited past `PENDING_STALL_BUDGET` (1 s, in
+/// `forwarding.rs`); a table of young entries over the count is a hand-off or a peer
+/// answering within the budget, and is admitted. The byte bound below stays hard.
+pub(crate) const PENDING_PUBLISH_CAP: usize = 65_536;
 
 /// The BYTE bound on the same table (see [`forwarding::PendingTable`]), under the
 /// same overflow policy. 64 MiB holds the full 65,536 entries of telemetry-sized
@@ -3423,6 +3459,13 @@ impl Hub {
                 shard_txs: Vec::new(),
                 shard_append_pending: HashMap::default(),
                 handoff: Vec::new(),
+                handoff_batches: Vec::new(),
+                shard_done_batches: Vec::new(),
+                handoff_inflight: Vec::new(),
+                handoff_inflight_cap: shards::DEFAULT_HANDOFF_INFLIGHT,
+                publish_credit: None,
+                shard_mailboxes: None,
+                mailman: None,
                 held_forwards: Vec::new(),
                 elision: Box::default(),
                 forward_windows: HashMap::default(),
@@ -3489,6 +3532,7 @@ impl Hub {
                 forward_index: HashMap::default(),
                 durable_writes: 0,
                 inherited_scan_inflight: false,
+                scan_is_takeover: false,
                 scan_started: (0, None),
                 interest_authoritative: false,
                 interest_suppressed_ticks: 0,
@@ -3789,7 +3833,7 @@ impl Hub {
         // The boot window's FIRST inherited-session scan runs immediately, not a
         // sweep tick later: on a fresh or restarted node it completes in
         // milliseconds and releases any publish acks gated on it (ADR 0042 T9).
-        self.spawn_inherited_session_scan();
+        self.spawn_inherited_session_scan(true);
         let mut since_yield = 0usize;
         loop {
             // ADR 0082 T2: sort what has arrived into the two lanes, then take the next
@@ -3832,6 +3876,9 @@ impl Hub {
                     if self.elision.entries > 0 {
                         self.expire_elided();
                     }
+                    // ADR 0093 D3: the batch's hand-offs and answers go to their shards
+                    // now, once per batch, before this loop gives up its worker.
+                    self.flush_shard_batches();
                     tokio::task::yield_now().await;
                 }
                 continue;
@@ -3839,6 +3886,9 @@ impl Hub {
             if closed {
                 break;
             }
+            // Nothing left to dispatch: what this batch owes other shards goes out
+            // before the loop parks (ADR 0093 D3).
+            self.flush_shard_batches();
             tokio::select! {
                 cmd = self.rx.recv() => match cmd {
                     Some(cmd) => self.enqueue(cmd),
@@ -3849,6 +3899,10 @@ impl Hub {
                 () = elision_wake(&self.elision), if self.elision.entries > 0 => {
                     self.expire_elided();
                 }
+                // ADR 0093 D4: another shard posted to this one's mailbox and the mailman
+                // woke this loop for it; `ingest` takes it next round.
+                () = shards::mailbox_wake(self.shard_mailboxes.as_deref(), self.shard),
+                    if self.shard_mailboxes.is_some() => {}
             }
         }
     }
@@ -3856,14 +3910,34 @@ impl Hub {
     /// The next command to dispatch: the oldest control command, else the oldest data
     /// command (ADR 0082 T2). Within a lane, arrival order is kept.
     fn next_command(&mut self) -> Option<HubCommand> {
-        self.control_q
-            .pop_front()
-            .or_else(|| self.data_q.pop_front())
+        if let Some(cmd) = self.control_q.pop_front() {
+            return Some(cmd);
+        }
+        // ADR 0093 D3: a target shard at its hand-off cap parks this loop's publishers:
+        // their commands wait in the data lane, their credit with them, and the pool
+        // parks the connections behind them; the hand-offs and the answers that reopen
+        // the lane travel on the control lane above.
+        if self.handoff_gated() {
+            return None;
+        }
+        self.data_q.pop_front()
     }
 
     /// Move up to [`HUB_INGEST_BATCH`] commands from the channel into their lanes.
     /// Returns `true` when the channel is closed (every sender gone).
     fn ingest(&mut self) -> bool {
+        // ADR 0093 D4: what another shard left in this one's mailbox, ahead of the
+        // channel — the mailman woke this loop for it, or it was found here anyway.
+        let posted = self
+            .shard_mailboxes
+            .as_deref()
+            .and_then(|boxes| boxes.get(usize::from(self.shard)))
+            .map(shards::ShardMailbox::take);
+        if let Some(posted) = posted {
+            for cmd in posted {
+                self.enqueue(cmd);
+            }
+        }
         for _ in 0..HUB_INGEST_BATCH {
             match self.rx.try_recv() {
                 Ok(cmd) => self.enqueue(cmd),
@@ -4277,13 +4351,12 @@ impl Hub {
                 filters,
                 online,
             } => self.apply_shard_route(&client, filters, online),
-            HubCommand::ShardDeliver(d) => self.dispatch_shard_deliver(*d),
-            HubCommand::ShardDone {
-                shard,
-                id,
-                outcome,
-                reached,
-            } => self.shard_done(shard, id, outcome, reached),
+            HubCommand::ShardDeliver(b) => self.dispatch_shard_batch(*b),
+            HubCommand::ShardDone { shard, answers } => {
+                for a in answers {
+                    self.shard_done(shard, a.id, a.outcome, a.reached);
+                }
+            }
             // Peer- and cluster-facing commands.
             other => self.dispatch_cluster(other).await,
         }
@@ -4357,9 +4430,11 @@ impl Hub {
             done,
             v5,
             publisher,
-            // Held to the end of this dispatch, then dropped: the publish's
-            // ingress credit returns to its connection and the pool (ADR 0082 T3).
-            credit: _credit,
+            // Held through the fan-out, where a hand-off to another shard may take it
+            // along (ADR 0093 D3); what is left is dropped when this dispatch ends, and
+            // the publish's ingress credit returns to its connection and the pool
+            // (ADR 0082 T3).
+            credit,
         } = cmd
         else {
             debug_assert!(false, "route_publish routes Publish commands only");
@@ -4427,6 +4502,7 @@ impl Hub {
         // 0020-T4; since issue #242 the durable appends themselves run
         // off-loop and are timed by `durable_append_latency_seconds`).
         let started = Instant::now();
+        self.publish_credit = credit;
         let durable = self
             .publish(
                 &topic,
@@ -4440,6 +4516,22 @@ impl Hub {
                 live_only,
             )
             .await;
+        // Not taken by a hand-off: held on the pending entry until the publisher is
+        // answered (ADR 0093 Amendment 2), so a publish whose ack waits on its durable
+        // appends, a subscriber's PUBACK or a peer keeps its bytes in the pool, and a
+        // durable path that falls behind parks the publishers at their sockets before
+        // the pending table's bound would evict with the acks withheld. Released at
+        // the answer (`try_complete_pending`, `refuse_pending`), or with the entry; at
+        // once for a publish nobody waits on.
+        if let Some(credit) = self.publish_credit.take() {
+            if let Some(id) = gate.filter(|id| {
+                self.pending_publishes
+                    .get(*id)
+                    .is_some_and(|p| !p.ack_released())
+            }) {
+                self.pending_publishes.hold_credit(id, credit);
+            }
+        }
         if let Some(m) = &self.metrics {
             m.observe_deliver_latency(started.elapsed().as_secs_f64());
         }
@@ -7441,9 +7533,9 @@ impl Hub {
         self.expiry_reconcile_tick = self.expiry_reconcile_tick.wrapping_add(1);
         if self.takeover_reconcile_ticks > 0 {
             self.takeover_reconcile_ticks -= 1;
-            self.spawn_inherited_session_scan();
+            self.spawn_inherited_session_scan(true);
         } else if self.periodic_scan_wanted()
-            && self.expiry_reconcile_tick % EXPIRY_RECONCILE_EVERY == 0
+            && self.expiry_reconcile_tick % EXPIRY_RECONCILE_EVERY == self.periodic_scan_phase()
         {
             // The `routing_unsettled()` half is the LIVENESS condition item 2.2
             // must not drop (issue #613 item 2.2 follow-up). `last_scan_complete`
@@ -7476,7 +7568,12 @@ impl Hub {
             // deadlines and subscriptions from, and it is what releases the acks
             // gated on it (ADR 0042 T9). So does the takeover-window arm above —
             // arming it at all already means something moved.
-            self.spawn_inherited_session_scan();
+            //
+            // This arm is the periodic reconcile, not a takeover: its scan leaves
+            // write elision on (ADR 0089 Amendment 2), and each shard runs it at its
+            // own phase of the cycle (`periodic_scan_phase`), so a node's shards never
+            // enumerate the store all at once (ADR 0093 Amendment 2).
+            self.spawn_inherited_session_scan(false);
         }
 
         // Drive the settle pass from the SWEEP, not from a scan completion
@@ -7606,6 +7703,33 @@ impl Hub {
             && (self.takeover_reconcile_ticks > 0 || self.inherited_scan_inflight)
     }
 
+    /// Whether a takeover WINDOW is open for write elision (ADR 0089 D2, Amendment 2):
+    /// the eager migration window is armed, or the boot scan or a scan that window
+    /// started is still materialising sessions. Narrower than
+    /// [`takeover_open`](Self::takeover_open), which a forward's answer waits on
+    /// (#1053): the periodic reconcile scan is not a takeover. It runs every
+    /// [`EXPIRY_RECONCILE_EVERY`] ticks on a settled node, the sessions it materialises
+    /// are offline (never held), and a move it might find can land in any of the
+    /// seconds between two scans, while elision runs anyway; turning elision off for
+    /// its flight wrote every delivery of the node for that time, every 30 s (the h3
+    /// runs of 2026-11-02 with four shards, ADR 0093 Amendment 2).
+    fn takeover_window_open(&self) -> bool {
+        self.sessions_can_move()
+            && self.clustered()
+            && (self.takeover_reconcile_ticks > 0
+                || (self.inherited_scan_inflight && self.scan_is_takeover))
+    }
+
+    /// The tick of each [`EXPIRY_RECONCILE_EVERY`] at which this shard runs its periodic
+    /// scan (ADR 0093 Amendment 2): shard `k` of `K` at `k × EVERY / K`, so a node's
+    /// shards spread their enumerations of the store over the cycle instead of running
+    /// them together. `0` with one shard, as before.
+    fn periodic_scan_phase(&self) -> u32 {
+        let k = u32::from(self.shard);
+        let shards = u32::from(self.shard_count.max(1));
+        EXPIRY_RECONCILE_EVERY * k / shards
+    }
+
     /// Whether a session can move to this node: it has a durable plane (with
     /// node-local storage a session never changes owner).
     #[cfg(not(test))]
@@ -7622,10 +7746,16 @@ impl Hub {
                 .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn spawn_inherited_session_scan(&mut self) {
+    /// `takeover`: the boot scan or one the takeover window starts, which keeps write
+    /// elision's window open until it lands; `false` for the periodic reconcile. A
+    /// takeover's request while a periodic scan is in flight makes that scan the
+    /// takeover's: one scan at a time, and the window must last until it lands.
+    fn spawn_inherited_session_scan(&mut self, takeover: bool) {
         if self.inherited_scan_inflight {
+            self.scan_is_takeover |= takeover;
             return;
         }
+        self.scan_is_takeover = takeover;
         #[cfg(test)]
         self.probe
             .scans_started
@@ -7739,6 +7869,7 @@ impl Hub {
     /// [`inherited_deadline`](Self::inherited_deadline).
     fn inherit_sessions(&mut self, sessions: Vec<mqtt_storage::ScannedSession>, complete: bool) {
         self.inherited_scan_inflight = false;
+        self.scan_is_takeover = false;
         self.last_scan_complete = complete;
         // The interest-authoritative transition (0043-P4 exhibit ②): once one
         // COMPLETE scan has landed over a WHOLE mesh, this hub's routing table
@@ -8827,13 +8958,20 @@ impl Hub {
         // `reroute_grace` stays in `obligations_done` deliberately: an unanswered
         // forward whose target died is doubt about the EVIDENCE, not about the
         // routing view, and item 2.1 does not widen into it.
+        let mut answered = false;
         if let Some(p) = self.pending_publishes.get_mut(id) {
             if !p.ack_awaits_settle && p.answer(PublishOutcome::Accepted) {
+                answered = true;
                 debug!(publish = id, topic = %p.topic, "pending publish complete; ack released");
                 if let Some(m) = &self.metrics {
                     m.observe_publish_ack(p.created_at.elapsed().as_secs_f64());
                 }
             }
+        }
+        // Answered: its ingress credit goes back now, though a settle window may keep
+        // the entry for its replay (ADR 0093 Amendment 2).
+        if answered {
+            self.pending_publishes.release_credit(id);
         }
         // Retire the entry only when the settle window is done with it AND its
         // publisher has been answered. The second condition is structural, not a
@@ -10150,6 +10288,7 @@ mod tests {
     mod elision_behind;
     mod elision_late_ack;
     mod forward_repeat;
+    mod held_credit;
     mod message_events;
     mod pending_gauges;
     mod qos2_retirement;
