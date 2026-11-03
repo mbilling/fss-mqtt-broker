@@ -82,7 +82,7 @@
 | [0072](../adr/0072-per-message-durability-selection.md) | # 0072. Per-message durability selection: the `mqttd-durability` user property | Accepted | [1/2 done](0072-per-message-durability-selection.md) | 1 deferred |
 | [0073](../adr/0073-scale-out-durable-ownership.md) | # 0073. Scale-out durable ownership: the voter set is a control plane, not the data path | Accepted | [3/10 done](0073-scale-out-durable-ownership.md) | 7 deferred |
 | [0074](../adr/0074-detached-ack-truncate.md) | # 0074. The subscriber-ack truncate leaves the hub loop's critical path | Accepted | [3/3 done](0074-detached-ack-truncate.md) | — |
-| [0075](../adr/0075-pipelined-durable-appends.md) | # 0075. Pipelined durable appends — the window stops paying the round trip per message | Accepted | [1/1 done](0075-pipelined-durable-appends.md) | — |
+| [0075](../adr/0075-pipelined-durable-appends.md) | # 0075. Pipelined durable appends — the window stops paying the round trip per message | Accepted | [2/2 done](0075-pipelined-durable-appends.md) | — |
 | [0076](../adr/0076-self-measuring-sharded-store.md) | # 0076. The self-measuring sharded store — the volume's capacity becomes the broker's business | Accepted | [3/3 done](0076-self-measuring-sharded-store.md) | — |
 | [0077](../adr/0077-workload-targeted-performance.md) | # 0077. Workload-targeted performance — a shape is not a result without its tail | Proposed | [6/10 done](0077-workload-targeted-performance.md) | 4 deferred |
 | [0078](../adr/0078-replica-segment-log.md) | # 0078. The replica store becomes an append-only segment log — the disk is the limit, not the B-tree | Accepted | [3/4 done](0078-replica-segment-log.md) | 1 open |
