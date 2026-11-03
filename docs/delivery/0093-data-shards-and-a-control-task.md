@@ -441,6 +441,53 @@ short; the runtime's workers default to the physical cores; the generator drains
 publishers before its consumers. Each in its own PR, with the amendment of the ADR that
 owns it (0089 for the writer, 0092 for the runtime).
 
+**The combined build measured on h3** (2026-11-03, `h3-20261103T130326Z`: this branch with
+#1190's writer batch bound, #1193's worker default and #1195's drain order merged locally;
+four shards, the ladder from 300,000, stopped by the maintainer after 122,900's three rounds
+and 138,300's first; 39 min, about USD 1.60):
+
+| offered | verdict | received | ack p99 | each loop's busy | hub µs a message | elided | the writer |
+|---|---|---|---|---|---|---|---|
+| 300,000 | failed | 110,979 | 13.1 s | 0.35 | 12.4 | one in four | ~102,000 ops/s, 1,024-op batches at 11–13 ms |
+| 240,000 | failed | 123,688 | 12.2 s | 0.37 | 11.7 | one in four | the same |
+| 192,000 | failed | 131,479 | 13.1 s | 0.39 | 11.8 | one in three | the same |
+| 153,600 | offer not taken | 107,474 | 14.6 s | 0.36 | 12.5 | — | the same |
+| **122,900** | **carried** | 122,900 | 1.7 ms | 0.26 | 8.1 | all | idle after the round's start |
+| 138,300 | carried (one round; stopped) | 138,300 | 1.9 ms | 0.29 | 8.2 | all | idle |
+
+The writer's batch bound backfires. Every round from 153,600 up, and the 300,000 prime, fell
+into write mode in its first seconds and stayed there, where the morning's unbounded build
+stayed elided in 22 of 24 rounds up to 342,200. The bound did what it says — batches of
+exactly 1,024 ops, commits of 11–13 ms instead of about 550 — and that is the problem: a
+write is in flight for its wait in the queue, not its commit alone, and with one fsync per
+1,024 ops the writer clears a backlog at about 102,000 ops/s, where the unbounded one, paying
+one fsync for everything queued, cleared it at 120,000–165,000. Write mode starts the same way
+in both builds (the round's attach writes and first-delivery block reservations, then A5),
+and a round leaves it only when the writer catches up: the bounded writer cannot above about
+120,000 msg/s, the unbounded one could up to 327,100. The 30 ms the amendment assumed between
+two deliveries on one topic was one publisher's interval; a session's topic gets a delivery
+every 1.7 ms at 300,000. Neither the disk (63 MB/s of 125, 37% busy) nor the CPU (7.5–8.2
+broker cores) was the limit; the loops ran at 0.35 busy with their queues empty, waiting on
+credit held by writes. Below the ceiling the broker is unharmed: 122,900 and 138,300 carried
+at 1.7–1.9 ms with every delivery elided, and a collapsed round left no hangover for the
+next. #1190 is to be withdrawn, its evidence recorded in ADR 0075. The way out of write mode
+is A5 itself — a delivery behind a write in flight queued behind it, still elided — which is
+the next decision, with the levers for the knee: dealing a `$share` publish to a member on
+the publisher's own shard (three of four publishes take a hand-off with four shards: 8.5 µs
+a message against 7.7 with two), yielding less often when the loop's queue is deep (22–27%
+of a loop's time is the yield every 64 commands and its wake), and eight shards (the config
+caps at four; the hand-off bitmask allows eight), with the connection path's 28 of the 36.6
+µs of CPU a message after that.
+
+The other two held up. The runtime found the 16 physical cores on its own (`runtime: 16
+worker threads (the physical cores)` in the broker's log; one bug: the line prints before
+`mqttd --version` answers, to fix in #1193). The drain order did what it was built for: in
+every collapsed round the consumers received 213,000–226,000 more deliveries after the
+publishers closed, no broker drop counter moved, and the ledger's acknowledged-but-missing
+count was 0 — the missing were publishes the broker never read before their sockets closed,
+which the verdict still calls FAILED ("ledger did not close") where it is the offer not
+taken; a refinement for verdict.py.
+
 ## Changelog
 
 - **2026-11-02** — ADR 0093 written from the prototype's four runs (ADR 0092 T5, #1163),
@@ -491,3 +538,9 @@ owns it (0089 for the writer, 0092 for the runtime).
   297,900, for 17% less CPU a message; two rounds fell into write mode (A5 over 550 ms
   commits), and every drop was the teardown's. Decided: bound the writer's batch, workers
   default to the physical cores, the generator drains publishers before consumers.
+- **2026-11-03** — The combined build measured on h3 (under Progress): #1190's writer batch
+  bound backfires — every round from 153,600 up stayed in write mode, the bounded writer
+  clearing a backlog at 102,000 ops/s against 120,000–165,000 unbounded, and the knee fell
+  from 327,100 to between 138,300 and 153,600; to be withdrawn. #1193 found the 16 cores;
+  #1195's settle received 213,000–226,000 deliveries a round after the publishers closed,
+  with no drop and no acknowledged loss.
