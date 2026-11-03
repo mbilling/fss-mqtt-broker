@@ -948,11 +948,49 @@ def next_rate(steps: list[dict], cfg: dict) -> tuple[float | None, str]:
             return None, f"not carried at the lowest step ({min(bads):g} msg/s)"
         return nxt, "coarse step down (nothing carried yet)"
     if (hi - lo) / lo <= gap:
-        return None, f"knee bracketed: good at {lo:g}, not at {hi:g} msg/s ({(hi - lo) / lo * 100:.1f}% gap)"
+        return band_rate(judged, measured, cfg, gap, gran,
+                         f"knee bracketed: good at {lo:g}, not at {hi:g} msg/s ({(hi - lo) / lo * 100:.1f}% gap)")
     mid = nice((lo + hi) / 2, gran)
     if mid in measured or mid <= lo or mid >= hi:
-        return None, f"knee bracketed at the step granularity: good at {lo:g}, not at {hi:g} msg/s"
+        return band_rate(judged, measured, cfg, gap, gran,
+                         f"knee bracketed at the step granularity: good at {lo:g}, not at {hi:g} msg/s")
     return mid, f"bisect between {lo:g} and {hi:g}"
+
+
+def band_rate(judged: list[dict], measured: set, cfg: dict, gap: float, gran: float,
+              done: str) -> tuple[float | None, str]:
+    """After the knee: the next step that brackets a latency band's edge, or (None, done).
+
+    `band_bisect` (ms) names the gated-p99 bands whose highest carried step the report
+    states. Without it that figure is whatever coarse step happened to fall inside the
+    band: the ×1.25 ladder of 2026-11-03 read the ≤ 1 s band as 300,000 when it carried
+    375,000 at 3.1 s, and the edge was somewhere in between. Largest band first: lo is the
+    highest carried step inside it, hi the lowest judged step above lo (carried outside the
+    band, or not carried), and the planner bisects between them to the knee's gap. A band
+    with no carried step inside it, or no judged step above that one, has nothing to
+    bracket. One step serves every band it falls in.
+    """
+    bands = [float(b) for b in cfg.get("band_bisect") or []]
+    if not bands:
+        return None, done
+    for band in sorted(bands, reverse=True):
+        inside = [s["rate"] for s in judged
+                  if s["verdict"] == CARRIED and s.get("gate_p99_us") is not None
+                  and s["gate_p99_us"] <= band * 1000]
+        if not inside:
+            continue
+        lo = max(inside)
+        above = [s["rate"] for s in judged if s["rate"] > lo]
+        if not above:
+            continue
+        hi = min(above)
+        if (hi - lo) / lo <= gap:
+            continue
+        mid = nice((lo + hi) / 2, gran)
+        if mid in measured or mid <= lo or mid >= hi:
+            continue
+        return mid, f"bisect the ≤ {band:g} ms band between {lo:g} (p99 inside it) and {hi:g} msg/s"
+    return None, f"{done}; the latency bands are bracketed"
 
 
 def ladder_steps(ladder: Path, before: str | None = None) -> list[dict]:

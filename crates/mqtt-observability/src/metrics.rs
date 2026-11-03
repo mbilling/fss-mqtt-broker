@@ -172,8 +172,8 @@ struct ShardLabel {
 /// The most hub loops a node runs (`node.hub_shards`, ADR 0092 T5), and each one's
 /// label value — resolved once, like the classes, so the loop's per-command
 /// observation allocates nothing.
-pub const HUB_SHARDS: usize = 4;
-const SHARD_LABELS: [&str; HUB_SHARDS] = ["0", "1", "2", "3"];
+pub const HUB_SHARDS: usize = 8;
+const SHARD_LABELS: [&str; HUB_SHARDS] = ["0", "1", "2", "3", "4", "5", "6", "7"];
 
 /// Every `{command}` class the hub records, in the order of [`Metrics::hub_dispatch_cache`]
 /// (ADR 0092 T3: the hub loop observes one of these per command, so each handle is
@@ -407,6 +407,7 @@ struct OtelInstruments {
     hub_fanout_peer_visits: OtelCounter<u64>,
     hub_queue_depth: OtelGauge<i64>,
     hub_lane_depth: OtelGauge<i64>,
+    hub_yields: OtelCounter<u64>,
     ingress_paused: OtelCounter<u64>,
     ingress_paused_seconds: OtelHistogram<f64>,
     ingress_credit_bytes: OtelGauge<i64>,
@@ -575,6 +576,7 @@ impl OtelInstruments {
             hub_fanout_peer_visits: meter.u64_counter("hub_fanout_peer_visits").build(),
             hub_queue_depth: meter.i64_gauge("hub_queue_depth").build(),
             hub_lane_depth: meter.i64_gauge("hub_lane_depth").build(),
+            hub_yields: meter.u64_counter("hub_yields").build(),
             ingress_paused: meter.u64_counter("ingress_paused").build(),
             ingress_paused_seconds: meter.f64_histogram("ingress_paused_seconds").build(),
             ingress_credit_bytes: meter.i64_gauge("ingress_credit_bytes").build(),
@@ -740,6 +742,8 @@ pub struct Metrics {
     hub_queue_depth: Family<ShardLabel, Gauge>,
     /// ADR 0082 T2: the hub's queued commands by lane, `control` and `data`.
     hub_lane_depth: Family<LaneLabel, Gauge>,
+    /// ADR 0093 Amendment 3: how often each hub loop handed its worker back.
+    hub_yields_total: Family<ShardLabel, Counter>,
     /// ADR 0082 T3: client connections that stopped reading for want of ingress
     /// credit, and for how long each pause lasted.
     ingress_paused_total: Counter,
@@ -1134,6 +1138,14 @@ impl Metrics {
             "Commands queued for the single-threaded hub loop (issue #613 item \
              3.5), per loop (`shard`, ADR 0092 T5). A loop is one task, so this IS \
              the statement \"work is arriving faster than it is retired\"",
+        );
+        let hub_yields_total = register_family(
+            &mut registry,
+            "hub_yields",
+            "Times a hub loop handed its worker back to the runtime, per loop (`shard`): \
+             every 64 commands while its queue is shallow, every 1,024 while it is deep \
+             (ADR 0093 Amendment 3), so yields a second against commands a second reads \
+             the rule at work",
         );
         let hub_lane_depth = register_gauge_family(
             &mut registry,
@@ -2053,6 +2065,7 @@ impl Metrics {
             hub_fanout_peer_visits_total,
             hub_queue_depth,
             hub_lane_depth,
+            hub_yields_total,
             ingress_paused_total,
             ingress_paused_seconds,
             ingress_credit_bytes,
@@ -2453,6 +2466,19 @@ impl Metrics {
         self.otel
             .hub_queue_depth
             .record(clamp_gauge(n), &[KeyValue::new("shard", SHARD_LABELS[s])]);
+    }
+
+    /// Hub loop `shard` handed its worker back to the runtime (ADR 0093 Amendment 3).
+    pub fn hub_yielded(&self, shard: u8) {
+        let s = usize::from(shard).min(HUB_SHARDS - 1);
+        self.hub_yields_total
+            .get_or_create(&ShardLabel {
+                shard: SHARD_LABELS[s].to_string(),
+            })
+            .inc();
+        self.otel
+            .hub_yields
+            .add(1, &[KeyValue::new("shard", SHARD_LABELS[s])]);
     }
 
     /// Set one lane of `hub_lane_depth` (ADR 0082 T2) for one hub loop (ADR 0092 T5).
