@@ -5,6 +5,9 @@
 # A nightly failure is triaged with the ADR 0042 exhibit-ledger discipline:
 # it lands as a row in the ADR 0044 findings ledger (docs/delivery/
 # 0044-release-readiness-assurance.md) before it is fixed or waived.
+#
+# Every job names `ubuntu-24.04`, not `ubuntu-latest`: the label moved to Ubuntu 26.04 on
+# 2026-11-02 and both kind jobs broke on that image (#1200). Lift the pin under #1200.
 name: nightly
 
 on:
@@ -22,7 +25,7 @@ permissions:
 jobs:
   proc-sweep:
     name: out-of-process seed sweep
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -47,7 +50,7 @@ jobs:
 
   stress-sweep:
     name: in-process stress sweep
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -61,7 +64,7 @@ jobs:
 
   fips-protocol:
     name: protocol suites against the fips binary
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # ADR 0068 T3, the nightly half: the client-visible protocol behaviour must
     # be identical under the validated module — proven by running the real
     # suites against a fips-built broker, not asserted.
@@ -81,7 +84,7 @@ jobs:
 
   upgrade:
     name: two-binary rolling upgrade
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -96,7 +99,7 @@ jobs:
 
   swim-stop:
     name: a stopped broker is not declared dead, and a stopped prober declares nobody
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # ADR 0016's amendments of 2026-10-13 (issues #975, #1002), on real processes.
     # One of twelve signed-gossip brokers is stopped for two seconds, eight times, and
     # no broker may declare it DEAD. And of two brokers, the one whose last direct
@@ -133,7 +136,7 @@ jobs:
 
   soak:
     name: one-hour soak (drift watermarks)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 110
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -146,7 +149,7 @@ jobs:
 
   bench:
     name: hot-path benchmarks (ADR 0044 P6)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -166,7 +169,7 @@ jobs:
 
   fuzz:
     name: fuzz every attacker-reachable parser (ADR 0044 P5)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
       fail-fast: false # one target's finding must not hide the others' runs
@@ -230,7 +233,7 @@ jobs:
 
   kube-smoke:
     name: kubernetes runtime smoke (kind)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -254,7 +257,7 @@ jobs:
 
   operator-e2e:
     name: operator end-to-end (kind)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # 60, not 45: the run grew from 3 assertions to 9 (RBAC minimality, scale, founder
     # guard, break-glass fence, operator restart mid-incident, leader failover, brownout
     # detection, CR-deletion GC), and several of them wait out real timers — a 30s Lease
@@ -280,7 +283,7 @@ jobs:
 
   admin-scenarios:
     name: admin API operator scenarios (compose)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # ~3 min of scenarios locally (sixteen fresh clusters, several waiting out real failure
     # detection) plus the image and host-binary builds.
     timeout-minutes: 60
@@ -313,7 +316,7 @@ jobs:
 
   oidc:
     name: OIDC integration (real Keycloak, forced rotation) (ADR 0050 T4)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -333,7 +336,7 @@ jobs:
 
   msrv:
     name: minimum supported Rust version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     # The declared `rust-version` is a PROMISE to anyone pinning an older
     # toolchain, and nothing checked it: every other job runs `stable` or the
@@ -391,7 +394,7 @@ jobs:
 
   image-smoke:
     name: container image, as a user runs it
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     # Every other test drives the BINARY, which left the image itself untested —
     # and the gap was not theoretical. The published v0.9.0-rc image runs as uid
