@@ -1,7 +1,7 @@
 # ADR 0093 — K data shards per node and one control task: the hub's split
 
-- **Status:** Proposed
-- **Date:** 2026-11-02
+- **Status:** Accepted
+- **Date:** 2026-11-02 (accepted the same day)
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0093-data-shards-and-a-control-task.md](../delivery/0093-data-shards-and-a-control-task.md) — plan, progress, and changelog
 - **Issues:** [#1163](https://github.com/mbilling/fss-mqtt-broker/issues/1163) (this record, ADR 0092 T5),
@@ -258,6 +258,73 @@ two shards carry more than one loop at an ack p99 within the one loop's band, ho
 their connections above the knee; then the README's per-node figures move, by the rig's
 numbers only.
 
+## Amendment 1 (2026-11-02): a shard deals `$share` among its own members first
+
+**What was measured.** T2 and T3's six h3 runs (one `m6i.8xlarge`, two shards; the rows
+are in the delivery doc) fit one ratio at every step to within 1%: the knee is the two
+loops' summed busy divided by the hub-µs a message. The prototype reached 118,700 at 1.02
+busy and 8.6 µs; T2's builds stayed at 0.92–1.04 busy and paid 9.2–9.5 µs, against the
+one loop's 6.9. About 2.4 µs of every message is the hand-off, and under D6 as written half
+of all deals cross shards on h3 and on `fanin-qos1`: a publish is dealt among every member
+of the node, and half of any group's members sit on the other shard.
+
+**The decision changes in one place, D6.** With locality on (`cluster.shared_prefer_local`,
+the default), a shard deals a `$share` publish among the online members it owns, by the
+same constant-time index — its own online members are kept as a prefix of the group's
+online prefix — and hands the publish to the other shard's members only when it owns no
+member online. Each shard turns its own cursor, so its members take equal turns: fairness
+is kept within a shard and given up across shards, the trade ADR 0077's prefer-local makes
+across nodes. Members split unevenly over the shards (a 500-member group about 250 ± 11 a
+shard, a 108-member one 54 ± 5), so a member on the less populated side takes a few
+percent more, up to about 10% in a small group; ADR 0091 D4's skip of a member that
+cannot keep up is unchanged. With locality off, dealing is the node-wide round-robin of
+D6. An ordinary subscriber, or a `#` subscriber, on the other shard still takes a
+hand-off: D6's limit for a broad subscriber stands.
+
+**What it should buy, to be measured.** On h3 and on `fanin-qos1` no `$share` deal
+crosses, so the pair's cost per message falls toward the one loop's 6.9 µs; at the 0.92–1.04
+summed busy measured so far, the knee is 133,000–150,000. The cross-shard wakes, the main
+suspect for the loops sharing one worker, go with the hand-offs, so the busy may rise too.
+One h3 run and one fan-in run against T2 and T3's rows (task T9).
+
+## Amendment 2 (2026-11-02): the bounds that push back come before the ones that drop
+
+**What was measured.** Four shards on h3 (`h3-20261102T214752Z`, the first run with the
+rig's host samples; rows in the delivery doc): the knee is 164,900, with the broker at 7.2
+of the host's 32 CPUs and each loop at 0.37 busy, so no resource set it. Every failed round
+went the same way. Each shard's periodic inherited-session scan turned write elision off for
+its flight (ADR 0089 Amendment 2), every 30 s; from 167,500 the writes swamped the writer
+and the data disk (gp3, 125 MB/s provisioned), an append took about a second, the pending
+entries passed the stall budget, and the bound evicted them with their acks withheld. The
+generator then dropped thousands of its 20,000 clients. Nothing pushed back first: a
+publish's ingress credit returned to the pool when the hub had dispatched it, so every
+socket was read at the full offer until the bound dropped acks. The maintainer's rule, the
+same evening: no time bound without a buffer bound that pushes back before it.
+
+**The decision changes in three places.**
+
+- **D3: the credit is held until the answer.** A publish whose publisher waits for an
+  answer keeps its ingress credit on its pending entry until that answer goes out, through
+  the append lanes, the elision window, the hand-offs and a peer's verdict alike; one nobody
+  waits for releases it at dispatch, as before. Nothing an answer waits for takes credit (an
+  append, a subscriber's PUBACK, a shard's or a peer's answer), so there is no cycle. A
+  durable path that falls behind now parks the publishers at their sockets, OFFER NOT
+  TAKEN, where it filled the pending table.
+- **D3: the pool is sized to the pending table's floor.** A pool nobody configured (256 MiB,
+  or 1/8 of the memory watermark) is at most 65,536 × the per-publish overhead a shard,
+  about 56 MiB. A full pool of the cheapest publishes is then the table's count floor, and
+  the stall budget, which evicts only over the floor, cannot drop a client publish's ack.
+  A configured pool is used as given, with a warning at startup when it is larger.
+- **The periodic scan runs on each shard in turn.** Shard `k` of `K` runs it at `k × 30 / K`
+  seconds into the 30-second reconcile cycle, so a node's shards no longer enumerate the
+  store at once. One scan a node, its results routed to the shards, was the other way. It
+  would move every shard's scan state, the flag #1053's held forwards wait on among it, into
+  a shared path, to save store reads alone once the scan leaves elision on.
+
+**What it should buy, to be measured.** The four-shard knee rising from 164,900 toward the
+loops' ceiling, and a durable path that falls behind shown as OFFER NOT TAKEN, never
+DISCONNECTED: one h3 run with four shards and one with two (task T10).
+
 ## Consequences
 
 - **The split's cost is known before it is built:** about 2 µs a message for the hand-off,
@@ -300,8 +367,8 @@ numbers only.
 
 ## Delivery
 
-Eight tasks: the control task and its snapshots (T1), hand-offs with credit and batching
+Nine tasks: the control task and its snapshots (T1), hand-offs with credit and batching
 (T2), the worker capture removed by measurement (T3), the ENA packet-rate probe on AWS
 (T4), the cluster paths on shards (T5), a shard's failure modes (T6), the four-shard knee
-against D8 (T7), and the hot-group and `#`-subscriber shapes (T8). Status in the delivery
-doc.
+against D8 (T7), the hot-group and `#`-subscriber shapes (T8), and shard-local `$share`
+dealing (T9, Amendment 1). Status in the delivery doc.
