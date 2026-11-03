@@ -375,13 +375,6 @@ async fn serve() -> Result<(), StartupError> {
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "info".to_string()),
     );
-    {
-        let (workers, why) = runtime_workers();
-        info!(
-            workers,
-            "runtime: {workers} worker threads ({why}; ADR 0092 Amendment 4)"
-        );
-    }
 
     // `--version` / `-V` and `--help` / `-h`: local, print-and-exit, before any subcommand
     // or config work (#169). `--version` in particular MUST exist — an operator typing it
@@ -465,6 +458,17 @@ async fn serve() -> Result<(), StartupError> {
         crypto = mqtt_net::tls::crypto_module(),
         "starting mqttd"
     );
+    {
+        // Logged here, after every print-and-exit verb above has had its turn: the
+        // runtime is built before them, but `--version` and `--help` are answered by
+        // their output alone, with no line of the broker's beside it (ADR 0092
+        // Amendment 4).
+        let (workers, why) = runtime_workers();
+        info!(
+            workers,
+            "runtime: {workers} worker threads ({why}; ADR 0092 Amendment 4)"
+        );
+    }
     log_effective_config(&config);
 
     // ADR 0046 T4: the running config, shared with the policy reload closures so a `SIGHUP` /

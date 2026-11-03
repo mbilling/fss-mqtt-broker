@@ -181,6 +181,13 @@ fn help_and_version_still_exit_successfully_without_loading_config() {
             stdout.contains(concat!("mqttd ", env!("CARGO_PKG_VERSION"))),
             "{stdout}"
         );
+        // The answer is the output alone: the runtime's startup line (ADR 0092
+        // Amendment 4) belongs to a boot, and a version probe that captures stderr
+        // must not read it.
+        assert!(
+            !stderr.contains("worker threads"),
+            "{arg}: the runtime's startup line printed: {stderr}"
+        );
         if matches!(arg, "--help" | "-h") {
             for option in ["--config", "--url", "--pid", "--timeout"] {
                 assert!(stdout.contains(option), "help omitted {option}: {stdout}");
