@@ -26,9 +26,10 @@ use tracing::debug;
 use super::lanes::AppendGate;
 use super::{min_qos, parse_shared, ClientSubs, DurableOutcome, Hub, HubCommand};
 
-/// The most shards a node may run (`MQTTD_HUB_SHARDS`): the prototype's bound, and
-/// the width of [`super::forwarding::PendingPublish::shard_outstanding`]'s bits.
-pub const MAX_SHARDS: usize = 4;
+/// The most shards a node may run (`MQTTD_HUB_SHARDS`): the width of
+/// [`super::forwarding::PendingPublish::shard_outstanding`]'s bits, a byte (four until
+/// ADR 0093 Amendment 3).
+pub const MAX_SHARDS: usize = 8;
 
 /// ADR 0093 D3, the per-pair credit's default (`node.hub_handoff_inflight`): how many
 /// gated hand-offs one shard may owe another an answer for before the origin stops
@@ -498,6 +499,13 @@ impl Hub {
     /// [`DEFAULT_HANDOFF_INFLIGHT`]. `0` means no cap.
     pub fn set_handoff_inflight_cap(&mut self, cap: u32) {
         self.handoff_inflight_cap = cap;
+    }
+
+    /// ADR 0093 Amendment 3: the queue depth from which this loop yields every
+    /// [`super::HUB_YIELD_EVERY_DEEP`] commands (`node.hub_yield_deep`). `0` turns the
+    /// rule off.
+    pub fn set_hub_yield_deep(&mut self, deep: u32) {
+        self.yield_deep = usize::try_from(deep).unwrap_or(usize::MAX);
     }
 
     /// Whether a target shard is at its hand-off cap, so this loop's data lane waits
