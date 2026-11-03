@@ -84,7 +84,8 @@ pub struct Node {
     /// How many hub loops ("data shards") the node runs (`MQTTD_HUB_SHARDS`, ADR 0092 T5's
     /// prototype): each owns the clients of disjoint placement groups, and a publish
     /// matched on one shard is handed to the others for the subscribers they own. Default
-    /// `1`, the one loop; `2` to `4` is the one-node prototype, refused on a node that
+    /// `1`, the one loop; `2` to `8` (ADR 0093 Amendment 3; `4` before it) is the one-node
+    /// prototype, refused on a node that
     /// names peers (`cluster.peers`, `cluster.swim.seeds`) and run with a warning on a
     /// node alone in its cluster. With `hub_thread = true`, shard `k` is pinned to
     /// `hub_core + k`. Restart-scoped.
@@ -106,6 +107,16 @@ pub struct Node {
     /// removes the cap (the prototype's behaviour: the pair collapses above its knee).
     /// Nothing with one shard. Restart-scoped.
     pub hub_handoff_inflight: u32,
+    /// ADR 0093 Amendment 3 (`MQTTD_HUB_YIELD_DEEP`): the queue depth, in commands, from
+    /// which a hub loop keeps its worker for 1,024 commands between yields instead of 64.
+    /// Below it the loop yields every 64 commands, so a command that reaches a quiet loop
+    /// waits at most a batch; from it the queue is the latency, and a yield buys nothing
+    /// but the wake that brings the loop back (22–27% of a loop's time at the four-shard
+    /// knee). 1,024 (the default) is one ingest batch. `0` turns the rule off: every 64
+    /// commands, always. The rule applies on the shared multi-thread runtime; a loop on a
+    /// thread of its own (`hub_thread`) yields every 64 commands regardless.
+    /// Restart-scoped.
+    pub hub_yield_deep: u32,
 }
 
 /// The node id a broker uses when the operator sets none.
@@ -127,6 +138,7 @@ impl Default for Node {
             hub_shards: 1,
             hub_handoff_wake: "local".to_string(),
             hub_handoff_inflight: 16_384,
+            hub_yield_deep: 1024,
         }
     }
 }
@@ -1462,6 +1474,11 @@ impl Config {
         on!("MQTTD_HUB_HANDOFF_INFLIGHT", v, {
             self.node.hub_handoff_inflight = num("MQTTD_HUB_HANDOFF_INFLIGHT", &v)?;
         });
+        // ADR 0093 Amendment 3: the queue depth from which a loop yields less often; 0
+        // turns the rule off.
+        on!("MQTTD_HUB_YIELD_DEEP", v, {
+            self.node.hub_yield_deep = num("MQTTD_HUB_YIELD_DEEP", &v)?;
+        });
         on!("MQTTD_FAILURE_DOMAINS", v, {
             let mut m = BTreeMap::new();
             for pair in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -2603,6 +2620,7 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_HUB_SHARDS",
     "MQTTD_HUB_HANDOFF_WAKE",
     "MQTTD_HUB_HANDOFF_INFLIGHT",
+    "MQTTD_HUB_YIELD_DEEP",
     "MQTTD_OWNERSHIP_DOMAIN",
     // limits
     "MQTTD_MAX_CONNECTIONS",
@@ -2858,8 +2876,10 @@ mod tests {
         assert_eq!(d.hub_handoff_wake, "local");
         // ADR 0093 D3: the per-pair credit's cap.
         assert_eq!(d.hub_handoff_inflight, 16_384);
+        // ADR 0093 Amendment 3: a loop yields less often from one ingest batch queued.
+        assert_eq!(d.hub_yield_deep, 1024);
         let c = Config::from_toml(
-            "[node]\nhub_thread = true\nhub_core = 3\nhub_shards = 2\nhub_handoff_wake = \"remote\"\nhub_handoff_inflight = 4096\n[durable]\nallow_ephemeral = true\n",
+            "[node]\nhub_thread = true\nhub_core = 3\nhub_shards = 2\nhub_handoff_wake = \"remote\"\nhub_handoff_inflight = 4096\nhub_yield_deep = 256\n[durable]\nallow_ephemeral = true\n",
         )
         .unwrap();
         assert!(c.node.hub_thread);
@@ -2867,6 +2887,7 @@ mod tests {
         assert_eq!(c.node.hub_shards, 2);
         assert_eq!(c.node.hub_handoff_wake, "remote");
         assert_eq!(c.node.hub_handoff_inflight, 4096);
+        assert_eq!(c.node.hub_yield_deep, 256);
 
         let mut c = Config::default();
         c.overlay_from(getter(&[
@@ -2875,6 +2896,7 @@ mod tests {
             ("MQTTD_HUB_SHARDS", "2"),
             ("MQTTD_HUB_HANDOFF_WAKE", " Remote "),
             ("MQTTD_HUB_HANDOFF_INFLIGHT", "0"),
+            ("MQTTD_HUB_YIELD_DEEP", "0"),
         ]))
         .unwrap();
         assert!(c.node.hub_thread);
@@ -2882,6 +2904,7 @@ mod tests {
         assert_eq!(c.node.hub_shards, 2);
         assert_eq!(c.node.hub_handoff_wake, "remote", "trimmed and lower-cased");
         assert_eq!(c.node.hub_handoff_inflight, 0, "0 removes the cap");
+        assert_eq!(c.node.hub_yield_deep, 0, "0 turns the rule off");
 
         // An explicit on/off, never a guess; a core is a number.
         let mut c = Config::default();
@@ -3887,10 +3910,12 @@ mod tests {
             // MQTTD_REPLICAS (ADR 0080): a valid factor that is not the default (2).
             "MQTTD_BACKUP_KEEP" | "MQTTD_RESTORE_TIMEOUT" | "MQTTD_REPLICAS" => "3",
             // MQTTD_HUB_SHARDS (ADR 0092 T5): the default is one loop, and the node refuses
-            // more than four, so "7" would not start a node; four is the most it runs.
+            // more than eight (ADR 0093 Amendment 3); four is a count every build ran.
             "MQTTD_HUB_SHARDS" => "4",
             // MQTTD_HUB_HANDOFF_INFLIGHT (ADR 0093 D3): a cap that is not the default.
             "MQTTD_HUB_HANDOFF_INFLIGHT" => "4096",
+            // MQTTD_HUB_YIELD_DEEP (ADR 0093 Amendment 3): a depth that is not the default.
+            "MQTTD_HUB_YIELD_DEEP" => "512",
             // Paths / addresses / lists / keys.
             _ => "x-sentinel",
         }
@@ -4112,8 +4137,9 @@ mod tests {
             // plus MQTTD_HUB_THREAD and MQTTD_HUB_CORE (ADR 0092 D1),
             // plus MQTTD_HUB_SHARDS (ADR 0092 T5),
             // plus MQTTD_HUB_HANDOFF_WAKE (ADR 0093 D4),
-            // plus MQTTD_HUB_HANDOFF_INFLIGHT (ADR 0093 D3).
-            134,
+            // plus MQTTD_HUB_HANDOFF_INFLIGHT (ADR 0093 D3),
+            // plus MQTTD_HUB_YIELD_DEEP (ADR 0093 Amendment 3).
+            135,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never

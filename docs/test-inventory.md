@@ -1542,7 +1542,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 914 test(s)
+## `crates/mqttd/src/lib.rs` — 915 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -2243,6 +2243,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::unreadable_session::a_truncated_unread_list_never_counts_as_complete`
 - `hub::tests::while_draining_a_rule_derived_forward_holds_the_barrier_until_the_peer_answers`
 - `hub::tests::without_no_local_a_publisher_receives_its_own_delivery`
+- `hub::yield_rule::a_deep_queue_yields_less_often_and_zero_turns_the_rule_off`
 - `ingress::tests::a_shard_that_holds_its_whole_pool_leaves_the_other_shards_pool_untouched`
 - `ingress::tests::an_unconfigured_pool_is_at_most_the_pending_floor_a_shard`
 - `ingress::tests::credit_is_returned_when_the_permit_drops_and_the_cap_bounds_one_connection`
