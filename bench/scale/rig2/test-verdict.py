@@ -901,6 +901,47 @@ class Ramp(unittest.TestCase):
         steps.append(st(22500, V.NOT_TAKEN))
         self.assertEqual(self.nxt(steps)[0], 18800)  # bisect from the last CARRIED, 15000
 
+    def test_the_latency_bands_are_bracketed_after_the_knee_when_asked(self):
+        # The knee is bracketed (17900 carried, 18400 not: 2.8%). Without `band_bisect`
+        # the ladder ends there, and the ≤ 1 s band reads 10000 — the only carried step
+        # inside it — with its edge anywhere up to 15000.
+        steps = [st(10000, V.CARRIED, p99_us=5_000), st(15000, V.CARRIED, p99_us=2_000_000),
+                 st(22500, V.NOT_TAKEN, p99_us=4_000_000), st(18800, V.NOT_TAKEN, p99_us=4_000_000),
+                 st(16900, V.CARRIED, p99_us=2_500_000), st(17900, V.CARRIED, p99_us=3_000_000),
+                 st(18400, V.NOT_TAKEN, p99_us=4_000_000)]
+        rate, why = self.nxt(steps)
+        self.assertIsNone(rate)
+        self.assertIn("knee bracketed", why)
+        # Asked for the ≤ 1 s band: bisect between 10000 (inside it) and 15000 (the lowest
+        # judged step above it) to the knee's 3%.
+        rate, why = self.nxt(steps, band_bisect=[1000])
+        self.assertEqual(rate, 12500)
+        self.assertIn("≤ 1000 ms band between 10000", why)
+        steps.append(st(12500, V.CARRIED, p99_us=200_000))
+        self.assertEqual(self.nxt(steps, band_bisect=[1000])[0], 13800)  # 13750 rounds half up
+        steps.append(st(13800, V.CARRIED, p99_us=1_500_000))
+        self.assertEqual(self.nxt(steps, band_bisect=[1000])[0], 13200)  # 13150
+        steps.append(st(13200, V.CARRIED, p99_us=900_000))
+        self.assertEqual(self.nxt(steps, band_bisect=[1000])[0], 13500)  # a 4.5% gap still
+        steps.append(st(13500, V.CARRIED, p99_us=950_000))
+        rate, why = self.nxt(steps, band_bisect=[1000])
+        self.assertIsNone(rate)  # 13500 to 13800 is 2.2%
+        self.assertIn("knee bracketed", why)
+        self.assertIn("the latency bands are bracketed", why)
+        # Three bands, largest first: the ≤ 1 s band is done, so the ≤ 250 ms band is next:
+        # 12500 (200 ms) is inside it and 13200 (900 ms) the lowest step above.
+        rate, why = self.nxt(steps, band_bisect=[1000, 250, 100])
+        self.assertEqual(rate, 12900)  # 12850
+        self.assertIn("≤ 250 ms band between 12500", why)
+        steps.append(st(12900, V.CARRIED, p99_us=300_000))
+        # 12500 to 12900 is 3.2%: one more step; then the ≤ 100 ms band, 10000 (5 ms)
+        # against 12500, the lowest judged step above it.
+        self.assertEqual(self.nxt(steps, band_bisect=[1000, 250, 100])[0], 12700)
+        steps.append(st(12700, V.CARRIED, p99_us=240_000))
+        self.assertEqual(self.nxt(steps, band_bisect=[1000, 250, 100])[0], 11300)  # 11250
+        # A band with no carried step inside it has nothing to bracket.
+        self.assertIsNone(self.nxt(steps, band_bisect=[1])[0])
+
     def test_a_failed_step_stops_the_ladder(self):
         rate, why = self.nxt([st(10000, V.CARRIED), st(15000, V.FAILED)])
         self.assertIsNone(rate)
