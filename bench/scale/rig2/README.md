@@ -435,6 +435,14 @@ first rate steps down by the factor instead. `MAX_STEPS` (14; local 3) and `MAX_
 bound a ladder. The ramp reads only step verdicts, so a step's rounds never make the
 ladder rerun it.
 
+`BAND_BISECT` (off) names ack p99 bands in ms (`1000`, or `1000,250,100` for the report's
+three) whose edge the ladder brackets after the knee: the next step is the midpoint between
+the highest carried step inside the band and the lowest judged step above it, to `GAP_PCT`,
+largest band first; one step serves every band it falls in. Without it a band's figure is
+whatever coarse step happened to fall inside it — the ×1.25 ladder of 2026-11-03 read the
+≤ 1 s band as 300,000 when 375,000 carried at 3.1 s, with the edge somewhere between. About
+three or four steps a band; raise `MAX_STEPS` by as many.
+
 **Transient retries.** One bad round must not cap a ladder when nothing below it pointed at
 the knee. A FAILED, OFFER NOT TAKEN, DISCONNECTED or NOT DRAINED round of a step whose
 nearest carried step below it had its (mean) gated p99 (ack; QoS 0: end-to-end) under

@@ -125,6 +125,11 @@ DRAIN_QUIET_FACTOR="${DRAIN_QUIET_FACTOR:-2}"
 FACTOR="${FACTOR:-1.5}"
 GAP_PCT="${GAP_PCT:-3}"
 GRANULARITY="${GRANULARITY:-100}"
+# After the knee, bracket the edge of these ack-p99 bands too (ms, comma-separated; the
+# report's bands are 1000,250,100), each to GAP_PCT. Off when empty: a band's figure is then
+# whatever coarse step fell inside it. About three or four steps a band — raise MAX_STEPS
+# by as many.
+BAND_BISECT="${BAND_BISECT:-}"
 MIN_RATE="${MIN_RATE:-$GRANULARITY}"
 MAX_RATE="${MAX_RATE:-2000000}"
 MAX_STEPS="${MAX_STEPS:-$DEF_MAX_STEPS}"
@@ -998,6 +1003,7 @@ json.dump({"workload": "$WORKLOAD", "arm": "$ARM", "binary": """$BINARY_DESC""",
            "ramp": {"start_rate": $START_RATE, "factor": $FACTOR, "gap_pct": $GAP_PCT, "granularity": $GRANULARITY,
                     "min_rate": $MIN_RATE, "max_rate": $MAX_RATE, "void_retries": $VOID_RETRIES,
                     "bisect_on_fail": bool($BISECT_ON_FAIL), "latency_gate": "$LATENCY_GATE",
+                    "band_bisect": [int(b) for b in "$BAND_BISECT".replace(",", " ").split()],
                     "retry_p99_ms": $RETRY_P99_MS, "retry_max": $RETRY_MAX, "rounds": $ROUNDS},
            "mqtt_load": {"qos": $QOS, "shape": "$SHAPE", "sessions": "$SESSIONS", "session_expiry_s": $SESSION_EXPIRY,
                          "payload": $PAYLOAD, "topics_per_generator": $TOPICS, "consumers": $CONSUMERS_N,
