@@ -59,7 +59,7 @@ pub const DEFAULT_POOL_BYTES: usize = 256 * 1024 * 1024;
 /// its publisher is answered, so a full pool parks the shard's publishers at their
 /// sockets before that table holds more than its floor of them, and the stall budget,
 /// which only ever evicts over the floor, never drops a client publish's ack. About
-/// 55 MiB: 65,536 × [`COMMAND_OVERHEAD`].
+/// 56 MiB: 65,536 × [`COMMAND_OVERHEAD`].
 pub const MAX_SHARD_POOL_BYTES: usize = crate::hub::PENDING_PUBLISH_CAP * COMMAND_OVERHEAD;
 
 /// The per-connection cap when unconfigured (ADR 0082 §5).

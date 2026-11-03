@@ -312,7 +312,7 @@ same evening: no time bound without a buffer bound that pushes back before it.
   TAKEN, where it filled the pending table.
 - **D3: the pool is sized to the pending table's floor.** A pool nobody configured (256 MiB,
   or 1/8 of the memory watermark) is at most 65,536 × the per-publish overhead a shard,
-  about 55 MiB. A full pool of the cheapest publishes is then the table's count floor, and
+  about 56 MiB. A full pool of the cheapest publishes is then the table's count floor, and
   the stall budget, which evicts only over the floor, cannot drop a client publish's ack.
   A configured pool is used as given, with a warning at startup when it is larger.
 - **The periodic scan runs on each shard in turn.** Shard `k` of `K` runs it at `k × 30 / K`

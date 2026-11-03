@@ -347,8 +347,8 @@ it is absorbed.
 ingress credit stays on its pending entry until its publisher is answered
 (`route_publish`, released in `try_complete_pending` or with the entry), so the pool now
 covers the answer as well as the queue. A pool nobody configured is at most
-`MAX_SHARD_POOL_BYTES` a shard, 65,536 × `COMMAND_OVERHEAD` (about 55 MiB): with one shard
-the default falls from 256 MiB to that, with four from 256 MiB to 220 MiB, and a full pool
+`MAX_SHARD_POOL_BYTES` a shard, 65,536 × `COMMAND_OVERHEAD` (about 56 MiB): with one shard
+the default falls from 256 MiB to that, with four from 256 MiB to 224 MiB, and a full pool
 of the cheapest publishes is the pending table's floor. Write elision's takeover window is
 `takeover_window_open`: the eager window, the boot scan or a scan the window started, never
 the periodic reconcile; the forwards #1053 holds still wait on any scan. Shard `k` of `K`
@@ -356,7 +356,41 @@ runs the periodic scan at tick `k × 30 / K` of the cycle. The one scan a node p
 above became this stagger: routing one scan's results to every shard would put the scan
 state #1053's forwards wait on behind a shared path, for store reads alone once elision
 stays on. Tests in `hub/tests/held_credit.rs`; with the three changes undone, the four
-tests aimed at them fail. The rig run is next.
+tests aimed at them fail.
+
+**T10 measured on h3** (2026-11-02, commit `0b4e243c` in the standard build: four shards in
+`h3-20261102T230920Z`, two in `h3-20261102T235219Z`; both ladders from 206,100):
+
+| shards | offered | verdict | received | ack p99 | each loop's busy | hub µs a message | broker CPU |
+|---|---|---|---|---|---|---|---|
+| 4 | 206,100 | carried | 206,100 | 2.8 ms | 0.46–0.48 | 9.1 | 8.6 cores |
+| 4 | 257,600 | carried | 257,599 | 25.4 ms | 0.65–0.66 | 10.2 | 10.8 cores |
+| 4 | 289,800 | carried | 289,695 | 400 ms | 0.72–0.73 | 10.0 | 12.7 cores |
+| 4 | **297,900** | **carried, the knee** | 297,823 | 612 ms | 0.72 | 9.7 | 13.1 cores |
+| 4 | 305,900 | offer not taken | 302,219 | 3.4 s | 0.70–0.73 | 9.4 | 14.0 cores |
+| 4 | 322,000 | offer not taken, twice | 295,860–304,413 | 4.8–4.9 s | 0.70 | 9.3 | 14.7 cores |
+| 2 | 164,900 | carried | 164,901 | 8.5 ms | 0.62–0.63 | 7.6 | 6.3 cores |
+| 2 | 185,500 | carried | 185,515 | 86.5 ms | 0.75 | 8.1 | 7.4 cores |
+| 2 | 195,800 | carried | 195,871 | 163 ms | 0.77 | 7.8 | 7.9 cores |
+| 2 | **201,000** | **carried, the knee** | 200,958 | 239 ms | 0.77 | 7.7 | 8.1 cores |
+| 2 | 206,100 | offer not taken | 201,457 | 4.0 s | 0.75–0.78 | 7.6 | 8.8 cores |
+
+Four shards' knee is 297,900, from 164,900 before T10 and above the pair's 206,100: 9,309
+msg/s per vCPU. The scan's bursts are gone: at 206,100 the four shards' scans arrive one
+at a time, spread over the cycle, and the writer takes at most 900 appends a second where
+every scan used to send it 8,000–16,000; the data disk writes under 1.5 MB/s at every step.
+Every step over a knee is OFFER NOT TAKEN, with no client disconnected and nothing dropped:
+the pool runs dry and the publishers wait at their sockets (at 206,100 the pair's busier
+shard held its whole 58.7 MB pool with 51,578 commands queued), where every earlier build
+disconnected them. The pair's knee is 201,000 against 206,100 before, one bisect step
+lower: its loops are at their ceiling there either way, and the smaller pool now refuses the
+2% that the deeper one used to queue at a 300 ms ack p99. The loops set both knees, the
+pair's at 0.77 busy and the four's at 0.72, where 22–27% of a loop's time is the yield every
+64 commands and its wake (41–104 µs mean lateness); a message costs the hub 7.7 µs with two
+shards and 9.7 with four. The machine is not the limit: at the four-shard knee the broker
+uses 13.1 cores, 44 µs of CPU a message, and the host 14.6 of its 32 CPUs, about its 16
+physical cores. Not measured: an overload 25% past either knee, where run 1 and the drain
+fix's 257,600 disconnected.
 
 ## Changelog
 
@@ -399,3 +433,7 @@ tests aimed at them fail. The rig run is next.
   most the pending table's floor a shard, and the periodic reconcile scan out of write
   elision's takeover window (ADR 0089 Amendment 2) and staggered over the shards. The
   four-shard and two-shard rig runs are next.
+- **2026-11-02** — T10 measured on h3 (under Progress): four shards' knee is 297,900, from
+  164,900, and every overload step is OFFER NOT TAKEN with no client disconnected; the
+  pair's knee is 201,000, one bisect step below its 206,100. The hub loops set both knees,
+  and the machine is at about its physical cores at the four-shard one.
