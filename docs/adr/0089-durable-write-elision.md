@@ -282,6 +282,29 @@ What it buys depends on how many publishers share a topic. In the T5 sweep every
 has its own topic, so a (session, topic) pair sees about 0.5 msg/s against 300 msg/s for
 the session. Where many publishers share one topic, the rule stays close to per session.
 
+## Amendment 2 — the periodic reconcile scan is not a takeover window (2026-11-02)
+
+Decided by the maintainer ("fix") on the four-shard h3 runs of ADR 0093 (Amendment 2 there,
+rows in its delivery doc).
+
+**What they showed.** D2 excludes a node "in a takeover window for that session's group".
+The implementation asked `takeover_open()`, which is also true while ANY inherited-session
+scan is in flight, and on a durable node the periodic reconcile starts one every 30 s.
+Every round of those runs showed it: for each scan's flight every delivery of the node was
+written, a burst of 8,000–16,000 appends every 30 s. Two shards absorbed it. Four shards at
+167,500 msg/s did not: the bistable path of Amendment 1 tipped over, the writer and the
+data disk fell behind, and the pending table's bound dropped acks.
+
+**The window, stated.** A takeover window is open while the eager migration window is armed
+(a peer's death, a membership or committed-lease change, and the boot) or while the boot
+scan or a scan that window started is in flight (`takeover_window_open`). The periodic
+reconcile scan does not open it. The sessions such a scan materialises are offline, so they
+are never held; and an ownership move it might find can land in any second between two
+scans, when elision runs anyway, so closing elision for the scan's own flight protected
+nothing. A takeover that asks for its scan while a periodic one is in flight takes that
+scan over, and the window lasts until it lands. The forwards #1053 holds still wait on any
+scan (`takeover_open`): that rule is about answering, not holding.
+
 ## Open questions
 
 - Whether a publish whose subscriber is on another node (a relocated session's frontend)

@@ -89,6 +89,23 @@ pub struct Node {
     /// node alone in its cluster. With `hub_thread = true`, shard `k` is pinned to
     /// `hub_core + k`. Restart-scoped.
     pub hub_shards: u8,
+    /// ADR 0093 D4: how a shard wakes another for a batch of hand-offs
+    /// (`MQTTD_HUB_HANDOFF_WAKE`). `"local"` (the default): the batch goes on the other
+    /// shard's channel and the wake is this worker's, which on this runtime puts the
+    /// woken shard in the sender's worker's LIFO slot, to run next on it. `"remote"`: the
+    /// batch is posted to the shard's mailbox and a thread of the node's own wakes it,
+    /// through the runtime's injection queue, for an idle worker to take. The arm the
+    /// ADR measures; nothing with one shard. Restart-scoped.
+    pub hub_handoff_wake: String,
+    /// ADR 0093 D3, the per-pair credit (`MQTTD_HUB_HANDOFF_INFLIGHT`): how many
+    /// acknowledged publishes one shard may have handed to another and not yet been
+    /// answered for before it stops taking its own publishers' commands until an answer
+    /// comes — the ingress credit then parks those publishers. A time in ADR 0091 D6's
+    /// form: 16,384 (the default) is about 0.16 s of the target's queue at 10 µs a
+    /// dispatch, well inside the 1 s stall budget that evicts a pending publish. `0`
+    /// removes the cap (the prototype's behaviour: the pair collapses above its knee).
+    /// Nothing with one shard. Restart-scoped.
+    pub hub_handoff_inflight: u32,
 }
 
 /// The node id a broker uses when the operator sets none.
@@ -108,6 +125,8 @@ impl Default for Node {
             hub_thread: false,
             hub_core: None,
             hub_shards: 1,
+            hub_handoff_wake: "local".to_string(),
+            hub_handoff_inflight: 16_384,
         }
     }
 }
@@ -1037,11 +1056,16 @@ pub struct Limits {
     /// over minutes degrades to read-mostly with a metric and a log line, instead of
     /// arriving as an OOM kill.
     pub memory_max_bytes: Option<u64>,
-    /// Bytes of client publishes that may wait for the hub at once, node-wide
-    /// (`MQTTD_HUB_INGRESS_BYTES`, ADR 0082 T3). Each publish holds credit for its topic,
-    /// payload and a fixed per-command overhead from the moment it is read until the hub
-    /// has dispatched it. Unset = 1/8 of [`Limits::memory_max_bytes`] when that is set,
-    /// otherwise 256 MiB. At least 4096. Restart-scoped.
+    /// Bytes of client publishes that may wait for the hub or for their answer at once,
+    /// node-wide (`MQTTD_HUB_INGRESS_BYTES`, ADR 0082 T3), split evenly over the hub
+    /// shards. Each publish holds credit for its topic, payload and a fixed per-command
+    /// overhead from the moment it is read until its publisher is answered, or until the
+    /// hub has dispatched it when nobody waits for an answer (ADR 0093 Amendment 2).
+    /// Unset = 1/8 of [`Limits::memory_max_bytes`] when that is set, otherwise 256 MiB,
+    /// and then at most about 56 MiB a hub shard: as many of the cheapest publishes as a
+    /// shard's pending table holds before its eviction bound applies, so a full pool parks
+    /// publishers at their sockets before that bound would drop an ack. A value set here
+    /// is used as given. At least 4096. Restart-scoped.
     pub hub_ingress_bytes: Option<u64>,
     /// The most of [`Limits::hub_ingress_bytes`] one connection may hold
     /// (`MQTTD_CONN_INGRESS_BYTES`, ADR 0082 T3), so one hot publisher cannot take the
@@ -1429,6 +1453,14 @@ impl Config {
         // ADR 0092 T5: the node's data shards (the prototype); 1 is the one loop.
         on!("MQTTD_HUB_SHARDS", v, {
             self.node.hub_shards = num("MQTTD_HUB_SHARDS", &v)?;
+        });
+        // ADR 0093 D4: the hand-off's wake, "local" or "remote" (checked at startup).
+        on!("MQTTD_HUB_HANDOFF_WAKE", v, {
+            self.node.hub_handoff_wake = v.trim().to_ascii_lowercase();
+        });
+        // ADR 0093 D3: the per-pair hand-off credit; 0 removes the cap.
+        on!("MQTTD_HUB_HANDOFF_INFLIGHT", v, {
+            self.node.hub_handoff_inflight = num("MQTTD_HUB_HANDOFF_INFLIGHT", &v)?;
         });
         on!("MQTTD_FAILURE_DOMAINS", v, {
             let mut m = BTreeMap::new();
@@ -2569,6 +2601,8 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_HUB_THREAD",
     "MQTTD_HUB_CORE",
     "MQTTD_HUB_SHARDS",
+    "MQTTD_HUB_HANDOFF_WAKE",
+    "MQTTD_HUB_HANDOFF_INFLIGHT",
     "MQTTD_OWNERSHIP_DOMAIN",
     // limits
     "MQTTD_MAX_CONNECTIONS",
@@ -2820,24 +2854,34 @@ mod tests {
         assert_eq!(d.hub_core, None);
         // ADR 0092 T5: one loop unless the prototype's shards are asked for.
         assert_eq!(d.hub_shards, 1);
+        // ADR 0093 D4: a hand-off's wake is the sender's worker's unless asked otherwise.
+        assert_eq!(d.hub_handoff_wake, "local");
+        // ADR 0093 D3: the per-pair credit's cap.
+        assert_eq!(d.hub_handoff_inflight, 16_384);
         let c = Config::from_toml(
-            "[node]\nhub_thread = true\nhub_core = 3\nhub_shards = 2\n[durable]\nallow_ephemeral = true\n",
+            "[node]\nhub_thread = true\nhub_core = 3\nhub_shards = 2\nhub_handoff_wake = \"remote\"\nhub_handoff_inflight = 4096\n[durable]\nallow_ephemeral = true\n",
         )
         .unwrap();
         assert!(c.node.hub_thread);
         assert_eq!(c.node.hub_core, Some(3));
         assert_eq!(c.node.hub_shards, 2);
+        assert_eq!(c.node.hub_handoff_wake, "remote");
+        assert_eq!(c.node.hub_handoff_inflight, 4096);
 
         let mut c = Config::default();
         c.overlay_from(getter(&[
             ("MQTTD_HUB_THREAD", "on"),
             ("MQTTD_HUB_CORE", "2"),
             ("MQTTD_HUB_SHARDS", "2"),
+            ("MQTTD_HUB_HANDOFF_WAKE", " Remote "),
+            ("MQTTD_HUB_HANDOFF_INFLIGHT", "0"),
         ]))
         .unwrap();
         assert!(c.node.hub_thread);
         assert_eq!(c.node.hub_core, Some(2));
         assert_eq!(c.node.hub_shards, 2);
+        assert_eq!(c.node.hub_handoff_wake, "remote", "trimmed and lower-cased");
+        assert_eq!(c.node.hub_handoff_inflight, 0, "0 removes the cap");
 
         // An explicit on/off, never a guess; a core is a number.
         let mut c = Config::default();
@@ -3845,6 +3889,8 @@ mod tests {
             // MQTTD_HUB_SHARDS (ADR 0092 T5): the default is one loop, and the node refuses
             // more than four, so "7" would not start a node; four is the most it runs.
             "MQTTD_HUB_SHARDS" => "4",
+            // MQTTD_HUB_HANDOFF_INFLIGHT (ADR 0093 D3): a cap that is not the default.
+            "MQTTD_HUB_HANDOFF_INFLIGHT" => "4096",
             // Paths / addresses / lists / keys.
             _ => "x-sentinel",
         }
@@ -4064,8 +4110,10 @@ mod tests {
             // plus MQTTD_DURABLE_WRITE_ELISION_MS (ADR 0089),
             // plus MQTTD_WRITE_STALL_KEEPALIVES and MQTTD_WRITE_STALL_TIMEOUT (#1117),
             // plus MQTTD_HUB_THREAD and MQTTD_HUB_CORE (ADR 0092 D1),
-            // plus MQTTD_HUB_SHARDS (ADR 0092 T5).
-            132,
+            // plus MQTTD_HUB_SHARDS (ADR 0092 T5),
+            // plus MQTTD_HUB_HANDOFF_WAKE (ADR 0093 D4),
+            // plus MQTTD_HUB_HANDOFF_INFLIGHT (ADR 0093 D3).
+            134,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never

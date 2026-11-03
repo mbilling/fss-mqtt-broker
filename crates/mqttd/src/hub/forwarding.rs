@@ -58,6 +58,15 @@ fn pending_cost(topic: &str, payload: &Bytes) -> usize {
     std::mem::size_of::<PendingPublish>() + topic.len() + payload.len()
 }
 
+/// ADR 0093 D3, in ADR 0091 D6's form: how long an entry over [`PENDING_PUBLISH_CAP`]
+/// may have waited before it is the one evicted. The count is a floor the table never
+/// evicts under; over it, young entries are admitted — `R × S` of them ride out a stall
+/// of `S` at `R` publishes a second, 120,000 at the h3 knee — under
+/// [`PENDING_PUBLISH_MAX_BYTES`] always, which stays hard: memory, not time, is what it
+/// protects. The prototype's pair evicted answered entries by the hundred thousand a
+/// round at the count alone, with every one of them younger than this.
+pub(super) const PENDING_STALL_BUDGET: Duration = Duration::from_secs(1);
+
 /// The pending-publish table: an id-ordered map that knows its own byte total.
 ///
 /// It is a type rather than a `BTreeMap` field plus a counter because the bound is
@@ -69,6 +78,12 @@ fn pending_cost(topic: &str, payload: &Bytes) -> usize {
 pub(super) struct PendingTable {
     entries: BTreeMap<u64, PendingPublish>,
     bytes: usize,
+    /// ADR 0093 D3: the ingress credit (ADR 0082 T3) of each entry with a hand-off to
+    /// another shard outstanding, held so the pool is charged for the hand-off's
+    /// lifetime and a shard that answers late parks the publishers that feed it.
+    /// Released by the last [`HubCommand::ShardDone`], or with the entry — beside the
+    /// entries, not on them, so the one-loop entry keeps its size.
+    credits: FastMap<u64, crate::ingress::IngressPermit>,
 }
 
 impl PendingTable {
@@ -127,6 +142,20 @@ impl PendingTable {
                 || self.bytes.saturating_add(cost) > PENDING_PUBLISH_MAX_BYTES)
     }
 
+    /// Whether `cost` more bytes stay within the byte bound.
+    pub(super) fn fits_bytes(&self, cost: usize) -> bool {
+        self.bytes.saturating_add(cost) <= PENDING_PUBLISH_MAX_BYTES
+    }
+
+    /// How long the OLDEST entry (the lowest id, the one eviction takes) has been
+    /// pending; zero when the table is empty.
+    pub(super) fn oldest_age(&self) -> Duration {
+        self.entries
+            .values()
+            .next()
+            .map_or(Duration::ZERO, |p| p.created_at.elapsed())
+    }
+
     pub(super) fn insert(&mut self, id: u64, mut entry: PendingPublish) {
         entry.cost = u32::try_from(pending_cost(&entry.topic, &entry.payload)).unwrap_or(u32::MAX);
         self.bytes += entry.cost as usize;
@@ -140,7 +169,21 @@ impl PendingTable {
     pub(super) fn remove(&mut self, id: u64) -> Option<PendingPublish> {
         let entry = self.entries.remove(&id)?;
         self.bytes -= entry.cost as usize;
+        self.credits.remove(&id);
         Some(entry)
+    }
+
+    /// ADR 0093 D3: hold `credit` for entry `id` while a hand-off is outstanding; an
+    /// entry that already holds one, or is gone, releases this one at once.
+    pub(super) fn hold_credit(&mut self, id: u64, credit: crate::ingress::IngressPermit) {
+        if self.entries.contains_key(&id) {
+            self.credits.entry(id).or_insert(credit);
+        }
+    }
+
+    /// Give entry `id`'s held credit back to the pool: the last shard answered.
+    pub(super) fn release_credit(&mut self, id: u64) {
+        self.credits.remove(&id);
     }
 
     /// Record that entry `id` has been handed to `clients` ([`PendingPublish::reached`]),
@@ -176,6 +219,7 @@ impl PendingTable {
     pub(super) fn pop_first(&mut self) -> Option<(u64, PendingPublish)> {
         let (id, entry) = self.entries.pop_first()?;
         self.bytes -= entry.cost as usize;
+        self.credits.remove(&id);
         Some((id, entry))
     }
 }
@@ -1481,6 +1525,16 @@ impl Hub {
         // bound anyway.
         let cost = pending_cost(topic, payload);
         while self.pending_publishes.is_full_for(cost) {
+            // ADR 0093 D3 (ADR 0091 D6's form): the entry count is a floor, not a
+            // cliff. Over it, the oldest entry is evicted only once it has waited longer
+            // than the stall budget: a table of young entries over the count is a
+            // hand-off or a peer answering within the budget, not a partition, and the
+            // newcomer is admitted. The byte bound stays hard.
+            if self.pending_publishes.fits_bytes(cost)
+                && self.pending_publishes.oldest_age() < PENDING_STALL_BUDGET
+            {
+                break;
+            }
             let Some((old_id, old)) = self.pending_publishes.pop_first() else {
                 break;
             };
@@ -4215,12 +4269,13 @@ mod zone_fwd_proofs {
         }
     }
 
-    /// At the pending table's bound a hold behaves as the table always has: the
-    /// OLDEST entry is evicted with its acknowledgement withheld and counted
-    /// (`pending-cap`), the newest is admitted, and neither bound is exceeded —
-    /// 65,536 entries and 64 MiB hold whatever is owed to a peer that cannot be
-    /// reached, and no more. An evicted publish leaves nothing behind in the index
-    /// of outstanding forwards.
+    /// At the pending table's bound a hold behaves as the table always has, with ADR
+    /// 0093 D3's one change: the entry count is a floor. Young entries over it are
+    /// admitted; once the OLDEST has waited past the stall budget it is evicted with its
+    /// acknowledgement withheld and counted (`pending-cap`), the newest is admitted, and
+    /// the byte bound is never exceeded — 64 MiB holds whatever is owed to a peer that
+    /// cannot be reached, and no more. An evicted publish leaves nothing behind in the
+    /// index of outstanding forwards.
     #[test]
     fn a_hold_at_the_pending_table_bound_evicts_the_oldest_and_withholds_its_ack() {
         let mut h = hub();
@@ -4237,14 +4292,32 @@ mod zone_fwd_proofs {
             h.pending_local_done(id);
             waiting.push(rx);
         }
-        assert_eq!(h.pending_publishes.len(), PENDING_PUBLISH_CAP);
+        // Every entry is younger than the stall budget: the ones over the count are
+        // admitted, and nothing is evicted for them.
+        assert_eq!(h.pending_publishes.len(), PENDING_PUBLISH_CAP + over);
         assert!(h.pending_publishes.bytes() <= PENDING_PUBLISH_MAX_BYTES);
+        assert!(
+            waiting
+                .iter_mut()
+                .all(|rx| matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty))),
+            "nothing is withheld while every entry is young"
+        );
+        // Age the oldest `over` past the budget: the next registration evicts exactly
+        // those, oldest first, and admits itself.
+        for (_, p) in h.pending_publishes.iter_mut().take(over) {
+            p.created_at = Instant::now() - 2 * PENDING_STALL_BUDGET;
+        }
+        let (id, rx) = register(&mut h, "t/x");
+        fan_out(&mut h, "t/x", QoS::AtLeastOnce, false, Some(id));
+        h.pending_local_done(id);
+        waiting.push(rx);
+        assert_eq!(h.pending_publishes.len(), PENDING_PUBLISH_CAP + 1);
         assert_eq!(
             h.forward_index.len(),
-            PENDING_PUBLISH_CAP,
+            PENDING_PUBLISH_CAP + 1,
             "one outstanding forward per entry held, none for an evicted one"
         );
-        assert_eq!(h.publishes_held_for_unreachable(), PENDING_PUBLISH_CAP);
+        assert_eq!(h.publishes_held_for_unreachable(), PENDING_PUBLISH_CAP + 1);
         for (i, rx) in waiting.iter_mut().enumerate() {
             let evicted = i < over;
             assert_eq!(
@@ -4539,6 +4612,11 @@ mod zone_fwd_proofs {
             let _ = register(&mut h, &format!("t/{i}"));
         }
         assert_eq!(h.pending_publishes.len(), PENDING_PUBLISH_CAP);
+        // ADR 0093 D3: the count is a floor; eviction over it takes entries that have
+        // waited past the stall budget, so every entry here has.
+        for (_, p) in h.pending_publishes.iter_mut() {
+            p.created_at = Instant::now() - 2 * PENDING_STALL_BUDGET;
+        }
 
         // One arrival past the cap evicts the oldest: the answered one.
         let _ = register(&mut h, "t/over-1");
@@ -4590,6 +4668,10 @@ mod zone_fwd_proofs {
         h.drain_gated.insert(gated);
         for i in 3..PENDING_PUBLISH_CAP {
             let _ = register(&mut h, &format!("t/{i}"));
+        }
+        // ADR 0093 D3: eviction over the count takes entries past the stall budget.
+        for (_, p) in h.pending_publishes.iter_mut() {
+            p.created_at = Instant::now() - 2 * PENDING_STALL_BUDGET;
         }
         let _ = register(&mut h, "t/over-1"); // evicts t/0, answered
         let _ = register(&mut h, "t/over-2"); // evicts t/1, a client's
@@ -4717,6 +4799,11 @@ mod pending_bounds {
         }
         assert_eq!(hub.pending_publishes.len(), PENDING_PUBLISH_CAP);
         assert!(!withheld(&mut first_wait), "nothing is evicted AT the cap");
+        // ADR 0093 D3: the count is a floor; the publish past it evicts the oldest only
+        // once that one has waited past the stall budget — so every entry here has.
+        for (_, p) in hub.pending_publishes.iter_mut() {
+            p.created_at = Instant::now() - 2 * PENDING_STALL_BUDGET;
+        }
 
         let (_new, _w) = register(&mut hub, "t", &payload);
         assert_eq!(hub.pending_publishes.len(), PENDING_PUBLISH_CAP);
