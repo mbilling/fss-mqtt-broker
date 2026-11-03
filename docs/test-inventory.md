@@ -274,7 +274,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 429 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 431 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -384,8 +384,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `durable_node::tests::admit_desired_keeps_a_current_voter_through_a_link_blip`
 - `durable_node::tests::current_and_pure_shrink_still_apply_while_the_node_stays_in_the_set`
 - `durable_node::tests::single_node_durable_store_bootstraps_and_serves`
+- `durable_plane::tests::a_burst_commits_in_batches_no_deeper_than_the_bound`
 - `durable_plane::tests::a_learner_is_ready_under_the_scale_out_capability`
 - `durable_plane::tests::deliver_to_unregistered_peer_is_unreachable`
+- `durable_plane::tests::large_records_bound_a_batch_by_bytes`
 - `durable_plane::tests::lease_group_ready_tracks_leadership_and_voter_membership`
 - `durable_plane::tests::lease_group_ready_waits_for_the_first_lease`
 - `durable_plane::tests::owner_writes_group_commit_with_follower_applies`

@@ -758,12 +758,53 @@ impl DurablePlane {
     }
 }
 
+/// Bound on the ops one writer commit takes (ADR 0075 Amendment 1). A commit's time
+/// grows with its batch, and ADR 0089 Amendment 1's A5 keeps a topic in write mode for
+/// as long as its write is in flight: on h3 (2026-11-03) unbounded batches of
+/// 35,000–73,000 ops committed in about 550 ms, long enough that every busy topic's next
+/// delivery found a write in flight, and write mode fed the writer that fed write mode.
+/// 1,024 ops at the ~11 µs an op measured there is about 12 ms a commit, under the
+/// ~30 ms between two deliveries on one topic at that load. Throughput is unchanged:
+/// the per-op cost dominates the barrier's fixed cost well before this depth.
+pub const MAX_BATCH_OPS: usize = 1_024;
+
+/// Bound on the record bytes one writer commit takes: the same bound for a node whose
+/// records are large, where [`MAX_BATCH_OPS`] could be hundreds of megabytes.
+pub const MAX_BATCH_BYTES: usize = 4 << 20;
+
+/// What an op adds to a batch's byte bound: its record, or a fixed share for the ops
+/// that carry none.
+fn op_bytes(op: &crate::cluster_log::ReplOp) -> usize {
+    match op {
+        crate::cluster_log::ReplOp::Append { record, .. } => record.len().max(64),
+        _ => 64,
+    }
+}
+
+/// Drain what is queued into `batch`, up to the batch bounds: until the queue is empty,
+/// [`MAX_BATCH_OPS`] ops are in, or [`MAX_BATCH_BYTES`] of records. `bytes` carries the
+/// batch's record bytes across the two drains of one batch.
+fn drain_bounded(
+    rx: &mut mpsc::UnboundedReceiver<ReplicaWrite>,
+    batch: &mut Vec<ReplicaWrite>,
+    bytes: &mut usize,
+) {
+    while batch.len() < MAX_BATCH_OPS && *bytes < MAX_BATCH_BYTES {
+        let Ok(next) = rx.try_recv() else {
+            break;
+        };
+        *bytes += op_bytes(&next.1);
+        batch.push(next);
+    }
+}
+
 /// Spawn the single **replica-writer** task for a node's follower copy (ADR 0027).
 ///
 /// Inbound `Replicate` frames send their op here rather than each fsyncing on its own.
-/// The writer takes the next queued op, **drains everything else already queued**, and
-/// applies the whole burst with one [`ReplicaState::apply_batch`] — a single fsync for
-/// the batch instead of one per message. Each waiting frame is then answered with its
+/// The writer takes the next queued op, **drains what else is queued, up to the batch
+/// bounds** ([`MAX_BATCH_OPS`], [`MAX_BATCH_BYTES`]; ADR 0075 Amendment 1), and applies
+/// the burst with one [`ReplicaState::apply_batch`] — a single fsync for the batch instead
+/// of one per message; what is left queued is the next batch. Each waiting frame is then answered with its
 /// op's accept/fence result. Under load this collapses N per-message fsyncs into one per
 /// batch (the contention ADR 0026 T4 found); at rest (one op in flight) it is exactly the
 /// previous one-op-per-commit behaviour. Returns the sender the plane keeps and the task's
@@ -786,11 +827,11 @@ fn spawn_replica_writer(
         // because a linger derived from no measurement is a guess.
         let mut mean_commit = std::time::Duration::ZERO;
         while let Some(first) = rx.recv().await {
-            // Coalesce the current backlog: this op plus everything already queued.
+            // Coalesce the current backlog: this op plus what is queued, up to the
+            // batch bounds (ADR 0075 Amendment 1); the rest is the next batch.
+            let mut bytes = op_bytes(&first.1);
             let mut batch = vec![first];
-            while let Ok(next) = rx.try_recv() {
-                batch.push(next);
-            }
+            drain_bounded(&mut rx, &mut batch, &mut bytes);
             // ADR 0076 T3, the ADAPTIVE half: after ADR 0075's group commit,
             // throughput is `batch depth x barrier rate`, and the depth a burst
             // reaches is whatever arrived during the previous commit. A batch
@@ -804,12 +845,16 @@ fn spawn_replica_writer(
             // commit has been measured, and the wait is skipped whenever the
             // drained batch is a single op (an uncontended writer must keep its
             // latency exactly as it is today).
-            if linger > 0.0 && batch.len() > 1 && mean_commit > std::time::Duration::ZERO {
+            // A batch already at its bound has nothing to gain from a linger.
+            if linger > 0.0
+                && batch.len() > 1
+                && batch.len() < MAX_BATCH_OPS
+                && bytes < MAX_BATCH_BYTES
+                && mean_commit > std::time::Duration::ZERO
+            {
                 let wait = mean_commit.mul_f64(linger);
                 tokio::time::sleep(wait).await;
-                while let Ok(next) = rx.try_recv() {
-                    batch.push(next);
-                }
+                drain_bounded(&mut rx, &mut batch, &mut bytes);
             }
             let mut ops = Vec::with_capacity(batch.len());
             let mut replies = Vec::with_capacity(batch.len());
@@ -1488,6 +1533,93 @@ mod tests {
             }
         }
 
+        p.raft().shutdown().await.unwrap();
+    }
+
+    /// Replicate `total` appends to distinct keys through the plane at once and return
+    /// how many were accepted; `record` is every op's record.
+    async fn replicate_burst(
+        p: &DurablePlane,
+        prefix: &str,
+        total: usize,
+        record: Vec<u8>,
+    ) -> usize {
+        let mut tasks = Vec::new();
+        for i in 0..total {
+            let plane = p.clone();
+            let record = record.clone();
+            let key = format!("{prefix}/{i}");
+            tasks.push(tokio::spawn(async move {
+                let frame = PeerMessage::Replicate {
+                    req_id: u64::try_from(i).expect("a test's count fits"),
+                    epoch: 1,
+                    op: ReplOp::Append {
+                        key,
+                        offset: 1,
+                        seq: 1,
+                        record,
+                    },
+                    queued: crate::peer::Queued::default(),
+                };
+                match plane.handle(frame).await {
+                    Some(PeerMessage::ReplicateAck { accepted, .. }) => accepted,
+                    _ => false,
+                }
+            }));
+        }
+        let mut accepted = 0;
+        for t in tasks {
+            if t.await.unwrap() {
+                accepted += 1;
+            }
+        }
+        accepted
+    }
+
+    /// A burst deeper than the batch bound commits in several batches, none deeper than
+    /// the bound (ADR 0075 Amendment 1), and every op in it is accepted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_burst_commits_in_batches_no_deeper_than_the_bound() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let p = node("bound-node").await;
+        let total = 2 * super::MAX_BATCH_OPS + 500;
+        let accepted = replicate_burst(&p, "b", total, vec![1]).await;
+        assert_eq!(accepted, total, "every op in the burst is accepted");
+        let stats = p.writer_stats();
+        let max_batch = stats.max_batch.load(Relaxed);
+        let batches = stats.batches.load(Relaxed);
+        assert!(
+            max_batch <= super::MAX_BATCH_OPS as u64,
+            "no batch deeper than the bound: {max_batch}"
+        );
+        assert!(
+            batches >= 3,
+            "{total} ops take at least three bounded batches, took {batches}"
+        );
+        p.raft().shutdown().await.unwrap();
+    }
+
+    /// Large records bound a batch by bytes: nine 1 MiB records commit in at least three
+    /// batches of at most four (ADR 0075 Amendment 1).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn large_records_bound_a_batch_by_bytes() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let p = node("bytes-node").await;
+        let per_batch = super::MAX_BATCH_BYTES / (1 << 20);
+        let total = 2 * per_batch + 1;
+        let accepted = replicate_burst(&p, "big", total, vec![7; 1 << 20]).await;
+        assert_eq!(accepted, total, "every large record is accepted");
+        let stats = p.writer_stats();
+        let max_batch = stats.max_batch.load(Relaxed);
+        let batches = stats.batches.load(Relaxed);
+        assert!(
+            max_batch <= per_batch as u64,
+            "no batch over {per_batch} MiB records: {max_batch}"
+        );
+        assert!(
+            batches >= 3,
+            "{total} large records take at least three bounded batches, took {batches}"
+        );
         p.raft().shutdown().await.unwrap();
     }
 }

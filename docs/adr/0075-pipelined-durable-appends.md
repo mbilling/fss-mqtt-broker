@@ -141,3 +141,39 @@ holding the store) is upheld by construction.
 - **A per-log driver task instead of lane-driven futures:** another owned
   task and channel for no behavioral difference; lane-driven inherits the
   right lifecycle for free.
+
+## Amendment 1 (2026-11-03): the writer's batch is bounded
+
+Decided by the maintainer on the h3 runs of ADR 0093 (its delivery doc, "Sixteen
+workers measured on h3"). The writer took "everything already queued" into one
+fsync'd batch, with no bound on the batch. That was right for throughput —
+throughput is batch depth × barrier rate, and a deeper batch is a cheaper op —
+and wrong for the one thing a commit's time governs besides throughput: ADR 0089
+Amendment 1's A5 keeps a topic in write mode for as long as a write on it is in
+flight, and a write is in flight for its whole commit. On h3, two rounds of 24
+fell into write mode in their first seconds and stayed there: the batches grew to
+35,000–73,000 ops and committed in about 550 ms, every busy topic's next delivery
+(about 30 ms apart at that load) found a write in flight and was written too,
+and write mode fed the writer that fed write mode — the bistable path of ADR
+0089 Amendment 1, with the writer's unbounded batch as the loop's gain. The acks
+ran 9–11 s and the generator's drain timed out. This is a timing with no buffer
+bound, which the maintainer's rule forbids: every wait needs a bound that pushes
+back before it.
+
+The bound: a batch takes at most `MAX_BATCH_OPS` (1,024) ops or `MAX_BATCH_BYTES`
+(4 MiB) of records, whichever comes first; what is left queued is the next batch,
+committed at once. ADR 0076 T3's linger (off by default) respects the same bound
+and is skipped for a batch already at it. At the ~11 µs an op measured on h3,
+1,024 ops is about 12 ms a commit, under the 30 ms between two deliveries on one
+topic there, so a topic's next delivery finds its write landed and is held
+(elided) instead of written; the loop's gain drops below one. Throughput is
+unchanged where it matters: the per-op cost dominates the barrier's fixed cost
+(about 0.5 ms) well before this depth, so 1,024-op commits do the same ops a
+second as 50,000-op ones, at a fiftieth of the latency. A deeper bound (4,096 →
+~45 ms) would have left the loop's gain above one at that load; the measurement
+that confirms this on h3 is the next rig run, with the other two decisions of that
+day (the runtime's workers, the generator's drain order).
+
+Not changed: the owner path's submit order (offset order), the in-order commit
+watermark, tail-fail; a batch's ops are the same ops in the same order, in more
+batches.
