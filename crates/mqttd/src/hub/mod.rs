@@ -2312,8 +2312,60 @@ pub(crate) enum Lane {
 const HUB_INGEST_BATCH: usize = 1024;
 
 /// Dispatches between cooperative yields while the hub is busy (ADR 0082 T2): the loop
-/// no longer awaits the channel per command, so it yields itself.
+/// no longer awaits the channel per command, so it yields itself. Also how often the
+/// housekeeping of a yield point runs (the sweep's tick, the elision expiry, the
+/// hand-off batches), whether or not the loop yields there (ADR 0093 Amendment 3).
 const HUB_YIELD_EVERY: usize = 64;
+
+/// Dispatches between yields while the loop's queue is deep (ADR 0093 Amendment 3): the
+/// queue is the latency then, and a yield buys nothing but the wake that brings the loop
+/// back, 22–27% of a loop's time at the four-shard knee.
+const HUB_YIELD_EVERY_DEEP: usize = 1024;
+
+/// The queue depth from which the loop yields every [`HUB_YIELD_EVERY_DEEP`] commands
+/// (`node.hub_yield_deep`'s default): one ingest batch.
+pub const DEFAULT_HUB_YIELD_DEEP: usize = HUB_INGEST_BATCH;
+
+/// How many commands the loop dispatches between yields with `queued` commands waiting
+/// (ADR 0093 Amendment 3): [`HUB_YIELD_EVERY_DEEP`] from `deep` queued, else
+/// [`HUB_YIELD_EVERY`]; `deep == 0` turns the rule off.
+fn yield_every(queued: usize, deep: usize) -> usize {
+    if deep > 0 && queued >= deep {
+        HUB_YIELD_EVERY_DEEP
+    } else {
+        HUB_YIELD_EVERY
+    }
+}
+
+#[cfg(test)]
+mod yield_rule {
+    use super::*;
+
+    /// ADR 0093 Amendment 3: a shallow queue yields as ADR 0082 T2 set it; one at or over
+    /// the depth yields every [`HUB_YIELD_EVERY_DEEP`]; `0` keeps the old rule everywhere.
+    #[test]
+    fn a_deep_queue_yields_less_often_and_zero_turns_the_rule_off() {
+        assert_eq!(yield_every(0, DEFAULT_HUB_YIELD_DEEP), HUB_YIELD_EVERY);
+        assert_eq!(
+            yield_every(DEFAULT_HUB_YIELD_DEEP - 1, DEFAULT_HUB_YIELD_DEEP),
+            HUB_YIELD_EVERY
+        );
+        assert_eq!(
+            yield_every(DEFAULT_HUB_YIELD_DEEP, DEFAULT_HUB_YIELD_DEEP),
+            HUB_YIELD_EVERY_DEEP
+        );
+        assert_eq!(
+            yield_every(50_000, DEFAULT_HUB_YIELD_DEEP),
+            HUB_YIELD_EVERY_DEEP
+        );
+        assert_eq!(yield_every(50_000, 0), HUB_YIELD_EVERY);
+        assert_eq!(
+            HUB_YIELD_EVERY_DEEP % HUB_YIELD_EVERY,
+            0,
+            "a whole number of batches"
+        );
+    }
+}
 
 /// The name of the hub loop's own OS thread (ADR 0092 D1).
 pub const HUB_THREAD_NAME: &str = "mqttd-hub";
@@ -2622,6 +2674,11 @@ pub struct Hub {
     control_q: std::collections::VecDeque<HubCommand>,
     /// Sorted, undispatched data commands (ADR 0082 T2), in arrival order.
     data_q: std::collections::VecDeque<HubCommand>,
+    /// The queue depth from which the loop yields every [`HUB_YIELD_EVERY_DEEP`]
+    /// commands instead of every [`HUB_YIELD_EVERY`] (ADR 0093 Amendment 3,
+    /// `node.hub_yield_deep`); `0` turns the rule off. Read only on a multi-thread
+    /// runtime: on a current-thread one a yield is how everything else runs.
+    yield_deep: usize,
     /// This node's identity.
     node_id: NodeId,
     /// Currently-connected clients.
@@ -3436,6 +3493,7 @@ impl Hub {
                 rx,
                 control_q: std::collections::VecDeque::new(),
                 data_q: std::collections::VecDeque::new(),
+                yield_deep: DEFAULT_HUB_YIELD_DEEP,
                 self_tx: tx.clone(),
                 connecting: HashMap::default(),
                 append_lanes: HashMap::default(),
@@ -3835,6 +3893,18 @@ impl Hub {
         // milliseconds and releases any publish acks gated on it (ADR 0042 T9).
         self.spawn_inherited_session_scan(true);
         let mut since_yield = 0usize;
+        let mut since_housekeeping = 0usize;
+        // ADR 0093 Amendment 3 is a rule for the shared multi-thread runtime, where a
+        // yield costs the wake that brings the loop back on some worker. On a
+        // current-thread runtime (a test's, or the loop's own thread of ADR 0092 D1) a
+        // yield is how every other task runs at all, so the loop yields every
+        // HUB_YIELD_EVERY commands there whatever its queue holds.
+        let yield_deep = match tokio::runtime::Handle::try_current() {
+            Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                self.yield_deep
+            }
+            _ => 0,
+        };
         loop {
             // ADR 0082 T2: sort what has arrived into the two lanes, then take the next
             // command, control before data. A raft frame, an ack or the /livez ping no
@@ -3866,8 +3936,9 @@ impl Hub {
                     cmd => self.dispatch_timed(cmd).await,
                 }
                 since_yield += 1;
-                if since_yield >= HUB_YIELD_EVERY {
-                    since_yield = 0;
+                since_housekeeping += 1;
+                if since_housekeeping >= HUB_YIELD_EVERY {
+                    since_housekeeping = 0;
                     // Busy: the sweep still runs on schedule (Interval::tick is cancel
                     // safe), and the hub yields so it never monopolizes a worker.
                     if futures_util::FutureExt::now_or_never(sweep.tick()).is_some() {
@@ -3879,7 +3950,17 @@ impl Hub {
                     // ADR 0093 D3: the batch's hand-offs and answers go to their shards
                     // now, once per batch, before this loop gives up its worker.
                     self.flush_shard_batches();
-                    tokio::task::yield_now().await;
+                    // ADR 0093 Amendment 3: with its queue deep the loop keeps its worker
+                    // for HUB_YIELD_EVERY_DEEP commands between yields; the queue is the
+                    // latency then, and a yield buys nothing but its wake.
+                    let queued = self.rx.len() + self.control_q.len() + self.data_q.len();
+                    if since_yield >= yield_every(queued, yield_deep) {
+                        since_yield = 0;
+                        if let Some(m) = &self.metrics {
+                            m.hub_yielded(self.shard);
+                        }
+                        tokio::task::yield_now().await;
+                    }
                 }
                 continue;
             }

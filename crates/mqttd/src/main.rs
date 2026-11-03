@@ -3430,6 +3430,7 @@ fn start_shards(
     for (k, hub) in hubs.iter_mut().enumerate() {
         hub.set_shards(u8::try_from(k).expect("at most MAX_SHARDS"), txs.clone());
         hub.set_handoff_inflight_cap(config.node.hub_handoff_inflight);
+        hub.set_hub_yield_deep(config.node.hub_yield_deep);
         if let Some((boxes, mailman)) = &mailboxes {
             hub.set_shard_mailboxes(boxes.clone(), mailman.clone());
         }
@@ -3453,6 +3454,7 @@ fn start_shards(
         info!(
             shards,
             handoff_wake = %config.node.hub_handoff_wake,
+            yield_deep = config.node.hub_yield_deep,
             "hub shards (ADR 0092 T5 prototype, ADR 0093 D3): each owns the clients of its \
              placement groups; a publish matched on one is handed to the others for theirs, \
              once per dispatch batch, carrying its ingress credit"
