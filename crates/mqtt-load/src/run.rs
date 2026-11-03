@@ -21,8 +21,9 @@ use crate::start;
 use crate::stats::{Counters, Histos, Stats};
 use crate::subscriber;
 use crate::summary::{
-    Aggregate, Connections, DrainReport, GeneratorReport, Outcome, PhaseReport, PhaseSpec, Spread,
-    StartReport, Summary, Tool, WindowHealth, WindowKind, WindowReport, Workload, SCHEMA,
+    Aggregate, Connections, DrainReport, GeneratorReport, Outcome, PhaseReport, PhaseSpec,
+    SettleReport, Spread, StartReport, Summary, Tool, WindowHealth, WindowKind, WindowReport,
+    Workload, SCHEMA,
 };
 
 /// A run that could not start.
@@ -324,6 +325,7 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
         last_progress_ns: AtomicU64::new(0),
         errors: Errors::default(),
         stopping: AtomicBool::new(false),
+        publishers_stopping: AtomicBool::new(false),
         run,
         cfg,
     });
@@ -698,9 +700,10 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
         }
     };
     let drain_end = now_ns();
+    let delivered_at_drain_end = ctx.unique_deliveries();
     let outstanding_deliveries = ctx
         .expected_deliveries()
-        .saturating_sub(ctx.unique_deliveries());
+        .saturating_sub(delivered_at_drain_end);
     let outstanding_acks: u64 = col
         .pubs
         .iter()
@@ -721,15 +724,13 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
     };
     finish_window(&mut col, &drain_pw, &cur, c, &mut windows);
 
-    // Reconcile before closing anything, so the end of the run cannot change it.
-    let ledger = ctx.ledger.report(cfg.qos == 1);
-    let missing_sample = if ledger.missing > 0 {
-        ctx.ledger.missing_sample(cfg.report_missing)
-    } else {
-        Vec::new()
-    };
-    ctx.stopping.store(true, Ordering::Relaxed);
-    let _ = stop_tx.send(true);
+    // The teardown, publishers first. Once they are gone nothing new enters the brokers,
+    // and the consumers read what the brokers still hold for them (the settle) before
+    // they close. Closing both at once had a durable consumer end its session (expiry 0)
+    // while the brokers still held deliveries and publishes in flight for it: the brokers
+    // discarded the one and dropped the other as loss (h3 durable-qos1, 2026-11-03:
+    // 18,285 and 235,383 drops, every one in the teardown's last seconds).
+    ctx.publishers_stopping.store(true, Ordering::Relaxed);
     // Writers ping through the drain; stop them all, then take each write half back
     // for its DISCONNECT, under one deadline (a writer stuck on a full socket is
     // aborted at it).
@@ -748,6 +749,54 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
         }
         p.reader.abort();
     }
+
+    // The settle: until every expected delivery has arrived, nothing arrived for the
+    // drain's quiet window, every consumer's connection has already ended, or the
+    // drain's timeout (at least the quiet window). A drain that completed settles at
+    // once.
+    let settle_start = now_ns();
+    let settle_ended_by = loop {
+        if ctx.unique_deliveries() >= ctx.expected_deliveries() {
+            break "complete";
+        }
+        if consumer_tasks
+            .iter()
+            .all(tokio::task::JoinHandle::is_finished)
+        {
+            break "closed";
+        }
+        let now = now_ns();
+        let last = ctx
+            .last_progress_ns
+            .load(Ordering::Relaxed)
+            .max(settle_start);
+        if now.saturating_sub(last) >= quiet_ns {
+            break "quiet";
+        }
+        if now.saturating_sub(settle_start) >= cfg.drain_timeout_ns.max(quiet_ns) {
+            break "timeout";
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let settle_end = now_ns();
+    let settle = SettleReport {
+        duration_s: (settle_end.saturating_sub(settle_start)) as f64 / NS,
+        ended_by: settle_ended_by,
+        received: ctx
+            .unique_deliveries()
+            .saturating_sub(delivered_at_drain_end),
+        end_s: (settle_end.saturating_sub(start)) as f64 / NS,
+    };
+
+    // Reconcile before closing the consumers, so their closing cannot change it.
+    let ledger = ctx.ledger.report(cfg.qos == 1);
+    let missing_sample = if ledger.missing > 0 {
+        ctx.ledger.missing_sample(cfg.report_missing)
+    } else {
+        Vec::new()
+    };
+    ctx.stopping.store(true, Ordering::Relaxed);
+    let _ = stop_tx.send(true);
     // One deadline for all of them: a consumer whose broker stopped reading its socket
     // cannot hold the exit for 5 s each (60 stuck consumers were 5 minutes).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -863,6 +912,7 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
             outstanding_deliveries,
             outstanding_acks,
             since_progress_s: since_progress_ns as f64 / NS,
+            settle,
         },
         ledger,
         missing_sample,

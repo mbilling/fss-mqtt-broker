@@ -293,8 +293,8 @@ def broker_figures(step: Path, lo_ms: float, hi_ms: float, margin_ms: float, min
     scrape of the step, warm-up and drain included: a message dropped at any point is loss.
 
     `held_at_cutoff`: what the brokers still held for clients (HELD_GAUGES, summed) at
-    each broker's last scrape at or before `cutoff_ms`, the generators' drain end (its first
-    scrape after when none precedes it).
+    each broker's last scrape at or before `cutoff_ms`, when the generators reconciled
+    their ledgers (`ledger_ms`; its first scrape after when none precedes it).
 
     `expected`: the run's broker count. The figures are a cluster's only when EVERY
     broker has a usable window: `complete` is false, a problem names the brokers whose
@@ -340,10 +340,10 @@ def broker_figures(step: Path, lo_ms: float, hi_ms: float, margin_ms: float, min
         res["lost"] += sum(v for k, v in drops.items() if drop_is_loss(k))
         row["dropped"] = sum(drops.values())
         if cutoff_ms is not None:
-            # The last scrape at or before the drain's end: what the broker held while
-            # the generator was still connected and waiting. Not the first one after:
-            # at its drain end mqtt-load disconnects every client, a durable consumer
-            # with session expiry 0, and the broker discards those sessions' unacked
+            # The last scrape at or before the ledger's moment: what the broker held while
+            # the generator's consumers were still connected and reading. Not the first
+            # one after: right after it mqtt-load closes its consumers, a durable one with
+            # session expiry 0, and the broker discards those sessions' unacked
             # deliveries with them, so a scrape after it reads 0 for messages the broker
             # held until that moment (h3 durable-qos1 45,000 round 2, 2026-10-29: 297
             # unacked deliveries up to 134 ms before the drain's end, 0 after, reported
@@ -556,6 +556,17 @@ def drain_end_ms(s: dict) -> float:
     return s["schedule_start_unix_ms"] + max(w["end_s"] for w in s["windows"]) * 1000
 
 
+def ledger_ms(s: dict) -> float:
+    """When a generator summary's ledger was reconciled, wall ms: the end of its settle
+    (mqtt-load closes its publishers after the drain, lets its consumers read what the
+    brokers still hold, reconciles, then closes the consumers), or the drain's end for a
+    generator that reconciled there."""
+    settle = (s.get("drain") or {}).get("settle") or {}
+    if settle.get("end_s") is not None:
+        return s["schedule_start_unix_ms"] + settle["end_s"] * 1000
+    return drain_end_ms(s)
+
+
 def drain_figures(gens: list, bf: dict | None) -> dict:
     """How the generators' drains ended, and the ledger's missing count reconciled with
     the brokers' own figures when a drain ended before it was complete:
@@ -563,17 +574,20 @@ def drain_figures(gens: list, bf: dict | None) -> dict:
         missing = broker loss drops + still queued at the cut-off + unexplained
 
     `queued_at_cutoff` is what the brokers' gauges account for (unacked deliveries and
-    pending publishes at their last scrape before the drain's end, at most the missing
-    beyond the drops); `unexplained` is the rest: missing that no drop counter and no
-    broker queue accounts for. `still_queued` is true when the gauges account for every
-    message missing beyond the drops (and every unacked publish) and nothing unexpected
-    arrived: the drain gave up on messages the brokers still held."""
+    pending publishes at their last scrape before the ledgers were reconciled — the end
+    of the generators' settle, after the publishers closed and the consumers read on —
+    at most the missing beyond the drops); `unexplained` is the rest: missing that no
+    drop counter and no broker queue accounts for. `still_queued` is true when the gauges
+    account for every message missing beyond the drops (and every unacked publish) and
+    nothing unexpected arrived: the drain gave up on messages the brokers still held."""
     per = []
     for g, s, _ in gens:
         d = s.get("drain", {})
+        st = d.get("settle") or {}
         per.append({"generator": g, "ended_by": d.get("ended_by"), "duration_s": d.get("duration_s"),
                     "quiet_s": d.get("quiet_s"), "outstanding_deliveries": d.get("outstanding_deliveries"),
-                    "outstanding_acks": d.get("outstanding_acks")})
+                    "outstanding_acks": d.get("outstanding_acks"), "settle_ended_by": st.get("ended_by"),
+                    "settle_s": st.get("duration_s"), "settle_received": st.get("received")})
     missing = sum(s["ledger"]["missing"] for _, s, _ in gens)
     # Of the missing, those whose publish was positively acknowledged: the broker took
     # responsibility and the message never arrived, which is loss. The rest were never
@@ -610,7 +624,15 @@ def drain_figures(gens: list, bf: dict | None) -> dict:
                 f"; the brokers then held {held['mqttd_inflight_messages']:,.0f} unacked deliveries, "
                 f"{held['mqttd_pending_publishes']:,.0f} pending publishes and "
                 f"{held['mqttd_backlog_bytes'] / 1e6:,.1f} MB of backlog")
-    out["reconciled"] = f"drain cut off ({how}): missing {missing:,} = " + " + ".join(parts) + held_txt
+    settled = [p for p in per if p["settle_ended_by"] is not None]
+    settle_txt = ""
+    if settled:
+        ends = ", ".join(sorted({f"{p['settle_ended_by']} after {p['settle_s']:.1f} s" for p in settled
+                                 if p["settle_s"] is not None}))
+        got = sum(p["settle_received"] or 0 for p in settled)
+        settle_txt = f"; the publishers closed and the consumers settled ({ends}), receiving {got:,} more"
+    out["reconciled"] = (f"drain cut off ({how}{settle_txt}): missing {missing:,} = " + " + ".join(parts)
+                         + held_txt)
     out["still_queued"] = bool(held is not None and unexpected == 0 and residual > 0
                                and held_msgs >= residual + unacked)
     return out
@@ -741,7 +763,7 @@ def judge(step: Path, cfg: dict | None = None) -> dict:
         if hi - lo < min_overlap * shortest:
             out["voids"].append(f"generator measured windows overlap {max(0.0, hi - lo) / 1000:.1f} s of {shortest / 1000:.1f} s")
         else:
-            bf = broker_figures(step, lo, hi, margin_ms, min_cover, cutoff_ms=max(drain_end_ms(s) for _, s, _ in gens),
+            bf = broker_figures(step, lo, hi, margin_ms, min_cover, cutoff_ms=max(ledger_ms(s) for _, s, _ in gens),
                                 expected=n_brokers)
             out["brokers"] = bf
             out["voids"].extend(f"broker evidence: {p}" for p in bf["problems"])

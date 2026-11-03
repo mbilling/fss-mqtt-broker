@@ -292,7 +292,7 @@ pub async fn writer(
         let written = write_tracked(&mut w, &buf).await;
         ctx.topic_sent[topic_idx].fetch_add(n, Ordering::Relaxed);
         let Ok((blocked, blocked_ns)) = written else {
-            if !ctx.is_stopping() {
+            if !ctx.publishers_stopping() {
                 ctx.errors.write.fetch_add(1, Ordering::Relaxed);
             }
             state.close();
@@ -405,7 +405,7 @@ pub async fn reader(
         match r.read_buf(&mut buf).await {
             Ok(n) if n > 0 => {}
             _ => {
-                if !ctx.is_stopping() {
+                if !ctx.publishers_stopping() {
                     ctx.errors.disconnects.fetch_add(1, Ordering::Relaxed);
                 }
                 state.close();

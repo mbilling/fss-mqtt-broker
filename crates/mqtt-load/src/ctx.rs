@@ -74,6 +74,10 @@ pub struct Ctx {
     pub errors: Errors,
     /// Set once the run is ending connections itself, so their closing is not an error.
     pub stopping: std::sync::atomic::AtomicBool,
+    /// Set once the run is ending its publishers' connections, the teardown's first half:
+    /// the consumers stay connected through the settle, where the broker closing one is
+    /// still an error.
+    pub publishers_stopping: std::sync::atomic::AtomicBool,
 }
 
 impl Ctx {
@@ -86,6 +90,12 @@ impl Ctx {
     #[must_use]
     pub fn is_stopping(&self) -> bool {
         self.stopping.load(Ordering::Relaxed)
+    }
+
+    /// Whether the run is ending its publishers' connections itself.
+    #[must_use]
+    pub fn publishers_stopping(&self) -> bool {
+        self.publishers_stopping.load(Ordering::Relaxed) || self.is_stopping()
     }
 
     /// Deliveries the streams should have, given what was written so far.

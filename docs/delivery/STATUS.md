@@ -97,7 +97,7 @@
 | [0087](../adr/0087-delivery-across-a-false-dead-verdict.md) | A QoS ≥ 1 publish is acknowledged only when every node that owns a subscriber has accepted it: no path around the acknowledged forward | Proposed | [7/13 done](0087-delivery-across-a-false-dead-verdict.md) | 6 open |
 | [0088](../adr/0088-credential-lifetimes-and-rotation.md) | Cluster credentials have a lifetime the deployer sets, the broker enforces it strictly, and whoever operates the cluster rotates in time | Accepted | [3/7 done](0088-credential-lifetimes-and-rotation.md) | 4 open |
 | [0089](../adr/0089-durable-write-elision.md) | Write elision on the durable QoS 1 path: a message the subscriber has acknowledged need never be written | Accepted | [9/9 done](0089-durable-write-elision.md) | — |
-| [0090](../adr/0090-benchmark-rig-redesign.md) | The benchmark rig measures msg/s and ack latency on one clock, at a fraction of the cost | Accepted | [0/8 done](0090-benchmark-rig-redesign.md) | 8 open |
+| [0090](../adr/0090-benchmark-rig-redesign.md) | The benchmark rig measures msg/s and ack latency on one clock, at a fraction of the cost | Accepted | [1/9 done](0090-benchmark-rig-redesign.md) | 8 open |
 | [0091](../adr/0091-capacity-model.md) | Every bound is a function of a few measured numbers | Accepted | [1/7 done](0091-capacity-model.md) | 6 open |
 | [0092](../adr/0092-hub-task-ceiling.md) | The hub task bounds a node: a pinned thread, less work per message, consumer PUBACKs off the loop | Accepted | [5/6 done](0092-hub-task-ceiling.md) | 1 open |
 | [0093](../adr/0093-data-shards-and-a-control-task.md) | K data shards per node and one control task: the hub's split | Accepted | [0/12 done](0093-data-shards-and-a-control-task.md) | 12 open |

@@ -355,6 +355,27 @@ pub struct DrainReport {
     pub outstanding_acks: u64,
     /// Seconds between the last ack or delivery read and the drain's end.
     pub since_progress_s: f64,
+    /// What followed the drain: the publishers closed, the consumers read on.
+    pub settle: SettleReport,
+}
+
+/// The consumers' settle. After the drain the publishers close first, so nothing new
+/// enters the brokers, and the consumers read what the brokers still hold for them;
+/// the ledger is reconciled at its end, and the consumers close after it.
+#[derive(Debug, Clone, Serialize)]
+pub struct SettleReport {
+    /// Seconds from the publishers' close.
+    pub duration_s: f64,
+    /// `complete` (every expected delivery seen), `quiet` (nothing delivered for the
+    /// drain's `quiet_s`), `closed` (every consumer's connection had already ended) or
+    /// `timeout` (the drain's timeout, at least its quiet window, with deliveries still
+    /// arriving).
+    pub ended_by: &'static str,
+    /// Distinct deliveries read after the drain's end (the publishers' close included):
+    /// of the drain's `outstanding_deliveries`, those that still arrived.
+    pub received: u64,
+    /// When it ended, seconds from the schedule's start: the ledger's moment.
+    pub end_s: f64,
 }
 
 /// The generator's health over the run.
