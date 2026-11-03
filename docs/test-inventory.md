@@ -887,7 +887,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_whole_env_surface_overlays_without_collision`
 - `tests::warn_mode_boots_a_newer_config_and_reports_the_ignored_keys`
 
-## `crates/mqtt-core/src/lib.rs` — 60 test(s)
+## `crates/mqtt-core/src/lib.rs` — 61 test(s)
 
 - `filter_index::tests::a_deep_wildcard_chain_drops_without_recursion`
 - `filter_index::tests::a_trie_node_stays_small`
@@ -911,6 +911,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `shared::tests::selection_rotates_only_over_online_members`
 - `shared::tests::snapshot_lists_every_group_with_members`
 - `shared::tests::the_online_prefix_survives_every_transition_order`
+- `shared::tests::the_own_prefix_holds_through_every_transition_and_selection_stays_inside_it`
 - `shared::tests::unsubscribe_and_remove_client_prune_groups`
 - `subscriptions::tests::a_distinct_filter_is_allocated_once_however_many_subscribers`
 - `subscriptions::tests::a_fully_removed_filter_can_be_resubscribed`
@@ -1541,7 +1542,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 898 test(s)
+## `crates/mqttd/src/lib.rs` — 914 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1688,7 +1689,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `conn::tests::connection_lifecycle_moves_the_metrics_counters`
 - `conn::tests::empty_client_id_with_clean_session_gets_auto_id`
 - `conn::tests::empty_client_id_with_persistent_session_is_rejected`
+- `conn::tests::graceful_shutdown_drains_a_connection_in_the_middle_of_traffic`
 - `conn::tests::graceful_shutdown_drains_an_established_connection`
+- `conn::tests::graceful_shutdown_drains_every_connection_through_its_child_token`
 - `conn::tests::graceful_shutdown_sends_v5_server_shutting_down_disconnect`
 - `conn::tests::idle_connection_is_closed_after_keepalive_grace`
 - `conn::tests::ingress_credit::a_batch_waiting_for_credit_releases_its_originals_credit_first`
@@ -2041,6 +2044,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::forwarding_is_counted_and_local_delivery_is_not`
 - `hub::tests::gauge_refresh_snapshots_sessions_and_subscriptions`
 - `hub::tests::growth_releases_moved_sessions_on_the_old_owner`
+- `hub::tests::held_credit::a_delivery_stays_eligible_for_elision_through_the_periodic_scan`
+- `hub::tests::held_credit::a_held_delivery_keeps_the_credit_until_the_subscribers_puback`
+- `hub::tests::held_credit::a_publish_keeps_its_credit_until_its_durable_write_lands`
+- `hub::tests::held_credit::a_publish_nobody_waits_for_returns_its_credit_at_dispatch`
+- `hub::tests::held_credit::an_answered_entry_the_settle_window_keeps_returns_its_credit`
+- `hub::tests::held_credit::each_shard_runs_its_periodic_scan_at_its_own_phase`
+- `hub::tests::held_credit::only_a_takeover_closes_write_elision_and_the_periodic_scan_does_not`
 - `hub::tests::held_deliveries_fall_back_in_order_when_the_subscriber_leaves`
 - `hub::tests::hub_dispatch_time_is_exported_and_stays_flat_while_a_store_is_parked`
 - `hub::tests::inherited_session_expiry_is_swept_after_takeover`
@@ -2149,9 +2159,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::settle_gate::leaving_the_settle_window_answers_a_restore_shaped_entry`
 - `hub::tests::settle_gate::no_periodic_inherited_scan_runs_without_a_durable_plane`
 - `hub::tests::settle_gate::the_interest_authoritative_backstop_fires_on_its_own_constant`
+- `hub::tests::sharded::a_burst_of_hand_offs_goes_over_in_batches_and_every_publish_is_answered`
+- `hub::tests::sharded::a_hand_off_holds_the_publishers_credit_until_the_other_shard_answers`
+- `hub::tests::sharded::a_hand_off_through_the_mailbox_and_the_mailman_is_delivered_and_answered`
 - `hub::tests::sharded::a_publish_reaches_a_subscriber_the_other_shard_owns_and_is_acked_after_its_write`
 - `hub::tests::sharded::a_qos0_publish_is_handed_off_ungated`
-- `hub::tests::sharded::a_shared_group_split_across_shards_takes_every_publish_under_the_window`
+- `hub::tests::sharded::a_shared_group_deals_on_the_publishers_shard_and_crosses_only_when_it_has_no_member_online`
+- `hub::tests::sharded::a_shared_group_on_the_other_shard_takes_every_publish_under_the_window`
+- `hub::tests::sharded::a_target_at_its_hand_off_cap_parks_the_origins_data_lane_until_it_answers`
 - `hub::tests::sharded::an_unsubscribe_is_mirrored_to_the_other_shard`
 - `hub::tests::share_obligations::a_drain_gated_share_delivery_behind_a_lost_link_does_not_hold_the_drain`
 - `hub::tests::share_obligations::a_drain_gated_share_delivery_with_nobody_to_hand_it_to_is_dropped_and_counted`
@@ -2228,6 +2243,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::unreadable_session::a_truncated_unread_list_never_counts_as_complete`
 - `hub::tests::while_draining_a_rule_derived_forward_holds_the_barrier_until_the_peer_answers`
 - `hub::tests::without_no_local_a_publisher_receives_its_own_delivery`
+- `ingress::tests::a_shard_that_holds_its_whole_pool_leaves_the_other_shards_pool_untouched`
+- `ingress::tests::an_unconfigured_pool_is_at_most_the_pending_floor_a_shard`
 - `ingress::tests::credit_is_returned_when_the_permit_drops_and_the_cap_bounds_one_connection`
 - `ingress::tests::peer_credit_draws_on_the_pool_alone_and_counts_what_it_sheds`
 - `ingress::tests::the_pool_follows_the_config_then_the_watermark_then_the_default`

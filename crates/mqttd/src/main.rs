@@ -240,19 +240,53 @@ impl std::fmt::Debug for StartupError {
     }
 }
 
+/// The process entry: the runtime first — ADR 0093 D4's first arm is an option of the
+/// runtime, so it cannot wait for the configuration — then the startup sequence on it.
 fn main() -> Result<(), StartupError> {
     let runtime = build_runtime().map_err(|e| StartupError(Box::new(e)))?;
     runtime.block_on(serve())
 }
 
+/// Whether the runtime was built without tokio's LIFO slot, for the startup log.
+static LIFO_SLOT_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether `MQTTD_HUB_LIFO_SLOT` asks for the runtime without tokio's LIFO slot (`off`,
+/// `false`, `0` or `no`). Read from the environment, not the typed config, because the
+/// runtime exists before the config is loaded, as `MQTTD_WORKERS` is; an experiment
+/// (ADR 0093 D4).
+fn hub_lifo_slot_off() -> bool {
+    std::env::var("MQTTD_HUB_LIFO_SLOT").is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "off" | "false" | "0" | "no"
+        )
+    })
+}
+
 /// The runtime every task of the broker runs on: what `#[tokio::main]` built, with the
-/// worker count of ADR 0092 Amendment 4 — the physical cores by default, measured on h3
-/// against one worker per vCPU: +9.8% at the knee for 17% less CPU a message, because
-/// thirty-two workers on sixteen cores thrash where sixteen batch.
+/// worker count of ADR 0092 Amendment 4 (the physical cores by default; see
+/// [`runtime_workers`]), plus ADR 0093 D4's first arm. With `MQTTD_HUB_LIFO_SLOT=off` the runtime has no LIFO slot, so
+/// a task woken from a worker is queued for any worker instead of running next on the
+/// waker's — the slot is what let the prototype's two shards take turns on one worker,
+/// and what makes the one loop's own wakes cheap; which outweighs which is the
+/// measurement. The option is tokio's unstable API: it takes effect in a build with
+/// `--cfg tokio_unstable` (the rig's) and is reported and ignored in any other.
 fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
     builder.worker_threads(runtime_workers().0);
+    if hub_lifo_slot_off() {
+        #[cfg(tokio_unstable)]
+        {
+            builder.disable_lifo_slot();
+            LIFO_SLOT_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        #[cfg(not(tokio_unstable))]
+        eprintln!(
+            "MQTTD_HUB_LIFO_SLOT=off: this build keeps tokio's LIFO slot (not built with \
+             --cfg tokio_unstable); ignored"
+        );
+    }
     builder.build()
 }
 
@@ -375,6 +409,12 @@ async fn serve() -> Result<(), StartupError> {
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "info".to_string()),
     );
+    if LIFO_SLOT_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        info!(
+            "the runtime runs without tokio's LIFO slot (MQTTD_HUB_LIFO_SLOT=off, ADR 0093 \
+             D4): a task woken from a worker is queued for any worker"
+        );
+    }
 
     // `--version` / `-V` and `--help` / `-h`: local, print-and-exit, before any subcommand
     // or config work (#169). `--version` in particular MUST exist — an operator typing it
@@ -3255,11 +3295,27 @@ fn subscriber_limits_from_config(
 }
 
 /// The node's ingress credit from config (ADR 0082 T3): the pool (explicit, else 1/8 of
-/// the memory watermark, else 256 MiB), the per-connection cap and the overload mode.
+/// the memory watermark, else 256 MiB, then at most `MAX_SHARD_POOL_BYTES` a shard), the
+/// per-connection cap and the overload mode.
 fn ingress_from_config(config: &Config) -> Arc<mqttd::ingress::IngressCredit> {
-    use mqttd::ingress::{IngressCredit, OverloadMode, DEFAULT_CONN_BYTES};
+    use mqttd::ingress::{IngressCredit, OverloadMode, DEFAULT_CONN_BYTES, MAX_SHARD_POOL_BYTES};
     let limits = &config.limits;
-    let pool = IngressCredit::pool_from_config(limits.hub_ingress_bytes, limits.memory_max_bytes);
+    // ADR 0093 D3: one pool per hub shard, so a shard behind parks only its own
+    // publishers instead of holding the node's whole pool.
+    let shards = usize::from(config.node.hub_shards.max(1));
+    let pool =
+        IngressCredit::pool_from_config(limits.hub_ingress_bytes, limits.memory_max_bytes, shards);
+    if limits.hub_ingress_bytes.is_some() && pool / shards > MAX_SHARD_POOL_BYTES {
+        warn!(
+            pool_bytes = pool,
+            shards,
+            shard_cap = MAX_SHARD_POOL_BYTES,
+            "the configured ingress pool holds more publishes a shard than the pending \
+             table's floor: under a durable path that falls behind, its stall budget can \
+             evict with the acks withheld before the pool parks the publishers (ADR 0093 \
+             Amendment 2)"
+        );
+    }
     let conn = limits.conn_ingress_bytes.map_or(DEFAULT_CONN_BYTES, |b| {
         usize::try_from(b).unwrap_or(usize::MAX)
     });
@@ -3268,9 +3324,10 @@ fn ingress_from_config(config: &Config) -> Arc<mqttd::ingress::IngressCredit> {
         pool_bytes = pool,
         conn_bytes = conn,
         mode = ?mode,
+        shards,
         "ingress credit (ADR 0082 T3): client publishes wait at the socket past these bounds"
     );
-    Arc::new(IngressCredit::new(pool, conn, mode))
+    Arc::new(IngressCredit::sharded(pool, conn, mode, shards))
 }
 
 /// Everything every hub-construction arm must do before [`hub::Hub::run`] (issue #241).
@@ -3351,10 +3408,31 @@ fn start_shards(
              node is served by its first shard alone"
         );
     }
+    // ADR 0093 D4: how a shard wakes another for a batch of hand-offs.
+    let remote_wake = match config.node.hub_handoff_wake.as_str() {
+        "local" => false,
+        "remote" => true,
+        other => {
+            return Err(format!(
+                "node.hub_handoff_wake = {other:?}: \"local\" or \"remote\" (ADR 0093 D4)"
+            )
+            .into());
+        }
+    };
+    let mailboxes = (shards > 1 && remote_wake).then(|| {
+        let boxes: Arc<[hub::ShardMailbox]> =
+            (0..shards).map(|_| hub::ShardMailbox::default()).collect();
+        let mailman = hub::spawn_mailman(boxes.clone());
+        (boxes, mailman)
+    });
     let mut hubs: Vec<hub::Hub> = (0..shards).map(|_| make()).collect();
     let txs: Vec<_> = hubs.iter().map(hub::Hub::sender).collect();
     for (k, hub) in hubs.iter_mut().enumerate() {
         hub.set_shards(u8::try_from(k).expect("at most MAX_SHARDS"), txs.clone());
+        hub.set_handoff_inflight_cap(config.node.hub_handoff_inflight);
+        if let Some((boxes, mailman)) = &mailboxes {
+            hub.set_shard_mailboxes(boxes.clone(), mailman.clone());
+        }
         if cluster_configured {
             hub.set_cluster_configured();
         }
@@ -3374,8 +3452,10 @@ fn start_shards(
     if shards > 1 {
         info!(
             shards,
-            "hub shards (ADR 0092 T5 prototype): each owns the clients of its placement \
-             groups; a publish matched on one is handed to the others for theirs"
+            handoff_wake = %config.node.hub_handoff_wake,
+            "hub shards (ADR 0092 T5 prototype, ADR 0093 D3): each owns the clients of its \
+             placement groups; a publish matched on one is handed to the others for theirs, \
+             once per dispatch batch, carrying its ingress credit"
         );
     }
     Ok(hub::HubTx::sharded(txs))
@@ -5563,7 +5643,7 @@ async fn probe_health() -> ! {
         .replace("0.0.0.0:", "127.0.0.1:")
         .replace("[::]:", "[::1]:");
 
-    // `main` is already `#[tokio::main]`, so this awaits on the existing runtime rather
+    // `serve` already runs on the process runtime, so this awaits on it rather
     // than building a nested one (which panics).
     match probe_once(&target, &path).await {
         Ok(200) => {
