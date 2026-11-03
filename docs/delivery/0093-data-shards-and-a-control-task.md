@@ -47,12 +47,12 @@ tasks:
     title: "Shard-local $share dealing (Amendment 1): with locality on, a shard deals among the online members it owns — own online members a prefix of each group's online prefix, so the deal stays one index — and hands across only when it owns none online; measured on h3 and fan-in against T2 and T3's rows"
     status: in-progress
     issue: 1180
-    notes: "Size S to build, two rig runs. mqtt-core shared.rs: GroupMembers keeps three regions (own online, another shard's online, offline) and select_own_online; the table records another shard's members (subscribe_member with own = false, from the routing mirror). hub delivery.rs plan_local_fast deals among own online members when the node runs shards. Tests: the region invariant checked against a model after every subscribe, attach, detach, mirror and leave; a group with a member on each shard deals on the publisher's shard and crosses only when it has no member online; a group wholly on the other shard still takes every publish under the window."
+    notes: "Size S to build, two rig runs. mqtt-core shared.rs: GroupMembers keeps three regions (own online, another shard's online, offline) and select_own_online; the table records another shard's members (subscribe_member with own = false, from the routing mirror). hub delivery.rs plan_local_fast deals among own online members when the node runs shards. Tests: the region invariant checked against a model after every subscribe, attach, detach, mirror and leave; a group with a member on each shard deals on the publisher's shard and crosses only when it has no member online; a group wholly on the other shard still takes every publish under the window. Finding of the eight-shard run (2026-11-03, h3-20261103T192204Z): with a group's members hashed over eight shards and each shard dealing only among its own, the busiest consumer took 1.7–2.2× the mean consumer's deliveries in every round (the four-shard run reported no unevenness), and its append lane (256 jobs) overflowed from 386,800 while the loops ran at 0.41 busy — the eight-shard knee is this deal's. T9's own measurement found no knee from keeping the deal local, so the lever to weigh is the deal over every online member again (the hand-off is 0.9% of the knee's time) or a local deal weighted by the shard's share of the group."
   - id: 0093-T10
     title: "The bounds that push back before the ones that drop (Amendment 2): a publish's ingress credit held on its pending entry until its publisher is answered; an unconfigured pool at most the pending table's floor a shard (65,536 × the per-publish overhead); the periodic reconcile scan out of write elision's takeover window (ADR 0089 Amendment 2) and run by each shard at its own phase of the cycle; measured on h3 with four shards and with two"
     status: in-progress
     issue: 1180
-    notes: "Size S to build, two rig runs. hub/mod.rs route_publish holds the credit (hold_credit) and try_complete_pending releases it at the answer; ingress.rs MAX_SHARD_POOL_BYTES caps pool_from_config's derived pool; hub/mod.rs takeover_window_open and periodic_scan_phase, elision.rs may_elide on the window. Tests (hub/tests/held_credit.rs): the credit held through a parked durable write and an elision hold and returned at the answer, at dispatch for a publish nobody waits on, at the answer for an entry a settle window keeps; the window open for the boot, a takeover's scan and the eager window and closed for the periodic scan; a delivery eligible through the periodic scan; each shard's phase. Measured: the four-shard knee above 164,900 and a durable path that falls behind shown as OFFER NOT TAKEN, never DISCONNECTED."
+    notes: "Size S to build, two rig runs. hub/mod.rs route_publish holds the credit (hold_credit) and try_complete_pending releases it at the answer; ingress.rs MAX_SHARD_POOL_BYTES caps pool_from_config's derived pool; hub/mod.rs takeover_window_open and periodic_scan_phase, elision.rs may_elide on the window. Tests (hub/tests/held_credit.rs): the credit held through a parked durable write and an elision hold and returned at the answer, at dispatch for a publish nobody waits on, at the answer for an entry a settle window keeps; the window open for the boot, a takeover's scan and the eager window and closed for the periodic scan; a delivery eligible through the periodic scan; each shard's phase. Measured: the four-shard knee above 164,900 and a durable path that falls behind shown as OFFER NOT TAKEN, never DISCONNECTED. The pool as a time bound (open after the four-shard runs) was weighed on 2026-11-03 and withdrawn: at an offer equal to the capacity the backlog that built during the ramp is conserved, so a smaller pool only moves the wait from the shard's queue into the sockets and the generator measures the same ack latency; the knee's latency is that backlog over the rate, and the levers are capacity (eight shards took 375,000 from 3.1 s to 23 ms) and the ladder's resolution near the knee (the band bisect, ADR 0090)."
   - id: 0093-T11
     title: "The loop yields by its queue's depth (Amendment 3): every 64 commands below node.hub_yield_deep queued (1,024, one ingest batch), every 1,024 from it; the housekeeping still every 64; mqttd_hub_yields_total{shard}"
     status: in-progress
@@ -64,7 +64,7 @@ tasks:
     status: in-progress
     issue: 1180
     date: 2026-11-03
-    notes: "Size XS. hub/shards.rs MAX_SHARDS, mqtt-observability HUB_SHARDS and SHARD_LABELS. Not yet run: T11's run (2026-11-03) found the h3 generator at its own limit from 420,000 offered, so an eight-shard ladder on h3 needs a second generator host (GENERATORS=2) to be judged above 400,000."
+    notes: "Size XS. hub/shards.rs MAX_SHARDS, mqtt-observability HUB_SHARDS and SHARD_LABELS. Measured 2026-11-03 on h3 with two generator hosts (run h3-20261103T192204Z, the paragraph under Progress): the lossless knee 380,900 against four shards' 375,000, at ack p99 23 ms where four shards read 3.1 s, so every latency band reads 380,900 (four shards: 300,000); each loop at 0.41 busy at the knee, 8.6 µs a message; the wall is a loss, not the hub — the shard-local deal (T9) loads one hot member's append lane until it overflows (append-backlog-full drops of 17–478 a round from 386,800) — and 468,800 ended DISCONNECTED on its retry."
 ---
 
 # Delivery 0093 — K data shards per node and one control task
@@ -102,10 +102,10 @@ measurement is in this doc, whatever the number (ADR 0092 D4).
 | 0093-T6 | ⬜ planned | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | — | "Size M. Tests: a target shard held busy parks the origin's publishers and nothing else on the node waits; a shard's panic ends the process as the one loop's does (ADR 0061 §8)." |
 | 0093-T7 | ⬜ planned | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | — | "Size S, two rig runs. After T2, T3 and T4. The default stays hub_shards = 1 until two shards carry more than one loop at an ack p99 within the one loop's band, holding their connections above the knee." |
 | 0093-T8 | ⬜ planned | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | — | "Size M: two rig2 workloads (a hot-group arm of fanin-qos1 with the members' placement groups spread; a wildcard arm with one # subscriber) and two runs. A broad subscriber's capacity is one shard's delivery capacity (ADR 0093 D6); the measurement states the number." |
-| 0093-T9 | 🚧 in-progress | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | — | "Size S to build, two rig runs. mqtt-core shared.rs: GroupMembers keeps three regions (own online, another shard's online, offline) and select_own_online; the table records another shard's members (subscribe_member with own = false, from the routing mirror). hub delivery.rs plan_local_fast deals among own online members when the node runs shards. Tests: the region invariant checked against a model after every subscribe, attach, detach, mirror and leave; a group with a member on each shard deals on the publisher's shard and crosses only when it has no member online; a group wholly on the other shard still takes every publish under the window." |
-| 0093-T10 | 🚧 in-progress | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | — | "Size S to build, two rig runs. hub/mod.rs route_publish holds the credit (hold_credit) and try_complete_pending releases it at the answer; ingress.rs MAX_SHARD_POOL_BYTES caps pool_from_config's derived pool; hub/mod.rs takeover_window_open and periodic_scan_phase, elision.rs may_elide on the window. Tests (hub/tests/held_credit.rs): the credit held through a parked durable write and an elision hold and returned at the answer, at dispatch for a publish nobody waits on, at the answer for an entry a settle window keeps; the window open for the boot, a takeover's scan and the eager window and closed for the periodic scan; a delivery eligible through the periodic scan; each shard's phase. Measured: the four-shard knee above 164,900 and a durable path that falls behind shown as OFFER NOT TAKEN, never DISCONNECTED." |
+| 0093-T9 | 🚧 in-progress | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | — | "Size S to build, two rig runs. mqtt-core shared.rs: GroupMembers keeps three regions (own online, another shard's online, offline) and select_own_online; the table records another shard's members (subscribe_member with own = false, from the routing mirror). hub delivery.rs plan_local_fast deals among own online members when the node runs shards. Tests: the region invariant checked against a model after every subscribe, attach, detach, mirror and leave; a group with a member on each shard deals on the publisher's shard and crosses only when it has no member online; a group wholly on the other shard still takes every publish under the window. Finding of the eight-shard run (2026-11-03, h3-20261103T192204Z): with a group's members hashed over eight shards and each shard dealing only among its own, the busiest consumer took 1.7–2.2× the mean consumer's deliveries in every round (the four-shard run reported no unevenness), and its append lane (256 jobs) overflowed from 386,800 while the loops ran at 0.41 busy — the eight-shard knee is this deal's. T9's own measurement found no knee from keeping the deal local, so the lever to weigh is the deal over every online member again (the hand-off is 0.9% of the knee's time) or a local deal weighted by the shard's share of the group." |
+| 0093-T10 | 🚧 in-progress | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | — | "Size S to build, two rig runs. hub/mod.rs route_publish holds the credit (hold_credit) and try_complete_pending releases it at the answer; ingress.rs MAX_SHARD_POOL_BYTES caps pool_from_config's derived pool; hub/mod.rs takeover_window_open and periodic_scan_phase, elision.rs may_elide on the window. Tests (hub/tests/held_credit.rs): the credit held through a parked durable write and an elision hold and returned at the answer, at dispatch for a publish nobody waits on, at the answer for an entry a settle window keeps; the window open for the boot, a takeover's scan and the eager window and closed for the periodic scan; a delivery eligible through the periodic scan; each shard's phase. Measured: the four-shard knee above 164,900 and a durable path that falls behind shown as OFFER NOT TAKEN, never DISCONNECTED. The pool as a time bound (open after the four-shard runs) was weighed on 2026-11-03 and withdrawn: at an offer equal to the capacity the backlog that built during the ramp is conserved, so a smaller pool only moves the wait from the shard's queue into the sockets and the generator measures the same ack latency; the knee's latency is that backlog over the rate, and the levers are capacity (eight shards took 375,000 from 3.1 s to 23 ms) and the ladder's resolution near the knee (the band bisect, ADR 0090)." |
 | 0093-T11 | 🚧 in-progress | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | 2026-11-03 | "Size S. hub/mod.rs (HUB_YIELD_EVERY_DEEP, yield_every, the loop's since_yield and since_housekeeping counters, set_hub_yield_deep), mqtt-config node.hub_yield_deep / MQTTD_HUB_YIELD_DEEP, main.rs wiring, mqtt-observability hub_yields_total, CONFIGURATION regenerated. Tests: the rule's unit test, the config's default, TOML and env cases. Measured 2026-11-03 on h3 with four shards together with ADR 0089 Amendment 3 (run h3-20261103T162448Z, the paragraph under Progress): each loop's busy ceiling 0.86 against 0.70, the knee 375,000 against 327,100, the broker taking about 400,000 when offered more, 300,000 at 52.7 ms." |
-| 0093-T12 | 🚧 in-progress | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | 2026-11-03 | "Size XS. hub/shards.rs MAX_SHARDS, mqtt-observability HUB_SHARDS and SHARD_LABELS. Not yet run: T11's run (2026-11-03) found the h3 generator at its own limit from 420,000 offered, so an eight-shard ladder on h3 needs a second generator host (GENERATORS=2) to be judged above 400,000." |
+| 0093-T12 | 🚧 in-progress | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | 2026-11-03 | "Size XS. hub/shards.rs MAX_SHARDS, mqtt-observability HUB_SHARDS and SHARD_LABELS. Measured 2026-11-03 on h3 with two generator hosts (run h3-20261103T192204Z, the paragraph under Progress): the lossless knee 380,900 against four shards' 375,000, at ack p99 23 ms where four shards read 3.1 s, so every latency band reads 380,900 (four shards: 300,000); each loop at 0.41 busy at the knee, 8.6 µs a message; the wall is a loss, not the hub — the shard-local deal (T9) loads one hot member's append lane until it overflows (append-backlog-full drops of 17–478 a round from 386,800) — and 468,800 ended DISCONNECTED on its retry." |
 <!-- /status-table:0093 -->
 
 ## Progress
@@ -543,9 +543,49 @@ after the second host replacement rebooted the broker host (16:59Z; the one-way-
 of #368 rebooted the wrong side), mqttd was gone, and the ladder was stopped by hand at
 17:06Z; the teardown and both label audits were clean. The per-round scrape series and the
 host CPU samples (#1188) went with the replaced generator hosts, so this run has no broker
-CPU figure. Eight shards (T12) are not run: above 400,000 the generator decides, so that
-ladder needs `GENERATORS=2`, and with the loops at 0.86 the next limit on this host is its
-sixteen cores (36.6 µs of CPU a message on the morning's run is 13.7 cores at 375,000).
+CPU figure. Eight shards (T12) were then run with two generators, the next paragraph; with
+the loops at 0.86 the next limit on this host was expected to be its sixteen cores (36.6 µs
+of CPU a message on the morning's run is 13.7 cores at 375,000).
+
+**Eight shards measured on h3, with two generator hosts** (2026-11-03,
+`h3-20261103T192204Z`: the same build as the four-shard run above, `MQTTD_HUB_SHARDS=8`,
+two m6i.4xlarge generators, the ladder from 300,000; 47 min, about USD 2.60). The per-round
+counters are the broker's pre-round scrapes (`scratchpad/round-counters.py`); the hub model,
+the drops and the busiest consumer's share are the rig's report:
+
+| offered | verdict | received | ack p99 | each loop's busy | hub µs a message | busiest `$share` consumer | dropped, `append-backlog-full` | the writer |
+|---|---|---|---|---|---|---|---|---|
+| 300,000 | carried, 3 rounds | 299,996 | 2.1 ± 0.0 ms | 0.29–0.31 | 8.1 | up to 2.1× the mean | 0 | — |
+| 375,000 | carried, 3 rounds, the third on its retry | 374,995 | 22.5 ± 0.7 ms | 0.38–0.40 | 8.3 | up to 2.2× | 63 in the round that failed | 47 ops a batch, 1.4 ms a commit |
+| **380,900** | **carried, 3 rounds** | 380,893 | 23.0 ± 0.4 ms | 0.40–0.41 | 8.6 | up to 2.2× | 0 | 45 ops, 1.4 ms |
+| 386,800 | failed in round 2 | 386,222 | 24.7 ± 0.8 ms | 0.41–0.45 | 8.8 | up to 2.2× | 190 | 49 ops, 1.4 ms |
+| 398,500 | failed | 397,874 | 22.6 ms | 0.41–0.46 | 8.6 | up to 2.1× | 27 | — |
+| 421,900 | failed | 421,501 | 34.8 ms | 0.44–0.51 | 8.8 | up to 2.1× | 17 | — |
+| 468,800 | failed, then DISCONNECTED on its retry | 463,427–466,618 | 512 ms; 4.1 s | 0.51–0.58 | 9.5 | up to 2.1× | 478 | 136 ops, 6.1 ms |
+
+The knee moved from 375,000 to 380,900 (+1.6%) and its latency from 3.1 s to 23 ms: every
+band (≤ 1 s, ≤ 250 ms, ≤ 100 ms) reads 380,900 where four shards read 300,000, and 300,000
+runs at 2.1 ms (52.7 ms before). The loops are not the limit — 0.41 busy each at the knee
+against the four-shard run's 0.86 ceiling, 8.6 µs a message, queue maxima about 1,000 — and
+nor are the generators (26–41% CPU, lag p99 1.3–2.1 ms). What ends the ladder is loss: from
+386,800 every step dropped 17–478 messages as `append-backlog-full`, one hot durable
+member's append lane (256 jobs) overflowing, and the rounds name the cause. The busiest
+`$share` consumer received 1.7–2.2× the mean consumer's deliveries in every round of this
+run, where the four-shard run reported no unevenness at all: T9's shard-local deal. A group's
+members hash over eight shards unevenly, each shard deals only among its own, and a shard
+with few members of a group loads each of them harder. The write path behind those members
+shows the same thing at 468,800: the writer went from 45 ops a batch and 1.4 ms a commit to
+136 and 6.1 ms, elision timeouts doubled (793,000 against 392,000 a round), and the retry
+round ended DISCONNECTED (missing 4,068, unacked 27,107, ack p99 4.1 s) with the loops at
+0.51–0.58 and 917 µs of wake lateness. The hub's capacity at eight shards, 8 × 0.86 / 8.6 µs,
+is about 800,000 a second; the next limit after the deal is the host's sixteen cores.
+
+Next is the deal, not the hub: every online member again (the hand-off costs 0.9% of the
+knee's time and T9's own measurement found no knee from keeping it local), or a local deal
+weighted by the shard's share of the group; the same ladder then says how far the knee climbs
+toward the host's CPU. The default stays `hub_shards = 1` (T7) until the cluster paths (T5)
+and the control task (T1) are in. The pool as a time bound is withdrawn under T10: at an
+offer equal to the capacity the backlog is conserved and only moves into the sockets.
 
 ## Changelog
 
@@ -617,3 +657,10 @@ sixteen cores (36.6 µs of CPU a message on the morning's run is 13.7 cores at 3
   420,000 offered (four void rounds on two hosts), and the rig's mesh retry after the second
   host replacement rebooted the broker host, which ended the run. Eight shards wait for a
   second generator.
+- 2026-11-03 — Eight shards measured on h3 with two generator hosts (`h3-20261103T192204Z`):
+  the knee 380,900 against four shards' 375,000, at ack p99 23 ms against 3.1 s, so every
+  latency band reads 380,900 (four shards: 300,000) and 300,000 runs at 2.1 ms; the loops at
+  0.41 busy; the ladder ended by loss — the shard-local deal (T9) loads the busiest `$share`
+  member 1.7–2.2× the mean and its append lane overflows from 386,800 (`append-backlog-full`)
+  — and 468,800 ended DISCONNECTED on its retry. The pool as a time bound weighed and
+  withdrawn under T10.
