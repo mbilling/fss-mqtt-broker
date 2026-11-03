@@ -19,6 +19,17 @@ path, which the broker's own metrics cannot see. TCP round-trip times and retran
 of the established sockets on PORT (`ss -ti`), softnet's per-CPU processed, dropped and
 squeezed counts, per-CPU softirq time, and every interface's packet counters, queue
 count and RPS mask. Counters are cumulative; a reader takes differences.
+
+With `--host NAME` each tick also writes `DIR/<unix_ms>.host.json`, read right after the
+scrape: the host's CPUs and disks, which the broker's metrics cannot see either.
+/proc/stat's jiffies for the machine and per CPU (user, nice, system, idle, iowait, irq,
+softirq, steal), its context switches and runnable tasks; the CPU of the newest process
+named NAME (utime and stime from /proc/<pid>/stat, and its thread count); and every whole
+disk's counters from /proc/diskstats (reads, writes, sectors, write and busy ms, flushes).
+That is three small /proc reads a tick, beside `--net`'s listing of every socket. Counters
+are cumulative; a reader takes differences by the sample's own `unix_ms`, in `clk_tck`
+jiffies a second. A reading that fails is written as `{"error": ...}`: it never stops the
+loop, whose scrapes the judge reads.
 """
 import argparse
 import json
@@ -83,6 +94,69 @@ def net_sample(port: int) -> dict:
             "sample_s": round(time.time() - t0, 3)}
 
 
+# /proc/stat's CPU columns, in order (proc(5)); guest time is already inside user.
+CPU_FIELDS = ("user", "nice", "system", "idle", "iowait", "irq", "softirq", "steal")
+
+
+def find_process(name: str, proc: str = "/proc") -> int | None:
+    """The pid of the newest process whose comm is `name`, or None."""
+    best = None
+    try:
+        entries = os.listdir(proc)
+    except OSError:
+        return None
+    for d in entries:
+        if not d.isdigit() or read(f"{proc}/{d}/comm").strip() != name:
+            continue
+        st = read(f"{proc}/{d}/stat").rpartition(")")[2].split()
+        if len(st) > 19 and (best is None or int(st[19]) > best[0]):
+            best = (int(st[19]), int(d))
+    return best[1] if best else None
+
+
+def host_sample(name: str, pids: dict, proc: str = "/proc", sys_block: str = "/sys/block") -> dict:
+    """One reading of the host's CPUs and disks and of process `name`'s CPU (see the
+    module docstring). `pids` keeps the process's pid from one tick to the next; it is
+    looked up again when that pid is gone or no longer `name` (a restarted broker)."""
+    t0 = time.time()
+    total, per_cpu, counts = [], [], {}
+    for line in read(f"{proc}/stat").splitlines():
+        f = line.split()
+        if not f:
+            continue
+        if f[0] == "cpu":
+            total = [int(x) for x in f[1:1 + len(CPU_FIELDS)]]
+        elif re.fullmatch(r"cpu\d+", f[0]):
+            per_cpu.append([int(x) for x in f[1:1 + len(CPU_FIELDS)]])
+        elif f[0] in ("ctxt", "procs_running", "procs_blocked"):
+            counts[f[0]] = int(f[1])
+    pid = pids.get(name)
+    if pid is None or read(f"{proc}/{pid}/comm").strip() != name:
+        pid = pids[name] = find_process(name, proc)
+    process = None
+    if pid is not None:
+        # proc(5)'s fields 14 (utime), 15 (stime), 20 (num_threads) and 22 (starttime),
+        # counted from field 3 here: the comm before it may hold spaces and parentheses.
+        st = read(f"{proc}/{pid}/stat").rpartition(")")[2].split()
+        if len(st) > 19:
+            process = {"pid": pid, "utime": int(st[11]), "stime": int(st[12]),
+                       "threads": int(st[17]), "starttime": int(st[19])}
+    disks = {}
+    for line in read(f"{proc}/diskstats").splitlines():
+        f = line.split()
+        # Whole disks only (a partition's I/O is inside its disk's), never loop or ram.
+        if len(f) < 14 or f[2].startswith(("loop", "ram")) or not os.path.isdir(f"{sys_block}/{f[2]}"):
+            continue
+        d = {"reads": int(f[3]), "read_sectors": int(f[5]), "writes": int(f[7]),
+             "write_sectors": int(f[9]), "write_ms": int(f[10]), "io_ms": int(f[12])}
+        if len(f) >= 20:  # Linux 5.5+: the flush requests an fsync sends a disk with a write cache
+            d["flushes"], d["flush_ms"] = int(f[18]), int(f[19])
+        disks[f[2]] = d
+    return {"unix_ms": int(t0 * 1000), "clk_tck": os.sysconf("SC_CLK_TCK"), "cpu_fields": list(CPU_FIELDS),
+            "cpu": total, "per_cpu": per_cpu, **counts, "process": process, "disks": disks,
+            "sample_s": round(time.time() - t0, 4)}
+
+
 def scrape(url: str, timeout: float) -> tuple[int, bytes | None]:
     t0 = time.time()
     try:
@@ -105,6 +179,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--timeout", type=float, default=5.0)
     ap.add_argument("--once", action="store_true", help="one scrape, then exit (1 if it failed)")
     ap.add_argument("--net", type=int, metavar="PORT", help="also sample the host's network path for PORT")
+    ap.add_argument("--host", metavar="NAME", help="also sample the host's CPUs and disks, and process NAME's CPU")
     a = ap.parse_args(argv)
     os.makedirs(a.out, exist_ok=True)
     stop = False
@@ -116,6 +191,7 @@ def main(argv: list[str]) -> int:
     signal.signal(signal.SIGTERM, on_term)
     signal.signal(signal.SIGINT, on_term)
     failed = 0
+    pids: dict = {}
     start = time.monotonic()
     k = 0
     while not stop:
@@ -129,6 +205,15 @@ def main(argv: list[str]) -> int:
             with open(tmp, "wb") as f:
                 f.write(body)
             os.replace(tmp, os.path.join(a.out, f"{t_ms}.prom"))
+        if a.host:
+            try:
+                sample = host_sample(a.host, pids)
+            except Exception as e:  # noqa: BLE001 — a missing reading, never a stopped scrape
+                sample = {"error": repr(e)}
+            tmp = os.path.join(a.out, f".{t_ms}.host.tmp")
+            with open(tmp, "w") as f:
+                json.dump(sample, f)
+            os.replace(tmp, os.path.join(a.out, f"{t_ms}.host.json"))
         if a.net:
             tmp = os.path.join(a.out, f".{t_ms}.net.tmp")
             with open(tmp, "w") as f:

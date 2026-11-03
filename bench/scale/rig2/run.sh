@@ -127,6 +127,11 @@ DRAIN_QUIET_FACTOR="${DRAIN_QUIET_FACTOR:-2}"
 FACTOR="${FACTOR:-1.5}"
 GAP_PCT="${GAP_PCT:-3}"
 GRANULARITY="${GRANULARITY:-100}"
+# After the knee, bracket the edge of these ack-p99 bands too (ms, comma-separated; the
+# report's bands are 1000,250,100), each to GAP_PCT. Off when empty: a band's figure is then
+# whatever coarse step fell inside it. About three or four steps a band — raise MAX_STEPS
+# by as many.
+BAND_BISECT="${BAND_BISECT:-}"
 MIN_RATE="${MIN_RATE:-$GRANULARITY}"
 MAX_RATE="${MAX_RATE:-2000000}"
 MAX_STEPS="${MAX_STEPS:-$DEF_MAX_STEPS}"
@@ -174,6 +179,11 @@ START_SYNC_WAIT="${START_SYNC_WAIT:-${DEF_START_SYNC_WAIT:-30}}"
 # The port is the brokers' plaintext listener (templates/mqttd.env.tmpl); the local tier
 # has no `ss` and no /proc, so it samples nothing. NET_PORT= turns it off.
 if [ "$TIER" = local ]; then NET_PORT="${NET_PORT-}"; else NET_PORT="${NET_PORT-1883}"; fi
+# The broker host's CPUs and disks, sampled with every scrape (scrape-loop.py --host): the
+# machine's and the broker process's CPU time and the disks' I/O counters, so a run shows
+# whether the host ran out of CPU or the data disk of IOPS (host-load.py reads them). The
+# process is the broker's, by name; the local tier has no /proc. HOST_PROC= turns it off.
+if [ "$TIER" = local ]; then HOST_PROC="${HOST_PROC-}"; else HOST_PROC="${HOST_PROC-mqttd}"; fi
 # A generator's own wait counts from its ready file, not from its launch, and mqtt-load
 # refuses one longer than the keep-alive (60 s): its publishers are silent while they
 # wait. So it is capped there, whatever the rig waits for the slowest generator.
@@ -861,7 +871,7 @@ prime_ladder() { # prime_ladder <ladder-dir>: unmeasured load at the start rate 
 # left by an earlier try of the same start is stopped first), stopped, fetched.
 scrape_loop_start() {
 	on_broker "$1" "[ -f \$H/steps/$hid/scrape.pid ] && kill \$(cat \$H/steps/$hid/scrape.pid) 2>/dev/null; rm -rf \$H/steps/$hid; mkdir -p \$H/steps/$hid; nohup python3 \$H/scrape-loop.py --url '$(broker_metrics_url "$1")' \
-		--out \$H/steps/$hid/scrapes --interval $SCRAPE_INTERVAL --max-secs 1800 ${NET_PORT:+--net $NET_PORT} >/dev/null 2>&1 </dev/null & echo \$! >\$H/steps/$hid/scrape.pid"
+		--out \$H/steps/$hid/scrapes --interval $SCRAPE_INTERVAL --max-secs 1800 ${NET_PORT:+--net $NET_PORT} ${HOST_PROC:+--host $HOST_PROC} >/dev/null 2>&1 </dev/null & echo \$! >\$H/steps/$hid/scrape.pid"
 }
 scrape_loop_stop() { on_broker "$1" "kill \$(cat \$H/steps/$hid/scrape.pid) 2>/dev/null; true"; }
 # One tar stream per broker, unpacked beside the target and renamed into place only when
@@ -1000,6 +1010,7 @@ json.dump({"workload": "$WORKLOAD", "arm": "$ARM", "binary": """$BINARY_DESC""",
            "ramp": {"start_rate": $START_RATE, "factor": $FACTOR, "gap_pct": $GAP_PCT, "granularity": $GRANULARITY,
                     "min_rate": $MIN_RATE, "max_rate": $MAX_RATE, "void_retries": $VOID_RETRIES,
                     "bisect_on_fail": bool($BISECT_ON_FAIL), "latency_gate": "$LATENCY_GATE",
+                    "band_bisect": [int(b) for b in "$BAND_BISECT".replace(",", " ").split()],
                     "retry_p99_ms": $RETRY_P99_MS, "retry_max": $RETRY_MAX, "rounds": $ROUNDS},
            "mqtt_load": {"qos": $QOS, "shape": "$SHAPE", "sessions": "$SESSIONS", "session_expiry_s": $SESSION_EXPIRY,
                          "payload": $PAYLOAD, "topics_per_generator": $TOPICS, "consumers": $CONSUMERS_N,

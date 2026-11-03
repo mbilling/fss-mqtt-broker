@@ -1391,6 +1391,12 @@ msg/s with its ack p99 at half a second.
   the work per message and the hand-offs per message cut (ADR 0092 T3, T4), not more cores
   and not a thread of its own. `bench/scale/rig2/hub-model.py` reads the same figures from
   a rig run's scrapes.
+- **How often it hands its worker back:** `mqttd_hub_yields_total{shard}`. A loop yields
+  every 64 commands while its queue is shallow and every 1,024 once the queue holds
+  `node.hub_yield_deep` commands (`MQTTD_HUB_YIELD_DEEP`, 1,024 by default; `0` keeps
+  every 64) — the queue is the latency then, and a yield buys nothing but the wake that
+  brings the loop back (ADR 0093 Amendment 3). Yields a second against commands a second
+  shows which regime a loop is in.
 
 ## Overload: bounded hub ingress (ADR 0082)
 

@@ -133,7 +133,9 @@ impl Hub {
             || self.brownout
             || self.draining
             || self.connecting.contains_key(client)
-            || self.takeover_open()
+            // A takeover window, not every scan: the periodic reconcile leaves
+            // elision on (Amendment 2, see `takeover_window_open`).
+            || self.takeover_window_open()
         {
             return false;
         }
