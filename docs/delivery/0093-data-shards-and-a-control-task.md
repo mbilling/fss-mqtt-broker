@@ -53,6 +53,18 @@ tasks:
     status: in-progress
     issue: 1180
     notes: "Size S to build, two rig runs. hub/mod.rs route_publish holds the credit (hold_credit) and try_complete_pending releases it at the answer; ingress.rs MAX_SHARD_POOL_BYTES caps pool_from_config's derived pool; hub/mod.rs takeover_window_open and periodic_scan_phase, elision.rs may_elide on the window. Tests (hub/tests/held_credit.rs): the credit held through a parked durable write and an elision hold and returned at the answer, at dispatch for a publish nobody waits on, at the answer for an entry a settle window keeps; the window open for the boot, a takeover's scan and the eager window and closed for the periodic scan; a delivery eligible through the periodic scan; each shard's phase. Measured: the four-shard knee above 164,900 and a durable path that falls behind shown as OFFER NOT TAKEN, never DISCONNECTED."
+  - id: 0093-T11
+    title: "The loop yields by its queue's depth (Amendment 3): every 64 commands below node.hub_yield_deep queued (1,024, one ingest batch), every 1,024 from it; the housekeeping still every 64; mqttd_hub_yields_total{shard}"
+    status: in-progress
+    issue: 1180
+    date: 2026-11-03
+    notes: "Size S. hub/mod.rs (HUB_YIELD_EVERY_DEEP, yield_every, the loop's since_yield and since_housekeeping counters, set_hub_yield_deep), mqtt-config node.hub_yield_deep / MQTTD_HUB_YIELD_DEEP, main.rs wiring, mqtt-observability hub_yields_total, CONFIGURATION regenerated. Tests: the rule's unit test, the config's default, TOML and env cases. Measured next on h3 with four shards together with ADR 0089 Amendment 3, against 327,100."
+  - id: 0093-T12
+    title: "Eight shards (Amendment 3): MAX_SHARDS from four to eight, the metrics' shard labels with it"
+    status: in-progress
+    issue: 1180
+    date: 2026-11-03
+    notes: "Size XS. hub/shards.rs MAX_SHARDS, mqtt-observability HUB_SHARDS and SHARD_LABELS. Measured next on h3 with eight shards once T11's run holds."
 ---
 
 # Delivery 0093 — K data shards per node and one control task
@@ -92,6 +104,8 @@ measurement is in this doc, whatever the number (ADR 0092 D4).
 | 0093-T8 | ⬜ planned | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | — | "Size M: two rig2 workloads (a hot-group arm of fanin-qos1 with the members' placement groups spread; a wildcard arm with one # subscriber) and two runs. A broad subscriber's capacity is one shard's delivery capacity (ADR 0093 D6); the measurement states the number." |
 | 0093-T9 | 🚧 in-progress | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | — | "Size S to build, two rig runs. mqtt-core shared.rs: GroupMembers keeps three regions (own online, another shard's online, offline) and select_own_online; the table records another shard's members (subscribe_member with own = false, from the routing mirror). hub delivery.rs plan_local_fast deals among own online members when the node runs shards. Tests: the region invariant checked against a model after every subscribe, attach, detach, mirror and leave; a group with a member on each shard deals on the publisher's shard and crosses only when it has no member online; a group wholly on the other shard still takes every publish under the window." |
 | 0093-T10 | 🚧 in-progress | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | — | "Size S to build, two rig runs. hub/mod.rs route_publish holds the credit (hold_credit) and try_complete_pending releases it at the answer; ingress.rs MAX_SHARD_POOL_BYTES caps pool_from_config's derived pool; hub/mod.rs takeover_window_open and periodic_scan_phase, elision.rs may_elide on the window. Tests (hub/tests/held_credit.rs): the credit held through a parked durable write and an elision hold and returned at the answer, at dispatch for a publish nobody waits on, at the answer for an entry a settle window keeps; the window open for the boot, a takeover's scan and the eager window and closed for the periodic scan; a delivery eligible through the periodic scan; each shard's phase. Measured: the four-shard knee above 164,900 and a durable path that falls behind shown as OFFER NOT TAKEN, never DISCONNECTED." |
+| 0093-T11 | 🚧 in-progress | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | 2026-11-03 | "Size S. hub/mod.rs (HUB_YIELD_EVERY_DEEP, yield_every, the loop's since_yield and since_housekeeping counters, set_hub_yield_deep), mqtt-config node.hub_yield_deep / MQTTD_HUB_YIELD_DEEP, main.rs wiring, mqtt-observability hub_yields_total, CONFIGURATION regenerated. Tests: the rule's unit test, the config's default, TOML and env cases. Measured next on h3 with four shards together with ADR 0089 Amendment 3, against 327,100." |
+| 0093-T12 | 🚧 in-progress | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | 2026-11-03 | "Size XS. hub/shards.rs MAX_SHARDS, mqtt-observability HUB_SHARDS and SHARD_LABELS. Measured next on h3 with eight shards once T11's run holds." |
 <!-- /status-table:0093 -->
 
 ## Progress
@@ -547,3 +561,9 @@ taken; a refinement for verdict.py.
   from 327,100 to between 138,300 and 153,600; to be withdrawn. #1193 found the 16 cores;
   #1195's settle received 213,000–226,000 deliveries a round after the publishers closed,
   with no drop and no acknowledged loss.
+- 2026-11-03 — Amendment 3: the loop yields by its queue's depth (T11: every 64 commands
+  below `node.hub_yield_deep` queued, every 1,024 from it, the housekeeping still every 64,
+  `mqttd_hub_yields_total{shard}`) and eight shards (T12: `MAX_SHARDS` 8). The shard-local
+  dealing lever withdrawn: the knee's `shard` class is 0.009 a publish, Amendment 1 already
+  keeps the deal on the origin's shard. To be measured on h3 with four shards together with
+  ADR 0089 Amendment 3 (a delivery behind a write in flight waits for it), then with eight.
