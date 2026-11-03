@@ -392,6 +392,55 @@ uses 13.1 cores, 44 µs of CPU a message, and the host 14.6 of its 32 CPUs, abou
 physical cores. Not measured: an overload 25% past either knee, where run 1 and the drain
 fix's 257,600 disconnected.
 
+**Sixteen workers measured on h3** (2026-11-03, `h3-20261103T103426Z`: the T10 binary of
+`0b4e243c`, four shards, `TOKIO_WORKER_THREADS=16`, the m6i.8xlarge's physical cores,
+against tokio's default of its 32 vCPUs in `h3-20261102T230920Z`; the ladder from 206,100):
+
+| workers | offered | verdict | received | ack p99 | each loop's busy | hub µs a message | broker CPU |
+|---|---|---|---|---|---|---|---|
+| 16 | 206,100 | carried | 206,100 | 2.2 ms | 0.42–0.43 | 8.2 | 7.9 cores |
+| 16 | 257,600 | carried (round 3 collapsed; its retry carried) | 257,599 | 45.2 ms | 0.50–0.52 | 8.8 | 9.2 cores |
+| 16 | 322,000 | carried | 321,961 | 497 ms | 0.69–0.70 | 8.6 | 11.8 cores |
+| 16 | **327,100** | **carried, the knee** | 327,756 | 584 ms | 0.69–0.70 | 8.5 | 12.0 cores |
+| 16 | 332,100 | failed (round 2 collapsed) | 237,018 | 10.3 s | 0.61–0.62 | 9.4 | 11.0 cores |
+| 16 | 342,200 | offer not taken (round 2) | 339,943 | 1.6 s | 0.69 | 8.1 | 12.7 cores |
+| 16 | 362,300 | offer not taken | 333,849 | 4.4 s | 0.67–0.68 | 8.1 | 13.2 cores |
+| 16 | 402,500 | offer not taken | 335,270 | 4.4 s | 0.68 | 8.1 | 13.2 cores |
+
+The knee is 327,100 against 297,900 with 32 workers, +9.8%: 10,222 msg/s per vCPU. Sixteen
+workers do the same work for less. At 322,000, which the 32 refused, the loops cost 8.6 µs a
+message against 9.3, the broker 36.7 µs of CPU a message against 49.0 (11.8 cores against
+14.7), the host switched context 161,000 times a second against 224,500, and a yielded loop
+was back in 79 µs against 112; at the two knees, 8.5 against 9.7 µs of loop a message and
+36.6 against 44.0 of CPU. The loops set this knee too, at 0.70 busy with their queues
+behind. Below the knee the tail is fatter (45 ms against 25 at 257,600; 2.2 against 2.8 ms
+at 206,100 the other way), where a yield waits longer and nothing else is saturated. The
+scheduler did not keep the 16 to one thread a core: at the knee 12.3 vCPUs were busy with
+both siblings of a core active for 0.4–2.8 core-equivalents of the time, so the
+one-thread-a-core case (`CPUAffinity=0-15`) is unmeasured.
+
+Two of the 24 rounds (257,600 round 3, 332,100 round 2) fell into write mode in their first
+seconds and stayed there: the writer took 490,000–660,000 ops per 4 s at about 550 ms a
+commit, one delivery in eight was elided, the credit pool was 100% in use from the offer's
+second second, acks ran 9–11 s, and the drain timed out. The mechanism is ADR 0089
+Amendment 1's A5: a delivery whose topic has a write in flight is written too, a write is
+in flight for its whole commit, and a 550 ms commit keeps every busy topic in write mode,
+which keeps the writer saturated — the bistable path, entered this time where the round's
+start found consumers without a free send slot (the 16 workers ramp the connection tasks
+slower: 3,119 attach batches were still committing at the offer's start against 1,523 in
+the carried round). The 32-worker ladder entered it in none of its 18 rounds. Nothing was
+dropped under offered load: every drop counter in both rounds (18,285 and 235,383) moved in
+the teardown's last six seconds, after the generator's drain gave up and ended the
+consumers' sessions with expiry 0 — hand-offs to members just gone (withheld: the
+publisher is closed without an ack, `shards.rs`), publishes after the consumers had left
+(no member), and the append lane in the last two seconds — and the ledger's
+acknowledged-but-missing messages (10,475 and 1,895) were the consumers' backlogs at that
+moment (1.6 MB at 200 B), discarded at the generator's own request. Decided (2026-11-03):
+the writer's batch gets a bound, so that a commit, and with it A5's hold on a topic, stays
+short; the runtime's workers default to the physical cores; the generator drains its
+publishers before its consumers. Each in its own PR, with the amendment of the ADR that
+owns it (0089 for the writer, 0092 for the runtime).
+
 ## Changelog
 
 - **2026-11-02** — ADR 0093 written from the prototype's four runs (ADR 0092 T5, #1163),
@@ -437,3 +486,8 @@ fix's 257,600 disconnected.
   164,900, and every overload step is OFFER NOT TAKEN with no client disconnected; the
   pair's knee is 201,000, one bisect step below its 206,100. The hub loops set both knees,
   and the machine is at about its physical cores at the four-shard one.
+- **2026-11-03** — Sixteen workers measured on h3 (under Progress): with
+  `TOKIO_WORKER_THREADS=16`, the physical cores, four shards' knee is 327,100 against
+  297,900, for 17% less CPU a message; two rounds fell into write mode (A5 over 550 ms
+  commits), and every drop was the teardown's. Decided: bound the writer's batch, workers
+  default to the physical cores, the generator drains publishers before consumers.
