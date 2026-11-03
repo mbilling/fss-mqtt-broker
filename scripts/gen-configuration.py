@@ -204,6 +204,16 @@ def render(env_vars: list[str], toml_keys: dict[str, str], docs: dict[str, str])
                 "segment-log sync becomes a sleep of this many microseconds, for fsync-latency "
                 "sweeps on one machine. Such a build is NOT durable; it warns on stderr."
             )
+        elif var == "MQTTD_WORKERS":
+            desc = (
+                f"{why}, because the runtime exists before the config is loaded. Source: "
+                f"`{where}`. Not experimental: the runtime's worker threads. Unset, the "
+                "machine's physical cores (ADR 0092 Amendment 4: on Linux the distinct "
+                "package/core pairs of the online CPUs, clamped to the available parallelism "
+                "so a container's CPU quota counts; elsewhere the available parallelism). A "
+                "positive count sets it as given; `TOKIO_WORKER_THREADS` is honoured when this "
+                "is unset. The choice is logged at startup. Restart-scoped."
+            )
         else:
             desc = docs.get(
                 var,
