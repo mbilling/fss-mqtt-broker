@@ -58,13 +58,13 @@ tasks:
     status: in-progress
     issue: 1180
     date: 2026-11-03
-    notes: "Size S. hub/mod.rs (HUB_YIELD_EVERY_DEEP, yield_every, the loop's since_yield and since_housekeeping counters, set_hub_yield_deep), mqtt-config node.hub_yield_deep / MQTTD_HUB_YIELD_DEEP, main.rs wiring, mqtt-observability hub_yields_total, CONFIGURATION regenerated. Tests: the rule's unit test, the config's default, TOML and env cases. Measured next on h3 with four shards together with ADR 0089 Amendment 3, against 327,100."
+    notes: "Size S. hub/mod.rs (HUB_YIELD_EVERY_DEEP, yield_every, the loop's since_yield and since_housekeeping counters, set_hub_yield_deep), mqtt-config node.hub_yield_deep / MQTTD_HUB_YIELD_DEEP, main.rs wiring, mqtt-observability hub_yields_total, CONFIGURATION regenerated. Tests: the rule's unit test, the config's default, TOML and env cases. Measured 2026-11-03 on h3 with four shards together with ADR 0089 Amendment 3 (run h3-20261103T162448Z, the paragraph under Progress): each loop's busy ceiling 0.86 against 0.70, the knee 375,000 against 327,100, the broker taking about 400,000 when offered more, 300,000 at 52.7 ms."
   - id: 0093-T12
     title: "Eight shards (Amendment 3): MAX_SHARDS from four to eight, the metrics' shard labels with it"
     status: in-progress
     issue: 1180
     date: 2026-11-03
-    notes: "Size XS. hub/shards.rs MAX_SHARDS, mqtt-observability HUB_SHARDS and SHARD_LABELS. Measured next on h3 with eight shards once T11's run holds."
+    notes: "Size XS. hub/shards.rs MAX_SHARDS, mqtt-observability HUB_SHARDS and SHARD_LABELS. Not yet run: T11's run (2026-11-03) found the h3 generator at its own limit from 420,000 offered, so an eight-shard ladder on h3 needs a second generator host (GENERATORS=2) to be judged above 400,000."
 ---
 
 # Delivery 0093 — K data shards per node and one control task
@@ -104,8 +104,8 @@ measurement is in this doc, whatever the number (ADR 0092 D4).
 | 0093-T8 | ⬜ planned | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | — | "Size M: two rig2 workloads (a hot-group arm of fanin-qos1 with the members' placement groups spread; a wildcard arm with one # subscriber) and two runs. A broad subscriber's capacity is one shard's delivery capacity (ADR 0093 D6); the measurement states the number." |
 | 0093-T9 | 🚧 in-progress | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | — | "Size S to build, two rig runs. mqtt-core shared.rs: GroupMembers keeps three regions (own online, another shard's online, offline) and select_own_online; the table records another shard's members (subscribe_member with own = false, from the routing mirror). hub delivery.rs plan_local_fast deals among own online members when the node runs shards. Tests: the region invariant checked against a model after every subscribe, attach, detach, mirror and leave; a group with a member on each shard deals on the publisher's shard and crosses only when it has no member online; a group wholly on the other shard still takes every publish under the window." |
 | 0093-T10 | 🚧 in-progress | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | — | "Size S to build, two rig runs. hub/mod.rs route_publish holds the credit (hold_credit) and try_complete_pending releases it at the answer; ingress.rs MAX_SHARD_POOL_BYTES caps pool_from_config's derived pool; hub/mod.rs takeover_window_open and periodic_scan_phase, elision.rs may_elide on the window. Tests (hub/tests/held_credit.rs): the credit held through a parked durable write and an elision hold and returned at the answer, at dispatch for a publish nobody waits on, at the answer for an entry a settle window keeps; the window open for the boot, a takeover's scan and the eager window and closed for the periodic scan; a delivery eligible through the periodic scan; each shard's phase. Measured: the four-shard knee above 164,900 and a durable path that falls behind shown as OFFER NOT TAKEN, never DISCONNECTED." |
-| 0093-T11 | 🚧 in-progress | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | 2026-11-03 | "Size S. hub/mod.rs (HUB_YIELD_EVERY_DEEP, yield_every, the loop's since_yield and since_housekeeping counters, set_hub_yield_deep), mqtt-config node.hub_yield_deep / MQTTD_HUB_YIELD_DEEP, main.rs wiring, mqtt-observability hub_yields_total, CONFIGURATION regenerated. Tests: the rule's unit test, the config's default, TOML and env cases. Measured next on h3 with four shards together with ADR 0089 Amendment 3, against 327,100." |
-| 0093-T12 | 🚧 in-progress | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | 2026-11-03 | "Size XS. hub/shards.rs MAX_SHARDS, mqtt-observability HUB_SHARDS and SHARD_LABELS. Measured next on h3 with eight shards once T11's run holds." |
+| 0093-T11 | 🚧 in-progress | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | 2026-11-03 | "Size S. hub/mod.rs (HUB_YIELD_EVERY_DEEP, yield_every, the loop's since_yield and since_housekeeping counters, set_hub_yield_deep), mqtt-config node.hub_yield_deep / MQTTD_HUB_YIELD_DEEP, main.rs wiring, mqtt-observability hub_yields_total, CONFIGURATION regenerated. Tests: the rule's unit test, the config's default, TOML and env cases. Measured 2026-11-03 on h3 with four shards together with ADR 0089 Amendment 3 (run h3-20261103T162448Z, the paragraph under Progress): each loop's busy ceiling 0.86 against 0.70, the knee 375,000 against 327,100, the broker taking about 400,000 when offered more, 300,000 at 52.7 ms." |
+| 0093-T12 | 🚧 in-progress | [#1180](https://github.com/mbilling/fss-mqtt-broker/issues/1180) | 2026-11-03 | "Size XS. hub/shards.rs MAX_SHARDS, mqtt-observability HUB_SHARDS and SHARD_LABELS. Not yet run: T11's run (2026-11-03) found the h3 generator at its own limit from 420,000 offered, so an eight-shard ladder on h3 needs a second generator host (GENERATORS=2) to be judged above 400,000." |
 <!-- /status-table:0093 -->
 
 ## Progress
@@ -505,6 +505,48 @@ count was 0 — the missing were publishes the broker never read before their so
 which the verdict still calls FAILED ("ledger did not close") where it is the offer not
 taken; a refinement for verdict.py.
 
+**Amendment 3 measured on h3, with ADR 0089 Amendment 3** (2026-11-03,
+`h3-20261103T162448Z`: this branch — the yield by the queue's depth at its default 1,024,
+eight shards allowed — with ADR 0089 Amendment 3 (a delivery behind a write in flight waits
+for it, #1198), #1193's worker default and #1195's drain order merged locally; four shards,
+the ladder from 300,000; 43 min, about USD 1.80). The per-round counters are the broker's
+pre-round scrapes (`scratchpad/round-counters.py`); the hub model is the rig's report:
+
+| offered | verdict | received | ack p99 | each loop's busy | hub µs a message | yields per 1,000 commands | waited behind a write, a round | written: head / timeout | the writer |
+|---|---|---|---|---|---|---|---|---|---|
+| 300,000 | carried, 3 rounds | 300,004 | 52.7 ± 4.0 ms | 0.62–0.64 | 8.4 | 13.1 | 375,000 | 135,000 / 145,000 | 29 ops a batch, 1.2 ms a commit |
+| **375,000** | **carried, 3 rounds** | 378,265 | 3,087 ± 665 ms | 0.82–0.86 | 8.8 | 1.8–2.5 | 274,000–382,000 | 93,000–124,000 / 116,000–158,000 | 24–30 ops, 1.2–1.3 ms |
+| 468,800 | offer not taken | 400,841 | 4,399 ms | 0.84 | 8.4 | 1.03 | 210,000 | 66,000 / 94,000 | 24 ops, 1.2 ms |
+| 421,900 | void, four rounds on two generator hosts | 390,000–400,000 | 4.0–4.8 s | 0.83–0.84 | 8.4 | — | — | — | — |
+
+The knee is 375,000 against the 16-worker run's 327,100, +14.6%, and the broker took about
+400,000 whenever it was offered more. The yield rule did what the amendment said: each loop's
+busy ceiling is 0.86 where it was 0.70, and 4 × 0.86 / 8.8 µs is 391,000, the 390,000–400,841
+the broker took at 421,900 and 468,800. The yields read the regime: 13.1 per 1,000 commands
+at 300,000 (one per 76, the shallow rule with deep spells) and 1.0–2.5 from 375,000 (one per
+1,024). The cost of a message did not move (8.4–8.8 µs against 8.5). Latency moved the other
+way at the old knee's rate: 300,000 at 52.7 ms where the 16-worker run had 327,100 at 584 ms,
+but the ladder's ×1.25 skipped the 330,000–360,000 band and 375,000 carried at 3.1 s, so the
+≤ 1 s band reads 300,000 (it was 327,100). ADR 0089 Amendment 3 held every round out of
+write mode: 95.9–97.3% of deliveries were acknowledged inside the window, 210,000–382,000 a
+round waited behind a write instead of being written, and the writer stayed at 24–30 ops a
+batch and 1.2 ms a commit at every rung, against 35,000–73,000 ops and 550 ms in the two
+collapsed rounds of the morning; what was still written is the window's timeouts (0.3–0.5%)
+and the head rule (0.2–0.4%). The overload is OFFER NOT TAKEN at 468,800 with the
+connections kept.
+
+The upper bracket is the generator's, not the broker's: the m6i.4xlarge ran at 77% CPU at
+375,000 and 83% at 468,800 with a scheduling-lag p99 of 12.9 ms, and 421,900 voided four
+times on two hosts (the generator saturated, sched_lag), so an h3 ladder cannot be judged
+above about 400,000 with one generator. The run ended there: the rig's private-net mesh retry
+after the second host replacement rebooted the broker host (16:59Z; the one-way-attach retry
+of #368 rebooted the wrong side), mqttd was gone, and the ladder was stopped by hand at
+17:06Z; the teardown and both label audits were clean. The per-round scrape series and the
+host CPU samples (#1188) went with the replaced generator hosts, so this run has no broker
+CPU figure. Eight shards (T12) are not run: above 400,000 the generator decides, so that
+ladder needs `GENERATORS=2`, and with the loops at 0.86 the next limit on this host is its
+sixteen cores (36.6 µs of CPU a message on the morning's run is 13.7 cores at 375,000).
+
 ## Changelog
 
 - **2026-11-02** — ADR 0093 written from the prototype's four runs (ADR 0092 T5, #1163),
@@ -567,3 +609,11 @@ taken; a refinement for verdict.py.
   dealing lever withdrawn: the knee's `shard` class is 0.009 a publish, Amendment 1 already
   keeps the deal on the origin's shard. To be measured on h3 with four shards together with
   ADR 0089 Amendment 3 (a delivery behind a write in flight waits for it), then with eight.
+- 2026-11-03 — Amendment 3 measured on h3 with ADR 0089 Amendment 3 (`h3-20261103T162448Z`,
+  four shards): the knee 375,000 against 327,100 (+14.6%), each loop's busy ceiling 0.86
+  against 0.70, 300,000 at 52.7 ms; no round in write mode, 210,000–382,000 deliveries a
+  round waiting behind a write instead of being written; the broker took about 400,000 when
+  offered more and pushed back (OFFER NOT TAKEN); the h3 generator at its own limit from
+  420,000 offered (four void rounds on two hosts), and the rig's mesh retry after the second
+  host replacement rebooted the broker host, which ended the run. Eight shards wait for a
+  second generator.
