@@ -34,6 +34,9 @@ const MAX_BATCH: usize = 64;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct Slot {
+    /// The ledger publisher the message is from: the connection itself, or one of its
+    /// topics' logical publishers when the connection is a bridge.
+    publisher: u32,
     seq: u64,
     send_ns: u64,
     used: bool,
@@ -70,10 +73,11 @@ impl Inflight {
         usize::from(self.window) - self.free.len()
     }
 
-    /// Take a packet id for `seq`, sent at `send_ns`.
-    pub fn take(&mut self, seq: u64, send_ns: u64) -> Option<u16> {
+    /// Take a packet id for ledger publisher `publisher`'s `seq`, sent at `send_ns`.
+    pub fn take(&mut self, publisher: u32, seq: u64, send_ns: u64) -> Option<u16> {
         let pkid = self.free.pop()?;
         self.slots[usize::from(pkid)] = Slot {
+            publisher,
             seq,
             send_ns,
             used: true,
@@ -81,15 +85,16 @@ impl Inflight {
         Some(pkid)
     }
 
-    /// Release `pkid`: its (seq, `send_ns`), or `None` if nothing was in flight on it.
-    pub fn release(&mut self, pkid: u16) -> Option<(u64, u64)> {
+    /// Release `pkid`: its (publisher, seq, `send_ns`), or `None` if nothing was in
+    /// flight on it.
+    pub fn release(&mut self, pkid: u16) -> Option<(u32, u64, u64)> {
         let slot = self.slots.get_mut(usize::from(pkid))?;
         if !slot.used {
             return None;
         }
         slot.used = false;
         self.free.push(pkid);
-        Some((slot.seq, slot.send_ns))
+        Some((slot.publisher, slot.seq, slot.send_ns))
     }
 }
 
@@ -199,15 +204,25 @@ pub async fn writer(
     shard: usize,
 ) -> OwnedWriteHalf {
     let cfg = &ctx.cfg;
-    let topic_idx = id as usize % cfg.topics;
-    let topic = cfg.topic(topic_idx).into_bytes();
+    // The connection's lanes: (topic index, topic name, ledger publisher). One, on
+    // topic `id % topics`; as a bridge, one per topic, its messages dealt round-robin.
+    let lanes: Vec<(usize, Vec<u8>, u32)> = if cfg.bridge {
+        (0..cfg.topics)
+            .map(|t| (t, cfg.topic(t).into_bytes(), cfg.logical(id, t)))
+            .collect()
+    } else {
+        let t = id as usize % cfg.topics;
+        vec![(t, cfg.topic(t).into_bytes(), id)]
+    };
+    let mut seqs = vec![0u64; lanes.len()];
+    let mut batch_sent = vec![0u64; lanes.len()];
+    let mut lane = 0usize;
+    let longest_topic = lanes.iter().map(|(_, t, _)| t.len()).max().unwrap_or(0);
     let qos1 = cfg.qos == 1;
-    let ledger = &ctx.ledger.publishers[id as usize];
     let ka_ns = u64::from(cfg.keepalive) * 500_000_000; // ping at half the keep-alive
-    let mut buf = Vec::with_capacity(MAX_BATCH * (cfg.payload + topic.len() + 8));
+    let mut buf = Vec::with_capacity(MAX_BATCH * (cfg.payload + longest_topic + 8));
     let mut delays: Vec<(u64, bool)> = Vec::with_capacity(MAX_BATCH);
     let mut next = cursor.next();
-    let mut seq = 0u64;
     // Messages due before this instant were held back by something outside the
     // generator (credit or the socket).
     let mut held_until = 0u64;
@@ -261,20 +276,22 @@ pub async fn writer(
                 if d > stamp || delays.len() >= credit.min(MAX_BATCH) {
                     break;
                 }
+                let (_, topic, publisher) = &lanes[lane];
+                let seq = seqs[lane];
                 let pkid = match inflight.as_mut() {
-                    Some(inf) => inf.take(seq, stamp),
+                    Some(inf) => inf.take(*publisher, seq, stamp),
                     None => None,
                 };
-                let _ = ledger.sent.set(seq);
+                let _ = ctx.ledger.publishers[*publisher as usize].sent.set(seq);
                 let header = Header {
                     run: ctx.run,
-                    publisher: id,
+                    publisher: *publisher,
                     seq,
                     send_ns: stamp,
                 };
                 encode_publish(
                     &mut buf,
-                    &topic,
+                    topic,
                     cfg.qos,
                     pkid,
                     true,
@@ -284,13 +301,20 @@ pub async fn writer(
                 )
                 .expect("a validated workload encodes");
                 delays.push((stamp - d, d < held_until));
-                seq += 1;
+                seqs[lane] += 1;
+                batch_sent[lane] += 1;
+                lane = (lane + 1) % lanes.len();
                 next = cursor.next();
             }
         }
         let n = delays.len() as u64;
         let written = write_tracked(&mut w, &buf).await;
-        ctx.topic_sent[topic_idx].fetch_add(n, Ordering::Relaxed);
+        for (k, sent) in batch_sent.iter_mut().enumerate() {
+            if *sent > 0 {
+                ctx.topic_sent[lanes[k].0].fetch_add(*sent, Ordering::Relaxed);
+                *sent = 0;
+            }
+        }
         let Ok((blocked, blocked_ns)) = written else {
             if !ctx.publishers_stopping() {
                 ctx.errors.write.fetch_add(1, Ordering::Relaxed);
@@ -341,13 +365,11 @@ pub async fn writer(
 /// If another task panicked holding the in-flight lock.
 pub async fn reader(
     ctx: Arc<Ctx>,
-    id: u32,
     state: Arc<PubShared>,
     mut r: OwnedReadHalf,
     mut buf: BytesMut,
     shard: usize,
 ) {
-    let ledger = &ctx.ledger.publishers[id as usize];
     let mut acks: Vec<(u16, u8)> = Vec::with_capacity(256);
     let mut lat: Vec<u64> = Vec::with_capacity(256);
     loop {
@@ -377,8 +399,8 @@ pub async fn reader(
                 let mut inf = state.inflight.lock().expect("inflight poisoned");
                 for &(pkid, reason) in &acks {
                     match inf.release(pkid) {
-                        Some((seq, sent)) if reason < 0x80 => {
-                            let _ = ledger.acked.set(seq);
+                        Some((publisher, seq, sent)) if reason < 0x80 => {
+                            let _ = ctx.ledger.publishers[publisher as usize].acked.set(seq);
                             lat.push(now.saturating_sub(sent));
                         }
                         Some(_) => {
@@ -422,15 +444,19 @@ mod tests {
     #[test]
     fn inflight_window_hands_out_and_takes_back_packet_ids() {
         let mut inf = Inflight::new(3);
-        let a = inf.take(10, 100).unwrap();
-        let b = inf.take(11, 101).unwrap();
-        let c = inf.take(12, 102).unwrap();
-        assert_eq!(inf.take(13, 103), None, "window full");
+        let a = inf.take(0, 10, 100).unwrap();
+        let b = inf.take(4, 11, 101).unwrap();
+        let c = inf.take(0, 12, 102).unwrap();
+        assert_eq!(inf.take(0, 13, 103), None, "window full");
         assert_eq!(inf.outstanding(), 3);
         let mut ids = [a, b, c];
         ids.sort_unstable();
         assert_eq!(ids, [1, 2, 3]);
-        assert_eq!(inf.release(b), Some((11, 101)));
+        assert_eq!(
+            inf.release(b),
+            Some((4, 11, 101)),
+            "the slot gives back the ledger publisher it was taken for"
+        );
         assert_eq!(
             inf.release(b),
             None,
@@ -439,6 +465,6 @@ mod tests {
         assert_eq!(inf.release(0), None);
         assert_eq!(inf.release(999), None);
         assert_eq!(inf.free(), 1);
-        assert_eq!(inf.take(13, 103), Some(b));
+        assert_eq!(inf.take(0, 13, 103), Some(b));
     }
 }

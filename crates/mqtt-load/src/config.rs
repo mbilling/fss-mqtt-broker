@@ -87,6 +87,11 @@ pub struct Config {
     pub payload: usize,
     /// Topics; publisher `i` publishes to topic `i % topics`.
     pub topics: usize,
+    /// Every publisher connection carries every topic, its messages dealt round-robin
+    /// over them: the shape of a bridge forwarding many topics over one connection. The
+    /// ledger then keeps one logical publisher per (connection, topic), with its own
+    /// sequence, so each still publishes to exactly one topic.
+    pub bridge: bool,
     /// Topic `t` is `<topic_prefix>/<t>`.
     pub topic_prefix: String,
     /// Subscription shape.
@@ -163,6 +168,7 @@ impl Config {
             qos: 1,
             payload: 128,
             topics: 1,
+            bridge: false,
             topic_prefix: "load".into(),
             shape: Shape::Share,
             consumers: 2,
@@ -225,11 +231,21 @@ impl Config {
         if self.topics == 0 {
             return Err("at least one topic".into());
         }
-        if (self.publishers as usize) < self.topics {
+        // With `bridge` every connection covers every topic; without, publisher i
+        // publishes to topic i % topics, so it takes a publisher per topic.
+        if !self.bridge && (self.publishers as usize) < self.topics {
             return Err(format!(
                 "{} publishers cannot cover {} topics (publisher i publishes to topic i % topics)",
                 self.publishers, self.topics
             ));
+        }
+        if self.bridge
+            && u32::try_from(self.topics)
+                .ok()
+                .and_then(|t| self.publishers.checked_mul(t))
+                .is_none()
+        {
+            return Err("publishers x topics must fit in 32 bits".into());
         }
         if self.shape != Shape::None && (self.consumers == 0 || self.groups == 0) {
             return Err("consumers and groups must be at least 1".into());
@@ -262,12 +278,21 @@ impl Config {
             return Err(format!(
                 "the busiest consumer session would carry {skew:.2}x the mean session's load \
                  (limit {:.2}): {} publishers over {} topics and {} brokers do not divide evenly \
-                 — use a multiple of topics x brokers ({}) or raise --max-skew",
+                 — use a multiple of {} ({}) or raise --max-skew",
                 self.max_skew,
                 self.publishers,
                 self.topics,
                 self.brokers.len(),
-                self.topics * self.brokers.len()
+                if self.bridge {
+                    "brokers"
+                } else {
+                    "topics x brokers"
+                },
+                if self.bridge {
+                    self.brokers.len()
+                } else {
+                    self.topics * self.brokers.len()
+                }
             ));
         }
         Ok(())
@@ -296,10 +321,18 @@ impl Config {
         if brokers == 0 || self.topics == 0 {
             return 1.0;
         }
-        // Publishers per topic and broker.
+        // Publishers per topic and broker. A bridge connection carries every topic at a
+        // topics-th of its rate each; counting it once on every topic scales every load
+        // alike, which leaves the ratio this returns as it is.
         let mut pubs = vec![vec![0usize; brokers]; self.topics];
         for i in 0..self.publishers as usize {
-            pubs[i % self.topics][self.publisher_broker(i)] += 1;
+            if self.bridge {
+                for topic in &mut pubs {
+                    topic[self.publisher_broker(i)] += 1;
+                }
+            } else {
+                pubs[i % self.topics][self.publisher_broker(i)] += 1;
+            }
         }
         let specs = self.consumer_specs();
         let mut loads: Vec<f64> = Vec::with_capacity(specs.len());
@@ -356,6 +389,29 @@ impl Config {
     #[must_use]
     pub fn topic(&self, t: usize) -> String {
         format!("{}/{t}", self.topic_prefix)
+    }
+
+    /// The ledger's publishers: one per connection, or one per (connection, topic)
+    /// when [`bridge`](Self::bridge) puts every topic on every connection.
+    #[must_use]
+    pub fn logical_publishers(&self) -> u32 {
+        if self.bridge {
+            self.publishers
+                .saturating_mul(u32::try_from(self.topics).unwrap_or(u32::MAX))
+        } else {
+            self.publishers
+        }
+    }
+
+    /// The ledger publisher of connection `conn`'s messages to topic `t`. Its index
+    /// modulo `topics` is `t`, so the ledger's topic of a publisher holds either way.
+    #[must_use]
+    pub fn logical(&self, conn: u32, t: usize) -> u32 {
+        if self.bridge {
+            conn * u32::try_from(self.topics).unwrap_or(u32::MAX) + u32::try_from(t).unwrap_or(0)
+        } else {
+            conn
+        }
     }
 
     /// The ledger's streams, each by its topic index.
@@ -438,6 +494,32 @@ mod tests {
         assert_eq!(c.drain_quiet_window_ns(17_900_000), 10_000_000_000);
         c.drain_quiet_factor = f64::NAN;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn a_bridge_connection_carries_every_topic_as_one_logical_publisher_each() {
+        let mut c = cfg();
+        c.publishers = 2;
+        c.topics = 3;
+        assert!(
+            c.validate().is_err(),
+            "without a bridge, two publishers cannot cover three topics"
+        );
+        c.bridge = true;
+        c.validate()
+            .expect("a bridge connection covers every topic");
+        assert_eq!(c.logical_publishers(), 6);
+        // Connection 1's topic-2 messages are ledger publisher 5, whose topic is 5 % 3.
+        assert_eq!(c.logical(1, 2), 5);
+        assert!((0..2).all(|conn| (0..3).all(|t| c.logical(conn, t) as usize % 3 == t)));
+        c.bridge = false;
+        c.publishers = 6;
+        assert_eq!(c.logical_publishers(), 6);
+        assert_eq!(
+            c.logical(4, 1),
+            4,
+            "without a bridge a connection is its publisher"
+        );
     }
 
     #[test]

@@ -951,10 +951,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_reserved_tree_is_exactly_sys_and_below`
 - `tests::topic_name_validity_rejects_wildcards_and_emptiness`
 
-## `crates/mqtt-load/src/lib.rs` — 44 test(s)
+## `crates/mqtt-load/src/lib.rs` — 45 test(s)
 
 - `client::tests::fixed_packets_decode_as_themselves`
 - `clock::tests::clock_is_monotonic_and_maps_back_to_instants`
+- `config::tests::a_bridge_connection_carries_every_topic_as_one_logical_publisher_each`
 - `config::tests::a_hot_session_is_refused_unless_asked_for`
 - `config::tests::every_group_has_a_member_on_every_broker`
 - `config::tests::every_topic_has_publishers_on_every_broker`
@@ -2811,8 +2812,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `session_takeover_publishes_will`
 - `zero_keepalive_is_never_idle_disconnected`
 
-## `crates/mqttd/tests/loadgen.rs` — 7 test(s)
+## `crates/mqttd/tests/loadgen.rs` — 8 test(s)
 
+- `a_bridge_connection_carries_every_topic_and_closes_its_ledger`
 - `a_cut_drain_settles_what_the_broker_holds_before_the_ledger_is_reconciled`
 - `a_lost_consumer_opens_the_ledger`
 - `generators_share_a_start_through_the_start_file`

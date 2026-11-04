@@ -308,7 +308,21 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
         .clone()
         .unwrap_or_else(|| format!("mqload-{run:08x}"));
     let counting = Schedule::new(&cfg.phases, cfg.publishers, 0);
-    let capacity: Vec<u64> = (0..cfg.publishers).map(|p| counting.total_for(p)).collect();
+    // One entry per logical publisher. As a bridge, connection c's schedule is dealt
+    // round-robin over the topics, the first topic first, so topic t gets at most a
+    // topics-th of it, rounded up.
+    let capacity: Vec<u64> = (0..cfg.logical_publishers())
+        .map(|l| {
+            if cfg.bridge {
+                let topics = cfg.topics as u64;
+                counting
+                    .total_for(l / u32::try_from(cfg.topics).unwrap_or(u32::MAX))
+                    .div_ceil(topics)
+            } else {
+                counting.total_for(l)
+            }
+        })
+        .collect();
     let stream_topics = cfg.stream_topics();
     let streams_per_topic = stream_topics.len().checked_div(cfg.topics).unwrap_or(0);
     let shards = (cfg.worker_threads * 4).max(4);
@@ -523,7 +537,6 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
         ));
         let reader = tokio::spawn(publisher::reader(
             ctx.clone(),
-            id,
             state.clone(),
             r,
             c.buf,

@@ -168,6 +168,34 @@ async fn qos1_durable_share_run_closes_its_ledger() {
     assert_eq!(s.schema, "mqtt-load.summary.v2");
 }
 
+/// One bridge connection carrying four topics, each to its own `$share` group of
+/// durable consumers: every message arrives on its own topic, once, and every topic
+/// carries a share, so no consumer is idle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bridge_connection_carries_every_topic_and_closes_its_ledger() {
+    let dir = common::TempDir::new();
+    let broker = spawn_broker(dir.path()).await;
+    let mut c = workload(broker.client, 400.0, 1);
+    c.qos = 1;
+    c.inflight = 64;
+    c.topics = 4;
+    c.bridge = true;
+    c.shape = Shape::Share;
+    c.consumers = 2;
+    c.groups = 1;
+    c.sessions = Sessions::Durable;
+    let s = mqtt_load::run(c).await.expect("run");
+    assert_closed(&s, &broker);
+    let l = &s.ledger;
+    // 400 msg/s for 2.5 s on the one connection, one group per topic.
+    assert_eq!(l.sent, 1000);
+    assert_eq!(l.acked, 1000);
+    assert_eq!(l.expected, 1000);
+    assert_eq!(s.connections.publishers, 1, "one connection");
+    let spread = s.spread.expect("deliveries were made");
+    assert_eq!(spread.idle_consumers, 0, "every topic carried messages");
+}
+
 /// Clean-session `QoS` 0 fan-out: no acks to count, every subscriber gets every message.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn qos0_clean_fanout_run_closes_its_ledger() {

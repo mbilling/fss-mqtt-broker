@@ -236,6 +236,13 @@ defaults; the environment wins.
 | `durable-qos1` | 1 | `$share`, one member per broker per topic | persistent, session expiry 30 s | 200 B | ack p99 |
 | `clean-qos1` | 1 | `$share`, one member per broker per topic | clean | 200 B | ack p99 |
 | `qos0` | 0 | `$share`, one member per broker per topic | clean | 200 B | end-to-end p99 |
+| `bridge-qos1` | 1 | `$share`, 4 members per topic, 10 topics | persistent, session expiry 30 s | 200 B | ack p99 |
+
+`bridge-qos1` is the bridge shape: one publisher connection per generator carries all
+ten topics (`BRIDGE=1`, mqtt-load `--bridge`), as a site gateway forwarding everything
+over one bridge connection, with 8,192 messages in flight capped by the broker's Receive
+Maximum (256 unless `MQTTD_RECEIVE_MAXIMUM` raises it). It measures what one connection
+can carry: one connection task, and the one hub shard that owns the client.
 
 Each generator process publishes under its own topic prefix
 (`rig2/<step>/g<generator>/<t>`), so a topic's publishers and consumers always share one
