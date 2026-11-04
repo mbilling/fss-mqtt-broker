@@ -129,16 +129,13 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           NAME="mqttd-${VERSION}-${{ matrix.target }}"
           BRIDGE_NAME="mqtt-bridge-${VERSION}-${{ matrix.target }}"
-          UI_NAME="mqttui-${VERSION}-${{ matrix.target }}"
           OPERATOR_NAME="mqttd-operator-${VERSION}-${{ matrix.target }}"
           FIPS_NAME="mqttd-fips-${VERSION}-${{ matrix.target }}"
           mkdir -p dist out
           cp "target/${{ matrix.target }}/release/mqttd" "out/${NAME}"
           cp "target/${{ matrix.target }}/release/mqtt-bridge" "out/${BRIDGE_NAME}"
-          # mqttui ships as a signed binary but NOT in the container image: it is a terminal
-          # UI for a human at a keyboard, and adding a TUI to the broker image would grow
-          # the runtime attack surface for something nothing in the image can use.
-          cp "tools/mqttui/target/${{ matrix.target }}/release/mqttui" "out/${UI_NAME}"
+          # No mqttui: it is not built or released since 2026-10-31 (ADR 0056 is
+          # deprecated until its remake), so the reproducible build above never makes one.
           cp "target/${{ matrix.target }}/release/mqttd-operator" "out/${OPERATOR_NAME}"
           # The fips variant (ADR 0068 T4): a binary artifact only — the container
           # images stay single-variant; a fips image is its own future decision.
@@ -154,12 +151,10 @@ jobs:
           cp "target/${{ matrix.target }}/release/mqttd-operator" dist/mqttd-operator
           ( cd out && sha256sum "${NAME}" > "${NAME}.sha256" )
           ( cd out && sha256sum "${BRIDGE_NAME}" > "${BRIDGE_NAME}.sha256" )
-          ( cd out && sha256sum "${UI_NAME}" > "${UI_NAME}.sha256" )
           ( cd out && sha256sum "${OPERATOR_NAME}" > "${OPERATOR_NAME}.sha256" )
           ( cd out && sha256sum "${FIPS_NAME}" > "${FIPS_NAME}.sha256" )
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
           echo "bridge_name=${BRIDGE_NAME}" >> "$GITHUB_OUTPUT"
-          echo "ui_name=${UI_NAME}" >> "$GITHUB_OUTPUT"
           echo "operator_name=${OPERATOR_NAME}" >> "$GITHUB_OUTPUT"
           echo "fips_name=${FIPS_NAME}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
@@ -171,7 +166,6 @@ jobs:
           subject-path: |
             out/${{ steps.stage.outputs.name }}
             out/${{ steps.stage.outputs.bridge_name }}
-            out/${{ steps.stage.outputs.ui_name }}
             out/${{ steps.stage.outputs.operator_name }}
             out/${{ steps.stage.outputs.fips_name }}
 
@@ -403,21 +397,8 @@ jobs:
             cp "$SBOM" "assets/${out}-${{ steps.v.outputs.version }}.cdx.json"
             echo "SBOM: $SBOM -> ${out}-${{ steps.v.outputs.version }}.cdx.json ($(wc -c < "$SBOM") bytes)"
           done
-
-          # mqttui is a SEPARATE workspace with its own lockfile (ADR 0056 §1), so the run
-          # above cannot see it — its graph is deliberately not in the broker's. It is a
-          # published, signed artifact, so by ADR 0045's own standard it gets an SBOM too,
-          # cut from ITS lockfile.
-          cargo cyclonedx --format json --manifest-path tools/mqttui/Cargo.toml
-          git diff --exit-code tools/mqttui/Cargo.lock || {
-            echo "::error title=SBOM::mqttui SBOM generation mutated tools/mqttui/Cargo.lock"; exit 1;
-          }
-          UI_SBOM="$(find tools/mqttui -name 'mqttui.cdx.json' -print -quit)"
-          if [ -z "$UI_SBOM" ]; then
-            echo "::error title=SBOM::cargo-cyclonedx produced no mqttui.cdx.json"; exit 1
-          fi
-          cp "$UI_SBOM" "assets/sbom-mqttui-${{ steps.v.outputs.version }}.cdx.json"
-          echo "SBOM: $UI_SBOM -> sbom-mqttui-${{ steps.v.outputs.version }}.cdx.json ($(wc -c < "$UI_SBOM") bytes)"
+          # No mqttui SBOM: an SBOM describes a shipped binary, and mqttui is not built or
+          # released since 2026-10-31 (ADR 0056 is deprecated until its remake).
 
       # ── VEX: the machine-readable "is mqttd affected?" beside the SBOMs ──
       # (ADR 0065 T3). security/vex/statements.json is the reviewed source of
