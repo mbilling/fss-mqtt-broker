@@ -27,15 +27,19 @@ nothing), then the highest step at p99 ≤ 1 s:
 
 | workload | 1 node | 3 nodes | 10 nodes |
 |---|---|---|---|
-| durable QoS 1 (ack after fsync and a quorum copy) | 92,900 msg/s, one copy · the same at ack p99 ≤ 1 s | 117,800 msg/s · 114,200 at ack p99 ≤ 1 s | 292,200 msg/s · 228,000 at ack p99 ≤ 1 s |
+| durable QoS 1 (ack after fsync and a quorum copy) | 92,900 msg/s, one copy · the same at ack p99 ≤ 1 s | 142,800 msg/s · the same at ack p99 ≤ 1 s | 292,200 msg/s · 228,000 at ack p99 ≤ 1 s |
 | QoS 1, clean sessions | 114,000 msg/s · the same at ack p99 ≤ 1 s | 270,800 msg/s · 152,000 at ack p99 ≤ 1 s | 875,900 msg/s · 303,800 at ack p99 ≤ 1 s |
 | QoS 0 | 123,100 msg/s · the same at end-to-end p99 ≤ 1 s | 340,300 msg/s · 253,200 at end-to-end p99 ≤ 1 s | 973,200 msg/s · 506,300 at end-to-end p99 ≤ 1 s |
+
+The 3-node durable cell is the 1.3.0 release's code, measured on 2026-11-04 at ack p99
+64.7 ms ([RIG2-RESULTS.md § the release candidate](RIG2-RESULTS.md#durable-qos-1-on-the-130-release-candidate)).
+The other cells are the 1.3.0 candidate's, before ADR 0092 cut the hub's work per message.
 
 Per node, at the maximum lossless step:
 
 | workload | 1 node | 3 nodes | 10 nodes |
 |---|---|---|---|
-| durable QoS 1 | 92.9k (one copy) | 39.3k | 29.2k |
+| durable QoS 1 | 92.9k (one copy) | 47.6k | 29.2k |
 | QoS 1, clean sessions | 114k | 90.3k | 87.6k |
 | QoS 0 | 123k | 113k | 97.3k |
 
@@ -65,10 +69,11 @@ clusters', which keep 2 copies.
 
 **Scaling from 3 to 10 nodes:**
 - **QoS 1 with clean sessions and QoS 0** hold close to their per-node rate.
-- **Durable QoS 1** falls from 39.3k to 29.2k per node. At 10 nodes, more of each
-  message's replication and forwarding crosses between nodes. It's being profiled.
+- **Durable QoS 1** falls from 39.3k to 29.2k per node on the same code, the 1.3.0
+  candidate. At 10 nodes, more of each message's replication and forwarding crosses
+  between nodes. It's being profiled.
 
-**Node size:** per vCPU, durable QoS 1 carries 9,817 msg/s on 4-vCPU nodes, 4,066 on
+**Node size:** per vCPU, durable QoS 1 carries 11,900 msg/s on 4-vCPU nodes, 4,066 on
 16-vCPU nodes and 2,821 on 32-vCPU nodes. A node's throughput is bound by its one hub
 task, not by its vCPU: a lone 32-vCPU node carries 88,700, a lone 4-vCPU node 92,900
 ([RIG2-RESULTS.md § AWS](RIG2-RESULTS.md#aws-96-vcpu)).
@@ -83,18 +88,18 @@ task, not by its vCPU: a lone 32-vCPU node carries 88,700, a lone 4-vCPU node 92
 - **The price basis:** both brokers are priced at AWS `m6a.8xlarge` on-demand (us-east-1,
   Linux, $1.3824 an hour for 32 vCPU), the instance HiveMQ's run used. Hetzner CCX23
   costs about the same per vCPU.
-- **The result:** mqttd's measured durable QoS 1 clusters cost 3.5× less than HiveMQ at
+- **The result:** mqttd's measured durable QoS 1 clusters cost 4.2× less than HiveMQ at
   the same traffic on 3 × 4 vCPU, 2.6× less on 10 × 4, and 1.45× less on 6 × 16 vCPU,
   HiveMQ's own vCPU count: at its $3,027 a month, 390,300 msg/s against its published
   270,000.
 - **HiveMQ's traffic, 270,000 msg/s,** fits on ten 4-vCPU nodes: they carry 292,200 for
   $1,261 a month, 2.4× less than HiveMQ's $3,027, with no line drawn through either point.
-- **Per million msg/s:** the hardware behind a million msg/s of durable QoS 1 costs $3,212 a month on
+- **Per million msg/s:** the hardware behind a million msg/s of durable QoS 1 costs $2,650 a month on
   3 × 4 vCPU, $4,317 on 10 × 4 and $7,757 on 6 × 16, against $11,213 at HiveMQ's
   published rate; a lone node, one copy, $1,358 on 4 vCPU and $11,377 on 32. The
   scale-out chart prints it under every column.
-- **Every mqttd point is its run's maximum lossless step:** the 3- and 10-node steps ran
-  at ack p99 1.35 s and 1.37 s, the 6-node one at 112 ms.
+- **Every mqttd point is its run's maximum lossless step:** the 3-node step ran at ack
+  p99 64.7 ms, the 10-node one at 1.37 s and the 6-node one at 112 ms.
 - **HiveMQ's line is an extrapolation,** drawn straight through its one published point.
 - **The licence comes on top:** HiveMQ's clustering needs its commercial edition, whose
   price is not published.
@@ -113,7 +118,7 @@ costs several times a QoS 0 one, and connection count dominates the large vendor
 
 | class | mqttd (maximum lossless) | best comparable | ratio |
 |---|---|---|---|
-| cluster, durable QoS 1, 2 copies, 4-vCPU nodes | 9,817 /vCPU (117,800 msg/s on 3 × CCX23, fsync + replication) | HiveMQ 4.18 2,812 /vCPU (published) | **3.5×** |
+| cluster, durable QoS 1, 2 copies, 4-vCPU nodes | 11,900 /vCPU (142,800 msg/s on 3 × CCX23, fsync + replication, the 1.3.0 release) | HiveMQ 4.18 2,812 /vCPU (published) | **4.2×** |
 | the same on 16-vCPU nodes | 4,066 /vCPU (390,300 msg/s on 6 × m6i.4xlarge) | HiveMQ 4.18 2,812 /vCPU | **1.45×** |
 | the same on HiveMQ's shape, 3 × 32 vCPU | 2,821 /vCPU (270,800 msg/s on 3 × m6i.8xlarge) | HiveMQ 4.18 2,812 /vCPU | 1.0× |
 | cluster, QoS 1, not durable | 22,567 /vCPU (270,800 msg/s on 3 × CCX23, clean sessions) | EMQX 5.0 679 /core (published; compare per core) | — |

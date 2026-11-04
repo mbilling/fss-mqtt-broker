@@ -311,7 +311,8 @@ quoted — **not reproduced**, with every workload difference beside them — in
 - **Performance:** no cross-broker numbers are printed here, deliberately.
   - **mqttd's own figures** are in [RIG2-RESULTS.md](benchmarks/RIG2-RESULTS.md), the
     benchmark rig of ADR 0090. Durable QoS 1, ack after fsync and a quorum copy, carries
-    117,800 msg/s on 3 nodes and 292,200 on 10 with no message lost. QoS 1 with clean
+    142,800 msg/s on 3 nodes with the 1.3.0 release and 292,200 on 10 with its candidate,
+    with no message lost. QoS 1 with clean
     sessions carries 270,800 and 875,900, and QoS 0 340,300 and 973,200.
   - **Comparing with the vendors** is done in [EVIDENCE.md](benchmarks/EVIDENCE.md), next
     to their published figures. It isn't a reproduction.
