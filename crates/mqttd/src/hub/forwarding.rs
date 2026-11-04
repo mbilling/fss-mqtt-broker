@@ -4889,7 +4889,12 @@ mod pending_bounds {
         let aged = Instant::now()
             .checked_sub(crate::hub::SESSION_SWEEP_INTERVAL)
             .expect("the clock is past one sweep interval");
-        hub.pending_publishes.get_mut(id).unwrap().created_at = aged;
+        let p = hub.pending_publishes.get_mut(id).unwrap();
+        p.created_at = aged;
+        // The sweep ages a forward from its SEND, `created_at` plus this offset (#644):
+        // left at the millisecond the send above took, it kept the forward that much
+        // short of overdue in about one run in ten.
+        p.forwarded_after_ms = 0;
         hub.sweep_pending_forwards();
         assert!(rx.try_recv().is_ok(), "an overdue forward is retransmitted");
         assert!(rx.try_recv().is_err(), "exactly once per sweep");

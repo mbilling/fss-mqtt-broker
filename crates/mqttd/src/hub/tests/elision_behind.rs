@@ -142,7 +142,9 @@ async fn a_delivery_behind_a_write_in_flight_on_its_topic_waits_for_it_and_is_th
     );
     assert!(accepted(on_two).await);
     assert!(accepted(on_three).await);
-    assert_eq!(counter(&metrics, "mqttd_durable_elided_total"), 1);
+    // The warm-up and three: the warm-up is held too, its block reserved at the attach
+    // (ADR 0089 Amendment 4).
+    assert_eq!(counter(&metrics, "mqttd_durable_elided_total"), 2);
     assert_eq!(
         counter(&metrics, "mqttd_durable_elision_fallback_total"),
         1,
@@ -242,8 +244,9 @@ async fn what_waits_behind_a_write_is_written_at_the_landing_when_its_session_ca
     );
     assert_eq!(
         counter(&metrics, "mqttd_durable_elided_total"),
-        1,
-        "the second waited again and was held"
+        2,
+        "the second waited again and was held (with the warm-up, whose block the attach \
+         reserved: ADR 0089 Amendment 4)"
     );
 }
 

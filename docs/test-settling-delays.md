@@ -43,6 +43,7 @@ caller changes this file and the gate fails until it is regenerated and re-read.
 | `crates/mqttd/src/http_auth.rs` | `the_cache_expires_and_is_bounded` | `http-auth-cache-ttl` | 80ms | in the test itself |
 | `crates/mqttd/src/hub/mod.rs` | `enqueue_with_expiry` | `append-hold` | 10ms | helper, 8 call site(s) |
 | `crates/mqttd/src/hub/mod.rs` | `enqueue_with_expiry` | `write-delay` | ? | helper, 8 call site(s) |
+| `crates/mqttd/src/hub/mod.rs` | `reserve_packet_ids` | `reserve-hold` | 10ms | helper, 11 call site(s) |
 | `crates/mqttd/src/hub/mod.rs` | `publisher_wait` | `subscriber-ack-delay` | ? | helper, 4 call site(s) |
 | `crates/mqttd/src/hub/mod.rs` | `successor_hub` | `successor-scan-cadence` | EXPIRY_RECONCILE_EVERY | helper, 3 call site(s) |
 | `crates/mqttd/src/hub/mod.rs` | `enqueue_with_expiry` | `store-slow-first-enqueue` | ? | helper, 8 call site(s) |

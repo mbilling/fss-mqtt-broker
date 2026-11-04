@@ -1393,9 +1393,23 @@ impl Hub {
     /// off-loop contract. [`PkidBlockReserved`](HubCommand::PkidBlockReserved)
     /// banks the result and drains.
     pub(super) fn defer_for_pkid_block(&mut self, client: &ClientId, entry: BacklogEntry) {
+        self.inflight
+            .entry(client.clone())
+            .or_default()
+            .backlog
+            .push_front_admitted(entry);
+        self.reserve_pkid_block(client);
+    }
+
+    /// Reserve `client`'s next packet-id block off-loop, single-flight: nothing happens
+    /// while a reservation is in flight or a block is banked already.
+    /// [`PkidBlockReserved`](HubCommand::PkidBlockReserved) banks the answer and drains.
+    /// Run once a block is spent ([`defer_for_pkid_block`](Self::defer_for_pkid_block)),
+    /// and ahead of need: when a durable session attaches, and when its current block is
+    /// down to [`PKID_RESERVE_AHEAD`](super::PKID_RESERVE_AHEAD) ids (ADR 0089 Amendment 4).
+    pub(super) fn reserve_pkid_block(&mut self, client: &ClientId) {
         let inf = self.inflight.entry(client.clone()).or_default();
-        inf.backlog.push_front_admitted(entry);
-        if inf.reserve_outstanding {
+        if inf.reserve_outstanding || inf.banked_base.is_some() {
             return;
         }
         inf.reserve_outstanding = true;
