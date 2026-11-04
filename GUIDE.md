@@ -197,6 +197,14 @@ Measured with the benchmark rig of
 
 ## The runnable map: mqttui
 
+> **Deprecated since 2026-10-31.** `mqttui` is not built, tested or released while
+> [ADR 0056](docs/adr/0056-mqttui.md) waits for its remake, and 1.2.0 is the last release
+> with its binaries. Every task it lists is a script in this repository that runs from a
+> checkout without it: `scripts/migrate/from-mosquitto.py` for `mqttui migrate mosquitto`,
+> `scripts/deploy-smoke.sh` for `--run deploy-smoke`, `scripts/quickstart-smoke.sh` for
+> `--run quickstart`, `demo/loadgen/loadgen.sh` for `--run demo-stack`, and the rest in
+> `tools/mqttui/tasks.toml`.
+
 **`mqttui`** is the map of everything runnable in this repository — the demo
 cluster, the Mosquitto / EMQX / HiveMQ migration converters, the secured quickstarts, the
 Kubernetes examples. It tells you what each task needs *before* it starts, instead of failing five
@@ -212,8 +220,8 @@ mqttui            # the terminal UI — `mqttui --list` is the same thing, headl
 > assumes them): a Rust toolchain for the `cargo install` above
 > ([rustup.rs](https://rustup.rs)); **Docker** for the demos and reference
 > deployments; and the Mosquitto client tools for every pub/sub snippet in this
-> file (`brew install mosquitto` / `apt install mosquitto-clients`). Signed
-> prebuilt `mqttui` binaries ship with releases after v0.9.0.
+> file (`brew install mosquitto` / `apt install mosquitto-clients`). The releases
+> after v0.9.0, up to 1.2.0, ship signed prebuilt `mqttui` binaries; later ones do not.
 
 **Migrating from a production broker, or evaluating one?**
 
@@ -243,9 +251,9 @@ do versus Mosquitto, EMQX, VerneMQ and NanoMQ — including every cell it loses 
 [`docs/COMPARISON.md`](docs/COMPARISON.md); capacity planning is
 [`docs/SIZING.md`](docs/SIZING.md).
 
-The converter also works with **no clone at all** — the examples travel inside the
-binary, and updates arrive as a cosign-signed bundle (`mqttui update`), never a
-trust-the-branch download:
+The converter also works with **no clone at all**, because the examples travel inside the
+binary. Their cosign-signed bundle updates (`mqttui update`) stopped with the deprecation,
+so a binary installed this way keeps the examples it was built with:
 
 ```sh
 cargo install --locked --git https://github.com/mbilling/fss-mqtt-broker mqttui

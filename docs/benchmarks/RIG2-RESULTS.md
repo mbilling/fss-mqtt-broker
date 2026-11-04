@@ -207,6 +207,45 @@ Run `n3-20261028T030901Z` · 3 × ccx23 brokers, 2 × ccx33 generators · 3 roun
 | 12 | 117,800 | CARRIED | 3 | 118,047 | 1.35 ± 0.60 s |
 | 13 | 119,600 | FAILED | 2 | 114,623 | 2.95 ± 2.66 s |
 
+### Durable QoS 1, on the 1.3.0 release candidate
+
+![Durable QoS 1, 3 nodes, the 1.3.0 release candidate: ack p99 by offered msg/s](img/rig2/n3-durable-qos1-rc.svg)
+
+Run `n3-20261104T123655Z` · 3 × ccx23 brokers, 2 × ccx33 generators · 3 rounds a step · 200 B payload · latency is the ack p99, the mean of the rounds ± their standard deviation. The binary is the release candidate, main `a61c7b77` with ADR 0089 Amendment 4 (#1210), every default as it ships: each broker ran 2 runtime workers, the physical cores of its 4 vCPUs (ADR 0092 Amendment 4).
+
+- **Maximum lossless:** 142,800 msg/s offered, 47.6k per node and 11,900 per vCPU (brokers received 142,797), ack p99 64.7 ± 7.9 ms
+- **ack p99 ≤ 1 s:** 142,800 msg/s (64.7 ± 7.9 ms)
+- **ack p99 ≤ 250 ms:** 142,800 msg/s (64.7 ± 7.9 ms)
+- **ack p99 ≤ 100 ms:** 142,800 msg/s (64.7 ± 7.9 ms)
+
+| step | offered msg/s | verdict | rounds | brokers received (mean) | ack p99 (mean ± sd) |
+|---|---|---|---|---|---|
+| 1 | 10,000 | CARRIED | 3 | 10,000 | 1.3 ± 0.0 ms |
+| 2 | 15,000 | CARRIED | 3 | 15,000 | 1.4 ± 0.1 ms |
+| 3 | 22,500 | CARRIED | 3 | 22,500 | 1.3 ± 0.0 ms |
+| 4 | 33,800 | CARRIED | 3 | 33,800 | 1.4 ± 0.1 ms |
+| 5 | 50,700 | CARRIED | 3 | 50,700 | 1.6 ± 0.0 ms |
+| 6 | 76,100 | CARRIED | 3 | 76,100 | 2.3 ± 0.1 ms |
+| 7 | 114,200 | CARRIED | 3 | 114,193 | 33.6 ± 3.9 ms |
+| 8 | 171,300 | FAILED | 1 | 57,641 | 2.0 ms |
+| 9 | 142,800 | CARRIED | 3 | 142,797 | 64.7 ± 7.9 ms |
+| 10 | 157,100 | FAILED | 1 | 155,445 | 92.9 ms |
+| 11 | 150,000 | FAILED | 1 | 126,456 | 252.9 ms |
+| 12 | 146,400 | FAILED | 1 | 139,728 | 94.3 ms |
+
+**What this run shows.**
+- **The knee is bracketed to 2.5%:** 142,800 msg/s carried in all 3 rounds and 146,400
+  failed. Round 3 at 142,800 first dropped 23 messages, then carried its retry after a full
+  settle ("retried: transient").
+- **No acknowledged message was lost.** Every message missing from a failed round was one
+  the brokers had not acknowledged, so its publisher still owned it.
+- **The drops near the knee came mid-round,** 38 to 56 s in, when one broker's append lanes
+  filled. None fell in a round's first seconds, where ADR 0089 Amendment 4 removed a write
+  storm. Above the knee, at 171,300, the drops started at once: the retry of that step
+  dropped 95,939 messages as `append-backlog-full` and the brokers took 57,641 msg/s.
+- **The `$share` spread:** at the knee the busiest consumer took 1.33× the mean consumer's
+  deliveries, and at 171,300 up to 3.34×.
+
 ## 1 node
 
 One broker, measured on 2026-10-28 on main `9520b33`: the 1.3.0 candidate plus #1146, the
