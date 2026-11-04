@@ -34,6 +34,11 @@
 > **Amended 2026-11-03** by the maintainer on ADR 0093's h3 runs: a delivery behind a write
 > in flight on its topic waits for that write, unsent, instead of being written too. See
 > [Amendment 3](#amendment-3--a-delivery-behind-a-write-in-flight-waits-for-it-2026-11-03).
+>
+> **Amended 2026-11-04** after ADR 0093's eight-shard h3 run: a session's next packet-id
+> block is reserved ahead of need, at its attach and when its current block is half spent,
+> so a held delivery never meets a spent block. See
+> [Amendment 4](#amendment-4--a-sessions-next-packet-id-block-is-reserved-ahead-of-need-2026-11-04).
 
 ## Context
 
@@ -354,6 +359,47 @@ mode ends by itself. A delivery waits at most one write's flight before its wind
 which is what the written delivery itself waited, unless its session has become ineligible
 meanwhile. `mqttd_durable_elision_behind_total` counts what waited; `/statusz`'s
 `write_elision` block reports it as `behind`.
+
+## Amendment 4 — a session's next packet-id block is reserved ahead of need (2026-11-04)
+
+Written from ADR 0093's eight-shard h3 run (`h3-20261103T192204Z`, its delivery doc's
+"Eight shards measured on h3"), issue #1209.
+
+**What it showed.** Every round from 375,000 msg/s up began with the same write storm, the
+rounds that carried and the rounds that failed alike: in the round's first eight seconds
+appends ran at 105,000–160,000 a second at 0.5–1 s each, elision timeouts at
+68,000–160,000 a second, and 20,000–29,000 jobs queued in session lanes; from the twelfth
+second on nearly every delivery was elided again and an append took 1.7 ms. Every
+`append-backlog-full` drop of the run, 17–478 a round, landed in those first seconds, when
+some session's lane passed its 256 jobs. Which round lost one was chance, so the ladder's
+knee there, 380,900, was the transient's tail, not a capacity.
+
+**Why.** A session reserved its packet-id block only once the current one was spent (ADR
+0007 T9, reserve-at-spent since issue #242 finding A). A session that has just attached has
+none. Its first delivery was written, by D2's rule that a hold needs a block, and that
+delivery's send then waited in the session's backlog for the reservation, a second store
+write. While the backlog was not empty D2 refused every later delivery to the session, so
+each was written too, until both writes landed. At a load step every durable session does
+this at once: tens of thousands of writes the window would have spared, which flood the
+writer, which lengthens every write, which lengthens the spell. Amendment 3's rule is not
+the cause: it keeps a delivery behind a write unwritten, but a session waiting for its block
+is ineligible, not behind.
+
+**The decision.** A session's next block is reserved before it is needed:
+
+- a durable session reserves its first block when it attaches (a clean session reserves
+  nothing then: it has no durable state for a block to advance);
+- any session reserves its next block once the current one is down to half
+  (`PKID_RESERVE_AHEAD`, 512 of `PKID_BLOCK`'s 1,024 ids);
+- single-flight, as before: nothing while a reservation is in flight or a block is banked.
+  The spent-block path stays as it was, for a first publish that outruns the reservation
+  its attach made.
+
+**What it changes.** The reservation answers long before the block runs out, so a held
+delivery never meets a spent block and a session's first delivery after an attach is held
+like any other. The number of reservations is the same, one per block; they are made
+earlier. A takeover skips at most two blocks of ids instead of one, which the 65,535-id
+space absorbs as it absorbed one.
 
 ## Open questions
 

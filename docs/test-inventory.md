@@ -1542,7 +1542,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 919 test(s)
+## `crates/mqttd/src/lib.rs` — 922 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -2086,6 +2086,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::periodic_anti_entropy_says_nothing_when_there_is_nothing_retained`
 - `hub::tests::permanently_unavailable_store_rejects_rather_than_downgrades`
 - `hub::tests::pipelined_completions_reach_the_hub_in_offset_order`
+- `hub::tests::pkid_ahead::a_clean_session_reserves_nothing_at_its_attach`
+- `hub::tests::pkid_ahead::a_durable_sessions_first_delivery_is_held_not_written`
+- `hub::tests::pkid_ahead::the_next_block_is_banked_before_the_current_one_runs_out`
 - `hub::tests::prefer_local_keeps_shared_delivery_off_the_cluster_bus`
 - `hub::tests::prefer_local_still_rotates_among_several_local_members`
 - `hub::tests::prefer_local_still_uses_a_remote_member_when_there_is_no_local_one`

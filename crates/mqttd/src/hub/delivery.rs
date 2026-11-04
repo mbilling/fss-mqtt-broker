@@ -2026,7 +2026,7 @@ impl Hub {
     /// non-durable / clean session, base 0) banks a bare refill: the free-running
     /// in-memory counter, exactly as before.
     pub(super) fn alloc_pkid(&mut self, client: &ClientId) -> Option<u16> {
-        loop {
+        let (id, reserve_ahead) = loop {
             let inf = self.inflight.entry(client.clone()).or_default();
             if inf.block_remaining == 0 {
                 // Spent: adopt the banked reservation, or tell the caller to defer.
@@ -2043,9 +2043,18 @@ impl Hub {
             inf.block_remaining = inf.block_remaining.saturating_sub(1);
             let id = inf.next_pkid;
             if !inf.pending.contains_key(&id) && !inf.orphaned_qos2.contains_key(&id) {
-                return Some(id);
+                // Half the block left and nothing banked: reserve the next one now, so
+                // it is banked before this one is spent (ADR 0089 Amendment 4).
+                let ahead = inf.block_remaining <= PKID_RESERVE_AHEAD
+                    && inf.banked_base.is_none()
+                    && !inf.reserve_outstanding;
+                break (id, ahead);
             }
+        };
+        if reserve_ahead {
+            self.reserve_pkid_block(client);
         }
+        Some(id)
     }
 
     /// See [`QosSend`] for what each return means to the caller's drain loop. This is

@@ -211,6 +211,15 @@ const RETAINED_INTEREST_WINDOW: Duration = Duration::from_secs(3);
 /// and the counter simply wraps).
 const PKID_BLOCK: u16 = 1024;
 
+/// A session's next packet-id block is reserved once its current one is down to this many
+/// ids and nothing is banked (ADR 0089 Amendment 4), and a durable session reserves its
+/// first block when it attaches. The reservation then answers long before the block runs
+/// out, so no delivery waits in the backlog for one and write elision never meets a spent
+/// block. Reserved only once spent, as before, the session's next delivery and every one
+/// after it until the reservation landed were written instead of held: at a load step,
+/// that was every durable session's first second of deliveries.
+const PKID_RESERVE_AHEAD: u16 = PKID_BLOCK / 2;
+
 /// MQTT 5.0 Session Expiry Interval meaning "never expire" (0xFFFFFFFF). v3.1.1
 /// `clean_session=0` maps to this.
 const SESSION_EXPIRY_NEVER: u32 = u32::MAX;
@@ -5844,6 +5853,19 @@ impl Hub {
         if let Some(relay) = relay {
             self.open_relay(conn_id, *relay, RelayHolder::Session(client.clone()));
         }
+        // A durable session reserves its first packet-id block now, ahead of its first
+        // delivery (ADR 0089 Amendment 4). Reserved at that delivery instead, it and every
+        // delivery after it until the reservation landed were written, not held: at a
+        // load step that is every durable session's first second of deliveries, and the
+        // writes that flood the writer then fill the slowest sessions' lanes.
+        if session_expiry != 0
+            && self
+                .inflight
+                .get(&client)
+                .is_none_or(|inf| inf.block_remaining <= PKID_RESERVE_AHEAD)
+        {
+            self.reserve_pkid_block(&client);
+        }
         // Its groups' online prefixes must include it from here on (ADR 0015).
         self.shared.set_client_online(&client, true);
         self.mirror_routing(&client);
@@ -10372,6 +10394,7 @@ mod tests {
     mod held_credit;
     mod message_events;
     mod pending_gauges;
+    mod pkid_ahead;
     mod qos2_retirement;
     mod remote_group_index;
     mod scaling_locality;
@@ -10711,6 +10734,13 @@ mod tests {
         write_delay_ms: std::sync::atomic::AtomicU64,
         /// Durable appends applied, so a test can count the writes elision saved.
         appends: std::sync::atomic::AtomicUsize,
+        /// While true, every packet-id block reservation waits before it is applied: a
+        /// test makes a session's first delivery meet a spent block, the path a session
+        /// takes when its first publish outruns the reservation made at its attach
+        /// (ADR 0089 Amendment 4).
+        hold_reserve: std::sync::atomic::AtomicBool,
+        /// Packet-id block reservations applied, so a test can wait for one.
+        reserves: std::sync::atomic::AtomicUsize,
     }
 
     impl FlakyStore {
@@ -10724,6 +10754,8 @@ mod tests {
                 hold_enqueue: std::sync::atomic::AtomicBool::new(false),
                 write_delay_ms: std::sync::atomic::AtomicU64::new(0),
                 appends: std::sync::atomic::AtomicUsize::new(0),
+                hold_reserve: std::sync::atomic::AtomicBool::new(false),
+                reserves: std::sync::atomic::AtomicUsize::new(0),
             })
         }
 
@@ -10739,6 +10771,8 @@ mod tests {
                 hold_enqueue: std::sync::atomic::AtomicBool::new(false),
                 write_delay_ms: std::sync::atomic::AtomicU64::new(0),
                 appends: std::sync::atomic::AtomicUsize::new(0),
+                hold_reserve: std::sync::atomic::AtomicBool::new(false),
+                reserves: std::sync::atomic::AtomicUsize::new(0),
             })
         }
     }
@@ -10923,6 +10957,23 @@ mod tests {
             client: &ClientId,
         ) -> Result<u16, mqtt_storage::StorageError> {
             self.inner.next_packet_id(client).await
+        }
+
+        async fn reserve_packet_ids(
+            &self,
+            _client: &ClientId,
+            _count: u16,
+        ) -> Result<u16, mqtt_storage::StorageError> {
+            while self.hold_reserve.load(std::sync::atomic::Ordering::SeqCst) {
+                // SETTLE(reserve-hold): a fault injection, not a wait for state; the test
+                // that set the hold clears it, and its own deadlines bound it.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            self.reserves
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // The trait's default answer (base 0, the in-memory allocation), which every
+            // test on this store ran on before the override.
+            Ok(0)
         }
 
         async fn remove(&self, client: &ClientId) -> Result<(), mqtt_storage::StorageError> {
@@ -16371,8 +16422,10 @@ mod tests {
         );
     }
 
-    /// A first delivery to `c` on today's path, acknowledged: it reserves the session's
-    /// packet-id block, so later deliveries can be held (ADR 0089 D2).
+    /// A first delivery to `c`, acknowledged, so the tests that follow start from a session
+    /// that has delivered before. It used to be what reserved the session's packet-id
+    /// block, which a held delivery needs (ADR 0089 D2); since Amendment 4 the attach
+    /// reserves it, and this delivery is held too.
     async fn warm_packet_ids(tx: &HubTx, rx: &mut crate::hub::OutboundRx, c: &str) {
         let done = publish_gated(tx, "t", b"warm", QoS::AtLeastOnce, false);
         let p = recv_packet(rx).await.expect("the warm-up delivery");
@@ -16381,6 +16434,36 @@ mod tests {
             timeout(Duration::from_secs(2), done).await,
             Ok(Ok(PublishOutcome::Accepted))
         ));
+    }
+
+    /// Every command sent before this one, in either lane, has been dispatched (the
+    /// data-lane barrier, [`HubCommand::Flush`]).
+    async fn flush(tx: &HubTx) {
+        let (reply, done) = oneshot::channel();
+        tx.send(HubCommand::Flush { reply }).unwrap();
+        timeout(Duration::from_secs(2), done)
+            .await
+            .expect("the hub reached the flush")
+            .unwrap();
+    }
+
+    /// Publish `payload` on `t` so that `c`'s delivery is WRITTEN: the path a durable
+    /// session's first delivery takes when its first publish outruns the packet-id block
+    /// reservation made at its attach (ADR 0089 Amendment 4). The caller set
+    /// `store.hold_reserve` before attaching `c`; the reservation is released once the
+    /// publish has been dispatched, so the delivery met a spent block and was written,
+    /// and its send then waits for the block as it always has.
+    async fn publish_first_written(
+        store: &FlakyStore,
+        tx: &HubTx,
+        payload: &'static [u8],
+    ) -> oneshot::Receiver<PublishOutcome> {
+        let done = publish_gated(tx, "t", payload, QoS::AtLeastOnce, false);
+        flush(tx).await;
+        store
+            .hold_reserve
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        done
     }
 
     /// ADR 0089 D1: with write elision on, a durable `QoS` 1 delivery goes on the wire
@@ -16520,17 +16603,21 @@ mod tests {
 
     /// ADR 0089 Amendment 1 A2: a delivery already written and on the wire, still
     /// unacknowledged, no longer keeps the next one on the durable path. The session's
-    /// first delivery is written (it reserves the packet-id block) and left unacked;
-    /// with every write then hanging, the next delivery can only arrive if it is held.
+    /// first delivery is written (it meets a spent packet-id block: its reservation is
+    /// held, see `publish_first_written`) and left unacked; with every write then
+    /// hanging, the next delivery can only arrive if it is held.
     #[tokio::test]
     async fn a_written_unacknowledged_delivery_no_longer_blocks_the_next_hold() {
         let store = FlakyStore::new(0);
         let tx = start_hub_eliding(store.clone(), 60_000);
+        store
+            .hold_reserve
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let (mut rx, _) = attach_full(&tx, "c", 1, false, u32::MAX, 8).await;
         subscribe_qos(&tx, "c", "t", QoS::AtLeastOnce);
         let _ = attach(&tx, "barrier", 99, true).await;
 
-        let written = publish_gated(&tx, "t", b"written", QoS::AtLeastOnce, false);
+        let written = publish_first_written(&store, &tx, b"written").await;
         assert_eq!(payload_of(&recv_packet(&mut rx).await.unwrap()), b"written");
         assert!(matches!(
             timeout(Duration::from_secs(2), written).await,
@@ -16570,11 +16657,14 @@ mod tests {
     async fn a_hold_behind_a_written_delivery_replays_after_it() {
         let store = FlakyStore::new(0);
         let tx = start_hub_eliding(store.clone(), 60_000);
+        store
+            .hold_reserve
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let (mut rx, _) = attach_full(&tx, "c", 1, false, u32::MAX, 8).await;
         subscribe_qos(&tx, "c", "t", QoS::AtLeastOnce);
         let _ = attach(&tx, "barrier", 99, true).await;
 
-        let first = publish_gated(&tx, "t", b"one", QoS::AtLeastOnce, false);
+        let first = publish_first_written(&store, &tx, b"one").await;
         assert_eq!(payload_of(&recv_packet(&mut rx).await.unwrap()), b"one");
         assert!(matches!(
             timeout(Duration::from_secs(2), first).await,
@@ -24516,6 +24606,33 @@ mod tests {
         let (_rx, _) = attach(&tx, "s", 1, false).await;
         subscribe_qos(&tx, "s", "m/t", QoS::AtLeastOnce);
         detach(&tx, "s", 1);
+        // The attach reserved the session's first packet-id block (ADR 0089 Amendment 4),
+        // and its answer is a dispatch of the publish class too: wait until it has been
+        // dispatched, so the count below moves by the publish alone. The store logs the
+        // reservation and the task sends its answer in the same poll, so once the log
+        // shows it the answer is ahead of the flush.
+        timeout(Duration::from_secs(2), async {
+            while !store
+                .ops()
+                .iter()
+                .any(|(op, c)| op == "reserve" && c == "s")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the attach reserved the session's first block");
+        flush(&tx).await;
+        let publish_dispatches = |out: &str| -> u64 {
+            out.lines()
+                .find_map(|l| {
+                    l.strip_prefix(
+                        "mqttd_hub_dispatch_seconds_count{command=\"publish\",shard=\"0\"} ",
+                    )
+                })
+                .map_or(0, |n| n.trim().parse().unwrap())
+        };
+        let before = publish_dispatches(&metrics.render());
 
         let done = publish_gated(&tx, "m/t", b"timed", QoS::AtLeastOnce, true);
         // Prove the loop already recorded the publish dispatch (it is NOT waiting on
@@ -24530,8 +24647,9 @@ mod tests {
         // recorded dispatch under the stall bound (the park is 30s-equivalent; any
         // inline await would land in the top buckets).
         let out = metrics.render();
-        assert!(
-            out.contains("mqttd_hub_dispatch_seconds_count{command=\"publish\",shard=\"0\"} 1"),
+        assert_eq!(
+            publish_dispatches(&out),
+            before + 1,
             "the publish dispatch must be observed exactly once while its append is \
              still parked:\n{out}"
         );
