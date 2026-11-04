@@ -472,9 +472,10 @@ universally. Method, limits and the commands:
 [benchmarks/DURABLE-PATH.md](benchmarks/DURABLE-PATH.md).
 
 **What a durable node carries.** On the benchmark rig of ADR 0090, with Hetzner CCX23
-brokers (4 vCPU, local NVMe), 2 copies and the 1.3.0 defaults, durable QoS 1 carried 39.3k
-msg/s per node on 3 nodes and 29.2k per node on 10, with no message lost. At ack p99 ≤ 1 s
-it carried 114,200 msg/s on 3 nodes and 228,000 on 10.
+brokers (4 vCPU, local NVMe), 2 copies and the 1.3.0 defaults, durable QoS 1 carried 47.6k
+msg/s per node on 3 nodes with the 1.3.0 release, and 29.2k per node on 10 with its
+candidate, which predates the hub's per-message work (ADR 0092), with no message lost. At
+ack p99 ≤ 1 s it carried 142,800 msg/s on 3 nodes and 228,000 on 10.
 - **A starting point, not a promise:** your disk's barrier latency and your network decide
   your figure.
 - **One durable session tops out at about 2,500 msg/s,** however many nodes there are.

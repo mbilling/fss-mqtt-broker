@@ -1,9 +1,10 @@
 # Evidence: what mqttd carries, and how it was measured
 
-**Dated 2026-10-31.** The throughput and latency mqttd publishes. They were measured with
-the benchmark rig of [ADR 0090](../adr/0090-benchmark-rig-redesign.md) on the 1.3.0
-candidate (main `edfdb49`; the 1-node run on `9520b33`; the AWS runs of 2026-10-30 on
-`19f36004`).
+**Dated 2026-11-04.** The throughput and latency mqttd publishes. They were measured with
+the benchmark rig of [ADR 0090](../adr/0090-benchmark-rig-redesign.md): on the v1.3.0
+release for the 3-node Hetzner durable cell and the AWS 32-vCPU rows (2026-11-04), and
+otherwise on the 1.3.0 candidate (main `edfdb49`; the 1-node run on `9520b33`; the AWS runs
+of 2026-10-30 on `19f36004`).
 
 - **The full card:** [RIG2-RESULTS.md](RIG2-RESULTS.md) has the method, the limits, every
   step of every ramp and each ramp's chart.
@@ -27,26 +28,31 @@ nothing), then the highest step at p99 ≤ 1 s:
 
 | workload | 1 node | 3 nodes | 10 nodes |
 |---|---|---|---|
-| durable QoS 1 (ack after fsync and a quorum copy) | 92,900 msg/s, one copy · the same at ack p99 ≤ 1 s | 117,800 msg/s · 114,200 at ack p99 ≤ 1 s | 292,200 msg/s · 228,000 at ack p99 ≤ 1 s |
+| durable QoS 1 (ack after fsync and a quorum copy) | 92,900 msg/s, one copy · the same at ack p99 ≤ 1 s | 142,800 msg/s · the same at ack p99 ≤ 1 s | 292,200 msg/s · 228,000 at ack p99 ≤ 1 s |
 | QoS 1, clean sessions | 114,000 msg/s · the same at ack p99 ≤ 1 s | 270,800 msg/s · 152,000 at ack p99 ≤ 1 s | 875,900 msg/s · 303,800 at ack p99 ≤ 1 s |
 | QoS 0 | 123,100 msg/s · the same at end-to-end p99 ≤ 1 s | 340,300 msg/s · 253,200 at end-to-end p99 ≤ 1 s | 973,200 msg/s · 506,300 at end-to-end p99 ≤ 1 s |
+
+The 3-node durable cell is the 1.3.0 release's code, measured on 2026-11-04 at ack p99
+64.7 ms ([RIG2-RESULTS.md § the release candidate](RIG2-RESULTS.md#durable-qos-1-on-the-130-release-candidate)).
+The other cells are the 1.3.0 candidate's, before ADR 0092 cut the hub's work per message.
 
 Per node, at the maximum lossless step:
 
 | workload | 1 node | 3 nodes | 10 nodes |
 |---|---|---|---|
-| durable QoS 1 | 92.9k (one copy) | 39.3k | 29.2k |
+| durable QoS 1 | 92.9k (one copy) | 47.6k | 29.2k |
 | QoS 1, clean sessions | 114k | 90.3k | 87.6k |
 | QoS 0 | 123k | 113k | 97.3k |
 
-**On AWS,** durable QoS 1 only, with the 20,000 clients of HiveMQ 4.18's published run
-(main `19f36004`, 2026-10-30 and 2026-10-31):
+**On AWS,** durable QoS 1 only, with the 20,000 clients of HiveMQ 4.18's published run.
+The `m6i.8xlarge` rows are the v1.3.0 release (2026-11-04); the others are main
+`19f36004` (2026-10-30 and 2026-10-31), before ADR 0092 cut the hub's work per message:
 
 | cluster | vCPU | maximum lossless | at ack p99 ≤ 1 s | per vCPU |
 |---|---|---|---|---|
 | 6 × `m6i.4xlarge` | 96 | 390,300 msg/s at ack p99 112 ms; the knee is bracketed to 2.7%: 400,800 lost messages in one round of 3 | 390,300 | 4,066 |
-| 3 × `m6i.8xlarge`, HiveMQ's shape | 96 | 270,800 msg/s at 1.17 s | 256,500 | 2,821 |
-| 1 × `m6i.8xlarge`, one copy | 32 | 88,700 msg/s at 300 ms | 88,700 | 2,772 |
+| 3 × `m6i.8xlarge`, HiveMQ's shape, v1.3.0 | 96 | 366,300 msg/s at 1.61 s; the knee is bracketed to 3.1% | 293,000 | 3,816 |
+| 1 × `m6i.8xlarge`, one copy, v1.3.0 | 32 | 131,900 msg/s at 1.60 s | 125,300 | 4,122 |
 | 1 × `m7a.8xlarge`, one copy, AMD EPYC Genoa | 32 | 69,700 msg/s at 342 ms | 69,700 | 2,178 |
 
 **How a figure is judged:**
@@ -65,12 +71,14 @@ clusters', which keep 2 copies.
 
 **Scaling from 3 to 10 nodes:**
 - **QoS 1 with clean sessions and QoS 0** hold close to their per-node rate.
-- **Durable QoS 1** falls from 39.3k to 29.2k per node. At 10 nodes, more of each
-  message's replication and forwarding crosses between nodes. It's being profiled.
+- **Durable QoS 1** falls from 39.3k to 29.2k per node on the same code, the 1.3.0
+  candidate. At 10 nodes, more of each message's replication and forwarding crosses
+  between nodes. It's being profiled.
 
-**Node size:** per vCPU, durable QoS 1 carries 9,817 msg/s on 4-vCPU nodes, 4,066 on
-16-vCPU nodes and 2,821 on 32-vCPU nodes. A node's throughput is bound by its one hub
-task, not by its vCPU: a lone 32-vCPU node carries 88,700, a lone 4-vCPU node 92,900
+**Node size:** per vCPU, durable QoS 1 carries 11,900 msg/s on 4-vCPU nodes, 4,066 on
+16-vCPU nodes and 3,816 on 32-vCPU nodes. A node's throughput is bound by its one hub
+task far more than by its vCPU: a lone 32-vCPU node carries 131,900 on v1.3.0, 1.4 times
+a lone 4-vCPU node's 92,900 on the candidate with eight times the vCPU
 ([RIG2-RESULTS.md § AWS](RIG2-RESULTS.md#aws-96-vcpu)).
 
 ## Per vCPU, like for like
@@ -83,18 +91,18 @@ task, not by its vCPU: a lone 32-vCPU node carries 88,700, a lone 4-vCPU node 92
 - **The price basis:** both brokers are priced at AWS `m6a.8xlarge` on-demand (us-east-1,
   Linux, $1.3824 an hour for 32 vCPU), the instance HiveMQ's run used. Hetzner CCX23
   costs about the same per vCPU.
-- **The result:** mqttd's measured durable QoS 1 clusters cost 3.5× less than HiveMQ at
+- **The result:** mqttd's measured durable QoS 1 clusters cost 4.2× less than HiveMQ at
   the same traffic on 3 × 4 vCPU, 2.6× less on 10 × 4, and 1.45× less on 6 × 16 vCPU,
   HiveMQ's own vCPU count: at its $3,027 a month, 390,300 msg/s against its published
   270,000.
 - **HiveMQ's traffic, 270,000 msg/s,** fits on ten 4-vCPU nodes: they carry 292,200 for
   $1,261 a month, 2.4× less than HiveMQ's $3,027, with no line drawn through either point.
-- **Per million msg/s:** the hardware behind a million msg/s of durable QoS 1 costs $3,212 a month on
+- **Per million msg/s:** the hardware behind a million msg/s of durable QoS 1 costs $2,650 a month on
   3 × 4 vCPU, $4,317 on 10 × 4 and $7,757 on 6 × 16, against $11,213 at HiveMQ's
-  published rate; a lone node, one copy, $1,358 on 4 vCPU and $11,377 on 32. The
+  published rate; a lone node, one copy, $1,358 on 4 vCPU and $7,651 on 32. The
   scale-out chart prints it under every column.
-- **Every mqttd point is its run's maximum lossless step:** the 3- and 10-node steps ran
-  at ack p99 1.35 s and 1.37 s, the 6-node one at 112 ms.
+- **Every mqttd point is its run's maximum lossless step:** the 3-node step ran at ack
+  p99 64.7 ms, the 10-node one at 1.37 s and the 6-node one at 112 ms.
 - **HiveMQ's line is an extrapolation,** drawn straight through its one published point.
 - **The licence comes on top:** HiveMQ's clustering needs its commercial edition, whose
   price is not published.
@@ -113,14 +121,14 @@ costs several times a QoS 0 one, and connection count dominates the large vendor
 
 | class | mqttd (maximum lossless) | best comparable | ratio |
 |---|---|---|---|
-| cluster, durable QoS 1, 2 copies, 4-vCPU nodes | 9,817 /vCPU (117,800 msg/s on 3 × CCX23, fsync + replication) | HiveMQ 4.18 2,812 /vCPU (published) | **3.5×** |
+| cluster, durable QoS 1, 2 copies, 4-vCPU nodes | 11,900 /vCPU (142,800 msg/s on 3 × CCX23, fsync + replication, the 1.3.0 release) | HiveMQ 4.18 2,812 /vCPU (published) | **4.2×** |
 | the same on 16-vCPU nodes | 4,066 /vCPU (390,300 msg/s on 6 × m6i.4xlarge) | HiveMQ 4.18 2,812 /vCPU | **1.45×** |
-| the same on HiveMQ's shape, 3 × 32 vCPU | 2,821 /vCPU (270,800 msg/s on 3 × m6i.8xlarge) | HiveMQ 4.18 2,812 /vCPU | 1.0× |
+| the same on HiveMQ's shape, 3 × 32 vCPU | 3,816 /vCPU (366,300 msg/s on 3 × m6i.8xlarge, v1.3.0) | HiveMQ 4.18 2,812 /vCPU | **1.36×** |
 | cluster, QoS 1, not durable | 22,567 /vCPU (270,800 msg/s on 3 × CCX23, clean sessions) | EMQX 5.0 679 /core (published; compare per core) | — |
 
 **Why HiveMQ 4.18 is the closest comparison:**
-- **Reproduced in shape:** 3 × 32-vCPU nodes with 20,000 clients on AWS carried 270,800
-  msg/s with no message lost
+- **Reproduced in shape:** 3 × 32-vCPU nodes with 20,000 clients on AWS carried 366,300
+  msg/s with no message lost on v1.3.0
   ([RIG2-RESULTS.md § AWS, 96 vCPU](RIG2-RESULTS.md#aws-96-vcpu)).
 - **Durable, at the same copy count.** HiveMQ publishes its benchmarks on its default
   configuration, which persists sessions and keeps **2 copies** of all persistent data
@@ -184,7 +192,7 @@ Sources: [HiveMQ 200M connections](https://www.hivemq.com/whitepaper/achieving-2
 | Feature surface | EMQX | dashboard, rule-engine data sinks, MQTT-SN/CoAP |
 | Connection scale | HiveMQ, EMQX | published 200M / 100M connections; mqttd's runs used 7,200 to 20,000 |
 | Durable scale-out per node | not yet mqttd | durable QoS 1 falls from 39.3k to 29.2k msg/s per node from 3 to 10 nodes ([↑](#the-figures)); plan [#537](https://github.com/mbilling/fss-mqtt-broker/issues/537) |
-| Per vCPU on large nodes | HiveMQ, level | on HiveMQ's shape, 3 × 32 vCPU, mqttd carries 2,821 msg/s per vCPU to HiveMQ's published 2,812: one hub task bounds a node ([↑](#the-figures)) |
+| Per vCPU on large nodes | not a competitor: mqttd's own limit | on v1.3.0 a 32-vCPU node carries 3,816 msg/s per vCPU, 1.36× HiveMQ's published 2,812 on its shape, but a third of what a 4-vCPU node carries: one hub task bounds a node ([↑](#the-figures)) |
 | Not covered | — | no other broker has been measured on this rig yet; vendor cluster figures are published, not reproduced |
 
 The full list of mqttd's limitations is in [GUIDE.md § Limitations](../../GUIDE.md#limitations).

@@ -177,14 +177,16 @@ record of exactly what is built (91 ADRs, per-task status).
 ## How fast is it
 
 Measured with the benchmark rig of
-[ADR 0090](docs/adr/0090-benchmark-rig-redesign.md) on the 1.3.0 candidate:
+[ADR 0090](docs/adr/0090-benchmark-rig-redesign.md): the 3-node durable figure on the
+1.3.0 release's code, the others on its candidate, before ADR 0092 cut the hub's work per
+message.
 - **Hosts:** Hetzner CCX23 brokers, 4 vCPU each.
 - **Load:** 200 B payloads, `$share` groups with one member per broker.
 - **Steps:** 3 rounds a step. A step counts only when no round lost a message.
 
 | workload | 3 nodes | 10 nodes |
 |---|---|---|
-| durable QoS 1, ack after fsync and a quorum copy | 117,800 msg/s (114,200 at ack p99 ≤ 1 s) | 292,200 msg/s (228,000 at ack p99 ≤ 1 s) |
+| durable QoS 1, ack after fsync and a quorum copy | 142,800 msg/s (the same at ack p99 ≤ 1 s) | 292,200 msg/s (228,000 at ack p99 ≤ 1 s) |
 | QoS 1, clean sessions | 270,800 msg/s | 875,900 msg/s |
 | QoS 0 | 340,300 msg/s | 973,200 msg/s |
 
@@ -855,7 +857,8 @@ be found. Each is tracked; none is a silent surprise.
   of the broker's semver.
 - **Throughput is measured at 3 and 10 nodes, not beyond.**
   - **The figures:** [docs/benchmarks/RIG2-RESULTS.md](docs/benchmarks/RIG2-RESULTS.md) has the cluster figures, the method and the limits.
-  - **Durable QoS 1 scales sub-linearly:** 117,800 msg/s on 3 nodes, 292,200 on 10.
+  - **Durable QoS 1 scales sub-linearly:** on the same code, the 1.3.0 candidate, 117,800
+    msg/s on 3 nodes and 292,200 on 10.
   - **One durable session tops out at about 2,500 msg/s.** That's 16 writes in flight ÷
     the append latency (ADR 0091 T4).
   - **Connections:** the runs used 7,200 to 18,400, not millions.
@@ -1056,8 +1059,8 @@ docker run --rm -e MQTTD_DATA_DIR=/var/lib/mqttd \
 # An unrecognised flag is now an ERROR (exit 2), not a silent broker start.
 
 # Verify the image signature before trusting it. Pin the release you run; the newest
-# is on https://github.com/mbilling/fss-mqtt-broker/releases (1.2.0 on 2026-10-25):
-VERSION=1.2.0
+# is on https://github.com/mbilling/fss-mqtt-broker/releases (1.3.0 on 2026-11-04):
+VERSION=1.3.0
 cosign verify ghcr.io/mbilling/fss-mqtt-broker:$VERSION \
   --certificate-identity-regexp 'https://github.com/mbilling/fss-mqtt-broker/.github/workflows/release.yml@.*' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
