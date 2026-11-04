@@ -76,6 +76,11 @@ struct Cli {
     #[arg(long, default_value_t = 10)]
     topics: usize,
 
+    /// Every publisher connection carries every topic, round-robin per message: the
+    /// shape of a bridge forwarding many topics over one connection.
+    #[arg(long)]
+    bridge: bool,
+
     /// Topic t is <topic-prefix>/<t>.
     #[arg(long, default_value = "load")]
     topic_prefix: String,
@@ -248,8 +253,10 @@ fn config(cli: Cli, threads: usize) -> Result<(Config, Option<PathBuf>), String>
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let p = (max_rate / cli.rate_per_publisher).ceil().max(1.0) as u32;
         // A whole number of publishers per topic and broker, so every consumer
-        // session gets the same share (and every topic carries traffic).
-        let unit = u32::try_from(cli.topics.saturating_mul(brokers.len().max(1)))
+        // session gets the same share (and every topic carries traffic). As a bridge, a
+        // connection covers every topic, so a whole number per broker is enough.
+        let per_broker = if cli.bridge { 1 } else { cli.topics };
+        let unit = u32::try_from(per_broker.saturating_mul(brokers.len().max(1)))
             .unwrap_or(u32::MAX)
             .max(1);
         p.div_ceil(unit).saturating_mul(unit)
@@ -261,6 +268,7 @@ fn config(cli: Cli, threads: usize) -> Result<(Config, Option<PathBuf>), String>
     c.qos = cli.qos;
     c.payload = cli.payload;
     c.topics = cli.topics;
+    c.bridge = cli.bridge;
     c.topic_prefix = cli.topic_prefix;
     c.shape = cli.shape;
     c.consumers = cli.consumers;

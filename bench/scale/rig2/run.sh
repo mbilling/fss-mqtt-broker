@@ -795,6 +795,7 @@ launch_gens() { # launch_gens <local-dir> <host-id> <per-gen rate> <warmup> <mea
 		--ready-file "steps/$hid/gen.ready" --start-file "steps/$hid/gen.start" --start-wait "$GEN_START_WAIT")
 	[ "$SESSIONS" != durable ] || args+=(--session-expiry "$SESSION_EXPIRY")
 	[ -z "$PUBLISHERS_N" ] || args+=(--publishers "$PUBLISHERS_N")
+	[ "${BRIDGE:-0}" != 1 ] || args+=(--bridge)
 	bound=$((START_SYNC_WAIT + GEN_START_WAIT + warmup + measure + 2 * DRAIN_TIMEOUT + 180))
 	for ((g = 0; g < GENERATORS; g++)); do
 		metrics=""
@@ -1015,7 +1016,7 @@ json.dump({"workload": "$WORKLOAD", "arm": "$ARM", "binary": """$BINARY_DESC""",
            "mqtt_load": {"qos": $QOS, "shape": "$SHAPE", "sessions": "$SESSIONS", "session_expiry_s": $SESSION_EXPIRY,
                          "payload": $PAYLOAD, "topics_per_generator": $TOPICS, "consumers": $CONSUMERS_N,
                          "groups": $SHARE_GROUPS, "rate_per_publisher": $RATE_PER_PUBLISHER, "inflight": $INFLIGHT,
-                         "publishers_per_generator": ${PUBLISHERS_N:-None},
+                         "publishers_per_generator": ${PUBLISHERS_N:-None}, "bridge": bool(${BRIDGE:-0}),
                          "warmup_s": $WARMUP, "measure_s": $MEASURE, "window_s": $WINDOW, "drain_timeout_s": $DRAIN_TIMEOUT,
                          "drain_quiet_s": $DRAIN_QUIET, "drain_quiet_factor": $DRAIN_QUIET_FACTOR, "prime_s": $PRIME_SECS}},
           open(sys.argv[1], "w"), indent=2)
