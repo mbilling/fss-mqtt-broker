@@ -22,7 +22,7 @@ default, and ships every feature under Apache-2.0.
   copies costs 1.45–4.2× less to run than HiveMQ 4.18's published run, and HiveMQ's
   licence comes on top. Clustering needs their commercial edition, whose price isn't
   published. Per vCPU, mqttd carries 11,900 msg/s on 4-vCPU nodes against HiveMQ's 2,812;
-  on HiveMQ's own shape, 3 × 32 vCPU, it carries 3,192, 1.13× HiveMQ's, because a node's
+  on HiveMQ's own shape, 3 × 32 vCPU, it carries 3,816, 1.36× HiveMQ's, because a node's
   throughput is bound by its one hub task. The hardware behind a million msg/s costs
   $2,650 a month on 4-vCPU nodes and $7,757 on 16-vCPU nodes, against $11,213 at
   HiveMQ's published rate. HiveMQ's figure is its own: we haven't
@@ -58,12 +58,13 @@ fsync and a quorum copy on another node. It is the one we measure first.
   10 × 4 (7.3k) and 390,300 on 6 × 16 vCPU on AWS (4.1k), with no message lost; at ack
   p99 ≤ 1 s, the same 142,800, 228k and the same 390,300. The 3-node figure is the 1.3.0
   release's code; the others were measured before ADR 0092 cut the hub's work per message.
-- **HiveMQ's shape,** 3 × 32 vCPU on AWS: 306,400 msg/s with no message lost, where
-  HiveMQ 4.18 publishes 270,000. Six 16-vCPU nodes carried 390,300 on the same 96 vCPU
-  before ADR 0092 T3 cut the hub's work per message; they are not re-measured yet.
+- **HiveMQ's shape,** 3 × 32 vCPU on AWS: 366,300 msg/s with no message lost on the v1.3.0
+  release, where HiveMQ 4.18 publishes 270,000. Six 16-vCPU nodes carried 390,300 on the
+  same 96 vCPU before ADR 0092 T3 cut the hub's work per message; they are not re-measured
+  yet.
 - **QoS 1 with clean sessions** carries 271k on 3 × 4 vCPU and 876k on 10 × 4; **QoS 0**
   340k and 973k.
-- **One node** carries 92,900 durable on 4 vCPU and 112,100 on 32 (one copy, fsync only):
+- **One node** carries 92,900 durable on 4 vCPU and 131,900 on 32 (one copy, fsync only):
   a node's throughput is bound by its one hub task far more than by its vCPU.
 
 ![What the hardware behind a million msg/s of durable QoS 1 costs a month: mqttd's measured range across node sizes as one bar, HiveMQ 4.18's published run as a dashed bar, both at AWS m6a.8xlarge prices, licence not included](docs/benchmarks/img/readme-durable-cost.svg)

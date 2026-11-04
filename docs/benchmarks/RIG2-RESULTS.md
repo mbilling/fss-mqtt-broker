@@ -426,6 +426,41 @@ Run `h3-20261101T012140Z` · 3 × m6i.8xlarge brokers (96 vCPU in all), 6 × m6i
 | 10 | 299,300 | CARRIED | 3 | 299,357 | 90.6 ± 3.0 ms |
 | 11 | 306,400 | CARRIED | 3 | 306,355 | 91.6 ± 3.0 ms |
 
+### 3 × m6i.8xlarge, v1.3.0
+
+![Durable QoS 1, 3 × m6i.8xlarge on the v1.3.0 release: ack p99 by offered msg/s](img/rig2/aws-3x-m6i8xl-durable-qos1-130.svg)
+
+Run `h3-20261104T183144Z` · 3 × m6i.8xlarge brokers (96 vCPU in all), 6 × m6i.2xlarge generators · 3 rounds a step · 200 B payload · latency is the ack p99, the mean of the rounds ± their standard deviation. The binary is the published v1.3.0 release, every default as it ships: each broker ran 16 runtime workers, the physical cores of its 32 vCPUs. The ladder started at 150,000 msg/s, stepped ×1.25 and bisected from there.
+
+- **Maximum lossless:** 366,300 msg/s offered, 122.1k per node and 3,816 per vCPU (brokers received 364,977), ack p99 1.61 ± 0.52 s
+- **ack p99 ≤ 1 s:** 293,000 msg/s (48.8 ± 4.6 ms)
+- **ack p99 ≤ 250 ms:** 293,000 msg/s (48.8 ± 4.6 ms)
+- **ack p99 ≤ 100 ms:** 293,000 msg/s (48.8 ± 4.6 ms)
+- ladder ended: incomplete, with the knee bracketed: good at 366300, not at 377800 msg/s (3.1% gap)
+
+| step | offered msg/s | verdict | rounds | brokers received (mean) | ack p99 (mean ± sd) |
+|---|---|---|---|---|---|
+| 1 | 150,000 | CARRIED | 3 | 150,000 | 0.7 ± 0.0 ms |
+| 2 | 187,500 | CARRIED | 3 | 187,500 | 1.1 ± 0.3 ms |
+| 3 | 234,400 | CARRIED | 3 | 234,399 | 11.5 ± 2.7 ms |
+| 4 | 293,000 | CARRIED | 3 | 292,983 | 48.8 ± 4.6 ms |
+| 5 | 366,300 | CARRIED | 3 | 364,977 | 1.61 ± 0.52 s |
+| 6 | 457,900 | OFFER NOT TAKEN | 1 | 384,858 | 3.81 s |
+| 7 | 412,100 | OFFER NOT TAKEN | 1 | 382,758 | 3.98 s |
+| 8 | 389,200 | OFFER NOT TAKEN | 1 | 378,297 | 3.70 s |
+| 9 | 377,800 | OFFER NOT TAKEN | 1 | 363,897 | 4.33 s |
+
+**What this run shows.**
+- **No round lost a message.** Every step that did not carry was an offer the brokers did
+  not take in full.
+- **The run was cut short, not by the brokers.** At 19:37Z every host of the run was stopped
+  from outside, by the account's AWS Budgets spend-limit role, during the bisection's last
+  step at 372,100, which went void. So the knee is bracketed to 3.1%, and the latency
+  bands' edges between 293,000 at 48.8 ms and 366,300 at 1.61 s were not measured: the
+  bands' figures are floors.
+- **Against HiveMQ 4.18's published run** on the same 96 vCPU, 3 × `m6a.8xlarge` at
+  270,000 msg/s, three 32-vCPU nodes of v1.3.0 carry 1.36× as much.
+
 ## AWS, 32 vCPU
 
 One broker on 2026-10-30, the same binary, generator shape and 20,000 clients as the 96-vCPU
@@ -477,6 +512,40 @@ Run `h3-20261031T225644Z` · 1 × m6i.8xlarge broker (32 vCPU in all), 1 × m6i.
 | 5 | 118,700 | OFFER NOT TAKEN | 1 | 102,450 | 9.08 s |
 | 6 | 112,100 | CARRIED | 3 | 112,052 | 353.9 ± 230.6 ms |
 | 7 | 115,400 | OFFER NOT TAKEN | 1 | 105,118 | 6.39 s |
+
+### 1 × m6i.8xlarge, v1.3.0
+
+![Durable QoS 1, 1 × m6i.8xlarge on the v1.3.0 release: ack p99 by offered msg/s](img/rig2/aws-1x-m6i8xl-durable-qos1-130.svg)
+
+Run `h3-20261104T170821Z` · 1 × m6i.8xlarge broker (32 vCPU in all), 1 × m6i.4xlarge generator · 3 rounds a step · 200 B payload · latency is the ack p99, the mean of the rounds ± their standard deviation. The binary is the published v1.3.0 release, every default as it ships: 16 runtime workers and one hub loop. A lone node keeps one copy, so this is fsync only. The ladder is the one above: from 67,500 msg/s, ×1.25, bisected.
+
+- **Maximum lossless:** 131,900 msg/s offered, 131.9k per node and 4,122 per vCPU (brokers received 134,137), ack p99 1.60 ± 0.47 s
+- **ack p99 ≤ 1 s:** 125,300 msg/s (697.1 ± 377.0 ms)
+- **ack p99 ≤ 250 ms:** 118,700 msg/s (233.0 ± 107.7 ms)
+- **ack p99 ≤ 100 ms:** 105,500 msg/s (22.2 ± 6.1 ms)
+- ladder ended: knee bracketed: good at 131900, not at 134000 msg/s (1.6% gap)
+
+| step | offered msg/s | verdict | rounds | brokers received (mean) | ack p99 (mean ± sd) |
+|---|---|---|---|---|---|
+| 1 | 67,500 | CARRIED | 3 | 67,500 | 1.3 ± 0.0 ms |
+| 2 | 84,400 | CARRIED | 3 | 84,400 | 1.9 ± 0.1 ms |
+| 3 | 105,500 | CARRIED | 3 | 105,500 | 22.2 ± 6.1 ms |
+| 4 | 131,900 | CARRIED | 3 | 134,137 | 1.60 ± 0.47 s |
+| 5 | 164,900 | OFFER NOT TAKEN | 1 | 133,934 | 9.90 s |
+| 6 | 148,400 | OFFER NOT TAKEN | 1 | 132,626 | 9.08 s |
+| 7 | 140,200 | OFFER NOT TAKEN | 1 | 135,946 | 1.97 s |
+| 8 | 136,100 | OFFER NOT TAKEN | 2 | 134,421 | 2.80 ± 1.65 s |
+| 9 | 134,000 | OFFER NOT TAKEN | 1 | 125,458 | 3.83 s |
+| 10 | 118,700 | CARRIED | 3 | 118,810 | 233.0 ± 107.7 ms |
+| 11 | 125,300 | CARRIED | 3 | 125,556 | 697.1 ± 377.0 ms |
+| 12 | 128,600 | OFFER NOT TAKEN | 1 | 124,181 | 2.29 s |
+
+**What this run shows.**
+- **No round lost a message.** Every step that did not carry was an offer the broker did not
+  take in full.
+- **The knee's edge is noisy:** 131,900 carried in all 3 rounds, its third on a retry after a
+  full settle, while 128,600 and 134,000 each fell short of the 99% bar in a round. Read the
+  knee as about 130,000 msg/s.
 
 ### 1 × m7a.8xlarge
 
