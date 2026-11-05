@@ -186,9 +186,9 @@ attached to an event that may not recur.
 makes retained messages `eventual` by default on a durable cluster, with ADR 0037's
 owner-committed path kept as the `strong` mode. For this record:
 
-- **§1's copy to every peer comes back** in the eventual mode. It now carries a hybrid
-  logical clock stamp, is batched per peer with each topic's latest value only, and is
-  applied outside the hub loop.
+- **§1's copy to every peer comes back** in the eventual mode. It now carries a stamp from
+  a paced logical clock, which compares no wall clocks between nodes, is batched per peer
+  with each topic's latest value only, and is applied outside the hub loop.
 - **§3's back-fill machinery stands,** with the higher-stamp-wins rule in place of
   gap-fill, as ADR 0037 §4 already replaced it with higher-token-wins.
 - **Durable off is unchanged.** With durable sessions off, this record's behaviour applies

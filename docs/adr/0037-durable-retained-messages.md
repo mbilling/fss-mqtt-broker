@@ -252,11 +252,34 @@ copies converge, and `strong` is the mode that waits. With durable sessions off 
 is no lease plane to be strong with, so retained keeps ADR 0014's behaviour whatever this
 is set to. Whether that path should move to `eventual` as well is left open.
 
-**2. Eventual: the write.** The node a retained publish lands on stamps the value with its
-hybrid logical clock (ADR 0085 D6, `mqtt_rules::crdt::Hlc`), applies it to its own retained
-cache at once, and marks the topic changed for every peer. No other node is asked. The
-publisher's ack waits for point 4's local write and, as before, for the publish's durable
-deliveries. It never waits for another node's retained copy.
+**2. Eventual: the write and its clock.** The node a retained publish lands on stamps the
+value with its paced logical clock, applies it to its own retained cache at once, and marks
+the topic changed for every peer. No other node is asked. The publisher's ack waits for
+point 4's local write and, as before, for the publish's durable deliveries. It never waits
+for another node's retained copy.
+
+The clock:
+
+- **What it is.** Every node keeps a 64-bit count of microseconds. Between events it
+  advances at the rate of the node's own monotonic clock. A local write stamps its current
+  value, at least one more than the last stamp the node issued. Every frame from a peer
+  carries the peer's clock, membership pings included, and the receiver moves its clock up
+  to it when the peer's is ahead.
+- **What it never does.** It never reads or compares wall clocks between nodes, so a wrong
+  time, a wrong time zone or an NTP step changes nothing. It assumes only that the nodes'
+  clocks tick at about the same rate, which server hardware holds to within about 0.005%
+  without NTP.
+- **What it orders.** While frames flow, at least once a second with the membership pings,
+  the nodes' clocks agree to within the network delay, about a millisecond. A write made
+  more than that after another, on any node, gets the higher stamp. A client that
+  reconnects to another node takes far longer than that, so its writes stay in order.
+- **Ties.** Equal stamps are broken by node id, so every node picks the same winner.
+- **Restarts.** A node saves its clock with every batch it writes (point 4). A restarted
+  node starts from the saved value plus the time it was down, by its own wall clock, which
+  is the only wall-clock reading and is compared with nothing but itself. It merges the
+  first peer's clock before it stamps a write.
+- **No skew rule.** A stamp ahead of the receiver's clock is never refused. Taking it moves
+  the receiver's clock forward, and only the order of stamps matters.
 
 **3. Eventual: the copies.** This is ADR 0085 D15's shape, applied to retained values:
 
@@ -265,10 +288,8 @@ deliveries. It never waits for another node's retained copy.
   number of publishes: a topic written 40 times while a batch is in flight is sent once. A
   congested link makes the task wait. Nothing is dropped, and no publisher is paused.
 - **Receiving.** The peer link's reader applies each value to the cache directly, if its
-  stamp is higher than the one held, with ties broken by node id (ADR 0085's order). It is
-  not a hub command, so it waits in none of the hub's lanes and never holds the hub loop.
-- **Skew.** A stamp more than 60 seconds ahead of the receiver's wall clock is refused and
-  counted, and repair retries it later (ADR 0085's `MAX_FORWARD_SKEW_MS`).
+  stamp is higher than the one held, with ties broken by node id. It is not a hub command,
+  so it waits in none of the hub's lanes and never holds the hub loop.
 - **Repair.** The digest exchange of ADR 0014 T6/T8 and its 2026-08-06 amendment still runs
   at link-up and every 30 seconds. It is re-based on stamps, so each topic converges to its
   highest stamp.
@@ -285,8 +306,9 @@ same writer less often, coalesced per topic, because repair can refill them. So:
   it. The topic then keeps its previous value. The window is one batch long.
 
 **5. Eventual: partitions.** Both sides keep taking and serving retained writes. When the
-partition heals, repair gives each topic the value with the highest stamp, which is the
-latest one while the nodes' clocks agree. An acknowledged value can be replaced that way
+partition heals, repair gives each topic the value with the highest stamp. That is the
+latest one, unless the two writes were closer together than the clocks' drift since the
+split, a few seconds after a day. An acknowledged value can be replaced that way
 without notice, and repair counts it on `mqttd_retained_divergence_total`. This is the
 trade the maintainer chose: retained state stays writable on every node, and a partition
 can cost a write that a concurrent one replaced.
@@ -332,9 +354,10 @@ doing one thing at a time:
 
 - **The harness** (ADR 0042) gains an oracle for the eventual mode. No node ever moves a
   topic to a lower stamp. Once writes stop and partitions heal, every node holds the same
-  value within one repair period. An acknowledged retained value survives `kill -9` of the
-  node that took it, unless a later value replaced it. The strong mode keeps the
-  acked-facts oracle, which learns point 6's "replaced".
+  value within one repair period. With the nodes' wall clocks set hours apart, writes more
+  than the network delay apart keep their order. An acknowledged retained value survives
+  `kill -9` of the node that took it, unless a later value replaced it. The strong mode
+  keeps the acked-facts oracle, which learns point 6's "replaced".
 - **A rolling upgrade test** from 1.3.0 (`BASELINE_REF`) through the change of default.
 - **The rig** measures both modes as a ladder of retained publishes a second (mqtt-load
   gains `--retain`), with the prediction below beside each result (ADR 0091 D7).
@@ -360,9 +383,9 @@ loop.
 - **The default changes.** Retained values can differ between nodes for a moment, and
   across a partition a concurrent write can replace an acknowledged one. The release notes
   and GUIDE's limitations say so.
-- **Clocks.** This record's "no wall-clock anywhere" now holds for the strong mode only.
-  The eventual mode orders writes by the hybrid clock, as rule state already does (ADR 0085
-  D6), so the nodes' clock agreement matters: run NTP.
+- **Clocks.** Neither mode compares wall clocks between nodes. The eventual mode's clock
+  assumes only that the nodes' clocks tick at about the same rate. Rule state keeps its
+  hybrid clock (ADR 0085 D6) for now, and could move to this one later.
 - **Cost.** The eventual mode removes the owner round trip, the one-at-a-time chain and
   the flush per update on every node. Each node still applies every changed topic, in
   batches, off the hub loop.
@@ -376,13 +399,24 @@ loop.
 - **Keep strong only, and make it fast (point 6 alone).** The ack would still wait for the
   owner and both copies, and the minority side of a partition could not change a retained
   value at all. That is the availability the maintainer wants by default.
-- **A Lamport counter instead of the hybrid clock.** It is clock-free and orders the
-  writes a node has seen. But a client that moves to another node can publish there before
-  its previous value has arrived, and if that node's counter is lower, the stale value
-  wins. The hybrid clock orders those writes by time, as long as the clocks agree to within
-  the time a reconnect takes.
-- **Vector clocks with sibling values.** A last-value cache has nothing to merge siblings
-  with, as ADR 0085 found for its `lww` type.
+- **A hybrid logical clock** (ADR 0085 D6), as this amendment first proposed. It orders
+  writes by wall-clock time, so it is right only while the nodes' wall clocks agree. A node
+  set ahead wins every concurrent write until the others catch up, and the clock needs a
+  skew bound: rule state refuses a stamp more than 60 seconds ahead. Rejected in review on
+  2026-11-05: "we should not expect nodes to be clock equivalent".
+- **A plain Lamport counter.** It needs no clock at all and orders the writes a node has
+  seen. But a client that reconnects to another node can publish there before its previous
+  value has arrived, and if that node's counter is lower, the stale value wins. After a
+  crash in a quiet cluster, it can stay until the topic's next write. Pacing the counter by
+  elapsed time is what closes this: the clocks then agree to within the network delay, and
+  a reconnect takes far longer.
+- **Version vectors.** They show exactly which writes were concurrent, but a last-value
+  cache must still pick one of them by an arbitrary rule, and they cost a vector per
+  topic. There is nothing to merge sibling values with, as ADR 0085 found for its `lww`
+  type.
+- **The topic's owner numbers each write,** in memory, with no quorum. The order is right
+  while the owner is reachable, but each ack waits for a round trip to it, and a partition
+  needs a second scheme for the side without the owner.
 - **A choice per publish,** like ADR 0072's tiers. One topic's values would then carry both
   kinds of version. A mode per cluster keeps one order per topic; a choice per topic prefix
   could come later.
@@ -390,6 +424,12 @@ loop.
   Mosquitto do. But a crash would then lose acknowledged values that never left the node,
   and one batch flush is cheap enough to keep that guarantee.
 - **Fetch on subscribe.** Rejected again, for ADR 0014's reasons.
+
+### Left open
+
+- **Order supplied by the publisher,** as a later opt-in. An MQTT 5 user property carrying
+  the source's own sequence or timestamp, used when present, would order a single writer's
+  topics by the source's own order. It needs the edge to set it.
 
 ### Delivery
 
