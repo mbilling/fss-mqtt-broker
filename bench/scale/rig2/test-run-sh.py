@@ -14,9 +14,11 @@ what held it, even when its last pass was idle; the settle budget is
 wall-clock time, not a count of sleeps; a broker that never answers voids the step with
 its name; a broker whose step scrapes cannot be fetched voids that round by name, and
 the step reruns that round alone; a step of ROUNDS=2 runs two rounds (each its own
-directory, settle and generator run) and is judged from them; and a TERM sent mid-step
+directory, settle and generator run) and is judged from them; a TERM sent mid-step
 runs the trap at once (it used to wait for the ladder to finish), stopping the generator
-and the local cluster.
+and the local cluster; and JOIN_BROKERS=2 runs a ladder on 3 brokers, a join round (cohort
+A on the 3, 2 brokers joining, cohort B on those 2, consumers reconnecting) and a ladder
+on all 5.
 """
 import json
 import os
@@ -38,19 +40,19 @@ IDLE = ("# TYPE mqttd_connections_active gauge\nmqttd_connections_active {conns}
 
 
 def active_seconds(activity: Path | None, now: float) -> float:
-    """Seconds the summary stub's load has run until `now`: its +start / -end lines (unix ms)."""
+    """Load-seconds the summary stubs' loads have run until `now`, from their +start / -end
+    lines (unix ms): two loads at once (a join round's two cohorts) count twice."""
     if activity is None or not activity.is_file():
         return 0.0
-    total, since = 0.0, None
-    for line in activity.read_text().split():
-        t = int(line[1:]) / 1000
-        if line[0] == "+":
-            since = t
-        elif since is not None:
-            total += max(0.0, min(t, now) - since)
-            since = None
-    if since is not None:
-        total += max(0.0, now - since)
+    events = sorted((int(line[1:]) / 1000, 1 if line[0] == "+" else -1) for line in activity.read_text().split())
+    total, level, last = 0.0, 0, None
+    for t, step in events:
+        t = min(t, now)
+        if last is not None:
+            total += level * max(0.0, t - last)
+        level, last = level + step, t
+    if last is not None and level > 0:
+        total += level * max(0.0, now - last)
     return total
 
 
@@ -107,16 +109,30 @@ class FakeBroker:
 
 
 LOCAL_CLUSTER_STUB = """#!/usr/bin/env bash
-# Stub of rig2/local-cluster.sh: the brokers are the test's HTTP servers.
+# Stub of rig2/local-cluster.sh: the brokers are the test's HTTP servers. `start` names
+# the first [nodes] of them, `join` the next ones (each ready 100 ms after its start).
 set -euo pipefail
 STATE="$2"
+line() { printf '%s\\t127.0.0.1:%s\\t127.0.0.1:%s\\n' "$1" "$((21000 + $1))" "$2" >>"$STATE/brokers.tsv"; }
 case "$1" in
 start)
 	mkdir -p "$STATE"
 	: >"$STATE/brokers.tsv"
 	i=0
 	for p in $FAKE_BROKER_PORTS; do
-		printf '%s\\t127.0.0.1:%s\\t127.0.0.1:%s\\n' "$i" "$((21000 + i))" "$p" >>"$STATE/brokers.tsv"
+		[ "$i" -lt "${3:-99}" ] || break
+		line "$i" "$p"
+		i=$((i + 1))
+	done
+	;;
+join)
+	i=0
+	for p in $FAKE_BROKER_PORTS; do
+		if [ "$i" -ge "$3" ] && [ "$i" -lt "$4" ]; then
+			t=$(python3 -c 'import time; print(int(time.time() * 1000))')
+			line "$i" "$p"
+			printf '%s\\t%s\\t%s\\n' "$i" "$t" "$((t + 100))" >>"${JOINS_TSV:-$STATE/joins.tsv}"
+		fi
 		i=$((i + 1))
 	done
 	;;
@@ -143,10 +159,12 @@ MQTTD_STUB = "#!/usr/bin/env bash\necho 'mqttd stub'\n"
 # warm-up and measured time) and writes a clean mqtt-load.summary.v2: every message
 # acked and delivered, ack and end-to-end p99 2 ms. Its load runs from the start to the
 # end of the measured time, logged to FAKE_LOAD_ACTIVITY for the fake brokers' counters.
+# Its arguments go to <--out>.args, on the generator's host.
 SUMMARY_STUB = r"""
 import json, os, sys, time
 a = sys.argv[1:]
 opt = {a[i]: a[i + 1] for i in range(len(a) - 1) if a[i].startswith("--")}
+json.dump(a, open(opt["--out"] + ".args", "w"))
 rate, warmup, measure, window = (float(opt[k]) for k in ("--rate", "--warmup", "--duration", "--window"))
 open(opt["--ready-file"], "w").close()
 deadline = time.time() + float(opt["--start-wait"])
@@ -165,12 +183,16 @@ hist = {"unit": "us", "significant_figures": 3, "highest_trackable_us": 60000000
         "buckets": [[1000, n - n // 50], [2000, n // 50]]}
 health = {"cpu_fraction": 0.1, "busiest_worker": 0.1, "credit_stall_fraction": 0.0, "backlog": 0,
           "saturated": False, "reasons": []}
+def agg(secs, n):
+    return {"duration_s": secs, "offered": n, "sent": n, "acked": n, "received": n, "reconnects": 0, "publisher_reconnects": 0,
+            "ack_latency": {"count": n, "p99_us": 2000}, "e2e_latency": {"count": n, "p99_us": 2000}}
 windows = [{"index": 0, "kind": "warmup", "start_s": 0.0, "end_s": warmup, "sched_lag": {"p99_us": 100},
-            "health": health}]
+            "health": health, **agg(warmup, 0)}]
 t = warmup
 while t < warmup + measure - 1e-9:
-    windows.append({"index": len(windows), "kind": "measure", "start_s": t, "end_s": min(t + window, warmup + measure),
-                    "sched_lag": {"p99_us": 100}, "health": health})
+    end = min(t + window, warmup + measure)
+    windows.append({"index": len(windows), "kind": "measure", "start_s": t, "end_s": end,
+                    "sched_lag": {"p99_us": 100}, "health": health, **agg(end - t, int(rate * (end - t)))})
     t += window
 json.dump({"schema": "mqtt-load.summary.v2", "schedule_start_unix_ms": start_ms,
            "start": {"by": "shared", "requested_unix_ms": start_ms, "waited_s": 0.1, "late_ms": 0},
@@ -388,6 +410,57 @@ class RunShTest(unittest.TestCase):
         md = (self.run_dir / "report.md").read_text()
         self.assertIn("| 2 of 2 |", md)
         self.assertIn("### Variance across rounds: durable-qos1", md)
+
+    def test_a_join_grows_the_cluster_under_load_between_two_ladders(self):
+        # JOIN_BROKERS=2 against a generator stub that writes clean summaries: a ladder on
+        # the 3 brokers, the join round (cohort A on them, the 2 joining 2 s into its
+        # measured time, cohort B on the 2 a second after they are ready), then a ladder
+        # on all 5 from the first ladder's maximum lossless.
+        self.brokers += [FakeBroker(), FakeBroker()]
+        activity = self.root / "activity.log"
+        for b in self.brokers:
+            b.activity, b.load_rate = activity, 120.0  # 3 x 120/s: the brokers take the 300 msg/s offered
+        r = self.run_to_end(timeout=300, BROKERS=3, JOIN_BROKERS=2, START_RATE=300, MEASURE=6, MARGIN_S=0.2,
+                            SETTLE_QUIET=1, SETTLE_QUIET_LONG=1, JOIN_WARMUP=1, JOIN_MEASURE=12, JOIN_AT=2,
+                            JOIN_B_DELAY=1, JOIN_B_WARMUP=1, JOIN_B_MIN=1, JOIN_B_CONNECT=1,
+                            FAKE_LOAD_SUMMARY=self.root / "summary-stub.py", FAKE_LOAD_ACTIVITY=activity)
+        out = r.stderr[-5000:]
+        join = self.run_dir / "join" / "durable-qos1"
+        meta = json.loads((join / "join.json").read_text())
+        self.assertTrue(meta["joined"] and meta["cohort_b"], out)
+        # 0.8 of the first ladder's 300 msg/s, to the 100 msg/s granularity; cohort B as
+        # much on each new broker: 200 x 2 / 3.
+        self.assertEqual((meta["rate_a"], meta["rate_b"]), (200.0, 100.0), out)
+        self.assertEqual([x.split("\t")[0] for x in (join / "joins.tsv").read_text().split()[::3]], ["3", "4"], out)
+
+        def args(hid):
+            return json.loads((self.run_dir / "hosts" / "gen-0" / "steps" / hid / "gen.json.args").read_text())
+
+        def opt(a, k):
+            return a[a.index(k) + 1]
+
+        a, b = args("A-durable-qos1-join-a"), args("A-durable-qos1-join-b")
+        self.assertEqual(opt(a, "--broker"), "127.0.0.1:21000,127.0.0.1:21001,127.0.0.1:21002")
+        self.assertEqual(opt(b, "--broker"), "127.0.0.1:21003,127.0.0.1:21004", "cohort B on the new brokers only")
+        self.assertIn("--reconnect", a)
+        self.assertIn("--reconnect", b)
+        self.assertEqual(opt(b, "--consumers"), "2", "as many members per new broker as cohort A per old one")
+        for i in range(5):
+            self.assertTrue(list((join / "scrapes" / f"broker-{i}").glob("*.prom")), f"broker {i}: {out}")
+        v = json.loads((join / "verdict.json").read_text())
+        self.assertEqual(v["verdict"], "HELD", json.dumps(v, indent=1)[-3000:])
+        self.assertEqual(sorted(v["phases"]["with_b"]["brokers"]["brokers"]), [0, 1, 2, 3, 4])
+        self.assertIn("JOIN HELD: 3 -> 5 brokers", r.stderr)
+        # The ladder after the join: on all 5 brokers, from the first ladder's 300 msg/s.
+        after = self.run_dir / "after-join" / "durable-qos1" / "steps" / "01-300"
+        self.assertEqual(json.loads((after / "round-1" / "step.json").read_text())["brokers"], 5, out)
+        self.assertEqual(len(opt(args("after-join-durable-qos1-01-300-round-1"), "--broker").split(",")), 5)
+        self.assertNotIn("--reconnect", args("after-join-durable-qos1-01-300-round-1"), "a ladder's disconnect stays an error")
+        self.assertEqual(json.loads((after / "verdict.json").read_text())["verdict"], "CARRIED", out)
+        md = (self.run_dir / "report.md").read_text()
+        self.assertIn("## Join under load: `durable-qos1`, 3 → 5 brokers", md)
+        self.assertLess(md.index("## Join under load"), len(md))
+        self.assertTrue((self.run_dir / "local" / "stopped").is_file())
 
     def test_term_mid_step_runs_the_trap_at_once(self):
         pidfile = self.root / "load.pid"

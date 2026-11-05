@@ -405,6 +405,222 @@ async fn proxy(target: SocketAddr, delay: Duration, cut_after: Option<usize>) ->
     addr
 }
 
+/// A proxy that plays a cluster closing connections: it relays both ways, and on each of
+/// its first `times` connections, after `after` packets of MQTT type `kind` from the
+/// broker to the client, it sends the client `goodbye` (if any) and closes both sides;
+/// later connections it relays untouched. It frames the broker's stream into whole
+/// packets, so `goodbye` never lands inside one. Two closes it plays: a session the
+/// cluster moves (ADR 0005; after PUBLISH packets, kind 3, a DISCONNECT 0x9C: Use
+/// another server), and a publisher whose ack the broker withholds (after PUBACKs, kind
+/// 4, nothing: fail closed, ADR 0041 T5). (A proxy that closed every connection could
+/// close each before the consumer's PUBACKs reached the broker, and the resumed session
+/// would redeliver the same messages forever: a cluster moves a session once per
+/// ownership change.)
+async fn closing_proxy(
+    target: SocketAddr,
+    kind: u8,
+    after: usize,
+    times: usize,
+    goodbye: Option<Vec<u8>>,
+) -> SocketAddr {
+    /// The length of the whole packet at the front of `buf`, once all of it is there.
+    fn frame_len(buf: &[u8]) -> Option<usize> {
+        let (mut len, mut mult) = (0usize, 1usize);
+        for i in 1..5 {
+            let b = *buf.get(i)?;
+            len += usize::from(b & 0x7f) * mult;
+            if b & 0x80 == 0 {
+                return Some(1 + i + len).filter(|&n| buf.len() >= n);
+            }
+            mult *= 128;
+        }
+        None
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let rehomed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    tokio::spawn(async move {
+        loop {
+            let Ok((inbound, _)) = listener.accept().await else {
+                return;
+            };
+            let goodbye = goodbye.clone();
+            let rehomed = rehomed.clone();
+            tokio::spawn(async move {
+                let Ok(outbound) = TcpStream::connect(target).await else {
+                    return;
+                };
+                let _ = inbound.set_nodelay(true);
+                let _ = outbound.set_nodelay(true);
+                let (mut ir, mut iw) = inbound.into_split();
+                let (mut or, mut ow) = outbound.into_split();
+                let up = async {
+                    let _ = tokio::io::copy(&mut ir, &mut ow).await;
+                };
+                let down = async {
+                    let mut buf = bytes::BytesMut::with_capacity(64 * 1024);
+                    let mut seen = 0usize;
+                    loop {
+                        while let Some(n) = frame_len(&buf) {
+                            let frame = buf.split_to(n);
+                            if iw.write_all(&frame).await.is_err() {
+                                return;
+                            }
+                            if frame[0] >> 4 == kind {
+                                seen += 1;
+                                if seen == after
+                                    && rehomed.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                        < times
+                                {
+                                    if let Some(g) = &goodbye {
+                                        let _ = iw.write_all(g).await;
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                        match or.read_buf(&mut buf).await {
+                            Ok(n) if n > 0 => {}
+                            _ => return,
+                        }
+                    }
+                };
+                // Either direction ending closes the whole relayed connection.
+                tokio::select! {
+                    () = up => {}
+                    () = down => {}
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// With `--reconnect`, a consumer whose broker closes its connection comes back. Here
+/// every connection runs through a proxy that behaves like a cluster moving the session
+/// five times: after 20 deliveries it says "use another server" (DISCONNECT 0x9C) and
+/// closes. Each time the consumer connects again with its client id, resumes its
+/// durable session — the broker kept what it had not acknowledged — and in the end the
+/// ledger closes: nothing lost, the run not an error, and every close counted by the
+/// reason the broker gave, in the windows where it happened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_consumer_told_to_use_another_server_resumes_its_session_and_closes_the_ledger() {
+    let dir = common::TempDir::new();
+    let broker = spawn_broker(dir.path()).await;
+    let mut goodbye = Vec::new();
+    mqtt_codec::Packet::Disconnect(mqtt_codec::Disconnect {
+        reason: 0x9c,
+        properties: mqtt_codec::Properties::new(),
+    })
+    .encode(&mut goodbye, mqtt_codec::ProtocolVersion::V5)
+    .unwrap();
+    let rehome = closing_proxy(broker.client, 3, 20, 5, Some(goodbye)).await;
+    // Every connection goes through the proxy; only the consumer is ever closed, as
+    // the publishers receive no PUBLISH packets.
+    let mut c = workload(rehome, 200.0, 2);
+    c.qos = 1;
+    c.topics = 1;
+    c.shape = Shape::Share;
+    c.consumers = 1;
+    c.groups = 1;
+    c.sessions = Sessions::Durable;
+    c.session_expiry = 30;
+    c.reconnect_within_ns = Some(10_000_000_000);
+    let s = mqtt_load::run(c).await.expect("run");
+    assert_closed(&s, &broker);
+    let r = &s.reconnect;
+    let report = || serde_json::to_string_pretty(&s).unwrap();
+    assert!(r.enabled, "{}", report());
+    assert_eq!(r.reconnects, 5, "one per move: {}", report());
+    // A close the consumer met while writing its PUBACKs reads what the broker said
+    // first; the socket's reset can still discard it, and that close is `write`.
+    assert!(
+        r.by_reason.get("0x9c").is_some_and(|&n| n >= 1)
+            && r.by_reason.keys().all(|k| k == "0x9c" || k == "write")
+            && r.by_reason.values().sum::<u64>() == r.reconnects,
+        "every close named by its reason: {}",
+        report()
+    );
+    assert_eq!((r.sessions_lost, r.failed), (0, 0), "{}", report());
+    assert!(
+        r.gap.count == r.reconnects && r.gap.max_us > 0,
+        "{}",
+        report()
+    );
+    assert_eq!(
+        (s.errors.disconnects, s.errors.server_disconnects),
+        (0, 0),
+        "a consumer that came back is not a lost connection: {}",
+        report()
+    );
+    let in_windows: u64 = s.windows.iter().map(|w| w.agg.reconnects).sum();
+    assert!(
+        in_windows > 0 && in_windows <= r.reconnects,
+        "the windows place the reconnects in time: {}",
+        report()
+    );
+}
+
+/// With `--reconnect`, a publisher whose broker closes its connection comes back and
+/// sends again what it had in flight. Here every connection runs through a proxy that
+/// closes a connection after 20 PUBACKs, without a word, three times — what a broker
+/// does to a publisher whose ack it withholds (fail closed, ADR 0041 T5), as a cluster
+/// moving the session a message is for does. Each time the publisher connects again
+/// (a clean session) and publishes its unacknowledged messages again: the ledger closes,
+/// with no message unacknowledged and every one delivered, duplicates allowed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_publisher_closed_with_its_acks_withheld_reconnects_and_sends_again() {
+    let dir = common::TempDir::new();
+    let broker = spawn_broker(dir.path()).await;
+    // Only publishers receive PUBACKs, so only they are ever closed.
+    let closing = closing_proxy(broker.client, 4, 20, 3, None).await;
+    let mut c = workload(closing, 200.0, 2);
+    c.qos = 1;
+    c.topics = 1;
+    c.shape = Shape::Share;
+    c.consumers = 1;
+    c.groups = 1;
+    c.sessions = Sessions::Durable;
+    c.session_expiry = 30;
+    c.reconnect_within_ns = Some(10_000_000_000);
+    let s = mqtt_load::run(c).await.expect("run");
+    assert_closed(&s, &broker);
+    let p = &s.reconnect.publishers;
+    let report = || serde_json::to_string_pretty(&s).unwrap();
+    assert_eq!(p.reconnects, 3, "one per close: {}", report());
+    assert_eq!(p.failed, 0, "{}", report());
+    assert_eq!(
+        p.by_reason.values().sum::<u64>(),
+        3,
+        "every close counted: {}",
+        report()
+    );
+    assert!(
+        p.by_reason.keys().all(|k| k == "closed" || k == "write"),
+        "no DISCONNECT was sent: {}",
+        report()
+    );
+    assert_eq!(p.gap.count, 3, "{}", report());
+    assert_eq!(
+        s.reconnect.reconnects,
+        0,
+        "no consumer was closed: {}",
+        report()
+    );
+    assert_eq!(
+        (s.errors.disconnects, s.errors.write),
+        (0, 0),
+        "a publisher that came back is not a lost connection: {}",
+        report()
+    );
+    let in_windows: u64 = s.windows.iter().map(|w| w.agg.publisher_reconnects).sum();
+    assert!(
+        in_windows > 0 && in_windows <= p.reconnects,
+        "the windows place the reconnects in time: {}",
+        report()
+    );
+}
+
 /// The ledger sees loss: the only consumer's connection is cut early in the run (it
 /// reaches the broker through a proxy that closes it after 4 KiB of deliveries), and
 /// the identities it never received are reported missing — the run does not pass.

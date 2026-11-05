@@ -11,6 +11,18 @@
 # machine (gen-certs.sh's rule); only leaf material, the CA *certificates* and
 # the swim key travel — over SSH, never through cloud-init user_data or
 # terraform state.
+#
+# JOIN_FROM=<k>: grow a running cluster instead. Brokers 0..k-1 of the inventory
+# already run as one cluster this run dir bootstrapped (from an inventory of its
+# first k brokers, so its PKI is <run-dir>/pki-<k>); brokers k..N-1 join it under
+# whatever load it carries, one at a time, as an operator grows a cluster
+# (deploy/systemd/README.md): a node certificate from the SAME cluster CA, the same
+# swim key, seeds naming two running members, the readiness floor at the majority of
+# the new size, then start and wait for /readyz. The running members are not touched:
+# their seed lists and floors stay as they were (a restart to rewrite them is not
+# part of growing a cluster). Each joiner's start and readiness, on its own clock in
+# unix ms, is appended to JOINS_TSV (default <run-dir>/joins.tsv): index, start,
+# ready.
 
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
@@ -45,7 +57,16 @@ mkdir -p "$RUN"
 
 
 N=$(broker_count)
-say "bootstrapping a $N-node cluster (mode: $MODE)"
+JOIN_FROM="${JOIN_FROM:-}"
+if [ -n "$JOIN_FROM" ]; then
+	case "$JOIN_FROM" in '' | *[!0-9]*) die "JOIN_FROM must be a broker count, not '$JOIN_FROM'" ;; esac
+	[ "$JOIN_FROM" -ge 1 ] && [ "$JOIN_FROM" -lt "$N" ] ||
+		die "JOIN_FROM=$JOIN_FROM: the inventory has $N brokers, so 1..$((N - 1)) of them can be running"
+	say "joining brokers $JOIN_FROM..$((N - 1)) to the running $JOIN_FROM-node cluster (mode: $MODE)"
+else
+	say "bootstrapping a $N-node cluster (mode: $MODE)"
+fi
+JOINS_TSV="${JOINS_TSV:-$RUN/joins.tsv}"
 
 # PEER_NET=private|public picks the network the peer bus (MQTTD_PEER_ADVERTISE,
 # :7001) runs over (#662): replication between brokers is one TCP connection
@@ -68,11 +89,26 @@ peer_host() { # peer_host <index> — the address the peer bus advertises
 
 # ── 1. Mint per-size secrets locally ─────────────────────────────────────────
 PKI="$RUN/pki-$N"
+# A join extends the running cluster's PKI: the same CA signs the joiners.
+[ -z "$JOIN_FROM" ] || PKI="$RUN/pki-$JOIN_FROM"
 # A PKI minted for one PEER_NET has the other network's SANs on its peer certs.
 if [ -d "$PKI" ] && [ "$(cat "$PKI/peer-net" 2>/dev/null || echo private)" != "$PEER_NET" ]; then
 	die "$PKI was minted for PEER_NET=$(cat "$PKI/peer-net" 2>/dev/null || echo private), not $PEER_NET — use a fresh run dir"
 fi
-if [ ! -d "$PKI" ]; then
+if [ -n "$JOIN_FROM" ]; then
+	[ -d "$PKI/cluster/ca" ] || die "JOIN_FROM=$JOIN_FROM: no running cluster's PKI at $PKI (bootstrap the first $JOIN_FROM brokers from this run dir first)"
+	[ "$PEER_NET" = private ] || die "a join is only wired for PEER_NET=private (the public peer port's firewall rule names the brokers of the bootstrap)"
+	OPENSSL_BIN=$(pick_openssl)
+	for ((i = JOIN_FROM; i < N; i++)); do
+		[ ! -d "$PKI/cluster/$(broker_node_id "$i")" ] || continue
+		say "minting a node certificate for joiner $(broker_node_id "$i") from the running cluster's CA"
+		(cd "$PKI" && OPENSSL="$OPENSSL_BIN" PKI_DIR="$PKI/cluster" \
+			sh "$REPO_ROOT/deploy/systemd/gen-certs.sh" node --lifetime "$CERT_LIFETIME" \
+			"$(broker_node_id "$i")" "$(peer_host "$i")" "$(broker_priv_ip "$i")" \
+			>>"$PKI/gen-certs.log" 2>&1) ||
+			{ cat "$PKI/gen-certs.log" >&2; die "gen-certs.sh node $(broker_node_id "$i") failed"; }
+	done
+elif [ ! -d "$PKI" ]; then
 	mkdir -p "$PKI"
 	echo "$PEER_NET" >"$PKI/peer-net"
 	OPENSSL_BIN=$(pick_openssl)
@@ -168,7 +204,7 @@ push_node() { # push_node <index> <ready-min> <seeds>
 	'
 }
 
-for ((i = 0; i < N; i++)); do
+for ((i = ${JOIN_FROM:-0}; i < N; i++)); do
 	wait_for "cloud-init on broker $i" 600 \
 		rssh "$(broker_pub_ip "$i")" "test -f /run/bench-cloudinit-done"
 done
@@ -177,6 +213,7 @@ done
 # (verifies the brokers' server certs) and the client leaf. No private CA key
 # ever leaves this machine.
 ND=$(driver_count)
+[ -z "$JOIN_FROM" ] || ND=0
 for ((i = 0; i < ND; i++)); do
 	dip=$(driver_pub_ip "$i")
 	wait_for "cloud-init on driver $i" 600 rssh "$dip" "test -f /run/bench-cloudinit-done"
@@ -215,6 +252,41 @@ if [ "$N" -gt 1 ]; then
 	wait_for "private-net full mesh (every broker reaches every other)" 1200 mesh_sweep
 	wait_for "private-net mesh stability (3 clean sweeps 5s apart)" 300 mesh_stable
 	say "private-net full mesh verified stable"
+fi
+
+# ── 3.6 JOIN_FROM: the joiners, one at a time, then nothing else ─────────────
+# join_ready <index>: poll the joiner's /readyz ON ITS HOST every 0.2 s for up to
+# 180 s and print the host's unix ms when it first answers 200 (one ssh session, so
+# the time is the host's, not this machine's); with one restart if it never does,
+# as follower_ready (issue #426).
+join_ready() {
+	local i="$1" ip id t
+	ip=$(broker_pub_ip "$i")
+	id=$(broker_node_id "$i")
+	local poll='for k in $(seq 1 900); do curl -sf -m 2 http://localhost:8080/readyz >/dev/null && { date +%s%3N; exit 0; }; sleep 0.2; done; exit 1'
+	t=$(rssh "$ip" "$poll") && { echo "$t"; return 0; }
+	mkdir -p "$RUN/formation"
+	rssh "$ip" "curl -s 'http://localhost:8080/readyz?verbose=1'; echo; curl -s http://localhost:8080/statusz; echo; journalctl -u mqttd --no-pager | tail -60" \
+		>"$RUN/formation/$id-join-not-ready.txt" 2>&1 || true
+	warn "joiner $id not ready after 180s — evidence kept in $RUN/formation/$id-join-not-ready.txt; restarting it once"
+	rssh "$ip" "systemctl restart mqttd"
+	t=$(rssh "$ip" "$poll") || die "joiner $id still not ready 180s after a restart — see $RUN/formation/$id-join-not-ready.txt"
+	echo "$t"
+}
+if [ -n "$JOIN_FROM" ]; then
+	MAJORITY=$(((N / 2) + 1))
+	for ((i = JOIN_FROM; i < N; i++)); do
+		# Two running members as seeds (seeds_for names the first two other
+		# indices, which for a joiner are brokers 0 and 1).
+		push_node "$i" "$MAJORITY" "$(seeds_for "$i")"
+		started=$(rssh "$(broker_pub_ip "$i")" "date +%s%3N; systemctl restart mqttd") ||
+			die "could not start joiner $(broker_node_id "$i")"
+		ready=$(join_ready "$i")
+		printf '%s\t%s\t%s\n' "$i" "$started" "$ready" >>"$JOINS_TSV"
+		say "joiner $(broker_node_id "$i") READY $((ready - started)) ms after its start (floor $MAJORITY of $N)"
+	done
+	say "cluster grown to $N nodes ($MODE mode)"
+	exit 0
 fi
 
 # ready_within <index> <secs>: 0 once the node's /readyz answers 200, 1 when the
