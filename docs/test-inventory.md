@@ -951,16 +951,19 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_reserved_tree_is_exactly_sys_and_below`
 - `tests::topic_name_validity_rejects_wildcards_and_emptiness`
 
-## `crates/mqtt-load/src/lib.rs` — 45 test(s)
+## `crates/mqtt-load/src/lib.rs` — 50 test(s)
 
 - `client::tests::fixed_packets_decode_as_themselves`
 - `clock::tests::clock_is_monotonic_and_maps_back_to_instants`
 - `config::tests::a_bridge_connection_carries_every_topic_as_one_logical_publisher_each`
+- `config::tests::a_group_sharing_every_topic_is_even_with_whole_connections_per_broker`
 - `config::tests::a_hot_session_is_refused_unless_asked_for`
+- `config::tests::a_site_bridge_carries_a_block_of_topics_of_its_own`
 - `config::tests::every_group_has_a_member_on_every_broker`
 - `config::tests::every_topic_has_publishers_on_every_broker`
 - `config::tests::fanout_shape_is_one_stream_per_subscriber`
 - `config::tests::session_skew_is_one_for_a_whole_number_of_publishers_per_topic_and_broker`
+- `config::tests::share_all_is_one_stream_per_group_over_every_topic`
 - `config::tests::share_shape_is_one_stream_per_group_and_topic`
 - `config::tests::the_drain_quiet_window_follows_the_slowest_p99_between_floor_and_timeout`
 - `config::tests::validation_catches_unrunnable_workloads`
@@ -973,6 +976,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hist::tests::percentiles_are_within_a_tenth_of_a_percent`
 - `hist::tests::rounding_saturation_merge_and_reset`
 - `ledger::tests::a_complete_run_closes`
+- `ledger::tests::a_stream_over_every_topic_expects_each_publisher_once`
 - `ledger::tests::bitset_marks_new_again_and_out_of_range`
 - `ledger::tests::duplicates_are_counted_and_do_not_open_the_ledger`
 - `ledger::tests::missing_acked_counts_only_acknowledged_identities_that_never_arrived`
@@ -986,6 +990,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `payload::tests::publish_round_trips_through_the_codec`
 - `payload::tests::short_or_alien_payloads_are_foreign`
 - `publisher::tests::inflight_window_hands_out_and_takes_back_packet_ids`
+- `publisher::tests::payload_sizes_cover_the_range_evenly_and_repeat_with_their_seed`
 - `schedule::tests::cursor_yields_exactly_the_offered_count`
 - `schedule::tests::low_rates_with_many_publishers_send_nothing_rather_than_too_much`
 - `schedule::tests::offered_total_matches_rate_times_time`
@@ -999,8 +1004,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `subscriber::tests::packet_ids_follow_in_order_and_skip_zero`
 - `summary::tests::spread_names_the_busiest_consumer_and_its_broker`
 
-## `crates/mqtt-load/src/main.rs` — 0 test(s)
+## `crates/mqtt-load/src/main.rs` — 2 test(s)
 
+- `tests::a_payload_is_one_size_or_a_range`
+- `tests::site_bridges_derive_their_topics_from_the_connections`
 
 ## `crates/mqtt-net/src/lib.rs` — 30 test(s)
 
@@ -2812,7 +2819,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `session_takeover_publishes_will`
 - `zero_keepalive_is_never_idle_disconnected`
 
-## `crates/mqttd/tests/loadgen.rs` — 8 test(s)
+## `crates/mqttd/tests/loadgen.rs` — 9 test(s)
 
 - `a_bridge_connection_carries_every_topic_and_closes_its_ledger`
 - `a_cut_drain_settles_what_the_broker_holds_before_the_ledger_is_reconciled`
@@ -2822,6 +2829,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `publishers_stay_connected_through_a_drain_longer_than_the_keep_alive`
 - `qos0_clean_fanout_run_closes_its_ledger`
 - `qos1_durable_share_run_closes_its_ledger`
+- `site_bridges_into_one_group_over_every_topic_close_their_ledger`
 
 ## `crates/mqttd/tests/memory_watermark.rs` — 3 test(s) — the whole file is `cfg(target_os = "linux")`
 

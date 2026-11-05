@@ -68,9 +68,10 @@ struct Cli {
     #[arg(long, default_value_t = 1)]
     qos: u8,
 
-    /// Payload bytes (at least 32: the identity header).
-    #[arg(long, default_value_t = 128)]
-    payload: usize,
+    /// Payload bytes (at least 32: the identity header), or a range MIN-MAX from which
+    /// each message's size is drawn uniformly (e.g. 50-200).
+    #[arg(long, default_value = "128", value_parser = parse_payload)]
+    payload: (usize, usize),
 
     /// Topics; publisher i publishes to topic i % topics.
     #[arg(long, default_value_t = 10)]
@@ -81,6 +82,13 @@ struct Cli {
     #[arg(long)]
     bridge: bool,
 
+    /// With --bridge: each connection carries this many topics of its own, as each
+    /// site's bridge carries its site's data. Connection c carries topics c*K to
+    /// c*K+K-1, named <topic-prefix>/<c>/<tag>; the topic count is then publishers x K,
+    /// and --topics is ignored.
+    #[arg(long, default_value_t = 0)]
+    topics_per_connection: usize,
+
     /// Topic t is <topic-prefix>/<t>.
     #[arg(long, default_value = "load")]
     topic_prefix: String,
@@ -89,11 +97,12 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = Shape::Share)]
     shape: Shape,
 
-    /// Consumers per topic: members per $share group, or fan-out subscribers.
+    /// Consumers: members per $share group (a group per topic, or with share-all one
+    /// over every topic), or fan-out subscribers per topic.
     #[arg(long, default_value_t = 2)]
     consumers: usize,
 
-    /// $share groups per topic.
+    /// $share groups: per topic, or with share-all, groups over every topic.
     #[arg(long, default_value_t = 1)]
     groups: usize,
 
@@ -210,6 +219,19 @@ struct Cli {
     quiet: bool,
 }
 
+/// Payload bytes: `N`, or `MIN-MAX`.
+fn parse_payload(s: &str) -> Result<(usize, usize), String> {
+    let num = |v: &str| {
+        v.trim()
+            .parse::<usize>()
+            .map_err(|e| format!("payload {s:?}: {e}"))
+    };
+    match s.split_once('-') {
+        Some((min, max)) => Ok((num(min)?, num(max)?)),
+        None => num(s).map(|n| (n, n)),
+    }
+}
+
 fn secs_ns(s: f64) -> Result<u64, String> {
     if s.is_finite() && s >= 0.0 {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -266,9 +288,14 @@ fn config(cli: Cli, threads: usize) -> Result<(Config, Option<PathBuf>), String>
     c.window_ns = secs_ns(cli.window)?;
     c.inflight = cli.inflight;
     c.qos = cli.qos;
-    c.payload = cli.payload;
-    c.topics = cli.topics;
+    (c.payload, c.payload_max) = cli.payload;
+    c.topics = if cli.topics_per_connection > 0 {
+        (publishers as usize).saturating_mul(cli.topics_per_connection)
+    } else {
+        cli.topics
+    };
     c.bridge = cli.bridge;
+    c.topics_per_connection = cli.topics_per_connection;
     c.topic_prefix = cli.topic_prefix;
     c.shape = cli.shape;
     c.consumers = cli.consumers;
@@ -320,14 +347,19 @@ fn main() -> ExitCode {
         }
     };
     if cfg.progress {
+        let payload = if cfg.payload_max > cfg.payload {
+            format!("{}-{}", cfg.payload, cfg.payload_max)
+        } else {
+            cfg.payload.to_string()
+        };
         eprintln!(
-            "mqtt-load: {} publishers, {} consumers, {} phase(s), peak {} msg/s, QoS {}, {} B, {:?}/{:?}, {} worker threads",
+            "mqtt-load: {} publishers, {} topics, {} consumers, {} phase(s), peak {} msg/s, QoS {}, {payload} B, {:?}/{:?}, {} worker threads",
             cfg.publishers,
+            cfg.topics,
             cfg.consumer_specs().len(),
             cfg.phases.len(),
             cfg.max_rate(),
             cfg.qos,
-            cfg.payload,
             cfg.shape,
             cfg.sessions,
             threads
@@ -382,4 +414,45 @@ fn main() -> ExitCode {
         if summary.generator.saturated { " (SATURATED: run is VOID)" } else { "" },
     );
     ExitCode::from(u8::try_from(summary.outcome.exit_code()).unwrap_or(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_payload_is_one_size_or_a_range() {
+        assert_eq!(parse_payload("200"), Ok((200, 200)));
+        assert_eq!(parse_payload("50-200"), Ok((50, 200)));
+        assert!(parse_payload("50-").is_err());
+        assert!(parse_payload("big").is_err());
+    }
+
+    #[test]
+    fn site_bridges_derive_their_topics_from_the_connections() {
+        let cli = Cli::parse_from([
+            "mqtt-load",
+            "--broker",
+            "127.0.0.1:1883,127.0.0.1:1884,127.0.0.1:1885",
+            "--rate",
+            "60000",
+            "--rate-per-publisher",
+            "10000",
+            "--bridge",
+            "--topics-per-connection",
+            "250",
+            "--shape",
+            "share-all",
+            "--consumers",
+            "3",
+            "--payload",
+            "50-200",
+        ]);
+        let (c, _) = config(cli, 1).expect("a valid plant workload");
+        assert_eq!(c.publishers, 6, "60,000 msg/s at 10,000 a site");
+        assert_eq!(c.topics, 1500, "250 topics a site");
+        assert_eq!((c.payload, c.payload_max), (50, 200));
+        assert_eq!(c.consumer_specs()[0].filter, "$share/g0/load/#");
+        assert!((c.session_skew() - 1.0).abs() < 1e-9);
+    }
 }

@@ -116,10 +116,15 @@ pub struct Workload {
     pub inflight: u16,
     /// `QoS`.
     pub qos: u8,
-    /// Payload bytes.
+    /// Payload bytes: every payload's size, or the smallest when sizes vary.
     pub payload_bytes: usize,
+    /// The largest payload: equal to `payload_bytes` when every payload has one size.
+    pub payload_max_bytes: usize,
     /// Topics.
     pub topics: usize,
+    /// Topics of its own each bridge connection carries; 0 when every connection
+    /// carries every topic, or there is no bridge.
+    pub topics_per_connection: usize,
     /// Topic prefix.
     pub topic_prefix: String,
     /// Subscription shape.

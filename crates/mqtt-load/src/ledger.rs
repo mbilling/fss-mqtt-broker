@@ -128,10 +128,11 @@ pub struct PublisherLedger {
 /// One delivery stream's received identities, per publisher on its topic.
 #[derive(Debug)]
 pub struct StreamLedger {
-    /// The topic index this stream receives.
-    pub topic: usize,
-    /// `received[k]` is for publisher `topic + k·topics` (publishers are assigned to
-    /// topics round-robin).
+    /// The topic index this stream receives, or `None` for a stream that receives every
+    /// topic (a `$share` group over a wildcard filter).
+    pub topic: Option<usize>,
+    /// For one topic, `received[k]` is for publisher `topic + k·topics` (publishers are
+    /// assigned to topics round-robin); for every topic, `received[k]` is publisher `k`'s.
     received: Vec<AtomicBitset>,
     /// Every delivery of this run's identities, duplicates included.
     pub deliveries: AtomicU64,
@@ -217,7 +218,7 @@ pub struct LedgerReport {
 pub struct MissingId {
     /// The stream that should have received it.
     pub stream: usize,
-    /// The stream's topic index.
+    /// The topic index of its publisher.
     pub topic: usize,
     /// Publisher id.
     pub publisher: u32,
@@ -233,12 +234,13 @@ pub struct MissingId {
 impl Ledger {
     /// A ledger for `capacity.len()` publishers (publisher `i` can send at most
     /// `capacity[i]` messages), `topics` topics (publisher `i` publishes to topic
-    /// `i % topics`), and one stream per entry of `stream_topics`.
+    /// `i % topics`), and one stream per entry of `stream_topics`: the topic it
+    /// receives, or `None` for every topic.
     ///
     /// # Panics
     /// If `topics` is zero or a stream names a topic out of range.
     #[must_use]
-    pub fn new(capacity: &[u64], topics: usize, stream_topics: &[usize]) -> Self {
+    pub fn new(capacity: &[u64], topics: usize, stream_topics: &[Option<usize>]) -> Self {
         assert!(topics > 0);
         let publishers = capacity
             .iter()
@@ -249,12 +251,18 @@ impl Ledger {
             .collect();
         let streams = stream_topics
             .iter()
-            .map(|&t| {
-                assert!(t < topics, "stream topic out of range");
+            .map(|&topic| {
+                let (first, step) = match topic {
+                    Some(t) => {
+                        assert!(t < topics, "stream topic out of range");
+                        (t, topics)
+                    }
+                    None => (0, 1),
+                };
                 StreamLedger {
-                    topic: t,
-                    received: (t..capacity.len())
-                        .step_by(topics)
+                    topic,
+                    received: (first..capacity.len())
+                        .step_by(step)
                         .map(|p| AtomicBitset::new(capacity[p]))
                         .collect(),
                     deliveries: AtomicU64::new(0),
@@ -282,15 +290,31 @@ impl Ledger {
         publisher % self.topics
     }
 
+    /// The publisher whose identities stream `s`'s `k`-th set holds.
+    fn publisher_at(&self, s: &StreamLedger, k: usize) -> usize {
+        match s.topic {
+            Some(t) => t + k * self.topics,
+            None => k,
+        }
+    }
+
+    /// Which of stream `s`'s sets holds publisher `p`'s identities, if the stream
+    /// receives its topic.
+    fn slot(&self, s: &StreamLedger, p: usize) -> Option<usize> {
+        match s.topic {
+            Some(t) => (self.topic_of(p) == t).then_some(p / self.topics),
+            None => Some(p),
+        }
+    }
+
     /// Record a delivery of (`publisher`, `seq`) on stream `stream`.
     pub fn receive(&self, stream: usize, publisher: u32, seq: u64) -> Mark {
         let s = &self.streams[stream];
         s.deliveries.fetch_add(1, Ordering::Relaxed);
         let p = publisher as usize;
-        let mark = if p < self.publishers.len() && self.topic_of(p) == s.topic {
-            s.received[p / self.topics].set(seq)
-        } else {
-            Mark::OutOfRange
+        let mark = match self.slot(s, p) {
+            Some(k) if p < self.publishers.len() => s.received[k].set(seq),
+            _ => Mark::OutOfRange,
         };
         match mark {
             Mark::New => s.unique.fetch_add(1, Ordering::Relaxed),
@@ -306,7 +330,7 @@ impl Ledger {
         let mut out = Vec::new();
         for (si, s) in self.streams.iter().enumerate() {
             for (k, recv) in s.received.iter().enumerate() {
-                let pi = s.topic + k * self.topics;
+                let pi = self.publisher_at(s, k);
                 let p = &self.publishers[pi];
                 if p.sent.count_and_not(recv) == 0 {
                     continue;
@@ -320,7 +344,7 @@ impl Ledger {
                     if p.sent.get(seq) && !recv.get(seq) {
                         out.push(MissingId {
                             stream: si,
-                            topic: s.topic,
+                            topic: self.topic_of(pi),
                             publisher: u32::try_from(pi).unwrap_or(u32::MAX),
                             seq,
                             publisher_sent: sent,
@@ -352,7 +376,7 @@ impl Ledger {
             r.duplicates += s.duplicates.load(Ordering::Relaxed);
             r.unexpected += s.unexpected.load(Ordering::Relaxed);
             for (k, recv) in s.received.iter().enumerate() {
-                let p = &self.publishers[s.topic + k * self.topics];
+                let p = &self.publishers[self.publisher_at(s, k)];
                 r.expected += p.sent.count();
                 r.unique_received += recv.count();
                 r.missing += p.sent.count_and_not(recv);
@@ -398,7 +422,39 @@ mod tests {
     /// Two topics, four publishers (0, 2 → topic 0; 1, 3 → topic 1), and three
     /// streams: a share group on each topic, plus a second subscriber on topic 0.
     fn ledger() -> Ledger {
-        Ledger::new(&[10, 10, 10, 10], 2, &[0, 1, 0])
+        Ledger::new(&[10, 10, 10, 10], 2, &[Some(0), Some(1), Some(0)])
+    }
+
+    #[test]
+    fn a_stream_over_every_topic_expects_each_publisher_once() {
+        // Two topics, four publishers, and one stream that receives both topics: a
+        // `$share` group over a wildcard filter.
+        let l = Ledger::new(&[10, 10, 10, 10], 2, &[None]);
+        send_all(&l, 10, true);
+        for p in 0..4u32 {
+            for seq in 0..10 {
+                if (p, seq) != (3, 6) {
+                    assert_eq!(l.receive(0, p, seq), Mark::New);
+                }
+            }
+        }
+        let r = l.report(true);
+        assert_eq!(r.expected, 40, "each publisher's ten, once");
+        assert_eq!((r.missing, r.missing_acked), (1, 1), "{r:?}");
+        let m = l.missing_sample(5);
+        assert_eq!(
+            (m[0].stream, m[0].topic, m[0].publisher, m[0].seq),
+            (0, 1, 3, 6),
+            "named with its publisher's topic"
+        );
+        assert_eq!(l.receive(0, 3, 6), Mark::New);
+        assert!(l.report(true).closed);
+        assert_eq!(
+            l.receive(0, 4, 0),
+            Mark::OutOfRange,
+            "there is no fifth publisher"
+        );
+        assert_eq!(l.report(true).unexpected, 1);
     }
 
     fn send_all(l: &Ledger, n: u64, ack: bool) {
@@ -414,7 +470,7 @@ mod tests {
 
     fn deliver_all(l: &Ledger, n: u64) {
         for (i, s) in l.streams.iter().enumerate() {
-            for p in (s.topic..4).step_by(2) {
+            for p in (s.topic.unwrap()..4).step_by(2) {
                 for seq in 0..n {
                     l.receive(i, u32::try_from(p).unwrap(), seq);
                 }
@@ -446,7 +502,7 @@ mod tests {
         let l2 = ledger();
         send_all(&l2, 10, true);
         for (i, s) in l2.streams.iter().enumerate() {
-            for p in (s.topic..4).step_by(2) {
+            for p in (s.topic.unwrap()..4).step_by(2) {
                 for seq in 0..10 {
                     if (i, p, seq) == (2, 2, 7) || (i, p, seq) == (1, 3, 9) {
                         continue;
@@ -466,7 +522,7 @@ mod tests {
         let l = ledger();
         send_all(&l, 10, true);
         for (i, s) in l.streams.iter().enumerate() {
-            for p in (s.topic..4).step_by(2) {
+            for p in (s.topic.unwrap()..4).step_by(2) {
                 for seq in 0..10 {
                     // Stream 1 lost publisher 3's seq 4 (a gap: 5..9 arrived) and seq 9
                     // (the tail).
@@ -512,7 +568,7 @@ mod tests {
             let l = ledger();
             send_all(&l, 5, true);
             for (i, s) in l.streams.iter().enumerate() {
-                for p in (s.topic..4).step_by(2) {
+                for p in (s.topic.unwrap()..4).step_by(2) {
                     for q in 0..5 {
                         l.receive(i, u32::try_from(p).unwrap(), q);
                     }

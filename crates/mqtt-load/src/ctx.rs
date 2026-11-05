@@ -101,10 +101,19 @@ impl Ctx {
     /// Deliveries the streams should have, given what was written so far.
     #[must_use]
     pub fn expected_deliveries(&self) -> u64 {
+        let every_topic = || {
+            self.topic_sent
+                .iter()
+                .map(|n| n.load(Ordering::Relaxed))
+                .sum::<u64>()
+        };
         self.ledger
             .streams
             .iter()
-            .map(|s| self.topic_sent[s.topic].load(Ordering::Relaxed))
+            .map(|s| match s.topic {
+                Some(t) => self.topic_sent[t].load(Ordering::Relaxed),
+                None => every_topic(),
+            })
             .sum()
     }
 
