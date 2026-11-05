@@ -73,6 +73,51 @@ tasks:
     status: done
     date: 2026-08-13
     evidence: "The §4 retention decision ('kept indefinitely; horizon-GC is the shape to build') is now built. Signals, all pre-existing: handle_retained_digest records the wall-clock instant a peer's digest MATCHED ours (the pair-converged observation, clock-seam so tests drive it); apply paths record when a tombstone was first observed per topic (a re-set value discharges the entry); the reconcile driver pushes the durable raft membership ROSTER — voters AND learners, mapped through the accumulated id map with an explicit unnameable count — onto placement each tick. The gate: a tombstone discharges when a full anti-entropy period has passed AND every roster member other than self has matched since the observation AND no roster member is unnameable; crashed members stay on the raft roster until decommissioned, which is precisely why the gate uses it and never live gossip (gossip forgets the absent — the original resurrection). On discharge each node independently drops its in-memory fence off the same signals; the topic's group owner also calls the new DurableRetained::reap (log.remove, NotOwner-routed); a reap failure keeps fence and clock for retry. Pay-for-use per-tick pass (no tombstones = no work). retained_tombstones gauge (Prometheus+OTLP) counts held fences. Safety residual recorded in the ADR: re-attaching a decommissioned node's old data dir is outside the contract. Tests (reverse-mutation fails 2/2): discharge after the roster converges (peer digest echoed post-clear, TestClock period advance, keyspace record gone); an unconverged or unnameable member blocks indefinitely; a re-taken topic leaves the discharge clock and is never reaped as a clear, while a roster-of-one clear discharges vacuously."
+  - id: 0037-T15
+    title: "Amendment 1, points 1 and 7: cluster.retained_consistency (eventual or strong, default eventual) and the mode in force, computed every sweep from every placement member's negotiated protocol and configured mode; /statusz shows both, and a node logs the members that hold the cluster in strong"
+    status: planned
+    issue: 1214
+    notes: "Size M. ADR 0073 §4's pattern. Tests: a member below protocol 15, or one configured strong, holds every node in strong; the verdict follows a member's upgrade and rollback; gen-configuration.py picks up the knob."
+  - id: 0037-T16
+    title: "Amendment 1, point 2: the eventual write: the landing node stamps a retained value with its hybrid logical clock (mqtt_rules::crdt::Hlc), applies it to its cache at once and marks the topic changed for every peer; the retained ack gate is not set"
+    status: planned
+    issue: 1214
+    notes: "Size M. Tests: a retained publish acks without any peer answering; a node cut off from every peer still takes and serves retained writes; while eventual is in force a stamp outranks every commit token."
+  - id: 0037-T17
+    title: "Amendment 1, point 3: the copies: a sending task per peer link with per-topic change marks, batched frames at peer protocol 15, applied by the link's reader outside the hub when the stamp is higher (ties by node id), stamps more than 60 s ahead refused and counted"
+    status: planned
+    issue: 1214
+    notes: "Size M-L. ADR 0085 D15's shape; reuse its marks and frame plumbing where it fits. Tests: a topic written 40 times while a batch is in flight is sent once; a slow link waits and drops nothing; the hub's dispatch never carries a retained copy; batches applied out of order converge to the highest stamp."
+  - id: 0037-T18
+    title: "Amendment 1, point 4: the retained writer off the hub loop: batched redb transactions with one flush per batch; a retained publish's ack waits for its batch's flush; copies from peers coalesced per topic and written less often"
+    status: planned
+    issue: 1214
+    notes: "Size M. Serves T20's off-hub applies too. Tests: kill -9 after the ack keeps the value; a value whose batch never flushed is lost only on the node that took it; the hub loop does no fsync for retained state."
+  - id: 0037-T19
+    title: "Amendment 1, points 3 and 5: repair and tombstones on stamps: the digest exchange converges every topic to its highest stamp, and stamped tombstones are discharged by the convergence-gated rule of P14 (#229)"
+    status: planned
+    issue: 1214
+    notes: "Size M. Tests: both sides of a partition write the same topic and converge at the heal to the higher stamp, counted on mqttd_retained_divergence_total; a clear made during a partition does not come back."
+  - id: 0037-T20
+    title: "Amendment 1, point 6: the strong mode in batches: a newer mutation replaces a queued one of its topic and carries the replaced publish's ack, a commit carries every queued topic of a placement group, the fan-out is one frame per peer per commit, and hand-offs are pipelined with per-topic order"
+    status: planned
+    issue: 1214
+    notes: "Size L. The acked-facts oracle learns 'replaced'. Tests: P6's and T8's ordering tests hold with several hand-offs in flight; a replaced value's publish acks when the newer value commits and never before; one commit carries many topics."
+  - id: 0037-T21
+    title: "Amendment 1, point 7: switching on a running cluster: strong to eventual with no migration; eventual to strong after a repair round, with each owner committing the highest-stamped value of its groups' topics"
+    status: planned
+    issue: 1214
+    notes: "Size M. Tests: no permanent divergence across either switch; copies agree within one repair period after it."
+  - id: 0037-T22
+    title: "Amendment 1, point 8: the eventual-mode oracle in the ADR 0042 harness (no topic moves to a lower stamp; copies agree within a repair period once writes stop and partitions heal; an acknowledged value survives kill -9 of its landing node unless replaced), and a rolling upgrade from 1.3.0 through the change of default"
+    status: planned
+    issue: 1214
+    notes: "Size M-L. BASELINE_REF (crates/mqttd/tests/cluster_upgrade.rs) stays at the 1.3.0 release."
+  - id: 0037-T23
+    title: "Amendment 1, point 8 and its consequences: mqtt-load --retain and a retained ladder per mode on the rig, with the formulas' prediction beside each result; CONFIGURATION, SIZING (the queue's description, the formulas), COMPARISON's partition row, THREAT-MODEL's clock note, GUIDE's limitations and the release notes"
+    status: planned
+    issue: 1214
+    notes: "Size S-M."
 ---
 
 # Delivery — ADR 0037: Durable single-owner retained messages
@@ -84,6 +129,10 @@ through its topic's placement-group lease-owner into the quorum-replicated group
 all cache/back-fill decisions reduce to a consensus-issued `(epoch, offset)` token — no
 wall-clock anywhere. Detection lands first (P1) as the baseline and the after-proof; each
 phase lands test-first and independently green.
+
+**Amendment 1 (2026-11-05)** makes retained messages `eventual` by default and keeps this
+delivery's path as the `strong` mode, chosen by `cluster.retained_consistency`: tasks T15 to
+T23, issue [#1214](https://github.com/mbilling/fss-mqtt-broker/issues/1214).
 
 ## Plan
 
@@ -117,9 +166,26 @@ phase lands test-first and independently green.
 | 0037-P12 | ✅ done | — | 2026-08-12 | "The steady-state rejection of #87 item 3 STANDS (delivering from apply_retained_update would double every retained update for established subscribers); what lands is the one delivery the interest-forward path structurally cannot make. Mechanism, no wire changes: an ordinary SUBSCRIBE opens (or refreshes) a per-client RetainedWindow (RETAINED_INTEREST_WINDOW = 3s — the advertisement plus forward hop under load; after it the steady-state rule is back in force, so early closure merely reverts to the old behaviour for the tail), seeded with the retained_value_id of every value the subscribe replay shows; deliver_local RECORDS delivered value identities into open windows (never suppresses — a wrongly swallowed live publish would break QoS 1, a rare extra copy does not); apply_retained_update, after a successful store write, delivers to matching local subscribers whose window is open and whose ledger does not already hold this exact value — through deliver_to_client, so granted-QoS downgrade, RAP flag and OFFLINE-durable queueing all apply (the same gap was open for the queued path). The fan-out-first-then-forward race is deliberately not suppressed (at-least-once within the window; suppressing it would need content-matching in the live path). Steady state costs one is_empty() per apply; windows are swept per tick and dropped with the session. Tests (the reverse-mutation fails 3/3): fresh-subscriber delivery exactly-once; live-copy-first dedup; window-closed silence with the cache still warmed (the #87 item-3 regression proper); replay-seeded ledger (same value re-committed at a higher token is not repeated, a newer value is); offline durable subscriber gets the missed commit on resume via the queue." |
 | 0037-P13 | ✅ done | — | 2026-08-13 | "A v5 retained publish with a Message Expiry Interval was immortal: Message carried no deadline, the stores persisted none, and the subscribe replay sent message_expiry: None unconditionally — both spec violations ([MQTT-3.3.2-5/6]) and a divergence from EMQX/HiveMQ, whose retainers expire. Delivered: mqtt_core::Message gains expires_at (absolute Unix epoch seconds, stamped by the hub's clock seam when the publish is PROCESSED — stores stay clock-free and persist it; the same absolute instant everywhere is what keeps expiry out of the clock-free token machinery). The persistent retained store bumps its layout stamp 1->2 (fail-closed gate, pre-1.0 posture); the durable keyspace record becomes SELF-VERSIONED by its first byte (2 = current with expiry; 0 = the legacy layout, unambiguous because a legacy record starts with the epoch MSB — tested byte-for-byte both ways); RetainedWireEntry, RetainedUpdate and RetainedCommit carry the deadline (pre-1.0 wire reshape, permitted and noted). Replay: an expired copy is skipped (and the collection loop filters before window-seeding); a live one carries the REMAINING interval computed at send. Reaping: pay-for-use per-tick sweep armed by a one-bool flag (a broker with no expiring retained values never scans); under durable retained the OWNER commits the reap as an ordinary CLEAR so every cache converges by token exactly as for a client's zero-length publish — never by comparing clocks across nodes; a non-owner filters reads and waits for the owner's tombstone; durable-off deletes locally. The windowed (#219) apply-path delivery forwards the remaining interval and skips expired values. Wills unchanged (their expiry counts from publication; stamped there). Tests: replay carries remaining (60 of 100 after a 40s clock advance, TestClock); expired value not replayed AND reaped from the store (gauge to zero); the committed record carries the deadline and the owner reaps it as a committed tombstone; fan-out and snapshot entries carry the deadline; storage codec roundtrips expiry and still reads the legacy layout." |
 | 0037-P14 | ✅ done | — | 2026-08-13 | "The §4 retention decision ('kept indefinitely; horizon-GC is the shape to build') is now built. Signals, all pre-existing: handle_retained_digest records the wall-clock instant a peer's digest MATCHED ours (the pair-converged observation, clock-seam so tests drive it); apply paths record when a tombstone was first observed per topic (a re-set value discharges the entry); the reconcile driver pushes the durable raft membership ROSTER — voters AND learners, mapped through the accumulated id map with an explicit unnameable count — onto placement each tick. The gate: a tombstone discharges when a full anti-entropy period has passed AND every roster member other than self has matched since the observation AND no roster member is unnameable; crashed members stay on the raft roster until decommissioned, which is precisely why the gate uses it and never live gossip (gossip forgets the absent — the original resurrection). On discharge each node independently drops its in-memory fence off the same signals; the topic's group owner also calls the new DurableRetained::reap (log.remove, NotOwner-routed); a reap failure keeps fence and clock for retry. Pay-for-use per-tick pass (no tombstones = no work). retained_tombstones gauge (Prometheus+OTLP) counts held fences. Safety residual recorded in the ADR: re-attaching a decommissioned node's old data dir is outside the contract. Tests (reverse-mutation fails 2/2): discharge after the roster converges (peer digest echoed post-clear, TestClock period advance, keyspace record gone); an unconverged or unnameable member blocks indefinitely; a re-taken topic leaves the discharge clock and is never reaped as a clear, while a roster-of-one clear discharges vacuously." |
+| 0037-T15 | ⬜ planned | [#1214](https://github.com/mbilling/fss-mqtt-broker/issues/1214) | — | "Size M. ADR 0073 §4's pattern. Tests: a member below protocol 15, or one configured strong, holds every node in strong; the verdict follows a member's upgrade and rollback; gen-configuration.py picks up the knob." |
+| 0037-T16 | ⬜ planned | [#1214](https://github.com/mbilling/fss-mqtt-broker/issues/1214) | — | "Size M. Tests: a retained publish acks without any peer answering; a node cut off from every peer still takes and serves retained writes; while eventual is in force a stamp outranks every commit token." |
+| 0037-T17 | ⬜ planned | [#1214](https://github.com/mbilling/fss-mqtt-broker/issues/1214) | — | "Size M-L. ADR 0085 D15's shape; reuse its marks and frame plumbing where it fits. Tests: a topic written 40 times while a batch is in flight is sent once; a slow link waits and drops nothing; the hub's dispatch never carries a retained copy; batches applied out of order converge to the highest stamp." |
+| 0037-T18 | ⬜ planned | [#1214](https://github.com/mbilling/fss-mqtt-broker/issues/1214) | — | "Size M. Serves T20's off-hub applies too. Tests: kill -9 after the ack keeps the value; a value whose batch never flushed is lost only on the node that took it; the hub loop does no fsync for retained state." |
+| 0037-T19 | ⬜ planned | [#1214](https://github.com/mbilling/fss-mqtt-broker/issues/1214) | — | "Size M. Tests: both sides of a partition write the same topic and converge at the heal to the higher stamp, counted on mqttd_retained_divergence_total; a clear made during a partition does not come back." |
+| 0037-T20 | ⬜ planned | [#1214](https://github.com/mbilling/fss-mqtt-broker/issues/1214) | — | "Size L. The acked-facts oracle learns 'replaced'. Tests: P6's and T8's ordering tests hold with several hand-offs in flight; a replaced value's publish acks when the newer value commits and never before; one commit carries many topics." |
+| 0037-T21 | ⬜ planned | [#1214](https://github.com/mbilling/fss-mqtt-broker/issues/1214) | — | "Size M. Tests: no permanent divergence across either switch; copies agree within one repair period after it." |
+| 0037-T22 | ⬜ planned | [#1214](https://github.com/mbilling/fss-mqtt-broker/issues/1214) | — | "Size M-L. BASELINE_REF (crates/mqttd/tests/cluster_upgrade.rs) stays at the 1.3.0 release." |
+| 0037-T23 | ⬜ planned | [#1214](https://github.com/mbilling/fss-mqtt-broker/issues/1214) | — | "Size S-M." |
 <!-- /status-table:0037 -->
 
 ## Changelog
+
+- **2026-11-05** — Amendment 1 decided: retained messages are `eventual` by default, and
+  this delivery's path becomes the `strong` mode, chosen by `cluster.retained_consistency`.
+  The reasons are the costs read from the code: a retained publish's ack waits for the
+  owner's commit, commits run one at a time per node, every node flushes every update on
+  its hub loop, and the 1,024-entry queue drops on every path. The eventual mode reuses
+  rule state's hybrid logical clock and per-peer replication (ADR 0085 D6 and D15). T15 to
+  T23 planned under #1214.
 
 - **2026-07-04** — T8 delivered (post-acceptance hardening): the P6 handoff of a routed
   retained mutation to a *linked* owner was fire-and-forget — a frame draining into a

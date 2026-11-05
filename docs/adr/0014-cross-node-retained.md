@@ -10,7 +10,9 @@
   sessions (the default) retained *writes* commit through the group lease-owner and
   caches converge by token; this ADR's read model and back-fill machinery stand, and
   its full behaviour remains the explicit durable-off fallback (see the revision
-  notes at the end)
+  notes at the end). [ADR 0037 Amendment 1](0037-durable-retained-messages.md#amendment-1-2026-11-05-eventual-by-default-strong-by-configuration)
+  (2026-11-05) makes `eventual` the default, which brings back §1's copy to every peer,
+  batched and stamped
 
 > This record states the decision only. How it is being built and how far along it is
 > live in the [delivery doc](../delivery/0014-cross-node-retained.md).
@@ -177,3 +179,17 @@ nothing.
 This is the same lesson as issue #92 in a different subsystem: a transient loss must
 not be allowed to become a permanent divergence just because the only repair path is
 attached to an event that may not recur.
+
+## Revision notes — ADR 0037 Amendment 1 (2026-11-05)
+
+[ADR 0037 Amendment 1](0037-durable-retained-messages.md#amendment-1-2026-11-05-eventual-by-default-strong-by-configuration)
+makes retained messages `eventual` by default on a durable cluster, with ADR 0037's
+owner-committed path kept as the `strong` mode. For this record:
+
+- **§1's copy to every peer comes back** in the eventual mode. It now carries a hybrid
+  logical clock stamp, is batched per peer with each topic's latest value only, and is
+  applied outside the hub loop.
+- **§3's back-fill machinery stands,** with the higher-stamp-wins rule in place of
+  gap-fill, as ADR 0037 §4 already replaced it with higher-token-wins.
+- **Durable off is unchanged.** With durable sessions off, this record's behaviour applies
+  as before; whether that path should move to `eventual` is left open in the amendment.
