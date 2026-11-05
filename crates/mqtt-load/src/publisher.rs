@@ -167,6 +167,40 @@ impl PubShared {
     }
 }
 
+/// Payload sizes for one connection: always `min` when `min == max`, otherwise drawn
+/// uniformly from `min..=max` by `SplitMix64`, seeded so a run can be repeated.
+#[derive(Debug, Clone)]
+struct Sizes {
+    min: usize,
+    span: u64,
+    state: u64,
+}
+
+impl Sizes {
+    fn new(min: usize, max: usize, seed: u64) -> Self {
+        Self {
+            min,
+            span: (max.saturating_sub(min) as u64) + 1,
+            state: seed,
+        }
+    }
+
+    fn next(&mut self) -> usize {
+        if self.span == 1 {
+            return self.min;
+        }
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        // span is at most usize::MAX + 1 and the remainder below it, so the sum fits.
+        #[allow(clippy::cast_possible_truncation)]
+        let extra = (z % self.span) as usize;
+        self.min + extra
+    }
+}
+
 /// Write all of `buf`; returns (times the socket was full, ns spent waiting on it).
 async fn write_tracked(w: &mut OwnedWriteHalf, mut buf: &[u8]) -> std::io::Result<(u64, u64)> {
     let (mut blocked, mut blocked_ns) = (0, 0);
@@ -205,22 +239,25 @@ pub async fn writer(
 ) -> OwnedWriteHalf {
     let cfg = &ctx.cfg;
     // The connection's lanes: (topic index, topic name, ledger publisher). One, on
-    // topic `id % topics`; as a bridge, one per topic, its messages dealt round-robin.
-    let lanes: Vec<(usize, Vec<u8>, u32)> = if cfg.bridge {
-        (0..cfg.topics)
-            .map(|t| (t, cfg.topic(t).into_bytes(), cfg.logical(id, t)))
-            .collect()
-    } else {
-        let t = id as usize % cfg.topics;
-        vec![(t, cfg.topic(t).into_bytes(), id)]
-    };
+    // topic `id % topics`; as a bridge, one per topic it carries, its messages dealt
+    // round-robin.
+    let lanes: Vec<(usize, Vec<u8>, u32)> = cfg
+        .connection_topics(id)
+        .map(|t| (t, cfg.topic(t).into_bytes(), cfg.logical(id, t)))
+        .collect();
     let mut seqs = vec![0u64; lanes.len()];
     let mut batch_sent = vec![0u64; lanes.len()];
     let mut lane = 0usize;
     let longest_topic = lanes.iter().map(|(_, t, _)| t.len()).max().unwrap_or(0);
     let qos1 = cfg.qos == 1;
     let ka_ns = u64::from(cfg.keepalive) * 500_000_000; // ping at half the keep-alive
-    let mut buf = Vec::with_capacity(MAX_BATCH * (cfg.payload + longest_topic + 8));
+    let mut buf = Vec::with_capacity(MAX_BATCH * (cfg.payload_max + longest_topic + 8));
+    // Payload sizes, seeded per run and connection so a run can be repeated.
+    let mut sizes = Sizes::new(
+        cfg.payload,
+        cfg.payload_max,
+        (u64::from(ctx.run) << 32) | u64::from(id),
+    );
     let mut delays: Vec<(u64, bool)> = Vec::with_capacity(MAX_BATCH);
     let mut next = cursor.next();
     // Messages due before this instant were held back by something outside the
@@ -296,7 +333,7 @@ pub async fn writer(
                     pkid,
                     true,
                     &header,
-                    cfg.payload,
+                    sizes.next(),
                     &ctx.filler,
                 )
                 .expect("a validated workload encodes");
@@ -466,5 +503,31 @@ mod tests {
         assert_eq!(inf.release(999), None);
         assert_eq!(inf.free(), 1);
         assert_eq!(inf.take(0, 13, 103), Some(b));
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn payload_sizes_cover_the_range_evenly_and_repeat_with_their_seed() {
+        let mut one = Sizes::new(128, 128, 7);
+        assert!((0..100).all(|_| one.next() == 128), "one size");
+        let mut s = Sizes::new(50, 200, 42);
+        let draws: Vec<usize> = (0..60_000).map(|_| s.next()).collect();
+        assert!(draws.iter().all(|&n| (50..=200).contains(&n)));
+        let mut counts = [0u32; 151];
+        for &n in &draws {
+            counts[n - 50] += 1;
+        }
+        // 60,000 draws over 151 sizes: about 397 each; every size well represented.
+        assert!(
+            counts.iter().all(|&c| (250..550).contains(&c)),
+            "{counts:?}"
+        );
+        let mean = draws.iter().sum::<usize>() as f64 / draws.len() as f64;
+        assert!((mean - 125.0).abs() < 1.0, "mean {mean}");
+        let mut again = Sizes::new(50, 200, 42);
+        assert!(
+            draws.iter().take(100).all(|&n| n == again.next()),
+            "same seed, same sizes"
+        );
     }
 }

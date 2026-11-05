@@ -11,6 +11,11 @@ use crate::schedule::Phase;
 pub enum Shape {
     /// `$share/<group>/<topic>`: each message to one of `consumers` members, per group.
     Share,
+    /// `$share/<group>/<topic-prefix>/#`: one group shares every topic, as a consumer
+    /// application takes a whole fleet's data. Each message to one of `consumers`
+    /// members, per group.
+    #[serde(rename = "share-all")]
+    ShareAll,
     /// `<topic>`: each message to every one of `consumers` subscribers.
     Fanout,
     /// No subscribers: publish only.
@@ -83,15 +88,26 @@ pub struct Config {
     pub inflight: u16,
     /// 0 or 1.
     pub qos: u8,
-    /// Payload bytes (at least [`crate::payload::HEADER_LEN`]).
+    /// Payload bytes (at least [`crate::payload::HEADER_LEN`]): every payload's size, or
+    /// the smallest when [`payload_max`](Self::payload_max) is larger.
     pub payload: usize,
-    /// Topics; publisher `i` publishes to topic `i % topics`.
+    /// The largest payload. Each message's size is drawn uniformly from
+    /// `payload..=payload_max`; equal to `payload`, every payload has that size.
+    pub payload_max: usize,
+    /// Topics; publisher `i` publishes to topic `i % topics`. With
+    /// [`topics_per_connection`](Self::topics_per_connection), `publishers` times it.
     pub topics: usize,
     /// Every publisher connection carries every topic, its messages dealt round-robin
     /// over them: the shape of a bridge forwarding many topics over one connection. The
     /// ledger then keeps one logical publisher per (connection, topic), with its own
     /// sequence, so each still publishes to exactly one topic.
     pub bridge: bool,
+    /// As a bridge, each connection carries this many topics of its own instead of every
+    /// topic: connection `c` carries topics `c·k .. c·k + k`, as each site's bridge
+    /// carries that site's data. Topic `t` is then `<topic_prefix>/<t / k>/<t % k>`
+    /// (site, then tag), and its one publisher is ledger publisher `t`. 0: every
+    /// connection carries every topic.
+    pub topics_per_connection: usize,
     /// Topic `t` is `<topic_prefix>/<t>`.
     pub topic_prefix: String,
     /// Subscription shape.
@@ -167,8 +183,10 @@ impl Config {
             inflight: 32,
             qos: 1,
             payload: 128,
+            payload_max: 128,
             topics: 1,
             bridge: false,
+            topics_per_connection: 0,
             topic_prefix: "load".into(),
             shape: Shape::Share,
             consumers: 2,
@@ -228,8 +246,33 @@ impl Config {
                 crate::payload::HEADER_LEN
             ));
         }
+        if self.payload_max < self.payload {
+            return Err(format!(
+                "the largest payload ({}) is smaller than the smallest ({})",
+                self.payload_max, self.payload
+            ));
+        }
         if self.topics == 0 {
             return Err("at least one topic".into());
+        }
+        if self.topics_per_connection > 0 {
+            if !self.bridge {
+                return Err("topics per connection needs a bridge connection (--bridge)".into());
+            }
+            if (self.publishers as usize).checked_mul(self.topics_per_connection)
+                != Some(self.topics)
+            {
+                return Err(format!(
+                    "{} connections of {} topics each are {} topics, not {}",
+                    self.publishers,
+                    self.topics_per_connection,
+                    (self.publishers as usize).saturating_mul(self.topics_per_connection),
+                    self.topics
+                ));
+            }
+            if u32::try_from(self.topics).is_err() {
+                return Err("connections x topics per connection must fit in 32 bits".into());
+            }
         }
         // With `bridge` every connection covers every topic; without, publisher i
         // publishes to topic i % topics, so it takes a publisher per topic.
@@ -240,6 +283,7 @@ impl Config {
             ));
         }
         if self.bridge
+            && self.topics_per_connection == 0
             && u32::try_from(self.topics)
                 .ok()
                 .and_then(|t| self.publishers.checked_mul(t))
@@ -270,11 +314,21 @@ impl Config {
                 self.keepalive
             ));
         }
+        self.check_skew()
+    }
+
+    /// The skew half of [`Config::validate`]: refuse a workload whose busiest consumer
+    /// session would carry more than [`Config::max_skew`] times the mean.
+    fn check_skew(&self) -> Result<(), String> {
         if !(self.max_skew.is_finite() && self.max_skew >= 0.0) {
             return Err("max skew must be finite and >= 0".into());
         }
         let skew = self.session_skew();
         if self.max_skew > 0.0 && skew > self.max_skew {
+            // A connection of a bridge, or of any publisher under one group that shares
+            // every topic, loads the members on its broker whatever its topic: a whole
+            // number of connections per broker is then the even deal.
+            let per_broker = self.bridge || self.shape == Shape::ShareAll;
             return Err(format!(
                 "the busiest consumer session would carry {skew:.2}x the mean session's load \
                  (limit {:.2}): {} publishers over {} topics and {} brokers do not divide evenly \
@@ -283,12 +337,12 @@ impl Config {
                 self.publishers,
                 self.topics,
                 self.brokers.len(),
-                if self.bridge {
+                if per_broker {
                     "brokers"
                 } else {
                     "topics x brokers"
                 },
-                if self.bridge {
+                if per_broker {
                     self.brokers.len()
                 } else {
                     self.topics * self.brokers.len()
@@ -296,6 +350,34 @@ impl Config {
             ));
         }
         Ok(())
+    }
+
+    /// The topics connection `conn` publishes to: its own block with
+    /// [`topics_per_connection`](Self::topics_per_connection), every topic as a bridge,
+    /// and otherwise topic `conn % topics`.
+    #[must_use]
+    pub fn connection_topics(&self, conn: u32) -> std::ops::Range<usize> {
+        let c = conn as usize;
+        if self.topics_per_connection > 0 {
+            let k = self.topics_per_connection;
+            c * k..c * k + k
+        } else if self.bridge {
+            0..self.topics
+        } else {
+            let t = c % self.topics.max(1);
+            t..t + 1
+        }
+    }
+
+    /// Deliveries each published message should produce: one per group with `$share`,
+    /// one per subscriber with fan-out.
+    #[must_use]
+    pub fn deliveries_per_message(&self) -> usize {
+        match self.shape {
+            Shape::None => 0,
+            Shape::Share | Shape::ShareAll => self.groups,
+            Shape::Fanout => self.consumers,
+        }
     }
 
     /// The broker publisher `i` connects to, as an index into [`Config::brokers`].
@@ -321,23 +403,40 @@ impl Config {
         if brokers == 0 || self.topics == 0 {
             return 1.0;
         }
-        // Publishers per topic and broker. A bridge connection carries every topic at a
-        // topics-th of its rate each; counting it once on every topic scales every load
-        // alike, which leaves the ratio this returns as it is.
+        // Publishers per topic and broker. A bridge connection carries each of its topics
+        // at a share of its rate; counting it once on each scales every load of the
+        // shape alike, which leaves the ratio this returns as it is.
         let mut pubs = vec![vec![0usize; brokers]; self.topics];
-        for i in 0..self.publishers as usize {
-            if self.bridge {
-                for topic in &mut pubs {
-                    topic[self.publisher_broker(i)] += 1;
-                }
-            } else {
-                pubs[i % self.topics][self.publisher_broker(i)] += 1;
+        for i in 0..self.publishers {
+            let b = self.publisher_broker(i as usize);
+            for t in self.connection_topics(i) {
+                pubs[t][b] += 1;
             }
         }
         let specs = self.consumer_specs();
         let mut loads: Vec<f64> = Vec::with_capacity(specs.len());
         match self.shape {
             Shape::None => return 1.0,
+            Shape::ShareAll => {
+                // Every connection loads the members on its broker, whatever its topics,
+                // and every connection publishes at the same rate.
+                let mut on = vec![0usize; brokers];
+                for i in 0..self.publishers as usize {
+                    on[self.publisher_broker(i)] += 1;
+                }
+                let mut members = vec![vec![0usize; brokers]; self.groups];
+                for spec in &specs {
+                    members[spec.stream][spec.broker] += 1;
+                }
+                for spec in &specs {
+                    let here = &members[spec.stream];
+                    let remote: usize = (0..brokers).filter(|&b| here[b] == 0).map(|b| on[b]).sum();
+                    loads.push(
+                        on[spec.broker] as f64 / here[spec.broker] as f64
+                            + remote as f64 / self.consumers as f64,
+                    );
+                }
+            }
             Shape::Fanout => {
                 for spec in &specs {
                     let t = spec.stream / self.consumers;
@@ -351,7 +450,10 @@ impl Config {
                     members[spec.stream][spec.broker] += 1;
                 }
                 for spec in &specs {
-                    let on = &pubs[topics[spec.stream]];
+                    let Some(t) = topics[spec.stream] else {
+                        continue;
+                    };
+                    let on = &pubs[t];
                     let here = &members[spec.stream];
                     // Publishers on a broker with no member of the group go to any member.
                     let remote: usize = (0..brokers).filter(|&b| here[b] == 0).map(|b| on[b]).sum();
@@ -385,17 +487,27 @@ impl Config {
             .min(self.drain_timeout_ns.max(self.drain_quiet_ns))
     }
 
-    /// Topic `t`'s name.
+    /// Topic `t`'s name: `<topic_prefix>/<t>`, or `<topic_prefix>/<site>/<tag>` with
+    /// [`topics_per_connection`](Self::topics_per_connection).
     #[must_use]
     pub fn topic(&self, t: usize) -> String {
-        format!("{}/{t}", self.topic_prefix)
+        if self.topics_per_connection > 0 {
+            let k = self.topics_per_connection;
+            format!("{}/{}/{}", self.topic_prefix, t / k, t % k)
+        } else {
+            format!("{}/{t}", self.topic_prefix)
+        }
     }
 
     /// The ledger's publishers: one per connection, or one per (connection, topic)
-    /// when [`bridge`](Self::bridge) puts every topic on every connection.
+    /// when [`bridge`](Self::bridge) puts every topic on every connection, or one per
+    /// topic when each connection has [`topics_per_connection`](Self::topics_per_connection)
+    /// of its own.
     #[must_use]
     pub fn logical_publishers(&self) -> u32 {
-        if self.bridge {
+        if self.topics_per_connection > 0 {
+            u32::try_from(self.topics).unwrap_or(u32::MAX)
+        } else if self.bridge {
             self.publishers
                 .saturating_mul(u32::try_from(self.topics).unwrap_or(u32::MAX))
         } else {
@@ -407,21 +519,27 @@ impl Config {
     /// modulo `topics` is `t`, so the ledger's topic of a publisher holds either way.
     #[must_use]
     pub fn logical(&self, conn: u32, t: usize) -> u32 {
-        if self.bridge {
+        if self.topics_per_connection > 0 {
+            u32::try_from(t).unwrap_or(u32::MAX)
+        } else if self.bridge {
             conn * u32::try_from(self.topics).unwrap_or(u32::MAX) + u32::try_from(t).unwrap_or(0)
         } else {
             conn
         }
     }
 
-    /// The ledger's streams, each by its topic index.
+    /// The ledger's streams, each by the topic it receives, or `None` for a group that
+    /// shares every topic ([`Shape::ShareAll`]).
     #[must_use]
-    pub fn stream_topics(&self) -> Vec<usize> {
+    pub fn stream_topics(&self) -> Vec<Option<usize>> {
         match self.shape {
             Shape::None => Vec::new(),
-            Shape::Share => (0..self.groups).flat_map(|_| 0..self.topics).collect(),
+            Shape::Share => (0..self.groups)
+                .flat_map(|_| (0..self.topics).map(Some))
+                .collect(),
+            Shape::ShareAll => vec![None; self.groups],
             Shape::Fanout => (0..self.topics)
-                .flat_map(|t| std::iter::repeat_n(t, self.consumers))
+                .flat_map(|t| std::iter::repeat_n(Some(t), self.consumers))
                 .collect(),
         }
     }
@@ -447,6 +565,21 @@ impl Config {
                                 broker: (stream + j) % self.brokers.len(),
                             });
                         }
+                    }
+                }
+                v
+            }
+            Shape::ShareAll => {
+                let mut v = Vec::with_capacity(self.groups * self.consumers);
+                for g in 0..self.groups {
+                    let filter = format!("$share/{}{g}/{}/#", self.group_prefix, self.topic_prefix);
+                    // Member j of group g on broker (g + j), as for a group per topic.
+                    for j in 0..self.consumers {
+                        v.push(ConsumerSpec {
+                            stream: g,
+                            filter: filter.clone(),
+                            broker: (g + j) % self.brokers.len(),
+                        });
                     }
                 }
                 v
@@ -528,7 +661,7 @@ mod tests {
         c.topics = 3;
         c.groups = 2;
         c.consumers = 2;
-        assert_eq!(c.stream_topics(), vec![0, 1, 2, 0, 1, 2]);
+        assert_eq!(c.stream_topics(), [0, 1, 2, 0, 1, 2].map(Some).to_vec());
         let specs = c.consumer_specs();
         assert_eq!(specs.len(), 12);
         assert_eq!(specs[0].filter, "$share/g0/load/0");
@@ -536,12 +669,79 @@ mod tests {
         assert_eq!(specs[11].filter, "$share/g1/load/2");
         assert_eq!(specs[11].stream, 5);
         assert!(specs.iter().all(|s| c.stream_topics()[s.stream]
-            == s.filter
-                .rsplit('/')
-                .next()
-                .unwrap()
-                .parse::<usize>()
-                .unwrap()));
+            == s.filter.rsplit('/').next().unwrap().parse::<usize>().ok()));
+        assert_eq!(c.deliveries_per_message(), 2);
+    }
+
+    #[test]
+    fn share_all_is_one_stream_per_group_over_every_topic() {
+        let mut c = cfg();
+        c.shape = Shape::ShareAll;
+        c.topics = 5;
+        c.groups = 2;
+        c.consumers = 3;
+        c.validate()
+            .expect("a group sharing every topic is runnable");
+        assert_eq!(c.stream_topics(), vec![None, None]);
+        let specs = c.consumer_specs();
+        assert_eq!(specs.len(), 6, "3 members in each of 2 groups");
+        assert!(specs[..3]
+            .iter()
+            .all(|s| s.stream == 0 && s.filter == "$share/g0/load/#"));
+        assert!(specs[3..]
+            .iter()
+            .all(|s| s.stream == 1 && s.filter == "$share/g1/load/#"));
+        assert_eq!(c.deliveries_per_message(), 2, "once per group");
+    }
+
+    #[test]
+    fn a_site_bridge_carries_a_block_of_topics_of_its_own() {
+        let mut c = cfg();
+        c.publishers = 3;
+        c.bridge = true;
+        c.topics_per_connection = 4;
+        c.topics = 12;
+        c.validate().expect("3 sites of 4 topics");
+        assert_eq!(c.connection_topics(1), 4..8);
+        assert_eq!(c.topic(5), "load/1/1", "site 1, tag 1");
+        assert_eq!(c.logical_publishers(), 12, "one ledger publisher per topic");
+        // Every topic has exactly one connection, and its ledger publisher is the topic.
+        let mut owner = [None; 12];
+        for conn in 0..3 {
+            for t in c.connection_topics(conn) {
+                assert_eq!(owner[t], None, "topic {t} has two connections");
+                owner[t] = Some(conn);
+                assert_eq!(c.logical(conn, t) as usize, t);
+            }
+        }
+        assert!(owner.iter().all(Option::is_some));
+        c.topics = 10;
+        assert!(c.validate().unwrap_err().contains("not 10"));
+        c.topics = 12;
+        c.bridge = false;
+        assert!(c.validate().unwrap_err().contains("--bridge"));
+    }
+
+    #[test]
+    fn a_group_sharing_every_topic_is_even_with_whole_connections_per_broker() {
+        // Three brokers, one member of the group on each, a site bridge per connection.
+        let site = |publishers: u32| {
+            let mut c = cluster(3, publishers);
+            c.shape = Shape::ShareAll;
+            c.consumers = 3;
+            c.bridge = true;
+            c.topics_per_connection = 250;
+            c.topics = publishers as usize * 250;
+            c
+        };
+        assert!((site(6).session_skew() - 1.0).abs() < 1e-9);
+        // Seven sites: one broker carries three, the others two.
+        let c = site(7);
+        assert!(c.session_skew() > 1.25, "{}", c.session_skew());
+        assert!(c
+            .validate()
+            .unwrap_err()
+            .contains("multiple of brokers (3)"));
     }
 
     #[test]
@@ -550,11 +750,12 @@ mod tests {
         c.shape = Shape::Fanout;
         c.topics = 2;
         c.consumers = 3;
-        assert_eq!(c.stream_topics(), vec![0, 0, 0, 1, 1, 1]);
+        assert_eq!(c.stream_topics(), [0, 0, 0, 1, 1, 1].map(Some).to_vec());
         let specs = c.consumer_specs();
         assert_eq!(specs.len(), 6);
         assert_eq!(specs[4].filter, "load/1");
         assert_eq!(specs[4].stream, 4);
+        assert_eq!(c.deliveries_per_message(), 3);
     }
 
     /// `brokers` local endpoints, 20 topics, one `$share` group with a member on every
@@ -646,6 +847,13 @@ mod tests {
         let mut c = cfg();
         c.payload = 8;
         assert!(c.validate().is_err());
+        let mut c = cfg();
+        c.payload = 200;
+        c.payload_max = 50;
+        assert!(c
+            .validate()
+            .unwrap_err()
+            .contains("smaller than the smallest"));
         let mut c = cfg();
         c.qos = 2;
         assert!(c.validate().is_err());

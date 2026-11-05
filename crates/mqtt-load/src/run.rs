@@ -309,11 +309,15 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
         .unwrap_or_else(|| format!("mqload-{run:08x}"));
     let counting = Schedule::new(&cfg.phases, cfg.publishers, 0);
     // One entry per logical publisher. As a bridge, connection c's schedule is dealt
-    // round-robin over the topics, the first topic first, so topic t gets at most a
-    // topics-th of it, rounded up.
+    // round-robin over its topics, the first topic first, so each of its topics gets at
+    // most its share, rounded up: a topics-th of it when every connection carries every
+    // topic, a k-th when each carries k of its own.
     let capacity: Vec<u64> = (0..cfg.logical_publishers())
         .map(|l| {
-            if cfg.bridge {
+            if cfg.topics_per_connection > 0 {
+                let k = u32::try_from(cfg.topics_per_connection).unwrap_or(u32::MAX);
+                counting.total_for(l / k).div_ceil(u64::from(k))
+            } else if cfg.bridge {
                 let topics = cfg.topics as u64;
                 counting
                     .total_for(l / u32::try_from(cfg.topics).unwrap_or(u32::MAX))
@@ -324,12 +328,12 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
         })
         .collect();
     let stream_topics = cfg.stream_topics();
-    let streams_per_topic = stream_topics.len().checked_div(cfg.topics).unwrap_or(0);
+    let deliveries_per_message = cfg.deliveries_per_message();
     let shards = (cfg.worker_threads * 4).max(4);
     let ctx = Arc::new(Ctx {
         ledger: Ledger::new(&capacity, cfg.topics, &stream_topics),
         stats: Stats::new(shards),
-        filler: (0..cfg.payload)
+        filler: (0..cfg.payload_max)
             .map(|i| b'a' + u8::try_from(i % 26).unwrap_or(0))
             .collect(),
         topic_sent: (0..cfg.topics).map(|_| AtomicU64::new(0)).collect(),
@@ -888,7 +892,9 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
             inflight: cfg.inflight,
             qos: cfg.qos,
             payload_bytes: cfg.payload,
+            payload_max_bytes: cfg.payload_max,
             topics: cfg.topics,
+            topics_per_connection: cfg.topics_per_connection,
             topic_prefix: cfg.topic_prefix.clone(),
             shape: cfg.shape,
             consumers: if cfg.shape == Shape::None {
@@ -896,7 +902,7 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
             } else {
                 cfg.consumers
             },
-            groups: if cfg.shape == Shape::Share {
+            groups: if matches!(cfg.shape, Shape::Share | Shape::ShareAll) {
                 cfg.groups
             } else {
                 0
@@ -904,7 +910,7 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
             sessions: cfg.sessions,
             session_expiry_s: if durable { cfg.session_expiry } else { 0 },
             session_skew: cfg.session_skew(),
-            deliveries_per_message: streams_per_topic,
+            deliveries_per_message,
             brokers: cfg.brokers.iter().map(ToString::to_string).collect(),
         },
         connections: Connections {

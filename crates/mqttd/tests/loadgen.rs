@@ -196,6 +196,47 @@ async fn a_bridge_connection_carries_every_topic_and_closes_its_ledger() {
     assert_eq!(spread.idle_consumers, 0, "every topic carried messages");
 }
 
+/// The power-plant shape: a bridge connection per site, each carrying a block of
+/// topics of its own, payloads of varying size, and one durable `$share` group over
+/// every topic. Every message arrives once, whichever topic it was on, and every member
+/// takes a share.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn site_bridges_into_one_group_over_every_topic_close_their_ledger() {
+    let dir = common::TempDir::new();
+    let broker = spawn_broker(dir.path()).await;
+    let mut c = workload(broker.client, 600.0, 3);
+    c.qos = 1;
+    c.inflight = 64;
+    c.bridge = true;
+    c.topics_per_connection = 5;
+    c.topics = 15;
+    c.payload = 50;
+    c.payload_max = 200;
+    c.shape = Shape::ShareAll;
+    c.consumers = 3;
+    c.groups = 1;
+    c.sessions = Sessions::Durable;
+    let s = mqtt_load::run(c).await.expect("run");
+    assert_closed(&s, &broker);
+    let l = &s.ledger;
+    // 600 msg/s for 2.5 s over three connections; one group, so each message once.
+    assert_eq!(l.sent, 1500);
+    assert_eq!(l.acked, 1500);
+    assert_eq!(l.expected, 1500);
+    assert_eq!(s.workload.deliveries_per_message, 1);
+    assert_eq!(
+        (s.workload.topics, s.workload.topics_per_connection),
+        (15, 5)
+    );
+    assert_eq!(
+        (s.workload.payload_bytes, s.workload.payload_max_bytes),
+        (50, 200)
+    );
+    assert_eq!(s.connections.publishers, 3, "one connection a site");
+    let spread = s.spread.expect("deliveries were made");
+    assert_eq!(spread.idle_consumers, 0, "every member took a share");
+}
+
 /// Clean-session `QoS` 0 fan-out: no acks to count, every subscriber gets every message.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn qos0_clean_fanout_run_closes_its_ledger() {

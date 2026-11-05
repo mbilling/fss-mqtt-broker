@@ -237,12 +237,24 @@ defaults; the environment wins.
 | `clean-qos1` | 1 | `$share`, one member per broker per topic | clean | 200 B | ack p99 |
 | `qos0` | 0 | `$share`, one member per broker per topic | clean | 200 B | end-to-end p99 |
 | `bridge-qos1` | 1 | `$share`, 4 members per topic, 10 topics | persistent, session expiry 30 s | 200 B | ack p99 |
+| `plant-qos1` | 1 | one `$share` group over every topic, 240 members per generator | persistent, session expiry 30 s | 50–200 B | ack p99 |
 
 `bridge-qos1` is the bridge shape: one publisher connection per generator carries all
 ten topics (`BRIDGE=1`, mqtt-load `--bridge`), as a site gateway forwarding everything
 over one bridge connection, with 8,192 messages in flight capped by the broker's Receive
 Maximum (256 unless `MQTTD_RECEIVE_MAXIMUM` raises it). It measures what one connection
 can carry: one connection task, and the one hub shard that owns the client.
+
+`plant-qos1` is a fleet of power plants:
+- **Sites:** each site's bridge is one publisher connection carrying its own 250 topics,
+  `rig2/<step>/g<generator>/<site>/<tag>` (`TOPICS_PER_CONNECTION`, mqtt-load
+  `--topics-per-connection`).
+- **Consumers:** one durable `$share` group shares every topic (`SHAPE=share-all`), as a
+  historian takes the whole fleet's data.
+- **Steps:** a step's sites on a generator are its rate ÷ 10,000 msg/s, rounded up to a
+  whole number per broker, so a site carries at most 10,000 msg/s.
+- **Receive Maximum:** run it with `EXTRA_BROKER_ENV="MQTTD_RECEIVE_MAXIMUM=4096"`. At the
+  default 256, a site carries at most 256 ÷ its ack latency.
 
 Each generator process publishes under its own topic prefix
 (`rig2/<step>/g<generator>/<t>`), so a topic's publishers and consumers always share one

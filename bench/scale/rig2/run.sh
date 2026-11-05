@@ -796,6 +796,7 @@ launch_gens() { # launch_gens <local-dir> <host-id> <per-gen rate> <warmup> <mea
 	[ "$SESSIONS" != durable ] || args+=(--session-expiry "$SESSION_EXPIRY")
 	[ -z "$PUBLISHERS_N" ] || args+=(--publishers "$PUBLISHERS_N")
 	[ "${BRIDGE:-0}" != 1 ] || args+=(--bridge)
+	[ "${TOPICS_PER_CONNECTION:-0}" = 0 ] || args+=(--topics-per-connection "$TOPICS_PER_CONNECTION")
 	bound=$((START_SYNC_WAIT + GEN_START_WAIT + warmup + measure + 2 * DRAIN_TIMEOUT + 180))
 	for ((g = 0; g < GENERATORS; g++)); do
 		metrics=""
@@ -1014,7 +1015,9 @@ json.dump({"workload": "$WORKLOAD", "arm": "$ARM", "binary": """$BINARY_DESC""",
                     "band_bisect": [int(b) for b in "$BAND_BISECT".replace(",", " ").split()],
                     "retry_p99_ms": $RETRY_P99_MS, "retry_max": $RETRY_MAX, "rounds": $ROUNDS},
            "mqtt_load": {"qos": $QOS, "shape": "$SHAPE", "sessions": "$SESSIONS", "session_expiry_s": $SESSION_EXPIRY,
-                         "payload": $PAYLOAD, "topics_per_generator": $TOPICS, "consumers": $CONSUMERS_N,
+                         "payload": int("$PAYLOAD") if "$PAYLOAD".isdigit() else "$PAYLOAD",
+                         "topics_per_generator": $TOPICS, "topics_per_connection": ${TOPICS_PER_CONNECTION:-0},
+                         "consumers": $CONSUMERS_N,
                          "groups": $SHARE_GROUPS, "rate_per_publisher": $RATE_PER_PUBLISHER, "inflight": $INFLIGHT,
                          "publishers_per_generator": ${PUBLISHERS_N:-None}, "bridge": bool(${BRIDGE:-0}),
                          "warmup_s": $WARMUP, "measure_s": $MEASURE, "window_s": $WINDOW, "drain_timeout_s": $DRAIN_TIMEOUT,
@@ -1046,7 +1049,7 @@ calibrate_gens() {
 		say "calibrating the generator hosts: $CALIB_RATE_PER_GEN msg/s each, QoS 0 share, ${CALIB_MEASURE}s (attempt $attempt)"
 		(
 			QOS=0 SHAPE=share SESSIONS=clean SESSION_EXPIRY=0 PAYLOAD=200 TOPICS=20 SHARE_GROUPS=1
-			CONSUMERS_N="$BROKERS" RATE_PER_PUBLISHER=50 INFLIGHT=128 PUBLISHERS_N=""
+			CONSUMERS_N="$BROKERS" RATE_PER_PUBLISHER=50 INFLIGHT=128 PUBLISHERS_N="" BRIDGE=0 TOPICS_PER_CONNECTION=0
 			launch_gens "$dir" "calib-$attempt" "$CALIB_RATE_PER_GEN" "$CALIB_WARMUP" "$CALIB_MEASURE"
 		)
 		if python3 "$RIG2/verdict.py" calibrate "$dir" >"$dir/verdict.out"; then
