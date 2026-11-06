@@ -1,12 +1,16 @@
 //! State every connection task of a run shares.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use serde::Serialize;
 
 use crate::config::Config;
+use crate::hist::Latency;
 use crate::ledger::Ledger;
 use crate::stats::Stats;
+use crate::summary::{PublisherReconnects, ReconnectReport};
 
 /// Connection-level failures during a run.
 #[derive(Debug, Default)]
@@ -50,6 +54,119 @@ impl Errors {
     }
 }
 
+/// What consumers that reconnect (`--reconnect`) went through: a broker closing a
+/// consumer's connection is then not the run's error but an event, counted here, and
+/// the consumer resumes its session.
+#[derive(Debug, Default)]
+pub struct Reconnects {
+    /// Connections re-established.
+    pub reconnects: AtomicU64,
+    /// Durable resumes the broker answered with no session (session present 0).
+    pub sessions_lost: AtomicU64,
+    /// Consumers that gave up reconnecting.
+    pub failed: AtomicU64,
+    /// Closes by what the broker said ([`close_label`]).
+    pub by_reason: Mutex<BTreeMap<String, u64>>,
+    /// Each consumer's time without a connection, from the close to the session back.
+    pub gaps: Mutex<Latency>,
+    /// The publishers' side.
+    pub publishers: PubReconnects,
+}
+
+/// What publishers that reconnect went through.
+#[derive(Debug, Default)]
+pub struct PubReconnects {
+    /// Connections re-established.
+    pub reconnects: AtomicU64,
+    /// Messages in flight sent again on a new connection.
+    pub resent: AtomicU64,
+    /// Publishers that gave up reconnecting.
+    pub failed: AtomicU64,
+    /// Closes by what the broker said ([`close_label`]).
+    pub by_reason: Mutex<BTreeMap<String, u64>>,
+    /// Each publisher's time without a connection.
+    pub gaps: Mutex<Latency>,
+}
+
+/// How a consumer's connection ended, as [`ReconnectReport::by_reason`] names it: the
+/// broker's DISCONNECT reason code (`0x9c`, Use another server: a cluster moved the
+/// session to another node, ADR 0005), or `closed` when it closed the socket without
+/// one, or `write` when the consumer could not write to it.
+#[must_use]
+pub fn close_label(reason: Option<u8>, write_failed: bool) -> String {
+    match reason {
+        Some(r) => format!("0x{r:02x}"),
+        None if write_failed => "write".to_string(),
+        None => "closed".to_string(),
+    }
+}
+
+impl Reconnects {
+    /// Count a close.
+    ///
+    /// # Panics
+    /// If another task panicked holding the lock.
+    pub fn closed(&self, label: String) {
+        *self
+            .by_reason
+            .lock()
+            .expect("reconnect reasons poisoned")
+            .entry(label)
+            .or_default() += 1;
+    }
+
+    /// Count a publisher's close.
+    ///
+    /// # Panics
+    /// If another task panicked holding the lock.
+    pub fn publisher_closed(&self, label: String) {
+        *self
+            .publishers
+            .by_reason
+            .lock()
+            .expect("reconnect reasons poisoned")
+            .entry(label)
+            .or_default() += 1;
+    }
+
+    /// The report; `enabled` is whether clients reconnect at all.
+    ///
+    /// # Panics
+    /// If another task panicked holding a lock.
+    #[must_use]
+    pub fn report(&self, enabled: bool) -> ReconnectReport {
+        ReconnectReport {
+            enabled,
+            reconnects: self.reconnects.load(Ordering::Relaxed),
+            by_reason: self
+                .by_reason
+                .lock()
+                .expect("reconnect reasons poisoned")
+                .clone(),
+            sessions_lost: self.sessions_lost.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+            gap: self.gaps.lock().expect("reconnect gaps poisoned").summary(),
+            publishers: PublisherReconnects {
+                reconnects: self.publishers.reconnects.load(Ordering::Relaxed),
+                resent: self.publishers.resent.load(Ordering::Relaxed),
+                failed: self.publishers.failed.load(Ordering::Relaxed),
+                by_reason: self
+                    .publishers
+                    .by_reason
+                    .lock()
+                    .expect("reconnect reasons poisoned")
+                    .clone(),
+                gap: self
+                    .publishers
+                    .gaps
+                    .lock()
+                    .expect("reconnect gaps poisoned")
+                    .summary(),
+            },
+        }
+    }
+}
+
 /// The run's shared state.
 #[derive(Debug)]
 pub struct Ctx {
@@ -72,6 +189,8 @@ pub struct Ctx {
     pub last_progress_ns: AtomicU64,
     /// Failures.
     pub errors: Errors,
+    /// Consumer reconnects (`--reconnect`).
+    pub reconnects: Reconnects,
     /// Set once the run is ending connections itself, so their closing is not an error.
     pub stopping: std::sync::atomic::AtomicBool,
     /// Set once the run is ending its publishers' connections, the teardown's first half:
@@ -125,5 +244,39 @@ impl Ctx {
             .iter()
             .map(|s| s.unique.load(Ordering::Relaxed))
             .sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_close_is_named_by_the_brokers_reason_or_how_the_socket_ended() {
+        assert_eq!(close_label(Some(0x9c), false), "0x9c");
+        assert_eq!(
+            close_label(Some(0x8e), true),
+            "0x8e",
+            "the broker's word wins"
+        );
+        assert_eq!(close_label(None, false), "closed");
+        assert_eq!(close_label(None, true), "write");
+        let r = Reconnects::default();
+        r.closed(close_label(Some(0x9c), false));
+        r.closed(close_label(Some(0x9c), false));
+        r.closed(close_label(None, false));
+        r.reconnects.fetch_add(3, Ordering::Relaxed);
+        r.gaps.lock().unwrap().record_ns(12_000_000);
+        r.publisher_closed(close_label(None, false));
+        r.publishers.resent.fetch_add(40, Ordering::Relaxed);
+        let rep = r.report(true);
+        assert_eq!(rep.publishers.by_reason.get("closed"), Some(&1));
+        assert_eq!(rep.publishers.resent, 40);
+        assert!(rep.enabled);
+        assert_eq!(rep.reconnects, 3);
+        assert_eq!(rep.by_reason.get("0x9c"), Some(&2));
+        assert_eq!(rep.by_reason.get("closed"), Some(&1));
+        assert_eq!(rep.gap.count, 1);
+        assert!((11_900..=12_100).contains(&rep.gap.max_us), "{:?}", rep.gap);
     }
 }

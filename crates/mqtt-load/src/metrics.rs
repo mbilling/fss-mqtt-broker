@@ -35,6 +35,10 @@ pub struct View<'a> {
     pub ledger: LedgerReport,
     /// Errors.
     pub errors: ErrorCounts,
+    /// Consumer reconnects so far.
+    pub reconnects: u64,
+    /// Publisher reconnects so far.
+    pub publisher_reconnects: u64,
     /// Messages in flight.
     pub inflight: u64,
     /// The current phase.
@@ -128,6 +132,18 @@ pub fn render(v: &View<'_>) -> String {
         "mqload_unexpected_acks_total",
         "PUBACKs for nothing in flight.",
         v.ledger.unexpected_acks,
+    );
+    counter(
+        &mut o,
+        "mqload_reconnects_total",
+        "Consumer connections re-established after the broker closed them (--reconnect).",
+        v.reconnects,
+    );
+    counter(
+        &mut o,
+        "mqload_publisher_reconnects_total",
+        "Publisher connections re-established, in-flight messages sent again (--reconnect).",
+        v.publisher_reconnects,
     );
     counter(
         &mut o,

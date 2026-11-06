@@ -8,6 +8,7 @@
 #   HCLOUD_TOKEN=... MQTTD_URL=... MQTTD_SHA256=... TIER=n10 WORKLOADS="durable-qos1" ./run.sh
 #   HCLOUD_TOKEN=... MQTTD_LOCAL_BIN=path/to/mqttd TIER=n3 ./run.sh   # a binary on this machine
 #   CLOUD=aws AWS_PROFILE=mqttd-bench MQTTD_LOCAL_BIN=... TIER=h3 ./run.sh   # PAID, on AWS EC2
+#   JOIN_BROKERS=2 TIER=local WORKLOADS=plant-qos1 ./run.sh   # 3 nodes, then 2 more join under load
 #
 # One provisioning carries every workload in WORKLOADS, one ladder after the other, on
 # the same cluster. A ladder is a sequence of steps; a step is ROUNDS rounds at its msg/s
@@ -189,6 +190,49 @@ if [ "$TIER" = local ]; then HOST_PROC="${HOST_PROC-}"; else HOST_PROC="${HOST_P
 # wait. So it is capped there, whatever the rig waits for the slowest generator.
 GEN_START_WAIT=$((START_SYNC_WAIT + 15 > 55 ? 55 : START_SYNC_WAIT + 15))
 if [ "$TIER" = local ]; then START_LEAD_MS="${START_LEAD_MS:-500}"; else START_LEAD_MS="${START_LEAD_MS:-3000}"; fi
+# ── join under load (bench/scale/rig2/README.md, "Join under load") ─────────────────
+# JOIN_BROKERS=K (default 0: off) provisions BROKERS + K broker hosts and bootstraps the
+# first BROKERS only. The one workload in WORKLOADS then runs, on the same provisioning:
+#   1. its ladder on the BROKERS (JOIN_LADDER_BEFORE=0 skips it);
+#   2. the join round, one long round in two cohorts. Cohort A is the workload at JOIN_RATE
+#      msg/s (default JOIN_LOAD, 0.8, of the ladder's maximum lossless) on the first
+#      BROKERS, JOIN_WARMUP s of warm-up and JOIN_MEASURE s measured. JOIN_AT s into its
+#      measured time the K brokers join, one at a time, each once the cluster before it is
+#      fully formed (bootstrap-cluster.sh JOIN_FROM; locally local-cluster.sh join).
+#      JOIN_B_DELAY s after the cluster has formed with the last one, cohort B —
+#      new sites at JOIN_RATE_B msg/s (default JOIN_RATE x K / BROKERS: as much on each
+#      new broker as cohort A puts on each old one), connected to the new brokers only —
+#      starts and runs until cohort A ends. Every client reconnects (mqtt-load
+#      --reconnect, within RECONNECT_GIVE_UP s): a cluster that moves a session to a new
+#      broker closes its connection (0x9C) and the consumer resumes it; a publish for a
+#      moving session has its ack withheld and its publisher's connection closed (fail
+#      closed, ADR 0041 T5), and the publisher sends its in-flight messages again;
+#   3. its ladder on all BROKERS + K, from the first ladder's maximum lossless (or
+#      JOIN_RATE + JOIN_RATE_B; JOIN_LADDER_AFTER=0 skips it).
+# verdict.py join judges the round, and the report gives it beside the two ladders.
+JOIN_BROKERS="${JOIN_BROKERS:-0}"
+[[ "$JOIN_BROKERS" =~ ^[0-9]+$ ]] || die "JOIN_BROKERS must be a broker count, not '$JOIN_BROKERS'"
+TOTAL_BROKERS=$((BROKERS + JOIN_BROKERS))
+JOIN_LOAD="${JOIN_LOAD:-0.8}"
+JOIN_LADDER_BEFORE="${JOIN_LADDER_BEFORE:-1}"
+JOIN_LADDER_AFTER="${JOIN_LADDER_AFTER:-1}"
+if [ "$TIER" = local ]; then
+	JOIN_WARMUP="${JOIN_WARMUP:-10}" JOIN_MEASURE="${JOIN_MEASURE:-120}" JOIN_AT="${JOIN_AT:-30}"
+	JOIN_B_DELAY="${JOIN_B_DELAY:-10}" JOIN_B_WARMUP="${JOIN_B_WARMUP:-5}" JOIN_B_MIN="${JOIN_B_MIN:-20}"
+	JOIN_B_CONNECT="${JOIN_B_CONNECT:-5}"
+else
+	JOIN_WARMUP="${JOIN_WARMUP:-30}" JOIN_MEASURE="${JOIN_MEASURE:-900}" JOIN_AT="${JOIN_AT:-180}"
+	JOIN_B_DELAY="${JOIN_B_DELAY:-60}" JOIN_B_WARMUP="${JOIN_B_WARMUP:-20}" JOIN_B_MIN="${JOIN_B_MIN:-60}"
+	JOIN_B_CONNECT="${JOIN_B_CONNECT:-15}"
+fi
+RECONNECT_GIVE_UP="${RECONNECT_GIVE_UP:-20}"
+if [ "$JOIN_BROKERS" -gt 0 ]; then
+	[ "$(wc -w <<<"$WORKLOADS" | tr -d ' ')" = 1 ] || die "a join run carries one workload (the cluster grows once), not '$WORKLOADS'"
+	[ -z "${JOIN_RATE:-}" ] && [ "$JOIN_LADDER_BEFORE" = 0 ] &&
+		die "JOIN_LADDER_BEFORE=0 needs JOIN_RATE: the join round's rate comes from the ladder before it otherwise"
+	[ "$JOIN_AT" -lt "$JOIN_MEASURE" ] || die "JOIN_AT ($JOIN_AT s) must fall inside JOIN_MEASURE ($JOIN_MEASURE s)"
+fi
+
 # For the price quote: steps a ladder is expected to take (coarse climb + bisection), and
 # the long settles it waits through besides the first (after a step that was not carried,
 # before a transient retry), each about SETTLE_QUIET_LONG + 30 s.
@@ -270,6 +314,13 @@ for w in $WORKLOADS; do
 	[ -f "$RIG2/workloads/$w.env" ] || die "no workload $w (have: $(cd "$RIG2/workloads" && ls ./*.env | sed 's|./||; s|\.env||' | tr '\n' ' '))"
 done
 NWORK=$(wc -w <<<"$WORKLOADS" | tr -d ' ')
+# A join run: a ladder before and after the join, and the round itself (its settle,
+# connect, warm-up, measured time and drain).
+EXTRA_SECS=0
+if [ "$JOIN_BROKERS" -gt 0 ]; then
+	NWORK=$((JOIN_LADDER_BEFORE + JOIN_LADDER_AFTER))
+	EXTRA_SECS=$((SETTLE_QUIET_LONG + 30 + 30 + JOIN_WARMUP + JOIN_MEASURE + 2 * DRAIN_TIMEOUT))
+fi
 # One round: ~20 s of connect, start lead, drain and scrape fetch around WARMUP + MEASURE
 # (the 10-node runs of 2026-10-27: 97-111 s a round at 20 + 60), plus its short settle.
 ROUND_SECS=$((WARMUP + MEASURE + 20 + SETTLE_QUIET + 25))
@@ -296,9 +347,10 @@ if [ "$TIER" != local ]; then
 		done
 		PRICE_ARGS+=(--currency USD)
 	fi
-	say "$(python3 "$RIG2/verdict.py" cost --tier "$TIER" --brokers "$BROKERS" --generators "$GENERATORS" \
+	say "$(python3 "$RIG2/verdict.py" cost --tier "$TIER" --brokers "$TOTAL_BROKERS" --generators "$GENERATORS" \
 		--broker-type "$BROKER_TYPE" --gen-type "$GEN_TYPE" --workloads "$NWORK" --steps "$EST_STEPS" \
-		--rounds "$ROUNDS" --step-secs "$ROUND_SECS" --ladder-secs "$LADDER_SECS" ${PRICE_ARGS[@]+"${PRICE_ARGS[@]}"})"
+		--rounds "$ROUNDS" --step-secs "$ROUND_SECS" --ladder-secs "$LADDER_SECS" --extra-secs "$EXTRA_SECS" \
+		${PRICE_ARGS[@]+"${PRICE_ARGS[@]}"})"
 	[ "${PRICE_ONLY:-0}" != 1 ] || exit 0
 fi
 
@@ -334,6 +386,15 @@ else
 	gen_metrics_addr() { echo "$(driver_priv_ip "$1"):$LOAD_METRICS_PORT"; }
 fi
 
+# endpoints_of <from> <to>: the MQTT endpoints of brokers from..to-1, comma-separated.
+endpoints_of() {
+	if [ "$TIER" = local ]; then
+		sed -n "$(($1 + 1)),$2p" "$RUN/local/brokers.tsv" | cut -f2 | paste -sd, -
+	else
+		jq -r --argjson a "$1" --argjson b "$2" '[.brokers[$a:$b][].mqtt_plain] | join(",")' "$INVENTORY"
+	fi
+}
+
 # ── bring-up ────────────────────────────────────────────────────────────────────────
 BINARY_DESC=""
 if [ "$TIER" = local ]; then
@@ -366,12 +427,12 @@ if [ "$TIER" = local ]; then
 	}
 	trap stop_local EXIT INT TERM
 	MQTTD_BIN="$MQTTD_BIN" run_fg "$RIG2/local-cluster.sh" start "$RUN/local" "$BROKERS"
-	ENDPOINTS=$(cut -f2 "$RUN/local/brokers.tsv" | paste -sd, -)
+	ENDPOINTS=$(endpoints_of 0 "$BROKERS")
 	if [ "$OBSERVE" = 1 ]; then
 		run_fg "$SCALE_DIR/observe.sh" attach-local "$RUN" "$RUN/local/brokers.tsv" "$(gen_metrics_addr 0)" ||
 			warn "observe attach failed (is Docker running?) — continuing unobserved; OBSERVE=0 skips it"
 	fi
-	for i in $(seq 0 $((BROKERS - 1))); do mkdir -p "$(host_dir "broker-$i")"; cp "$RIG2/scrape-loop.py" "$(host_dir "broker-$i")/"; done
+	for i in $(seq 0 $((TOTAL_BROKERS - 1))); do mkdir -p "$(host_dir "broker-$i")"; cp "$RIG2/scrape-loop.py" "$(host_dir "broker-$i")/"; done
 	mkdir -p "$(host_dir gen-0)"
 	cp "$LOAD_BIN" "$(host_dir gen-0)/mqtt-load"
 else
@@ -452,7 +513,7 @@ else
 	# run under run_fg: a background job, so the cd and the credentials stay there.
 	tf() { cloud_tofu_env && cd "$TFDIR" && "$TF" "$@"; }
 	run_fg tf init -input=false >"$RUN/tf-init.log" 2>&1 || { cat "$RUN/tf-init.log" >&2; die "tofu init failed"; }
-	TF_APPLY_ARGS=(-var node_count="$BROKERS" -var driver_count="$GENERATORS"
+	TF_APPLY_ARGS=(-var node_count="$TOTAL_BROKERS" -var driver_count="$GENERATORS"
 		-var broker_server_type="$BROKER_TYPE" -var driver_server_type="$GEN_TYPE"
 		-var run_label="rig2-$STAMP" -var mqttd_version="$MQTTD_VERSION"
 		-var build_bench=false -var driver_emqtt_bench=false)
@@ -476,8 +537,9 @@ else
 	[ -z "${MQTTD_SHA256:-}" ] || TF_APPLY_ARGS+=(-var mqttd_sha256="$MQTTD_SHA256")
 	TF_APPLY_ARGS+=(${TOFU_SSH_PUBKEY_ARGS[@]+"${TOFU_SSH_PUBKEY_ARGS[@]}"})
 	declare -p TF_APPLY_ARGS >"$RUN/tf-apply-args.sh"
-	phase provisioning "rig2 $TIER: $BROKERS x $BROKER_TYPE + $GENERATORS x $GEN_TYPE"
-	say "provisioning $BROKERS x $BROKER_TYPE + $GENERATORS x $GEN_TYPE"
+	phase provisioning "rig2 $TIER: $TOTAL_BROKERS x $BROKER_TYPE + $GENERATORS x $GEN_TYPE"
+	say "provisioning $TOTAL_BROKERS x $BROKER_TYPE + $GENERATORS x $GEN_TYPE"
+	[ "$JOIN_BROKERS" = 0 ] || say "  $BROKERS of the brokers form the cluster; $JOIN_BROKERS join it under load later"
 	run_fg tf apply -auto-approve -input=false "${TF_APPLY_ARGS[@]}" >"$RUN/tf-apply.log" 2>&1 ||
 		{ tail -30 "$RUN/tf-apply.log" >&2; die "tofu apply failed"; }
 	INVENTORY="$RUN/inventory.json"
@@ -488,7 +550,7 @@ else
 	# hash is checked on the host, so a short or corrupted copy fails the run.
 	push_local_bin() {
 		local i ip got
-		for ((i = 0; i < BROKERS; i++)); do
+		for ((i = 0; i < TOTAL_BROKERS; i++)); do
 			ip=$(broker_pub_ip "$i")
 			rssh "$ip" "systemctl stop mqttd 2>/dev/null; true"
 			rscp "$MQTTD_LOCAL_BIN" "root@$ip:/tmp/mqttd-local"
@@ -503,10 +565,17 @@ else
 	# EXTRA_BROKER_ENV: lines appended to every broker's env (bootstrap-cluster.sh), and
 	# disclosed in run.json and the report: a variant never runs undisclosed.
 	[ -z "${EXTRA_BROKER_ENV:-}" ] || say "broker env added to the shipped defaults: $(printf '%s' "$EXTRA_BROKER_ENV" | tr '\n' ' ')"
-	run_fg "$SCALE_DIR/bootstrap-cluster.sh" "$RUN" "$INVENTORY" durable
-	ENDPOINTS=$(jq -r '[.brokers[].mqtt_plain] | join(",")' "$INVENTORY")
+	if [ "$JOIN_BROKERS" = 0 ]; then
+		run_fg "$SCALE_DIR/bootstrap-cluster.sh" "$RUN" "$INVENTORY" durable
+	else
+		# The cluster to start with: the first BROKERS of the inventory (its PKI is
+		# pki-<BROKERS>, which the join extends). The joiners stay installed and stopped.
+		jq --argjson n "$BROKERS" '.brokers |= .[:$n] | .node_count = $n' "$INVENTORY" >"$RUN/inventory-$BROKERS.json"
+		run_fg "$SCALE_DIR/bootstrap-cluster.sh" "$RUN" "$RUN/inventory-$BROKERS.json" durable
+	fi
+	ENDPOINTS=$(endpoints_of 0 "$BROKERS")
 	mapfile -t BROKER_PRIV < <(jq -r '.brokers[].private_ip' "$INVENTORY")
-	for i in $(seq 0 $((BROKERS - 1))); do
+	for i in $(seq 0 $((TOTAL_BROKERS - 1))); do
 		on_broker "$i" 'mkdir -p $H'
 		rscp "$RIG2/scrape-loop.py" "root@$(broker_pub_ip "$i"):$REMOTE_H/"
 	done
@@ -553,7 +622,7 @@ fi
 CPU_JSON="{}"
 if [ "$TIER" != local ]; then
 	cpu_list=""
-	for ((i = 0; i < BROKERS; i++)); do
+	for ((i = 0; i < TOTAL_BROKERS; i++)); do
 		cpu_list+="broker	$(on_broker "$i" "lscpu | sed -n 's/^Model name: *//p' | head -1" 2>/dev/null || echo unknown)"$'\n'
 	done
 	for ((g = 0; g < GENERATORS; g++)); do
@@ -574,7 +643,8 @@ python3 - "$RUN/run.json" <<PY
 import json, sys
 json.dump({"tier": "$TIER", "cloud": "$CLOUD" if "$TIER" != "local" else "local",
            "region": "${AWS_REGION:-}" or None, "location": json.load(open("$RUN/inventory.json")).get("location") if "$TIER" != "local" else None,
-           "brokers": $BROKERS, "broker_type": "$BROKER_TYPE" if "$TIER" != "local" else "local",
+           "brokers": $BROKERS, "join_brokers": $JOIN_BROKERS,
+           "broker_type": "$BROKER_TYPE" if "$TIER" != "local" else "local",
            "generators": $GENERATORS, "gen_type": "$GEN_TYPE" if "$TIER" != "local" else "local",
            "binary": """$BINARY_DESC""", "unreleased": bool("${MQTTD_URL:-}"), "workloads": "$WORKLOADS".split(),
            "started_utc": "$STAMP", "warmup_s": $WARMUP, "measure_s": $MEASURE, "window_s": $WINDOW,
@@ -797,6 +867,7 @@ launch_gens() { # launch_gens <local-dir> <host-id> <per-gen rate> <warmup> <mea
 	[ -z "$PUBLISHERS_N" ] || args+=(--publishers "$PUBLISHERS_N")
 	[ "${BRIDGE:-0}" != 1 ] || args+=(--bridge)
 	[ "${TOPICS_PER_CONNECTION:-0}" = 0 ] || args+=(--topics-per-connection "$TOPICS_PER_CONNECTION")
+	[ "${RECONNECT:-0}" != 1 ] || args+=(--reconnect --reconnect-give-up "$RECONNECT_GIVE_UP")
 	bound=$((START_SYNC_WAIT + GEN_START_WAIT + warmup + measure + 2 * DRAIN_TIMEOUT + 180))
 	for ((g = 0; g < GENERATORS; g++)); do
 		metrics=""
@@ -1008,7 +1079,7 @@ run_ladder() { # run_ladder <workload>, as a background job (run_fg): its own su
 	mkdir -p "$ladder/steps"
 	python3 - "$ladder/ladder.json" <<PY
 import json, sys
-json.dump({"workload": "$WORKLOAD", "arm": "$ARM", "binary": """$BINARY_DESC""",
+json.dump({"workload": "$WORKLOAD", "arm": "$ARM", "binary": """$BINARY_DESC""", "brokers": $BROKERS,
            "ramp": {"start_rate": $START_RATE, "factor": $FACTOR, "gap_pct": $GAP_PCT, "granularity": $GRANULARITY,
                     "min_rate": $MIN_RATE, "max_rate": $MAX_RATE, "void_retries": $VOID_RETRIES,
                     "bisect_on_fail": bool($BISECT_ON_FAIL), "latency_gate": "$LATENCY_GATE",
@@ -1034,6 +1105,130 @@ PY
 		run_step "$ladder" "$idx" "$rate" "$(cat "$ladder/next.log")"
 	done
 	[ "$idx" -lt "$MAX_STEPS" ] || warn "[$WORKLOAD] stopped at MAX_STEPS=$MAX_STEPS"
+}
+
+# ── the join under load (JOIN_BROKERS) ──────────────────────────────────────────────
+# join_brokers <joins.tsv>: grow the cluster from BROKERS to TOTAL_BROKERS under whatever
+# load runs; each joiner's start and readiness (unix ms, its own clock) to <joins.tsv>.
+join_brokers() {
+	if [ "$TIER" = local ]; then
+		JOINS_TSV="$1" MQTTD_BIN="$MQTTD_BIN" "$RIG2/local-cluster.sh" join "$RUN/local" "$BROKERS" "$TOTAL_BROKERS"
+	else
+		JOIN_FROM="$BROKERS" JOINS_TSV="$1" "$SCALE_DIR/bootstrap-cluster.sh" "$RUN" "$INVENTORY" durable
+	fi
+}
+# gen_start_ms <host-id>: the shared start a round's generators were given (generator
+# host 0's start file, unix ms on its clock), once it is written.
+gen_start_ms() {
+	local t at
+	for ((t = 0; t < (START_SYNC_WAIT + 120) * 2; t++)); do
+		at=$(run_bounded 20 on_gen 0 "cat \$H/steps/$1/gen.start 2>/dev/null" 2>/dev/null) || at=""
+		at=$(tr -d '[:space:]' <<<"$at")
+		[[ ! "$at" =~ ^[0-9]+$ ]] || { echo "$at"; return 0; }
+		sleep 0.5
+	done
+	return 1
+}
+sleep_until_ms() { # sleep_until_ms <unix ms>: on this machine's clock (NTP, as every host's)
+	local s
+	s=$(python3 -c "import time; print(max(0.0, ($1 - time.time() * 1000) / 1000))")
+	sleep "$s"
+}
+
+run_join() { # run_join <workload>, as a background job (run_fg): the join round, see JOIN_BROKERS
+	WORKLOAD="$1"
+	# shellcheck disable=SC1090
+	. "$RIG2/workloads/$WORKLOAD.env"
+	if [ "$CONSUMERS" = auto ]; then CONSUMERS_N="${DEF_CONSUMERS:-$BROKERS}"; else CONSUMERS_N="$CONSUMERS"; fi
+	PUBLISHERS_N="${PUBLISHERS:-${DEF_PUBLISHERS:-}}"
+	local dir="$RUN/join/$WORKLOAD" rate_a rate_b knee per_a per_b at_ms last_formed b_at_ms a_end_ms b_measure=0
+	local consumers_b endpoints_b pid_a pid_b="" idle failed join_rc=0 before="$BROKERS"
+	mkdir -p "$dir/a" "$dir/b" "$dir/scrapes"
+	if [ -n "${JOIN_RATE:-}" ]; then
+		rate_a="$JOIN_RATE"
+	else
+		knee=$(python3 "$RIG2/verdict.py" capacity "$RUN/$ARM/$WORKLOAD" 2>/dev/null) || knee=""
+		[ -n "$knee" ] || die "[join] JOIN_RATE is unset and the ladder before the join carried no step"
+		rate_a=$(python3 -c "import math; print(max($GRANULARITY, math.floor($knee * $JOIN_LOAD / $GRANULARITY) * $GRANULARITY))")
+	fi
+	rate_b="${JOIN_RATE_B:-$(python3 -c "print(max(0, round($rate_a * $JOIN_BROKERS / $BROKERS / $GRANULARITY) * $GRANULARITY))")}"
+	# As many members per new broker as cohort A has per old one: a whole number per broker.
+	consumers_b=$(python3 -c "import math; k = $JOIN_BROKERS; print(max(k, math.ceil($CONSUMERS_N * k / $BROKERS / k) * k))")
+	per_a=$(python3 -c "print(f'{$rate_a / $GENERATORS:.3f}')")
+	per_b=$(python3 -c "print(f'{$rate_b / $GENERATORS:.3f}')")
+	python3 - "$dir/join.json" <<PY
+import json, sys
+json.dump({"workload": "$WORKLOAD", "arm": "$ARM", "binary": """$BINARY_DESC""",
+           "brokers_before": $BROKERS, "brokers_after": $TOTAL_BROKERS, "generators": $GENERATORS,
+           "rate_a": float($rate_a), "rate_b": float($rate_b), "join_load": $JOIN_LOAD,
+           "rate_from": "JOIN_RATE" if "${JOIN_RATE:-}" else "ladder",
+           "consumers_a": $CONSUMERS_N, "consumers_b": $consumers_b,
+           "warmup_s": $JOIN_WARMUP, "measure_s": $JOIN_MEASURE, "join_at_s": $JOIN_AT,
+           "b_delay_s": $JOIN_B_DELAY, "b_warmup_s": $JOIN_B_WARMUP, "reconnect_give_up_s": $RECONNECT_GIVE_UP,
+           "judge": {"margin_s": $MARGIN_S, "latency_gate": "$LATENCY_GATE", "idle_floor": $IDLE_FLOOR}},
+          open(sys.argv[1], "w"), indent=2)
+PY
+	say "════ join under load: $WORKLOAD, $BROKERS -> $TOTAL_BROKERS brokers ════"
+	idle=$(await_idle "$dir" "$SETTLE_BUDGET_LONG" "$SETTLE_QUIET_LONG" "$rate_a" "the join round runs on an unsettled cluster (VOID)")
+	printf '%s\n' "$idle" >"$dir/idle_before.json"
+	# The running brokers' scrape loops now; each joiner's once it has joined.
+	step="$dir" hid="$ARM-$WORKLOAD-join"
+	failed=$(for_brokers scrape_loop_start)
+	[ -z "$failed" ] || warn "scrape loop did not start on broker(s) $failed"
+	sleep "$SCRAPE_INTERVAL"
+	say "[join] cohort A: $rate_a msg/s on brokers 0..$((BROKERS - 1)), ${JOIN_WARMUP}s warm-up + ${JOIN_MEASURE}s; the join at +${JOIN_AT}s"
+	phase running "$WORKLOAD join round: cohort A at $rate_a msg/s"
+	(RECONNECT=1 launch_gens "$dir/a" "$hid-a" "$per_a" "$JOIN_WARMUP" "$JOIN_MEASURE") &
+	pid_a=$!
+	at_ms=$(gen_start_ms "$hid-a") || { wait "$pid_a" || true; die "[join] cohort A never started (no start file on generator host 0)"; }
+	a_end_ms=$((at_ms + (JOIN_WARMUP + JOIN_MEASURE) * 1000))
+	sleep_until_ms $((at_ms + (JOIN_WARMUP + JOIN_AT) * 1000))
+	say "[join] joining brokers $BROKERS..$((TOTAL_BROKERS - 1)) under load"
+	phase running "$WORKLOAD join round: joining $JOIN_BROKERS broker(s)"
+	join_brokers "$dir/joins.tsv" >>"$dir/join.log" 2>&1 || join_rc=$?
+	if [ "$join_rc" = 0 ]; then
+		failed=$(for_brokers scrape_loop_start $(seq "$before" $((TOTAL_BROKERS - 1))))
+		[ -z "$failed" ] || warn "scrape loop did not start on joiner(s) $failed"
+		BROKERS=$TOTAL_BROKERS
+		endpoints_b=$(endpoints_of "$before" "$TOTAL_BROKERS")
+		: >"$dir/joined"
+		# From the cluster's formation with the last joiner (column 4; its readiness
+		# where the join recorded no formation).
+		last_formed=$(awk -F'\t' '{print ($4 != "" ? $4 : $3)}' "$dir/joins.tsv" | sort -n | tail -1)
+		b_at_ms=$((last_formed + JOIN_B_DELAY * 1000))
+		b_measure=$(((a_end_ms - b_at_ms) / 1000 - JOIN_B_CONNECT - JOIN_B_WARMUP))
+		say "[join] every broker joined: $(awk -F'\t' '{printf "%sbroker %s ready in %d ms%s", (NR > 1 ? ", " : ""), $1, $3 - $2, ($4 != "" ? sprintf(", the cluster formed in %d ms", $4 - $2) : "")}' "$dir/joins.tsv")"
+	else
+		warn "[join] the join failed (exit $join_rc; $dir/join.log): cohort A runs on, and the round is judged"
+		tail -20 "$dir/join.log" >&2 || true
+	fi
+	if [ "$join_rc" = 0 ] && [ "${rate_b%.*}" -gt 0 ] && [ "$b_measure" -ge "$JOIN_B_MIN" ]; then
+		sleep_until_ms "$b_at_ms"
+		say "[join] cohort B: $rate_b msg/s on the new brokers, ${JOIN_B_WARMUP}s warm-up + ${b_measure}s"
+		phase running "$WORKLOAD join round: cohort A + cohort B at $rate_b msg/s"
+		(RECONNECT=1 ENDPOINTS="$endpoints_b" CONSUMERS_N="$consumers_b" LOAD_METRICS_PORT=$((LOAD_METRICS_PORT + 1)) \
+			launch_gens "$dir/b" "$hid-b" "$per_b" "$JOIN_B_WARMUP" "$b_measure") &
+		pid_b=$!
+	elif [ "$join_rc" = 0 ]; then
+		warn "[join] no cohort B (rate $rate_b msg/s, ${b_measure}s left of cohort A, ${JOIN_B_MIN}s needed)"
+	fi
+	wait "$pid_a" || warn "cohort A's generators ended with $?"
+	[ -z "$pid_b" ] || wait "$pid_b" || warn "cohort B's generators ended with $?"
+	python3 - "$dir/join.json" "$at_ms" "$b_measure" "$join_rc" "${pid_b:+1}" <<'PY'
+import json, sys
+p, at, bm, rc, b = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5] == "1"
+m = json.load(open(p))
+m.update(start_unix_ms=at, joined=rc == 0, join_exit=rc, cohort_b=b, b_measure_s=bm if b else None)
+json.dump(m, open(p, "w"), indent=2)
+PY
+	sleep "$SCRAPE_INTERVAL"
+	failed=$(for_brokers scrape_loop_stop)
+	[ -z "$failed" ] || warn "could not stop the scrape loop on broker(s) $failed (it stops itself after 1800 s)"
+	sleep 1
+	failed=$(for_brokers scrape_loop_fetch)
+	[ -z "$failed" ] || warn "could not fetch the scrapes of broker(s) $failed"
+	python3 "$RIG2/verdict.py" join "$dir" | while IFS= read -r line; do say "  $line"; done
+	[ "$join_rc" = 0 ] || die "[join] the cluster did not grow (exit $join_rc): the run stops here"
 }
 
 # calibrate_gens: see CALIBRATE. Each attempt is one round of the same QoS 0 share load
@@ -1080,11 +1275,25 @@ if scrape_once_all "$RUN/baseline"; then
 fi
 say "baseline: $BASELINE_SESSIONS session(s) on the fresh cluster"
 
-for w in $WORKLOADS; do
-	# A background job (its own subshell: one workload's values never leak into the
-	# next) under `wait`, so a TERM reaches the trap mid-ladder.
-	run_fg run_ladder "$w"
-done
+if [ "$JOIN_BROKERS" = 0 ]; then
+	for w in $WORKLOADS; do
+		# A background job (its own subshell: one workload's values never leak into the
+		# next) under `wait`, so a TERM reaches the trap mid-ladder.
+		run_fg run_ladder "$w"
+	done
+else
+	w="$WORKLOADS"
+	[ "$JOIN_LADDER_BEFORE" = 0 ] || run_fg run_ladder "$w"
+	run_fg run_join "$w"
+	[ -f "$RUN/join/$w/joined" ] || die "the join round left no record of a grown cluster"
+	# From here on the cluster is TOTAL_BROKERS strong: settles, scrapes and the ladder
+	# span every broker, and its sites are dealt over all of them.
+	AFTER_START=$(python3 "$RIG2/verdict.py" capacity "$RUN/$ARM/$w" 2>/dev/null || true)
+	[ -n "$AFTER_START" ] || AFTER_START=$(python3 -c "import json; m = json.load(open('$RUN/join/$w/join.json')); print(round(m['rate_a'] + m['rate_b']))")
+	BROKERS=$TOTAL_BROKERS
+	ENDPOINTS=$(endpoints_of 0 "$TOTAL_BROKERS")
+	[ "$JOIN_LADDER_AFTER" = 0 ] || START_RATE="$AFTER_START" ARM=after-join run_fg run_ladder "$w"
+fi
 
 phase collecting "rig2 report"
 python3 "$RIG2/verdict.py" report "$RUN" >/dev/null

@@ -11,15 +11,15 @@ use tokio::task::JoinHandle;
 use crate::client::{self, ConnectOpts};
 use crate::clock::{self, now_ns, sleep_until_ns};
 use crate::config::{Config, Sessions, Shape};
-use crate::ctx::{Ctx, Errors};
+use crate::ctx::{Ctx, Errors, Reconnects};
 use crate::health::{utilisation, CpuSample, CpuSampler};
 use crate::ledger::Ledger;
 use crate::metrics::{self, View};
-use crate::publisher::{self, PubShared};
+use crate::publisher::{self, PubResume, PubShared};
 use crate::schedule::Schedule;
 use crate::start;
 use crate::stats::{Counters, Histos, Stats};
-use crate::subscriber;
+use crate::subscriber::{self, Resume};
 use crate::summary::{
     Aggregate, Connections, DrainReport, GeneratorReport, Outcome, PhaseReport, PhaseSpec,
     SettleReport, Spread, StartReport, Summary, Tool, WindowHealth, WindowKind, WindowReport,
@@ -72,7 +72,6 @@ fn run_id() -> u32 {
 struct Pub {
     shared: Arc<PubShared>,
     writer: JoinHandle<tokio::net::tcp::OwnedWriteHalf>,
-    reader: JoinHandle<()>,
 }
 
 struct PlannedWindow {
@@ -130,6 +129,8 @@ fn aggregate(dur_ns: u64, offered: u64, c: &Counters, h: &Histos, buckets: bool)
         sent_rate: rate(c.sent),
         acked_rate: rate(c.acked),
         received_rate: rate(c.received),
+        reconnects: c.reconnects,
+        publisher_reconnects: c.publisher_reconnects,
         ack_latency: h.ack.summary(),
         e2e_latency: h.e2e.summary(),
         sched_lag: h.sched_lag.summary(),
@@ -179,6 +180,8 @@ impl Collector {
             received: c.received,
             ledger: live_ledger(&self.ctx.ledger),
             errors: self.ctx.errors.counts(),
+            reconnects: c.reconnects,
+            publisher_reconnects: c.publisher_reconnects,
             inflight: self.inflight(),
             phase,
             target_rate: target,
@@ -342,6 +345,7 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
             .collect(),
         last_progress_ns: AtomicU64::new(0),
         errors: Errors::default(),
+        reconnects: Reconnects::default(),
         stopping: AtomicBool::new(false),
         publishers_stopping: AtomicBool::new(false),
         run,
@@ -397,6 +401,16 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
                 .map_err(fail)?;
             let end_session = durable && !c.keep_sessions;
             let shard = i;
+            let resume = c.reconnect_within_ns.map(|within_ns| Resume {
+                addr,
+                client_id: id.clone(),
+                durable,
+                session_expiry: c.session_expiry,
+                filter: spec.filter.clone(),
+                qos,
+                timeout,
+                within_ns,
+            });
             Ok(tokio::spawn(subscriber::consumer(
                 ctx.clone(),
                 conn.stream,
@@ -406,6 +420,7 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
                 shard,
                 end_session,
                 stop,
+                resume,
             )))
         }
     })
@@ -531,6 +546,19 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
         let state = Arc::new(PubShared::new(w));
         let (r, wr) = c.stream.into_split();
         let slot = specs.len() + i;
+        let resume = cfg.reconnect_within_ns.map(|within_ns| PubResume {
+            addr: cfg.brokers[cfg.publisher_broker(i)],
+            client_id: format!("{prefix}-p{i}"),
+            timeout,
+            within_ns,
+        });
+        state.set_reader(tokio::spawn(publisher::reader(
+            ctx.clone(),
+            state.clone(),
+            r,
+            c.buf,
+            slot,
+        )));
         let writer = tokio::spawn(publisher::writer(
             ctx.clone(),
             id,
@@ -538,18 +566,11 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
             wr,
             sched.cursor(id),
             slot,
-        ));
-        let reader = tokio::spawn(publisher::reader(
-            ctx.clone(),
-            state.clone(),
-            r,
-            c.buf,
-            slot,
+            resume,
         ));
         pubs.push(Pub {
             shared: state,
             writer,
-            reader,
         });
     }
 
@@ -611,14 +632,7 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
             let pc = &mut phase_counts[pw.phase];
             pc.0 += dur;
             pc.1 += offered;
-            pc.2 = Counters {
-                sent: pc.2.sent + delta.sent,
-                acked: pc.2.acked + delta.acked,
-                received: pc.2.received + delta.received,
-                credit_stall_ns: pc.2.credit_stall_ns + delta.credit_stall_ns,
-                socket_blocked: pc.2.socket_blocked + delta.socket_blocked,
-                socket_blocked_ns: pc.2.socket_blocked_ns + delta.socket_blocked_ns,
-            };
+            pc.2 = pc.2.plus(&delta);
             phase_saturated[pw.phase] |= health.saturated;
             cpu_cores_max = cpu_cores_max.max(health.cpu_cores);
             if let Some((_, ns)) = cpu {
@@ -764,7 +778,9 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
             }
             _ => p.writer.abort(),
         }
-        p.reader.abort();
+        if let Some(r) = p.shared.take_reader() {
+            r.abort();
+        }
     }
 
     // The settle: until every expected delivery has arrived, nothing arrived for the
@@ -842,10 +858,7 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
         tot_h.add(&phase_hist[j]);
         tot_d += phase_counts[j].0;
         tot_o += phase_counts[j].1;
-        let c = &phase_counts[j].2;
-        tot_c.sent += c.sent;
-        tot_c.acked += c.acked;
-        tot_c.received += c.received;
+        tot_c = tot_c.plus(&phase_counts[j].2);
     }
     let saturated_windows: Vec<usize> = windows
         .iter()
@@ -956,6 +969,7 @@ pub async fn run(cfg: Config) -> Result<Summary, RunError> {
             },
         },
         errors,
+        reconnect: ctx.reconnects.report(cfg.reconnect_within_ns.is_some()),
         outcome,
     })
 }

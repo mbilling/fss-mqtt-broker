@@ -46,6 +46,21 @@ never linked into `mqttd`.
   expiry 0, unless `--keep-sessions` is given. They close last: after the drain the
   publishers close first, and the consumers read what the broker still holds for them
   (the settle) before the ledger is reconciled and they close too.
+- **Reconnects** (`--reconnect`, off by default). A cluster that moves a durable session
+  to another node closes its connection with DISCONNECT 0x9C, Use another server
+  (ADR 0005). A broker that cannot honour a publish withholds its ack and closes the
+  publisher's connection so that it sends again (fail closed, ADR 0041 T5); a cluster
+  growing under load does both. With `--reconnect` a closed client comes back, connecting
+  again with its client id:
+  - a consumer resumes its durable session, or a clean one subscribes again;
+  - a publisher, always a clean session, starts a new reader on the new connection and
+    sends again every message still in flight, with its first send time. An edge that
+    keeps what was not acknowledged does the same.
+
+  Both back off from 20 ms to 1 s for at most `--reconnect-give-up` seconds. A client
+  that gives up is a lost connection, as is every close without `--reconnect`. The
+  summary's `reconnect` counts what happened, by the broker's DISCONNECT reason, and
+  each window carries its own `reconnects` and `publisher_reconnects`.
 - **Endpoints.** Every topic's publishers and every stream's consumers are spread over
   all `--broker` endpoints: publisher `i` publishes to topic `i % topics` on broker
   `(i % topics + i / topics) % brokers`, and member `j` of stream `s` connects to broker
@@ -162,11 +177,14 @@ run (derived from the highest step), so the rate per publisher steps with the to
 | `--max-skew` | 1.25 | refuse a workload whose busiest consumer session would carry more than this times the mean; 0 accepts any (to measure one hot session on purpose) |
 | `--inflight` | 32 | QoS 1 window per publisher, capped by Receive Maximum; it holds the offer up to `inflight / rate-per-publisher` seconds of ack latency |
 | `--qos` | 1 | 0 or 1 |
-| `--payload` | 128 | bytes, at least 32 |
+| `--payload` | 128 | bytes, at least 32; `MIN-MAX` draws each message's size uniformly from the range, seeded per run and connection |
 | `--topics`, `--topic-prefix` | 10, `load` | publisher `i` publishes to `<prefix>/<i % topics>` |
-| `--shape` | `share` | `share`, `fanout` or `none` |
+| `--bridge` | off | one connection carries every topic, as a site's bridge: one logical publisher per topic in the ledger |
+| `--topics-per-connection` | 0 | with `--bridge`: connection `c` carries topics of its own, `<prefix>/<c>/<tag>`; the topic count is connections × this |
+| `--shape` | `share` | `share`, `share-all` (groups over `<prefix>/#`, every topic), `fanout` or `none` |
 | `--consumers`, `--groups`, `--group-prefix` | 2, 1, `g` | consumers per topic (per group for `share`); groups per topic |
 | `--sessions`, `--session-expiry`, `--keep-sessions` | `durable`, 300 s | consumer sessions |
+| `--reconnect`, `--reconnect-give-up` | off, 20 s | closed clients come back (see How it works); the budget must be shorter than the session expiry |
 | `--client-prefix` | `mqload-<run id>` | client id prefix |
 | `--drain-timeout`, `--drain-quiet`, `--drain-quiet-factor` | 30 s, 5 s, 2 | the drain ends when nothing is in flight and every expected delivery has arrived, when nothing moves for the quiet window, or at the timeout. The quiet window is `--drain-quiet`, or `--drain-quiet-factor` times the slowest measured window's ack or end-to-end p99 if that is longer (never past the timeout): deliveries running 10 s behind are not over after 5 s of silence |
 | `--metrics` | off | Prometheus endpoint during the run |
@@ -193,7 +211,7 @@ All series are prefixed `mqload_`:
 
 - counters `offered_total`, `sent_total`, `acked_total`, `received_total`,
   `duplicates_total`, `unexpected_total`, `negative_acks_total`, `unexpected_acks_total`,
-  and `errors_total{kind}`;
+  `reconnects_total`, `publisher_reconnects_total` and `errors_total{kind}`;
 - gauges `inflight`, `backlog`, `phase`, `target_rate`, `cpu_cores` and `saturated`;
 - histograms `ack_latency_seconds`, `e2e_latency_seconds` and `sched_lag_seconds`, with
   buckets from 250 µs to 30 s.
@@ -243,10 +261,18 @@ generator         {saturated, saturated_windows[], thresholds{cpu_fraction, thre
                    sched_lag_p99_us}, worker_threads, per_thread_cpu, cpu_cores_max,
                    sent_per_cpu_second}
 errors            {connect, disconnects, server_disconnects, protocol, write}
+reconnect         {enabled, reconnects, by_reason, sessions_lost, failed, gap, publishers}:
+                  the consumers' reconnects, closes by the broker's DISCONNECT reason
+                  ("0x9c", or "closed" without one, "write" when a write failed first),
+                  durable resumes answered with no session, consumers that gave up, and
+                  the close-to-session-back latency; publishers {reconnects, resent,
+                  failed, by_reason, gap}, resent being the in-flight messages sent again.
+                  Added within v2
 outcome           ok | loss | void | error
 
 <aggregate> = {duration_s, offered, sent, acked, received,
                offered_rate, sent_rate, acked_rate, received_rate,
+               reconnects, publisher_reconnects,
                ack_latency, e2e_latency, sched_lag, send_delay,
                ack_histogram, e2e_histogram}   (the two histograms: phases and totals only)
 latency     = {count, mean_us, p50_us, p90_us, p99_us, p999_us, max_us}
@@ -305,9 +331,12 @@ the calibration.
 ## Known limits
 
 - MQTT 5 only, and QoS 0 or 1. QoS 2 is not implemented.
-- No reconnect. A connection the broker closes stays closed, and the run reports it
-  (`errors`, outcome `error`). Under overload the broker's durable plane closes
-  publishers on purpose: a full append lane fails the publish closed.
+- No reconnect unless `--reconnect` is given. Without it, a connection the broker closes
+  stays closed and the run reports it (`errors`, outcome `error`). Under overload the
+  broker's durable plane closes publishers on purpose: a full append lane fails the
+  publish closed. Publishers reconnect as clean sessions: their re-sent messages are new
+  publishes of the same identities, so a consumer may receive one twice (counted as
+  duplicates).
 - No TLS.
 - Per-thread CPU is read on Linux only. Elsewhere `ps` gives the process total.
 - The payload carries the send time of the write. For messages that waited for credit
