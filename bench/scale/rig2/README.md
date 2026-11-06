@@ -515,9 +515,15 @@ names exactly one) then runs three parts on the same hosts:
      each joiner a node certificate from the running cluster's CA, the same gossip key,
      two running members as seeds and the readiness floor at the new size's majority,
      starts it and polls its `/readyz` on its own host. Locally it is
-     `local-cluster.sh join`. The members already running are not touched. Each joiner's
-     start and readiness (unix ms, its own clock) go to `joins.tsv`.
-   - **Cohort B:** `JOIN_B_DELAY` s after the last joiner is ready (60; locally 10), new
+     `local-cluster.sh join`. The next joiner starts only once the cluster is **fully
+     formed** (`../cluster-formed.py` on every member: every member alive and none
+     suspect, a full peer mesh, the voter set): a joiner is ready at its majority floor
+     seconds before the others have it in their membership, and a joiner started then
+     overlaps the one before. The members already running are not touched. Each
+     joiner's start and readiness (unix ms, its own clock) and the cluster's formation
+     with it (this machine's clock) go to `joins.tsv`.
+   - **Cohort B:** `JOIN_B_DELAY` s after the cluster has formed with the last joiner (60;
+     locally 10), new
      sites at `JOIN_RATE_B` msg/s connect to the new brokers only. The default is
      `JOIN_RATE × K / BROKERS`: as much on each new broker as cohort A puts on each old
      one, with as many members per new broker. Cohort B runs until cohort A ends.
@@ -559,7 +565,8 @@ step. It writes `verdict.json`, and the report gives the round after the ladders
 - **HELD:** none of these.
 
 Latency is reported, not judged. The report gives it per phase: **before** the join,
-**joining** (from the first joiner's start to 30 s after the last is ready), **after**,
+**joining** (from the first joiner's start to 30 s after the cluster formed with the last),
+**after**,
 and **with cohort B**. Each phase has the cohorts' offered and received msg/s, the median
 and worst window's ack p99, the brokers' received msg/s with how many brokers were rated,
 and the reconnects of consumers and publishers. Below that come each cohort's reconnects

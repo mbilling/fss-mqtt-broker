@@ -18,11 +18,15 @@
 # whatever load it carries, one at a time, as an operator grows a cluster
 # (deploy/systemd/README.md): a node certificate from the SAME cluster CA, the same
 # swim key, seeds naming two running members, the readiness floor at the majority of
-# the new size, then start and wait for /readyz. The running members are not touched:
-# their seed lists and floors stay as they were (a restart to rewrite them is not
-# part of growing a cluster). Each joiner's start and readiness, on its own clock in
-# unix ms, is appended to JOINS_TSV (default <run-dir>/joins.tsv): index, start,
-# ready.
+# the new size, then start it, wait for its /readyz, and then for the
+# cluster to be FULLY FORMED (cluster-formed.py, on every member: all members alive and
+# none suspect, a full peer mesh, the voter set) before the next joiner starts: a
+# joiner is ready at its majority floor seconds before the others have it in their
+# membership, and a second joiner started then overlaps the first one's join. The
+# running members are not touched: their seed lists and floors stay as they were (a
+# restart to rewrite them is not part of growing a cluster). Each joiner is appended
+# to JOINS_TSV (default <run-dir>/joins.tsv): index, start and ready (unix ms, its own
+# clock), and formed (unix ms, this machine's clock).
 
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
@@ -273,6 +277,30 @@ join_ready() {
 	t=$(rssh "$ip" "$poll") || die "joiner $id still not ready 180s after a restart — see $RUN/formation/$id-join-not-ready.txt"
 	echo "$t"
 }
+# formed <n>: brokers 0..n-1 are one fully formed cluster: every one's view passes
+# cluster-formed.py (asked of all of them at once). The last pass that was not formed
+# is kept in <run-dir>/formation/not-formed-<n>.txt.
+VOTER_CAP=$(printf '%s\n' "${EXTRA_BROKER_ENV:-}" | sed -n 's/^MQTTD_LEASE_VOTERS=\([0-9][0-9]*\).*/\1/p' | tail -n 1)
+VOTER_CAP="${VOTER_CAP:-5}"
+formed() {
+	local n="$1" i dir rc=0 why
+	dir=$(mktemp -d)
+	for ((i = 0; i < n; i++)); do
+		rssh "$(broker_pub_ip "$i")" "curl -s -m 3 'http://localhost:8080/readyz?verbose=1'; echo; curl -sf -m 3 http://localhost:8080/metrics | grep -E '^mqttd_(members|peer_links|voters)[ {]'" \
+			>"$dir/$i" 2>/dev/null &
+	done
+	wait
+	: >"$dir/why"
+	for ((i = 0; i < n; i++)); do
+		why=$(python3 "$SCALE_DIR/cluster-formed.py" "$n" "$VOTER_CAP" <"$dir/$i") || { rc=1; echo "$(broker_node_id "$i"): $why" >>"$dir/why"; }
+	done
+	if [ "$rc" != 0 ]; then
+		mkdir -p "$RUN/formation"
+		cp "$dir/why" "$RUN/formation/not-formed-$n.txt"
+	fi
+	rm -rf "$dir"
+	return "$rc"
+}
 if [ -n "$JOIN_FROM" ]; then
 	MAJORITY=$(((N / 2) + 1))
 	for ((i = JOIN_FROM; i < N; i++)); do
@@ -282,8 +310,13 @@ if [ -n "$JOIN_FROM" ]; then
 		started=$(rssh "$(broker_pub_ip "$i")" "date +%s%3N; systemctl restart mqttd") ||
 			die "could not start joiner $(broker_node_id "$i")"
 		ready=$(join_ready "$i")
-		printf '%s\t%s\t%s\n' "$i" "$started" "$ready" >>"$JOINS_TSV"
-		say "joiner $(broker_node_id "$i") READY $((ready - started)) ms after its start (floor $MAJORITY of $N)"
+		say "joiner $(broker_node_id "$i") READY $((ready - started)) ms after its start (floor $MAJORITY of $N); waiting for the cluster to form"
+		# A subshell: wait_for dies on its budget, and the reasons are named after it.
+		( wait_for "a fully formed cluster of $((i + 1))" 300 formed "$((i + 1))" ) ||
+			die "the cluster did not form at $((i + 1)) nodes in 300 s: $(tr '\n' ' ' <"$RUN/formation/not-formed-$((i + 1)).txt" 2>/dev/null)"
+		formed_at=$(python3 -c 'import time; print(int(time.time() * 1000))')
+		printf '%s\t%s\t%s\t%s\n' "$i" "$started" "$ready" "$formed_at" >>"$JOINS_TSV"
+		say "the cluster is fully formed at $((i + 1)) nodes, $((formed_at - started)) ms after $(broker_node_id "$i") started"
 	done
 	say "cluster grown to $N nodes ($MODE mode)"
 	exit 0

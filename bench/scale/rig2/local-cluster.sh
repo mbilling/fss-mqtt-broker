@@ -15,11 +15,12 @@
 # `start` writes <state-dir>/brokers.tsv (index, mqtt, health) and waits until every
 # node's /readyz is ready with all N members. `join` adds nodes <from>..<to>-1 to the
 # running cluster of <from> nodes, one at a time, each seeding off the running nodes
-# (what an operator does to grow a cluster, deploy/systemd/README.md); it appends them
-# to brokers.tsv, writes one line per joiner to $JOINS_TSV (default
-# <state-dir>/joins.tsv: index, start and ready unix ms) and waits until every node is
-# ready with <to> members. `stop` sends SIGTERM to every node and waits for them to
-# exit.
+# (what an operator does to grow a cluster, deploy/systemd/README.md): each joiner is
+# started once the cluster before it is FULLY FORMED (../cluster-formed.py on every
+# node: all members alive and none suspect, a full peer mesh, the voter set). It
+# appends them to brokers.tsv and writes one line per joiner to $JOINS_TSV (default
+# <state-dir>/joins.tsv: index, then start, ready and formed in unix ms). `stop` sends
+# SIGTERM to every node and waits for them to exit.
 
 set -euo pipefail
 
@@ -36,6 +37,16 @@ SWIM_KEY=5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a
 
 port() { echo $((BASE + 10 * $1 + $2)); }
 now_ms() { python3 -c 'import time; print(int(time.time() * 1000))'; }
+
+# formed <n>: nodes 0..n-1 are one fully formed cluster (../cluster-formed.py on each).
+formed() {
+	local n="$1" i view
+	for ((i = 0; i < n; i++)); do
+		view=$(curl -s -m 2 "http://127.0.0.1:$(port "$i" 2)/readyz?verbose=1"; echo
+			curl -sf -m 2 "http://127.0.0.1:$(port "$i" 2)/metrics" | grep -E '^mqttd_(members|peer_links|voters)[ {]') || return 1
+		python3 "$HERE/../cluster-formed.py" "$n" 5 <<<"$view" >/dev/null || return 1
+	done
+}
 
 # start_node <index> <seeds>: one mqttd, its own data dir, its line in brokers.tsv.
 start_node() {
@@ -124,19 +135,17 @@ join)
 			sleep 0.2
 		done
 		[ -n "$ready" ] || { echo "joiner $i not ready in 120 s" >&2; tail -20 "$STATE/node$i/mqttd.log" >&2; exit 1; }
-		printf '%s\t%s\t%s\n' "$i" "$started" "$ready" >>"${JOINS_TSV:-$STATE/joins.tsv}"
-		echo "local cluster: node $i joined (ready after $((ready - started)) ms)" >&2
+		formed_at=""
+		for ((t = 0; t < 600; t++)); do
+			if formed "$((i + 1))"; then formed_at=$(now_ms); break; fi
+			sleep 0.2
+		done
+		[ -n "$formed_at" ] || { echo "the cluster did not form at $((i + 1)) nodes in 120 s" >&2; exit 1; }
+		printf '%s\t%s\t%s\t%s\n' "$i" "$started" "$ready" "$formed_at" >>"${JOINS_TSV:-$STATE/joins.tsv}"
+		echo "local cluster: node $i joined (ready after $((ready - started)) ms, the cluster formed after $((formed_at - started)) ms)" >&2
 	done
-	N="$TO"
-	for ((t = 0; t < 120; t++)); do
-		if ready_all; then
-			echo "local cluster: $N nodes ready" >&2
-			exit 0
-		fi
-		sleep 1
-	done
-	echo "local cluster: not every node reached ready with $N members in 120 s after the join" >&2
-	exit 1
+	echo "local cluster: $TO nodes, fully formed" >&2
+	exit 0
 	;;
 stop)
 	for pidf in "$STATE"/node*/pid; do

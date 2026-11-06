@@ -131,7 +131,7 @@ join)
 		if [ "$i" -ge "$3" ] && [ "$i" -lt "$4" ]; then
 			t=$(python3 -c 'import time; print(int(time.time() * 1000))')
 			line "$i" "$p"
-			printf '%s\\t%s\\t%s\\n' "$i" "$t" "$((t + 100))" >>"${JOINS_TSV:-$STATE/joins.tsv}"
+			printf '%s\\t%s\\t%s\\t%s\\n' "$i" "$t" "$((t + 100))" "$((t + 200))" >>"${JOINS_TSV:-$STATE/joins.tsv}"
 		fi
 		i=$((i + 1))
 	done
@@ -431,7 +431,8 @@ class RunShTest(unittest.TestCase):
         # 0.8 of the first ladder's 300 msg/s, to the 100 msg/s granularity; cohort B as
         # much on each new broker: 200 x 2 / 3.
         self.assertEqual((meta["rate_a"], meta["rate_b"]), (200.0, 100.0), out)
-        self.assertEqual([x.split("\t")[0] for x in (join / "joins.tsv").read_text().split()[::3]], ["3", "4"], out)
+        self.assertEqual([x.split("\t")[0] for x in (join / "joins.tsv").read_text().split()[::4]], ["3", "4"], out)
+        self.assertIn("the cluster formed in 200 ms", r.stderr)
 
         def args(hid):
             return json.loads((self.run_dir / "hosts" / "gen-0" / "steps" / hid / "gen.json.args").read_text())

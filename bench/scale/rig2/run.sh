@@ -197,8 +197,9 @@ if [ "$TIER" = local ]; then START_LEAD_MS="${START_LEAD_MS:-500}"; else START_L
 #   2. the join round, one long round in two cohorts. Cohort A is the workload at JOIN_RATE
 #      msg/s (default JOIN_LOAD, 0.8, of the ladder's maximum lossless) on the first
 #      BROKERS, JOIN_WARMUP s of warm-up and JOIN_MEASURE s measured. JOIN_AT s into its
-#      measured time the K brokers join, one at a time (bootstrap-cluster.sh JOIN_FROM;
-#      locally local-cluster.sh join). JOIN_B_DELAY s after the last is ready, cohort B —
+#      measured time the K brokers join, one at a time, each once the cluster before it is
+#      fully formed (bootstrap-cluster.sh JOIN_FROM; locally local-cluster.sh join).
+#      JOIN_B_DELAY s after the cluster has formed with the last one, cohort B —
 #      new sites at JOIN_RATE_B msg/s (default JOIN_RATE x K / BROKERS: as much on each
 #      new broker as cohort A puts on each old one), connected to the new brokers only —
 #      starts and runs until cohort A ends. Every client reconnects (mqtt-load
@@ -1078,7 +1079,7 @@ run_ladder() { # run_ladder <workload>, as a background job (run_fg): its own su
 	mkdir -p "$ladder/steps"
 	python3 - "$ladder/ladder.json" <<PY
 import json, sys
-json.dump({"workload": "$WORKLOAD", "arm": "$ARM", "binary": """$BINARY_DESC""",
+json.dump({"workload": "$WORKLOAD", "arm": "$ARM", "binary": """$BINARY_DESC""", "brokers": $BROKERS,
            "ramp": {"start_rate": $START_RATE, "factor": $FACTOR, "gap_pct": $GAP_PCT, "granularity": $GRANULARITY,
                     "min_rate": $MIN_RATE, "max_rate": $MAX_RATE, "void_retries": $VOID_RETRIES,
                     "bisect_on_fail": bool($BISECT_ON_FAIL), "latency_gate": "$LATENCY_GATE",
@@ -1140,7 +1141,7 @@ run_join() { # run_join <workload>, as a background job (run_fg): the join round
 	. "$RIG2/workloads/$WORKLOAD.env"
 	if [ "$CONSUMERS" = auto ]; then CONSUMERS_N="${DEF_CONSUMERS:-$BROKERS}"; else CONSUMERS_N="$CONSUMERS"; fi
 	PUBLISHERS_N="${PUBLISHERS:-${DEF_PUBLISHERS:-}}"
-	local dir="$RUN/join/$WORKLOAD" rate_a rate_b knee per_a per_b at_ms last_ready b_at_ms a_end_ms b_measure=0
+	local dir="$RUN/join/$WORKLOAD" rate_a rate_b knee per_a per_b at_ms last_formed b_at_ms a_end_ms b_measure=0
 	local consumers_b endpoints_b pid_a pid_b="" idle failed join_rc=0 before="$BROKERS"
 	mkdir -p "$dir/a" "$dir/b" "$dir/scrapes"
 	if [ -n "${JOIN_RATE:-}" ]; then
@@ -1191,10 +1192,12 @@ PY
 		BROKERS=$TOTAL_BROKERS
 		endpoints_b=$(endpoints_of "$before" "$TOTAL_BROKERS")
 		: >"$dir/joined"
-		last_ready=$(cut -f3 "$dir/joins.tsv" | sort -n | tail -1)
-		b_at_ms=$((last_ready + JOIN_B_DELAY * 1000))
+		# From the cluster's formation with the last joiner (column 4; its readiness
+		# where the join recorded no formation).
+		last_formed=$(awk -F'\t' '{print ($4 != "" ? $4 : $3)}' "$dir/joins.tsv" | sort -n | tail -1)
+		b_at_ms=$((last_formed + JOIN_B_DELAY * 1000))
 		b_measure=$(((a_end_ms - b_at_ms) / 1000 - JOIN_B_CONNECT - JOIN_B_WARMUP))
-		say "[join] every broker ready: $(awk -F'\t' '{printf "%sbroker %s in %d ms", (NR > 1 ? ", " : ""), $1, $3 - $2}' "$dir/joins.tsv")"
+		say "[join] every broker joined: $(awk -F'\t' '{printf "%sbroker %s ready in %d ms%s", (NR > 1 ? ", " : ""), $1, $3 - $2, ($4 != "" ? sprintf(", the cluster formed in %d ms", $4 - $2) : "")}' "$dir/joins.tsv")"
 	else
 		warn "[join] the join failed (exit $join_rc; $dir/join.log): cohort A runs on, and the round is judged"
 		tail -20 "$dir/join.log" >&2 || true

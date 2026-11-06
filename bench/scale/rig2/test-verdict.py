@@ -1315,7 +1315,10 @@ def make_join(root: Path, *, joined=True, cohort_b=True, b_share=1.0, a=None, b=
         (d / "b" / "gen-0.json").write_text(json.dumps(sb))
         (d / "b" / "gen-0.exit").write_text("0")
     if joined:
-        (d / "joins.tsv").write_text(f"3\t{T0 + 210_000}\t{T0 + 212_000}\n4\t{T0 + 213_000}\t{T0 + 215_000}\n")
+        # Each joiner ready 2 s after its start, the cluster formed with it 1 s later, and
+        # the next joiner started then.
+        (d / "joins.tsv").write_text(f"3\t{T0 + 210_000}\t{T0 + 212_000}\t{T0 + 213_000}\n"
+                                     f"4\t{T0 + 213_000}\t{T0 + 215_000}\t{T0 + 216_000}\n")
     last = T0 + 660_000
     for i in range(5):
         bd = d / "scrapes" / f"broker-{i}"
@@ -1353,7 +1356,9 @@ class JoinRound(unittest.TestCase):
         self.assertAlmostEqual(v["joins"][0]["took_s"], 2.0)
         ph = v["phases"]
         self.assertEqual(list(ph), ["before", "joining", "after", "with_b"])
-        self.assertEqual((ph["joining"]["start_s"], ph["joining"]["end_s"]), (210.0, 245.0))
+        # From the first joiner's start to 30 s after the cluster formed with the last.
+        self.assertEqual((ph["joining"]["start_s"], ph["joining"]["end_s"]), (210.0, 246.0))
+        self.assertAlmostEqual(v["joins"][1]["formed_after_s"], 3.0)
         self.assertEqual(ph["before"]["a"]["ack_p99_us_max"], 4000)
         self.assertEqual(ph["joining"]["a"]["ack_p99_us_max"], 40_000, "the join's cost, reported")
         self.assertEqual(ph["joining"]["a"]["reconnects"], 48)
@@ -1369,10 +1374,21 @@ class JoinRound(unittest.TestCase):
         self.assertTrue(any("3 publisher reconnect(s) (closed 3)" in x for x in V.join_lines(v)), V.join_lines(v))
         self.assertEqual(v["brokers"]["rehomes_by_reason"], {"lease-moved": 48.0})
         self.assertEqual([e["voters"] for e in v["brokers"]["end"]][3:], [5.0, 5.0])
-        self.assertIn("JOIN HELD: 3 -> 5 brokers (broker 3 in 2.0 s, broker 4 in 2.0 s)", V.join_lines(v)[0])
+        self.assertIn("JOIN HELD: 3 -> 5 brokers (broker 3 in 2.0 s, formed in 3.0 s, broker 4 in 2.0 s, formed in 3.0 s)",
+                      V.join_lines(v)[0])
         md = "\n".join(V.render_join_md(v))
         self.assertIn("## Join under load: `plant-qos1`, 3 → 5 brokers", md)
-        self.assertIn("| joining (+30 s) | 210–245 |", md)
+        self.assertIn("| joining (+30 s) | 210–246 |", md)
+        self.assertIn("broker 4 started 213.0, ready 215.0, the cluster formed 216.0", md)
+
+    def test_a_join_recorded_without_its_formation_still_reads(self):
+        d = make_join(self.root)
+        lines = [x.rsplit("\t", 1)[0] for x in (d / "joins.tsv").read_text().splitlines()]
+        (d / "joins.tsv").write_text("\n".join(lines) + "\n")
+        v = V.join_round(d)
+        self.assertEqual(v["verdict"], V.HELD, V.join_lines(v))
+        self.assertNotIn("formed_s", v["joins"][0])
+        self.assertEqual(v["phases"]["joining"]["end_s"], 245.0, "30 s after the last ready")
 
     def test_a_joiner_that_never_became_ready_fails_the_round(self):
         v = V.join_round(make_join(self.root, joined=False))
@@ -1425,6 +1441,12 @@ class JoinRound(unittest.TestCase):
 
     def test_capacity_prints_a_ladders_maximum_lossless(self):
         self.assertIsNone(V.capacity([])["lossless"])
+
+    def test_a_ladder_after_the_join_counts_the_vcpu_of_every_broker(self):
+        meta = {"brokers": 3, "join_brokers": 2, "broker_type": "m6i.4xlarge"}
+        self.assertEqual(V.cluster_vcpu(meta), 48)
+        self.assertEqual(V.cluster_vcpu(meta, 5), 80, "the ladder on all 5 brokers")
+        self.assertEqual(V.cluster_vcpu({"brokers": 3, "broker_type": "nope"}, 5), None)
 
 
 if __name__ == "__main__":

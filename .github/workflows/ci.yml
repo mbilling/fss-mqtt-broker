@@ -476,6 +476,8 @@ jobs:
         run: python3 bench/scale/rig2/test-hub-model.py
       - name: The rig2 host samples, the broker hosts' CPU and disks per step (offline)
         run: python3 bench/scale/rig2/test-host-load.py
+      - name: A join waits for a fully formed cluster (offline)
+        run: python3 bench/scale/cluster-formed.py --self-test
       - name: The README's evidence charts draw every bar from headline.csv in its tier
         run: python3 bench/scale/chart-readme.py --self-test
 

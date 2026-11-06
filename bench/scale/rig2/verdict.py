@@ -887,8 +887,9 @@ def judge(step: Path, cfg: dict | None = None) -> dict:
 # and the consumers' reconnect gaps.
 
 HELD = "HELD"
-# The joining phase: from the first joiner's start until this long after the last one
-# was ready, while the cluster moves sessions and replicas onto the new brokers.
+# The joining phase: from the first joiner's start until this long after the cluster
+# formed with the last one (or, without a formation time, after the last was ready),
+# while the cluster moves sessions and replicas onto the new brokers.
 JOIN_SETTLE_S = 30.0
 REHOMES = "mqttd_session_rehomes_total"
 PHASES = ("before", "joining", "after", "with_b")
@@ -1016,11 +1017,16 @@ def join_round(d: Path) -> dict:
     rel = lambda ms: (ms - t0) / 1000  # noqa: E731
     joins = []
     if (d / "joins.tsv").is_file():
+        # index, start, ready (the joiner's clock) and, since the join waits for it, the
+        # cluster's formation (this machine's clock).
         for line in (d / "joins.tsv").read_text().splitlines():
             parts = line.split("\t")
-            if len(parts) == 3 and all(x.strip().isdigit() for x in parts):
-                i, st, rd = (int(x) for x in parts)
-                joins.append({"broker": i, "start_s": rel(st), "ready_s": rel(rd), "took_s": (rd - st) / 1000})
+            if len(parts) in (3, 4) and all(x.strip().isdigit() for x in parts):
+                i, st, rd, *fm = (int(x) for x in parts)
+                j = {"broker": i, "start_s": rel(st), "ready_s": rel(rd), "took_s": (rd - st) / 1000}
+                if fm:
+                    j.update(formed_s=rel(fm[0]), formed_after_s=(fm[0] - st) / 1000)
+                joins.append(j)
     out["joins"] = joins
     if not meta.get("joined", bool(joins)):
         out["failures"].append(f"the cluster did not grow: {len(joins)} of "
@@ -1029,7 +1035,7 @@ def join_round(d: Path) -> dict:
     b_lo = max((measured_span(sm)[0] for _, sm, _ in gens_b), default=None)
     b_hi = min((measured_span(sm)[1] for _, sm, _ in gens_b), default=None)
     first_join = min((j["start_s"] for j in joins), default=rel(a_hi))
-    joined_by = max((j["ready_s"] for j in joins), default=first_join) + JOIN_SETTLE_S
+    joined_by = max((j.get("formed_s", j["ready_s"]) for j in joins), default=first_join) + JOIN_SETTLE_S
     if b_lo:
         # Cohort B's phase begins when B is measured, whatever the settle allowance.
         joined_by = min(joined_by, rel(b_lo))
@@ -1192,7 +1198,9 @@ def join_lines(v: dict) -> list[str]:
         x = (ph.get(k) or {}).get(cohort) or {}
         return fmt_us(x.get("ack_p99_us_max"))
 
-    joins = ", ".join(f"broker {j['broker']} in {j['took_s']:.1f} s" for j in v.get("joins", [])) or "no joiner ready"
+    joins = ", ".join(f"broker {j['broker']} in {j['took_s']:.1f} s"
+                      + (f", formed in {j['formed_after_s']:.1f} s" if "formed_after_s" in j else "")
+                      for j in v.get("joins", [])) or "no joiner ready"
     head = (f"JOIN {v['verdict']}: {v['brokers_before']} -> {v['brokers_after']} brokers ({joins}); cohort A "
             f"{fmt_rate(v['rate_a'])} msg/s" + (f", cohort B {fmt_rate(v['rate_b'])} msg/s" if "B" in v.get("cohorts", {}) else ""))
     lp = v.get("last_phase")
@@ -1242,7 +1250,8 @@ def render_join_md(v: dict) -> list[str]:
     md.append("")
     if v.get("joins"):
         md.append("Joins (s since cohort A's start): " + "; ".join(
-            f"broker {j['broker']} started {j['start_s']:.1f}, ready {j['ready_s']:.1f}" for j in v["joins"]) + ".")
+            f"broker {j['broker']} started {j['start_s']:.1f}, ready {j['ready_s']:.1f}"
+            + (f", the cluster formed {j['formed_s']:.1f}" if "formed_s" in j else "") for j in v["joins"]) + ".")
     if tl.get("b_measured_s"):
         md.append(f"Cohort B measured {tl['b_measured_s'][0]:.0f}–{tl['b_measured_s'][1]:.0f} s.")
     end = (v.get("brokers") or {}).get("end") or []
@@ -1821,16 +1830,20 @@ def ladder_report(ladder: Path) -> dict:
     for st_, m in zip(steps, retry_marks(steps, meta["ramp"])):
         st_["retry"] = m
     nxt, why = next_rate(steps, meta["ramp"]) if steps else (None, "no steps")
-    return {"workload": meta["workload"], "arm": meta.get("arm", "A"), "latency_gate": meta["ramp"].get("latency_gate", "ack"),
+    return {"workload": meta["workload"], "arm": meta.get("arm", "A"), "brokers": meta.get("brokers"),
+            "latency_gate": meta["ramp"].get("latency_gate", "ack"),
             "ramp": meta["ramp"], "mqtt_load": meta.get("mqtt_load", {}), "steps": steps, "capacity": capacity(steps),
             "ended": why if nxt is None else f"incomplete (next would be {nxt:g} msg/s: {why})",
             "hub": _hub(ladder)}
 
 
-def cluster_vcpu(meta: dict) -> int | None:
-    """The brokers' dedicated vCPU in all, or None where the server type is unknown."""
+def cluster_vcpu(meta: dict, brokers: int | None = None) -> int | None:
+    """The brokers' dedicated vCPU in all, or None where the server type is unknown:
+    `brokers` of the run's type (a ladder after a join runs on more brokers than the run
+    started with), by default the run's own count."""
     per = VCPU.get(meta.get("broker_type", ""))
-    return per * int(meta["brokers"]) if per and meta.get("brokers") else None
+    n = brokers or meta.get("brokers")
+    return per * int(n) if per and n else None
 
 
 def per_vcpu(rate: float, vcpu: int | None) -> str:
@@ -1974,9 +1987,12 @@ def report(run: Path) -> dict:
     (run / "report.json").write_text(json.dumps(data, indent=2) + "\n")
     md = [f"# mqttd msg/s ramp — {meta.get('tier', '?')}", ""]
     if meta:
-        md.append(f"- tier `{meta.get('tier')}`: {meta.get('brokers')} brokers ({meta.get('broker_type')}"
-                  + (f", {vcpu} vCPU in all" if vcpu else "") + f"), "
-                  f"{meta.get('generators')} generator host(s) ({meta.get('gen_type')})")
+        grown = meta.get("join_brokers") or 0
+        md.append(f"- tier `{meta.get('tier')}`: {meta.get('brokers')} brokers"
+                  + (f" growing to {int(meta['brokers']) + grown} by a join" if grown else "")
+                  + f" ({meta.get('broker_type')}" + (f", {vcpu} vCPU in all" if vcpu else "")
+                  + (f" before the join, {cluster_vcpu(meta, int(meta['brokers']) + grown)} after" if grown and vcpu else "")
+                  + f"), {meta.get('generators')} generator host(s) ({meta.get('gen_type')})")
         if meta.get("cloud") not in (None, "local"):
             md.append(f"- cloud: {meta['cloud']}" + (f", {meta['region']}" if meta.get("region") else "")
                       + (f" ({meta['location']})" if meta.get("location") else ""))
@@ -2003,7 +2019,7 @@ def report(run: Path) -> dict:
            "highest carried step; the lines below it are the highest carried step within each ack p99 band "
            "(QoS 0: end-to-end p99).", ""]
     for r in data["ladders"]:
-        md += render_ladder_md(r, vcpu)
+        md += render_ladder_md(r, cluster_vcpu(meta, r.get("brokers")))
     for vj in data["joins"]:
         md += render_join_md(vj)
     (run / "report.md").write_text("\n".join(md))
