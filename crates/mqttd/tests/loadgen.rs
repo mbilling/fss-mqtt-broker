@@ -509,7 +509,7 @@ async fn a_consumer_told_to_use_another_server_resumes_its_session_and_closes_th
     let broker = spawn_broker(dir.path()).await;
     let mut goodbye = Vec::new();
     mqtt_codec::Packet::Disconnect(mqtt_codec::Disconnect {
-        reason: 0x9c,
+        reason: 0x9c, // reason-code: imitated by the proxy, the broker's is not provoked here
         properties: mqtt_codec::Properties::new(),
     })
     .encode(&mut goodbye, mqtt_codec::ProtocolVersion::V5)
