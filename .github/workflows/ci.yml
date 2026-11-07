@@ -480,6 +480,12 @@ jobs:
         run: python3 bench/scale/cluster-formed.py --self-test
       - name: The README's evidence charts draw every bar from headline.csv in its tier
         run: python3 bench/scale/chart-readme.py --self-test
+      # The README's plant-shape charts: every column a headline.csv row with its AWS node
+      # type, a floor marked as one, the per-node rate linear wherever the network card was
+      # not throttled, the latency chart one curve across cluster sizes, and the committed
+      # SVGs what the script draws.
+      - name: The plant-shape charts draw headline.csv's columns and one latency curve
+        run: python3 bench/scale/chart-plant.py --self-test
 
   interop:
     name: foreign-client interop (mosquitto + paho)

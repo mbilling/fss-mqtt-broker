@@ -136,8 +136,9 @@ REPLACE_STRIKES = 2
 PRICES_EUR_H = {"ccx23": 0.17225, "ccx33": 0.277375, "ccx43": 0.552875, "ccx53": 1.06875}
 # Dedicated vCPU per server type: the report states every capacity per vCPU as well.
 VCPU = {"ccx13": 2, "ccx23": 4, "ccx33": 8, "ccx43": 16, "ccx53": 32, "ccx63": 48,
-        # AWS (CLOUD=aws): rig2/run.sh maps a tier's CCX type to the m6i of the same count.
-        **{f"{fam}.{size}": n for fam in ("m6i", "m6a", "m7a", "c6i", "c7a", "r6i")
+        # AWS (CLOUD=aws): rig2/run.sh maps a tier's CCX type to the m6i of the same count;
+        # an EC2 type given as it is (m6in: the network-optimized m6i) counts the same.
+        **{f"{fam}.{size}": n for fam in ("m6i", "m6in", "m6a", "m7a", "c6i", "c6in", "c7a", "r6i")
            for size, n in (("large", 2), ("xlarge", 4), ("2xlarge", 8), ("4xlarge", 16),
                            ("8xlarge", 32), ("12xlarge", 48), ("16xlarge", 64))}}
 TIERS = {

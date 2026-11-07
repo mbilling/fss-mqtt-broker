@@ -3,7 +3,8 @@
 Every throughput and latency figure in the README comes from this card. They were measured
 with the benchmark rig of [ADR 0090](../adr/0090-benchmark-rig-redesign.md)
 (`bench/scale/rig2/`): on Hetzner on 2026-10-27 and 2026-10-28, and on AWS on 2026-10-30 and 2026-10-31
-([96 vCPU](#aws-96-vcpu), [32 vCPU](#aws-32-vcpu)).
+([96 vCPU](#aws-96-vcpu), [32 vCPU](#aws-32-vcpu)), on 2026-11-04 (the v1.3.0 release) and on
+2026-11-06 and 2026-11-07 ([the plant shape](#aws-the-plant-shape), v1.3.0).
 
 ## How a figure is measured
 
@@ -15,18 +16,22 @@ with the benchmark rig of [ADR 0090](../adr/0090-benchmark-rig-redesign.md)
 - **The hosts** are Hetzner CCX23 brokers (4 dedicated vCPU, AMD EPYC Milan, local NVMe).
   The load generators run on CCX33 hosts: 2 for 1 and 3 nodes, 4 for 10 nodes.
   The AWS runs use `m6i.4xlarge` (16 vCPU) and `m6i.8xlarge` (32 vCPU) brokers, Intel Ice
-  Lake with a gp3 EBS root, and one `m7a.8xlarge` (AMD EPYC Genoa), with `m6i.2xlarge` and
-  `m6i.4xlarge` generators ([AWS, 96 vCPU](#aws-96-vcpu)).
+  Lake with a gp3 EBS root, one `m7a.8xlarge` (AMD EPYC Genoa), and `c6in.4xlarge` (the
+  m6i.4xlarge's CPU on a network-optimized card), with `m6i.2xlarge` and `m6i.4xlarge`
+  generators ([AWS, 96 vCPU](#aws-96-vcpu), [the plant shape](#aws-the-plant-shape)).
 - **The load generator** is `mqtt-load` (`crates/mqtt-load`), an open-loop paced
   generator. Every topic's publishers and every `$share` group's members are spread over
   every broker. A generator refuses a workload whose busiest session would carry more than
   1.25× the mean.
 - **Calibration.** Before the first step, every generator runs the same load. A host that
   saturates, or whose latency is far above the others', is replaced.
-- **Workloads.** All three use 200-byte payloads:
+- **Workloads.** The three standard ones use 200-byte payloads:
   - **durable QoS 1:** persistent `$share` consumers with a session expiry of 30 s;
   - **QoS 1, clean sessions:** the same shape, with clean sessions;
-  - **QoS 0:** the same shape, at most once.
+  - **QoS 0:** the same shape, at most once;
+  - **the plant shape** ([AWS, the plant shape](#aws-the-plant-shape)): durable QoS 1 as a
+    fleet of sites, each one bridge connection of 250 topics at up to 10,000 msg/s, 50–200 B
+    payloads, one durable `$share` group over every topic.
 - **Throughput** is msg/s from the brokers' own counters (`mqttd_publish_received_total`).
 - **Latency** is measured on the generator's one clock:
   - **ack latency** for QoS 1, publish to PUBACK, where a durable ack waits for fsync and
@@ -570,3 +575,169 @@ Run `h3-20261030T211314Z` · 1 × m7a.8xlarge broker (32 vCPU in all), 1 × m6i.
 | 5 | 71,800 | OFFER NOT TAKEN | 1 | 67,122 | 6.06 s |
 | 6 | 69,700 | CARRIED | 3 | 69,651 | 341.7 ± 138.9 ms |
 | 7 | 70,800 | OFFER NOT TAKEN | 2 | 68,225 | 3.07 ± 4.13 s |
+
+## AWS, the plant shape
+
+Durable QoS 1 in the shape of a fleet of power plants, measured on 2026-11-06 and 2026-11-07
+on the v1.3.0 release with `MQTTD_RECEIVE_MAXIMUM=4096` (the shipped default is 256, which
+holds a site at 256 publishes in flight ÷ the ack latency). The workload is
+`bench/scale/rig2/workloads/plant-qos1.env`: every site is one bridge connection carrying
+its own 250 topics at up to 10,000 msg/s, payloads of 50 to 200 bytes, and one durable
+`$share` group of 240 members per generator, the historian, takes every topic. Sites
+follow the rate: a step's sites on a generator are its rate ÷ 10,000, rounded up to a whole
+number per broker. Brokers are 16-vCPU `m6i.4xlarge` (Intel Xeon Platinum 8375C) and, in the
+last run, `c6in.4xlarge`: the same CPU and vCPU count on a network-optimized card. The
+generators are `m6i.2xlarge`, 6 for the 3-, 5- and 8-node clusters and 8 for 12 nodes.
+
+**Linear from 3 to 12 nodes.** The maximum lossless step is 495,800 msg/s on 3 nodes,
+826,300 on 5, 1,322,000 on 8 and 2,000,000 on 12 × `c6in.4xlarge`: 165,250–166,667 msg/s a
+node, within 1%, at ack p99 0.39–0.66 s. The 12-node ladder ended at the rig's 2,000,000
+msg/s ceiling (`MAX_RATE`), carried in all 3 rounds, so its knee lies above the figure. Each
+cluster's highest step within ack p99 ≤ 100 ms is 421,900, 661,000, 1,057,600 and 1,322,000
+msg/s (55, 46, 48 and 12 ms). The README's `plant-scale-out.svg` and `plant-latency.svg`
+(`bench/scale/chart-plant.py`) draw these five ladders.
+
+**The 5-, 8- and 12-node m6i clusters were built by a join under load** ([the rig's join
+step](../../bench/scale/rig2/README.md#join-under-load)): a cluster carrying cohort A's traffic took its new
+nodes one at a time, the rig waited for each to form, then cohort B's traffic was added and
+the ladder ran on the grown cluster. 3 → 5 held under 396,600 msg/s (two joiners ready in
+2.1–2.3 s each; publishers' ack p99 reached 11.8 s while the joiners formed, with 544 consumer
+and 2,247 publisher reconnects, and no message lost), 5 → 8 held under 661,000 (three
+joiners; worst ack p99 10.1 s while joining; 663 and 6,610 reconnects), and 8 → 12 **failed**
+under 1,057,600: the brokers took all of the 1,586,400 msg/s offered after it, but 11 durable
+sessions were gone when their consumer reconnected (the broker answered session present 0)
+and 5,918 messages were dropped as `append-backlog-full` while the fourth joiner formed
+(worst ack p99 7.2 s; 747 and 9,168 reconnects). The ledger still closed with no message
+missing: the group's other members took what the gone sessions would have had, which a
+durable subscriber outside a `$share` group has no claim to. Both are broker defects, not
+yet fixed: [#1218](https://github.com/mbilling/fss-mqtt-broker/issues/1218) (the sessions)
+and [#1219](https://github.com/mbilling/fss-mqtt-broker/issues/1219) (the drops).
+
+**Known limits of these runs.**
+- **12 × `m6i.4xlarge` is throttled by its network card, not by the broker.** Its ladder
+  carried 1,322,000 msg/s at ack p99 39 ms, then ended on a round the rig voided at
+  1,454,200: one generator's ack p99 (618 ms) stood far above the others' (median 83 ms),
+  which the rig reads as that generator's host. Sampled every 20 s over `ethtool -S`, 7 of
+  the 12 brokers' ENA `pps_allowance_exceeded` counters grew from about 700,000 packets/s a
+  broker, about 110,000 msg/s a node: in none of the rounds at 1,057,600, in three of the
+  four at 1,322,000 and in both at 1,454,200. The one clean round at 1,322,000 carried it at
+  ack p99 18 ms with every generator alike. At 1,586,400 the brokers took 98.8% of the offer
+  (the rule is 99%) with the hub loops' queues at 1,400–2,700 of their ~4,100 cap. The same 12
+  nodes as `c6in.4xlarge` moved 1.15 million packets/s each at 2,000,000 msg/s with no
+  exceedance on any of the 20 hosts, and carried 1,322,000 at ack p99 11.7 ms.
+- **Hub-bound at 2,000,000.** On 12 × `c6in.4xlarge` the busiest node's hub loop dispatched
+  83% of wall-clock at 2,000,000 msg/s, 4.9 µs a message, with its queue at most 6,172
+  commands: the per-node ceiling is the hub task's, as on the other AWS shapes.
+- **Latency at the knee.** Every cluster's maximum lossless step sits at ack p99 0.39–0.66 s;
+  its highest step within 100 ms is 66–85% of it. The band edges are not bisected in these
+  ladders (`band_bisect` off).
+- **Uneven `$share` spread,** as on the other AWS runs: the busiest consumer received
+  1.5–2.5× the mean consumer's deliveries at 12 nodes.
+
+### 3 × m6i.4xlarge
+
+![Durable QoS 1 in the plant shape, 3 × m6i.4xlarge: ack p99 by offered msg/s](img/rig2/aws-3x-m6i4xl-plant-qos1.svg)
+
+Run `h3-20261106T145432Z` · 3 × m6i.4xlarge brokers (48 vCPU in all), 6 × m6i.2xlarge generators · 3 rounds a step · 50–200 B payload · latency is the ack p99, the mean of the rounds ± their standard deviation. The ladder started at 150,000, climbed ×1.5 and bisected to 3%.
+
+- **Maximum lossless:** 495,800 msg/s offered, 165.3k per node and 10,329 per vCPU (brokers received 493,679), ack p99 486.3 ± 24.6 ms
+- **ack p99 ≤ 1 s:** 495,800 msg/s (486.3 ± 24.6 ms)
+- **ack p99 ≤ 250 ms:** 464,100 msg/s (179.7 ± 91.8 ms)
+- **ack p99 ≤ 100 ms:** 421,900 msg/s (55.3 ± 5.0 ms)
+- ladder ended: knee bracketed: good at 495800, not at 506300 msg/s (2.1% gap)
+
+| step | offered msg/s | verdict | rounds | brokers received (mean) | ack p99 (mean ± sd) |
+|---|---|---|---|---|---|
+| 1 | 150,000 | CARRIED | 3 | 150,000 | 0.8 ± 0.0 ms |
+| 2 | 225,000 | CARRIED | 3 | 224,999 | 0.8 ± 0.0 ms |
+| 3 | 337,500 | CARRIED | 3 | 337,496 | 15.9 ± 1.4 ms |
+| 4 | 506,300 | OFFER NOT TAKEN | 1 | 493,318 | 509 ms |
+| 5 | 421,900 | CARRIED | 3 | 421,866 | 55.3 ± 5.0 ms |
+| 6 | 464,100 | CARRIED | 3 | 464,224 | 179.7 ± 91.8 ms |
+| 7 | 485,200 | CARRIED | 3 | 483,977 | 326.2 ± 169.0 ms |
+| 8 | 495,800 | CARRIED | 3 | 493,679 | 486.3 ± 24.6 ms |
+
+The same run then joined two nodes under 396,600 msg/s (HELD) and its 5-node ladder was cut short by an account spend limit; the 5-node card below is the next run's.
+
+### 5 × m6i.4xlarge, after a 3 → 5 join under load
+
+![Durable QoS 1 in the plant shape, 5 × m6i.4xlarge after a 3 → 5 join: ack p99 by offered msg/s](img/rig2/aws-5x-m6i4xl-plant-qos1.svg)
+
+Run `h3-20261106T170406Z` · 3 × m6i.4xlarge brokers growing to 5 by a join (80 vCPU in all after it), 6 × m6i.2xlarge generators · 3 rounds a step · 50–200 B payload · latency is the ack p99, the mean of the rounds ± their standard deviation. The join HELD: cohort A at 396,600 msg/s, cohort B at 264,400 added after it, the 5 brokers took 660,997 of 661,000 offered. The ladder then started at 661,000 on the 5-node cluster, climbed ×1.5 and bisected to 3%.
+
+- **Maximum lossless:** 826,300 msg/s offered, 165.3k per node and 10,329 per vCPU (brokers received 824,371), ack p99 389.2 ± 171.6 ms
+- **ack p99 ≤ 1 s:** 826,300 msg/s (389.2 ± 171.6 ms)
+- **ack p99 ≤ 250 ms:** 661,000 msg/s (46.2 ± 2.9 ms)
+- **ack p99 ≤ 100 ms:** 661,000 msg/s (46.2 ± 2.9 ms)
+- ladder ended: knee bracketed: good at 826300, not at 847000 msg/s (2.5% gap)
+
+| step | offered msg/s | verdict | rounds | brokers received (mean) | ack p99 (mean ± sd) |
+|---|---|---|---|---|---|
+| 1 | 661,000 | CARRIED | 3 | 661,019 | 46.2 ± 2.9 ms |
+| 2 | 991,500 | OFFER NOT TAKEN | 1 | 858,693 | 643 ms |
+| 3 | 826,300 | CARRIED | 3 | 824,371 | 389.2 ± 171.6 ms |
+| 4 | 908,900 | OFFER NOT TAKEN | 1 | 852,315 | 666 ms |
+| 5 | 867,600 | OFFER NOT TAKEN | 1 | 848,738 | 485 ms |
+| 6 | 847,000 | OFFER NOT TAKEN | 2 | 838,621 | 494.1 ± 14.5 ms |
+
+### 8 × m6i.4xlarge, after a 5 → 8 join under load
+
+![Durable QoS 1 in the plant shape, 8 × m6i.4xlarge after a 5 → 8 join: ack p99 by offered msg/s](img/rig2/aws-8x-m6i4xl-plant-qos1.svg)
+
+Run `h3-20261106T182931Z` · 5 × m6i.4xlarge brokers growing to 8 by a join (128 vCPU in all after it), 6 × m6i.2xlarge generators · 3 rounds a step · 50–200 B payload · latency is the ack p99, the mean of the rounds ± their standard deviation. The join HELD: cohort A at 661,000 msg/s, cohort B at 396,600 added after it, the 8 brokers took 1,057,588 of 1,057,600 offered. The ladder then started at 1,057,600 on the 8-node cluster, climbed ×1.5 and bisected to 3%.
+
+- **Maximum lossless:** 1,322,000 msg/s offered, 165.3k per node and 10,328 per vCPU (brokers received 1,318,258), ack p99 493.5 ± 12.4 ms
+- **ack p99 ≤ 1 s:** 1,322,000 msg/s (493.5 ± 12.4 ms)
+- **ack p99 ≤ 250 ms:** 1,057,600 msg/s (48.4 ± 1.8 ms)
+- **ack p99 ≤ 100 ms:** 1,057,600 msg/s (48.4 ± 1.8 ms)
+- ladder ended: knee bracketed: good at 1322000, not at 1355100 msg/s (2.5% gap)
+
+| step | offered msg/s | verdict | rounds | brokers received (mean) | ack p99 (mean ± sd) |
+|---|---|---|---|---|---|
+| 1 | 1,057,600 | CARRIED | 3 | 1,057,672 | 48.4 ± 1.8 ms |
+| 2 | 1,586,400 | OFFER NOT TAKEN | 1 | 1,331,885 | 680 ms |
+| 3 | 1,322,000 | CARRIED | 3 | 1,318,258 | 493.5 ± 12.4 ms |
+| 4 | 1,454,200 | OFFER NOT TAKEN | 1 | 1,334,756 | 677 ms |
+| 5 | 1,388,100 | OFFER NOT TAKEN | 1 | 1,338,033 | 515 ms |
+| 6 | 1,355,100 | OFFER NOT TAKEN | 1 | 1,335,325 | 500 ms |
+
+### 12 × m6i.4xlarge, after an 8 → 12 join under load
+
+![Durable QoS 1 in the plant shape, 12 × m6i.4xlarge after an 8 → 12 join: ack p99 by offered msg/s](img/rig2/aws-12x-m6i4xl-plant-qos1.svg)
+
+Run `h3-20261106T194402Z` · 8 × m6i.4xlarge brokers growing to 12 by a join (192 vCPU in all after it), 8 × m6i.2xlarge generators · 3 rounds a step · 50–200 B payload · latency is the ack p99, the mean of the rounds ± their standard deviation. The join FAILED (above): cohort A at 1,057,600 msg/s, cohort B at 528,800 added after it, the 12 brokers took 1,586,971 of 1,586,400 offered, but 11 durable sessions were lost and 5,918 messages dropped while the joiners formed. The ladder started at 1,586,400 on the 12-node cluster, where the brokers took 98.8% of the offer, and bisected from 1,057,600.
+
+- **Maximum lossless:** 1,322,000 msg/s offered, 110.2k per node and 6,885 per vCPU (brokers received 1,322,042), ack p99 39.3 ± 22.1 ms
+- **ack p99 ≤ 1 s:** 1,322,000 msg/s (39.3 ± 22.1 ms)
+- **ack p99 ≤ 250 ms:** 1,322,000 msg/s (39.3 ± 22.1 ms)
+- **ack p99 ≤ 100 ms:** 1,322,000 msg/s (39.3 ± 22.1 ms)
+- ladder ended: VOID at 1454200 msg/s: round 1 stayed VOID through 2 attempts (generator 0's ack p99 617.5 ms is far above the other generators' median 82.8 ms: they reach the same brokers the same way, so its host set it)
+
+| step | offered msg/s | verdict | rounds | brokers received (mean) | ack p99 (mean ± sd) |
+|---|---|---|---|---|---|
+| 1 | 1,586,400 | OFFER NOT TAKEN | 1 | 1,568,049 | 647 ms |
+| 2 | 1,057,600 | CARRIED | 3 | 1,057,603 | 3.3 ± 1.1 ms |
+| 3 | 1,322,000 | CARRIED | 3 | 1,322,042 | 39.3 ± 22.1 ms |
+| 4 | 1,454,200 | VOID | 1 | 1,453,923 | 463 ms |
+
+The figure is a floor, not a knee: the network cards, not the brokers, set it (the known limits above). The step at 1,322,000 read ack p99 37.8 and 62.1 ms in the two rounds whose brokers exceeded their packet allowance and 18.0 ms in the one whose brokers did not.
+
+### 12 × c6in.4xlarge
+
+![Durable QoS 1 in the plant shape, 12 × c6in.4xlarge: ack p99 by offered msg/s](img/rig2/aws-12x-c6in4xl-plant-qos1.svg)
+
+Run `h3-20261106T233606Z` · 12 × c6in.4xlarge brokers (192 vCPU in all), 8 × m6i.2xlarge generators · 3 rounds a step · 50–200 B payload · latency is the ack p99, the mean of the rounds ± their standard deviation. A cluster formed at once, not grown by a join. The ladder started at 1,322,000, the m6i cluster's floor, climbed ×1.5 to 1,983,000 and then to the rig's 2,000,000 msg/s ceiling (`MAX_RATE`), where it ended.
+
+- **Maximum lossless:** 2,000,000 msg/s offered, 166.7k per node and 10,417 per vCPU (brokers received 1,991,040), ack p99 656.9 ± 2.7 ms
+- **ack p99 ≤ 1 s:** 2,000,000 msg/s (656.9 ± 2.7 ms)
+- **ack p99 ≤ 250 ms:** 1,322,000 msg/s (11.7 ± 0.7 ms)
+- **ack p99 ≤ 100 ms:** 1,322,000 msg/s (11.7 ± 0.7 ms)
+- ladder ended: carried at the ladder's ceiling (2000000 msg/s)
+
+| step | offered msg/s | verdict | rounds | brokers received (mean) | ack p99 (mean ± sd) |
+|---|---|---|---|---|---|
+| 1 | 1,322,000 | CARRIED | 3 | 1,321,982 | 11.7 ± 0.7 ms |
+| 2 | 1,983,000 | CARRIED | 3 | 1,980,811 | 571.6 ± 49.2 ms |
+| 3 | 2,000,000 | CARRIED | 3 | 1,991,040 | 656.9 ± 2.7 ms |
+
+The figure is a floor: the ladder's ceiling, not a knee. Every round at 2,000,000 was carried with the brokers receiving 99.3–99.8% of the offer and no message lost; the hub loops were at 0.82–0.83 busy on the busiest node. The ENA counters on all 20 hosts read no `pps_allowance_exceeded` at 1.15 million packets/s per broker.
