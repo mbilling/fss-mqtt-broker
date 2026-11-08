@@ -605,13 +605,18 @@ the ladder ran on the grown cluster. 3 → 5 held under 396,600 msg/s (two joine
 and 2,247 publisher reconnects, and no message lost), 5 → 8 held under 661,000 (three
 joiners; worst ack p99 10.1 s while joining; 663 and 6,610 reconnects), and 8 → 12 **failed**
 under 1,057,600: the brokers took all of the 1,586,400 msg/s offered after it, but 11 durable
-sessions were gone when their consumer reconnected (the broker answered session present 0)
-and 5,918 messages were dropped as `append-backlog-full` while the fourth joiner formed
+sessions were gone when their consumer reconnected (the broker answered session present 0),
+and while the fourth joiner formed the brokers refused 5,918 deliveries as
+`append-backlog-full` and withheld those publishes' acks, so the publishers sent them again
 (worst ack p99 7.2 s; 747 and 9,168 reconnects). The ledger still closed with no message
 missing: the group's other members took what the gone sessions would have had, which a
-durable subscriber outside a `$share` group has no claim to. Both are broker defects, not
-yet fixed: [#1218](https://github.com/mbilling/fss-mqtt-broker/issues/1218) (the sessions)
-and [#1219](https://github.com/mbilling/fss-mqtt-broker/issues/1219) (the drops).
+durable subscriber outside a `$share` group has no claim to. The session loss is a broker
+defect, not yet fixed ([#1218](https://github.com/mbilling/fss-mqtt-broker/issues/1218)).
+The refused deliveries went to consumers whose append lanes had filled while their groups
+moved to a joiner, and the `$share` deal now passes such a member's turn to one with room
+([#1219](https://github.com/mbilling/fss-mqtt-broker/issues/1219), fixed in
+[#1220](https://github.com/mbilling/fss-mqtt-broker/pull/1220)); that is not yet measured
+on the rig.
 
 **Known limits of these runs.**
 - **12 × `m6i.4xlarge` is throttled by its network card, not by the broker.** Its ladder

@@ -73,10 +73,12 @@ fsync and a quorum copy on another node. It is the one we measure first.
 - **Grown under load.** The 5-, 8- and 12-node m6i.4xlarge clusters were built by joining
   nodes to a cluster carrying traffic (3 → 5, 5 → 8, 8 → 12) and measured after. The first
   two joins kept every session and every message. The 8 → 12 join lost 11 durable
-  sessions ([#1218](https://github.com/mbilling/fss-mqtt-broker/issues/1218)), and its
-  brokers counted dropped messages while the last joiner formed
-  ([#1219](https://github.com/mbilling/fss-mqtt-broker/issues/1219)); no message went
-  missing end to end, but both are defects, not yet fixed.
+  sessions, a defect not yet fixed
+  ([#1218](https://github.com/mbilling/fss-mqtt-broker/issues/1218)). While its last
+  joiner formed, its brokers also refused deliveries, and the publishers sent those
+  messages again ([#1219](https://github.com/mbilling/fss-mqtt-broker/issues/1219)). That
+  is fixed in [#1220](https://github.com/mbilling/fss-mqtt-broker/pull/1220) but not yet
+  measured on the rig. No message went missing end to end.
 
 ![Ack p99 on a log scale by msg/s per node for every step of the five plant-shape ladders: the 3-, 5- and 8-node m6i.4xlarge ladders and the 12-node c6in.4xlarge ladder lie on one curve, about 1 ms at low load and half a second at 165k a node; the 12-node m6i.4xlarge ladder leaves it at 110k a node, its network cards throttled](docs/benchmarks/img/rig2/plant-latency.svg)
 
