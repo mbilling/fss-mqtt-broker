@@ -10,8 +10,11 @@
 An MQTT 3.1.1 and 5.0 broker in Rust that clusters, replicates durable sessions by
 default, and ships every feature under Apache-2.0.
 
-> - **Durable QoS 1** (acked after fsync and a quorum copy on another node): 390,300 msg/s
->   with no message lost on 96 vCPU, at ack p99 112 ms; HiveMQ 4.18 publishes 270,000 on the
+> - **Durable QoS 1 scales linearly:** 2,000,000 msg/s with no message lost on 12 nodes,
+>   165k a node from 3 nodes to 12, with site bridges feeding one `$share` group; every
+>   message is acked after fsync and a quorum copy on another node.
+> - **Against HiveMQ:** 390,300 durable msg/s with no message lost on 96 vCPU from
+>   thousands of small publishers, at ack p99 112 ms; HiveMQ 4.18 publishes 270,000 on the
 >   same 96 vCPU.
 > - **On ten 4-vCPU nodes:** 292,200 durable, 876k with clean sessions, 973k at QoS 0.
 > - **Every feature, no paid tier:** clustering, durable replication, OIDC, audit, operator.
@@ -52,12 +55,44 @@ mqttd has no production users yet. The evidence below is what it offers instead.
 Durable QoS 1 is the hardest path a broker serves: every acknowledgement waits for
 fsync and a quorum copy on another node. It is the one we measure first.
 
+![Durable QoS 1 in the plant shape on AWS: one column per cluster at its maximum lossless msg/s from 3 to 12 nodes, coloured by node type, with a dotted line extending the 3-node rate per node; 12 nodes on m6i.4xlarge stop where their network cards throttled, the same 12 nodes on c6in.4xlarge reach the generators' rate ceiling](docs/benchmarks/img/rig2/plant-scale-out.svg)
+
+- **Add a node, add 165k msg/s.** The plant shape: every site is one bridge connection
+  carrying its own 250 topics, and one durable `$share` historian group takes them all.
+  On AWS, with 16-vCPU nodes, 3 × m6i.4xlarge carry 495,800 msg/s, 5 carry 826,300, 8
+  carry 1,322,000 and 12 × c6in.4xlarge carry 2,000,000, the most the load generators
+  offer: 165k a node from 3 to 12, no message lost, ack p99 under 1 s. At ack p99 ≤ 100 ms
+  the 12 nodes carry 1,322,000 msg/s (ack p99 12 ms) and the smaller clusters 80–85% of
+  their maximum.
+- **The network card, not the broker.** Twelve m6i.4xlarge nodes stopped at 1,322,000
+  msg/s (ack p99 39 ms): from about 110k msg/s a node their network cards exceeded AWS's
+  packet allowance, and the ladder ended on a round that one load generator's host
+  decided, not the brokers. Twelve c6in.4xlarge nodes, the same CPU behind a
+  network-optimized card, moved 1.15 million packets a second each with no exceedance and
+  carried 2,000,000.
+- **Grown under load.** The 5-, 8- and 12-node m6i.4xlarge clusters were built by joining
+  nodes to a cluster carrying traffic (3 → 5, 5 → 8, 8 → 12) and measured after. The first
+  two joins kept every session and every message. The 8 → 12 join lost 11 durable
+  sessions, a defect not yet fixed
+  ([#1218](https://github.com/mbilling/fss-mqtt-broker/issues/1218)). While its last
+  joiner formed, its brokers also refused deliveries, and the publishers sent those
+  messages again ([#1219](https://github.com/mbilling/fss-mqtt-broker/issues/1219)). That
+  is fixed in [#1220](https://github.com/mbilling/fss-mqtt-broker/pull/1220) but not yet
+  measured on the rig. No message went missing end to end.
+
+![Ack p99 on a log scale by msg/s per node for every step of the five plant-shape ladders: the 3-, 5- and 8-node m6i.4xlarge ladders and the 12-node c6in.4xlarge ladder lie on one curve, about 1 ms at low load and half a second at 165k a node; the 12-node m6i.4xlarge ladder leaves it at 110k a node, its network cards throttled](docs/benchmarks/img/rig2/plant-latency.svg)
+
+The standard durable workload is the other extreme: thousands of publishers at 50 msg/s
+each, into `$share` groups of persistent consumers. On Hetzner and AWS, against HiveMQ's
+published run:
+
 ![Cluster msg/s as columns from 4 to 96 vCPU on a linear vCPU axis, each column labelled with its shape as nodes × vCPU each and what its hardware costs a month per million msg/s, one panel each for durable QoS 1, QoS 1 with clean sessions and QoS 0, with HiveMQ 4.18's published point beside mqttd's at 96 vCPU, measured on the 1.3.0 candidate](docs/benchmarks/img/readme-scale-out.svg)
 
 - **Durable QoS 1** carries 142,800 msg/s on 3 × 4 vCPU (11.9k per vCPU), 292,200 on
   10 × 4 (7.3k) and 390,300 on 6 × 16 vCPU on AWS (4.1k), with no message lost; at ack
   p99 ≤ 1 s, the same 142,800, 228k and the same 390,300. The 3-node figure is the 1.3.0
-  release's code; the others were measured before ADR 0092 cut the hub's work per message.
+  release's code; the others were measured before
+  [ADR 0092](docs/adr/0092-hub-task-ceiling.md) cut the hub's work per message.
 - **HiveMQ's shape,** 3 × 32 vCPU on AWS: 366,300 msg/s with no message lost on the v1.3.0
   release, where HiveMQ 4.18 publishes 270,000. Six 16-vCPU nodes carried 390,300 on the
   same 96 vCPU before ADR 0092 T3 cut the hub's work per message; they are not re-measured
@@ -86,14 +121,16 @@ fsync and a quorum copy on another node. It is the one we measure first.
 
 ![Durable QoS 1 per vCPU: mqttd on 4-, 16- and 32-vCPU nodes against HiveMQ 4.18's published figure](docs/benchmarks/img/readme-durable-per-vcpu.svg)
 
-![Durable QoS 1 on 10 nodes: ack p99 by offered msg/s, the mean of 3 rounds per step](docs/benchmarks/img/rig2/n10-durable-qos1.svg)
-
-**How a step is judged** ([ADR 0090](docs/adr/0090-benchmark-rig-redesign.md)):
+**How a step is judged** ([ADR 0090](docs/adr/0090-benchmark-rig-redesign.md)): a run
+climbs a ladder of offered rates and bisects to the highest step that holds.
 - **Carried:** a step counts only when all 3 of its rounds lose no message and the brokers
   take at least 99% of the offered msg/s.
 - **Throughput** comes from the brokers' own counters.
 - **Latency** is the p99 on the load generator's own clock, the mean of the rounds. It is
   GREEN at ≤ 1 s, YELLOW at ≤ 5 s and RED above.
+- **A floor, marked ≥:** a ladder that ends at the generators' rate ceiling, or on a round
+  that one generator's own host decided, has no measured knee; its last carried step is a
+  floor.
 
 [RIG2-RESULTS.md](docs/benchmarks/RIG2-RESULTS.md) has every step, how it was measured and
 the limits of these runs. Where the others beat us (memory, tail latency at their knee,

@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 560" width="1080" height="560" role="img" aria-labelledby="t d">
+<title id="t">Add a node, add 165k msg/s: durable QoS 1 scales linearly to 2 million msg/s on 12 nodes</title><desc id="d">Columns of the cluster's maximum lossless msg/s at 3, 5, 8 and 12 nodes on AWS, coloured by node type, the type named under each column. 3 × m6i.4xlarge: 496k msg/s, 165k a node, ack p99 486 ms; 5 × m6i.4xlarge: 826k msg/s, 165k a node, ack p99 389 ms; 8 × m6i.4xlarge: 1.32M msg/s, 165k a node, ack p99 494 ms; 12 × m6i.4xlarge: ≥ 1.32M msg/s, 110k a node, ack p99 39 ms; 12 × c6in.4xlarge: ≥ 2.0M msg/s, 167k a node, ack p99 657 ms. A dotted line extends the 3-node rate, 165k a node. At 12 nodes the m6i.4xlarge column stops at 1.32M with a dashed extension to the 1.57M the brokers received but did not carry, its network card throttled; the c6in.4xlarge column, the same CPU with a network-optimized card, reaches 2.0M, the rig's ceiling. Source: bench/scale/rig2 runs h3-20261106T145432Z (3 × m6i.4xlarge), h3-20261106T170406Z (5 × m6i.4xlarge), h3-20261106T182931Z (8 × m6i.4xlarge), h3-20261106T194402Z (12 × m6i.4xlarge), h3-20261106T233606Z (12 × c6in.4xlarge), each run's report.md.</desc>
+<style>text{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-kerning:normal}.num{font-variant-numeric:tabular-nums}.f-surface{fill:#fcfcfb}.k-surface{stroke:#fcfcfb}.f-border{fill:#e1e0d9}.k-border{stroke:#e1e0d9}.f-ink{fill:#0b0b0b}.k-ink{stroke:#0b0b0b}.f-ink2{fill:#52514e}.k-ink2{stroke:#52514e}.f-muted{fill:#898781}.k-muted{stroke:#898781}.f-grid{fill:#eceae4}.k-grid{stroke:#eceae4}.f-axis{fill:#c3c2b7}.k-axis{stroke:#c3c2b7}.f-good{fill:#0ca30c}.k-good{stroke:#0ca30c}.f-warn{fill:#fab219}.k-warn{stroke:#fab219}.f-crit{fill:#d03b3b}.k-crit{stroke:#d03b3b}.f-ghost{fill:#898781}.k-ghost{stroke:#898781}.f-s1{fill:#2a78d6}.k-s1{stroke:#2a78d6}.f-s2{fill:#eb6834}.k-s2{stroke:#eb6834}.f-s3{fill:#1baf7a}.k-s3{stroke:#1baf7a}.f-s4{fill:#4a3aa7}.k-s4{stroke:#4a3aa7}@media (prefers-color-scheme:dark){.f-surface{fill:#1a1a19}.k-surface{stroke:#1a1a19}.f-border{fill:#2c2c2a}.k-border{stroke:#2c2c2a}.f-ink{fill:#ffffff}.k-ink{stroke:#ffffff}.f-ink2{fill:#c3c2b7}.k-ink2{stroke:#c3c2b7}.f-muted{fill:#898781}.k-muted{stroke:#898781}.f-grid{fill:#262624}.k-grid{stroke:#262624}.f-axis{fill:#383835}.k-axis{stroke:#383835}.f-good{fill:#0ca30c}.k-good{stroke:#0ca30c}.f-warn{fill:#fab219}.k-warn{stroke:#fab219}.f-crit{fill:#d03b3b}.k-crit{stroke:#d03b3b}.f-ghost{fill:#6f6e69}.k-ghost{stroke:#6f6e69}.f-s1{fill:#3987e5}.k-s1{stroke:#3987e5}.f-s2{fill:#d95926}.k-s2{stroke:#d95926}.f-s3{fill:#199e70}.k-s3{stroke:#199e70}.f-s4{fill:#9085e9}.k-s4{stroke:#9085e9}}</style>
+<rect x="0.5" y="0.5" width="1079" height="559" rx="14" class="f-surface k-border"/>
+<text x="32" y="42" font-size="20" font-weight="650" class="f-ink">Add a node, add 165k msg/s: durable QoS 1 scales linearly to 2 million msg/s on 12 nodes</text>
+<text x="32" y="64" font-size="13" class="f-ink2">Plant shape: a site is one bridge connection, 250 topics, 10,000 msg/s → one durable $share historian group · mqttd v1.3.0 · AWS, 16-vCPU nodes · Nov 2026</text>
+<text x="32.0" y="86.0" font-size="13" text-anchor="start" class="f-ink2">each column: the cluster's maximum lossless step (3 rounds, no message lost) and its ack p99 · ≥ where the ladder ended above the step</text>
+<rect x="32.0" y="106.0" width="12" height="12" rx="3" class="f-s1"/>
+<text x="51.0" y="117.0" font-size="12" text-anchor="start" class="f-ink2">m6i.4xlarge</text>
+<rect x="133.4" y="106.0" width="12" height="12" rx="3" class="f-s2"/>
+<text x="152.4" y="117.0" font-size="12" text-anchor="start" class="f-ink2">c6in.4xlarge: the same CPU, network-optimized</text>
+<line x1="453.4" y1="113.0" x2="470.4" y2="113.0" class="k-ghost" stroke-width="2.5" stroke-dasharray="0.1 5" stroke-linecap="round"/>
+<text x="478.4" y="117.0" font-size="12" text-anchor="start" class="f-ink2">165k a node, the 3-node rate, extended</text>
+<line x1="733.6" y1="113.0" x2="751.6" y2="113.0" class="k-ghost" stroke-width="2" stroke-dasharray="4 3"/>
+<text x="759.6" y="117.0" font-size="12" text-anchor="start" class="f-ink2">received, not carried: network card throttled</text>
+<line x1="96.0" y1="480.0" x2="1032.0" y2="480.0" class="k-axis" stroke-width="1"/>
+<text x="88.0" y="484.0" font-size="11" text-anchor="end" class="f-muted num">0</text>
+<line x1="96.0" y1="414.0" x2="1032.0" y2="414.0" class="k-grid" stroke-width="1"/>
+<text x="88.0" y="418.0" font-size="11" text-anchor="end" class="f-muted num">500k</text>
+<line x1="96.0" y1="348.0" x2="1032.0" y2="348.0" class="k-grid" stroke-width="1"/>
+<text x="88.0" y="352.0" font-size="11" text-anchor="end" class="f-muted num">1.0M</text>
+<line x1="96.0" y1="282.0" x2="1032.0" y2="282.0" class="k-grid" stroke-width="1"/>
+<text x="88.0" y="286.0" font-size="11" text-anchor="end" class="f-muted num">1.5M</text>
+<line x1="96.0" y1="216.0" x2="1032.0" y2="216.0" class="k-grid" stroke-width="1"/>
+<text x="88.0" y="220.0" font-size="11" text-anchor="end" class="f-muted num">2.0M</text>
+<line x1="96.0" y1="150.0" x2="1032.0" y2="150.0" class="k-grid" stroke-width="1"/>
+<text x="88.0" y="154.0" font-size="11" text-anchor="end" class="f-muted num">2.5M</text>
+<text x="32.0" y="138.0" font-size="11" text-anchor="start" class="f-muted">msg/s, cluster total</text>
+<line x1="305.6" y1="150.0" x2="305.6" y2="480.0" class="k-grid" stroke-width="1"/>
+<text x="305.6" y="498.0" font-size="13" font-weight="650" text-anchor="middle" class="f-ink num">3</text>
+<text x="305.6" y="513.0" font-size="10" text-anchor="middle" class="f-muted num">m6i.4xlarge</text>
+<line x1="445.3" y1="150.0" x2="445.3" y2="480.0" class="k-grid" stroke-width="1"/>
+<text x="445.3" y="498.0" font-size="13" font-weight="650" text-anchor="middle" class="f-ink num">5</text>
+<text x="445.3" y="513.0" font-size="10" text-anchor="middle" class="f-muted num">m6i.4xlarge</text>
+<line x1="654.8" y1="150.0" x2="654.8" y2="480.0" class="k-grid" stroke-width="1"/>
+<text x="654.8" y="498.0" font-size="13" font-weight="650" text-anchor="middle" class="f-ink num">8</text>
+<text x="654.8" y="513.0" font-size="10" text-anchor="middle" class="f-muted num">m6i.4xlarge</text>
+<line x1="934.2" y1="150.0" x2="934.2" y2="480.0" class="k-grid" stroke-width="1"/>
+<text x="934.2" y="498.0" font-size="13" font-weight="650" text-anchor="middle" class="f-ink num">12</text>
+<text x="934.2" y="513.0" font-size="10" text-anchor="middle" class="f-muted num">m6i.4xlarge · c6in.4xlarge</text>
+<text x="564.0" y="532.0" font-size="11" text-anchor="middle" class="f-muted">nodes, 16 vCPU each · at 12 the same cluster on both node types</text>
+<line x1="305.6" y1="414.6" x2="997.1" y2="198.6" class="k-ghost" stroke-width="2" stroke-dasharray="0.1 5" stroke-linecap="round"/>
+<path d="M283.6,480.0 V418.6 Q283.6,414.6 287.6,414.6 H323.6 Q327.6,414.6 327.6,418.6 V480.0 Z" class="f-s1"/>
+<text x="305.6" y="407.6" font-size="11" text-anchor="middle" class="f-muted num k-surface" stroke-width="4" paint-order="stroke" stroke-linejoin="round">≤ 100 ms: 422k (55 ms)</text>
+<text x="305.6" y="393.6" font-size="11" text-anchor="middle" class="f-ink2 num k-surface" stroke-width="4" paint-order="stroke" stroke-linejoin="round">165k/node · p99 486 ms</text>
+<text x="305.6" y="379.6" font-size="13" font-weight="650" text-anchor="middle" class="f-ink num k-surface" stroke-width="4" paint-order="stroke" stroke-linejoin="round">496k</text>
+<path d="M423.3,480.0 V374.9 Q423.3,370.9 427.3,370.9 H463.3 Q467.3,370.9 467.3,374.9 V480.0 Z" class="f-s1"/>
+<text x="445.3" y="363.9" font-size="11" text-anchor="middle" class="f-muted num k-surface" stroke-width="4" paint-order="stroke" stroke-linejoin="round">≤ 100 ms: 661k (46 ms)</text>
+<text x="445.3" y="349.9" font-size="11" text-anchor="middle" class="f-ink2 num k-surface" stroke-width="4" paint-order="stroke" stroke-linejoin="round">165k/node · p99 389 ms</text>
+<text x="445.3" y="335.9" font-size="13" font-weight="650" text-anchor="middle" class="f-ink num k-surface" stroke-width="4" paint-order="stroke" stroke-linejoin="round">826k</text>
+<path d="M632.8,480.0 V309.5 Q632.8,305.5 636.8,305.5 H672.8 Q676.8,305.5 676.8,309.5 V480.0 Z" class="f-s1"/>
+<text x="654.8" y="298.5" font-size="11" text-anchor="middle" class="f-muted num k-surface" stroke-width="4" paint-order="stroke" stroke-linejoin="round">≤ 100 ms: 1.06M (48 ms)</text>
+<text x="654.8" y="284.5" font-size="11" text-anchor="middle" class="f-ink2 num k-surface" stroke-width="4" paint-order="stroke" stroke-linejoin="round">165k/node · p99 494 ms</text>
+<text x="654.8" y="270.5" font-size="13" font-weight="650" text-anchor="middle" class="f-ink num k-surface" stroke-width="4" paint-order="stroke" stroke-linejoin="round">1.32M</text>
+<path d="M889.2,480.0 V309.5 Q889.2,305.5 893.2,305.5 H929.2 Q933.2,305.5 933.2,309.5 V480.0 Z" class="f-s1"/>
+<rect x="890.0" y="273.8" width="42.5" height="31.0" rx="4" fill="none" class="k-ghost" stroke-width="1.5" stroke-dasharray="4 3"/>
+<text x="883.2" y="277.0" font-size="13" font-weight="650" text-anchor="end" class="f-ink num k-surface" stroke-width="4" paint-order="stroke" stroke-linejoin="round">≥ 1.32M</text>
+<text x="883.2" y="293.0" font-size="11" text-anchor="end" class="f-ink2 num k-surface" stroke-width="4" paint-order="stroke" stroke-linejoin="round">110k/node · p99 39 ms</text>
+<text x="883.2" y="307.0" font-size="11" text-anchor="end" class="f-muted num k-surface" stroke-width="4" paint-order="stroke" stroke-linejoin="round">network card throttled</text>
+<text x="883.2" y="321.0" font-size="11" text-anchor="end" class="f-muted num k-surface" stroke-width="4" paint-order="stroke" stroke-linejoin="round">received 1.57M of 1.59M offered</text>
+<path d="M935.2,480.0 V220.0 Q935.2,216.0 939.2,216.0 H975.2 Q979.2,216.0 979.2,220.0 V480.0 Z" class="f-s2"/>
+<text x="957.2" y="209.0" font-size="11" text-anchor="middle" class="f-muted num k-surface" stroke-width="4" paint-order="stroke" stroke-linejoin="round">the rig's rate ceiling</text>
+<text x="957.2" y="195.0" font-size="11" text-anchor="middle" class="f-muted num k-surface" stroke-width="4" paint-order="stroke" stroke-linejoin="round">≤ 100 ms: 1.32M (12 ms)</text>
+<text x="957.2" y="181.0" font-size="11" text-anchor="middle" class="f-ink2 num k-surface" stroke-width="4" paint-order="stroke" stroke-linejoin="round">167k/node · p99 657 ms</text>
+<text x="957.2" y="167.0" font-size="13" font-weight="650" text-anchor="middle" class="f-ink num k-surface" stroke-width="4" paint-order="stroke" stroke-linejoin="round">≥ 2.0M</text>
+</svg>

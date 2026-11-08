@@ -951,11 +951,12 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_reserved_tree_is_exactly_sys_and_below`
 - `tests::topic_name_validity_rejects_wildcards_and_emptiness`
 
-## `crates/mqtt-load/src/lib.rs` — 50 test(s)
+## `crates/mqtt-load/src/lib.rs` — 52 test(s)
 
 - `client::tests::fixed_packets_decode_as_themselves`
 - `clock::tests::clock_is_monotonic_and_maps_back_to_instants`
 - `config::tests::a_bridge_connection_carries_every_topic_as_one_logical_publisher_each`
+- `config::tests::a_durable_consumer_reconnects_within_its_session_expiry`
 - `config::tests::a_group_sharing_every_topic_is_even_with_whole_connections_per_broker`
 - `config::tests::a_hot_session_is_refused_unless_asked_for`
 - `config::tests::a_site_bridge_carries_a_block_of_topics_of_its_own`
@@ -967,6 +968,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `config::tests::share_shape_is_one_stream_per_group_and_topic`
 - `config::tests::the_drain_quiet_window_follows_the_slowest_p99_between_floor_and_timeout`
 - `config::tests::validation_catches_unrunnable_workloads`
+- `ctx::tests::a_close_is_named_by_the_brokers_reason_or_how_the_socket_ended`
 - `health::tests::proc_stat_fields_survive_odd_command_names`
 - `health::tests::ps_time_formats`
 - `health::tests::softnet_squeezes_are_the_third_column_summed_over_cpus`
@@ -2823,11 +2825,13 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `session_takeover_publishes_will`
 - `zero_keepalive_is_never_idle_disconnected`
 
-## `crates/mqttd/tests/loadgen.rs` — 9 test(s)
+## `crates/mqttd/tests/loadgen.rs` — 11 test(s)
 
 - `a_bridge_connection_carries_every_topic_and_closes_its_ledger`
+- `a_consumer_told_to_use_another_server_resumes_its_session_and_closes_the_ledger`
 - `a_cut_drain_settles_what_the_broker_holds_before_the_ledger_is_reconciled`
 - `a_lost_consumer_opens_the_ledger`
+- `a_publisher_closed_with_its_acks_withheld_reconnects_and_sends_again`
 - `generators_share_a_start_through_the_start_file`
 - `measured_latency_reflects_an_injected_delay`
 - `publishers_stay_connected_through_a_drain_longer_than_the_keep_alive`

@@ -1232,5 +1232,222 @@ class PerVcpu(unittest.TestCase):
             self.assertIn("broker env added to the shipped defaults: `MQTTD_STORE_SHARDS=8`",
                           (run / "report.md").read_text())
 
+
+def join_summary(rate, *, start_ms, warmup_s, measure_s, p99_us=4000, joining_p99_us=None, joining=(0, 0),
+                 missing=0, missing_acked=None, outcome="ok", errors=None, reconnects=0, sessions_lost=0,
+                 failed=0, consumers=80):
+    """A cohort's mqtt-load summary with per-window figures (10 s windows): `rate` msg/s
+    offered, sent, acked and received; ack p99 `p99_us`, or `joining_p99_us` in the windows
+    whose midpoint lies in `joining` (s since the round's start, T0); `reconnects` consumer
+    reconnects, all in the first such window."""
+    windows, t, first_joining = [], warmup_s, True
+
+    def lat(p99, count):
+        return {"count": count, "mean_us": p99 / 4, "p50_us": p99 // 4, "p90_us": p99 // 2, "p99_us": p99,
+                "p999_us": p99, "max_us": p99}
+
+    health = {"cpu_fraction": 0.3, "busiest_worker": 0.4, "credit_stall_fraction": 0.0, "backlog": 0,
+              "saturated": False, "reasons": []}
+    # A window's figures sit on the window itself, as mqtt-load flattens them.
+    windows.append({"index": 0, "kind": "warmup", "start_s": 0.0, "end_s": warmup_s, "sched_lag": {"p99_us": 1000},
+                    "health": health, "duration_s": warmup_s, "offered": 0, "sent": 0, "acked": 0,
+                    "received": 0, "reconnects": 0, "ack_latency": lat(p99_us, 0), "e2e_latency": lat(p99_us, 0)})
+    while t < warmup_s + measure_s - 1e-9:
+        mid = (start_ms - T0) / 1000 + t + 5
+        inj = joining[0] <= mid < joining[1]
+        n = int(rate * 10)
+        rc = reconnects if (inj and first_joining) else 0
+        first_joining = first_joining and not inj
+        p99 = joining_p99_us if (inj and joining_p99_us) else p99_us
+        windows.append({"index": len(windows), "kind": "measure", "start_s": t, "end_s": t + 10,
+                        "sched_lag": {"p99_us": 2000}, "health": health,
+                        "duration_s": 10.0, "offered": n, "sent": n, "acked": n, "received": n,
+                        "reconnects": rc, "ack_latency": lat(p99, n), "e2e_latency": lat(p99 * 2, n)})
+        t += 10
+    windows.append({"index": len(windows), "kind": "drain", "start_s": t, "end_s": t + 1, "sched_lag": {"p99_us": 0},
+                    "health": health, "duration_s": 1.0, "offered": 0, "sent": 0, "acked": 0, "received": 0,
+                    "reconnects": 0, "ack_latency": lat(0, 0), "e2e_latency": lat(0, 0)})
+    n = int(rate * measure_s)
+    return {
+        "schema": "mqtt-load.summary.v2", "schedule_start_unix_ms": start_ms,
+        "workload": {"deliveries_per_message": 1, "session_skew": 1.0},
+        "connections": {"publishers": 3, "consumers": consumers},
+        "windows": windows, "phases": [{"index": 0, "offered_rate": rate, "sent_rate": rate, "received_rate": rate}],
+        "ledger": {"sent": n, "acked": n, "expected": n, "unique_received": n - missing, "missing": missing,
+                   "missing_acked": missing if missing_acked is None else missing_acked, "unacked": 0,
+                   "unexpected": 0, "unexpected_acks": 0, "duplicates": 7 * reconnects, "closed": missing == 0},
+        "drain": {"duration_s": 0.1, "ended_by": "complete", "quiet_s": 10.0, "outstanding_deliveries": missing,
+                  "outstanding_acks": 0, "since_progress_s": 0.0},
+        "errors": errors or {"connect": 0, "disconnects": 0, "server_disconnects": 0, "protocol": 0, "write": 0},
+        "reconnect": {"enabled": True, "reconnects": reconnects, "by_reason": {"0x9c": reconnects} if reconnects else {},
+                      "sessions_lost": sessions_lost, "failed": failed,
+                      "gap": {"count": reconnects, "p99_us": 180_000 if reconnects else 0,
+                              "max_us": 240_000 if reconnects else 0},
+                      "publishers": {"reconnects": 3 if reconnects else 0, "resent": 120 if reconnects else 0,
+                                     "failed": 0, "by_reason": {"closed": 3} if reconnects else {},
+                                     "gap": {"count": 3, "p99_us": 15_000, "max_us": 15_000}}},
+        "generator": {"saturated": False, "sent_per_cpu_second": 40000.0},
+        "outcome": outcome,
+    }
+
+
+def make_join(root: Path, *, joined=True, cohort_b=True, b_share=1.0, a=None, b=None, restart=False):
+    """A join round as run.sh run_join leaves it: 3 brokers, 2 joining at 210 and 213 s
+    (ready 2 s later) into cohort A's round (warm-up 30 s, 600 s measured: 30-630 s), cohort
+    B measured 310-630 s on the joiners. Brokers 0-2 take cohort A's 30,000 msg/s, the
+    joiners b_share of cohort B's 20,000 from 310 s; scrapes every 2 s, a joiner's from its
+    start."""
+    d = root / "join" / "plant-qos1"
+    (d / "a").mkdir(parents=True)
+    (d / "b").mkdir()
+    meta = {"workload": "plant-qos1", "brokers_before": 3, "brokers_after": 5, "generators": 1,
+            "rate_a": 30000.0, "rate_b": 20000.0, "start_unix_ms": T0, "joined": joined,
+            "join_exit": 0 if joined else 1, "cohort_b": cohort_b and joined, "judge": {"margin_s": 1.0}}
+    (d / "join.json").write_text(json.dumps(meta))
+    (d / "idle_before.json").write_text(json.dumps({"idle": True, "state": {}}))
+    joining = (210, 245)
+    sa = a or join_summary(10000 * 3, start_ms=T0, warmup_s=30, measure_s=600, joining=joining, reconnects=48,
+                           joining_p99_us=40_000)
+    (d / "a" / "gen-0.json").write_text(json.dumps(sa))
+    (d / "a" / "gen-0.exit").write_text("0")
+    if meta["cohort_b"]:
+        sb = b or join_summary(20000, start_ms=T0 + 290_000, warmup_s=20, measure_s=320, consumers=40)
+        (d / "b" / "gen-0.json").write_text(json.dumps(sb))
+        (d / "b" / "gen-0.exit").write_text("0")
+    if joined:
+        # Each joiner ready 2 s after its start, the cluster formed with it 1 s later, and
+        # the next joiner started then.
+        (d / "joins.tsv").write_text(f"3\t{T0 + 210_000}\t{T0 + 212_000}\t{T0 + 213_000}\n"
+                                     f"4\t{T0 + 213_000}\t{T0 + 215_000}\t{T0 + 216_000}\n")
+    last = T0 + 660_000
+    for i in range(5):
+        bd = d / "scrapes" / f"broker-{i}"
+        bd.mkdir(parents=True)
+        if i >= 3 and not joined:
+            continue
+        start_ms = T0 - 3_600_000 if i < 3 else T0 + (210_000 if i == 3 else 213_000)
+        first = T0 - 5000 if i < 3 else start_ms + 1000
+        stamps = list(range(first, last + 1, 2000))
+        for t in stamps:
+            if i < 3:
+                n = 10000 * max(0.0, (t - T0) / 1000)
+                g = {'mqttd_session_rehomes_total{reason="lease-moved"}': 16 if t > T0 + 212_000 else 0}
+            else:
+                n = 10000 * b_share * max(0.0, (t - T0 - 310_000) / 1000)
+                g = {"mqttd_voters": 5}
+            st = start_ms / 1000 + (1 if (restart and i == 0 and t == stamps[-1]) else 0)
+            (bd / f"{t}.prom").write_text(prom(n, n, None, st, g))
+    return d
+
+
+class JoinRound(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_a_join_that_lost_nothing_and_carried_both_cohorts_held(self):
+        v = V.join_round(make_join(self.root))
+        self.assertEqual(v["verdict"], V.HELD, V.join_lines(v))
+        self.assertTrue(v["good"])
+        self.assertEqual([j["broker"] for j in v["joins"]], [3, 4])
+        self.assertAlmostEqual(v["joins"][0]["took_s"], 2.0)
+        ph = v["phases"]
+        self.assertEqual(list(ph), ["before", "joining", "after", "with_b"])
+        # From the first joiner's start to 30 s after the cluster formed with the last.
+        self.assertEqual((ph["joining"]["start_s"], ph["joining"]["end_s"]), (210.0, 246.0))
+        self.assertAlmostEqual(v["joins"][1]["formed_after_s"], 3.0)
+        self.assertEqual(ph["before"]["a"]["ack_p99_us_max"], 4000)
+        self.assertEqual(ph["joining"]["a"]["ack_p99_us_max"], 40_000, "the join's cost, reported")
+        self.assertEqual(ph["joining"]["a"]["reconnects"], 48)
+        self.assertEqual(sorted(ph["before"]["brokers"]["brokers"]), [0, 1, 2], "the joiners were not up yet")
+        self.assertEqual(sorted(ph["with_b"]["brokers"]["brokers"]), [0, 1, 2, 3, 4])
+        lp = v["last_phase"]
+        self.assertEqual(lp["phase"], "with_b")
+        self.assertAlmostEqual(lp["offered_rate"], 50000, delta=1)
+        self.assertAlmostEqual(lp["received_share"], 1.0, delta=0.01)
+        c = v["cohorts"]["A"]
+        self.assertEqual((c["reconnects"], c["by_reason"], c["sessions_lost"]), (48, {"0x9c": 48}, 0))
+        self.assertEqual((c["publisher_reconnects"], c["resent"], c["publisher_by_reason"]), (3, 120, {"closed": 3}))
+        self.assertTrue(any("3 publisher reconnect(s) (closed 3)" in x for x in V.join_lines(v)), V.join_lines(v))
+        self.assertEqual(v["brokers"]["rehomes_by_reason"], {"lease-moved": 48.0})
+        self.assertEqual([e["voters"] for e in v["brokers"]["end"]][3:], [5.0, 5.0])
+        self.assertIn("JOIN HELD: 3 -> 5 brokers (broker 3 in 2.0 s, formed in 3.0 s, broker 4 in 2.0 s, formed in 3.0 s)",
+                      V.join_lines(v)[0])
+        md = "\n".join(V.render_join_md(v))
+        self.assertIn("## Join under load: `plant-qos1`, 3 → 5 brokers", md)
+        self.assertIn("| joining (+30 s) | 210–246 |", md)
+        self.assertIn("broker 4 started 213.0, ready 215.0, the cluster formed 216.0", md)
+
+    def test_a_join_recorded_without_its_formation_still_reads(self):
+        d = make_join(self.root)
+        lines = [x.rsplit("\t", 1)[0] for x in (d / "joins.tsv").read_text().splitlines()]
+        (d / "joins.tsv").write_text("\n".join(lines) + "\n")
+        v = V.join_round(d)
+        self.assertEqual(v["verdict"], V.HELD, V.join_lines(v))
+        self.assertNotIn("formed_s", v["joins"][0])
+        self.assertEqual(v["phases"]["joining"]["end_s"], 245.0, "30 s after the last ready")
+
+    def test_a_joiner_that_never_became_ready_fails_the_round(self):
+        v = V.join_round(make_join(self.root, joined=False))
+        self.assertEqual(v["verdict"], V.FAILED, V.join_lines(v))
+        self.assertTrue(any("did not grow: 0 of 2 joiner(s)" in f for f in v["failures"]), v["failures"])
+
+    def test_a_session_lost_in_its_move_fails_even_with_a_closed_ledger(self):
+        a = join_summary(30000, start_ms=T0, warmup_s=30, measure_s=600, joining=(210, 245), reconnects=48,
+                         sessions_lost=2)
+        v = V.join_round(make_join(self.root, a=a))
+        self.assertEqual(v["verdict"], V.FAILED, V.join_lines(v))
+        self.assertTrue(any("2 durable session(s) gone" in f for f in v["failures"]), v["failures"])
+
+    def test_a_consumer_that_could_not_come_back_is_disconnected(self):
+        err = {"connect": 0, "disconnects": 1, "server_disconnects": 0, "protocol": 0, "write": 0}
+        a = join_summary(30000, start_ms=T0, warmup_s=30, measure_s=600, joining=(210, 245), reconnects=47,
+                         failed=1, outcome="error", errors=err)
+        v = V.join_round(make_join(self.root, a=a))
+        self.assertEqual(v["verdict"], V.DISCONNECTED, V.join_lines(v))
+
+    def test_acknowledged_loss_in_a_cohort_fails(self):
+        b = join_summary(20000, start_ms=T0 + 290_000, warmup_s=20, measure_s=320, missing=10)
+        v = V.join_round(make_join(self.root, b=b))
+        self.assertEqual(v["verdict"], V.FAILED, V.join_lines(v))
+        self.assertTrue(any("cohort B: missing=10" in f for f in v["failures"]), v["failures"])
+
+    def test_the_grown_cluster_must_take_both_cohorts(self):
+        v = V.join_round(make_join(self.root, b_share=0.5))
+        self.assertEqual(v["verdict"], V.NOT_TAKEN, V.join_lines(v))
+        self.assertAlmostEqual(v["last_phase"]["received_share"], 0.8, delta=0.01)
+
+    def test_a_broker_restart_fails(self):
+        v = V.join_round(make_join(self.root, restart=True))
+        self.assertEqual(v["verdict"], V.FAILED, V.join_lines(v))
+        self.assertIn(0, v["brokers"]["restarted"])
+
+    def test_without_cohort_b_the_last_phase_is_after_the_join(self):
+        v = V.join_round(make_join(self.root, cohort_b=False))
+        self.assertEqual(v["verdict"], V.HELD, V.join_lines(v))
+        self.assertEqual(v["last_phase"]["phase"], "after")
+        self.assertNotIn("with_b", v["phases"])
+
+    def test_the_report_gives_the_join_after_the_ladders(self):
+        make_join(self.root)
+        (self.root / "run.json").write_text(json.dumps({"tier": "local", "brokers": 3, "join_brokers": 2,
+                                                         "workloads": ["plant-qos1"]}))
+        data = V.report(self.root)
+        self.assertEqual([j["verdict"] for j in data["joins"]], [V.HELD])
+        self.assertIn("## Join under load: `plant-qos1`", (self.root / "report.md").read_text())
+
+    def test_capacity_prints_a_ladders_maximum_lossless(self):
+        self.assertIsNone(V.capacity([])["lossless"])
+
+    def test_a_ladder_after_the_join_counts_the_vcpu_of_every_broker(self):
+        meta = {"brokers": 3, "join_brokers": 2, "broker_type": "m6i.4xlarge"}
+        self.assertEqual(V.cluster_vcpu(meta), 48)
+        self.assertEqual(V.cluster_vcpu(meta, 5), 80, "the ladder on all 5 brokers")
+        self.assertEqual(V.cluster_vcpu({"brokers": 3, "broker_type": "nope"}, 5), None)
+
+
 if __name__ == "__main__":
     unittest.main()

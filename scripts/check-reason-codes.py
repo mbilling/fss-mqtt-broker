@@ -14,6 +14,10 @@ happens to share the byte type: v3 0x05 means "not authorized" where v5 uses
 client's "disconnect with will". Restricting to >= 0x80 keeps the two spaces from
 being conflated, with no need to migrate ~90 test literals to symbols.
 
+A test that IMITATES the broker — a proxy or fake that writes the code itself, to test
+a client's handling of it — proves nothing about the broker emitting it. Such a line
+carries the marker `reason-code: imitated` in a comment, and is not counted.
+
 Usage: scripts/check-reason-codes.py
 """
 
@@ -29,6 +33,9 @@ CLIENT_GUIDE = ROOT / "docs" / "CLIENT-GUIDE.md"
 SRC_GLOBS = ("crates/*/src/*.rs", "crates/*/src/**/*.rs")
 TEST_GLOBS = ("crates/*/tests/*.rs", "crates/*/tests/**/*.rs")
 REASON_BEGIN = "<!-- reason-codes:begin -->"
+# A test line carrying this (in a comment) writes the code itself, imitating the broker:
+# not a provocation.
+IMITATED = "reason-code: imitated"
 REASON_END = "<!-- reason-codes:end -->"
 
 # One line per emittable failure code, sourced from the production call sites the
@@ -169,6 +176,12 @@ def strip_prose(text: str) -> str:
     return _NOISE.sub(lambda m: _blank(m.group(0)), "".join(out))
 
 
+def drop_imitations(text: str) -> str:
+    """Blank every line that carries the IMITATED marker: the code on it is the
+    test's own, written to imitate the broker, not one the broker was heard to say."""
+    return "\n".join("" if IMITATED in line else line for line in text.split("\n"))
+
+
 def split_test_modules(text: str) -> tuple[str, str]:
     """Split source into (production, in-file `mod tests`) halves.
 
@@ -205,7 +218,7 @@ def scan() -> tuple[dict[int, list[str]], set[int]]:
     # otherwise mark every code in that table "provoked" while proving nothing
     # about emission. Integration tests drive a real connection, so an assertion
     # there means the code was genuinely observed.
-    test_texts: list[str] = [strip_prose(p.read_text()) for p in rust_files(*TEST_GLOBS)]
+    test_texts: list[str] = [strip_prose(drop_imitations(p.read_text())) for p in rust_files(*TEST_GLOBS)]
 
     for path in rust_files(*SRC_GLOBS):
         prod, _ = split_test_modules(strip_prose(path.read_text()))
@@ -255,6 +268,9 @@ def self_check() -> list[str]:
     sample = strip_prose('let x = 1; // rejected with 0x88\nassert!(a, "reason 0x8B");')
     if "0x88" in sample or "0x8B" in sample:
         problems.append("strip_prose left a code in a comment or string literal.")
+    imitated = strip_prose(drop_imitations(f"reason: 0x9c, // {IMITATED} by a proxy\nassert_eq!(r, 0x8b);"))
+    if "0x9c" in imitated or "0x8b" not in imitated:
+        problems.append("drop_imitations must blank exactly the marked line.")
     return problems
 
 

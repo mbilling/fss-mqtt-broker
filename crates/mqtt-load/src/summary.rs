@@ -60,6 +60,8 @@ pub struct Summary {
     pub generator: GeneratorReport,
     /// Connection failures.
     pub errors: ErrorCounts,
+    /// Consumer reconnects (`--reconnect`).
+    pub reconnect: ReconnectReport,
     /// `ok`, `loss` (the ledger did not close), `void` (the generator saturated in a
     /// measured window — the run says nothing about the broker), or `error`
     /// (connections failed during the run). The process exit code follows it.
@@ -245,6 +247,11 @@ pub struct Aggregate {
     pub acked_rate: f64,
     /// `received / duration_s`.
     pub received_rate: f64,
+    /// Consumer connections re-established after the broker closed them
+    /// (`--reconnect`; see [`ReconnectReport`]).
+    pub reconnects: u64,
+    /// Publisher connections re-established (`--reconnect`).
+    pub publisher_reconnects: u64,
     /// PUBLISH written → PUBACK read.
     pub ack_latency: LatencySummary,
     /// PUBLISH written → delivery read.
@@ -264,6 +271,46 @@ pub struct Aggregate {
     /// The end-to-end-latency histogram's buckets (phases and totals only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub e2e_histogram: Option<HistogramExport>,
+}
+
+/// Consumers that reconnect (`--reconnect`): how often a broker closed one, what it
+/// said, and how long the consumer was without its session.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct ReconnectReport {
+    /// Whether consumers reconnect at all. Off, a lost connection is in `errors`.
+    pub enabled: bool,
+    /// Connections re-established (each window's `reconnects` places them in time).
+    pub reconnects: u64,
+    /// Closes by what the broker said: its DISCONNECT reason (`0x9c`, Use another
+    /// server: the cluster moved the session, ADR 0005), `closed` when it sent none,
+    /// `write` when the consumer's write failed.
+    pub by_reason: std::collections::BTreeMap<String, u64>,
+    /// Durable resumes the broker answered with no session (session present 0): what
+    /// the session held is gone, and the ledger shows it as missing.
+    pub sessions_lost: u64,
+    /// Consumers that gave up after the reconnect budget; each is also a disconnect.
+    pub failed: u64,
+    /// Time without a connection per reconnect, from the close to the session back.
+    pub gap: LatencySummary,
+    /// The publishers': a broker that withholds a publisher's ack closes its connection
+    /// so that it sends again (fail closed, ADR 0041 T5).
+    pub publishers: PublisherReconnects,
+}
+
+/// Publishers that reconnect (`--reconnect`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct PublisherReconnects {
+    /// Connections re-established (each window's `publisher_reconnects` places them).
+    pub reconnects: u64,
+    /// Messages in flight sent again on a new connection (the same identities).
+    pub resent: u64,
+    /// Publishers that gave up after the reconnect budget; each is also a disconnect.
+    pub failed: u64,
+    /// Closes by what the broker said, as for consumers: `closed` when it sent no
+    /// DISCONNECT (a withheld ack's close), `write` when a write failed first.
+    pub by_reason: std::collections::BTreeMap<String, u64>,
+    /// Time without a connection per reconnect.
+    pub gap: LatencySummary,
 }
 
 /// One window.

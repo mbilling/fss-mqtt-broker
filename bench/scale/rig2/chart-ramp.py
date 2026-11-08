@@ -96,7 +96,8 @@ def render(ladder: dict, run: dict) -> str:
     steps = sorted((s for s in ladder["steps"] if gated(s, gate)["p99_us"] is not None),
                    key=lambda s: (s["offered_rate"], s["step"]))
     name = WORKLOAD_NAME.get(ladder["workload"], ladder["workload"])
-    nodes = run.get("brokers", "?")
+    # A ladder after a join runs on more brokers than the run started with: its own count.
+    nodes = ladder.get("brokers") or run.get("brokers", "?")
     top = (ladder.get("capacity") or {}).get("lossless")
     multi = max((rounds_n(s) for s in steps), default=1)
     if top:
@@ -335,6 +336,11 @@ def self_test() -> None:
     assert len(bars) == 2 * 2 * 3, len(bars)
     stems = sorted((float(ln.get("y1")), float(ln.get("y2"))) for ln in bars if ln.get("x1") == ln.get("x2"))
     assert all(a < b for a, b in stems), stems  # top above bottom: max above min on the log scale
+    # A ladder after a join names its own broker count, not the count the run started with.
+    j_svg = render({**r_ladder, "arm": "after-join", "brokers": 5}, run)
+    j_title = ET.fromstring(j_svg).find(f"{ns}title").text
+    assert j_title == "Durable QoS 1, 5 nodes: 15,000 msg/s lossless, ack p99 mean 40 ms", j_title
+    assert "5 × ccx23 brokers" in j_svg, j_svg[:600]
     assert y_range([500, 18_940_000]) == (0.1, 100_000)
     assert y_range([800, 140_000]) == (0.1, 10_000)
     assert x_ticks(114200)[0] >= 114200 * 1.08

@@ -26,6 +26,11 @@ pub struct ShardData {
     pub socket_blocked: u64,
     /// Cumulative: ns writers spent waiting for the socket to drain.
     pub socket_blocked_ns: u64,
+    /// Cumulative: consumer connections re-established after the broker closed them
+    /// (`--reconnect`).
+    pub reconnects: u64,
+    /// Cumulative: publisher connections re-established (`--reconnect`).
+    pub publisher_reconnects: u64,
     /// Drained per tick: PUBLISH written → PUBACK read.
     pub ack: Latency,
     /// Drained per tick: PUBLISH written → delivery read.
@@ -97,6 +102,10 @@ pub struct Counters {
     pub socket_blocked: u64,
     /// Full-socket ns.
     pub socket_blocked_ns: u64,
+    /// Consumer reconnects.
+    pub reconnects: u64,
+    /// Publisher reconnects.
+    pub publisher_reconnects: u64,
 }
 
 impl Counters {
@@ -112,6 +121,25 @@ impl Counters {
             socket_blocked_ns: self
                 .socket_blocked_ns
                 .saturating_sub(earlier.socket_blocked_ns),
+            reconnects: self.reconnects.saturating_sub(earlier.reconnects),
+            publisher_reconnects: self
+                .publisher_reconnects
+                .saturating_sub(earlier.publisher_reconnects),
+        }
+    }
+
+    /// `self + other`.
+    #[must_use]
+    pub fn plus(&self, other: &Counters) -> Counters {
+        Counters {
+            sent: self.sent + other.sent,
+            acked: self.acked + other.acked,
+            received: self.received + other.received,
+            credit_stall_ns: self.credit_stall_ns + other.credit_stall_ns,
+            socket_blocked: self.socket_blocked + other.socket_blocked,
+            socket_blocked_ns: self.socket_blocked_ns + other.socket_blocked_ns,
+            reconnects: self.reconnects + other.reconnects,
+            publisher_reconnects: self.publisher_reconnects + other.publisher_reconnects,
         }
     }
 }
@@ -167,6 +195,8 @@ impl Stats {
             c.credit_stall_ns += s.credit_stall_ns;
             c.socket_blocked += s.socket_blocked;
             c.socket_blocked_ns += s.socket_blocked_ns;
+            c.reconnects += s.reconnects;
+            c.publisher_reconnects += s.publisher_reconnects;
         }
         c
     }
@@ -194,5 +224,6 @@ mod tests {
         assert_eq!(st.drain(&mut h2), c);
         assert_eq!(h2.ack.count(), 0);
         assert_eq!(c.since(&Counters::default()), c);
+        assert_eq!(c.plus(&c).since(&c), c);
     }
 }

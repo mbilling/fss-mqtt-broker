@@ -125,6 +125,14 @@ pub struct Config {
     /// Leave durable sessions on the broker at the end (default: end them with a
     /// DISCONNECT carrying session expiry 0).
     pub keep_sessions: bool,
+    /// Consumers reconnect, and resume their session, when the broker closes their
+    /// connection, each trying for at most this many ns: a cluster that moves a session
+    /// to another node closes its connection (DISCONNECT 0x9C, Use another server,
+    /// ADR 0005), and a real client comes back. A durable consumer must be back before
+    /// its session expires, so the budget is shorter than the session expiry. `None`:
+    /// a lost connection is the run's error. Publishers never reconnect: theirs are
+    /// clean sessions, served where they land and never moved.
+    pub reconnect_within_ns: Option<u64>,
     /// Client id prefix; default `mqload-<run id>`.
     pub client_prefix: Option<String>,
     /// Keep-alive, seconds.
@@ -195,6 +203,7 @@ impl Config {
             sessions: Sessions::Durable,
             session_expiry: 300,
             keep_sessions: false,
+            reconnect_within_ns: None,
             client_prefix: None,
             keepalive: 60,
             username: None,
@@ -314,7 +323,29 @@ impl Config {
                 self.keepalive
             ));
         }
+        self.check_reconnect()?;
         self.check_skew()
+    }
+
+    /// The reconnect half of [`Config::validate`]: a budget, and for a durable consumer
+    /// one its session outlives.
+    fn check_reconnect(&self) -> Result<(), String> {
+        let Some(within) = self.reconnect_within_ns else {
+            return Ok(());
+        };
+        if within == 0 {
+            return Err("reconnecting needs a budget above 0 s".into());
+        }
+        if self.sessions == Sessions::Durable
+            && within >= u64::from(self.session_expiry) * 1_000_000_000
+        {
+            return Err(format!(
+                "the reconnect budget ({:.1} s) must be shorter than the session expiry ({} s): a consumer back after its session expired has nothing to resume",
+                std::time::Duration::from_nanos(within).as_secs_f64(),
+                self.session_expiry
+            ));
+        }
+        Ok(())
     }
 
     /// The skew half of [`Config::validate`]: refuse a workload whose busiest consumer
@@ -627,6 +658,27 @@ mod tests {
         assert_eq!(c.drain_quiet_window_ns(17_900_000), 10_000_000_000);
         c.drain_quiet_factor = f64::NAN;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn a_durable_consumer_reconnects_within_its_session_expiry() {
+        let mut c = cfg();
+        c.validate().expect("reconnect is off by default");
+        c.sessions = Sessions::Durable;
+        c.session_expiry = 30;
+        c.reconnect_within_ns = Some(20_000_000_000);
+        c.validate().expect("20 s to come back, 30 s of session");
+        c.reconnect_within_ns = Some(30_000_000_000);
+        let e = c.validate().unwrap_err();
+        assert!(
+            e.contains("budget (30.0 s) must be shorter than the session expiry (30 s)"),
+            "{e}"
+        );
+        c.sessions = Sessions::Clean;
+        c.validate()
+            .expect("a clean consumer has no session to outlive; it subscribes again");
+        c.reconnect_within_ns = Some(0);
+        assert!(c.validate().unwrap_err().contains("budget"));
     }
 
     #[test]

@@ -12,7 +12,14 @@
 //! generator held back (no credit wait, no full socket buffer, since it fell due) is
 //! the generator's own lateness — timer, scheduling and CPU — and goes into the
 //! scheduling-lag histogram that judges generator saturation.
+//!
+//! With `--reconnect` ([`PubResume`]) a publisher whose connection is gone gets another
+//! and sends again what is still in flight. A broker that cannot honour a publish closes
+//! the publisher's connection with its ack withheld, so that it is sent again (fail
+//! closed, ADR 0041 T5); a cluster moving the session a message is for does exactly
+//! that.
 
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -22,10 +29,11 @@ use mqtt_codec::Packet;
 use tokio::io::AsyncReadExt;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 
-use crate::client::{self, VERSION};
+use crate::client::{self, ConnectOpts, VERSION};
 use crate::clock::{now_ns, sleep_until_ns};
-use crate::ctx::Ctx;
+use crate::ctx::{close_label, Ctx};
 use crate::payload::{encode_publish, Header};
 use crate::schedule::Cursor;
 
@@ -85,6 +93,17 @@ impl Inflight {
         Some(pkid)
     }
 
+    /// Every message in flight: (packet id, ledger publisher, seq, `send_ns`).
+    #[must_use]
+    pub fn in_flight(&self) -> Vec<(u16, u32, u64, u64)> {
+        (1..=self.window)
+            .filter_map(|pkid| {
+                let s = &self.slots[usize::from(pkid)];
+                s.used.then_some((pkid, s.publisher, s.seq, s.send_ns))
+            })
+            .collect()
+    }
+
     /// Release `pkid`: its (publisher, seq, `send_ns`), or `None` if nothing was in
     /// flight on it.
     pub fn release(&mut self, pkid: u16) -> Option<(u32, u64, u64)> {
@@ -105,8 +124,13 @@ pub struct PubShared {
     pub inflight: Mutex<Inflight>,
     /// Signalled when credit frees up (or the connection closes).
     pub credit: Notify,
-    /// The connection is gone.
+    /// The connection is gone for good.
     pub closed: AtomicBool,
+    /// The current connection is gone, and the writer is getting another
+    /// (`--reconnect`).
+    lost: AtomicBool,
+    /// The current connection's reader.
+    reader: Mutex<Option<JoinHandle<()>>>,
     /// The writer has written everything its schedule offered (it still pings).
     schedule_done: AtomicBool,
     /// The run is ending: the writer stops pinging and returns its write half.
@@ -121,6 +145,8 @@ impl PubShared {
             inflight: Mutex::new(Inflight::new(window)),
             credit: Notify::new(),
             closed: AtomicBool::new(false),
+            lost: AtomicBool::new(false),
+            reader: Mutex::new(None),
             schedule_done: AtomicBool::new(false),
             stop: AtomicBool::new(false),
         }
@@ -160,11 +186,53 @@ impl PubShared {
         self.credit.notify_one();
     }
 
-    /// Whether the connection is gone.
+    /// The current connection is gone; the writer gets another.
+    fn mark_lost(&self) {
+        self.lost.store(true, Ordering::Relaxed);
+        self.credit.notify_one();
+    }
+
+    fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::Relaxed)
+    }
+
+    /// Whether the connection is gone for good.
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Relaxed)
     }
+
+    /// Track `h` as the current connection's reader.
+    ///
+    /// # Panics
+    /// If another task panicked holding the reader's lock.
+    pub fn set_reader(&self, h: JoinHandle<()>) {
+        *self.reader.lock().expect("reader poisoned") = Some(h);
+    }
+
+    /// The current connection's reader, no longer tracked (the run aborts it at its end).
+    ///
+    /// # Panics
+    /// If another task panicked holding the reader's lock.
+    pub fn take_reader(&self) -> Option<JoinHandle<()>> {
+        self.reader.lock().expect("reader poisoned").take()
+    }
+}
+
+/// What a publisher needs to get its connection back (`--reconnect`): the broker and the
+/// CONNECT it made there. Publishers are clean sessions, so the new connection has no
+/// session, and the writer sends every message still in flight again, as an edge that
+/// keeps what was not acknowledged does: the same identities, new publishes.
+#[derive(Debug, Clone)]
+pub struct PubResume {
+    /// The broker.
+    pub addr: SocketAddr,
+    /// The publisher's client id.
+    pub client_id: String,
+    /// Each handshake step's timeout.
+    pub timeout: Duration,
+    /// How long to keep trying, ns ([`crate::config::Config::reconnect_within_ns`]).
+    pub within_ns: u64,
 }
 
 /// Payload sizes for one connection: always `min` when `min == max`, otherwise drawn
@@ -236,6 +304,7 @@ pub async fn writer(
     mut w: OwnedWriteHalf,
     mut cursor: Cursor,
     shard: usize,
+    resume: Option<PubResume>,
 ) -> OwnedWriteHalf {
     let cfg = &ctx.cfg;
     // The connection's lanes: (topic index, topic name, ledger publisher). One, on
@@ -268,6 +337,17 @@ pub async fn writer(
     while let Some(due) = next {
         if state.is_closed() {
             break;
+        }
+        if state.is_lost() {
+            match recover(&ctx, &state, resume.as_ref(), &lanes, &mut sizes, shard).await {
+                Some(nw) => {
+                    w = nw;
+                    last_write = now_ns();
+                    held_until = last_write;
+                    continue;
+                }
+                None => break,
+            }
         }
         let now = now_ns();
         if due > now {
@@ -352,12 +432,21 @@ pub async fn writer(
                 *sent = 0;
             }
         }
-        let Ok((blocked, blocked_ns)) = written else {
-            if !ctx.publishers_stopping() {
-                ctx.errors.write.fetch_add(1, Ordering::Relaxed);
+        let (blocked, blocked_ns) = match written {
+            Ok(b) => b,
+            // The batch is in flight: the recovery sends it again.
+            Err(_) if resume.is_some() && !ctx.publishers_stopping() => {
+                ctx.reconnects.publisher_closed(close_label(None, true));
+                state.mark_lost();
+                (0, 0)
             }
-            state.close();
-            break;
+            Err(_) => {
+                if !ctx.publishers_stopping() {
+                    ctx.errors.write.fetch_add(1, Ordering::Relaxed);
+                }
+                state.close();
+                break;
+            }
         };
         last_write = now_ns();
         if blocked > 0 {
@@ -375,11 +464,26 @@ pub async fn writer(
         }
     }
     state.schedule_done.store(true, Ordering::Relaxed);
-    // The drain: nothing more to send, but the connection must outlive it.
+    // The drain: nothing more to send, but the connection must outlive it, and what is
+    // still in flight on one that is lost is sent again.
     while !state.is_closed() && !state.stop.load(Ordering::Relaxed) {
+        if state.is_lost() {
+            match recover(&ctx, &state, resume.as_ref(), &lanes, &mut sizes, shard).await {
+                Some(nw) => {
+                    w = nw;
+                    last_write = now_ns();
+                    continue;
+                }
+                None => break,
+            }
+        }
         let now = now_ns();
         if ka_ns > 0 && now >= last_write + ka_ns {
             if write_tracked(&mut w, &client::PINGREQ).await.is_err() {
+                if resume.is_some() && !ctx.publishers_stopping() {
+                    state.mark_lost();
+                    continue;
+                }
                 break;
             }
             last_write = now_ns();
@@ -409,15 +513,22 @@ pub async fn reader(
 ) {
     let mut acks: Vec<(u16, u8)> = Vec::with_capacity(256);
     let mut lat: Vec<u64> = Vec::with_capacity(256);
+    // With a reconnect budget the writer gets a lost connection back, and its loss is
+    // counted as a reconnect, not an error.
+    let resumable = ctx.cfg.reconnect_within_ns.is_some();
+    let mut reason = None;
     loop {
         loop {
             match Packet::decode(&mut buf, VERSION) {
                 Ok(Some(Packet::PubAck(a))) => acks.push((a.pkid, a.reason)),
                 Ok(Some(Packet::PingResp)) => {}
-                Ok(Some(Packet::Disconnect(_))) => {
-                    ctx.errors
-                        .server_disconnects
-                        .fetch_add(1, Ordering::Relaxed);
+                Ok(Some(Packet::Disconnect(d))) => {
+                    reason = Some(d.reason);
+                    if !resumable {
+                        ctx.errors
+                            .server_disconnects
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 Ok(Some(_)) => {
                     ctx.errors.protocol.fetch_add(1, Ordering::Relaxed);
@@ -463,6 +574,11 @@ pub async fn reader(
         buf.reserve(16 * 1024);
         match r.read_buf(&mut buf).await {
             Ok(n) if n > 0 => {}
+            _ if resumable && !ctx.publishers_stopping() => {
+                ctx.reconnects.publisher_closed(close_label(reason, false));
+                state.mark_lost();
+                return;
+            }
             _ => {
                 if !ctx.publishers_stopping() {
                     ctx.errors.disconnects.fetch_add(1, Ordering::Relaxed);
@@ -471,6 +587,126 @@ pub async fn reader(
                 return;
             }
         }
+    }
+}
+
+/// Get a lost connection back (`--reconnect`): stop the old connection's reader (so no
+/// late ack of it can release a packet id the new connection reuses), connect again
+/// with the same client id, start a reader on the new connection, and send again every
+/// message still in flight. A clean session keeps nothing of the old connection, so
+/// they are new publishes of the same identities, stamped with their first send time:
+/// their ack and end-to-end latency include the outage. Backs off from 20 ms to 1 s;
+/// gives up, and the connection is gone for good, when the budget runs out or the run
+/// stops its publishers. Without `resume` the connection is gone for good at once.
+///
+/// # Panics
+/// If another task panicked holding the in-flight or a reconnect lock.
+async fn recover(
+    ctx: &Arc<Ctx>,
+    state: &Arc<PubShared>,
+    resume: Option<&PubResume>,
+    lanes: &[(usize, Vec<u8>, u32)],
+    sizes: &mut Sizes,
+    shard: usize,
+) -> Option<OwnedWriteHalf> {
+    let Some(r) = resume else {
+        state.close();
+        return None;
+    };
+    let lost_at = now_ns();
+    let give_up = lost_at.saturating_add(r.within_ns);
+    let mut backoff = Duration::from_millis(20);
+    let c = &ctx.cfg;
+    let mut buf = Vec::new();
+    loop {
+        if let Some(h) = state.take_reader() {
+            h.abort();
+            let _ = h.await;
+        }
+        if ctx.publishers_stopping() {
+            state.close();
+            return None;
+        }
+        let opts = ConnectOpts {
+            client_id: &r.client_id,
+            clean: true,
+            session_expiry: 0,
+            keepalive: c.keepalive,
+            receive_maximum: u16::MAX,
+            username: c.username.as_deref(),
+            password: c.password.as_deref(),
+        };
+        if let Ok(conn) = client::connect(r.addr, &opts, r.timeout).await {
+            let (rd, mut wr) = conn.stream.into_split();
+            state.lost.store(false, Ordering::Relaxed);
+            state.set_reader(tokio::spawn(reader(
+                ctx.clone(),
+                state.clone(),
+                rd,
+                conn.buf,
+                shard,
+            )));
+            let again = state
+                .inflight
+                .lock()
+                .expect("inflight poisoned")
+                .in_flight();
+            let mut sent_again = true;
+            for chunk in again.chunks(MAX_BATCH) {
+                buf.clear();
+                for &(pkid, publisher, seq, send_ns) in chunk {
+                    let Some((_, topic, _)) = lanes.iter().find(|l| l.2 == publisher) else {
+                        continue;
+                    };
+                    let header = Header {
+                        run: ctx.run,
+                        publisher,
+                        seq,
+                        send_ns,
+                    };
+                    encode_publish(
+                        &mut buf,
+                        topic,
+                        c.qos,
+                        Some(pkid),
+                        true,
+                        &header,
+                        sizes.next(),
+                        &ctx.filler,
+                    )
+                    .expect("a validated workload encodes");
+                }
+                if write_tracked(&mut wr, &buf).await.is_err() {
+                    sent_again = false;
+                    break;
+                }
+            }
+            if sent_again {
+                let p = &ctx.reconnects.publishers;
+                p.reconnects.fetch_add(1, Ordering::Relaxed);
+                p.resent.fetch_add(again.len() as u64, Ordering::Relaxed);
+                p.gaps
+                    .lock()
+                    .expect("reconnect gaps poisoned")
+                    .record_ns(now_ns().saturating_sub(lost_at));
+                ctx.stats.shard(shard).publisher_reconnects += 1;
+                state.credit.notify_one();
+                return Some(wr);
+            }
+            // Lost again while sending: the loop stops this reader and tries again.
+            state.lost.store(true, Ordering::Relaxed);
+        }
+        if now_ns() >= give_up {
+            ctx.reconnects
+                .publishers
+                .failed
+                .fetch_add(1, Ordering::Relaxed);
+            ctx.errors.disconnects.fetch_add(1, Ordering::Relaxed);
+            state.close();
+            return None;
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(1));
     }
 }
 
@@ -502,6 +738,15 @@ mod tests {
         assert_eq!(inf.release(0), None);
         assert_eq!(inf.release(999), None);
         assert_eq!(inf.free(), 1);
+        assert_eq!(
+            inf.in_flight(),
+            {
+                let mut v = vec![(a, 0, 10, 100), (c, 0, 12, 102)];
+                v.sort_unstable();
+                v
+            },
+            "what a recovered connection sends again"
+        );
         assert_eq!(inf.take(0, 13, 103), Some(b));
     }
 

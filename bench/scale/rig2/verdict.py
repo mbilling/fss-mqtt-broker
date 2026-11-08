@@ -7,6 +7,8 @@
     verdict.py idle   [--floor N] <scrape.prom>...  exit 0 when the cluster is idle (between steps)
     verdict.py cost   --tier n3|n10|h3 [...]      hourly price and expected duration of a run
     verdict.py calibrate <dir>                   exit 1 and name the generators whose host is too slow
+    verdict.py join   <join-dir>                 judge a join round (run.sh JOIN_BROKERS); writes verdict.json
+    verdict.py capacity <ladder-dir>             print the ladder's maximum lossless msg/s, or nothing
 
 Everything is judged from the broker's side (D1):
 
@@ -134,8 +136,9 @@ REPLACE_STRIKES = 2
 PRICES_EUR_H = {"ccx23": 0.17225, "ccx33": 0.277375, "ccx43": 0.552875, "ccx53": 1.06875}
 # Dedicated vCPU per server type: the report states every capacity per vCPU as well.
 VCPU = {"ccx13": 2, "ccx23": 4, "ccx33": 8, "ccx43": 16, "ccx53": 32, "ccx63": 48,
-        # AWS (CLOUD=aws): rig2/run.sh maps a tier's CCX type to the m6i of the same count.
-        **{f"{fam}.{size}": n for fam in ("m6i", "m6a", "m7a", "c6i", "c7a", "r6i")
+        # AWS (CLOUD=aws): rig2/run.sh maps a tier's CCX type to the m6i of the same count;
+        # an EC2 type given as it is (m6in: the network-optimized m6i) counts the same.
+        **{f"{fam}.{size}": n for fam in ("m6i", "m6in", "m6a", "m7a", "c6i", "c6in", "c7a", "r6i")
            for size, n in (("large", 2), ("xlarge", 4), ("2xlarge", 8), ("4xlarge", 16),
                            ("8xlarge", 32), ("12xlarge", 48), ("16xlarge", 64))}}
 TIERS = {
@@ -858,6 +861,408 @@ def judge(step: Path, cfg: dict | None = None) -> dict:
     return out
 
 
+# ── the join under load (run.sh JOIN_BROKERS) ───────────────────────────────────────
+#
+# One long round in two cohorts (run.sh run_join): cohort A on the brokers the cluster
+# started with; the new brokers join JOIN_AT s into A's measured time; cohort B, new
+# sites on the new brokers, from a little after the last is ready until A ends. Its
+# verdict, from the broker side as every step's:
+#
+# - FAILED: the cluster did not grow (a joiner never became ready), a broker dropped a
+#   message as loss or restarted, a durable session did not survive its move (a consumer
+#   resumed and the broker had no session), or a cohort's ledger lost an acknowledged
+#   message.
+# - VOID: the harness's evidence is missing or its own (a summary, a saturated generator,
+#   no scrapes from a broker, the cluster not settled when the round started).
+# - DISCONNECTED: a connection was lost for good: a publisher or a consumer that could
+#   not reconnect within its budget (mqtt-load --reconnect).
+# - NOT DRAINED: as a step's: what the ledger misses the brokers still held.
+# - OFFER NOT TAKEN: in the round's last phase (cohort B running, or after the join when
+#   there is none) the brokers took less than OFFER_TAKEN of what both cohorts offered:
+#   the grown cluster did not carry the load it grew for.
+# - HELD: none of these. The cluster grew under load without losing a message, every
+#   moved session came back, and the grown cluster carried the combined offer.
+#
+# Latency is reported per phase (before, joining, after, with cohort B: the windows whose
+# midpoint falls inside), never judged: the join's cost is the "joining" phase's latency
+# and the consumers' reconnect gaps.
+
+HELD = "HELD"
+# The joining phase: from the first joiner's start until this long after the cluster
+# formed with the last one (or, without a formation time, after the last was ready),
+# while the cluster moves sessions and replicas onto the new brokers.
+JOIN_SETTLE_S = 30.0
+REHOMES = "mqttd_session_rehomes_total"
+PHASES = ("before", "joining", "after", "with_b")
+
+
+def _join_gens(d: Path, n: int, who: str) -> tuple[list, list[str]]:
+    """(generator, summary, exit code) for each of `n` generators' summaries in d, and a
+    VOID for each one missing."""
+    gens, voids = [], []
+    for g in range(n):
+        code = (d / f"gen-{g}.exit").read_text().strip() if (d / f"gen-{g}.exit").is_file() else "?"
+        try:
+            sm = json.loads((d / f"gen-{g}.json").read_text())
+        except (OSError, ValueError):
+            voids.append(f"{who}: generator {g} produced no summary (exit {code})")
+            continue
+        if sm.get("schema") not in SCHEMAS_ACCEPTED:
+            voids.append(f"{who}: generator {g}: summary schema {sm.get('schema')!r}, need one of {SCHEMAS_ACCEPTED}")
+            continue
+        gens.append((g, sm, code))
+    return gens, voids
+
+
+def _measured_windows(gens: list, t0_ms: float) -> list[dict]:
+    """Every measured window of a cohort's generators, in seconds since t0. A window's
+    figures (mqtt-load's Aggregate) are flattened into the window itself."""
+    out = []
+    for g, sm, _ in gens:
+        base = sm["schedule_start_unix_ms"]
+        for w in sm["windows"]:
+            if w["kind"] == "measure" and "duration_s" in w:
+                out.append({"generator": g, "start": (base + w["start_s"] * 1000 - t0_ms) / 1000,
+                            "end": (base + w["end_s"] * 1000 - t0_ms) / 1000, "agg": w})
+    return out
+
+
+def _cohort_phase(windows: list[dict], lo: float, hi: float) -> dict | None:
+    """A cohort over [lo, hi) s: its windows whose midpoint falls inside; rates over the
+    span every generator covered, latency as the median and the worst of the windows' p99s."""
+    inside = [w for w in windows if lo <= (w["start"] + w["end"]) / 2 < hi]
+    if not inside:
+        return None
+    tot: Counter[str] = Counter()
+    secs: Counter[int] = Counter()
+    for w in inside:
+        for k in ("offered", "sent", "acked", "received", "reconnects", "publisher_reconnects"):
+            tot[k] += w["agg"].get(k, 0)
+        secs[w["generator"]] += w["agg"]["duration_s"]
+    span = sum(secs.values()) / len(secs)
+
+    def p99s(kind: str) -> list[int]:
+        return sorted(w["agg"][kind]["p99_us"] for w in inside if w["agg"][kind].get("count"))
+
+    ack, e2e = p99s("ack_latency"), p99s("e2e_latency")
+    out = {"windows": len(inside), "seconds": span, "reconnects": int(tot["reconnects"]),
+           "publisher_reconnects": int(tot["publisher_reconnects"])}
+    for k in ("offered", "sent", "acked", "received"):
+        out[f"{k}_rate"] = tot[k] / span if span else 0.0
+    for name, xs in (("ack", ack), ("e2e", e2e)):
+        out[f"{name}_p99_us_median"] = xs[len(xs) // 2] if xs else None
+        out[f"{name}_p99_us_max"] = xs[-1] if xs else None
+    return out
+
+
+def _brokers_phase(samples: dict[int, list], lo_ms: float, hi_ms: float, margin_ms: float) -> dict:
+    """The brokers' own rates over [lo, hi] wall ms: per broker, its first and last scrape
+    inside the span shrunk by the margin (its own clock), summed over the brokers that
+    have two. A broker that started inside the span counts from its first scrape."""
+    rx = dl = 0.0
+    rated = []
+    for idx, ss in sorted(samples.items()):
+        inside = [x for x in ss if lo_ms + margin_ms <= x[0] <= hi_ms - margin_ms]
+        if len(inside) < 2:
+            continue
+        (t0, a), (t1, z) = inside[0], inside[-1]
+        if t1 <= t0 or a.get(("process_start_time_seconds", "")) != z.get(("process_start_time_seconds", "")):
+            continue
+        dt = (t1 - t0) / 1000
+        rx += E.delta(a, z, E.RECEIVED) / dt
+        dl += E.delta(a, z, E.DELIVERED) / dt
+        rated.append(idx)
+    return {"received_rate": rx, "delivered_rate": dl, "brokers": rated}
+
+
+def _since_start(samples: list, lo_ms: float) -> dict:
+    """A broker's counters at its first scrape of the round, or zero for one whose process
+    started inside the round (a joiner, whose counters began at its start)."""
+    t, first = samples[0]
+    started_ms = first.get(("process_start_time_seconds", ""), 0.0) * 1000
+    return {} if started_ms > lo_ms else first
+
+
+def join_round(d: Path) -> dict:
+    """The verdict of one join round directory (run.sh run_join: join.json, joins.tsv,
+    a/ and b/ with one gen-<g>.json per generator, scrapes/broker-<i>/)."""
+    meta = json.loads((d / "join.json").read_text())
+    cfg = meta.get("judge", {})
+    margin_ms = float(cfg.get("margin_s", 1.0)) * 1000
+    out = {"workload": meta.get("workload"), "brokers_before": meta["brokers_before"],
+           "brokers_after": meta["brokers_after"], "rate_a": meta["rate_a"], "rate_b": meta["rate_b"],
+           "voids": [], "failures": [], "notes": []}
+    n = int(meta["generators"])
+    gens_a, v = _join_gens(d / "a", n, "cohort A")
+    out["voids"] += v
+    gens_b, v = _join_gens(d / "b", n, "cohort B") if meta.get("cohort_b") else ([], [])
+    out["voids"] += v
+    idle = None
+    if (d / "idle_before.json").is_file():
+        try:
+            idle = json.loads((d / "idle_before.json").read_text())
+        except ValueError:
+            idle = None
+    unreset = idle is not None and not idle.get("idle", False)
+    if unreset:
+        why = "; ".join((idle.get("state") or {}).get("why_not") or [])
+        out["voids"].append(f"the cluster was not settled when the round started ({why or 'no reason recorded'})")
+    if not gens_a:
+        out["verdict"], out["good"] = VOID, False
+        out["voids"].append("cohort A has no summaries: nothing to judge")
+        return out
+
+    # The round's clock: cohort A's schedule start (generator host 0's, shared by all).
+    t0 = min(sm["schedule_start_unix_ms"] for _, sm, _ in gens_a)
+    a_lo, a_hi = max(measured_span(sm)[0] for _, sm, _ in gens_a), min(measured_span(sm)[1] for _, sm, _ in gens_a)
+    rel = lambda ms: (ms - t0) / 1000  # noqa: E731
+    joins = []
+    if (d / "joins.tsv").is_file():
+        # index, start, ready (the joiner's clock) and, since the join waits for it, the
+        # cluster's formation (this machine's clock).
+        for line in (d / "joins.tsv").read_text().splitlines():
+            parts = line.split("\t")
+            if len(parts) in (3, 4) and all(x.strip().isdigit() for x in parts):
+                i, st, rd, *fm = (int(x) for x in parts)
+                j = {"broker": i, "start_s": rel(st), "ready_s": rel(rd), "took_s": (rd - st) / 1000}
+                if fm:
+                    j.update(formed_s=rel(fm[0]), formed_after_s=(fm[0] - st) / 1000)
+                joins.append(j)
+    out["joins"] = joins
+    if not meta.get("joined", bool(joins)):
+        out["failures"].append(f"the cluster did not grow: {len(joins)} of "
+                               f"{meta['brokers_after'] - meta['brokers_before']} joiner(s) became ready "
+                               f"(join exit {meta.get('join_exit', '?')})")
+    b_lo = max((measured_span(sm)[0] for _, sm, _ in gens_b), default=None)
+    b_hi = min((measured_span(sm)[1] for _, sm, _ in gens_b), default=None)
+    first_join = min((j["start_s"] for j in joins), default=rel(a_hi))
+    joined_by = max((j.get("formed_s", j["ready_s"]) for j in joins), default=first_join) + JOIN_SETTLE_S
+    if b_lo:
+        # Cohort B's phase begins when B is measured, whatever the settle allowance.
+        joined_by = min(joined_by, rel(b_lo))
+    bounds = {"before": (rel(a_lo), first_join), "joining": (first_join, joined_by),
+              "after": (joined_by, rel(b_lo) if b_lo else rel(a_hi)),
+              "with_b": (rel(b_lo), rel(min(a_hi, b_hi))) if b_lo else None}
+    out["timeline"] = {"a_measured_s": [rel(a_lo), rel(a_hi)], "b_measured_s": [rel(b_lo), rel(b_hi)] if b_lo else None,
+                       "phases": {k: v for k, v in bounds.items() if v}}
+
+    # The generators: health, ledgers, connections, reconnects.
+    out["cohorts"] = {}
+    all_gens = [("A", g, sm, c) for g, sm, c in gens_a] + [("B", g, sm, c) for g, sm, c in gens_b]
+    for name, gens in (("A", gens_a), ("B", gens_b)):
+        if not gens:
+            continue
+        rc = [sm.get("reconnect") or {} for _, sm, _ in gens]
+        gaps = [r.get("gap") or {} for r in rc]
+        by_reason: Counter[str] = Counter()
+        for r in rc:
+            by_reason.update(r.get("by_reason") or {})
+        pr = [r.get("publishers") or {} for r in rc]
+        pub_reason: Counter[str] = Counter()
+        for x in pr:
+            pub_reason.update(x.get("by_reason") or {})
+        led = {k: sum(sm["ledger"].get(k, 0) or 0 for _, sm, _ in gens)
+               for k in ("sent", "acked", "expected", "unique_received", "missing", "missing_acked", "unacked",
+                         "unexpected", "duplicates")}
+        out["cohorts"][name] = {
+            "generators": len(gens), "ledger": led, "closed": all(sm["ledger"]["closed"] for _, sm, _ in gens),
+            "outcomes": sorted({sm["outcome"] for _, sm, _ in gens}),
+            "errors": {k: sum(sm["errors"].get(k, 0) for _, sm, _ in gens)
+                       for k in ("disconnects", "server_disconnects", "protocol", "write")},
+            "reconnects": sum(r.get("reconnects", 0) for r in rc), "by_reason": dict(by_reason),
+            "sessions_lost": sum(r.get("sessions_lost", 0) for r in rc),
+            "reconnect_failed": sum(r.get("failed", 0) for r in rc),
+            "gap_p99_us": max((x.get("p99_us") or 0 for x in gaps), default=0),
+            "gap_max_us": max((x.get("max_us") or 0 for x in gaps), default=0),
+            "publisher_reconnects": sum(x.get("reconnects", 0) for x in pr),
+            "publisher_by_reason": dict(pub_reason), "resent": sum(x.get("resent", 0) for x in pr),
+            "publisher_failed": sum(x.get("failed", 0) for x in pr),
+            "publisher_gap_p99_us": max(((x.get("gap") or {}).get("p99_us") or 0 for x in pr), default=0),
+            "publisher_gap_max_us": max(((x.get("gap") or {}).get("max_us") or 0 for x in pr), default=0),
+            "consumers": sum((sm.get("connections") or {}).get("consumers", 0) for _, sm, _ in gens),
+            "publishers": sum((sm.get("connections") or {}).get("publishers", 0) for _, sm, _ in gens)}
+    for name, g, sm, _ in all_gens:
+        h = generator_health(sm, SATURATED_WINDOWS_MIN)
+        if h["saturated"]:
+            out["voids"].append(f"cohort {name}: generator {g} saturated ({', '.join(h['reasons']) or 'see summary'})")
+    for name, c in out["cohorts"].items():
+        if c["sessions_lost"]:
+            out["failures"].append(f"cohort {name}: {c['sessions_lost']} durable session(s) gone when their consumer "
+                                   "reconnected (the broker answered session present 0)")
+
+    # The brokers.
+    samples, refused = {}, 0
+    for b in sorted((x for x in (d / "scrapes").glob("broker-*") if x.is_dir()), key=lambda x: int(x.name.split("-")[1])):
+        ss, bad = load_samples(b)
+        refused += bad
+        if ss:
+            samples[int(b.name.split("-")[1])] = ss
+    absent = [i for i in range(meta["brokers_after"]) if i not in samples]
+    if absent:
+        out["voids"].append(f"broker evidence: no scrapes from broker(s) {' '.join(map(str, absent))}")
+    lost, not_lost, rehomes, restarted, held = Counter(), Counter(), Counter(), [], {g: 0.0 for g in HELD_GAUGES}
+    cutoff = max(ledger_ms(sm) for _, _, sm, _ in all_gens)
+    end = []
+    misplaced = 0.0
+    for idx, ss in samples.items():
+        base, last = _since_start(ss, a_lo - 60_000), ss[-1][1]
+        if ss[0][1].get(("process_start_time_seconds", "")) != last.get(("process_start_time_seconds", "")):
+            restarted.append(idx)
+            continue
+        for k, v in E.positive_deltas(base, last, E.DROPPED, "reason").items():
+            (lost if drop_is_loss(k) else not_lost)[k] += v
+        rehomes.update(E.positive_deltas(base, last, REHOMES, "reason"))
+        misplaced = max(misplaced, max(E.sum_family(x, "mqttd_misplaced_sessions") for _, x in ss))
+        before = [x for t, x in ss if t <= cutoff]
+        at = before[-1] if before else ss[0][1]
+        for g in HELD_GAUGES:
+            held[g] += E.sum_family(at, g)
+        # What each broker served at the end of the measured time (consumers still on).
+        live = [x for t, x in ss if t <= a_hi] or [ss[0][1]]
+        end.append({"broker": idx, "sessions": E.sum_family(live[-1], "mqttd_sessions"),
+                    "connections": E.sum_family(live[-1], "mqttd_connections_active"),
+                    "voters": E.sum_family(live[-1], "mqttd_voters"), "members": E.sum_family(live[-1], "mqttd_members"),
+                    "first_scrape_s": round(rel(ss[0][0]), 1)})
+    out["brokers"] = {"lost_by_reason": dict(lost), "not_lost_by_reason": dict(not_lost), "restarted": restarted,
+                      "rehomes_by_reason": dict(rehomes), "misplaced_sessions_max": misplaced,
+                      "held_at_cutoff": held, "refused_scrapes": refused, "end": end}
+    if sum(lost.values()):
+        out["failures"].append("brokers dropped " + str(int(sum(lost.values()))) + " messages ("
+                               + ", ".join(f"{k}={int(v)}" for k, v in sorted(lost.items())) + ")")
+    if not_lost:
+        out["notes"].append("broker drops that are not loss: " + ", ".join(f"{k}={int(v)}" for k, v in sorted(not_lost.items())))
+    if restarted:
+        out["failures"].append(f"broker(s) {restarted} restarted during the round")
+
+    # The phases, from both sides.
+    wa, wb = _measured_windows(gens_a, t0), _measured_windows(gens_b, t0)
+    out["phases"] = {}
+    for k in PHASES:
+        span = bounds.get(k)
+        if not span or span[1] <= span[0]:
+            continue
+        lo, hi = span
+        out["phases"][k] = {"start_s": round(lo, 1), "end_s": round(hi, 1), "a": _cohort_phase(wa, lo, hi),
+                            "b": _cohort_phase(wb, lo, hi),
+                            "brokers": _brokers_phase(samples, t0 + lo * 1000, t0 + hi * 1000, margin_ms)}
+
+    # The verdict, as a step's.
+    disconnected = [f"cohort {n_}: {c['errors']}" for n_, c in out["cohorts"].items() if "error" in c["outcomes"]]
+    gens_for_drain = [(g, sm, c) for _, g, sm, c in all_gens]
+    out["drain"] = drain = drain_figures(gens_for_drain, {"lost": sum(lost.values()), "held_at_cutoff": held})
+    if drain.get("reconciled"):
+        out["notes"].append(drain["reconciled"])
+    ledger_open = [n_ for n_, c in out["cohorts"].items() if not c["closed"]]
+    last_phase = out["phases"].get("with_b") or out["phases"].get("after")
+    taken = None
+    if last_phase:
+        offered = sum((last_phase[c] or {}).get("offered_rate", 0.0) for c in ("a", "b"))
+        got = last_phase["brokers"]["received_rate"]
+        missing_in_phase = [i for i in range(meta["brokers_after"]) if i not in last_phase["brokers"]["brokers"]]
+        if missing_in_phase:
+            out["voids"].append(f"broker evidence: broker(s) {' '.join(map(str, missing_in_phase))} have no two "
+                                "scrapes in the round's last phase")
+        taken = got / offered if offered else None
+        out["last_phase"] = {"phase": "with_b" if out["phases"].get("with_b") else "after", "offered_rate": offered,
+                             "received_rate": got, "received_share": taken}
+    if out["failures"]:
+        verdict = FAILED
+    elif out["voids"]:
+        verdict = VOID
+    elif disconnected:
+        verdict = DISCONNECTED
+        out["notes"].append("connections lost for good: " + "; ".join(disconnected))
+    elif ledger_open and drain["still_queued"]:
+        verdict = NOT_DRAINED
+    elif ledger_open:
+        verdict = FAILED
+        out["failures"].append("ledger did not close: " + "; ".join(
+            f"cohort {n_}: missing={out['cohorts'][n_]['ledger']['missing']} "
+            f"unacked={out['cohorts'][n_]['ledger']['unacked']} unexpected={out['cohorts'][n_]['ledger']['unexpected']}"
+            for n_ in ledger_open))
+    elif taken is None or taken < OFFER_TAKEN:
+        verdict = NOT_TAKEN
+    else:
+        verdict = HELD
+    if unreset and verdict != VOID:
+        out["notes"].append(f"would have been {verdict} on a settled cluster; VOID because it started unsettled")
+        verdict = VOID
+    out["verdict"], out["good"] = verdict, verdict == HELD
+    return out
+
+
+def join_lines(v: dict) -> list[str]:
+    """The join round's verdict in a few lines (run.sh prints them; the report quotes them)."""
+    ph = v.get("phases", {})
+
+    def lat(k: str, cohort: str = "a") -> str:
+        x = (ph.get(k) or {}).get(cohort) or {}
+        return fmt_us(x.get("ack_p99_us_max"))
+
+    joins = ", ".join(f"broker {j['broker']} in {j['took_s']:.1f} s"
+                      + (f", formed in {j['formed_after_s']:.1f} s" if "formed_after_s" in j else "")
+                      for j in v.get("joins", [])) or "no joiner ready"
+    head = (f"JOIN {v['verdict']}: {v['brokers_before']} -> {v['brokers_after']} brokers ({joins}); cohort A "
+            f"{fmt_rate(v['rate_a'])} msg/s" + (f", cohort B {fmt_rate(v['rate_b'])} msg/s" if "B" in v.get("cohorts", {}) else ""))
+    lp = v.get("last_phase")
+    if lp:
+        head += (f"; the brokers took {fmt_rate(lp['received_rate'])} msg/s of {fmt_rate(lp['offered_rate'])} offered "
+                 f"({fmt_pct(lp['received_share'])}) {'with cohort B' if lp['phase'] == 'with_b' else 'after the join'}")
+    lines = [head]
+    for n_, c in v.get("cohorts", {}).items():
+        reasons = ", ".join(f"{k} {n}" for k, n in sorted(c["by_reason"].items())) or "none"
+        lines.append(f"cohort {n_}: ledger {'closed' if c['closed'] else 'OPEN'} ({c['ledger']['sent']:,} sent, "
+                     f"{c['ledger']['duplicates']:,} duplicates); {c['reconnects']} consumer reconnect(s) ({reasons}), "
+                     f"back in p99 {fmt_us(c['gap_p99_us'])}, max {fmt_us(c['gap_max_us'])}; "
+                     f"{c['sessions_lost']} session(s) lost")
+        if c.get("publisher_reconnects") or c.get("publisher_failed"):
+            preasons = ", ".join(f"{k} {n}" for k, n in sorted(c["publisher_by_reason"].items())) or "none"
+            lines.append(f"cohort {n_}: {c['publisher_reconnects']} publisher reconnect(s) ({preasons}), "
+                         f"back in p99 {fmt_us(c['publisher_gap_p99_us'])}, max {fmt_us(c['publisher_gap_max_us'])}; "
+                         f"{c['resent']:,} message(s) sent again; {c['publisher_failed']} gave up")
+    lines.append("ack p99 (worst window): before " + lat("before") + ", joining " + lat("joining") + ", after "
+                 + lat("after") + (f", with cohort B {lat('with_b')} (B: {lat('with_b', 'b')})" if ph.get("with_b") else ""))
+    rh = v.get("brokers", {}).get("rehomes_by_reason") or {}
+    if rh:
+        lines.append("sessions the brokers closed to move them: " + ", ".join(f"{k} {int(n)}" for k, n in sorted(rh.items())))
+    return lines + [f"- {x}" for x in v["failures"] + v["voids"] + v["notes"]]
+
+
+def render_join_md(v: dict) -> list[str]:
+    """The report's section for one join round."""
+    md = [f"## Join under load: `{v.get('workload')}`, {v['brokers_before']} → {v['brokers_after']} brokers", "",
+          f"**{v['verdict']}**. " + join_lines(v)[0].split(": ", 1)[1], ""]
+    tl = v.get("timeline") or {}
+    md += ["| phase | seconds | cohort A msg/s (offered / received) | A ack p99 median / worst | cohort B msg/s "
+           "| B ack p99 worst | brokers received msg/s (brokers) | reconnects: consumers / publishers |",
+           "|---|---|---|---|---|---|---|---|"]
+    names = {"before": "before the join", "joining": "joining (+30 s)", "after": "after the join", "with_b": "with cohort B"}
+    for k in PHASES:
+        x = (v.get("phases") or {}).get(k)
+        if not x:
+            continue
+        a, b, br = x.get("a") or {}, x.get("b") or {}, x["brokers"]
+        md.append(f"| {names[k]} | {x['start_s']:.0f}–{x['end_s']:.0f} | {fmt_rate(a.get('offered_rate'))} / "
+                  f"{fmt_rate(a.get('received_rate'))} | {fmt_us(a.get('ack_p99_us_median'))} / {fmt_us(a.get('ack_p99_us_max'))} "
+                  f"| {fmt_rate(b.get('offered_rate')) if b else '—'} | {fmt_us(b.get('ack_p99_us_max')) if b else '—'} "
+                  f"| {fmt_rate(br['received_rate'])} ({len(br['brokers'])}) | "
+                  f"{(a.get('reconnects') or 0) + (b.get('reconnects') or 0)} / "
+                  f"{(a.get('publisher_reconnects') or 0) + (b.get('publisher_reconnects') or 0)} |")
+    md.append("")
+    if v.get("joins"):
+        md.append("Joins (s since cohort A's start): " + "; ".join(
+            f"broker {j['broker']} started {j['start_s']:.1f}, ready {j['ready_s']:.1f}"
+            + (f", the cluster formed {j['formed_s']:.1f}" if "formed_s" in j else "") for j in v["joins"]) + ".")
+    if tl.get("b_measured_s"):
+        md.append(f"Cohort B measured {tl['b_measured_s'][0]:.0f}–{tl['b_measured_s'][1]:.0f} s.")
+    end = (v.get("brokers") or {}).get("end") or []
+    if end:
+        md.append("At the end of the measured time, per broker: " + "; ".join(
+            f"{e['broker']}: {e['sessions']:.0f} sessions, {e['connections']:.0f} connections" for e in end) + ".")
+    md += [""] + join_lines(v)[1:] + [""]
+    return md
+
+
 # ── the ramp ────────────────────────────────────────────────────────────────────────
 
 
@@ -1426,16 +1831,20 @@ def ladder_report(ladder: Path) -> dict:
     for st_, m in zip(steps, retry_marks(steps, meta["ramp"])):
         st_["retry"] = m
     nxt, why = next_rate(steps, meta["ramp"]) if steps else (None, "no steps")
-    return {"workload": meta["workload"], "arm": meta.get("arm", "A"), "latency_gate": meta["ramp"].get("latency_gate", "ack"),
+    return {"workload": meta["workload"], "arm": meta.get("arm", "A"), "brokers": meta.get("brokers"),
+            "latency_gate": meta["ramp"].get("latency_gate", "ack"),
             "ramp": meta["ramp"], "mqtt_load": meta.get("mqtt_load", {}), "steps": steps, "capacity": capacity(steps),
             "ended": why if nxt is None else f"incomplete (next would be {nxt:g} msg/s: {why})",
             "hub": _hub(ladder)}
 
 
-def cluster_vcpu(meta: dict) -> int | None:
-    """The brokers' dedicated vCPU in all, or None where the server type is unknown."""
+def cluster_vcpu(meta: dict, brokers: int | None = None) -> int | None:
+    """The brokers' dedicated vCPU in all, or None where the server type is unknown:
+    `brokers` of the run's type (a ladder after a join runs on more brokers than the run
+    started with), by default the run's own count."""
     per = VCPU.get(meta.get("broker_type", ""))
-    return per * int(meta["brokers"]) if per and meta.get("brokers") else None
+    n = brokers or meta.get("brokers")
+    return per * int(n) if per and n else None
 
 
 def per_vcpu(rate: float, vcpu: int | None) -> str:
@@ -1564,8 +1973,14 @@ def report(run: Path) -> dict:
     ladders = sorted((p.parent for p in run.glob("**/ladder.json")),
                      key=lambda d: (d.parent.name, order.get(d.name, len(order)), d.name))
     vcpu = cluster_vcpu(meta)
+    joins = []
+    for jd in sorted(p.parent for p in run.glob("join/*/join.json")):
+        try:
+            joins.append(json.loads((jd / "verdict.json").read_text()) if (jd / "verdict.json").is_file() else join_round(jd))
+        except (OSError, ValueError, KeyError) as e:
+            print(f"verdict.py: join round {jd} not read: {e!r}", file=sys.stderr)
     data = {"schema": SCHEMA_REPORT, "run": meta, "vcpu": vcpu, "offer_taken": OFFER_TAKEN,
-            "ladders": [ladder_report(p) for p in ladders]}
+            "ladders": [ladder_report(p) for p in ladders], "joins": joins}
     try:
         _load("chart_ramp", HERE / "chart-ramp.py").write_charts(run, data)
     except Exception as e:  # a chart must never cost the report
@@ -1573,9 +1988,12 @@ def report(run: Path) -> dict:
     (run / "report.json").write_text(json.dumps(data, indent=2) + "\n")
     md = [f"# mqttd msg/s ramp — {meta.get('tier', '?')}", ""]
     if meta:
-        md.append(f"- tier `{meta.get('tier')}`: {meta.get('brokers')} brokers ({meta.get('broker_type')}"
-                  + (f", {vcpu} vCPU in all" if vcpu else "") + f"), "
-                  f"{meta.get('generators')} generator host(s) ({meta.get('gen_type')})")
+        grown = meta.get("join_brokers") or 0
+        md.append(f"- tier `{meta.get('tier')}`: {meta.get('brokers')} brokers"
+                  + (f" growing to {int(meta['brokers']) + grown} by a join" if grown else "")
+                  + f" ({meta.get('broker_type')}" + (f", {vcpu} vCPU in all" if vcpu else "")
+                  + (f" before the join, {cluster_vcpu(meta, int(meta['brokers']) + grown)} after" if grown and vcpu else "")
+                  + f"), {meta.get('generators')} generator host(s) ({meta.get('gen_type')})")
         if meta.get("cloud") not in (None, "local"):
             md.append(f"- cloud: {meta['cloud']}" + (f", {meta['region']}" if meta.get("region") else "")
                       + (f" ({meta['location']})" if meta.get("location") else ""))
@@ -1602,7 +2020,9 @@ def report(run: Path) -> dict:
            "highest carried step; the lines below it are the highest carried step within each ack p99 band "
            "(QoS 0: end-to-end p99).", ""]
     for r in data["ladders"]:
-        md += render_ladder_md(r, vcpu)
+        md += render_ladder_md(r, cluster_vcpu(meta, r.get("brokers")))
+    for vj in data["joins"]:
+        md += render_join_md(vj)
     (run / "report.md").write_text("\n".join(md))
     return data
 
@@ -1613,12 +2033,12 @@ def report(run: Path) -> dict:
 def cost(tier: str, brokers: int | None = None, gens: int | None = None, broker_type: str | None = None,
          gen_type: str | None = None, workloads: int = 1, steps: int = 9, step_secs: float = 120.0,
          bringup_min: float | None = None, teardown_min: float = 3.0, prices: dict | None = None,
-         rounds: int = 1, ladder_secs: float = 0.0, currency: str = "EUR") -> dict:
+         rounds: int = 1, ladder_secs: float = 0.0, currency: str = "EUR", extra_secs: float = 0.0) -> dict:
     """The price of a run. A ladder: `ladder_secs` (what it spends outside its steps' short
     settles: the prime and the long settles), then `steps` steps of `rounds` rounds, each
     round `step_secs` (its short settle, warm-up, measured time, drain and fetch). A step
     that is not carried stops at its first bad round, so this is the upper end for a given
-    step count."""
+    step count. `extra_secs`: time outside the ladders (a join round)."""
     t = TIERS[tier]
     brokers, gens = brokers or t["brokers"], gens or t["gens"]
     bt, gt = broker_type or t["broker_type"], gen_type or t["gen_type"]
@@ -1627,7 +2047,7 @@ def cost(tier: str, brokers: int | None = None, gens: int | None = None, broker_
         raise ValueError(f"no price for {bt if bt not in p else gt}; pass --price TYPE={currency}")
     hourly = brokers * p[bt] + gens * p[gt]
     bring = bringup_min if bringup_min is not None else (10.0 if brokers <= 3 else 14.0)
-    ramp_min = workloads * (ladder_secs + steps * rounds * step_secs) / 60
+    ramp_min = (workloads * (ladder_secs + steps * rounds * step_secs) + extra_secs) / 60
     total = bring + ramp_min + teardown_min
     return {"tier": tier, "currency": currency, "brokers": brokers, "broker_type": bt, "generators": gens, "gen_type": gt,
             "rounds": rounds, "eur_per_hour": round(hourly, 6), "minutes": round(total), "bringup_min": bring,
@@ -1662,6 +2082,10 @@ def main(argv: list[str]) -> int:
     rd.add_argument("step")
     cal = sub.add_parser("calibrate")
     cal.add_argument("dir")
+    jn = sub.add_parser("join")
+    jn.add_argument("dir")
+    cp = sub.add_parser("capacity")
+    cp.add_argument("ladder")
     c = sub.add_parser("cost")
     c.add_argument("--tier", required=True, choices=sorted(TIERS))
     c.add_argument("--brokers", type=int)
@@ -1676,6 +2100,7 @@ def main(argv: list[str]) -> int:
                    help="seconds a ladder spends outside its rounds: the prime and the long settles")
     c.add_argument("--price", action="append", default=[], help="TYPE=PRICE per hour, in --currency")
     c.add_argument("--currency", default="EUR", help="the currency of the prices (Hetzner's table is EUR; CLOUD=aws passes USD)")
+    c.add_argument("--extra-secs", type=float, default=0, help="seconds outside the ladders (a join round)")
     c.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
     if a.cmd == "judge":
@@ -1706,6 +2131,18 @@ def main(argv: list[str]) -> int:
               f"{fmt_pct(st_['received_rate']['cv'])}), {v['latency_gate']} p99 mean {fmt_mean_sd(st_['gate_p99_us'])}, "
               f"merged {fmt_us(v['gate_p99_merged_us'])}"
               + "".join(f"\n  - {x}" for x in v["failures"] + v["voids"] + v["notes"] + v["spread"]["flags"]))
+        return 0
+    if a.cmd == "join":
+        d = Path(a.dir)
+        v = join_round(d)
+        (d / "verdict.json").write_text(json.dumps(v, indent=2) + "\n")
+        print("\n".join(join_lines(v)))
+        return 0
+    if a.cmd == "capacity":
+        # The ladder's maximum lossless msg/s (its highest carried step's offer), for run.sh.
+        lossless = capacity(ladder_steps(Path(a.ladder)))["lossless"]
+        if lossless:
+            print(f"{lossless['offered_rate']:.0f}")
         return 0
     if a.cmd == "replace-due":
         r = replace_due(Path(a.step))
@@ -1747,13 +2184,16 @@ def main(argv: list[str]) -> int:
             k, v = kv.split("=", 1)
             prices[k] = float(v)
         c = cost(a.tier, a.brokers, a.generators, a.broker_type, a.gen_type, a.workloads, a.steps, a.step_secs,
-                 prices=prices, rounds=a.rounds, ladder_secs=a.ladder_secs, currency=a.currency)
+                 prices=prices, rounds=a.rounds, ladder_secs=a.ladder_secs, currency=a.currency,
+                 extra_secs=a.extra_secs)
         if a.json:
             print(json.dumps(c))
         else:
             per = f"~{a.steps} steps x {a.rounds} round(s) of ~{a.step_secs:.0f} s"
             if a.ladder_secs:
                 per = f"~{a.ladder_secs:.0f} s of prime and long settles + " + per
+            if a.extra_secs:
+                per += f"; + a ~{a.extra_secs / 60:.0f} min join round"
             print(f"tier {c['tier']}: {c['brokers']} x {c['broker_type']} + {c['generators']} x {c['gen_type']} = "
                   f"{c['currency']} {c['eur_per_hour']:.4f}/h; expected ~{c['minutes']} min ({c['bringup_min']:.0f} bring-up + "
                   f"{c['ramp_min']:.0f} ramp for {a.workloads} workload(s) x ({per}) + "

@@ -496,6 +496,85 @@ lowest reported band. Run 2's durable-qos1 had 32,400 and 33,100 carried at ack 
 1.7 to 1.8 ms, and 33,800 FAILED (290 `append-backlog-full`, 41 publisher disconnects) above
 22,500 at 1.5 ms, where run 1 carried up to 90,500: under this rule 33,800 is retried.
 
+## Join under load
+
+`JOIN_BROKERS=K` grows the cluster during a run, as an operator adds nodes to a cluster
+that carries traffic. The run provisions `BROKERS + K` broker hosts and bootstraps the
+first `BROKERS`; the other K stay installed and stopped. Its one workload (`WORKLOADS`
+names exactly one) then runs three parts on the same hosts:
+
+1. **The ladder on `BROKERS` nodes**, as any run's (`JOIN_LADDER_BEFORE=0` skips it and
+   needs `JOIN_RATE`).
+2. **The join round**, one long round in two cohorts, each its own mqtt-load process per
+   generator with its own ledger:
+   - **Cohort A** is the workload at `JOIN_RATE` msg/s (default `JOIN_LOAD`, 0.8, of the
+     ladder's maximum lossless) on the first `BROKERS`: `JOIN_WARMUP` s of warm-up (30;
+     locally 10) and `JOIN_MEASURE` s measured (900; locally 120).
+   - **The join:** `JOIN_AT` s into A's measured time (180; locally 30) the K brokers join
+     one at a time. In the cloud, `bootstrap-cluster.sh` with `JOIN_FROM=<BROKERS>` gives
+     each joiner a node certificate from the running cluster's CA, the same gossip key,
+     two running members as seeds and the readiness floor at the new size's majority,
+     starts it and polls its `/readyz` on its own host. Locally it is
+     `local-cluster.sh join`. The next joiner starts only once the cluster is **fully
+     formed** (`../cluster-formed.py` on every member: every member alive and none
+     suspect, a full peer mesh, the voter set): a joiner is ready at its majority floor
+     seconds before the others have it in their membership, and a joiner started then
+     overlaps the one before. The members already running are not touched. Each
+     joiner's start and readiness (unix ms, its own clock) and the cluster's formation
+     with it (this machine's clock) go to `joins.tsv`.
+   - **Cohort B:** `JOIN_B_DELAY` s after the cluster has formed with the last joiner (60;
+     locally 10), new
+     sites at `JOIN_RATE_B` msg/s connect to the new brokers only. The default is
+     `JOIN_RATE × K / BROKERS`: as much on each new broker as cohort A puts on each old
+     one, with as many members per new broker. Cohort B runs until cohort A ends.
+   - **Reconnects:** both cohorts' clients reconnect (mqtt-load `--reconnect`, within
+     `RECONNECT_GIVE_UP` s, 20). A cluster that moves a session to a new broker closes its
+     connection with DISCONNECT 0x9C, Use another server (ADR 0005), and the consumer
+     comes back to resume it. While a session moves, the brokers cannot append a publish
+     for it ("not the owning node"); the publisher's ack is then withheld and its
+     connection closed, so that it sends again (fail closed, ADR 0041 T5). The publisher,
+     a clean session, reconnects and sends again every message still in flight, as an
+     edge that keeps what was not acknowledged does.
+3. **The ladder on all `BROKERS + K` nodes**, starting from the first ladder's maximum
+   lossless, or `JOIN_RATE + JOIN_RATE_B` without one (`JOIN_LADDER_AFTER=0` skips it). Its
+   steps deal their sites over every broker. It is in `<run>/after-join/<workload>/`.
+
+```sh
+# Free: 3 local nodes, a short ladder, 2 more nodes joining under load, a ladder on 5.
+JOIN_BROKERS=2 TIER=local WORKLOADS=plant-qos1 ./run.sh
+# PAID: the power-plant fleet on AWS, 3 nodes growing to 5.
+CLOUD=aws AWS_PROFILE=mqttd-bench MQTTD_LOCAL_BIN=... BROKER_TYPE=ccx43 JOIN_BROKERS=2 \
+  EXTRA_BROKER_ENV="MQTTD_RECEIVE_MAXIMUM=4096" TIER=h3 WORKLOADS=plant-qos1 ./run.sh
+```
+
+`verdict.py join <run>/join/<workload>` judges the round from the brokers' side, like a
+step. It writes `verdict.json`, and the report gives the round after the ladders:
+
+- **FAILED:** the cluster did not grow (a joiner never became ready, even after one
+  restart), a broker dropped a message as loss or restarted, a durable session did not
+  survive its move (its consumer came back and the broker had no session), or a cohort's
+  ledger lost an acknowledged message.
+- **VOID:** the evidence is missing or the harness's own: no summary, a saturated
+  generator, a broker with no scrapes, or a cluster not settled when the round began.
+- **DISCONNECTED:** a connection was lost for good: a publisher or a consumer that did
+  not get back within its budget.
+- **NOT DRAINED:** as for a step.
+- **OFFER NOT TAKEN:** in the round's last phase (with cohort B, or after the join
+  without it) the brokers took less than 99% of what both cohorts offered (`OFFER_TAKEN`,
+  as for a step). The grown cluster did not carry the load it grew for.
+- **HELD:** none of these.
+
+Latency is reported, not judged. The report gives it per phase: **before** the join,
+**joining** (from the first joiner's start to 30 s after the cluster formed with the last),
+**after**,
+and **with cohort B**. Each phase has the cohorts' offered and received msg/s, the median
+and worst window's ack p99, the brokers' received msg/s with how many brokers were rated,
+and the reconnects of consumers and publishers. Below that come each cohort's reconnects
+by reason with their gap p99 and max, the messages its publishers sent again, the sessions
+the brokers closed to move them
+(`mqttd_session_rehomes_total`), and each broker's sessions and connections at the end of
+the measured time.
+
 ## Output
 
 `<run>/report.md` and `<run>/report.json` (`mqtt-rig2.report.v1`). Per step: the rounds
@@ -526,6 +605,11 @@ YELLOW (≤ 5 s) and RED bands; each mean carries an error bar from the rounds' 
 their max (the legend and subtitle say so). Carried steps are filled points, FAILED /
 OFFER NOT TAKEN / DISCONNECTED hollow red rings, VOID dashed grey rings; the maximum
 lossless step is labelled, and the title states it.
+
+A join run adds `<run>/join/<workload>/`: `join.json` (the rates, the timeline and its
+settings), `joins.tsv`, `a/` and `b/` (each cohort's generator summaries), `scrapes/` (every
+broker's, a joiner's from its start), `join.log` (the join's own output) and
+`verdict.json`.
 
 ## Not yet
 

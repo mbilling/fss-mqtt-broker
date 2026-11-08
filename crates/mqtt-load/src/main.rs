@@ -122,6 +122,17 @@ struct Cli {
     #[arg(long)]
     keep_sessions: bool,
 
+    /// Consumers reconnect and resume their session when the broker closes their
+    /// connection (a cluster moving a session closes it with 0x9C). Off, a lost
+    /// connection is the run's error. Publishers never reconnect.
+    #[arg(long)]
+    reconnect: bool,
+
+    /// How long a consumer keeps trying to reconnect, seconds (shorter than
+    /// --session-expiry for durable consumers).
+    #[arg(long, default_value_t = 20.0)]
+    reconnect_give_up: f64,
+
     /// Client id prefix. Default: mqload-<run id>.
     #[arg(long)]
     client_prefix: Option<String>,
@@ -304,6 +315,11 @@ fn config(cli: Cli, threads: usize) -> Result<(Config, Option<PathBuf>), String>
     c.sessions = cli.sessions;
     c.session_expiry = cli.session_expiry;
     c.keep_sessions = cli.keep_sessions;
+    c.reconnect_within_ns = if cli.reconnect {
+        Some(secs_ns(cli.reconnect_give_up)?)
+    } else {
+        None
+    };
     c.client_prefix = cli.client_prefix;
     c.keepalive = cli.keepalive;
     c.username = cli.username;
