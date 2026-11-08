@@ -1779,6 +1779,9 @@ not a spec defect ([CLIENT-GUIDE](CLIENT-GUIDE.md#shared-subscriptions),
 ADR 0010/0015 as-delivered notes). For source QoS 0, a known-full local outbound
 can now be bypassed before enqueue (#482), using the same packet/byte bounds as
 the send path. If no alternative exists it still sheds and counts `outbound-full`.
+At any QoS, so is a member whose durable-append lane is full (#1219), as a session's
+lane fills while its group moves to a joining node: with no alternative the publish
+fails closed and counts `append-backlog-full`, as before.
 This is not downstream credit: remote capacity is unknown, and bridge live queues
 are not covered by the disconnected-spool cap. Track subscriber/downstream receipts,
 not enqueue/forward-attempt counters; [evidence and limits](benchmarks/SHARED-CAPACITY.md).
@@ -1958,7 +1961,7 @@ the human-readable superset.
 
 **Rule:** `mqttd_append_lane_jobs` growing sustained (warn); `rate(mqttd_publish_dropped_total{reason="append-backlog-full"}[5m]) > 0` (page) — also in the chart `PrometheusRule` (`deploy/helm/mqttd/templates/prometheusrule.yaml`) when `metrics.prometheusRule.enabled` is true.
 
-**When it fires / what to do:** A session's placement group is not keeping up (degraded follower set: each append or QoS 2 outbound-id record is bounded by the 5s replication RPC timeout, FIFO per session — 256 queued jobs max per session, then the NEWEST publish is withheld so its publisher retries; a detach spill past the cap+headroom sheds into this same counter). Only that group's sessions are affected — connects, subscribes and other groups' publishes keep flowing (issue #242). The degraded-group signals are per-session ones: this gauge/counter pair, `rate(mqttd_publish_dropped_total{reason="outbound-id-write-failed"}[5m])` (a QoS 2 outbound-id record write failed; the delivery is re-queued and retried on the next drain), and end-to-end QoS 2 delivery latency to that group's subscribers — NOT hub dispatch tails, which stay flat by design. Find the degraded group's followers: `mqttd_replica_groups_tracked - mqttd_replica_groups_current`, `mqttd_durable_append_failures_total`, and the *Durable writes refused* row
+**When it fires / what to do:** A session's placement group is not keeping up (degraded follower set: each append or QoS 2 outbound-id record is bounded by the 5s replication RPC timeout, FIFO per session — 256 queued jobs max per session, then the NEWEST publish is withheld so its publisher retries; a detach spill past the cap+headroom sheds into this same counter). A `$share` group passes a full member's turn to a member with room (issue #1219), so for a shared subscription this counts a delivery only when no member could take it, or when a peer dealt it to a member here (the peer's publisher is withheld and retries). Only that group's sessions are affected — connects, subscribes and other groups' publishes keep flowing (issue #242). The degraded-group signals are per-session ones: this gauge/counter pair, `rate(mqttd_publish_dropped_total{reason="outbound-id-write-failed"}[5m])` (a QoS 2 outbound-id record write failed; the delivery is re-queued and retried on the next drain), and end-to-end QoS 2 delivery latency to that group's subscribers — NOT hub dispatch tails, which stay flat by design. Find the degraded group's followers: `mqttd_replica_groups_tracked - mqttd_replica_groups_current`, `mqttd_durable_append_failures_total`, and the *Durable writes refused* row
 
 ### Alert: Ingress credit saturated
 

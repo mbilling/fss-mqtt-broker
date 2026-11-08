@@ -196,6 +196,17 @@ pub(super) struct AppendLane {
     pub(super) outstanding: usize,
 }
 
+impl AppendLane {
+    /// Whether one more DELIVERY job would be admitted now: the channel holds fewer
+    /// than [`LANE_QUEUE_CAP`] jobs, its last [`LANE_CONTROL_HEADROOM`] slots being
+    /// kept for control jobs. The one definition, read by
+    /// [`Hub::submit_lane_job`] to admit a job and by the `$share` deal to pass a
+    /// full member's turn on before anything is enqueued (issue #1219).
+    pub(super) fn admits_delivery(&self) -> bool {
+        self.tx.capacity() > LANE_CONTROL_HEADROOM
+    }
+}
+
 /// A peer verdict aggregate: one `RemotePublishAcked`/`RemoteSharedDeliverAcked`
 /// fan-out's lane jobs, keyed `(origin, seq)`. The verdict is answered only when the
 /// last job lands — a peer is never told `Stored` before the store actually stored
@@ -955,8 +966,7 @@ impl Hub {
             // Delivery jobs are admitted only while channel occupancy is under
             // LANE_QUEUE_CAP — the remaining LANE_CONTROL_HEADROOM slots belong to
             // control jobs (discard/spill), which bypass this check.
-            lane.tx.capacity() > LANE_CONTROL_HEADROOM
-                && lane.tx.try_send(LaneJob::Deliver(Box::new(job))).is_ok()
+            lane.admits_delivery() && lane.tx.try_send(LaneJob::Deliver(Box::new(job))).is_ok()
         };
         if !admitted {
             warn!(

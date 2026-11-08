@@ -848,12 +848,11 @@ impl Hub {
             })
         });
         for mut plan in self.plan_shared(topic) {
-            if let Some(bytes) = qos0_bytes {
-                // At COMMIT time: a preceding matching group may have consumed
-                // this member's last slot since all groups were planned. Never
-                // retry a send; change the target only BEFORE any enqueue.
-                self.replan_qos0_shared(topic, &mut plan, bytes);
-            }
+            // At COMMIT time: a preceding matching group may have consumed this
+            // member's last slot since all groups were planned — in its outbound
+            // queue (`QoS` 0, #482) or in its append lane (issue #1219). Never retry
+            // a send; change the target only BEFORE any enqueue.
+            self.replan_shared_under_pressure(topic, &mut plan, qos0_bytes);
             // COMMIT the plan: advance the cursor exactly as `select_shared` would
             // have — including when no member was choosable (the rotation was spent).
             // Update in place. `HashMap::insert` keeps the OLD key and drops the
@@ -1065,6 +1064,11 @@ impl Hub {
                 // exhausted and the publisher hears the last answer, as it did when
                 // a lost link removed the member from the group.
                 .filter(|c| !only_now || self.shared_member_can_take_it_now(c))
+                // Nor to a member here whose append lane is full (issue #1219): the
+                // delivery would be rejected at submit and fail the publish closed,
+                // as a first placement no longer does while the group has a member
+                // with room.
+                .filter(|c| c.node.is_some() || self.lane_admits_delivery(&c.client))
                 .collect();
             let Some(chosen) = self.select_shared(&key, &candidates) else {
                 debug!(
@@ -1634,19 +1638,48 @@ impl Hub {
     }
 
     /// Keep the O(1) local-online selection when it has room; only a known-full
-    /// local `QoS` 0 target enters the pressure path. Closed targets still take the
-    /// existing send/reap path (#504). No `QoS` 1/2 obligations or wire retries change.
-    fn replan_qos0_shared(&self, topic: &str, plan: &mut SharedPlan, bytes: usize) {
+    /// local target enters the pressure path, before anything is enqueued:
+    ///
+    /// - **an append lane at its cap** (issue #1219), for any delivery: a durable
+    ///   one would be rejected at submit, failing its publish closed — the
+    ///   publisher's ack withheld, its connection closed so it sends again — and
+    ///   one that rides the lane only for order (`QoS` 0, or a clean session behind
+    ///   earlier appends) would be shed. A lane fills when its session's appends
+    ///   stall, as they do while the session's group moves to a joining node;
+    /// - **a full outbound queue** for a `QoS` 0 delivery (`qos0_bytes`, #482).
+    ///
+    /// Either way the group's turn passes to a member that can take the message
+    /// now. With none, the original target keeps its one counted outcome. Closed
+    /// targets still take the existing send/reap path (#504). No obligation or wire
+    /// retry changes: the plan only names a different member, as its rotation could
+    /// have.
+    fn replan_shared_under_pressure(
+        &self,
+        topic: &str,
+        plan: &mut SharedPlan,
+        qos0_bytes: Option<usize>,
+    ) {
         let Some(chosen) = &plan.chosen else { return };
         if chosen.node.is_some() {
             return; // Remote capacity is unknown: this is not a distributed credit scheme.
         }
+        // One lookup on the common path of a `QoS` ≥ 1 delivery: a lane with room
+        // and no outbound bound to check ends it.
+        let lane_room = self.lane_admits_delivery(&chosen.client);
+        if lane_room && qos0_bytes.is_none() {
+            return;
+        }
         let Some(online) = self.online.get(&chosen.client) else {
             return;
         };
-        if online.tx.is_closed() || self.qos0_outbound_has_room(&online.tx, bytes) {
+        let outbound_room =
+            |tx: &Outbound| qos0_bytes.is_none_or(|bytes| self.qos0_outbound_has_room(tx, bytes));
+        if online.tx.is_closed() || (lane_room && outbound_room(&online.tx)) {
             return;
         }
+        let room = |client: &ClientId, tx: &Outbound| {
+            self.lane_admits_delivery(client) && outbound_room(tx)
+        };
         let existing = self.shared_cursor.get(&plan.key_hash);
         let (key, start) = if let Some(key) = &plan.key_if_new {
             (key, 0)
@@ -1659,11 +1692,21 @@ impl Hub {
         // Use the OLD cursor, not plan.next_cursor: the local fast path reduces
         // next_cursor modulo local membership. That would reset every fallback
         // to the first remote and strand the other remote members under pressure.
-        if let Some((chosen, next)) = self.qos0_shared_alternative(topic, key, start, bytes) {
+        if let Some((chosen, next)) = self.shared_alternative(topic, key, start, room) {
             plan.chosen = Some(chosen);
             plan.next_cursor = next;
         }
-        // No alternative: keep the original target and its ONE counted shed.
+        // No alternative: keep the original target and its ONE counted outcome — a
+        // shed for `QoS` 0, a withheld publish for a durable delivery.
+    }
+
+    /// Whether `client`'s append lane would admit one more delivery job (issue #1219):
+    /// it has no lane yet, or its lane [admits one](super::lanes::AppendLane::admits_delivery).
+    /// A member another shard owns has no lane on this shard; its own shard decides.
+    pub(super) fn lane_admits_delivery(&self, client: &ClientId) -> bool {
+        self.append_lanes
+            .get(client)
+            .is_none_or(super::lanes::AppendLane::admits_delivery)
     }
 
     fn qos0_outbound_has_room(&self, tx: &Outbound, bytes: usize) -> bool {
@@ -1674,16 +1717,18 @@ impl Hub {
                 .is_none_or(|cap| tx.bytes().saturating_add(bytes) <= cap)
     }
 
-    /// A bounded scan of this group's members, paid only on known pressure.
-    /// Borrow candidates and clone just the chosen member, as in `plan_shared`.
-    /// Remote liveness is only a hint; require a usable link, but do not claim
-    /// knowledge of its consumer's capacity and do not replay ambiguous sends.
-    fn qos0_shared_alternative(
+    /// A bounded scan of this group's members, paid only on known pressure, for one
+    /// that can take the delivery now: a local member online with `room`, or a
+    /// remote member behind a usable link. Borrow candidates and clone just the
+    /// chosen member, as in `plan_shared`. Remote liveness is only a hint; require a
+    /// usable link, but do not claim knowledge of its consumer's capacity and do not
+    /// replay ambiguous sends.
+    fn shared_alternative(
         &self,
         topic: &str,
         key: &SharedKey,
         start: usize,
-        bytes: usize,
+        room: impl Fn(&ClientId, &Outbound) -> bool,
     ) -> Option<(SharedCandidate, usize)> {
         // ONE locality decision for this message (issue #613 item 3.4), used by the
         // local-first block, the final choice and the rotation modulus below.
@@ -1705,9 +1750,10 @@ impl Hub {
                     node: None,
                     client,
                     qos: *qos,
-                    online: self.online.get(client).is_some_and(|s| {
-                        !s.tx.is_closed() && self.qos0_outbound_has_room(&s.tx, bytes)
-                    }),
+                    online: self
+                        .online
+                        .get(client)
+                        .is_some_and(|s| !s.tx.is_closed() && room(client, &s.tx)),
                 });
             }
         }
