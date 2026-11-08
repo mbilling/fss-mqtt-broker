@@ -1550,7 +1550,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 922 test(s)
+## `crates/mqttd/src/lib.rs` — 926 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -2210,6 +2210,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::shared_capacity::qos0_shared_pressure_can_escape_locality_and_rotates_remote_members`
 - `hub::tests::shared_capacity::qos0_shared_uses_spare_local_capacity_at_both_outbound_bounds`
 - `hub::tests::shared_delivery_prefers_online_over_offline_member`
+- `hub::tests::shared_lanes::a_qos0_share_delivery_passes_over_a_member_whose_append_lane_is_full`
+- `hub::tests::shared_lanes::a_share_delivery_a_peer_refused_is_not_moved_onto_a_member_whose_lane_is_full`
+- `hub::tests::shared_lanes::a_share_group_whose_every_member_lane_is_full_still_fails_the_publish_closed`
+- `hub::tests::shared_lanes::a_share_member_whose_append_lane_is_full_passes_its_turn_to_one_with_room`
 - `hub::tests::shared_message_queues_for_offline_persistent_member`
 - `hub::tests::shared_selection_order_is_stable_across_two_peers`
 - `hub::tests::shared_selection_round_robins_local_and_remote_member`

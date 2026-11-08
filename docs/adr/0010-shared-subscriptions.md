@@ -128,7 +128,8 @@ can now be bypassed before enqueue in favour of another online member of the
 same group. Local room is checked against the packet and byte limits; remote
 capacity remains unknown. No post-send retry or QoS 1/2 policy change. See
 [ADR 0015's pressure-admission note](0015-cluster-shared-subscriptions.md) for the
-exact boundary and remaining downstream-scaling work.
+exact boundary and remaining downstream-scaling work. Since issue #1219 a member
+whose durable-append lane is full is bypassed the same way, at any QoS.
 
 ## Alternatives considered
 
