@@ -111,6 +111,18 @@ past the alternative, including across remote members. With no alternative, the
 original send path records one `outbound-full` drop. No retry occurs after a send,
 and QoS 1/2 selection and durability obligations are unchanged.
 
+**Append-lane pressure (2026-11-08, issue #1219).** The same commit-time check, for
+any QoS: a locally selected member whose durable-append lane is at its cap (256 jobs)
+is replaced, the same way, by a member that can take the message now. Before, the
+lane rejected the delivery at submit, counted `append-backlog-full`, and failed the
+publish closed — the publisher's ack withheld, its connection closed so it sent again —
+though the group had members with room. A lane fills when its session's appends stall,
+as they do while its group moves to a joining node: the 8 → 12 join of AWS run
+`h3-20261106T194402Z` counted 5,918 such rejections in one burst on four brokers. The
+re-selection after a peer refused a delivery (0041-T12) passes over such a member too.
+With no member that can take it, the publish still fails closed and is counted. A
+member on a peer is not checked: its node answers `Failed`, and the publisher retries.
+
 The normal local-online path stays O(1) in group size; pressure triggers a bounded
 member scan. This is **not remote capacity credit or downstream flow control**:
 remote capacity is unknown, a forwarded QoS 0 message can still be dropped at its

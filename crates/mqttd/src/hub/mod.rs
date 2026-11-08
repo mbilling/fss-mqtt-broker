@@ -10403,6 +10403,7 @@ mod tests {
     mod sharded;
     mod share_obligations;
     mod shared_capacity;
+    mod shared_lanes;
     mod truncate_flusher;
     mod unreadable_session;
     /// A committed retained snapshot entry with no application properties — the
