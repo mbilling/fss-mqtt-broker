@@ -1,6 +1,6 @@
 # Python dependencies of the interop conformance suite (scripts/interop/paho_conformance.py).
 # Hash-pinned: CI installs with `pip install --require-hashes -r`, so a changed artifact
 # on PyPI fails the install instead of running. Dependabot (pip ecosystem) proposes bumps.
-paho-mqtt==2.1.0 \
-    --hash=sha256:6db9ba9b34ed5bc6b6e3812718c7e06e2fd7444540df2455d2c51bd58808feee \
-    --hash=sha256:12d6e7511d4137555a3f6ea167ae846af2c7357b10bc6fa4f7c3968fc1723834
+paho-mqtt==2.2.0 \
+    --hash=sha256:3243630f7c2b05f71d1de8c6f59865eb04d3a59ae8c866e92377faed6753db4d \
+    --hash=sha256:bcf706f03f1f49e0fc3ae166dc7b67ee35463496f8bdfd7c9c36181f6ba635c9
