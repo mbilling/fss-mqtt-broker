@@ -72,6 +72,19 @@ not a guess: a restart mid-catch-up resumes or restarts the back-fill, never fak
 completion. This closes the hollow-replica hazard and, with it, the laptop-data case —
 growing 1→N back-fills the single-replica history as a plain instance of the same rule.
 
+**Amended (2026-11-17, issue #1218): recovery reads count only the copies that vouch.**
+Recovery counted every answer toward its read quorum, the recovering owner's own copy
+included, and asked only that one of them be complete (P1's anchor). A joiner leading the
+group then made up the quorum with its own empty copy and ONE complete copy, and a complete
+copy can lack a committed write: a replica that missed the write but applied the truncate
+after it is gap-free and empty. At R=3 a resume then answered session present 0 while
+another replica still held the session. `recover_key` now reads until the complete copies
+form a quorum by themselves, as this section says; that never stops the reads earlier than
+the anchor did. Two gaps remain. When the complete copies cannot form a quorum (a replica
+down while a joiner leads), the merge still rests on the complete copies there are. And the
+catch-up sweep stamps a copy current when it has no gap, even if it is stale. At the default
+R=2 every commit is on both copies, so neither the defect nor the change arises there.
+
 ### 2. Ring changes migrate eagerly, not on first touch
 
 A membership change triggers the same eager materialization the harness forced for

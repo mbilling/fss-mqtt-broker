@@ -629,14 +629,18 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
         }
     }
 
-    /// Recover `key`'s committed log by reading a quorum of the replica set: this
-    /// node's own follower copy plus the reachable peers'. Errors with
-    /// [`ReplError::NoQuorum`] if fewer than a quorum can be read (recovery is unsafe
-    /// — a committed entry might live only on an unread replica), or if no read in
-    /// the merge is **complete** (ADR 0043 P1): a quorum assembled entirely from
-    /// hollow joiners — replicas that entered the set mid-history and hold entries
-    /// above a hole — could silently truncate the history none of them received.
-    /// At least one gap-free copy must anchor the merge.
+    /// Recover `key`'s committed log by reading the replica set: this node's own
+    /// follower copy plus the reachable peers'. The reads stop once the copies that
+    /// vouch for the key's history form a quorum by themselves (ADR 0043 §1, issue
+    /// #1218); a copy vouches when it is **complete**, gap-free and caught up for this
+    /// set. Errors with [`ReplError::NoQuorum`] if fewer than a quorum of replicas
+    /// answer (recovery is unsafe — a committed entry might live only on an unread
+    /// replica). A quorum of answers in which no copy is complete (ADR 0043 P1) falls
+    /// back to the roster sweep (#390): a quorum assembled entirely from hollow
+    /// joiners — replicas that entered the set mid-history and hold entries above a
+    /// hole — could silently truncate the history none of them received. When every
+    /// replica has answered and the complete copies still fall short of a quorum, the
+    /// merge rests on the complete copies there are.
     async fn recover_key(
         &self,
         key: &str,
@@ -647,9 +651,15 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
         // 0080 §4) can ask for a majority of the prefix as well as of the whole.
         let position = |node: &NodeId| replica_set.iter().position(|n| n == node);
         let mut read_from: Vec<usize> = Vec::new();
-        let enough = |reads: &[crate::cluster_log::ReplicaRead], read_from: &[usize]| {
-            quorum.met_by(read_from.iter().copied()) && reads.iter().any(|r| r.complete)
-        };
+        // The positions whose copy vouches for the key's history: the only ones the
+        // quorum counts (ADR 0043 §1). Counting every answer let a joiner that leads
+        // the group make up the quorum with its own empty copy and ONE complete copy,
+        // and a complete copy can still lack a committed write: a replica that missed
+        // the write but applied the truncate after it is gap-free and empty. A resume
+        // then answered session present 0 while another replica held the session
+        // (issue #1218).
+        let mut vouching: Vec<usize> = Vec::new();
+        let enough = |vouching: &[usize]| quorum.met_by(vouching.iter().copied());
         let group = group_of_key(key);
         // Local copy first (sync; the guard is dropped before any await). Each read
         // carries the replica's truncation low-water so the merge cannot resurrect an
@@ -670,11 +680,16 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
                 entries: r.epoch_entries(key),
             }
         }];
+        if reads[0].complete {
+            vouching.extend(position(&self.local));
+        }
         // Read peers **concurrently** (like the append fan-out) and stop as soon as
-        // enough have responded — a quorum, at least one of it complete — so a slow
-        // or just-died replica's RPC timeout does not serialize recovery when quorum
-        // is reachable from faster replicas.
-        if !enough(&reads, &read_from) {
+        // the copies that vouch form a quorum, so a slow or just-died replica's RPC
+        // timeout does not serialize recovery when such a quorum is reachable from
+        // faster replicas. A quorum of vouching copies is also a quorum of answers
+        // with a complete copy among them, so the reads never stop before that
+        // weaker rule would have stopped them.
+        if !enough(&vouching) {
             let mut inflight = tokio::task::JoinSet::new();
             for (i, replica) in replica_set.iter().enumerate() {
                 if *replica == self.local {
@@ -685,9 +700,12 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
                 let key = key.to_string();
                 inflight.spawn(async move { (i, transport.read_replica(&replica, &key).await) });
             }
-            while !enough(&reads, &read_from) {
+            while !enough(&vouching) {
                 match inflight.join_next().await {
                     Some(Ok((i, Some(read)))) => {
+                        if read.complete {
+                            vouching.push(i);
+                        }
                         reads.push(read);
                         read_from.push(i);
                     }
@@ -2379,6 +2397,117 @@ mod tests {
         stamp_current(&replicas, &placement.read().unwrap());
         assert_eq!(log.read(&qkey, 0, 100).await.unwrap().len(), 0);
         assert_eq!(log.append(&qkey, b"m1".to_vec()).await.unwrap(), 1);
+    }
+
+    /// ADR 0043 §1, issue #1218: a copy that has not caught up counts toward no quorum,
+    /// recovery reads included. The lease has moved to a joiner, whose own copy is empty
+    /// and was never stamped current. f1 is gap-free but missed the session record's
+    /// last write: it applied the truncate that followed it, so it holds nothing above
+    /// its low-water. f2 holds the record. A read that counts the joiner's own copy stops
+    /// at the joiner and f1, takes f1's empty copy for the whole history, and the resume
+    /// answers session present 0 while f2 still holds the session. Only f1 and f2 can
+    /// vouch for the history, so the read has to wait for both. The clock is paused,
+    /// so f2's delay is virtual and its answers always come after f1's.
+    #[tokio::test(start_paused = true)]
+    async fn a_joiners_own_copy_does_not_make_up_a_recovery_quorum() {
+        use mqtt_storage::SessionClaim;
+        let owner = nid("owner");
+        // A 3-node ring (R=3, quorum=2): owner + two followers.
+        let mut p = Placement::new(owner.clone(), DEFAULT_REPLICAS);
+        p.observe(&nid("f1"), MemberState::Alive, "f1:7000", None);
+        p.observe(&nid("f2"), MemberState::Alive, "f2:7000", None);
+        let placement = Arc::new(RwLock::new(p));
+        let (_group, client) = owned_group_and_client(&placement.read().unwrap());
+        let mkey = format!("m/{}", client.0);
+        let subscription = mqtt_core::Subscription {
+            filter: "plant/#".into(),
+            max_qos: QoS::AtLeastOnce,
+            no_local: false,
+            sub_id: None,
+        };
+
+        // Before the move, at epoch 3: the session is created (offset 1) and subscribes
+        // (offset 2, truncating 1). Every copy applies every write.
+        let f2_state = Arc::new(Mutex::new(ReplicaState::new()));
+        {
+            let transport = Arc::new(PeerReplicaTransport::new());
+            for (node, state) in [
+                (nid("f1"), Arc::new(Mutex::new(ReplicaState::new()))),
+                (nid("f2"), f2_state.clone()),
+            ] {
+                let (tx, rx) = mpsc::unbounded_channel();
+                transport.register(node, tx);
+                spawn_follower(transport.clone(), state, rx);
+            }
+            let before = ReplicatedSessionStore::new(GroupRoutedLog::new(
+                owner.clone(),
+                placement.clone(),
+                transport,
+                FixedLease(3),
+                Arc::new(Mutex::new(ReplicaState::new())),
+            ));
+            assert_eq!(
+                before.claim_session(&client, "alice").await.unwrap(),
+                SessionClaim::Granted { present: false }
+            );
+            before
+                .set_subscriptions(&client, std::slice::from_ref(&subscription))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            f2_state.lock().unwrap().entries(&mkey).len(),
+            1,
+            "f2 holds the session record"
+        );
+
+        // After the move, at epoch 7. f1 missed the record's last write but applied the
+        // truncate after it: its copy is empty above low-water 1, which passes for
+        // complete. f2 answers after f1, as a busier replica does.
+        let transport = Arc::new(PeerReplicaTransport::new());
+        let mut f1 = ReplicaState::new();
+        assert!(f1.apply(
+            3,
+            &ReplOp::Truncate {
+                key: mkey.clone(),
+                up_to: 1,
+            }
+        ));
+        assert!(f1.complete(&mkey) && f1.entries(&mkey).is_empty());
+        let (f1_tx, f1_rx) = mpsc::unbounded_channel();
+        transport.register(nid("f1"), f1_tx);
+        spawn_follower(transport.clone(), Arc::new(Mutex::new(f1)), f1_rx);
+        let (f2_tx, mut f2_link) = mpsc::unbounded_channel();
+        transport.register(nid("f2"), f2_tx);
+        let (f2_in, f2_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(msg) = f2_link.recv().await {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                if f2_in.send(msg).is_err() {
+                    break;
+                }
+            }
+        });
+        spawn_follower(transport.clone(), f2_state.clone(), f2_rx);
+        // The new owner's own copy: empty and never stamped current, a joiner's.
+        let after = ReplicatedSessionStore::new(GroupRoutedLog::new(
+            owner.clone(),
+            placement.clone(),
+            transport,
+            FixedLease(7),
+            Arc::new(Mutex::new(ReplicaState::new())),
+        ));
+
+        assert_eq!(
+            after.claim_session(&client, "alice").await.unwrap(),
+            SessionClaim::Granted { present: true },
+            "the resume finds the session f2 holds"
+        );
+        assert_eq!(
+            after.subscriptions(&client).await.unwrap().len(),
+            1,
+            "and its subscription"
+        );
     }
 
     /// ADR 0043 P1: recovery refuses a quorum assembled entirely from HOLLOW copies.
