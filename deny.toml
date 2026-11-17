@@ -4,9 +4,17 @@
 [advisories]
 version = 2
 yanked = "deny"
-# No ignores: the last one (RUSTSEC-2025-0141, bincode 1.x) was closed by the
-# postcard codec succession (ADR 0052).
-ignore = []
+# The last ignore before this one (RUSTSEC-2025-0141, bincode 1.x) was closed by
+# the postcard codec succession (ADR 0052).
+#
+# RUSTSEC-2026-0543 says chrono is unmaintained: an informational advisory with no
+# vulnerability and no patched version. mqtt-rules uses chrono for its date
+# functions and openraft 0.9 depends on it, so no lockfile change removes it.
+# Replacing it in mqtt-rules (jiff or time) and moving openraft off it closes
+# this ignore.
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, with no patched version; mqtt-rules and openraft 0.9 depend on it" },
+]
 
 [bans]
 multiple-versions = "warn"
