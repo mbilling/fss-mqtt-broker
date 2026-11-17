@@ -46,7 +46,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/history-check/src/main.rs` — 0 test(s)
 
 
-## `crates/mqtt-auth/src/lib.rs` — 134 test(s)
+## `crates/mqtt-auth/src/lib.rs` — 135 test(s)
 
 - `acl::tests::a_bad_client_id_does_not_disturb_rules_that_never_use_it`
 - `acl::tests::a_bare_percent_is_literal`
@@ -173,6 +173,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `token::tests::empty_sub_is_rejected`
 - `token::tests::expired_token_is_rejected`
 - `token::tests::groups_are_parsed_from_the_default_claim`
+- `token::tests::hs256_refuses_an_empty_secret`
 - `token::tests::missing_sub_is_rejected`
 - `token::tests::non_token_credentials_are_not_permitted`
 - `token::tests::rs256_pem_parses_a_valid_public_key`

@@ -397,7 +397,7 @@ mod tests {
         let token = jsonwebtoken::encode(
             &Header::new(Algorithm::HS256),
             &good_claims(),
-            &EncodingKey::from_secret(b"whatever"),
+            &EncodingKey::from_secret(b"whatever").expect("a non-empty secret"),
         )
         .unwrap();
         assert!(matches!(
