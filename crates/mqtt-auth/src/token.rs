@@ -83,9 +83,14 @@ impl TokenAuthenticator {
     }
 
     /// Build an HS256 verifier from a shared secret.
-    #[must_use]
-    pub fn hs256(secret: &[u8], config: TokenConfig) -> Self {
-        Self::build(DecodingKey::from_secret(secret), Algorithm::HS256, config)
+    ///
+    /// # Errors
+    /// [`AuthError::Backend`] if the secret is empty: an empty HMAC key would let
+    /// anyone sign a token.
+    pub fn hs256(secret: &[u8], config: TokenConfig) -> Result<Self, AuthError> {
+        let key = DecodingKey::from_secret(secret)
+            .map_err(|e| AuthError::Backend(format!("invalid HS256 secret: {e}")))?;
+        Ok(Self::build(key, Algorithm::HS256, config))
     }
 
     /// Build an RS256 verifier from a PEM-encoded public key.
@@ -163,14 +168,15 @@ mod tests {
         jsonwebtoken::encode(
             &Header::new(Algorithm::HS256),
             claims,
-            &EncodingKey::from_secret(SECRET),
+            &EncodingKey::from_secret(SECRET).expect("a non-empty secret"),
         )
         .expect("encode")
     }
 
     #[tokio::test]
     async fn valid_hs256_token_authenticates_with_sub_as_subject() {
-        let auth = TokenAuthenticator::hs256(SECRET, TokenConfig::default());
+        let auth =
+            TokenAuthenticator::hs256(SECRET, TokenConfig::default()).expect("a non-empty secret");
         let token = hs256_token(&json!({ "sub": "alice", "exp": now() + 3600 }));
         let id = auth
             .authenticate(&client(), &Credentials::Token(&token))
@@ -182,7 +188,8 @@ mod tests {
 
     #[tokio::test]
     async fn groups_are_parsed_from_the_default_claim() {
-        let auth = TokenAuthenticator::hs256(SECRET, TokenConfig::default());
+        let auth =
+            TokenAuthenticator::hs256(SECRET, TokenConfig::default()).expect("a non-empty secret");
         let token = hs256_token(&json!({
             "sub": "alice",
             "exp": now() + 3600,
@@ -201,7 +208,7 @@ mod tests {
             groups_claim: "roles".to_string(),
             ..TokenConfig::default()
         };
-        let auth = TokenAuthenticator::hs256(SECRET, config);
+        let auth = TokenAuthenticator::hs256(SECRET, config).expect("a non-empty secret");
         let token = hs256_token(&json!({
             "sub": "alice",
             "exp": now() + 3600,
@@ -218,11 +225,12 @@ mod tests {
 
     #[tokio::test]
     async fn tampered_or_wrong_secret_signature_is_rejected() {
-        let auth = TokenAuthenticator::hs256(SECRET, TokenConfig::default());
+        let auth =
+            TokenAuthenticator::hs256(SECRET, TokenConfig::default()).expect("a non-empty secret");
         let forged = jsonwebtoken::encode(
             &Header::new(Algorithm::HS256),
             &json!({ "sub": "alice", "exp": now() + 3600 }),
-            &EncodingKey::from_secret(b"a-different-secret"),
+            &EncodingKey::from_secret(b"a-different-secret").expect("a non-empty secret"),
         )
         .expect("encode");
         assert!(matches!(
@@ -234,7 +242,8 @@ mod tests {
 
     #[tokio::test]
     async fn expired_token_is_rejected() {
-        let auth = TokenAuthenticator::hs256(SECRET, TokenConfig::default());
+        let auth =
+            TokenAuthenticator::hs256(SECRET, TokenConfig::default()).expect("a non-empty secret");
         // exp well beyond the library's default 60s leeway.
         let token = hs256_token(&json!({ "sub": "alice", "exp": now() - 3600 }));
         assert!(matches!(
@@ -250,7 +259,7 @@ mod tests {
             issuer: Some("https://issuer.example".to_string()),
             ..TokenConfig::default()
         };
-        let auth = TokenAuthenticator::hs256(SECRET, config);
+        let auth = TokenAuthenticator::hs256(SECRET, config).expect("a non-empty secret");
         let token = hs256_token(&json!({
             "sub": "alice",
             "exp": now() + 3600,
@@ -269,7 +278,7 @@ mod tests {
             issuer: Some("https://issuer.example".to_string()),
             ..TokenConfig::default()
         };
-        let auth = TokenAuthenticator::hs256(SECRET, config);
+        let auth = TokenAuthenticator::hs256(SECRET, config).expect("a non-empty secret");
         let token = hs256_token(&json!({
             "sub": "alice",
             "exp": now() + 3600,
@@ -287,7 +296,7 @@ mod tests {
             audience: Some("broker".to_string()),
             ..TokenConfig::default()
         };
-        let auth = TokenAuthenticator::hs256(SECRET, config);
+        let auth = TokenAuthenticator::hs256(SECRET, config).expect("a non-empty secret");
         let token = hs256_token(&json!({
             "sub": "alice",
             "exp": now() + 3600,
@@ -306,7 +315,7 @@ mod tests {
             audience: Some("broker".to_string()),
             ..TokenConfig::default()
         };
-        let auth = TokenAuthenticator::hs256(SECRET, config);
+        let auth = TokenAuthenticator::hs256(SECRET, config).expect("a non-empty secret");
         let token = hs256_token(&json!({
             "sub": "alice",
             "exp": now() + 3600,
@@ -320,7 +329,8 @@ mod tests {
 
     #[tokio::test]
     async fn missing_sub_is_rejected() {
-        let auth = TokenAuthenticator::hs256(SECRET, TokenConfig::default());
+        let auth =
+            TokenAuthenticator::hs256(SECRET, TokenConfig::default()).expect("a non-empty secret");
         let token = hs256_token(&json!({ "exp": now() + 3600 }));
         assert!(matches!(
             auth.authenticate(&client(), &Credentials::Token(&token))
@@ -331,7 +341,8 @@ mod tests {
 
     #[tokio::test]
     async fn empty_sub_is_rejected() {
-        let auth = TokenAuthenticator::hs256(SECRET, TokenConfig::default());
+        let auth =
+            TokenAuthenticator::hs256(SECRET, TokenConfig::default()).expect("a non-empty secret");
         let token = hs256_token(&json!({ "sub": "", "exp": now() + 3600 }));
         assert!(matches!(
             auth.authenticate(&client(), &Credentials::Token(&token))
@@ -342,7 +353,8 @@ mod tests {
 
     #[tokio::test]
     async fn non_token_credentials_are_not_permitted() {
-        let auth = TokenAuthenticator::hs256(SECRET, TokenConfig::default());
+        let auth =
+            TokenAuthenticator::hs256(SECRET, TokenConfig::default()).expect("a non-empty secret");
         for creds in [
             Credentials::Anonymous,
             Credentials::Password {
@@ -371,6 +383,16 @@ mod tests {
     fn rs256_pem_rejects_garbage_pem() {
         assert!(matches!(
             TokenAuthenticator::rs256_pem(b"not a pem at all", TokenConfig::default()),
+            Err(AuthError::Backend(_))
+        ));
+    }
+
+    /// An empty HMAC key would let anyone sign a token: the verifier refuses to be built
+    /// (jsonwebtoken 12), and the broker's startup fails instead of accepting such tokens.
+    #[test]
+    fn hs256_refuses_an_empty_secret() {
+        assert!(matches!(
+            TokenAuthenticator::hs256(b"", TokenConfig::default()),
             Err(AuthError::Backend(_))
         ));
     }

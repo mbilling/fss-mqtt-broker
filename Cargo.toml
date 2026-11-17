@@ -105,9 +105,9 @@ serde_ignored = "0.1"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 # password hashing (ADR 0004 step 6): Argon2id, no fast hashes
 argon2 = "0.6"
-# JWT bearer-token verification (ADR 0004 step 6). v11 with the aws_lc_rs backend:
-# staged prep for the single-crypto-provider consolidation (ADR 0053) — v9 carried a
-# hard dependency on maintenance-mode ring.
+# JWT bearer-token verification (ADR 0004 step 6), with the aws_lc_rs backend: the
+# single crypto provider (ADR 0053); v9 carried a hard dependency on maintenance-mode
+# ring. v12 refuses an empty HMAC key, so an empty HS256 secret is a startup error.
 jsonwebtoken = { version = "12", features = ["aws_lc_rs"] }
 serde_json = "1"
 # TLS (ADR 0002, provider per ADR 0053): rustls on aws-lc-rs. TLS 1.3 is the only

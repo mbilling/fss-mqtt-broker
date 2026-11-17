@@ -2103,11 +2103,9 @@ fn authenticator_from_config(
     // `mqtt_core::secrets` so the on-disk file and an inline value agree.
     if let Some(path) = &config.security.jwt.hs256_secret_file {
         let secret = mqtt_core::read_secret_file(path)?;
+        let tok = mqtt_auth::token::TokenAuthenticator::hs256(&secret, jwt_config(config))?;
         info!(%path, "JWT HS256 verification enabled (secret from file)");
-        members.push(Arc::new(mqtt_auth::token::TokenAuthenticator::hs256(
-            &secret,
-            jwt_config(config),
-        )));
+        members.push(Arc::new(tok));
     } else if let Some(pem_path) = &config.security.jwt.rs256_pem_file {
         let pem = std::fs::read(pem_path)?;
         let tok = mqtt_auth::token::TokenAuthenticator::rs256_pem(&pem, jwt_config(config))?;
