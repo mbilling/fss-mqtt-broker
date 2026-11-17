@@ -4,6 +4,10 @@
 - **Date:** 2026-07-03 (accepted 2026-07-04 — all phases delivered)
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0037-durable-retained-messages.md](../delivery/0037-durable-retained-messages.md) — plan, progress, and changelog
+- **Amended:** [Amendment 1](#amendment-1-2026-11-05-eventual-by-default-strong-by-configuration)
+  (2026-11-05, issue [#1214](https://github.com/mbilling/fss-mqtt-broker/issues/1214)):
+  retained messages are `eventual` by default, and the decision below becomes the `strong`
+  mode, chosen by configuration
 - **Related:** [ADR 0014](0014-cross-node-retained.md) (the best-effort broadcast model this
   revises — its §3 gap-fill and the 0014-T7 divergence question are the motivation),
   [ADR 0006](0006-consensus-and-replication.md) / [ADR 0007](0007-durable-store-integration.md)
@@ -190,3 +194,245 @@ happens), a regression alarm, and — after the migration — the proof that con
   (§6).
 - **Fetch retained from the owner on subscribe.** Re-rejected for the same latency reasons
   as ADR 0014: it taxes the common subscribe path to serve the rare heal.
+
+## Amendment 1 (2026-11-05): eventual by default, strong by configuration
+
+> **Decided 2026-11-05** by the maintainer, after sizing a deployment that retains every
+> reading: "we should be AP by default for retained messages, but it should be possible to
+> configure CP for retained messages." Issue
+> [#1214](https://github.com/mbilling/fss-mqtt-broker/issues/1214).
+
+### Why
+
+This record's decision is a CP design. Its cost was accepted on the assumption that
+retained publishes are infrequent. What one retained publish costs in 1.3.0, read from the
+code:
+
+- **The publisher waits for it.** A QoS 1 retained publish's ack waits until the topic's
+  owner has committed the value with both copies (`hub/mod.rs`, `obligations_done`:
+  `!p.awaiting_retained`).
+- **One at a time per node.** A node keeps one hand-off of its own in flight, and one
+  commit slot that the mutations peers route to it share (`hub/retained.rs`,
+  `kick_retained_queue`). A commit is two replicated writes: the value, then its compaction
+  (`mqtt-storage/src/retained_log.rs`, `write`).
+- **Every node flushes every update on its hub loop.** The owner sends the committed value
+  to every peer. Each applies it on the hub loop through `PersistentRetainedStore::set`,
+  which is one redb transaction with an immediate fsync, and the loop waits for it
+  (`hub/mod.rs`, `RemoteRetainedUpdate`; `mqtt-storage/src/persistent_retained.rs`,
+  `persist`).
+- **The queue drops on every path.** Every mutation passes the 1,024-entry queue. When it
+  is full, the oldest mutation is dropped with its publish, which then never acks
+  (`hub/retained.rs`, `enqueue_retained_mutation`). It is not only §5's heal-time queue,
+  which is how SIZING.md describes it.
+
+That chain is about five flushes and three round trips for each commit. From it, a cluster
+carries a few hundred retained publishes a second, and as it nears that, every node's hub
+loop spends most of its time waiting on flushes. This is an estimate from the code's
+ordering; nothing has measured it. A power plant whose bridge retains every reading
+publishes 10,000 a second on its own.
+
+The brokers mqttd is compared with keep retained state available instead (read on
+2026-11-05). Mosquitto holds it in memory unless persistence is on, and then saves it every
+30 minutes by default, or every 5 seconds with its SQLite plugin. EMQX writes it to every
+core node without a transaction, in memory by default, and its autoheal restarts the
+minority side of a healed split. HiveMQ keeps 2 copies and describes its cluster as
+favouring availability. A last-value cache mostly needs this: the newest value, on every
+node, soon, kept through the loss of a node.
+
+### Decision
+
+**1. Two modes, one per cluster.** `cluster.retained_consistency`
+(`MQTTD_RETAINED_CONSISTENCY`) takes two values:
+
+- `eventual`, the default: points 2 to 5.
+- `strong`: this record's decision, §1 to §7, with point 6.
+
+The names are rule state's (ADR 0085): `eventual` means every node holds the data and the
+copies converge, and `strong` is the mode that waits. With durable sessions off (§6) there
+is no lease plane to be strong with, so retained keeps ADR 0014's behaviour whatever this
+is set to. Whether that path should move to `eventual` as well is left open.
+
+**2. Eventual: the write and its clock.** The node a retained publish lands on stamps the
+value with its paced logical clock, applies it to its own retained cache at once, and marks
+the topic changed for every peer. No other node is asked. The publisher's ack waits for
+point 4's local write and, as before, for the publish's durable deliveries. It never waits
+for another node's retained copy.
+
+The clock:
+
+- **What it is.** Every node keeps a 64-bit count of microseconds. Between events it
+  advances at the rate of the node's own monotonic clock. A local write stamps its current
+  value, at least one more than the last stamp the node issued. Every frame from a peer
+  carries the peer's clock, membership pings included, and the receiver moves its clock up
+  to it when the peer's is ahead.
+- **What it never does.** It never reads or compares wall clocks between nodes, so a wrong
+  time, a wrong time zone or an NTP step changes nothing. It assumes only that the nodes'
+  clocks tick at about the same rate, which server hardware holds to within about 0.005%
+  without NTP.
+- **What it orders.** While frames flow, at least once a second with the membership pings,
+  the nodes' clocks agree to within the network delay, about a millisecond. A write made
+  more than that after another, on any node, gets the higher stamp. A client that
+  reconnects to another node takes far longer than that, so its writes stay in order.
+- **Ties.** Equal stamps are broken by node id, so every node picks the same winner.
+- **Restarts.** A node saves its clock with every batch it writes (point 4). A restarted
+  node starts from the saved value plus the time it was down, by its own wall clock, which
+  is the only wall-clock reading and is compared with nothing but itself. It merges the
+  first peer's clock before it stamps a write.
+- **No skew rule.** A stamp ahead of the receiver's clock is never refused. Taking it moves
+  the receiver's clock forward, and only the order of stamps matters.
+
+**3. Eventual: the copies.** This is ADR 0085 D15's shape, applied to retained values:
+
+- **Sending.** A task per peer link sends the changed topics' latest values in batches and
+  clears their marks. What waits to be sent is bounded by the number of topics, not the
+  number of publishes: a topic written 40 times while a batch is in flight is sent once. A
+  congested link makes the task wait. Nothing is dropped, and no publisher is paused.
+- **Receiving.** The peer link's reader applies each value to the cache directly, if its
+  stamp is higher than the one held, with ties broken by node id. It is not a hub command,
+  so it waits in none of the hub's lanes and never holds the hub loop.
+- **Repair.** The digest exchange of ADR 0014 T6/T8 and its 2026-08-06 amendment still runs
+  at link-up and every 30 seconds. It is re-based on stamps, so each topic converges to its
+  highest stamp.
+- **Clears** are stamped tombstones, discharged by §4's convergence-gated rule (#229).
+
+**4. Eventual: what a crash keeps.** A writer task off the hub loop persists the cache in
+batches, one redb transaction and one flush per batch. A retained publish's ack waits for
+the flush of the batch that holds its value. Copies received from peers go through the
+same writer less often, coalesced per topic, because repair can refill them. So:
+
+- an acknowledged retained value survives a restart of the node that took it, and reaches
+  every other node with its next batch;
+- a value is lost only if the node that took it loses its disk before any batch has left
+  it. The topic then keeps its previous value. The window is one batch long.
+
+**5. Eventual: partitions.** Both sides keep taking and serving retained writes. When the
+partition heals, repair gives each topic the value with the highest stamp. That is the
+latest one, unless the two writes were closer together than the clocks' drift since the
+split, a few seconds after a day. An acknowledged value can be replaced that way
+without notice, and repair counts it on `mqttd_retained_divergence_total`. This is the
+trade the maintainer chose: retained state stays writable on every node, and a partition
+can cost a write that a concurrent one replaced.
+
+**6. Strong: the same guarantee, in batches.** The strong mode keeps §1 to §7 and stops
+doing one thing at a time:
+
+- **Coalescing.** A mutation for a topic that already has one queued replaces it, and the
+  replaced publish's ack waits for the newer value's commit. The guarantee is restated: an
+  acknowledged retained value was committed, or was replaced by a later value of its topic
+  that was. Nothing can read the replaced value once the newer one has committed.
+- **Batching.** A commit carries every queued topic of a placement group in one append.
+  The post-commit fan-out carries every topic of a commit in one frame per peer.
+- **Pipelining.** Order is kept per topic instead of per node, so a node can have several
+  hand-offs in flight. P6 serialized commits to keep two publishes of one topic in order,
+  and T8 keeps one hand-off in flight to keep a publisher's order. Retained state needs
+  only the first: a topic's value has no order relative to another topic's.
+- **Off the hub.** Each node applies the fan-out's batches through point 4's writer, not
+  on the hub loop.
+
+**7. Agreement and upgrades.**
+
+- **The wire.** Point 3's frames are new, at the next peer protocol (15), and additive.
+  `PROTO_MIN` stays 6 (ADR 0038, ADR 0039).
+- **The mode in force** is computed by every node on every sweep, the way ADR 0073 §4
+  computes the ownership domain. It is `eventual` only while every placement member has
+  negotiated protocol 15 and is configured `eventual`; otherwise it is `strong`. `/statusz`
+  shows the mode in force beside the configured one, and a node logs which members hold
+  the cluster in `strong`.
+- **The mode in force decides which version wins.** Under `eventual` a stamp beats a
+  commit token, and under `strong` a commit token beats a stamp. Copies can disagree for up
+  to one repair period after a switch.
+- **A rolling upgrade from 1.3** stays strong until the last node runs the new release,
+  and then turns eventual, the new default. That is a change of behaviour at upgrade, and
+  the release notes must say so. An operator who wants strong sets it before the roll.
+- **Strong to eventual** needs no migration. Every cache holds committed values, and they
+  stay until the first stamped write of their topic.
+- **Eventual to strong** starts with a repair round with every member. Then each owner
+  commits the highest-stamped value it knows for every topic of its groups. Until a
+  topic's commit lands, its copies keep their stamped value.
+
+**8. What proves it.**
+
+- **The harness** (ADR 0042) gains an oracle for the eventual mode. No node ever moves a
+  topic to a lower stamp. Once writes stop and partitions heal, every node holds the same
+  value within one repair period. With the nodes' wall clocks set hours apart, writes more
+  than the network delay apart keep their order. An acknowledged retained value survives
+  `kill -9` of the node that took it, unless a later value replaced it. The strong mode
+  keeps the acked-facts oracle, which learns point 6's "replaced".
+- **A rolling upgrade test** from 1.3.0 (`BASELINE_REF`) through the change of default.
+- **The rig** measures both modes as a ladder of retained publishes a second (mqtt-load
+  gains `--retain`), with the prediction below beside each result (ADR 0091 D7).
+
+### The formulas
+
+ADR 0091 D2's symbols, plus P, the cluster's retained publishes a second; T, the retained
+topics; and b, the sending task's batch interval.
+
+| Quantity | `eventual` | `strong` (point 6) |
+|---|---|---|
+| a retained publish's ack waits for | the local batch's flush | its topic's batch commit at the owner, with both copies |
+| values each node applies a second | at most min(P, T ÷ b), off the hub loop | at most min(P, T ÷ the commit interval), off the hub loop |
+| frames each node sends a second | about (N − 1) ÷ b | about (N − 1) × its own commits a second |
+| how old another node's copy can be | about b + r | about one commit + r |
+
+A fleet of 100 plants at full size has P = 1,000,000 and T = 25,000. With b = 100 ms, that
+is at most 250,000 cache updates a second on each node, each a map operation off the hub
+loop.
+
+### Consequences
+
+- **The default changes.** Retained values can differ between nodes for a moment, and
+  across a partition a concurrent write can replace an acknowledged one. The release notes
+  and GUIDE's limitations say so.
+- **Clocks.** Neither mode compares wall clocks between nodes. The eventual mode's clock
+  assumes only that the nodes' clocks tick at about the same rate. Rule state keeps its
+  hybrid clock (ADR 0085 D6) for now, and could move to this one later.
+- **Cost.** The eventual mode removes the owner round trip, the one-at-a-time chain and
+  the flush per update on every node. Each node still applies every changed topic, in
+  batches, off the hub loop.
+- **The strong guarantee is restated** by point 6's coalescing.
+- **Docs that change with the delivery:** CONFIGURATION, SIZING (the queue's description
+  and these formulas), COMPARISON's partition row, THREAT-MODEL's clock note, GUIDE's
+  limitations, and the release notes.
+
+### Alternatives considered
+
+- **Keep strong only, and make it fast (point 6 alone).** The ack would still wait for the
+  owner and both copies, and the minority side of a partition could not change a retained
+  value at all. That is the availability the maintainer wants by default.
+- **A hybrid logical clock** (ADR 0085 D6), as this amendment first proposed. It orders
+  writes by wall-clock time, so it is right only while the nodes' wall clocks agree. A node
+  set ahead wins every concurrent write until the others catch up, and the clock needs a
+  skew bound: rule state refuses a stamp more than 60 seconds ahead. Rejected in review on
+  2026-11-05: "we should not expect nodes to be clock equivalent".
+- **A plain Lamport counter.** It needs no clock at all and orders the writes a node has
+  seen. But a client that reconnects to another node can publish there before its previous
+  value has arrived, and if that node's counter is lower, the stale value wins. After a
+  crash in a quiet cluster, it can stay until the topic's next write. Pacing the counter by
+  elapsed time is what closes this: the clocks then agree to within the network delay, and
+  a reconnect takes far longer.
+- **Version vectors.** They show exactly which writes were concurrent, but a last-value
+  cache must still pick one of them by an arbitrary rule, and they cost a vector per
+  topic. There is nothing to merge sibling values with, as ADR 0085 found for its `lww`
+  type.
+- **The topic's owner numbers each write,** in memory, with no quorum. The order is right
+  while the owner is reachable, but each ack waits for a round trip to it, and a partition
+  needs a second scheme for the side without the owner.
+- **A choice per publish,** like ADR 0072's tiers. One topic's values would then carry both
+  kinds of version. A mode per cluster keeps one order per topic; a choice per topic prefix
+  could come later.
+- **Ack before the local flush.** It is faster again, and it is what EMQX's default and
+  Mosquitto do. But a crash would then lose acknowledged values that never left the node,
+  and one batch flush is cheap enough to keep that guarantee.
+- **Fetch on subscribe.** Rejected again, for ADR 0014's reasons.
+
+### Left open
+
+- **Order supplied by the publisher,** as a later opt-in. An MQTT 5 user property carrying
+  the source's own sequence or timestamp, used when present, would order a single writer's
+  topics by the source's own order. It needs the edge to set it.
+
+### Delivery
+
+Tasks 0037-T15 to 0037-T23 in the
+[delivery doc](../delivery/0037-durable-retained-messages.md), issue
+[#1214](https://github.com/mbilling/fss-mqtt-broker/issues/1214).
