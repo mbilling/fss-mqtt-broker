@@ -274,7 +274,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 429 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 430 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -350,6 +350,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `cluster_store::tests::a_foreign_topics_retained_write_is_refused_not_diverged`
 - `cluster_store::tests::a_higher_lease_epoch_rebuilds_and_re_recovers_the_log`
 - `cluster_store::tests::a_joiner_enters_the_hot_paths_replica_set_on_the_next_append`
+- `cluster_store::tests::a_joiners_own_copy_does_not_make_up_a_recovery_quorum`
 - `cluster_store::tests::a_joint_epoch_needs_a_quorum_of_the_new_set_too`
 - `cluster_store::tests::a_lone_survivor_of_a_known_three_node_group_refuses_appends_by_default`
 - `cluster_store::tests::a_node_that_never_knew_a_cluster_acks_durable_writes_under_the_default_floor`
