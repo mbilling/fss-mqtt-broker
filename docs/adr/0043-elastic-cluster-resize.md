@@ -81,7 +81,9 @@ after it is gap-free and empty. At R=3 a resume then answered session present 0 
 another replica still held the session. `recover_key` now reads until the complete copies
 form a quorum by themselves, as this section says; that never stops the reads earlier than
 the anchor did. Two gaps remain. When the complete copies cannot form a quorum (a replica
-down while a joiner leads), the merge still rests on the complete copies there are. And the
+down while a joiner leads), the merge still rests on the complete copies there are. A
+replica whose link stays up but which never answers holds each such read for the RPC
+timeout (5 s) before that merge. And the
 catch-up sweep stamps a copy current when it has no gap, even if it is stale. At the default
 R=2 every commit is on both copies, so neither the defect nor the change arises there.
 

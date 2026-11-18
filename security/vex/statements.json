@@ -34,7 +34,7 @@
       ],
       "status": "not_affected",
       "justification": "component_not_present",
-      "impact_statement": "The advisory's affected range for jsonwebtoken ends at 10.3.0 (introduced 0, fixed 10.3.0 per OSV); this product ships jsonwebtoken 11.x, outside the affected range, so the vulnerable component version is not present. Repository-wide scanners also read the fuzz harness lockfiles, which are not shipped; crates/mqtt-auth/fuzz/Cargo.lock had gone stale at 9.3.1 and has been refreshed to the workspace version. Recorded in docs/delivery/0069-scorecard-remediation.md."
+      "impact_statement": "The advisory's affected range for jsonwebtoken ends at 10.3.0 (introduced 0, fixed 10.3.0 per OSV); this product ships jsonwebtoken 12.x, outside the affected range, so the vulnerable component version is not present. Repository-wide scanners also read the fuzz harness lockfiles, which are not shipped; crates/mqtt-auth/fuzz/Cargo.lock had gone stale at 9.3.1 and has been refreshed to the workspace version. Recorded in docs/delivery/0069-scorecard-remediation.md."
     },
     {
       "vulnerability": {

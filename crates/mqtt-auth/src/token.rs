@@ -397,6 +397,45 @@ mod tests {
         ));
     }
 
+    /// With an issuer and an audience configured, a token whose header lists a critical
+    /// extension the verifier does not implement (RFC 7515 §4.1.11), or whose `iss`, `aud`
+    /// or `sub` has the wrong type, is refused. The same claims with the right types and
+    /// no such header authenticate.
+    #[tokio::test]
+    async fn a_critical_extension_or_a_mistyped_claim_is_rejected() {
+        const ISS: &str = "https://issuer.example";
+        let config = TokenConfig {
+            issuer: Some(ISS.to_string()),
+            audience: Some("mqttd".to_string()),
+            ..TokenConfig::default()
+        };
+        let auth = TokenAuthenticator::hs256(SECRET, config).expect("a non-empty secret");
+        let good = json!({ "sub": "alice", "iss": ISS, "aud": "mqttd", "exp": now() + 3600 });
+        assert!(auth
+            .authenticate(&client(), &Credentials::Token(&hs256_token(&good)))
+            .await
+            .is_ok());
+
+        let mut header = Header::new(Algorithm::HS256);
+        header.crit = Some(vec!["urn:example:must-understand".to_string()]);
+        let key = EncodingKey::from_secret(SECRET).expect("a non-empty secret");
+        let mut refused = vec![jsonwebtoken::encode(&header, &good, &key).expect("encode")];
+        for claims in [
+            json!({ "sub": "alice", "iss": ISS, "aud": 1234, "exp": now() + 3600 }),
+            json!({ "sub": "alice", "iss": 1234, "aud": "mqttd", "exp": now() + 3600 }),
+            json!({ "sub": 42, "iss": ISS, "aud": "mqttd", "exp": now() + 3600 }),
+        ] {
+            refused.push(hs256_token(&claims));
+        }
+        for token in &refused {
+            assert!(matches!(
+                auth.authenticate(&client(), &Credentials::Token(token))
+                    .await,
+                Err(AuthError::Rejected)
+            ));
+        }
+    }
+
     #[test]
     fn rs256_pem_parses_a_valid_public_key() {
         assert!(TokenAuthenticator::rs256_pem(TEST_RSA_PUBLIC_PEM, TokenConfig::default()).is_ok());

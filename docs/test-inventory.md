@@ -46,7 +46,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/history-check/src/main.rs` — 0 test(s)
 
 
-## `crates/mqtt-auth/src/lib.rs` — 135 test(s)
+## `crates/mqtt-auth/src/lib.rs` — 139 test(s)
 
 - `acl::tests::a_bad_client_id_does_not_disturb_rules_that_never_use_it`
 - `acl::tests::a_bare_percent_is_literal`
@@ -131,8 +131,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `mtls::tests::the_default_source_is_the_common_name`
 - `mtls::tests::truncated_der_is_rejected_without_panic`
 - `oidc::tests::a_garbled_jwks_never_replaces_the_last_known_good_set`
+- `oidc::tests::a_token_naming_an_unknown_critical_extension_is_rejected`
 - `oidc::tests::a_valid_token_authenticates_with_subject_and_groups`
+- `oidc::tests::an_idp_shaped_token_with_an_audience_array_authenticates`
 - `oidc::tests::an_unknown_kid_rejects_and_hints_exactly_one_refresh`
+- `oidc::tests::claims_of_the_wrong_type_are_rejected`
 - `oidc::tests::hs256_is_refused_even_if_it_matches_a_key`
 - `oidc::tests::no_keys_installed_fails_closed_and_hints_refresh`
 - `oidc::tests::non_token_credentials_chain_through`
@@ -167,6 +170,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `signed_gossip::tests::garbage_crl_bytes_do_not_panic`
 - `tests::custom_authorizer_allow_path_works_through_the_trait`
 - `tests::deny_all_denies`
+- `token::tests::a_critical_extension_or_a_mistyped_claim_is_rejected`
 - `token::tests::a_custom_groups_claim_name_is_honored`
 - `token::tests::correct_audience_is_accepted_when_audience_is_configured`
 - `token::tests::correct_issuer_is_accepted_when_issuer_is_configured`
@@ -275,7 +279,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 430 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 431 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -351,6 +355,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `cluster_store::tests::a_foreign_topics_retained_write_is_refused_not_diverged`
 - `cluster_store::tests::a_higher_lease_epoch_rebuilds_and_re_recovers_the_log`
 - `cluster_store::tests::a_joiner_enters_the_hot_paths_replica_set_on_the_next_append`
+- `cluster_store::tests::a_joiner_recovers_from_one_complete_copy_after_a_wedged_peer_times_out`
 - `cluster_store::tests::a_joiners_own_copy_does_not_make_up_a_recovery_quorum`
 - `cluster_store::tests::a_joint_epoch_needs_a_quorum_of_the_new_set_too`
 - `cluster_store::tests::a_lone_survivor_of_a_known_three_node_group_refuses_appends_by_default`
@@ -2638,7 +2643,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_v311_qos2_publisher_is_closed_without_a_pubrec_by_a_real_browned_out_broker`
 - `a_v5_publisher_is_told_0x97_when_brownout_refuses_the_durable_enqueue`
 
-## `crates/mqttd/tests/check_config.rs` — 17 test(s)
+## `crates/mqttd/tests/check_config.rs` — 18 test(s)
 
 - `a_bad_env_value_fails_check_config`
 - `a_complete_secured_config_passes_both_gates`
@@ -2646,6 +2651,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_missing_referenced_file_is_refused_by_the_preflight_only`
 - `a_password_file_without_read_permission_is_refused_by_the_preflight` — only when `cfg(unix)`
 - `a_valid_file_validates_and_reports_the_path`
+- `an_empty_hs256_secret_file_is_refused_by_the_preflight_naming_the_file`
 - `an_unknown_key_fails_with_a_located_error_and_exit_1`
 - `an_unparseable_bind_is_refused_naming_the_key`
 - `bare_defaults_are_refused_naming_both_remedies`

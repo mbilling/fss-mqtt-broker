@@ -2001,8 +2001,8 @@ fn spawn_reload_handler(_reloader: std::sync::Arc<reload::Reloader>, _signal: Re
 }
 
 /// The configured policy file paths the reload closures read — the set the filesystem watcher
-/// stats (ADR 0033 T1). Only file-backed material: the JWT HS256 secret is an inline env value,
-/// not a file, so it is not watchable. A path is included only when its env var is set.
+/// stats (ADR 0033 T1). Only file-backed material, the JWT HS256 secret included since it is
+/// read from a file (ADR 0046 T5). A path is included only when its env var is set.
 fn watched_policy_paths(config: &Config) -> Vec<std::path::PathBuf> {
     [
         config.security.acl_file.as_ref(),
@@ -2103,7 +2103,10 @@ fn authenticator_from_config(
     // `mqtt_core::secrets` so the on-disk file and an inline value agree.
     if let Some(path) = &config.security.jwt.hs256_secret_file {
         let secret = mqtt_core::read_secret_file(path)?;
-        let tok = mqtt_auth::token::TokenAuthenticator::hs256(&secret, jwt_config(config))?;
+        // An empty or whitespace-only file is refused: an empty HMAC key would let anyone
+        // sign a token. The error names the file, so the operator knows which to fix.
+        let tok = mqtt_auth::token::TokenAuthenticator::hs256(&secret, jwt_config(config))
+            .map_err(|e| format!("MQTTD_JWT_HS256_SECRET_FILE ({path}): {e}"))?;
         info!(%path, "JWT HS256 verification enabled (secret from file)");
         members.push(Arc::new(tok));
     } else if let Some(pem_path) = &config.security.jwt.rs256_pem_file {
