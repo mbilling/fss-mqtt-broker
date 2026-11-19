@@ -59,6 +59,9 @@ services:
     # always builds.
     image: mqttd-rules-live:local
     init: true
+    # Like every long-running service here. Without it, a Docker restart brought the
+    # simulators and the UI back but not the broker, and the demo sat half up.
+    restart: unless-stopped
     environment:
       MQTTD_PLAINTEXT_BIND: 0.0.0.0:1883   # demo only: plaintext, loudly logged insecure
       MQTTD_ALLOW_ANONYMOUS: "1"           # demo only: no authentication, and no ACL file
