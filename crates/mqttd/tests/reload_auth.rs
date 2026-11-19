@@ -47,6 +47,7 @@ fn hash(password: &str) -> String {
 }
 
 /// A self-removing temp file holding the `username:phc-hash` password file.
+/// (The HS256 test keeps its secret in one too.)
 struct PwFile {
     path: PathBuf,
 }
@@ -76,7 +77,7 @@ impl Drop for PwFile {
 /// Start a broker whose authenticator is reloaded from `pw_path`. Returns the address and
 /// the reloader that re-reads the file on `reload()`.
 async fn start_reloadable_node(pw_path: PathBuf) -> (SocketAddr, reload::Reloader) {
-    let build = move || -> reload::BuildResult {
+    start_reloadable_node_with(move || -> reload::BuildResult {
         let text = std::fs::read_to_string(&pw_path).map_err(|e| format!("read pw: {e}"))?;
         let auth = PasswordAuthenticator::from_file_contents(&text)
             .map_err(|e| format!("parse pw: {e}"))?;
@@ -84,8 +85,16 @@ async fn start_reloadable_node(pw_path: PathBuf) -> (SocketAddr, reload::Reloade
             Arc::new(AllowAll) as Arc<dyn Authorizer>,
             Arc::new(auth) as Arc<dyn Authenticator>,
         ))
-    };
-    let initial = build().expect("the initial password file builds");
+    })
+    .await
+}
+
+/// Start a broker whose authorizer and authenticator come from `build`, which the returned
+/// reloader re-runs on `reload()`.
+async fn start_reloadable_node_with(
+    build: impl Fn() -> reload::BuildResult + Send + Sync + 'static,
+) -> (SocketAddr, reload::Reloader) {
+    let initial = build().expect("the initial build succeeds");
     let audit = Arc::new(mqtt_observability::AuditLog::new());
     let (mut reloader, handles) = reload::Reloader::new(initial, audit, build);
 
@@ -211,6 +220,52 @@ async fn malformed_password_file_reload_is_rejected_and_keeps_the_running_authen
         connect_code(addr, "alice", "secret-one").await,
         0x00,
         "the kept authenticator must still accept the existing credential"
+    );
+}
+
+/// An HS256 secret file emptied in place: the reload's verifier cannot be built, because an
+/// empty HMAC key would let anyone sign a token, so the reload is refused. The running
+/// verifier keeps accepting tokens signed with the secret it was built from. The build reads
+/// the file and builds the verifier the way mqttd's own reload does.
+#[tokio::test]
+async fn an_emptied_hs256_secret_file_reload_is_rejected_and_keeps_the_running_verifier() {
+    use mqtt_auth::token::{TokenAuthenticator, TokenConfig};
+    let secret = PwFile::new("a-32-byte-hmac-secret-for-reload\n");
+    let path = secret.path.clone();
+    let (addr, reloader) = start_reloadable_node_with(move || -> reload::BuildResult {
+        let key = mqtt_core::read_secret_file(&path).map_err(|e| format!("read secret: {e}"))?;
+        let auth =
+            TokenAuthenticator::hs256(&key, TokenConfig::default()).map_err(|e| e.to_string())?;
+        Ok((
+            Arc::new(AllowAll) as Arc<dyn Authorizer>,
+            Arc::new(auth) as Arc<dyn Authenticator>,
+        ))
+    })
+    .await;
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 600;
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &serde_json::json!({ "sub": "device-7", "exp": exp }),
+        &jsonwebtoken::EncodingKey::from_secret(b"a-32-byte-hmac-secret-for-reload")
+            .expect("a non-empty secret"),
+    )
+    .expect("encode");
+    // The token rides in the password field, as a client sends it.
+    assert_eq!(connect_code(addr, "device-7", &token).await, 0x00);
+
+    secret.write("\n");
+    assert!(
+        !reloader.reload("signal"),
+        "an emptied secret file must be rejected, not applied"
+    );
+    assert_eq!(
+        connect_code(addr, "device-7", &token).await,
+        0x00,
+        "the kept verifier must still accept a token signed with the secret it was built from"
     );
 }
 

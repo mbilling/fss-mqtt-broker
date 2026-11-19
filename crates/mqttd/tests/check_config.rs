@@ -450,18 +450,19 @@ fn a_missing_referenced_file_is_refused_by_the_preflight_only() {
 }
 
 /// An HS256 secret file that is empty or holds only whitespace would give a verifier that
-/// accepts tokens signed with an empty key. The preflight refuses it, as startup does, and
-/// names the file; the static gate opens no files. A real secret passes both.
+/// accepts tokens signed with an empty key, and a secret under 32 bytes is short of RFC
+/// 7518 §3.2's 256 bits. The preflight refuses both, as startup does, and names the file;
+/// the static gate opens no files. A 32-byte secret passes both.
 #[test]
-fn an_empty_hs256_secret_file_is_refused_by_the_preflight_naming_the_file() {
+fn an_empty_or_short_hs256_secret_file_is_refused_by_the_preflight_naming_the_file() {
     let dir = tempfile::tempdir().unwrap();
     let secret = dir.path().join("jwt-hs256");
     let toml = format!(
         "{BASE}[security.jwt]\nhs256_secret_file = \"{}\"\n",
         secret.display()
     );
-    for empty in ["", "\n", " \t\r\n"] {
-        std::fs::write(&secret, empty).unwrap();
+    for refused in ["", "\n", " \t\r\n", "a-31-byte-hmac-secret-too-short\n"] {
+        std::fs::write(&secret, refused).unwrap();
         assert_passes(Gate::Static, dir.path(), &toml);
         assert_refused(
             Gate::Preflight,
@@ -470,7 +471,7 @@ fn an_empty_hs256_secret_file_is_refused_by_the_preflight_naming_the_file() {
             &format!("MQTTD_JWT_HS256_SECRET_FILE ({})", secret.display()),
         );
     }
-    std::fs::write(&secret, "a-real-hmac-secret\n").unwrap();
+    std::fs::write(&secret, "a-32-byte-hmac-secret-just-right\n").unwrap();
     assert_passes(Gate::Preflight, dir.path(), &toml);
 }
 

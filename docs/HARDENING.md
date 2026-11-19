@@ -46,6 +46,7 @@ configuration before any port binds and is the pre-rollout gate for all of it.
 | H-2.3 | L1 | Password file unreadable to others | operator-managed | `stat -c %a <file>` (Linux) / `stat -f %Lp` (macOS) ≤ 640, owner = broker user |
 | H-2.4 | L2 | OIDC: HTTPS issuer only | `MQTTD_OIDC_ISSUER` https; `MQTTD_OIDC_ALLOW_HTTP` unset (on = `INSECURE`) | issuer URL scheme is https; no `INSECURE: OIDC` log line |
 | H-2.5 | L2 | Auth timeout bounds pre-auth sockets | `MQTTD_AUTH_TIMEOUT` (default on) | a socket that connects and sends nothing is closed within the timeout |
+| H-2.6 | L2 | OIDC: access tokens only, where the provider types them (RFC 9068) | `MQTTD_OIDC_REQUIRE_AT_JWT` (`security.oidc.require_at_jwt`), **off by default**: most providers do not issue `at+jwt` access tokens | set in the deployed config where the provider issues `at+jwt` access tokens; a CONNECT that carries one of the provider's ID tokens as its password is refused |
 
 ## 3. Authorization
 

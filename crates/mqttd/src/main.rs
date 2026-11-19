@@ -2068,8 +2068,9 @@ fn spawn_config_watcher(
 
 /// Build the CONNECT authenticator (ADR 0004 steps 2 + 6): a certificate /
 /// anonymous baseline, then — when configured — an Argon2id password file
-/// (`MQTTD_PASSWORD_FILE`) and a JWT verifier (`MQTTD_JWT_HS256_SECRET` or
-/// `MQTTD_JWT_RS256_PEM`, with optional `MQTTD_JWT_ISSUER`/`MQTTD_JWT_AUDIENCE`).
+/// (`MQTTD_PASSWORD_FILE`) and a JWT verifier (`MQTTD_JWT_HS256_SECRET_FILE` or
+/// `MQTTD_JWT_RS256_PEM`, with optional `MQTTD_JWT_ISSUER`/`MQTTD_JWT_AUDIENCE`, each a
+/// claim the token must then carry).
 /// Credentials are tried cert → password → token via a chain.
 fn authenticator_from_config(
     config: &Config,
@@ -2102,7 +2103,8 @@ fn authenticator_from_config(
     // inlined in the config. Whitespace trimming follows the one shared rule in
     // `mqtt_core::secrets` so the on-disk file and an inline value agree.
     if let Some(path) = &config.security.jwt.hs256_secret_file {
-        let secret = mqtt_core::read_secret_file(path)?;
+        let secret = mqtt_core::read_secret_file(path)
+            .map_err(|e| format!("cannot read MQTTD_JWT_HS256_SECRET_FILE ({path}): {e}"))?;
         // An empty or whitespace-only file is refused: an empty HMAC key would let anyone
         // sign a token. The error names the file, so the operator knows which to fix.
         let tok = mqtt_auth::token::TokenAuthenticator::hs256(&secret, jwt_config(config))
@@ -2110,7 +2112,8 @@ fn authenticator_from_config(
         info!(%path, "JWT HS256 verification enabled (secret from file)");
         members.push(Arc::new(tok));
     } else if let Some(pem_path) = &config.security.jwt.rs256_pem_file {
-        let pem = std::fs::read(pem_path)?;
+        let pem = std::fs::read(pem_path)
+            .map_err(|e| format!("cannot read MQTTD_JWT_RS256_PEM ({pem_path}): {e}"))?;
         let tok = mqtt_auth::token::TokenAuthenticator::rs256_pem(&pem, jwt_config(config))?;
         info!(%pem_path, "JWT RS256 verification enabled");
         members.push(Arc::new(tok));
@@ -2194,6 +2197,7 @@ impl OidcSettings {
         if let Some(c) = config.security.oidc.groups_claim.clone() {
             oidc.groups_claim = c;
         }
+        oidc.require_at_jwt = config.security.oidc.require_at_jwt;
         let refresh =
             Duration::from_secs(config.security.oidc.jwks_refresh_secs.unwrap_or(300).max(5));
         Ok(Some(Self {

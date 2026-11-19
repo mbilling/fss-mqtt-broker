@@ -6,7 +6,7 @@ Source of truth: `mqtt_config::ENV_VARS` and `Config::overlay_from` in `crates/m
 
 The annotated template is [`mqttd.example.toml`](mqttd.example.toml). Capacity arithmetic lives in [SIZING.md](SIZING.md); day-2 procedures in [OPERATIONS.md](OPERATIONS.md). This page is the inventory of knobs, not the runbook.
 
-Documented overlay variables: **135** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) and any experimental side-channel knobs below.
+Documented overlay variables: **136** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) and any experimental side-channel knobs below.
 
 ## Node identity
 
@@ -63,16 +63,17 @@ Documented overlay variables: **135** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) 
 | `MQTTD_PASSWORD_FILE` | `security.password_file` | Argon2id `username:phc-hash` password file (`MQTTD_PASSWORD_FILE`). |
 | `MQTTD_REQUIRE_PASSWORD_WITH_CERTIFICATE` | `security.require_password_with_certificate` | Require BOTH factors from a client that presents a verified certificate (`MQTTD_REQUIRE_PASSWORD_WITH_CERTIFICATE`, issue #670): its CONNECT must also carry a username equal to the certificate identity and a password that verifies for it. Default `false`: the certificate alone admits the client and any wire credential is ignored (ADR 0004). Needs `tls.client_ca` and a password verifier (`password_file` or `http_auth`). Certificate-less clients are not affected — on a TLS listener with a client CA the handshake already refuses them. Hot-reloadable; a change applies to new CONNECTs — established sessions are not re-authenticated. |
 | `MQTTD_ACL_FILE` | `security.acl_file` | Topic-ACL TOML policy file (`MQTTD_ACL_FILE`); without it authorization is not enforced and loudly logged. |
-| `MQTTD_JWT_HS256_SECRET_FILE` | `security.jwt.hs256_secret_file` | Path to a file holding the HS256 shared secret (`MQTTD_JWT_HS256_SECRET_FILE`, ADR 0046 T5): secret-by-reference, so the HMAC key is mounted from a Secret, never inlined. Whitespace around the secret is trimmed. A file that is empty after trimming is refused, since an empty HMAC key would let anyone sign a token: the broker does not start, `--check-config --preflight` fails, and a reload keeps the running verifier. |
+| `MQTTD_JWT_HS256_SECRET_FILE` | `security.jwt.hs256_secret_file` | Path to a file holding the HS256 shared secret (`MQTTD_JWT_HS256_SECRET_FILE`, ADR 0046 T5): secret-by-reference, so the HMAC key is mounted from a Secret, never inlined. Whitespace around the secret is trimmed. What remains must be at least 32 bytes (256 bits, RFC 7518 §3.2): a shorter secret can be guessed offline from one captured token, and an empty one lets anyone sign a token. A shorter or empty secret is refused: the broker does not start, `--check-config --preflight` fails, and a reload keeps the running verifier. |
 | `MQTTD_JWT_RS256_PEM` | `security.jwt.rs256_pem_file` | RS256 public-key PEM (`MQTTD_JWT_RS256_PEM`). |
-| `MQTTD_JWT_ISSUER` | `security.jwt.issuer` | Required `iss` claim (`MQTTD_JWT_ISSUER`). |
-| `MQTTD_JWT_AUDIENCE` | `security.jwt.audience` | Required `aud` claim (`MQTTD_JWT_AUDIENCE`). |
-| `MQTTD_OIDC_ISSUER` | `security.oidc.issuer` | Issuer URL (`MQTTD_OIDC_ISSUER`); enables OIDC mode. Must be https unless `allow_http` (testing) is set. Also the required `iss` claim value. |
-| `MQTTD_OIDC_AUDIENCE` | `security.oidc.audience` | Required `aud` claim (`MQTTD_OIDC_AUDIENCE`); mandatory in OIDC mode. |
+| `MQTTD_JWT_ISSUER` | `security.jwt.issuer` | The `iss` claim a token must carry (`MQTTD_JWT_ISSUER`): a token without it, or with another value, is refused. |
+| `MQTTD_JWT_AUDIENCE` | `security.jwt.audience` | The `aud` claim a token must carry (`MQTTD_JWT_AUDIENCE`): a token without it, or with another value, is refused. |
+| `MQTTD_OIDC_ISSUER` | `security.oidc.issuer` | Issuer URL (`MQTTD_OIDC_ISSUER`); enables OIDC mode. Must be https unless `allow_http` (testing) is set. Also the `iss` claim every token must carry. |
+| `MQTTD_OIDC_AUDIENCE` | `security.oidc.audience` | The `aud` claim every token must carry (`MQTTD_OIDC_AUDIENCE`); mandatory in OIDC mode. A token without `aud`, or without this value in it, is refused. |
 | `MQTTD_OIDC_JWKS_REFRESH` | `security.oidc.jwks_refresh_secs` | JWKS background-refresh interval in seconds (`MQTTD_OIDC_JWKS_REFRESH`, default 300). |
 | `MQTTD_OIDC_MAX_STALE` | `security.oidc.max_stale_secs` | Staleness window in seconds before fail-closed (`MQTTD_OIDC_MAX_STALE`, default 86400). |
 | `MQTTD_OIDC_ALLOW_HTTP` | `security.oidc.allow_http` | Permit an http:// issuer (`MQTTD_OIDC_ALLOW_HTTP` — INSECURE, loudly logged; tests). |
 | `MQTTD_OIDC_GROUPS_CLAIM` | `security.oidc.groups_claim` | Claim to read group memberships from (`MQTTD_OIDC_GROUPS_CLAIM`, default `groups`). |
+| `MQTTD_OIDC_REQUIRE_AT_JWT` | `security.oidc.require_at_jwt` | Accept only JWT access tokens as RFC 9068 types them, header `typ` `at+jwt` (`MQTTD_OIDC_REQUIRE_AT_JWT`, `1`/`0`), so an ID token cannot stand in for an access token. **Off by default**: most providers do not type their access tokens that way; turn it on where yours does. |
 | `MQTTD_AUTH_TIMEOUT` | `security.auth_timeout_secs` | Seconds a client may take to authenticate before the connection is dropped (`MQTTD_AUTH_TIMEOUT`). |
 | `MQTTD_AUTH_PENALTY_THRESHOLD` | `security.auth_penalty.threshold` | Failures from one IP before it is penalty-boxed (`MQTTD_AUTH_PENALTY_THRESHOLD`). |
 | `MQTTD_AUTH_PENALTY_DECAY_SECS` | `security.auth_penalty.decay_secs` | Seconds a penalty decays over (`MQTTD_AUTH_PENALTY_DECAY_SECS`). |

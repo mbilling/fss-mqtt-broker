@@ -1,7 +1,7 @@
 //! JWT bearer-token authentication (ADR 0004 step 6).
 //!
 //! Verifies a [`crate::Credentials::Token`] against a configured key
-//! (HS256 shared secret or an RS256 public key), checking signature, `exp`,
+//! (HS256 shared secret or an RS256 public key), checking signature, `exp`, `nbf`,
 //! and—when configured—`iss`/`aud`. The identity subject is the `sub` claim;
 //! groups come from a configurable claim. Full OIDC discovery / JWKS rotation
 //! is a later step; this takes a single static verification key.
@@ -11,12 +11,18 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use mqtt_core::ClientId;
 use serde::Deserialize;
 
+/// The shortest HS256 secret accepted, in bytes: RFC 7518 §3.2 requires a key at least as
+/// long as the hash output, 256 bits.
+pub const HS256_MIN_SECRET_BYTES: usize = 32;
+
 /// JWT verification configuration.
 #[derive(Debug, Clone)]
 pub struct TokenConfig {
-    /// Required issuer (`iss`), if any.
+    /// The issuer (`iss`) a token must carry, if any: a token without it, or with another
+    /// value, is refused.
     pub issuer: Option<String>,
-    /// Required audience (`aud`), if any.
+    /// The audience (`aud`) a token must carry, if any: a token without it, or with
+    /// another value, is refused.
     pub audience: Option<String>,
     /// Claim name to read group memberships from (default `groups`).
     pub groups_claim: String,
@@ -66,15 +72,24 @@ impl std::fmt::Debug for TokenAuthenticator {
 impl TokenAuthenticator {
     fn build(key: DecodingKey, algorithm: Algorithm, config: TokenConfig) -> Self {
         let mut validation = Validation::new(algorithm);
+        // jsonwebtoken compares `iss` and `aud` only when the token carries them, so a
+        // configured one is also a required claim: a token without it is refused.
+        let mut required = vec!["exp"];
         if let Some(iss) = &config.issuer {
             validation.set_issuer(&[iss]);
+            required.push("iss");
         }
         if let Some(aud) = &config.audience {
             validation.set_audience(&[aud]);
+            required.push("aud");
         } else {
             // No audience configured: don't require/validate `aud`.
             validation.validate_aud = false;
         }
+        validation.set_required_spec_claims(&required);
+        // A token is not accepted before its `nbf` (RFC 7519 §4.1.5); jsonwebtoken skips
+        // that check unless asked.
+        validation.validate_nbf = true;
         Self {
             key,
             validation,
@@ -85,9 +100,17 @@ impl TokenAuthenticator {
     /// Build an HS256 verifier from a shared secret.
     ///
     /// # Errors
-    /// [`AuthError::Backend`] if the secret is empty: an empty HMAC key would let
-    /// anyone sign a token.
+    /// [`AuthError::Backend`] if the secret is shorter than [`HS256_MIN_SECRET_BYTES`]
+    /// (RFC 7518 §3.2), the empty secret included: a short HMAC key can be guessed offline
+    /// from one captured token, and an empty one lets anyone sign a token.
     pub fn hs256(secret: &[u8], config: TokenConfig) -> Result<Self, AuthError> {
+        if secret.len() < HS256_MIN_SECRET_BYTES {
+            return Err(AuthError::Backend(format!(
+                "invalid HS256 secret: {} bytes, and RFC 7518 §3.2 requires at least \
+                 {HS256_MIN_SECRET_BYTES} (256 bits)",
+                secret.len()
+            )));
+        }
         let key = DecodingKey::from_secret(secret)
             .map_err(|e| AuthError::Backend(format!("invalid HS256 secret: {e}")))?;
         Ok(Self::build(key, Algorithm::HS256, config))
@@ -114,12 +137,14 @@ impl Authenticator for TokenAuthenticator {
         let Credentials::Token(jwt) = creds else {
             return Err(AuthError::NotPermitted);
         };
-        // Signature, `exp`, and (when configured) `iss`/`aud` are all checked
+        // Signature, `exp`, `nbf`, and (when configured) `iss`/`aud` are all checked
         // here; any failure is an indistinguishable rejection.
         let data = jsonwebtoken::decode::<Claims>(jwt, &self.key, &self.validation)
             .map_err(|_| AuthError::Rejected)?;
         let claims = data.claims;
-        if claims.sub.is_empty() {
+        // `iss` is one string (RFC 7519 §4.1.1). jsonwebtoken also passes an array that
+        // contains the expected issuer; such a token is malformed.
+        if claims.sub.is_empty() || claims.extra.get("iss").is_some_and(|iss| !iss.is_string()) {
             return Err(AuthError::Rejected);
         }
         let groups = claims
@@ -150,7 +175,8 @@ mod tests {
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    const SECRET: &[u8] = b"super-secret-hs256-key";
+    /// Exactly the 32 bytes RFC 7518 §3.2 requires for HS256.
+    const SECRET: &[u8] = b"an-hs256-test-secret-of-32-bytes";
 
     fn client() -> ClientId {
         ClientId("c1".into())
@@ -395,6 +421,117 @@ mod tests {
             TokenAuthenticator::hs256(b"", TokenConfig::default()),
             Err(AuthError::Backend(_))
         ));
+    }
+
+    /// RFC 7518 §3.2: an HS256 key is at least 256 bits. One byte short is refused, and the
+    /// error says what is required; exactly 32 bytes is accepted.
+    #[test]
+    fn hs256_refuses_a_secret_shorter_than_256_bits() {
+        let short = &SECRET[..HS256_MIN_SECRET_BYTES - 1];
+        match TokenAuthenticator::hs256(short, TokenConfig::default()) {
+            Err(AuthError::Backend(msg)) => {
+                assert!(msg.contains("31 bytes") && msg.contains("32"), "{msg}");
+            }
+            other => panic!("a 31-byte secret must be refused, got {other:?}"),
+        }
+        assert_eq!(SECRET.len(), HS256_MIN_SECRET_BYTES);
+        assert!(TokenAuthenticator::hs256(SECRET, TokenConfig::default()).is_ok());
+    }
+
+    /// A token is not accepted before its `nbf` (RFC 7519 §4.1.5), beyond the clock-skew
+    /// leeway. One whose `nbf` has passed authenticates.
+    #[tokio::test]
+    async fn a_token_that_is_not_yet_valid_is_rejected() {
+        let auth =
+            TokenAuthenticator::hs256(SECRET, TokenConfig::default()).expect("a valid secret");
+        let early =
+            hs256_token(&json!({ "sub": "alice", "nbf": now() + 3600, "exp": now() + 7200 }));
+        assert!(matches!(
+            auth.authenticate(&client(), &Credentials::Token(&early))
+                .await,
+            Err(AuthError::Rejected)
+        ));
+        let started =
+            hs256_token(&json!({ "sub": "alice", "nbf": now() - 60, "exp": now() + 3600 }));
+        assert!(auth
+            .authenticate(&client(), &Credentials::Token(&started))
+            .await
+            .is_ok());
+    }
+
+    /// `iss` is a single string (RFC 7519 §4.1.1): an array is refused, whether or not an
+    /// issuer is configured, and even when it holds the configured one.
+    #[tokio::test]
+    async fn an_issuer_that_is_not_a_single_string_is_rejected() {
+        const ISS: &str = "https://issuer.example";
+        let configured = TokenConfig {
+            issuer: Some(ISS.to_string()),
+            ..TokenConfig::default()
+        };
+        for config in [configured, TokenConfig::default()] {
+            let auth = TokenAuthenticator::hs256(SECRET, config).expect("a valid secret");
+            let token = hs256_token(&json!({ "sub": "alice", "iss": [ISS], "exp": now() + 3600 }));
+            assert!(matches!(
+                auth.authenticate(&client(), &Credentials::Token(&token))
+                    .await,
+                Err(AuthError::Rejected)
+            ));
+        }
+    }
+
+    /// A configured issuer or audience is a required claim: a token that does not carry it
+    /// is refused. A claim that is not configured is not required.
+    #[tokio::test]
+    async fn a_configured_issuer_or_audience_must_be_in_the_token() {
+        const ISS: &str = "https://issuer.example";
+        async fn verify(
+            config: TokenConfig,
+            claims: &serde_json::Value,
+        ) -> Result<Identity, AuthError> {
+            let auth = TokenAuthenticator::hs256(SECRET, config).expect("a non-empty secret");
+            auth.authenticate(&client(), &Credentials::Token(&hs256_token(claims)))
+                .await
+        }
+        let issuer_only = || TokenConfig {
+            issuer: Some(ISS.to_string()),
+            ..TokenConfig::default()
+        };
+        let audience_only = || TokenConfig {
+            audience: Some("mqttd".to_string()),
+            ..TokenConfig::default()
+        };
+        let exp = now() + 3600;
+
+        // Configured, so required.
+        assert!(matches!(
+            verify(
+                issuer_only(),
+                &json!({ "sub": "alice", "aud": "mqttd", "exp": exp })
+            )
+            .await,
+            Err(AuthError::Rejected)
+        ));
+        assert!(matches!(
+            verify(
+                audience_only(),
+                &json!({ "sub": "alice", "iss": ISS, "exp": exp })
+            )
+            .await,
+            Err(AuthError::Rejected)
+        ));
+        // The other claim is not configured, so it is not required.
+        assert!(verify(
+            issuer_only(),
+            &json!({ "sub": "alice", "iss": ISS, "exp": exp })
+        )
+        .await
+        .is_ok());
+        assert!(verify(
+            audience_only(),
+            &json!({ "sub": "alice", "aud": "mqttd", "exp": exp })
+        )
+        .await
+        .is_ok());
     }
 
     /// With an issuer and an audience configured, a token whose header lists a critical

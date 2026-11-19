@@ -7,8 +7,10 @@
 //!
 //! - **JWKS parsing with an asymmetric-only allow-list** — `RS256`/`ES256`; `HS*` is
 //!   refused outright (a public JWKS must never feed an HMAC verify — key confusion),
-//!   as is anything else `alg` could smuggle.
-//! - **`kid`-selected validation** with required `iss` + `aud` and bounded clock skew.
+//!   as is anything else `alg` could smuggle. A key without `alg` is used for the one
+//!   allowed algorithm its type implies, and a key published for encryption never is.
+//! - **`kid`-selected validation** with required `iss` + `aud`, `exp` and `nbf` under
+//!   bounded clock skew, and, when configured, RFC 9068 access tokens only (`at+jwt`).
 //! - **Staleness fail-closed** — beyond `max_stale` without a successful refresh the
 //!   authenticator rejects rather than trust keys it can no longer corroborate
 //!   (ADR 0017's philosophy applied to trust material).
@@ -41,11 +43,15 @@ pub struct OidcConfig {
     pub max_stale: Duration,
     /// Allowed clock skew for `exp`/`nbf`, in seconds.
     pub leeway_secs: u64,
+    /// Accept only JWT access tokens as RFC 9068 types them (header `typ` `at+jwt`), so
+    /// an ID token cannot stand in for one (RFC 8725 §3.11). Off by default: most
+    /// providers do not type their access tokens that way.
+    pub require_at_jwt: bool,
 }
 
 impl OidcConfig {
     /// A config with the decision defaults (ADR 0050): `groups` claim, 24 h staleness
-    /// window, 60 s leeway.
+    /// window, 60 s leeway, any token type.
     #[must_use]
     pub fn new(issuer: String, audience: String) -> Self {
         Self {
@@ -54,8 +60,15 @@ impl OidcConfig {
             groups_claim: "groups".to_string(),
             max_stale: Duration::from_hours(24),
             leeway_secs: 60,
+            require_at_jwt: false,
         }
     }
+}
+
+/// RFC 9068 §4: an access token's `typ` is `at+jwt` or `application/at+jwt`. Media types
+/// compare without regard to case.
+fn is_at_jwt(typ: &str) -> bool {
+    typ.eq_ignore_ascii_case("at+jwt") || typ.eq_ignore_ascii_case("application/at+jwt")
 }
 
 /// One verification key from the JWKS.
@@ -180,13 +193,24 @@ fn parse_jwks(bytes: &[u8]) -> Result<Vec<NamedKey>, AuthError> {
         .map_err(|e| AuthError::Backend(format!("JWKS does not parse: {e}")))?;
     let mut out = Vec::new();
     for jwk in &set.keys {
+        use jsonwebtoken::jwk::{AlgorithmParameters, EllipticCurve, KeyAlgorithm, PublicKeyUse};
+        // A key published for encryption never verifies a signature (RFC 7517 §4.2).
+        if jwk.common.public_key_use == Some(PublicKeyUse::Encryption) {
+            continue;
+        }
         // The asymmetric-only allow-list: RS256/ES256. Keys advertising anything
         // else — including symmetric algorithms a hostile JWKS could inject — are
         // skipped, not errors: an IdP may legitimately publish keys for other uses.
-        use jsonwebtoken::jwk::KeyAlgorithm;
-        let alg = match jwk.common.key_algorithm {
-            Some(KeyAlgorithm::RS256) => Algorithm::RS256,
-            Some(KeyAlgorithm::ES256) => Algorithm::ES256,
+        // `alg` is optional in a JWK (RFC 7517 §4.4); a key without it is used for the
+        // one allowed algorithm its type implies: RS256 for RSA, ES256 for P-256.
+        let alg = match (&jwk.common.key_algorithm, &jwk.algorithm) {
+            (Some(KeyAlgorithm::RS256), _) | (None, AlgorithmParameters::RSA(_)) => {
+                Algorithm::RS256
+            }
+            (Some(KeyAlgorithm::ES256), _) => Algorithm::ES256,
+            (None, AlgorithmParameters::EllipticCurve(ec)) if ec.curve == EllipticCurve::P256 => {
+                Algorithm::ES256
+            }
             _ => continue,
         };
         let Ok(key) = DecodingKey::from_jwk(jwk) else {
@@ -221,6 +245,11 @@ impl Authenticator for OidcAuthenticator {
         // included — the classic confusion attacks die here).
         let header = jsonwebtoken::decode_header(jwt).map_err(|_| AuthError::Rejected)?;
         if !matches!(header.alg, Algorithm::RS256 | Algorithm::ES256) {
+            return Err(AuthError::Rejected);
+        }
+        // Explicit typing, when configured (RFC 9068 §4, RFC 8725 §3.11): only a token
+        // typed as an access token passes, so an ID token for this audience does not.
+        if self.cfg.require_at_jwt && !header.typ.as_deref().is_some_and(is_at_jwt) {
             return Err(AuthError::Rejected);
         }
 
@@ -265,12 +294,22 @@ impl Authenticator for OidcAuthenticator {
         let mut validation = Validation::new(header.alg);
         validation.set_issuer(&[&self.cfg.issuer]);
         validation.set_audience(&[&self.cfg.audience]);
+        // jsonwebtoken compares `iss` and `aud` only when the token carries them, so they are
+        // also required claims: a token without either is refused (ADR 0050).
+        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+        // A token is not accepted before its `nbf` (RFC 7519 §4.1.5); jsonwebtoken skips
+        // that check unless asked.
+        validation.validate_nbf = true;
         validation.leeway = self.cfg.leeway_secs;
 
         for cand in candidates {
             if let Ok(data) = jsonwebtoken::decode::<Claims>(jwt, &cand.key, &validation) {
                 let claims = data.claims;
-                if claims.sub.is_empty() {
+                // `iss` is one string (RFC 7519 §4.1.1). jsonwebtoken also passes an array
+                // that contains the expected issuer; such a token is malformed.
+                if claims.sub.is_empty()
+                    || claims.extra.get("iss").is_some_and(|iss| !iss.is_string())
+                {
                     return Err(AuthError::Rejected);
                 }
                 let groups = claims
@@ -319,12 +358,15 @@ mod tests {
         jsonwebtoken::encode(&header, claims, &key).unwrap()
     }
 
-    fn exp() -> u64 {
+    fn now() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs()
-            + 600
+    }
+
+    fn exp() -> u64 {
+        now() + 600
     }
 
     fn good_claims() -> serde_json::Value {
@@ -405,6 +447,27 @@ mod tests {
         ));
     }
 
+    /// The issuer and the audience are required in OIDC mode (ADR 0050): a token that does
+    /// not carry `iss` or `aud` is refused, like one that carries the wrong value.
+    #[tokio::test]
+    async fn a_token_without_an_issuer_or_an_audience_is_rejected() {
+        let (a, _rx) = authenticator();
+        a.install_jwks(JWKS).unwrap();
+        for claims in [
+            json!({"sub":"d","iss":ISSUER,"exp":exp()}),
+            json!({"sub":"d","aud":AUD,"exp":exp()}),
+            json!({"sub":"d","exp":exp()}),
+        ] {
+            assert!(
+                matches!(
+                    auth(&a, &mint("t1", &claims)).await.unwrap_err(),
+                    AuthError::Rejected
+                ),
+                "{claims}"
+            );
+        }
+    }
+
     /// An `iss`, `aud` or `sub` of the wrong type is refused, whatever the signature.
     #[tokio::test]
     async fn claims_of_the_wrong_type_are_rejected() {
@@ -441,6 +504,111 @@ mod tests {
             auth(&a, &token).await.unwrap_err(),
             AuthError::Rejected
         ));
+    }
+
+    /// A token is not accepted before its `nbf` (RFC 7519 §4.1.5), beyond the clock-skew
+    /// leeway. One whose `nbf` has passed authenticates.
+    #[tokio::test]
+    async fn a_token_that_is_not_yet_valid_is_rejected() {
+        let (a, _rx) = authenticator();
+        a.install_jwks(JWKS).unwrap();
+        let mut early = good_claims();
+        early["nbf"] = json!(now() + 3600);
+        assert!(matches!(
+            auth(&a, &mint("t1", &early)).await.unwrap_err(),
+            AuthError::Rejected
+        ));
+        let mut started = good_claims();
+        started["nbf"] = json!(now() - 60);
+        assert!(auth(&a, &mint("t1", &started)).await.is_ok());
+    }
+
+    /// `iss` is a single string (RFC 7519 §4.1.1): an array is refused, even one that holds
+    /// the expected issuer.
+    #[tokio::test]
+    async fn an_issuer_that_is_not_a_single_string_is_rejected() {
+        let (a, _rx) = authenticator();
+        a.install_jwks(JWKS).unwrap();
+        for iss in [json!([ISSUER]), json!([ISSUER, "https://other.test"])] {
+            let mut claims = good_claims();
+            claims["iss"] = iss;
+            assert!(
+                matches!(
+                    auth(&a, &mint("t1", &claims)).await.unwrap_err(),
+                    AuthError::Rejected
+                ),
+                "{claims}"
+            );
+        }
+    }
+
+    /// With `require_at_jwt`, only a token typed as an RFC 9068 access token authenticates:
+    /// `at+jwt` or `application/at+jwt`, in any case. An ID token's `JWT`, and a token with
+    /// no `typ`, are refused. The default accepts any type.
+    #[tokio::test]
+    async fn with_at_jwt_required_only_an_access_token_type_authenticates() {
+        let typed = |typ: Option<&str>| {
+            let mut header = Header::new(Algorithm::RS256);
+            header.kid = Some("t1".to_string());
+            header.typ = typ.map(str::to_string);
+            let key = EncodingKey::from_rsa_pem(PRIVATE_PEM).unwrap();
+            jsonwebtoken::encode(&header, &good_claims(), &key).unwrap()
+        };
+        let mut cfg = OidcConfig::new(ISSUER.to_string(), AUD.to_string());
+        cfg.require_at_jwt = true;
+        let (a, _rx) = OidcAuthenticator::new(cfg);
+        a.install_jwks(JWKS).unwrap();
+        for typ in ["at+jwt", "application/at+jwt", "AT+JWT"] {
+            assert!(auth(&a, &typed(Some(typ))).await.is_ok(), "{typ}");
+        }
+        for typ in [Some("JWT"), None] {
+            assert!(
+                matches!(
+                    auth(&a, &typed(typ)).await.unwrap_err(),
+                    AuthError::Rejected
+                ),
+                "{typ:?}"
+            );
+        }
+
+        let (any_type, _rx) = authenticator();
+        any_type.install_jwks(JWKS).unwrap();
+        assert!(auth(&any_type, &typed(Some("JWT"))).await.is_ok());
+    }
+
+    /// `alg` is optional in a JWK (RFC 7517 §4.4). A key without it verifies the one
+    /// allowed algorithm its type implies: RS256 for an RSA key, ES256 for a P-256 key.
+    #[tokio::test]
+    async fn a_key_without_alg_verifies_the_algorithm_its_type_implies() {
+        let mut jwks: serde_json::Value = serde_json::from_slice(JWKS).unwrap();
+        jwks["keys"][0].as_object_mut().unwrap().remove("alg");
+        let (a, _rx) = authenticator();
+        a.install_jwks(&serde_json::to_vec(&jwks).unwrap()).unwrap();
+        assert!(auth(&a, &mint("t1", &good_claims())).await.is_ok());
+
+        let pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let signing = EncodingKey::from_ec_pem(pair.serialize_pem().as_bytes()).unwrap();
+        let mut jwk =
+            jsonwebtoken::jwk::Jwk::from_encoding_key(&signing, Algorithm::ES256).unwrap();
+        jwk.common.key_id = Some("e1".to_string());
+        jwk.common.key_algorithm = None;
+        let (a, _rx) = authenticator();
+        a.install_jwks(&serde_json::to_vec(&json!({ "keys": [jwk] })).unwrap())
+            .unwrap();
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some("e1".to_string());
+        let token = jsonwebtoken::encode(&header, &good_claims(), &signing).unwrap();
+        assert!(auth(&a, &token).await.is_ok());
+    }
+
+    /// A key published for encryption (`use: enc`) never verifies a signature (RFC 7517
+    /// §4.2), so a JWKS that holds only such keys installs nothing.
+    #[test]
+    fn a_key_published_for_encryption_is_not_used() {
+        let mut jwks: serde_json::Value = serde_json::from_slice(JWKS).unwrap();
+        jwks["keys"][0]["use"] = json!("enc");
+        let (a, _rx) = authenticator();
+        assert!(a.install_jwks(&serde_json::to_vec(&jwks).unwrap()).is_err());
     }
 
     #[tokio::test]
