@@ -83,7 +83,9 @@ struct UpstreamCounters {
 struct SideHandles {
     names: Vec<String>,
     connected: Vec<Arc<AtomicBool>>,
-    spools: Vec<Arc<Spool>>,
+    /// A side's spool, when it has one: a link's local side spools what comes in from its
+    /// upstream; an upstream side has one only while an older bridge's spool drains.
+    spools: Vec<Option<Arc<Spool>>>,
 }
 
 /// Bridge metrics. Cheap atomics; share one `Arc<BridgeMetrics>` across the engine tasks.
@@ -97,7 +99,33 @@ pub struct BridgeMetrics {
     dropped_hop_limit: AtomicU64,
     /// Reconnects per side, parallel to `SideHandles::names` once registered.
     reconnects: Vec<AtomicU64>,
+    /// Forwards a side refused for good (a permanent PUBACK error), per destination side.
+    refused: Vec<AtomicU64>,
+    /// Reconnects that found the side's session gone (`session_present = 0`), per side.
+    sessions_lost: Vec<AtomicU64>,
     sides: OnceLock<SideHandles>,
+}
+
+/// The metrics side index of upstream `link`'s local session (`remote = false`) or of the
+/// upstream itself (`remote = true`). Each link has the two, in config order: local 0,
+/// upstream 0, local 1, upstream 1, …
+#[must_use]
+pub fn side_index(link: usize, remote: bool) -> usize {
+    2 * link + usize::from(remote)
+}
+
+/// The metrics name of upstream `link`'s local side: `local` when the bridge has one
+/// upstream (the name it has always had), `local:<upstream>` when it has several.
+#[must_use]
+pub fn local_side_name(upstream_names: &[String], link: usize) -> String {
+    if upstream_names.len() <= 1 {
+        "local".to_string()
+    } else {
+        format!(
+            "local:{}",
+            upstream_names.get(link).map_or("", String::as_str)
+        )
+    }
 }
 
 impl std::fmt::Debug for SideHandles {
@@ -124,10 +152,12 @@ impl BridgeMetrics {
     /// A metrics set whose label values are fixed by `upstream_names`.
     #[must_use]
     pub fn for_upstreams(upstream_names: &[String]) -> Self {
-        // One reconnect counter per side: the local side plus one per upstream.
-        let reconnects = (0..=upstream_names.len())
-            .map(|_| AtomicU64::new(0))
-            .collect();
+        // Two sides per upstream: its local session and the upstream (see [`side_index`]).
+        let per_side = || {
+            (0..2 * upstream_names.len())
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>()
+        };
         Self {
             upstream_names: upstream_names.to_vec(),
             per_upstream: upstream_names
@@ -136,7 +166,9 @@ impl BridgeMetrics {
                 .collect(),
             unknown: UpstreamCounters::default(),
             dropped_hop_limit: AtomicU64::new(0),
-            reconnects,
+            reconnects: per_side(),
+            refused: per_side(),
+            sessions_lost: per_side(),
             sides: OnceLock::new(),
         }
     }
@@ -150,7 +182,7 @@ impl BridgeMetrics {
         &self,
         names: Vec<String>,
         connected: Vec<Arc<AtomicBool>>,
-        spools: Vec<Arc<Spool>>,
+        spools: Vec<Option<Arc<Spool>>>,
     ) {
         let _ = self.sides.set(SideHandles {
             names,
@@ -214,11 +246,57 @@ impl BridgeMetrics {
         );
     }
 
-    /// Record one (re)connection of the side at `side_index` (0 = local).
+    /// Record one (re)connection of the side at `side_index` (see [`side_index`]).
     pub fn reconnect(&self, side_index: usize) {
         if let Some(c) = self.reconnects.get(side_index) {
             c.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Record (and audit) one forward that the destination side at `side_index` refused for
+    /// good — a PUBACK reason code that a retry cannot change (ADR 0060 Amendment 1 §5). The
+    /// message was acknowledged at its source and is gone, so the audit record names it.
+    pub fn refused(&self, side_index: usize, side: &str, topic: &str, reason: u8) {
+        if let Some(c) = self.refused.get(side_index) {
+            c.fetch_add(1, Ordering::Relaxed);
+        }
+        info!(
+            target: "bridge::audit",
+            side,
+            topic,
+            reason = format_args!("0x{reason:02x}"),
+            "the destination refused a forward for good; acknowledged at the source and dropped"
+        );
+    }
+
+    /// Record (and audit) a reconnect that found the session of the side at `side_index`
+    /// gone (ADR 0060 Amendment 1 §1): whatever was queued in it, and whatever was published
+    /// while it did not exist, did not reach the bridge.
+    pub fn session_lost(&self, side_index: usize, side: &str) {
+        if let Some(c) = self.sessions_lost.get(side_index) {
+            c.fetch_add(1, Ordering::Relaxed);
+        }
+        info!(
+            target: "bridge::audit",
+            side,
+            "the session was gone on reconnect; messages queued in it, or published while it \
+             did not exist, were not received"
+        );
+    }
+
+    /// Forwards refused for good, summed across sides.
+    #[must_use]
+    pub fn refused_count(&self) -> u64 {
+        self.refused.iter().map(|c| c.load(Ordering::Relaxed)).sum()
+    }
+
+    /// Lost sessions found on reconnect, summed across sides.
+    #[must_use]
+    pub fn sessions_lost_count(&self) -> u64 {
+        self.sessions_lost
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .sum()
     }
 
     /// Messages forwarded local→upstream, across every upstream.
@@ -316,6 +394,7 @@ impl BridgeMetrics {
         // store-and-forward hit its bound and threw the oldest queued messages away.
         if let Some(sides) = self.sides.get() {
             for (i, spool) in sides.spools.iter().enumerate() {
+                let Some(spool) = spool else { continue };
                 let name = sides.names.get(i).map_or("unknown", String::as_str);
                 let _ = writeln!(
                     out,
@@ -324,6 +403,38 @@ impl BridgeMetrics {
                     spool.dropped_count()
                 );
             }
+            // Forwards the destination refused for good (ADR 0060 Amendment 1 §5).
+            for (i, c) in self.refused.iter().enumerate() {
+                let name = sides.names.get(i).map_or("unknown", String::as_str);
+                let _ = writeln!(
+                    out,
+                    "fss_bridge_dropped_total{{reason=\"refused\",side=\"{}\"}} {}",
+                    esc(name),
+                    c.load(Ordering::Relaxed)
+                );
+            }
+        }
+
+        out.push_str(
+            "# HELP fss_bridge_sessions_lost_total Reconnects that found the side's session gone.\n",
+        );
+        out.push_str("# TYPE fss_bridge_sessions_lost_total counter\n");
+        if let Some(sides) = self.sides.get() {
+            for (i, c) in self.sessions_lost.iter().enumerate() {
+                let name = sides.names.get(i).map_or("unknown", String::as_str);
+                let _ = writeln!(
+                    out,
+                    "fss_bridge_sessions_lost_total{{side=\"{}\"}} {}",
+                    esc(name),
+                    c.load(Ordering::Relaxed)
+                );
+            }
+        } else {
+            let _ = writeln!(
+                out,
+                "fss_bridge_sessions_lost_total {}",
+                self.sessions_lost_count()
+            );
         }
 
         out.push_str("# HELP fss_bridge_reconnects_total Side (re)connections.\n");
@@ -363,7 +474,7 @@ impl BridgeMetrics {
             }
 
             out.push_str(
-                "# HELP fss_bridge_spool_depth Messages currently buffered for this side.\n",
+                "# HELP fss_bridge_spool_depth Messages currently spooled for this side.\n",
             );
             out.push_str("# TYPE fss_bridge_spool_depth gauge\n");
             out.push_str(
@@ -371,6 +482,7 @@ impl BridgeMetrics {
             );
             out.push_str("# TYPE fss_bridge_spool_capacity gauge\n");
             for (i, spool) in sides.spools.iter().enumerate() {
+                let Some(spool) = spool else { continue };
                 let name = sides.names.get(i).map_or("unknown", String::as_str);
                 // A disk-backed spool can fail to report; skip the sample rather than
                 // publish a zero that would read as "nothing buffered".
@@ -464,7 +576,7 @@ mod tests {
         m.register_sides(
             vec!["local".to_string(), "partner".to_string()],
             vec![up, down],
-            vec![spool_a, spool_b],
+            vec![Some(spool_a), Some(spool_b)],
         );
 
         let text = m.render();
@@ -488,7 +600,7 @@ mod tests {
         m.register_sides(
             vec!["partner".to_string()],
             vec![Arc::new(AtomicBool::new(true))],
-            vec![spool],
+            vec![Some(spool)],
         );
 
         let text = m.render();
@@ -512,14 +624,41 @@ mod tests {
                 Arc::new(AtomicBool::new(true)),
                 Arc::new(AtomicBool::new(true)),
             ],
-            vec![
-                Arc::new(Spool::in_memory(10)),
-                Arc::new(Spool::in_memory(10)),
-            ],
+            vec![Some(Arc::new(Spool::in_memory(10))), None],
         );
         let text = m.render();
         assert!(text.contains(r#"fss_bridge_reconnects_total{side="local"} 1"#));
         assert!(text.contains(r#"fss_bridge_reconnects_total{side="partner"} 2"#));
+        // A side without a spool publishes no spool gauges, rather than a zero that reads as
+        // "nothing buffered" for a buffer that does not exist.
+        assert!(!text.contains(r#"fss_bridge_spool_depth{side="partner"}"#));
+    }
+
+    #[test]
+    fn refusals_and_lost_sessions_are_counted_per_side() {
+        let m = BridgeMetrics::for_upstreams(&["a".to_string(), "b".to_string()]);
+        assert_eq!(side_index(1, true), 3);
+        assert_eq!(
+            local_side_name(&["a".to_string(), "b".to_string()], 1),
+            "local:b"
+        );
+        assert_eq!(local_side_name(&["a".to_string()], 0), "local");
+        m.refused(side_index(1, true), "b", "t/x", 0x87);
+        m.session_lost(side_index(0, false), "local:a");
+        m.register_sides(
+            ["local:a", "a", "local:b", "b"].map(String::from).to_vec(),
+            (0..4).map(|_| Arc::new(AtomicBool::new(false))).collect(),
+            vec![None, None, None, None],
+        );
+        let text = m.render();
+        assert!(
+            text.contains(r#"fss_bridge_dropped_total{reason="refused",side="b"} 1"#),
+            "{text}"
+        );
+        assert!(text.contains(r#"fss_bridge_dropped_total{reason="refused",side="a"} 0"#));
+        assert!(text.contains(r#"fss_bridge_sessions_lost_total{side="local:a"} 1"#));
+        assert_eq!(m.refused_count(), 1);
+        assert_eq!(m.sessions_lost_count(), 1);
     }
 
     #[test]

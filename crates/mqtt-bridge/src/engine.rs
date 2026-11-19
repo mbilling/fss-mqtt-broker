@@ -1,111 +1,29 @@
-//! The bridge runtime — connect every side, subscribe per the rules, and route
-//! ([ADR 0025](../../../docs/adr/0025-boundary-bridge.md) §3, T3).
+//! The bridge runtime ([ADR 0025](../../../docs/adr/0025-boundary-bridge.md) §3,
+//! [ADR 0060](../../../docs/adr/0060-bridge-durability-and-ack-contract.md) Amendment 1).
 //!
-//! One supervised connection per side (the local cluster + each upstream): connect, issue
-//! the side's subscriptions, pump it ([`MqttClient::run`]), and on any disconnect reconnect
-//! with bounded backoff. Inbound publishes from every side funnel into one **router** task
-//! that applies the pure [`crate::forward`] policy and pushes the resulting publishes to the
-//! destination sides — so all the security-relevant decisions live in the tested pure core,
-//! and this layer is just plumbing.
+//! One link per upstream: each link task (the private `link` module) owns two connections, its own persistent
+//! session on the local cluster and the connection to its upstream, and moves messages both
+//! ways between them, so an unreachable upstream stops only its own traffic. This module
+//! builds the links from the configuration — client ids, connection options, subscriptions,
+//! spools (including the ones an older bridge left behind), metrics sides — and warns at
+//! startup about rules through which the bridge now relays from one upstream to another.
+//! All the security-relevant decisions stay in the pure [`crate::forward`] policy.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::path::Path;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use bytes::Bytes;
-use mqtt_codec::packet::Publish;
 use mqtt_codec::{ProtocolVersion, QoS};
-use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use crate::client::{Command, ConnectOptions, MqttClient, Transport};
-use crate::config::{BridgeConfig, Endpoint, HaMode};
-use crate::forward::{owns, plan_forwards, read_hop_count, set_hop_count, Side};
-use crate::metrics::{BridgeMetrics, CrossDirection};
-use crate::spool::{Overflow, Spool, SpoolError, SpooledMessage};
-
-/// A fixed keepalive (seconds) for every bridge connection; the client pings at half this.
-const KEEP_ALIVE: u16 = 30;
-/// Reconnect backoff bounds.
-const BACKOFF_START: Duration = Duration::from_millis(200);
-const BACKOFF_MAX: Duration = Duration::from_secs(10);
-
-/// One side's handoff between the live path and its spool (issue #1100).
-///
-/// The router decides, per forward, whether the destination is up (send it live) or down
-/// (spool it). The supervisor flips that answer when the side connects (drain the spool,
-/// queue the replay, open the live path) and when it disconnects. Both run under `gate`, so a
-/// forward is decided either wholly before a connect handoff (it is spooled and then drained
-/// with the rest) or wholly after it (it goes live, behind the replay on the same channel).
-///
-/// Without the gate a router could read "down", lose the CPU while the supervisor drained,
-/// then push into the just-emptied spool: the message sat there until the next reconnect,
-/// already acknowledged to its source.
-///
-/// `gate` is a `std` mutex and is never held across an `.await`: everything done under it is
-/// synchronous (a spool push or drain, and sends on an unbounded channel).
-#[derive(Debug)]
-struct Handoff {
-    gate: Mutex<()>,
-    /// Whether the side's connection is up. Written only under `gate`; the metrics read it
-    /// without the gate (a gauge needs no ordering against the router).
-    connected: Arc<AtomicBool>,
-    spool: Arc<Spool>,
-}
-
-impl Handoff {
-    fn new(spool: Arc<Spool>) -> Self {
-        Self {
-            gate: Mutex::new(()),
-            connected: Arc::new(AtomicBool::new(false)),
-            spool,
-        }
-    }
-
-    /// The side just connected: replay everything spooled while it was down onto its
-    /// command channel, oldest first, and only then open the live path, all under the gate.
-    /// A forward waiting on the gate therefore lands after the replay, never in the spool.
-    fn open(&self, self_tx: &mpsc::UnboundedSender<Command>, side: Side) {
-        let _gate = self.gate.lock().unwrap_or_else(PoisonError::into_inner);
-        replay_spool(&self.spool, self_tx, side);
-        self.connected.store(true, Ordering::SeqCst);
-    }
-
-    /// The side's connection ended: from here on, forwards to it are spooled.
-    ///
-    /// A forward sent live before this point is already on the side's command channel,
-    /// which outlives the connection, so the next connection writes it ahead of its
-    /// subscribes and its replay.
-    fn close(&self) {
-        let _gate = self.gate.lock().unwrap_or_else(PoisonError::into_inner);
-        self.connected.store(false, Ordering::SeqCst);
-    }
-
-    /// Route one forward `msg`: as `live(msg)` onto the side's channel when it is up, else
-    /// as `spooled(msg)` into its spool. Only the chosen conversion runs.
-    ///
-    /// # Errors
-    /// The spool's refusal (full under [`Overflow::Refuse`]) or disk failure: the message was
-    /// **not** accepted, so the caller withholds the source ack (ADR 0060 T2).
-    fn forward<M>(
-        &self,
-        tx: &mpsc::UnboundedSender<Command>,
-        msg: M,
-        live: impl FnOnce(M) -> Command,
-        spooled: impl FnOnce(M) -> SpooledMessage,
-    ) -> Result<(), SpoolError> {
-        let _gate = self.gate.lock().unwrap_or_else(PoisonError::into_inner);
-        if self.connected.load(Ordering::SeqCst) {
-            // Fast path: the destination is up — the run loop assigns the packet id.
-            let _ = tx.send(live(msg));
-            Ok(())
-        } else {
-            // The destination is down: spool it (bounded) for replay on reconnect (§7).
-            self.spool.push(&spooled(msg))
-        }
-    }
-}
+use crate::client::{ConnectOptions, Transport};
+use crate::config::{BridgeConfig, Endpoint};
+use crate::forward::{link_local_subscriptions, relay_paths, upstream_subscriptions, Side};
+use crate::link::{self, LinkSpec};
+use crate::metrics::{local_side_name, BridgeMetrics};
+use crate::spool::{Overflow, Spool};
 
 /// A running bridge. Dropping it (or calling [`Bridge::shutdown`]) stops every connection.
 #[derive(Debug)]
@@ -115,81 +33,114 @@ pub struct Bridge {
 }
 
 impl Bridge {
-    /// Start the bridge from a validated configuration: spawn a supervised connection per
-    /// side and the router. Returns immediately; the connections come up in the background.
+    /// Start the bridge from a validated configuration: one link per upstream. Returns
+    /// immediately; the connections come up in the background.
     #[must_use]
     pub fn start(cfg: BridgeConfig) -> Self {
         let cfg = Arc::new(cfg);
         // Register the label values up front, from config: metric cardinality is then
         // bounded by the configuration rather than by traffic.
-        let upstream_names: Vec<String> = cfg.upstreams.iter().map(|u| u.name.clone()).collect();
-        let metrics = Arc::new(BridgeMetrics::for_upstreams(&upstream_names));
-        let n_sides = 1 + cfg.upstreams.len();
+        let names: Vec<String> = cfg.upstreams.iter().map(|u| u.name.clone()).collect();
+        let metrics = Arc::new(BridgeMetrics::for_upstreams(&names));
 
-        // One command channel per side (index 0 = local, i+1 = upstream i). The router keeps
-        // every sender to dispatch forwards; each supervisor owns its receiver + a sender
-        // clone (to inject its own (re)subscribes after each connect).
-        let mut cmd_tx = Vec::with_capacity(n_sides);
-        let mut cmd_rx = Vec::with_capacity(n_sides);
-        for _ in 0..n_sides {
-            let (tx, rx) = mpsc::unbounded_channel::<Command>();
-            cmd_tx.push(tx);
-            cmd_rx.push(rx);
+        // Validation refuses these unless `relay_between_upstreams` allows them (ADR 0060
+        // Amendment 1 §2); name each allowed pair once, so the flow is visible in the log.
+        for path in relay_paths(&cfg) {
+            info!(
+                from = %path.from,
+                from_filter = %path.from_filter,
+                to = %path.to,
+                to_filter = %path.to_filter,
+                "relaying between upstreams, allowed by relay_between_upstreams: messages brought \
+                 in by this rule are forwarded on to the other upstream"
+            );
         }
 
-        // One inbound channel into the router, tagged with the originating side.
-        let (in_tx, in_rx) = mpsc::unbounded_channel::<(Side, Publish)>();
-
-        // Per-side store-and-forward spool + a connected flag, behind one handoff gate the
-        // router and the supervisor share: a forward to a connected side goes straight to its
-        // channel; a forward to a disconnected side is spooled (bounded) and replayed when the
-        // supervisor reconnects (§7, #1100).
-        let mut handoffs = Vec::with_capacity(n_sides);
-        handoffs.push(Arc::new(Handoff::new(build_spool(&cfg, Side::Local))));
-        for i in 0..cfg.upstreams.len() {
-            handoffs.push(Arc::new(Handoff::new(build_spool(&cfg, Side::Upstream(i)))));
+        let host = host_identity();
+        if host.is_none()
+            && cfg
+                .upstreams
+                .iter()
+                .any(|u| u.endpoint.client_id.is_empty())
+        {
+            // Without a host name every instance generates the SAME ids, so a second one
+            // would evict the first. Allowed, never silent.
+            warn!(
+                "could not determine this host's name (no HOSTNAME, no /etc/hostname); \
+                 every bridge instance will generate the SAME client id and they will \
+                 evict each other's MQTT session — set `client_id` explicitly on each side"
+            );
         }
 
-        let mut tasks = Vec::new();
+        let mut side_names = Vec::with_capacity(2 * names.len());
+        let mut connected = Vec::with_capacity(2 * names.len());
+        let mut spools = Vec::with_capacity(2 * names.len());
+        let mut tasks = Vec::with_capacity(names.len());
+        for (i, up) in cfg.upstreams.iter().enumerate() {
+            let local_side = local_side_name(&names, i);
+            let local_connected = Arc::new(AtomicBool::new(false));
+            let remote_connected = Arc::new(AtomicBool::new(false));
+            let inbound_spool = build_inbound_spool(&cfg, i, &local_side);
+            if i == 0 {
+                if let Some(dir) = &cfg.spool.dir {
+                    migrate_shared_local_spool(Path::new(dir), &inbound_spool);
+                }
+            }
+            let legacy_outbound = open_legacy_outbound(&cfg, i);
 
-        // Local supervisor (side index 0).
-        tasks.push(spawn_supervisor(
-            Side::Local,
-            cfg.clone(),
-            cmd_rx.remove(0),
-            cmd_tx[0].clone(),
-            in_tx.clone(),
-            metrics.clone(),
-            handoffs[0].clone(),
-        ));
-        // Upstream supervisors. `cmd_rx.remove(0)` keeps popping the front as sides advance.
-        for i in 0..cfg.upstreams.len() {
-            tasks.push(spawn_supervisor(
-                Side::Upstream(i),
-                cfg.clone(),
-                cmd_rx.remove(0),
-                cmd_tx[i + 1].clone(),
-                in_tx.clone(),
-                metrics.clone(),
-                handoffs[i + 1].clone(),
-            ));
+            side_names.push(local_side.clone());
+            connected.push(local_connected.clone());
+            spools.push(Some(inbound_spool.clone()));
+            side_names.push(up.name.clone());
+            connected.push(remote_connected.clone());
+            spools.push(legacy_outbound.clone());
+
+            let local_id = local_client_id(&cfg, host.as_deref(), i);
+            let remote_id = if up.endpoint.client_id.is_empty() {
+                let id = client_id_for(host.as_deref(), Side::Upstream(i));
+                log_generated_id(&id, host.as_deref(), &up.name);
+                id
+            } else {
+                up.endpoint.client_id.clone()
+            };
+            let local = connect_options(&cfg.local, local_id, cfg.local_session_expiry());
+            let remote = connect_options(
+                &up.endpoint,
+                remote_id,
+                up.endpoint.session_expiry_secs.unwrap_or(0),
+            );
+            let (local, remote) = match (local, remote) {
+                (Ok(l), Ok(r)) => (l, r),
+                (Err(e), _) | (_, Err(e)) => {
+                    // A config error will not fix itself by retrying.
+                    warn!(upstream = %up.name, error = %e, "bridge endpoint misconfigured; this link does not start");
+                    continue;
+                }
+            };
+            let qos = |subs: Vec<(String, u8)>| -> Vec<(String, QoS)> {
+                subs.into_iter().map(|(f, q)| (f, qos_from_u8(q))).collect()
+            };
+            let spec = LinkSpec {
+                index: i,
+                name: up.name.clone(),
+                local_side,
+                local,
+                remote,
+                local_subs: qos(link_local_subscriptions(&cfg, i)),
+                remote_subs: qos(upstream_subscriptions(&cfg, i)),
+                max_inflight_bytes: usize::try_from(cfg.max_inflight_bytes).unwrap_or(usize::MAX),
+                inbound_spool,
+                legacy_outbound,
+                local_connected,
+                remote_connected,
+            };
+            tasks.push(tokio::spawn(link::run(spec, cfg.clone(), metrics.clone())));
         }
 
         // Publish the live per-side state the gauges read. These are clones of the very
-        // flags and spools the engine uses, so `fss_bridge_connected` and
+        // flags and spools the links use, so `fss_bridge_connected` and
         // `fss_bridge_spool_depth` cannot drift from the state they describe.
-        let mut side_names = Vec::with_capacity(n_sides);
-        side_names.push("local".to_string());
-        for u in &cfg.upstreams {
-            side_names.push(u.name.clone());
-        }
-        metrics.register_sides(
-            side_names,
-            handoffs.iter().map(|h| h.connected.clone()).collect(),
-            handoffs.iter().map(|h| h.spool.clone()).collect(),
-        );
-
-        tasks.push(spawn_router(cfg, cmd_tx, in_rx, metrics.clone(), handoffs));
+        metrics.register_sides(side_names, connected, spools);
         Self { tasks, metrics }
     }
 
@@ -199,7 +150,7 @@ impl Bridge {
         self.metrics.clone()
     }
 
-    /// Stop every connection and the router.
+    /// Stop every link and its connections.
     pub fn shutdown(self) {
         for t in self.tasks {
             t.abort();
@@ -207,186 +158,56 @@ impl Bridge {
     }
 }
 
-/// The per-side connection supervisor: (re)connect, subscribe, pump, backoff.
-fn spawn_supervisor(
-    side: Side,
-    cfg: Arc<BridgeConfig>,
-    mut commands: mpsc::UnboundedReceiver<Command>,
-    self_tx: mpsc::UnboundedSender<Command>,
-    inbound_central: mpsc::UnboundedSender<(Side, Publish)>,
-    metrics: Arc<BridgeMetrics>,
-    handoff: Arc<Handoff>,
-) -> JoinHandle<()> {
-    // Tag each inbound PUBLISH with this side before it reaches the router.
-    let (in_tx, mut in_rx) = mpsc::unbounded_channel::<Publish>();
-    {
-        let central = inbound_central;
-        tokio::spawn(async move {
-            while let Some(p) = in_rx.recv().await {
-                if central.send((side, p)).is_err() {
-                    break;
-                }
-            }
-        });
+/// The client id of upstream `i`'s local session: the configured `[local] client_id`, with
+/// `.<upstream name>` appended when there are several upstreams; otherwise a generated one.
+/// With one upstream it is exactly the id the local side has always used.
+///
+/// **Unique per instance, by default.** The local id used to be the constant
+/// `fss-bridge-local`, which is safe for exactly one bridge and quietly catastrophic for two:
+/// MQTT keys a session by client id and requires the broker to disconnect the existing client
+/// when a new one connects with the same id, so two replicas evicted each other in a permanent
+/// reconnect loop. Deriving from the hostname makes replicas distinct without configuration,
+/// and keeps each id stable across restarts so the persistent session resumes rather than
+/// being orphaned. The id is deliberately **not** truncated to fit a strict broker — that
+/// could map two hosts onto one id; set `client_id` explicitly for such an endpoint.
+fn local_client_id(cfg: &BridgeConfig, host: Option<&str>, i: usize) -> String {
+    let several = cfg.upstreams.len() > 1;
+    if !cfg.local.client_id.is_empty() {
+        return if several {
+            format!("{}.{}", cfg.local.client_id, cfg.upstreams[i].name)
+        } else {
+            cfg.local.client_id.clone()
+        };
     }
-
-    tokio::spawn(async move {
-        let endpoint = endpoint_for(&cfg, side);
-        let subs = subscriptions_for(&cfg, side);
-        let default_id = default_client_id(side);
-        // The local side uses a **persistent** session (§5): a brief bridge restart resumes
-        // its shared subscription and buffered messages. Upstreams stay clean.
-        let persistent = matches!(side, Side::Local);
-        let mut backoff = mqtt_core::Backoff::new(BACKOFF_START, BACKOFF_MAX);
-        loop {
-            let opts = match connect_options(endpoint, &default_id, persistent) {
-                Ok(o) => o,
-                Err(e) => {
-                    warn!(?side, error = %e, "bridge endpoint misconfigured; not connecting");
-                    return; // a config error will not fix itself by retrying
-                }
-            };
-            match MqttClient::connect(&opts).await {
-                Ok(client) => {
-                    backoff.reset();
-                    metrics.reconnect(side_index(side));
-                    info!(?side, addr = %opts.addr, subs = subs.len(), "bridge side connected");
-                    // (Re)subscribe for this side's open direction(s) only.
-                    let mut pkid: u16 = 1;
-                    for (filter, qos) in &subs {
-                        let _ = self_tx.send(Command::Subscribe {
-                            pkid,
-                            filter: filter.clone(),
-                            qos: qos_from_u8(*qos),
-                        });
-                        pkid = pkid.wrapping_add(1).max(1);
-                    }
-                    // Replay anything spooled while this side was down (§7), oldest first,
-                    // before opening the live fast path so order is preserved — atomically
-                    // with the router's live-or-spool decision (#1100).
-                    handoff.open(&self_tx, side);
-                    let err = client.run(&mut commands, &in_tx, KEEP_ALIVE).await;
-                    handoff.close();
-                    warn!(?side, error = %err, "bridge side disconnected; reconnecting");
-                }
-                Err(e) => warn!(?side, addr = %opts.addr, error = %e, "bridge connect failed"),
-            }
-            tokio::time::sleep(backoff.next_delay()).await;
-        }
-    })
-}
-
-/// The router: apply the pure forwarding policy to each inbound message and dispatch.
-fn spawn_router(
-    cfg: Arc<BridgeConfig>,
-    cmd_tx: Vec<mpsc::UnboundedSender<Command>>,
-    mut inbound: mpsc::UnboundedReceiver<(Side, Publish)>,
-    metrics: Arc<BridgeMetrics>,
-    handoffs: Vec<Arc<Handoff>>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        while let Some((side, publish)) = inbound.recv().await {
-            // Partitioned HA (ADR 0059): every instance receives the full stream but forwards
-            // only the topics it owns, so inbound is delivered exactly once and per-topic order
-            // holds. Under `shared` (or a lone instance) this is always true.
-            if cfg.ha == HaMode::Partitioned && !owns(&publish.topic, cfg.total, cfg.instance) {
-                continue;
-            }
-            // ADR 0060 T2: this message owes the source an acknowledgement, and it is sent only
-            // once every destination has durably accepted the message (spooled) or taken it on
-            // the live path. A destination that refuses (spool full / disk error) withholds the
-            // ack entirely, so the source keeps its copy and redelivers — fail closed.
-            let owed_ack = if publish.qos == QoS::AtLeastOnce {
-                publish.pkid
-            } else {
-                None
-            };
-            let mut durably_accepted = true;
-            let hop = read_hop_count(&publish.properties);
-            let forwards = plan_forwards(&cfg, side, &publish.topic, hop);
-            if forwards.is_empty() && hop >= cfg.hop_count_limit {
-                metrics.dropped_hop_limit(&publish.topic, hop);
-                debug!(?side, topic = %publish.topic, hop, "hop limit reached; dropped");
-            }
-            for f in forwards {
-                let idx = side_index(f.dest);
-                // Record + audit the crossing (the upstream involved is the non-local side).
-                let (dir, up_name) = match side {
-                    Side::Local => (CrossDirection::Out, upstream_name(&cfg, f.dest)),
-                    Side::Upstream(_) => (CrossDirection::In, upstream_name(&cfg, side)),
-                };
-                metrics.forwarded(
-                    up_name,
-                    dir,
-                    &publish.topic,
-                    &f.topic,
-                    publish.payload.len(),
-                );
-                // Forward the publisher's user properties, with the hop count incremented.
-                let properties = set_hop_count(&publish.properties, hop + 1);
-                // Preserve the source retain bit unless the rule opts out (issue #189).
-                let retain = publish.retain && f.retain_ok;
-                let qos = f.qos;
-                let live = |(topic, properties)| Command::Publish {
-                    topic,
-                    payload: publish.payload.clone(),
-                    qos: qos_from_u8(qos),
-                    retain,
-                    pkid: None,
-                    properties,
-                };
-                let spooled = |(topic, properties): (String, mqtt_codec::Properties)| {
-                    let user_properties = properties
-                        .0
-                        .into_iter()
-                        .filter_map(|p| match p {
-                            mqtt_codec::Property::UserProperty(k, v) => Some((k, v)),
-                            _ => None,
-                        })
-                        .collect();
-                    SpooledMessage {
-                        topic,
-                        payload: publish.payload.to_vec(),
-                        qos,
-                        retain,
-                        user_properties,
-                    }
-                };
-                if let Err(e) =
-                    handoffs[idx].forward(&cmd_tx[idx], (f.topic, properties), live, spooled)
-                {
-                    // Not durably accepted: withhold the source ack (ADR 0060 T2) so the
-                    // source redelivers, rather than acking a message we just lost.
-                    warn!(dest = idx, error = %e, "failed to spool a message for a down side");
-                    durably_accepted = false;
-                }
-            }
-            // Acknowledge the source only now. A message with no matching rule (or one dropped
-            // at the hop limit) owes nothing and is acked immediately — withholding it would
-            // stall the source's in-flight window for a message deliberately not forwarded.
-            if let Some(pkid) = owed_ack.filter(|_| durably_accepted) {
-                let _ = cmd_tx[side_index(side)].send(Command::Ack { pkid });
-            }
-        }
-    })
-}
-
-/// Build a side's spool: disk-backed under `spool.dir` when configured (so it survives a
-/// bridge restart), else in-memory — bounded to `spool.max_messages` and, when set,
-/// `spool.max_bytes` (§7, ADR 0041 T7).
-fn build_spool(cfg: &BridgeConfig, side: Side) -> Arc<Spool> {
-    let cap = cfg.spool.max_messages;
-    let max_bytes = cfg.spool.max_bytes;
-    let label = match side {
-        Side::Local => "local".to_string(),
-        Side::Upstream(i) => cfg
-            .upstreams
-            .get(i)
-            .map_or_else(|| format!("upstream-{i}"), |u| u.name.clone()),
+    let id = if several {
+        link_client_id_for(host, i)
+    } else {
+        client_id_for(host, Side::Local)
     };
-    // ADR 0060 T5: a QoS≥1 rule refuses at the cap (everything spooled was already acked to the
-    // source, so shedding it loses a message the source believes was delivered); a QoS-0-only
-    // bridge drops the oldest, since QoS 0 promises nothing and a stalled crossing is worse.
+    log_generated_id(&id, host, &format!("local:{}", cfg.upstreams[i].name));
+    id
+}
+
+/// Print a generated id's mapping once: the hash suffix is opaque by construction, and this
+/// is what makes a strict, generated id as debuggable as a readable one.
+fn log_generated_id(id: &str, host: Option<&str>, side: &str) {
+    info!(
+        client_id = %id,
+        host = host.unwrap_or("<unknown>"),
+        side,
+        "generated MQTT client id (23-byte alphanumeric form accepted by any broker)"
+    );
+}
+
+/// Build upstream `i`'s inbound spool (ADR 0060 Amendment 1 §7): messages from the upstream
+/// that the bridge holds for the local cluster. Disk-backed under `spool.dir` as
+/// `spool-local-<i>.redb` (so it survives a bridge restart), else in memory — bounded by
+/// `spool.max_messages` and, when set, `spool.max_bytes` (ADR 0041 T7).
+fn build_inbound_spool(cfg: &BridgeConfig, i: usize, label: &str) -> Arc<Spool> {
+    let cap = cfg.spool.max_messages;
+    // ADR 0060 T5: a QoS≥1 rule bringing traffic in refuses at the cap (everything spooled was
+    // already acked to the upstream, so shedding it loses a message the upstream believes was
+    // delivered); a QoS-0-only one drops the oldest, since QoS 0 promises nothing.
     let overflow = if cfg.requires_durable_spool() {
         Overflow::Refuse
     } else {
@@ -395,100 +216,114 @@ fn build_spool(cfg: &BridgeConfig, side: Side) -> Arc<Spool> {
     let finish = |s: Spool| {
         Arc::new(
             s.with_overflow(overflow)
-                .with_max_bytes(max_bytes)
-                .with_label(label.clone()),
+                .with_max_bytes(cfg.spool.max_bytes)
+                .with_label(label),
         )
     };
-    match &cfg.spool.dir {
-        Some(dir) => {
-            let file = match side {
-                Side::Local => "spool-local.redb".to_string(),
-                Side::Upstream(i) => format!("spool-upstream-{i}.redb"),
-            };
-            let path = std::path::Path::new(dir).join(file);
-            match Spool::on_disk(&path, cap) {
-                Ok(s) => finish(s),
-                Err(e) => {
-                    // ADR 0060 T4: never silently fall back to a non-durable spool when a
-                    // QoS≥1 rule needs one — that loses acked messages on restart. Refuse to
-                    // start unless the operator opted into ephemeral operation.
-                    if cfg.requires_durable_spool() && !cfg.spool.allow_ephemeral_spool {
-                        error!(
-                            ?side, error = %e, path = %path.display(),
-                            "durable spool required for a QoS>=1 rule but the disk spool could \
-                             not be opened; refusing to start (set spool.allow_ephemeral_spool \
-                             to run non-durably and accept message loss)"
-                        );
-                        std::process::exit(1);
-                    }
-                    warn!(?side, error = %e, "disk spool unavailable; using an in-memory spool");
-                    finish(Spool::in_memory(cap))
-                }
+    let Some(dir) = &cfg.spool.dir else {
+        return finish(Spool::in_memory(cap));
+    };
+    let path = Path::new(dir).join(format!("spool-local-{i}.redb"));
+    match Spool::on_disk(&path, cap) {
+        Ok(s) => finish(s),
+        Err(e) => {
+            // ADR 0060 T4: never silently fall back to a non-durable spool when a QoS≥1 rule
+            // needs one — that loses acked messages on restart. Refuse to start unless the
+            // operator opted into ephemeral operation.
+            if cfg.requires_durable_spool() && !cfg.spool.allow_ephemeral_spool {
+                error!(
+                    path = %path.display(), error = %e,
+                    "durable spool required for a QoS>=1 in rule but the disk spool could not be \
+                     opened; refusing to start (set spool.allow_ephemeral_spool to run \
+                     non-durably and accept message loss)"
+                );
+                std::process::exit(1);
             }
+            warn!(path = %path.display(), error = %e, "disk spool unavailable; using an in-memory spool");
+            finish(Spool::in_memory(cap))
         }
-        None => finish(Spool::in_memory(cap)),
     }
 }
 
-/// Replay every spooled message for a side onto its command channel, oldest first.
-fn replay_spool(spool: &Spool, self_tx: &mpsc::UnboundedSender<Command>, side: Side) {
-    match spool.drain() {
-        Ok(msgs) => {
-            if !msgs.is_empty() {
+/// The spool an older bridge kept for upstream `i` (`spool-upstream-<i>.redb`), if it holds
+/// anything (ADR 0060 Amendment 1 §8). Those messages were acknowledged to the local cluster
+/// already, so the link sends them to the upstream before its local session connects. A
+/// bridge of this version never writes to it.
+fn open_legacy_outbound(cfg: &BridgeConfig, i: usize) -> Option<Arc<Spool>> {
+    let dir = cfg.spool.dir.as_ref()?;
+    let path = Path::new(dir).join(format!("spool-upstream-{i}.redb"));
+    if !path.exists() {
+        return None;
+    }
+    match Spool::on_disk(&path, usize::MAX) {
+        Ok(s) => match s.len() {
+            Ok(0) => None,
+            Ok(n) => {
                 info!(
-                    ?side,
-                    count = msgs.len(),
-                    "replaying spooled messages on reconnect"
+                    path = %path.display(), messages = n,
+                    "an older bridge left messages spooled for this upstream; sending them first"
                 );
+                Some(Arc::new(s))
             }
-            for m in msgs {
-                let properties = mqtt_codec::Properties(
-                    m.user_properties
-                        .into_iter()
-                        .map(|(k, v)| mqtt_codec::Property::UserProperty(k, v))
-                        .collect(),
-                );
-                let _ = self_tx.send(Command::Publish {
-                    topic: m.topic,
-                    payload: Bytes::from(m.payload),
-                    qos: qos_from_u8(m.qos),
-                    retain: m.retain,
-                    pkid: None,
-                    properties,
-                });
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "could not read the old spool");
+                None
             }
+        },
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "could not open the old spool");
+            None
         }
-        Err(e) => warn!(?side, error = %e, "failed to drain the spool on reconnect"),
     }
 }
 
-/// The configured name of the upstream involved in a side (for audit/metrics labels).
-fn upstream_name(cfg: &BridgeConfig, side: Side) -> &str {
-    match side {
-        Side::Local => "local",
-        Side::Upstream(i) => cfg.upstreams.get(i).map_or("unknown", |u| u.name.as_str()),
+/// Move what an older bridge spooled for the local cluster (`spool-local.redb`, shared by all
+/// upstreams then) into upstream 0's inbound spool, which replays it like its own (ADR 0060
+/// Amendment 1 §8). Each message is pushed before the old copies are removed, so a crash in
+/// between duplicates rather than loses. If the new spool refuses one, the rest stay in the
+/// old file for the next start.
+fn migrate_shared_local_spool(dir: &Path, into: &Spool) {
+    let path = dir.join("spool-local.redb");
+    if !path.exists() {
+        return;
     }
-}
-
-fn side_index(side: Side) -> usize {
-    match side {
-        Side::Local => 0,
-        Side::Upstream(i) => i + 1,
+    let old = match Spool::on_disk(&path, usize::MAX) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "could not open the old local spool");
+            return;
+        }
+    };
+    let messages = match old.peek_after(None, usize::MAX) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "could not read the old local spool");
+            return;
+        }
+    };
+    if messages.is_empty() {
+        return;
     }
-}
-
-fn endpoint_for(cfg: &BridgeConfig, side: Side) -> &Endpoint {
-    match side {
-        Side::Local => &cfg.local,
-        Side::Upstream(i) => &cfg.upstreams[i].endpoint,
+    let mut moved = Vec::with_capacity(messages.len());
+    for (key, m) in &messages {
+        if let Err(e) = into.push(m) {
+            warn!(
+                path = %path.display(), error = %e,
+                "the new spool refused a message from the old local spool; the rest stays there \
+                 for the next start"
+            );
+            break;
+        }
+        moved.push(*key);
     }
-}
-
-fn subscriptions_for(cfg: &BridgeConfig, side: Side) -> Vec<(String, u8)> {
-    match side {
-        Side::Local => crate::forward::local_subscriptions(cfg),
-        Side::Upstream(i) => crate::forward::upstream_subscriptions(cfg, i),
+    if let Err(e) = old.remove_many(&moved) {
+        warn!(path = %path.display(), error = %e, "could not remove moved messages from the old local spool; they will replay twice");
     }
+    info!(
+        moved = moved.len(),
+        "moved the messages an older bridge spooled for the local cluster into upstream 0's spool"
+    );
+    debug!(path = %path.display(), "old local spool emptied");
 }
 
 /// This host's name, as the runtime sees it — the stable, per-instance part of a
@@ -496,7 +331,7 @@ fn subscriptions_for(cfg: &BridgeConfig, side: Side) -> Vec<(String, u8)> {
 ///
 /// Two properties are required and both matter:
 ///
-/// - **Distinct per instance**, or replicas collide (see [`default_client_id`]).
+/// - **Distinct per instance**, or replicas collide (see [`local_client_id`]).
 /// - **Stable across restarts**, because the local side uses a persistent session
 ///   (`clean_session=false`). An id that changed on every start would orphan the
 ///   previous session — and its queued messages — on the broker each time.
@@ -522,51 +357,7 @@ fn host_identity() -> Option<String> {
     None
 }
 
-/// The client id used for a side when the config does not set one.
-///
-/// **Unique per instance, by default.** This used to return the constant
-/// `fss-bridge-local`, which is safe for exactly one bridge and quietly
-/// catastrophic for two: MQTT keys a session by client id and requires the broker
-/// to disconnect the existing client when a new one connects with the same id, so
-/// two replicas evicted each other in a permanent reconnect loop — turning the HA
-/// that a shared subscription is supposed to buy into an outage. Nothing warned;
-/// the config comment said "each instance still needs a distinct `client_id`" and
-/// the default made it easy to never notice.
-///
-/// Deriving from the hostname makes replicas distinct without configuration, and
-/// keeps each id stable across restarts so a persistent session resumes rather
-/// than being orphaned.
-///
-/// Note on length: MQTT guarantees server support only for ids up to 23 bytes,
-/// and a long hostname can exceed that. The id is deliberately **not** truncated —
-/// truncation could map two hosts onto one id, which is the very failure this
-/// exists to prevent. A strict upstream is handled by setting `client_id`
-/// explicitly for that endpoint, which is a loud, immediate connect error rather
-/// than a silent takeover.
-fn default_client_id(side: Side) -> String {
-    let host = host_identity();
-    if host.is_none() {
-        // Without a host name every instance generates the SAME id, so a second
-        // one would evict the first. Allowed, never silent.
-        warn!(
-            "could not determine this host's name (no HOSTNAME, no /etc/hostname); \
-             every bridge instance will generate the SAME client id and they will \
-             evict each other's MQTT session — set `client_id` explicitly on each side"
-        );
-    }
-    let id = client_id_for(host.as_deref(), side);
-    // The hash suffix is opaque by construction, so print the mapping once. This
-    // is what makes a strict, generated id as debuggable as a readable one.
-    info!(
-        client_id = %id,
-        host = host.as_deref().unwrap_or("<unknown>"),
-        ?side,
-        "generated MQTT client id (23-byte alphanumeric form accepted by any broker)"
-    );
-    id
-}
-
-/// The pure half of [`default_client_id`]: given a host identity (or none), the id.
+/// The pure half of [`local_client_id`]: given a host identity (or none), the id.
 ///
 /// Split out so the naming rules are testable without mutating process-wide
 /// environment — which, when a test did it, raced every other test reading it.
@@ -649,22 +440,38 @@ fn base36(n: u64, width: usize) -> String {
 /// Stable across restarts, because the local side uses `clean_session=false`: an
 /// id that varied per start would orphan the previous session and its queue.
 fn client_id_for(host: Option<&str>, side: Side) -> String {
-    let side_tag = match side {
-        Side::Local => "lo".to_string(),
-        // Beyond 36 upstreams the tag repeats; the hash still separates them,
-        // since it is taken over the real index.
-        Side::Upstream(i) => format!("u{}", base36((i % 36) as u64, 1)),
-    };
+    match side {
+        Side::Local => generated_id(host, "lo", b"local"),
+        // Beyond 36 upstreams the tag repeats; the hash still separates them, since it is
+        // taken over the real index.
+        Side::Upstream(i) => generated_id(
+            host,
+            &format!("u{}", base36((i % 36) as u64, 1)),
+            format!("up{i}").as_bytes(),
+        ),
+    }
+}
 
+/// The generated client id of upstream `link`'s local session when the bridge has several
+/// upstreams (ADR 0060 Amendment 1 §2): the same shape as [`client_id_for`], with the side tag
+/// `l<link>` and the link index in the hash, so every link's session is distinct and stable.
+fn link_client_id_for(host: Option<&str>, link: usize) -> String {
+    generated_id(
+        host,
+        &format!("l{}", base36((link % 36) as u64, 1)),
+        format!("local{link}").as_bytes(),
+    )
+}
+
+/// The shared body of the generated ids: `fssb` + a two-character side tag + the host's
+/// tail + a hash over the full host and `seed_tail`.
+fn generated_id(host: Option<&str>, side_tag: &str, seed_tail: &[u8]) -> String {
     let host = host.unwrap_or("");
     // Hash over the full identity — host and side — before anything is shortened.
     let mut seed = Vec::with_capacity(host.len() + 8);
     seed.extend_from_slice(host.as_bytes());
     seed.push(0);
-    match side {
-        Side::Local => seed.extend_from_slice(b"local"),
-        Side::Upstream(i) => seed.extend_from_slice(format!("up{i}").as_bytes()),
-    }
+    seed.extend_from_slice(seed_tail);
     let hash = base36(
         fnv1a64(&seed) % 36_u64.pow(ID_HASH_LEN),
         ID_HASH_LEN as usize,
@@ -705,15 +512,17 @@ fn qos_from_u8(v: u8) -> QoS {
     QoS::from_u8(v).unwrap_or(QoS::AtMostOnce)
 }
 
-/// Build the client connect options for an endpoint.
+/// Build the client connect options for an endpoint: `client_id`, and a session that lasts
+/// `session_expiry` seconds after a disconnect (`0` = a clean session that ends with the
+/// connection).
 ///
 /// # Errors
 /// A string error if the endpoint requests TLS without an mTLS identity (cert+key), which
 /// the client cannot yet honour, or a password file that cannot be read.
 fn connect_options(
     ep: &Endpoint,
-    default_id: &str,
-    persistent: bool,
+    client_id: String,
+    session_expiry: u32,
 ) -> Result<ConnectOptions, String> {
     let transport = match &ep.tls {
         None => Transport::Plain,
@@ -740,11 +549,6 @@ fn connect_options(
         }
         (None, None) => None,
     };
-    let client_id = if ep.client_id.is_empty() {
-        default_id.to_string()
-    } else {
-        ep.client_id.clone()
-    };
     Ok(ConnectOptions {
         addr: ep.url.clone(),
         transport,
@@ -752,14 +556,16 @@ fn connect_options(
         client_id,
         username: ep.username.clone(),
         password,
-        keep_alive: KEEP_ALIVE,
-        clean_start: !persistent,
+        keep_alive: ep.keep_alive(),
+        clean_start: session_expiry == 0,
+        session_expiry,
+        receive_maximum: None,
     })
 }
 
 #[cfg(test)]
 mod default_id_tests {
-    use super::{client_id_for, default_client_id, host_identity, Side, ID_MAX};
+    use super::{client_id_for, host_identity, local_client_id, Side, ID_MAX};
 
     /// Every generated id must satisfy MQTT's guaranteed-support shape, whatever
     /// the host is called: 1-23 bytes of [0-9a-zA-Z]. A broker is only obliged to
@@ -904,8 +710,48 @@ mod default_id_tests {
 
     #[test]
     fn the_live_default_matches_this_machine() {
-        let id = default_client_id(Side::Local);
+        let one = |extra: &str| {
+            crate::config::BridgeConfig::parse_toml(&format!(
+                r#"
+                [local]
+                url = "l:1"
+                [[upstreams]]
+                name = "a"
+                url = "a:1"
+                {extra}
+                "#
+            ))
+            .unwrap()
+        };
+        let host = host_identity();
+        // One upstream: the local id the bridge has always generated.
+        let id = local_client_id(&one(""), host.as_deref(), 0);
         assert_union_safe(&id);
-        assert_eq!(id, client_id_for(host_identity().as_deref(), Side::Local));
+        assert_eq!(id, client_id_for(host.as_deref(), Side::Local));
+        // Two upstreams: one distinct, union-safe id per link.
+        let two = one("[[upstreams]]\nname = \"b\"\nurl = \"b:1\"");
+        let a = local_client_id(&two, host.as_deref(), 0);
+        let b = local_client_id(&two, host.as_deref(), 1);
+        assert_union_safe(&a);
+        assert_union_safe(&b);
+        assert_ne!(a, b);
+        assert_ne!(a, id);
+    }
+
+    #[test]
+    fn a_configured_local_id_names_the_upstream_only_when_there_are_several() {
+        let cfg = |ups: &str| {
+            crate::config::BridgeConfig::parse_toml(&format!(
+                "[local]\nurl = \"l:1\"\nclient_id = \"bridge-0\"\n{ups}"
+            ))
+            .unwrap()
+        };
+        let one = cfg("[[upstreams]]\nname = \"a\"\nurl = \"a:1\"");
+        assert_eq!(local_client_id(&one, None, 0), "bridge-0");
+        let two = cfg(
+            "[[upstreams]]\nname = \"a\"\nurl = \"a:1\"\n[[upstreams]]\nname = \"b\"\nurl = \"b:1\"",
+        );
+        assert_eq!(local_client_id(&two, None, 0), "bridge-0.a");
+        assert_eq!(local_client_id(&two, None, 1), "bridge-0.b");
     }
 }

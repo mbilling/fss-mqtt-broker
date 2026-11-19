@@ -136,7 +136,9 @@ pub struct Spool {
 #[derive(Debug)]
 enum Inner {
     Mem {
-        q: VecDeque<SpooledMessage>,
+        /// Messages under their keys, oldest (lowest key) first.
+        q: VecDeque<(u64, SpooledMessage)>,
+        next: u64,
         bytes: usize,
     },
     Disk {
@@ -149,7 +151,7 @@ enum Inner {
 impl Inner {
     fn len_and_bytes(&self) -> Result<(usize, usize), SpoolError> {
         match self {
-            Self::Mem { q, bytes } => Ok((q.len(), *bytes)),
+            Self::Mem { q, bytes, .. } => Ok((q.len(), *bytes)),
             Self::Disk { db, bytes, .. } => {
                 let tx = db.begin_read().map_err(backend)?;
                 let len = match tx.open_table(SPOOL) {
@@ -204,6 +206,7 @@ impl Spool {
             label: String::new(),
             inner: Mutex::new(Inner::Mem {
                 q: VecDeque::new(),
+                next: 0,
                 bytes: 0,
             }),
             dropped: AtomicU64::new(0),
@@ -337,13 +340,13 @@ impl Spool {
                 return Err(SpoolError::Full);
             }
             match &mut *inner {
-                Inner::Mem { q, bytes } => {
+                Inner::Mem { q, next, bytes } => {
                     while q.len() >= self.cap
                         || self
                             .max_bytes
                             .is_some_and(|cap| bytes.saturating_add(incoming) > cap)
                     {
-                        let Some(shed) = q.pop_front() else {
+                        let Some((_, shed)) = q.pop_front() else {
                             break;
                         };
                         let shed_bytes = message_bytes(&shed);
@@ -356,7 +359,8 @@ impl Spool {
                         self.log_drop(&shed, shed_bytes, q.len(), *bytes, evicted_bound);
                         self.dropped.fetch_add(1, Ordering::Relaxed);
                     }
-                    q.push_back(msg.clone());
+                    q.push_back((*next, msg.clone()));
+                    *next += 1;
                     *bytes = bytes.saturating_add(incoming);
                     Ok(())
                 }
@@ -368,8 +372,9 @@ impl Spool {
             }
         } else {
             match &mut *inner {
-                Inner::Mem { q, bytes } => {
-                    q.push_back(msg.clone());
+                Inner::Mem { q, next, bytes } => {
+                    q.push_back((*next, msg.clone()));
+                    *next += 1;
                     *bytes = bytes.saturating_add(incoming);
                     Ok(())
                 }
@@ -533,9 +538,9 @@ impl Spool {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match &mut *inner {
-            Inner::Mem { q, bytes } => {
+            Inner::Mem { q, bytes, .. } => {
                 *bytes = 0;
-                Ok(q.drain(..).collect())
+                Ok(q.drain(..).map(|(_, m)| m).collect())
             }
             Inner::Disk { db, bytes, .. } => {
                 let mut out = Vec::new();
@@ -579,6 +584,149 @@ impl Spool {
                 }
                 *bytes = 0;
                 Ok(out)
+            }
+        }
+    }
+
+    /// Spooled messages with keys after `after` (from the start when `None`), oldest
+    /// first, until their accounted bytes reach `max_bytes` — at least one message when any
+    /// is there.
+    ///
+    /// Nothing replayable is removed. A replay deletes each message with [`Self::remove`]
+    /// once its destination has acknowledged it ([ADR 0060] Amendment 1 §7), so a crash or
+    /// a dropped link in the middle of a replay loses nothing: the same messages replay
+    /// again. [`Self::drain`] deleted first and sent after, which lost them.
+    ///
+    /// An undecodable record can never be replayed, so it is removed here, with a warning,
+    /// rather than left to block the spool.
+    ///
+    /// [ADR 0060]: ../../../docs/adr/0060-bridge-durability-and-ack-contract.md
+    ///
+    /// # Errors
+    /// [`SpoolError::Backend`] on a disk failure.
+    pub fn peek_after(
+        &self,
+        after: Option<u64>,
+        max_bytes: usize,
+    ) -> Result<Vec<(u64, SpooledMessage)>, SpoolError> {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut out = Vec::new();
+        let mut taken = 0usize;
+        match &*inner {
+            Inner::Mem { q, .. } => {
+                for (key, m) in q.iter().filter(|(k, _)| after.is_none_or(|a| *k > a)) {
+                    if !out.is_empty() && taken >= max_bytes {
+                        break;
+                    }
+                    taken += message_bytes(m);
+                    out.push((*key, m.clone()));
+                }
+                Ok(out)
+            }
+            Inner::Disk { db, .. } => {
+                let mut undecodable = Vec::new();
+                {
+                    let tx = db.begin_read().map_err(backend)?;
+                    let table = match tx.open_table(SPOOL) {
+                        Ok(t) => t,
+                        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(out),
+                        Err(e) => return Err(backend(e)),
+                    };
+                    let range = match after {
+                        Some(a) => table.range((a + 1)..).map_err(backend)?,
+                        None => table.range(0..).map_err(backend)?,
+                    };
+                    for entry in range {
+                        if !out.is_empty() && taken >= max_bytes {
+                            break;
+                        }
+                        let (k, v) = entry.map_err(backend)?;
+                        match decode(v.value()) {
+                            Some(m) => {
+                                taken += message_bytes(&m);
+                                out.push((k.value(), m));
+                            }
+                            None => undecodable.push(k.value()),
+                        }
+                    }
+                }
+                if !undecodable.is_empty() {
+                    warn!(
+                        records = undecodable.len(),
+                        "spool replay removed UNDECODABLE records (corruption or a \
+                         foreign layout): they can never be replayed"
+                    );
+                    let mut wtx = db.begin_write().map_err(backend)?;
+                    wtx.set_durability(Durability::Immediate);
+                    {
+                        let mut t = wtx.open_table(SPOOL).map_err(backend)?;
+                        for k in undecodable {
+                            t.remove(k).map_err(backend)?;
+                        }
+                    }
+                    wtx.commit().map_err(backend)?;
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// Remove the message stored under `key` — its destination acknowledged it. See
+    /// [`Self::remove_many`].
+    ///
+    /// # Errors
+    /// [`SpoolError::Backend`] on a disk failure.
+    pub fn remove(&self, key: u64) -> Result<(), SpoolError> {
+        self.remove_many(&[key])
+    }
+
+    /// Remove the messages stored under `keys` — their destination acknowledged them — in
+    /// one commit, fsync'd on disk, so a replay pays one flush per batch of acknowledgements
+    /// rather than one per message. A key that is no longer there is not an error.
+    ///
+    /// # Errors
+    /// [`SpoolError::Backend`] on a disk failure.
+    pub fn remove_many(&self, keys: &[u64]) -> Result<(), SpoolError> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &mut *inner {
+            Inner::Mem { q, bytes, .. } => {
+                for key in keys {
+                    if let Ok(i) = q.binary_search_by_key(key, |(k, _)| *k) {
+                        if let Some((_, m)) = q.remove(i) {
+                            *bytes = bytes.saturating_sub(message_bytes(&m));
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Inner::Disk { db, bytes, .. } => {
+                let mut wtx = db.begin_write().map_err(backend)?;
+                wtx.set_durability(Durability::Immediate);
+                let mut freed = 0usize;
+                {
+                    let mut t = wtx.open_table(SPOOL).map_err(backend)?;
+                    for key in keys {
+                        if let Some(m) = t
+                            .remove(*key)
+                            .map_err(backend)?
+                            .and_then(|v| decode(v.value()))
+                        {
+                            freed += message_bytes(&m);
+                        }
+                    }
+                }
+                wtx.commit().map_err(backend)?;
+                *bytes = bytes.saturating_sub(freed);
+                Ok(())
             }
         }
     }
@@ -649,7 +797,7 @@ impl Spool {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match &*inner {
-            Inner::Mem { q, .. } => Ok(q.iter().map(message_bytes).sum()),
+            Inner::Mem { q, .. } => Ok(q.iter().map(|(_, m)| message_bytes(m)).sum()),
             Inner::Disk { db, .. } => {
                 let tx = db.begin_read().map_err(backend)?;
                 match tx.open_table(SPOOL) {

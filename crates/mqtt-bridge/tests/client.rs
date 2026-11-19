@@ -40,6 +40,8 @@ fn opts(addr: SocketAddr, client_id: &str) -> ConnectOptions {
         password: None,
         keep_alive: 30,
         clean_start: true,
+        session_expiry: 0,
+        receive_maximum: None,
     }
 }
 

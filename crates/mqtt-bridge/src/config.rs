@@ -55,7 +55,33 @@ pub struct BridgeConfig {
     /// metrics are still collected and visible via the audit log, just not scraped.
     #[serde(default)]
     pub metrics_bind: Option<String>,
+    /// How many bytes of messages one direction of one link may hold while waiting for the
+    /// destination to acknowledge them (ADR 0060 Amendment 1 §3). Past it the bridge stops
+    /// reading the source, and reads again below half of it. Default 64 MiB; must be > 0.
+    /// The bound is in bytes, not messages: the bridge never lowers the source's Receive
+    /// Maximum.
+    #[serde(default = "default_max_inflight_bytes")]
+    pub max_inflight_bytes: u64,
+    /// Allow rules on different upstreams to relay between them (ADR 0060 Amendment 1 §2).
+    /// Each upstream has its own local session, so a message the bridge brings in from one
+    /// upstream is an ordinary local message to the others, and another upstream's `out` rule
+    /// that matches it sends it on. Default `false`: a configuration with such a pair of
+    /// rules is refused, so a flow between two outside zones is always chosen on purpose.
+    /// To keep them apart instead, remap the `in` rule's topics.
+    #[serde(default)]
+    pub relay_between_upstreams: bool,
 }
+
+fn default_max_inflight_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+/// The local session's default Session Expiry Interval: MQTT 5's "never expires"
+/// (ADR 0060 Amendment 1 §1).
+pub const LOCAL_SESSION_EXPIRY_DEFAULT: u32 = u32::MAX;
+
+/// The default keepalive, in seconds.
+pub const KEEP_ALIVE_DEFAULT: u16 = 30;
 
 /// Store-and-forward spool configuration (§7).
 #[derive(Debug, Clone, Deserialize)]
@@ -153,6 +179,26 @@ pub struct Endpoint {
     /// Path to a file holding the password (read at startup; never logged).
     #[serde(default)]
     pub password_file: Option<String>,
+    /// MQTT 5 Session Expiry Interval for this connection, in seconds (ADR 0060
+    /// Amendment 1). On `[local]` the default is 4294967295 (never): the local session is
+    /// the buffer for traffic to the upstreams while they are unreachable, so it must
+    /// outlive a disconnect. On an upstream the default is 0, a clean session that ends
+    /// with the connection; set it where the partner broker allows a persistent session,
+    /// and messages it has sent but the bridge has not acknowledged survive a bridge restart.
+    #[serde(default)]
+    pub session_expiry_secs: Option<u32>,
+    /// MQTT keepalive in seconds (default 30, at least 1). The bridge pings every half of
+    /// it and closes the connection when nothing has arrived for a whole interval.
+    #[serde(default)]
+    pub keep_alive_secs: Option<u16>,
+}
+
+impl Endpoint {
+    /// The keepalive to request, in seconds.
+    #[must_use]
+    pub fn keep_alive(&self) -> u16 {
+        self.keep_alive_secs.unwrap_or(KEEP_ALIVE_DEFAULT)
+    }
 }
 
 /// TLS material for an endpoint. A client certificate + key together select mTLS (§8); a
@@ -279,13 +325,33 @@ impl BridgeConfig {
     ///
     /// # Errors
     /// [`ConfigError::Invalid`] describing the first problem found.
-    /// Whether any rule forwards at `QoS` ≥ 1, so a durable spool is required (ADR 0060 T4).
+    /// Whether a rule brings traffic **in** from an upstream at `QoS` ≥ 1, so a durable spool
+    /// is required (ADR 0060 T4). Traffic out to the upstreams no longer uses the spool: it
+    /// waits in the local session (ADR 0060 Amendment 1 §1).
     #[must_use]
     pub fn requires_durable_spool(&self) -> bool {
         self.upstreams
             .iter()
             .flat_map(|u| &u.rules)
-            .any(|r| r.qos >= 1)
+            .any(|r| r.qos >= 1 && r.direction.allows_in())
+    }
+
+    /// Whether a rule sends traffic **out** to an upstream at `QoS` ≥ 1, so the local session
+    /// must outlive a disconnect (ADR 0060 Amendment 1 §1).
+    #[must_use]
+    pub fn requires_lasting_local_session(&self) -> bool {
+        self.upstreams
+            .iter()
+            .flat_map(|u| &u.rules)
+            .any(|r| r.qos >= 1 && r.direction.allows_out())
+    }
+
+    /// The local session's Session Expiry Interval, in seconds.
+    #[must_use]
+    pub fn local_session_expiry(&self) -> u32 {
+        self.local
+            .session_expiry_secs
+            .unwrap_or(LOCAL_SESSION_EXPIRY_DEFAULT)
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -348,17 +414,49 @@ impl BridgeConfig {
                 }
             }
         }
-        // ADR 0060 T4: a QoS≥1 rule must have a durable spool (checked after per-rule
-        // validation so a qos-range error surfaces first). An in-memory spool loses acked
-        // messages on any restart, and the source ack is meant to be durability-gated.
+        // ADR 0060 T4: a QoS≥1 rule bringing traffic in must have a durable spool (checked
+        // after per-rule validation so a qos-range error surfaces first). An in-memory spool
+        // loses acked messages on any restart, and the source ack is durability-gated.
         if self.requires_durable_spool()
             && self.spool.dir.is_none()
             && !self.spool.allow_ephemeral_spool
         {
             return Err(invalid(
-                "a QoS>=1 rule requires a durable spool: set [spool].dir, or set \
-                 [spool].allow_ephemeral_spool = true to accept message loss on restart",
+                "a QoS>=1 `in` or `both` rule requires a durable spool: set [spool].dir, or \
+                 set [spool].allow_ephemeral_spool = true to accept message loss on restart",
             ));
+        }
+        // ADR 0060 Amendment 1 §1: traffic out to an upstream waits in the local session
+        // while the upstream is unreachable, and the bridge disconnects from the local cluster
+        // meanwhile. A session that ends with the connection would lose all of it.
+        if self.requires_lasting_local_session() && self.local_session_expiry() == 0 {
+            return Err(invalid(
+                "a QoS>=1 `out` or `both` rule needs a local session that outlives a \
+                 disconnect: [local].session_expiry_secs must be > 0 (the default never \
+                 expires)",
+            ));
+        }
+        if self.max_inflight_bytes == 0 {
+            return Err(invalid("max_inflight_bytes must be > 0"));
+        }
+        // ADR 0060 Amendment 1 §2: a message brought in from one upstream reaches another
+        // upstream's out rule like any local message. A new flow between two outside zones
+        // must be chosen on purpose, so such a pair of rules is refused unless allowed.
+        if !self.relay_between_upstreams {
+            let paths = crate::forward::relay_paths(self);
+            if let Some(p) = paths.first() {
+                let more = match paths.len() - 1 {
+                    0 => String::new(),
+                    n => format!(" ({n} more such pair(s) of rules)"),
+                };
+                return Err(invalid(format!(
+                    "messages upstream {:?} brings in by rule {:?} match upstream {:?}'s out rule \
+                     {:?}, so the bridge would forward them from one upstream to the other{more}; \
+                     remap the in rule's topics so they no longer match, or set \
+                     relay_between_upstreams = true to allow it",
+                    p.from, p.from_filter, p.to, p.to_filter
+                )));
+            }
         }
         Ok(())
     }
@@ -367,6 +465,12 @@ impl BridgeConfig {
 fn validate_endpoint(label: &str, ep: &Endpoint) -> Result<(), ConfigError> {
     if ep.url.trim().is_empty() {
         return Err(invalid(format!("{label}: url must be non-empty")));
+    }
+    if ep.keep_alive_secs == Some(0) {
+        return Err(invalid(format!(
+            "{label}: keep_alive_secs must be >= 1 (the bridge needs the keepalive to notice \
+             a dead connection)"
+        )));
     }
     if ep.password.is_some() && ep.password_file.is_some() {
         return Err(invalid(format!(
@@ -661,9 +765,10 @@ mod tests {
     }
 
     #[test]
-    fn a_qos1_rule_requires_a_durable_spool() {
-        // #188/ADR 0060 T4: a QoS>=1 rule with no durable spool loses acked messages on
-        // restart, so it is refused unless the operator explicitly opts into ephemeral.
+    fn a_qos1_in_rule_requires_a_durable_spool() {
+        // #188/ADR 0060 T4: a QoS>=1 rule bringing traffic in with no durable spool loses
+        // acked messages on restart, so it is refused unless the operator opts into
+        // ephemeral.
         let base = |extra: &str| {
             format!(
                 r#"
@@ -674,7 +779,7 @@ mod tests {
                 name = "u"
                 url = "a:1"
                 [[upstreams.rules]]
-                direction = "out"
+                direction = "in"
                 filter = "t/#"
                 qos = 1
                 "#
@@ -692,6 +797,115 @@ mod tests {
             .expect("ephemeral opt-in ok");
         // A QoS 0 rule needs no spool.
         BridgeConfig::parse_toml(&base("").replace("qos = 1", "qos = 0")).expect("qos0 needs none");
+        // A `both` rule brings traffic in too.
+        let err = BridgeConfig::parse_toml(&base("").replace("\"in\"", "\"both\"")).unwrap_err();
+        assert!(
+            err.to_string().contains("requires a durable spool"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_qos1_out_rule_needs_a_lasting_local_session_but_no_spool() {
+        // ADR 0060 Amendment 1 §1: traffic out waits in the local session, not the spool.
+        let base = |local_extra: &str| {
+            format!(
+                r#"
+                [local]
+                url = "x:1883"
+                {local_extra}
+                [[upstreams]]
+                name = "u"
+                url = "a:1"
+                [[upstreams.rules]]
+                direction = "out"
+                filter = "t/#"
+                qos = 1
+                "#
+            )
+        };
+        let cfg = BridgeConfig::parse_toml(&base("")).expect("no spool needed");
+        assert_eq!(cfg.local_session_expiry(), LOCAL_SESSION_EXPIRY_DEFAULT);
+        BridgeConfig::parse_toml(&base("session_expiry_secs = 3600")).expect("finite expiry ok");
+        let err = BridgeConfig::parse_toml(&base("session_expiry_secs = 0")).unwrap_err();
+        assert!(
+            err.to_string().contains("session_expiry_secs must be > 0"),
+            "got: {err}"
+        );
+        // A QoS 0 rule promises nothing, so a session that ends with the connection is allowed.
+        BridgeConfig::parse_toml(&base("session_expiry_secs = 0").replace("qos = 1", "qos = 0"))
+            .expect("qos0 may use a clean session");
+    }
+
+    #[test]
+    fn rules_that_relay_between_upstreams_are_refused_unless_allowed() {
+        // ADR 0060 Amendment 1 §2: a's sensors land on local sensors/#, which b's out rule
+        // sends on to b.
+        let base = |top: &str, remap: &str| {
+            format!(
+                r#"
+                {top}
+                [local]
+                url = "x:1883"
+                [[upstreams]]
+                name = "a"
+                url = "a:1"
+                [[upstreams.rules]]
+                direction = "in"
+                filter = "sensors/#"
+                {remap}
+                [[upstreams]]
+                name = "b"
+                url = "b:1"
+                [[upstreams.rules]]
+                direction = "out"
+                filter = "sensors/#"
+                "#
+            )
+        };
+        let err = BridgeConfig::parse_toml(&base("", ""))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(r#"upstream "a" brings in by rule "sensors/#""#)
+                && err.contains(r#"upstream "b"'s out rule "sensors/#""#)
+                && err.contains("relay_between_upstreams = true"),
+            "got: {err}"
+        );
+        // The operator may allow it…
+        BridgeConfig::parse_toml(&base("relay_between_upstreams = true", ""))
+            .expect("allowed on purpose");
+        // …or keep the two apart with a remap.
+        BridgeConfig::parse_toml(&base("", r#"remap = { prefix = "partner-a/" }"#))
+            .expect("remapped topics no longer match b's rule");
+    }
+
+    #[test]
+    fn a_zero_keepalive_or_byte_bound_is_rejected() {
+        let err = BridgeConfig::parse_toml(
+            r#"
+            [local]
+            url = "x:1883"
+            keep_alive_secs = 0
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("keep_alive_secs must be >= 1"),
+            "got: {err}"
+        );
+        let err = BridgeConfig::parse_toml(
+            r#"
+            max_inflight_bytes = 0
+            [local]
+            url = "x:1883"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("max_inflight_bytes must be > 0"),
+            "got: {err}"
+        );
     }
 
     #[test]

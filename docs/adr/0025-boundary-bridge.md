@@ -131,8 +131,13 @@ contract is now explicit:
 - **Acknowledge only after durable acceptance.** The source PUBACK is sent once the message is
   spooled (fsync'd on commit) or dispatched to a live destination — never on arrival. A
   destination that cannot accept it withholds the ack entirely, so the source keeps its copy and
-  redelivers. *Residual:* on the fast path the ack fires at dispatch, not on the destination's
-  own PUBACK; closing that window is ADR 0060 T8.
+  redelivers. *Residual:* on the fast path the ack fired at dispatch, not on the destination's
+  own PUBACK. [ADR 0060 Amendment 1](0060-bridge-durability-and-ack-contract.md#amendment-1-2026-11-19-the-source-session-is-the-buffer)
+  (2026-11-19) closed it: the source is acknowledged on the destination's PUBACK; traffic from
+  the local cluster waits in the bridge's persistent local session, not the spool, while an
+  upstream is unreachable; and an upstream's session is clean by default, so "persistent
+  sessions on both brokers" above holds for the local cluster, and for an upstream only where
+  `session_expiry_secs` is set.
 - **Overflow: refuse, do not shed.** At the cap a `QoS`≥1 spool **refuses the newest** message
   rather than dropping the oldest, because everything already spooled was acknowledged to the
   source — shedding it would lose a message the source believes was delivered. A `QoS`-0-only

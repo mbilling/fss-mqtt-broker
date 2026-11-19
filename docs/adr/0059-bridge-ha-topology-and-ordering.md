@@ -78,7 +78,8 @@ When an instance dies, the topics it owned are re-derived by the survivors only 
 is reconfigured (scale event) — i.e. this is **static partitioning with operator-driven
 rebalance**, not automatic. A dead instance's topics are not served until `N` drops or a
 replacement with the same index returns. This is the deliberate CP-side trade: no invented
-election (ADR 0025 §1), and each side's **persistent session** buffers during the gap. An
+election (ADR 0025 §1), and the local side's **persistent session** buffers during the gap
+(an upstream's only where it is persistent; ADR 0060 Amendment 1). An
 optional **active/passive** mode (one owner, others hot-standby taking over the whole key
 space on liveness loss) is offered for small fleets that prefer availability over the
 no-coordination property; it requires a liveness signal and is documented as such.

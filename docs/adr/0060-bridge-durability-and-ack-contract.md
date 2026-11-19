@@ -5,6 +5,10 @@
 - **Deciders:** project maintainers
 - **Delivery:** [docs/delivery/0060-bridge-durability-and-ack-contract.md](../delivery/0060-bridge-durability-and-ack-contract.md) — plan, progress, and changelog
 - **Amends:** [ADR 0025 §7](0025-boundary-bridge.md) (store-and-forward), which promised at-least-once but left the ack/durability ordering unspecified.
+- **Amended:** [Amendment 1](#amendment-1-2026-11-19-the-source-session-is-the-buffer)
+  (2026-11-19, issue [#1103](https://github.com/mbilling/fss-mqtt-broker/issues/1103)):
+  traffic from the local cluster is forwarded through the bridge's persistent session there,
+  acknowledged after the upstream's acknowledgement, with no spool; one link per upstream
 - **Related:** [ADR 0057](0057-durable-outbound-inflight.md) (the broker's own outbound-in-flight durability — this is its bridge analogue), [ADR 0041 §T7](0041-resource-governance.md) (the spool byte-bound), [ADR 0025 §8](0025-boundary-bridge.md) (the audit record the drop path must feed).
 
 > This record states the decision only. How it is being built and how far along it is
@@ -150,3 +154,167 @@ for.
 - **Ack only after the destination acks (no spool ack path).** Correct but couples source ack
   latency to destination availability — a slow/down destination stalls all ingress even when the
   spool could absorb it. The spool-commit-or-downstream-ack rule is strictly better.
+
+## Amendment 1 (2026-11-19): the source session is the buffer
+
+> **Decided 2026-11-19** by the maintainer, who designed the flow: the bridge holds a
+> persistent session on the source, forwards each message to the destination, acknowledges
+> it at the source only after the destination has, and disconnects from the source while the
+> destination is unreachable, so the source keeps the messages. Issue
+> [#1103](https://github.com/mbilling/fss-mqtt-broker/issues/1103).
+
+### Why
+
+§5 was built in part. T1–T7 moved the source acknowledgement off arrival, but on the fast
+path the bridge still acknowledged a message when it handed it to a connected destination,
+not when the destination acknowledged it, and T8, which was to close that, was deferred.
+Probes against in-process brokers on 2026-11-19 measured what that left:
+
+- **A dropped destination link lost what was on the wire.** Five QoS 1 forwards written to
+  the upstream, the link dropped before the PUBACK, the bridge reconnected: 0 of 5 arrived.
+  The send loop ignored PUBACKs and kept no list of what was in flight.
+- **A bridge restart lost what was published meanwhile.** The local side connected with
+  MQTT 5 and `clean_start = false` but no Session Expiry Interval, which MQTT 5 reads as 0,
+  so the session ended at every disconnect. Of 5 messages published during a restart, 0
+  crossed. A plain MQTT 5 client with a 3,600-second expiry kept all 5.
+- **A half-open destination stayed "connected".** PINGRESPs were never checked, so a broker
+  that vanished without a reset was noticed only when TCP gave up, about 15 minutes with
+  Linux defaults. Meanwhile the router kept acknowledging the source into an unbounded
+  queue, and the spool was never used because the side still counted as up.
+- **A replay deleted before it delivered.** `drain` removed spooled messages from disk
+  before sending them, so a crash or a second drop during the replay lost them.
+
+### Decision
+
+**1. For traffic from the local cluster, the local session is the buffer.** The bridge keeps
+no copy of an outbound message on disk. Per upstream:
+
+1. Connect to the local cluster with `clean_start = false` and a Session Expiry Interval
+   (`[local] session_expiry_secs`, default 4,294,967,295, which MQTT 5 defines as never). If
+   the session is new, subscribe without retained messages. Disconnect.
+2. Connect to the upstream, retrying with backoff.
+3. Connect to the local cluster. If the session is gone (`session_present = 0`), count and
+   audit the gap, and subscribe again.
+4. Forward each message as it arrives.
+5. Acknowledge a message at the local cluster when the upstream has acknowledged every
+   forward it produced, in the order the messages arrived [MQTT-4.6.0-2].
+6. When the upstream link fails (an error, a close, or no packet within the keepalive),
+   disconnect from the local cluster without acknowledging what is pending. The local
+   cluster resends it, with DUP set, on the next connect. Go to 2.
+7. When the local link fails, discard the pending acknowledgements, so none is ever sent on
+   another connection, and go to 3.
+
+A QoS ≥ 1 `out` or `both` rule therefore needs a local session that outlives a disconnect:
+`session_expiry_secs = 0` is refused for it. It no longer needs `[spool].dir`.
+
+**2. One link per upstream.** Each upstream gets its own local session, with its own client id
+and subscriptions, so an unreachable upstream stops only its own traffic. With more than one
+upstream, a configured local client id gets `.<upstream name>` appended, a generated one
+encodes the upstream, and a `$share` group gets `.<upstream name>` appended so each link is
+its own group. A message the bridge brings in from upstream A is then an ordinary local
+message: if upstream B has an `out` rule that matches it, the bridge forwards it to B, and the
+hop count bounds any loop. Before, one local connection with No Local kept a single bridge
+from doing that, although a second bridge process would, and so did a second instance under
+partitioned HA for the topics it owned.
+
+A new flow between two outside zones must be chosen on purpose, so a configuration with such a
+pair of rules is **refused at startup** unless it sets `relay_between_upstreams = true`
+(decided by the maintainer on 2026-11-19, over a startup warning). The error names the pair
+and suggests remapping the `in` rule's topics. With the option set, the startup log names each
+pair it allows. The check reads the rules, so nothing on the wire can get around it; a
+partial `strip_prefix` on a wildcard filter makes it err on the side of refusing.
+
+**3. A window bounded in bytes, not messages.** The bridge does not lower the local session's
+Receive Maximum below the protocol's 65,535. It bounds what it holds by bytes instead: past
+`max_inflight_bytes` per direction of a link (default 64 MiB) it stops reading the source,
+and it reads again below half of that. Toward the destination it keeps to the Receive
+Maximum the destination's CONNACK grants.
+
+**4. Keepalive.** A connection that has received nothing from its broker for one keepalive
+interval, or whose write has blocked that long, is closed. A connect attempt times out after
+10 seconds. The keepalive is the endpoint's `keep_alive_secs` (default 30), or the broker's
+Server Keep Alive when it sends one.
+
+**5. Refusals.** A PUBACK whose reason code says not authorized (0x87), topic name invalid
+(0x90) or payload format invalid (0x99) is permanent: the message is acknowledged at the
+source, audited, and counted as `fss_bridge_dropped_total{reason="refused"}`. Any other error
+code is temporary: the message is published again as a new message, after 1 second at first
+and at most 30 seconds, and its source acknowledgement waits.
+
+**6. Retained messages.** On a resumed session the bridge subscribes with retain handling 1,
+so a reconnect does not resend every retained message. When the session is new or was lost
+it uses retain handling 0, so the current retained state crosses. No Local is never set on a
+`$share` subscription, where MQTT 5 makes it a protocol error [MQTT-3.8.3-4].
+
+**7. Traffic from an upstream keeps the spool.** An upstream's session stays clean by default,
+because a partner broker may not allow a persistent one, and leaving a clean session loses
+what is published meanwhile. So the bridge stays connected to the upstream and:
+
+- while the local link is up, forwards each message and acknowledges it at the upstream after
+  the local cluster's PUBACK, in order;
+- while the local link is down, spools each message (fsync) and acknowledges it after the
+  commit;
+- when the local link fails, spools what it was forwarding, then acknowledges it;
+- replays the spool oldest first when the local link is back, deleting each message when the
+  local cluster acknowledges it, and only then forwards newer messages.
+
+If the spool refuses a message, the bridge holds it in memory unacknowledged, behind the
+byte bound of §3. Each upstream has its own spool file. Setting `session_expiry_secs` on an
+upstream makes that session persistent, so messages the upstream has sent but the bridge has
+not acknowledged survive a bridge restart.
+
+**8. Upgrades.** Spools an older bridge left behind are drained, not dropped. An upstream's
+old spool (`spool-upstream-<i>.redb`) is sent to that upstream before the link's local
+session connects, deleting each message as the upstream acknowledges it. The old shared
+`spool-local.redb` is moved into the first link's spool at startup.
+
+### Consequences
+
+- **Good:** for traffic from the local cluster, at-least-once holds across a bridge crash or
+  restart, a dropped upstream link and a half-open one, with nothing on the bridge's disk. The
+  bridge holds at most `max_inflight_bytes` per direction of a link, and an unreachable
+  upstream no longer stalls the others.
+- **Cost:** a source acknowledgement waits for one round trip to the destination, which the
+  window hides. Every failure can duplicate messages, as at-least-once allows. The local
+  cluster carries one session per upstream.
+- **The broker's limits are the bridge's limits.** While an upstream is unreachable, the local
+  session's queue is the only buffer, so the broker's session limits decide how long an outage
+  it rides out. Issue [#1235](https://github.com/mbilling/fss-mqtt-broker/issues/1235) replaces
+  their message counts with memory and disk limits.
+- **Changed behaviour:** a configuration whose rules would relay between upstreams through the
+  local cluster is refused unless `relay_between_upstreams` allows it (§2); local client ids and
+  `$share` groups that name the upstream when there are several; per-link local sides in the
+  metrics when there are several upstreams.
+- **A retired bridge's session outlives it.** With the default expiry, a decommissioned bridge's
+  local session keeps queueing until it is deleted. Set a finite `session_expiry_secs` to have
+  it expire.
+
+### Alternatives considered
+
+- **Spool every outbound message before acknowledging the source.** §5 already rejected a disk
+  commit per message.
+- **Stay connected to the source and stop acknowledging** while the destination is down. The
+  broker then treats the bridge as a slow subscriber, not an offline one. Beyond the window and
+  its in-memory backlog it drops the oldest (issue #1235), and under `$share` it keeps dealing
+  messages to the stalled member.
+- **One local session for every upstream.** One unreachable upstream would stall the others
+  behind its unacknowledged messages, which is why §5 kept the spool.
+- **Receive Maximum 1**, taking one message at a time. One message per round trip: about
+  50 msg/s at 20 ms.
+- **Relay between upstreams with only a startup warning.** Rejected by the maintainer: a flow
+  from one partner zone to another would start on an upgrade, noticed only by someone reading
+  the log.
+- **Mark what the bridge publishes**, so a link can skip its sibling links' messages at run
+  time. Anyone who can read the bridged messages could copy the marker, and a link that is
+  down receives its siblings' messages later, from its session, when no record of them is left.
+
+### Left open
+
+- **Disconnecting from a persistent upstream** while the local link is down, so traffic from
+  that upstream uses the flow of §1 instead of the spool.
+- **Group commit** (§5.3) for the spool.
+
+### Delivery
+
+Task 0060-T9 in the [delivery doc](../delivery/0060-bridge-durability-and-ack-contract.md),
+issue [#1103](https://github.com/mbilling/fss-mqtt-broker/issues/1103). It supersedes T8.

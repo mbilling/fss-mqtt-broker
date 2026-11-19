@@ -9,22 +9,35 @@
 //! (ADR 0025 §7), so it downgrades `QoS` 2 rules to `QoS` 1 rather than run a cross-broker
 //! exactly-once handshake it cannot honour.
 //!
-//! The client owns the socket; callers drive it by reading [`MqttClient::next_event`] in a
-//! loop and calling [`MqttClient::publish`] / [`MqttClient::subscribe`]. Reconnection and
-//! forwarding policy live above this layer (the engine).
+//! Two ways to drive it. Step by step: [`MqttClient::next_event`],
+//! [`MqttClient::publish`], [`MqttClient::subscribe`] (the tests, and the short
+//! session-provisioning connect). Or as a running connection: [`MqttClient::spawn`] moves
+//! the socket into its own task and hands back a [`Session`] — commands in, events out —
+//! which is what the engine's links use. The spawned task also enforces the keepalive
+//! ([ADR 0060](../../../docs/adr/0060-bridge-durability-and-ack-contract.md) Amendment 1
+//! §4): a connection that has received nothing for one keepalive interval, or whose write
+//! has blocked that long, is closed instead of being trusted until TCP gives up.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use bytes::Bytes;
-use mqtt_codec::packet::{Ack, Connect, Packet, Publish, Subscribe, SubscribeFilter};
-use mqtt_codec::properties::Properties;
+use mqtt_codec::packet::{
+    Ack, Connect, Disconnect, Packet, Publish, Subscribe, SubscribeFilter, SubscriptionOptions,
+};
+use mqtt_codec::properties::{Properties, Property};
 use mqtt_codec::{ProtocolVersion, QoS};
 use mqtt_net::tls::{client_connector, server_name};
 use mqtt_net::{FrameReader, FrameWriter};
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::time::{Instant, MissedTickBehavior};
+
+/// How long a connect attempt (TCP, TLS and the CONNECT/CONNACK exchange) may take. A
+/// broker behind a firewall that drops packets would otherwise hold the attempt for as long
+/// as the OS retries SYNs.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Any byte stream the client can run over (plain TCP or a TLS session).
 pub trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -58,6 +71,9 @@ pub enum ClientError {
         /// Underlying IO error.
         source: std::io::Error,
     },
+    /// The connect attempt did not finish within [`CONNECT_TIMEOUT`].
+    #[error("connect to {0}: no CONNACK within {CONNECT_TIMEOUT:?}")]
+    ConnectTimeout(String),
     /// TLS setup or handshake failure.
     #[error("tls: {0}")]
     Tls(String),
@@ -70,17 +86,43 @@ pub enum ClientError {
     /// The peer closed the connection.
     #[error("connection closed by peer")]
     Closed,
+    /// The broker sent DISCONNECT with this reason code.
+    #[error("the broker disconnected: reason 0x{0:02x}")]
+    Disconnected(u8),
+    /// Nothing arrived from the broker for one keepalive interval, though the client kept
+    /// sending PINGREQ: the connection is treated as dead.
+    #[error("no packet from the broker within the keepalive")]
+    KeepAlive,
+    /// A write blocked for longer than the keepalive (a peer that stopped reading).
+    #[error("a write blocked for longer than the keepalive")]
+    WriteStalled,
+}
+
+/// What the broker's CONNACK granted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Granted {
+    /// Whether the broker resumed a stored session (`session_present`).
+    pub session_present: bool,
+    /// How many unacknowledged `QoS` 1 publishes the broker accepts from this client at
+    /// once: its Receive Maximum, 65,535 when the CONNACK carries none.
+    pub receive_maximum: u16,
+    /// The keepalive to use, in seconds: the broker's Server Keep Alive when it sent one,
+    /// otherwise the one this client asked for.
+    pub keep_alive: u16,
 }
 
 /// A connected MQTT client session.
 pub struct MqttClient {
     reader: FrameReader<ReadHalf<Box<dyn Io>>>,
     writer: FrameWriter<WriteHalf<Box<dyn Io>>>,
+    granted: Granted,
 }
 
 impl std::fmt::Debug for MqttClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MqttClient").finish_non_exhaustive()
+        f.debug_struct("MqttClient")
+            .field("granted", &self.granted)
+            .finish_non_exhaustive()
     }
 }
 
@@ -102,8 +144,15 @@ pub struct ConnectOptions {
     /// Keep-alive seconds advertised to the broker; the client pings at half this.
     pub keep_alive: u16,
     /// `clean_session` (v3.1.1) / `clean_start` (v5). The bridge uses a **persistent**
-    /// session on the cluster side for HA (ADR 0025 §5), so this is configurable.
+    /// session on the cluster side (ADR 0060 Amendment 1), so this is configurable.
     pub clean_start: bool,
+    /// MQTT 5 Session Expiry Interval, in seconds. `0` sends none, and MQTT 5 then ends the
+    /// session when the connection ends, whatever `clean_start` says [MQTT-3.1.2-11.2];
+    /// `u32::MAX` means the session never expires.
+    pub session_expiry: u32,
+    /// MQTT 5 Receive Maximum to advertise: how many unacknowledged `QoS` 1 publishes the
+    /// broker may send at once. `None` sends none, which means 65,535.
+    pub receive_maximum: Option<u16>,
 }
 
 /// An event surfaced from the broker while pumping the client.
@@ -124,53 +173,77 @@ pub enum Event {
     },
 }
 
-/// A command driven into a running client's **writer** side by the forwarding engine. The
-/// engine has already applied the rule's direction, remap, `QoS`, and hop count before
-/// issuing a [`Command::Publish`]; the client just serializes it.
+/// A command to a running connection ([`MqttClient::spawn`]).
 #[derive(Debug)]
-pub enum Command {
-    /// Subscribe to `filter` at `qos` with subscribe id `pkid`.
+pub enum Outgoing {
+    /// Send this PUBLISH. For `QoS` 1 the caller has assigned the packet id.
+    Publish(Publish),
+    /// Acknowledge the inbound `QoS` 1 PUBLISH with this packet id.
+    PubAck(u16),
+    /// Subscribe to one filter.
     Subscribe {
         /// Subscribe packet id.
         pkid: u16,
-        /// Topic filter to subscribe to.
+        /// Topic filter.
         filter: String,
         /// Requested maximum `QoS`.
         qos: QoS,
+        /// MQTT 5 subscription options.
+        options: SubscriptionOptions,
     },
-    /// Acknowledge an inbound `QoS` 1 delivery on this side (ADR 0060 T2). Sent by the engine
-    /// once the message has been durably accepted for forwarding — never on arrival.
-    Ack {
-        /// The inbound PUBLISH's packet id.
-        pkid: u16,
-    },
-    /// Publish a message (already transformed by the engine).
-    Publish {
-        /// Destination topic.
-        topic: String,
-        /// Application payload.
-        payload: Bytes,
-        /// Delivery `QoS`.
-        qos: QoS,
-        /// Whether to forward with the RETAIN flag set (issue #189): the bridge preserves the
-        /// source message's retain bit so retained state crosses the boundary, subject to the
-        /// rule's `outgoing_retain` escape.
-        retain: bool,
-        /// Packet id for `QoS` ≥ 1 (ignored for `QoS` 0).
-        pkid: Option<u16>,
-        /// MQTT 5 properties (e.g. the incremented hop-count user property).
-        properties: Properties,
-    },
+    /// Stop reading from the broker (`true`) or read again (`false`). While reads are
+    /// paused the broker's messages wait in the socket and the broker, and the keepalive
+    /// deadline does not run.
+    PauseReads(bool),
+    /// Send DISCONNECT and close.
+    Disconnect,
 }
 
-/// The MQTT 5 subscription options every bridge subscription uses (issues #189, #191).
+/// What a running connection reports ([`MqttClient::spawn`]).
+#[derive(Debug)]
+pub enum Incoming {
+    /// A delivered PUBLISH.
+    Publish(Publish),
+    /// The broker acknowledged our `QoS` 1 PUBLISH `pkid` with `reason` (0 = success; MQTT 5
+    /// codes ≥ 0x80 are refusals).
+    PubAck {
+        /// The packet id acknowledged.
+        pkid: u16,
+        /// The PUBACK reason code.
+        reason: u8,
+    },
+    /// A SUBACK with the granted return codes for `pkid`.
+    SubAck {
+        /// The subscribe packet id this acknowledges.
+        pkid: u16,
+        /// Per-filter granted `QoS` / `0x80`+ failure codes.
+        return_codes: Vec<u8>,
+    },
+    /// The connection ended. Nothing follows.
+    Closed(ClientError),
+}
+
+/// A connection running in its own task: send [`Outgoing`] on `tx`, read [`Incoming`] from
+/// `rx`. Dropping `tx` closes the connection.
+#[derive(Debug)]
+pub struct Session {
+    /// Commands to the connection.
+    pub tx: mpsc::UnboundedSender<Outgoing>,
+    /// Events from the connection, ending with [`Incoming::Closed`].
+    pub rx: mpsc::UnboundedReceiver<Incoming>,
+    /// What the CONNACK granted.
+    pub granted: Granted,
+}
+
+/// The MQTT 5 subscription options for a bridge subscription to `filter` (issues #189,
+/// #191), with `retain_handling` chosen by the caller.
 ///
 /// The bridge is always a subscriber that re-forwards, so it needs **Retain As Published**:
 /// with RAP a live message forwarded because it matched the subscription keeps the RETAIN flag
 /// it was published with, instead of the broker clearing it for established-subscription
-/// delivery [MQTT-3.3.1-9]. That is what lets retained state cross the boundary. `retain_handling`
-/// stays `0` (send retained at subscribe) so a reconnect re-syncs retained state — with RAP on,
-/// that replay is an idempotent retained re-sync, not a fake-live storm (the Mosquitto model).
+/// delivery [MQTT-3.3.1-9]. That is what lets retained state cross the boundary. Retain
+/// Handling is the caller's: 0 sends the retained messages at subscribe, 1 only when the
+/// subscription is new, 2 never (ADR 0060 Amendment 1 §6).
 ///
 /// **No Local** (`no_local = true`) is the primary, *unforgeable* loop defence — the mechanism
 /// Mosquitto (`try_private`) and EMQX (`bridge_mode`, "equivalent to No Local = 1") both use: the
@@ -180,20 +253,32 @@ pub enum Command {
 /// forged by a publisher. The hop counter stays as the multi-broker-cycle backstop (A→B→C→A,
 /// which NL alone cannot catch), matching `HiveMQ`. NL needs the broker to honour the option;
 /// against a broker that ignores it the structural direction + remap defence (§6) still holds.
-fn bridge_subscription_options() -> mqtt_codec::packet::SubscriptionOptions {
-    mqtt_codec::packet::SubscriptionOptions {
-        no_local: true,
+/// It is never set on a `$share` subscription, where MQTT 5 makes it a protocol error
+/// [MQTT-3.8.3-4].
+#[must_use]
+pub fn subscription_options(filter: &str, retain_handling: u8) -> SubscriptionOptions {
+    SubscriptionOptions {
+        no_local: !filter.starts_with("$share/"),
         retain_as_published: true,
-        retain_handling: 0,
+        retain_handling,
     }
 }
 
 impl MqttClient {
-    /// Dial, perform the MQTT CONNECT handshake, and return a live session.
+    /// Dial, perform the MQTT CONNECT handshake, and return a live session. The whole
+    /// attempt is bounded by [`CONNECT_TIMEOUT`].
     ///
     /// # Errors
-    /// [`ClientError`] on dial/TLS/handshake failure or a non-zero CONNACK reason.
+    /// [`ClientError`] on dial/TLS/handshake failure, a non-zero CONNACK reason, or the
+    /// timeout.
     pub async fn connect(opts: &ConnectOptions) -> Result<Self, ClientError> {
+        match tokio::time::timeout(CONNECT_TIMEOUT, Self::connect_inner(opts)).await {
+            Ok(result) => result,
+            Err(_) => Err(ClientError::ConnectTimeout(opts.addr.clone())),
+        }
+    }
+
+    async fn connect_inner(opts: &ConnectOptions) -> Result<Self, ClientError> {
         let tcp = TcpStream::connect(&opts.addr)
             .await
             .map_err(|source| ClientError::Connect {
@@ -219,9 +304,20 @@ impl MqttClient {
         let mut reader = FrameReader::new(rh, opts.version);
         let mut writer = FrameWriter::new(wh, opts.version);
 
+        let mut properties = Properties::new();
+        if opts.version == ProtocolVersion::V5 {
+            if opts.session_expiry > 0 {
+                properties
+                    .0
+                    .push(Property::SessionExpiryInterval(opts.session_expiry));
+            }
+            if let Some(max) = opts.receive_maximum {
+                properties.0.push(Property::ReceiveMaximum(max.max(1)));
+            }
+        }
         writer
             .send(&Packet::Connect(Connect {
-                properties: Properties::new(),
+                properties,
                 protocol: opts.version,
                 clean_session: opts.clean_start,
                 keep_alive: opts.keep_alive,
@@ -234,7 +330,31 @@ impl MqttClient {
             .map_err(|e| ClientError::Protocol(e.to_string()))?;
 
         match reader.next_packet().await {
-            Ok(Some(Packet::ConnAck(ack))) if ack.code == 0 => Ok(Self { reader, writer }),
+            Ok(Some(Packet::ConnAck(ack))) if ack.code == 0 => {
+                let receive_maximum = ack
+                    .properties
+                    .receive_maximum()
+                    .filter(|max| *max > 0)
+                    .unwrap_or(u16::MAX);
+                let keep_alive = ack
+                    .properties
+                    .0
+                    .iter()
+                    .find_map(|p| match p {
+                        Property::ServerKeepAlive(v) => Some(*v),
+                        _ => None,
+                    })
+                    .unwrap_or(opts.keep_alive);
+                Ok(Self {
+                    reader,
+                    writer,
+                    granted: Granted {
+                        session_present: ack.session_present,
+                        receive_maximum,
+                        keep_alive,
+                    },
+                })
+            }
             Ok(Some(Packet::ConnAck(ack))) => Err(ClientError::Refused(ack.code)),
             Ok(Some(_)) => Err(ClientError::Protocol("expected CONNACK".into())),
             Ok(None) => Err(ClientError::Closed),
@@ -242,8 +362,15 @@ impl MqttClient {
         }
     }
 
-    /// Subscribe to one `filter` at `qos` with subscribe packet id `pkid`. Returns once the
-    /// SUBSCRIBE is written; the matching [`Event::SubAck`] arrives via [`Self::next_event`].
+    /// What the broker's CONNACK granted.
+    #[must_use]
+    pub fn granted(&self) -> Granted {
+        self.granted
+    }
+
+    /// Subscribe to one `filter` at `qos` with subscribe packet id `pkid`, with the bridge's
+    /// subscription options and retain handling 0. Returns once the SUBSCRIBE is written;
+    /// the matching [`Event::SubAck`] arrives via [`Self::next_event`].
     ///
     /// # Errors
     /// [`ClientError::Protocol`] if the write fails.
@@ -253,6 +380,21 @@ impl MqttClient {
         filter: &str,
         qos: QoS,
     ) -> Result<(), ClientError> {
+        self.subscribe_with(pkid, filter, qos, subscription_options(filter, 0))
+            .await
+    }
+
+    /// Subscribe to one `filter` at `qos` with explicit subscription `options`.
+    ///
+    /// # Errors
+    /// [`ClientError::Protocol`] if the write fails.
+    pub async fn subscribe_with(
+        &mut self,
+        pkid: u16,
+        filter: &str,
+        qos: QoS,
+        options: SubscriptionOptions,
+    ) -> Result<(), ClientError> {
         self.writer
             .send(&Packet::Subscribe(Subscribe {
                 properties: Properties::new(),
@@ -260,7 +402,7 @@ impl MqttClient {
                 filters: vec![SubscribeFilter {
                     path: filter.to_string(),
                     qos,
-                    options: bridge_subscription_options(),
+                    options,
                 }],
             }))
             .await
@@ -348,104 +490,135 @@ impl MqttClient {
     pub async fn disconnect(&mut self) {
         let _ = self
             .writer
-            .send(&Packet::Disconnect(mqtt_codec::packet::Disconnect {
+            .send(&Packet::Disconnect(Disconnect {
                 reason: 0,
                 properties: Properties::new(),
             }))
             .await;
     }
 
-    /// Drive this client until the connection ends, consuming it.
+    /// Run this connection in its own task and return its [`Session`].
     ///
-    /// Concurrently: reads inbound packets — emitting each delivered PUBLISH to `inbound`
-    /// and **auto-acking** a `QoS` 1 delivery — while serializing `commands` from the
-    /// engine onto the wire and sending a periodic keepalive PING. Reading and writing run
-    /// in one `select!` over the split reader/writer, so a connection used for only one
-    /// direction (a one-way rule) still answers pings and never blocks. Returns the
-    /// terminal [`ClientError`] (so a supervisor can reconnect with backoff).
-    pub async fn run(
-        self,
-        commands: &mut mpsc::UnboundedReceiver<Command>,
-        inbound: &mpsc::UnboundedSender<Publish>,
-        keep_alive: u16,
-    ) -> ClientError {
-        let Self {
-            mut reader,
-            mut writer,
-        } = self;
-        let mut ping = tokio::time::interval(ping_interval(keep_alive));
-        // One packet-id space per connection: the run loop assigns ids for QoS ≥ 1 so live
-        // and replayed (spooled) publishes never need the caller to track them.
-        let mut next_pkid: u16 = 0;
-        loop {
-            tokio::select! {
-                packet = reader.next_packet() => match packet {
-                    Ok(Some(Packet::Publish(p))) => {
-                        // ADR 0060 T2: the QoS-1 acknowledgement is NOT sent here. Acking on
-                        // arrival releases the source's copy before this bridge has done
-                        // anything durable with the message, so a failure in between loses a
-                        // message the source believes was delivered. The engine decides when
-                        // the message is durably accepted and sends `Command::Ack`.
-                        if inbound.send(p).is_err() {
-                            return ClientError::Closed; // the engine is gone
-                        }
+    /// The task reads packets and reports them as [`Incoming`] events, writes the
+    /// [`Outgoing`] commands, and sends PINGREQ every half keepalive. It closes the
+    /// connection, reporting [`Incoming::Closed`], when:
+    ///
+    /// - nothing has arrived from the broker for a full keepalive interval while reads were
+    ///   not paused ([`ClientError::KeepAlive`]) — a broker that vanished without a reset;
+    /// - a write blocks for that long ([`ClientError::WriteStalled`]) — a broker that stopped
+    ///   reading;
+    /// - the broker closes or sends DISCONNECT, a packet fails to decode, or `tx` is dropped.
+    ///
+    /// Must be called inside a Tokio runtime.
+    #[must_use]
+    pub fn spawn(self) -> Session {
+        let (tx, commands) = mpsc::unbounded_channel();
+        let (events, rx) = mpsc::unbounded_channel();
+        let granted = self.granted;
+        tokio::spawn(run_connection(self, commands, events));
+        Session { tx, rx, granted }
+    }
+}
+
+/// The body of a spawned connection (see [`MqttClient::spawn`]).
+async fn run_connection(
+    client: MqttClient,
+    mut commands: mpsc::UnboundedReceiver<Outgoing>,
+    events: mpsc::UnboundedSender<Incoming>,
+) {
+    let MqttClient {
+        mut reader,
+        mut writer,
+        granted,
+    } = client;
+    let every = ping_interval(granted.keep_alive);
+    // Two ping intervals: a broker that answers has always had a full PINGREQ round trip
+    // inside the window, even with a 1-second keepalive.
+    let deadline = every * 2;
+    let mut ping = tokio::time::interval_at(Instant::now() + every, every);
+    ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut last_rx = Instant::now();
+    let mut paused = false;
+
+    let end = loop {
+        tokio::select! {
+            packet = reader.next_packet(), if !paused => match packet {
+                Ok(Some(packet)) => {
+                    last_rx = Instant::now();
+                    let event = match packet {
+                        Packet::Publish(p) => Incoming::Publish(p),
+                        Packet::PubAck(a) => Incoming::PubAck { pkid: a.pkid, reason: a.reason },
+                        Packet::SubAck(s) => Incoming::SubAck {
+                            pkid: s.pkid,
+                            return_codes: s.return_codes,
+                        },
+                        Packet::Disconnect(d) => break ClientError::Disconnected(d.reason),
+                        // PINGRESP refreshed `last_rx` above; nothing else needs an answer.
+                        _ => continue,
+                    };
+                    if events.send(event).is_err() {
+                        break ClientError::Closed; // the owner is gone
                     }
-                    // SUBACK / PUBACK / PINGRESP: housekeeping we do not act on here.
-                    Ok(Some(_)) => {}
-                    Ok(None) => return ClientError::Closed,
-                    Err(e) => return ClientError::Protocol(e.to_string()),
-                },
-                cmd = commands.recv() => match cmd {
-                    Some(Command::Ack { pkid }) => {
-                        if writer.send(&Packet::PubAck(Ack::new(pkid))).await.is_err() {
-                            return ClientError::Closed;
+                }
+                Ok(None) => break ClientError::Closed,
+                Err(e) => break ClientError::Protocol(e.to_string()),
+            },
+            command = commands.recv() => {
+                let packet = match command {
+                    None => break ClientError::Closed, // the owner dropped the session
+                    Some(Outgoing::PauseReads(pause)) => {
+                        if paused && !pause {
+                            // The deadline restarts: nothing was read while paused.
+                            last_rx = Instant::now();
                         }
+                        paused = pause;
+                        continue;
                     }
-                    Some(Command::Subscribe { pkid, filter, qos }) => {
-                        let pkt = Packet::Subscribe(Subscribe {
+                    Some(Outgoing::Disconnect) => {
+                        let bye = Packet::Disconnect(Disconnect {
+                            reason: 0,
+                            properties: Properties::new(),
+                        });
+                        let _ = write(&mut writer, &bye, deadline).await;
+                        break ClientError::Closed;
+                    }
+                    Some(Outgoing::Publish(p)) => Packet::Publish(p),
+                    Some(Outgoing::PubAck(pkid)) => Packet::PubAck(Ack::new(pkid)),
+                    Some(Outgoing::Subscribe { pkid, filter, qos, options }) => {
+                        Packet::Subscribe(Subscribe {
                             properties: Properties::new(),
                             pkid,
-                            filters: vec![SubscribeFilter {
-                                path: filter,
-                                qos,
-                                options: bridge_subscription_options(),
-                            }],
-                        });
-                        if writer.send(&pkt).await.is_err() {
-                            return ClientError::Closed;
-                        }
+                            filters: vec![SubscribeFilter { path: filter, qos, options }],
+                        })
                     }
-                    Some(Command::Publish { topic, payload, qos, retain, pkid, properties }) => {
-                        let pkid = if qos == QoS::AtMostOnce {
-                            None
-                        } else {
-                            pkid.or_else(|| {
-                                next_pkid = next_pkid.wrapping_add(1).max(1);
-                                Some(next_pkid)
-                            })
-                        };
-                        let pkt = Packet::Publish(Publish {
-                            dup: false,
-                            qos,
-                            retain,
-                            topic,
-                            pkid,
-                            properties,
-                            payload,
-                        });
-                        if writer.send(&pkt).await.is_err() {
-                            return ClientError::Closed;
-                        }
-                    }
-                    None => return ClientError::Closed, // the engine dropped our command channel
-                },
-                _ = ping.tick() => {
-                    if writer.send(&Packet::PingReq).await.is_err() {
-                        return ClientError::Closed;
-                    }
+                };
+                if let Err(e) = write(&mut writer, &packet, deadline).await {
+                    break e;
+                }
+            },
+            _ = ping.tick() => {
+                if !paused && last_rx.elapsed() >= deadline {
+                    break ClientError::KeepAlive;
+                }
+                if let Err(e) = write(&mut writer, &Packet::PingReq, deadline).await {
+                    break e;
                 }
             }
         }
+    };
+    let _ = events.send(Incoming::Closed(end));
+}
+
+/// Write one packet, giving up after `limit`.
+async fn write(
+    writer: &mut FrameWriter<WriteHalf<Box<dyn Io>>>,
+    packet: &Packet,
+    limit: Duration,
+) -> Result<(), ClientError> {
+    match tokio::time::timeout(limit, writer.send(packet)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(ClientError::Protocol(e.to_string())),
+        Err(_) => Err(ClientError::WriteStalled),
     }
 }
 
@@ -458,16 +631,24 @@ pub fn ping_interval(keep_alive: u16) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use super::bridge_subscription_options;
+    use super::subscription_options;
 
     #[test]
     fn bridge_subscriptions_set_no_local_and_retain_as_published() {
-        let o = bridge_subscription_options();
+        let o = subscription_options("a/#", 1);
         // No Local is the primary, unforgeable loop defence (#191) — Mosquitto/EMQX parity.
         assert!(o.no_local, "bridge subscriptions must set No Local");
         // Retain As Published lets retained state cross the boundary (#189).
         assert!(o.retain_as_published, "bridge subscriptions must set RAP");
-        // Retain handling 0 = send retained at subscribe (idempotent re-sync with RAP on).
-        assert_eq!(o.retain_handling, 0);
+        // Retain handling is the caller's choice (ADR 0060 Amendment 1 §6).
+        assert_eq!(o.retain_handling, 1);
+    }
+
+    #[test]
+    fn a_share_subscription_never_sets_no_local() {
+        // MQTT 5 makes No Local on a shared subscription a protocol error [MQTT-3.8.3-4].
+        let o = subscription_options("$share/g/a/#", 0);
+        assert!(!o.no_local);
+        assert!(o.retain_as_published);
     }
 }

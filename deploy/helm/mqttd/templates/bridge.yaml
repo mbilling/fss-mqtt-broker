@@ -125,8 +125,9 @@ spec:
               containerPort: 8090
               protocol: TCP
           # No readiness probe on connectivity by design: a bridge whose upstream
-          # is down is doing its job — spooling — not failing. Liveness is the
-          # metrics endpoint answering at all.
+          # is down is doing its job — leaving the messages queued in its local
+          # session (ADR 0060 Amendment 1) — not failing. Liveness is the metrics
+          # endpoint answering at all.
           livenessProbe:
             httpGet:
               path: /metrics

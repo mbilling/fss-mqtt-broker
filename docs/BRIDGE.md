@@ -26,18 +26,18 @@ own restart without a gap.
    │   │ node-0 │  │ node-1 │  │ node-2 │ │           ┊
    │   └────────┘  └────────┘  └────────┘ │           ┊
    └───────────────────┬──────────────────┘           ┊
-                       │                              ┊
+                       │  the bridge's persistent     ┊
+                       │  session keeps messages here ┊
+                       │  while the upstream is down  ┊
         subscribe  "telemetry/#"   (plain filter)     ┊
-                       │  every message → this one    ┊
-                       ▼          subscriber          ┊
+                       │                              ┊
+                       ▼                              ┊
              ┌───────────────────────┐                ┊
              │      mqtt-bridge      │                ┊
              │  client_id = <unique> │                ┊
-             │                       │                ┊
-             │   ┌───────────────┐   │                ┊
-             │   │     spool     │   │  buffers while ┊
-             │   │  (bounded)    │   │  the upstream  ┊
-             │   └───────────────┘   │  is down       ┊
+             │  acks each message    │                ┊
+             │  only after the       │                ┊
+             │  partner acks it      │                ┊
              └───────────┬───────────┘                ┊
                          │                            ┊
                 publish  │  direction = "out" ONLY    ┊
@@ -56,13 +56,17 @@ url = "mqttd:1883"
 # client_id is optional: unset generates a per-instance, 23-byte-safe id
 ```
 
-**What you get:** the crossing works, and an upstream outage is buffered in the
-spool and replayed on reconnect.
+**What you get:** the crossing works, and nothing is lost to an outage of the upstream or a
+restart of the bridge. The bridge keeps a persistent session on the local cluster and
+acknowledges a message there only after the partner has acknowledged it. While the partner is
+unreachable the bridge is not connected to the local cluster at all, so the messages wait in
+that session and cross, in order, when it is back. A restart is the same case: the session
+outlives the bridge ([ADR 0060](adr/0060-bridge-durability-and-ack-contract.md) Amendment 1).
 
-**What you don't:** while the bridge itself is restarting, nothing is forwarded.
-Messages published during that window are not queued anywhere for it — the local
-side's persistent session holds its subscription, so a *brief* restart resumes and
-catches up, but a long outage or a lost pod is a gap.
+**What you don't:** the session is the only buffer, so the broker's limits on one session
+bound how long an outage it rides out: 100,000 messages by default
+(`MQTTD_MAX_QUEUED_MESSAGES`, then the oldest are dropped; issue #1235 replaces the count
+with memory and disk limits). And a single instance forwards nothing while it is down.
 
 ---
 
@@ -97,7 +101,9 @@ The chart sets **`MQTTD_BRIDGE_TOTAL`** from `replicaCount`, and the bridge deri
 to every replica. Getting `total` wrong is the one footgun: too low **duplicates** inbound,
 too high **strands** a slice — so wire it from the deployment (the chart does). A scale change
 re-derives ownership across the survivors; a dead instance's slice waits for the operator
-rebalance (or a returning ordinal), covered by each side's persistent session meanwhile.
+rebalance (or a returning ordinal). Meanwhile the messages for it wait in its local session;
+messages from an upstream wait only if that upstream's session is persistent
+(`session_expiry_secs` on the upstream).
 
 ### Shared (`$share`) — opt-in, `out`-only
 
@@ -227,9 +233,12 @@ Measured, two replicas over 30 seconds:
 | **shared** client id | **73** | unusable |
 | distinct (the default now) | **1** | 6 messages in → 6 out, split 3/3 |
 
-The local side also uses a **persistent** session (`clean_session=false`) so a brief
-restart resumes its subscription — which means colliding replicas would be
-inheriting and clobbering each other's stored queue, not merely stealing a socket.
+The local side also uses a **persistent** session (`clean_start = false` and a Session Expiry
+Interval: `[local] session_expiry_secs`, default 4294967295, which MQTT 5 defines as never), so
+a restart resumes it — which means colliding replicas would be inheriting and clobbering each
+other's stored queue, not merely stealing a socket. With several upstreams each one has its own
+local session: a configured local `client_id` gets `.<upstream name>` appended, and a generated
+one encodes the upstream.
 
 The chart is explicit anyway: put `__POD_NAME__` in every `client_id` and its init
 container substitutes the pod's name, so the id is visible in the config rather
@@ -248,21 +257,24 @@ second instance on that fallback would still collide.
 survivors take the whole stream. Forwarding continues with no duplicates, because
 the group delivers each message once regardless of how many members are up.
 
-**Not covered — and worth knowing before you rely on it.** A spool is replayed
-only by the replica that owns it, on *its* reconnect. So messages already buffered
-by a replica that is down stay buffered until **that** replica returns:
+**Not covered — and worth knowing before you rely on it.** What a replica holds is
+delivered only by that replica, when it returns. Its local session keeps what was
+already queued for it, and its volume keeps whatever it spooled from an upstream:
 
 ```
-   bridge-1 spooled 5 000 messages while the partner was unreachable
+   the partner is unreachable; bridge-1's local session holds 5 000 messages for it
    bridge-1's pod is deleted and does not come back
    → bridge-0 keeps forwarding the LIVE stream normally
-   → those 5 000 remain on bridge-1's PVC, unsent, until a pod re-attaches to it
+   → those 5 000 stay in bridge-1's session on the cluster until a pod with its
+     client id connects again
 ```
 
-A StatefulSet re-attaches the same PVC to the same ordinal, so a restarted or
-rescheduled replica drains its own backlog. **Scaling down does not** — the
-retired ordinal's volume keeps its spool with nobody to replay it. Drain before
-scaling down, or accept the backlog is stranded.
+A StatefulSet brings the same ordinal back with the same name and volume, so a
+restarted or rescheduled replica resumes its own session and drains its own spool.
+**Scaling down does not**: the retired ordinal's session keeps queueing, and its
+volume keeps its spool, with nobody to deliver either. Drain before scaling down. A
+session that is no longer wanted is deleted through the admin API, or expires on
+its own if `[local] session_expiry_secs` is finite.
 
 Watch it with:
 
@@ -270,11 +282,44 @@ Watch it with:
 fss_bridge_spool_depth                       # per side, per replica
 fss_bridge_connected == 0                    # a side that is down
 rate(fss_bridge_dropped_total{reason="spool-full"}[5m])   # actual message loss
+rate(fss_bridge_dropped_total{reason="refused"}[5m])      # refused by the far broker
+increase(fss_bridge_sessions_lost_total[1h]) # a session found gone on reconnect
 ```
 
 The Grafana dashboard at
 [`../deploy/observability/grafana/mqttd-bridge.json`](../deploy/observability/grafana/mqttd-bridge.json)
-has panels for all three.
+has panels for the first three.
+
+---
+
+## Several upstreams
+
+Each upstream is its own link: its own local session, with its own subscriptions, and its own
+connection to the upstream. An upstream that is unreachable stops only its own traffic; the
+others keep forwarding, and its messages wait in its own session.
+
+A message the bridge brings **in** from one upstream is, on the local cluster, an ordinary
+message. If another upstream has an `out` rule that matches its local topic, the bridge
+forwards it on to that upstream too, with the hop count bounding any loop. A single bridge
+did not do this before 1.4.0, when all upstreams shared one local connection with No Local
+set (a second bridge process would have).
+
+So the bridge **refuses to start** with a pair of rules on different upstreams where this can
+happen, and the error names the pair. Choose one:
+
+```toml
+# keep the two apart: the in rule's topics no longer match the other upstream's out rule
+[[upstreams.rules]]
+direction = "in"
+filter = "sensors/#"
+remap = { prefix = "partner-a/" }
+
+# or allow the flow on purpose (top level); the startup log names each pair it allows
+relay_between_upstreams = true
+```
+
+The check reads only this bridge's rules. Two separate bridge deployments, one bringing a
+partner's messages in and another sending the same topics out, relay as they always did.
 
 ---
 
@@ -309,9 +354,38 @@ Three things to know:
 
 ## Durability of a QoS ≥ 1 rule
 
-The spool is **fsync-durable** on commit (ADR 0060 T3), and a QoS ≥ 1 rule **refuses to start**
-without a durable spool — set `[spool].dir`, or `[spool].allow_ephemeral_spool = true` to accept
-loss on restart (ADR 0060 T4). A spool-full drop is **audited** (topic + reason + bound + sizes),
+How a message is acknowledged
+([ADR 0060](adr/0060-bridge-durability-and-ack-contract.md) Amendment 1):
+
+- **Out, local cluster → upstream:** at the local cluster, only after the upstream has
+  acknowledged every forward the message produced, in the order the messages arrived. While the
+  upstream is unreachable the bridge stays disconnected from the local cluster, whose session
+  keeps the messages. Nothing is written to the bridge's disk, so an `out` rule needs no
+  `[spool].dir`; it needs a local session that outlives a disconnect, and
+  `session_expiry_secs = 0` is refused for it.
+- **In, upstream → local cluster:** at the upstream, after the local cluster's PUBACK, or, while
+  the local link is down, after the message is spooled. What was on its way to the local cluster
+  when the link failed is spooled too. A replay sends the spool oldest first and deletes each
+  message only when the local cluster acknowledges it, and newer messages wait behind it.
+- **A refusal by the far broker:** a PUBACK saying not authorized (0x87), topic name invalid
+  (0x90) or payload format invalid (0x99) is final: the message is acknowledged at its source,
+  audited, and counted as `fss_bridge_dropped_total{reason="refused"}`. Any other error code is
+  retried as a new publish after 1 second, doubling to at most 30.
+- **A dead connection** is noticed by the keepalive: nothing from the broker for one interval
+  (`keep_alive_secs`, default 30), or a write blocked that long, closes it. Before 1.4.0 a broker
+  that vanished without a reset counted as connected until TCP gave up.
+- **Memory:** one direction of a link holds at most `max_inflight_bytes` (default 64 MiB) of
+  messages waiting for the destination; past it the bridge stops reading the source.
+
+What remains is at-least-once: after any failure a message can arrive twice. And an upstream's
+session is clean by default, because a partner broker may not allow a persistent one, so
+messages it has sent but the bridge has not yet acknowledged are lost if the bridge itself
+crashes. Set `session_expiry_secs` on the upstream where the partner allows it.
+
+The spool is **fsync-durable** on commit (ADR 0060 T3), and a QoS ≥ 1 `in` or `both` rule
+**refuses to start** without a durable spool — set `[spool].dir`, or
+`[spool].allow_ephemeral_spool = true` to accept loss on restart (ADR 0060 T4). Each upstream
+has its own spool file. Spools an older bridge left behind are drained, not dropped. A spool-full drop is **audited** (topic + reason + bound + sizes),
 not just counted (T5 / ADR 0041 T7), so a lost auditable crossing leaves a trail. The count
 bound (`spool.max_messages`, default 10 000) and the byte bound (`spool.max_bytes`, default
 unset / 0 = off) join: first reached wins, with the same overflow policy. A message larger
@@ -326,31 +400,20 @@ bridge serves anything: at the motivating size, 10 000 × 1 MiB payloads is
 schema bump; size `[spool].dir`'s volume and your restart window knowing the
 reopen scales with resident bytes, not just the message count.
 
-**The acknowledgement is no longer sent on arrival.** The bridge used to PUBACK a `QoS`≥1
-message the moment it read it — before doing anything durable with it — so the source dropped
-its copy while the bridge might still lose it. Now the engine acknowledges only after the
-message has been **durably accepted**: spooled (fsync'd) when the destination is down, or
-dispatched when it is up. A spool that cannot accept the message withholds the ack entirely, so
-the source keeps it and redelivers.
-
-That is also why a **full spool refuses** the newest message for a `QoS`≥1 rule instead of
-shedding the oldest: everything already spooled was acknowledged to the source, so dropping it
-would lose a message the source believes was delivered. A `QoS`-0-only bridge still drops the
+A **full spool refuses** the newest message for a `QoS`≥1 rule instead of shedding the oldest:
+everything already spooled was acknowledged to the upstream, so dropping it would lose a message
+the upstream believes was delivered. The refused message stays in the bridge's memory,
+unacknowledged, and everything after it waits behind it. A `QoS`-0-only bridge still drops the
 oldest — `QoS` 0 promises nothing, and a stalled crossing would be worse.
-
-**One residual, stated plainly.** On the fast path the ack fires when the message is dispatched
-to a connected destination, not when that destination *acknowledges* it — so a crash in that
-narrow window can still lose a message the source considered delivered. Closing it means
-correlating the destination's packet id back to the source (ADR 0060 T8, designed in
-[§5](adr/0060-bridge-durability-and-ack-contract.md)). For the strongest guarantee
-today, keep a durable spool and treat the crossing as at-least-once with that caveat.
 
 ---
 
 ## Encrypt the spool at rest — a deployment requirement
 
-The store-and-forward spool holds **cross-zone message payloads in the clear** while a
-side is unreachable (a plain length-prefixed store, ADR 0025 §7). On a boundary host —
+The store-and-forward spool holds **cross-zone message payloads in the clear** while the
+local cluster is unreachable (a plain length-prefixed store, ADR 0025 §7). Since 1.4.0 only
+traffic coming in from an upstream is spooled; a bridge with only `out` rules writes no
+payloads to disk. On a boundary host —
 by design a more-exposed box than a broker inside a trusted zone — that is a plaintext
 copy of everything crossing the boundary. Anyone who reads that disk (a stolen drive, a
 backup, a compromised host) reads the traffic.

@@ -35,6 +35,8 @@ caller changes this file and the gate fails until it is regenerated and re-read.
 | --- | --- | --- | --- | --- |
 | `crates/mqtt-bridge/tests/engine.rs` | `a_full_spool_must_not_shed_a_message_the_bridge_already_accepted` | `bridge-spool-refusal` | 20ms | in the test itself |
 | `crates/mqtt-bridge/tests/engine.rs` | `a_message_spooled_while_its_side_connects_is_not_stranded_in_the_spool` | `bridge-connect-stream` | 1ms | in the test itself |
+| `crates/mqtt-bridge/tests/engine.rs` | `messages_published_while_the_bridge_restarts_cross_after_it` | `bridge-restart-gap` | 300ms | in the test itself |
+| `crates/mqtt-bridge/tests/engine.rs` | `a_local_session_found_gone_on_reconnect_is_counted` | `bridge-session-expiry` | 3s | in the test itself |
 | `crates/mqtt-cluster/src/cluster_log.rs` | `deliver` | `local-tier-slow-followers` | 400ms | helper, 17 call site(s) |
 | `crates/mqtt-cluster/src/cluster_log.rs` | `pipelined_appends_overlap_and_commit_in_offset_order` | `pipelined-commit-holdback` | 100ms | in the test itself |
 | `crates/mqtt-cluster/src/cluster_log.rs` | `overlap_starts_the_fan_out_before_the_local_write_is_durable` | `serial-fan-out` | 100ms | in the test itself |
