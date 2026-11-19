@@ -14,9 +14,11 @@ use serde::Deserialize;
 /// JWT verification configuration.
 #[derive(Debug, Clone)]
 pub struct TokenConfig {
-    /// Required issuer (`iss`), if any.
+    /// The issuer (`iss`) a token must carry, if any: a token without it, or with another
+    /// value, is refused.
     pub issuer: Option<String>,
-    /// Required audience (`aud`), if any.
+    /// The audience (`aud`) a token must carry, if any: a token without it, or with
+    /// another value, is refused.
     pub audience: Option<String>,
     /// Claim name to read group memberships from (default `groups`).
     pub groups_claim: String,
@@ -66,15 +68,21 @@ impl std::fmt::Debug for TokenAuthenticator {
 impl TokenAuthenticator {
     fn build(key: DecodingKey, algorithm: Algorithm, config: TokenConfig) -> Self {
         let mut validation = Validation::new(algorithm);
+        // jsonwebtoken compares `iss` and `aud` only when the token carries them, so a
+        // configured one is also a required claim: a token without it is refused.
+        let mut required = vec!["exp"];
         if let Some(iss) = &config.issuer {
             validation.set_issuer(&[iss]);
+            required.push("iss");
         }
         if let Some(aud) = &config.audience {
             validation.set_audience(&[aud]);
+            required.push("aud");
         } else {
             // No audience configured: don't require/validate `aud`.
             validation.validate_aud = false;
         }
+        validation.set_required_spec_claims(&required);
         Self {
             key,
             validation,
@@ -395,6 +403,61 @@ mod tests {
             TokenAuthenticator::hs256(b"", TokenConfig::default()),
             Err(AuthError::Backend(_))
         ));
+    }
+
+    /// A configured issuer or audience is a required claim: a token that does not carry it
+    /// is refused. A claim that is not configured is not required.
+    #[tokio::test]
+    async fn a_configured_issuer_or_audience_must_be_in_the_token() {
+        const ISS: &str = "https://issuer.example";
+        async fn verify(
+            config: TokenConfig,
+            claims: &serde_json::Value,
+        ) -> Result<Identity, AuthError> {
+            let auth = TokenAuthenticator::hs256(SECRET, config).expect("a non-empty secret");
+            auth.authenticate(&client(), &Credentials::Token(&hs256_token(claims)))
+                .await
+        }
+        let issuer_only = || TokenConfig {
+            issuer: Some(ISS.to_string()),
+            ..TokenConfig::default()
+        };
+        let audience_only = || TokenConfig {
+            audience: Some("mqttd".to_string()),
+            ..TokenConfig::default()
+        };
+        let exp = now() + 3600;
+
+        // Configured, so required.
+        assert!(matches!(
+            verify(
+                issuer_only(),
+                &json!({ "sub": "alice", "aud": "mqttd", "exp": exp })
+            )
+            .await,
+            Err(AuthError::Rejected)
+        ));
+        assert!(matches!(
+            verify(
+                audience_only(),
+                &json!({ "sub": "alice", "iss": ISS, "exp": exp })
+            )
+            .await,
+            Err(AuthError::Rejected)
+        ));
+        // The other claim is not configured, so it is not required.
+        assert!(verify(
+            issuer_only(),
+            &json!({ "sub": "alice", "iss": ISS, "exp": exp })
+        )
+        .await
+        .is_ok());
+        assert!(verify(
+            audience_only(),
+            &json!({ "sub": "alice", "aud": "mqttd", "exp": exp })
+        )
+        .await
+        .is_ok());
     }
 
     /// With an issuer and an audience configured, a token whose header lists a critical

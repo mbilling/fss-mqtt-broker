@@ -265,6 +265,9 @@ impl Authenticator for OidcAuthenticator {
         let mut validation = Validation::new(header.alg);
         validation.set_issuer(&[&self.cfg.issuer]);
         validation.set_audience(&[&self.cfg.audience]);
+        // jsonwebtoken compares `iss` and `aud` only when the token carries them, so they are
+        // also required claims: a token without either is refused (ADR 0050).
+        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
         validation.leeway = self.cfg.leeway_secs;
 
         for cand in candidates {
@@ -403,6 +406,27 @@ mod tests {
             auth(&a, &elsewhere).await.unwrap_err(),
             AuthError::Rejected
         ));
+    }
+
+    /// The issuer and the audience are required in OIDC mode (ADR 0050): a token that does
+    /// not carry `iss` or `aud` is refused, like one that carries the wrong value.
+    #[tokio::test]
+    async fn a_token_without_an_issuer_or_an_audience_is_rejected() {
+        let (a, _rx) = authenticator();
+        a.install_jwks(JWKS).unwrap();
+        for claims in [
+            json!({"sub":"d","iss":ISSUER,"exp":exp()}),
+            json!({"sub":"d","aud":AUD,"exp":exp()}),
+            json!({"sub":"d","exp":exp()}),
+        ] {
+            assert!(
+                matches!(
+                    auth(&a, &mint("t1", &claims)).await.unwrap_err(),
+                    AuthError::Rejected
+                ),
+                "{claims}"
+            );
+        }
     }
 
     /// An `iss`, `aud` or `sub` of the wrong type is refused, whatever the signature.

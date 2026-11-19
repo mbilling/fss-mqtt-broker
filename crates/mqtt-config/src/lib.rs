@@ -323,9 +323,11 @@ pub struct Jwt {
     pub hs256_secret_file: Option<String>,
     /// RS256 public-key PEM (`MQTTD_JWT_RS256_PEM`).
     pub rs256_pem_file: Option<String>,
-    /// Required `iss` claim (`MQTTD_JWT_ISSUER`).
+    /// The `iss` claim a token must carry (`MQTTD_JWT_ISSUER`): a token without it, or with
+    /// another value, is refused.
     pub issuer: Option<String>,
-    /// Required `aud` claim (`MQTTD_JWT_AUDIENCE`).
+    /// The `aud` claim a token must carry (`MQTTD_JWT_AUDIENCE`): a token without it, or
+    /// with another value, is refused.
     pub audience: Option<String>,
 }
 
@@ -336,9 +338,10 @@ pub struct Jwt {
 #[serde(default)]
 pub struct Oidc {
     /// Issuer URL (`MQTTD_OIDC_ISSUER`); enables OIDC mode. Must be https unless
-    /// `allow_http` (testing) is set. Also the required `iss` claim value.
+    /// `allow_http` (testing) is set. Also the `iss` claim every token must carry.
     pub issuer: Option<String>,
-    /// Required `aud` claim (`MQTTD_OIDC_AUDIENCE`); mandatory in OIDC mode.
+    /// The `aud` claim every token must carry (`MQTTD_OIDC_AUDIENCE`); mandatory in OIDC
+    /// mode. A token without `aud`, or without this value in it, is refused.
     pub audience: Option<String>,
     /// JWKS background-refresh interval in seconds (`MQTTD_OIDC_JWKS_REFRESH`, default 300).
     pub jwks_refresh_secs: Option<u64>,

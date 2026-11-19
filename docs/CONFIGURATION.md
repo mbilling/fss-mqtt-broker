@@ -65,10 +65,10 @@ Documented overlay variables: **135** in `ENV_VARS`, plus `MQTTD_CONFIG` (meta) 
 | `MQTTD_ACL_FILE` | `security.acl_file` | Topic-ACL TOML policy file (`MQTTD_ACL_FILE`); without it authorization is not enforced and loudly logged. |
 | `MQTTD_JWT_HS256_SECRET_FILE` | `security.jwt.hs256_secret_file` | Path to a file holding the HS256 shared secret (`MQTTD_JWT_HS256_SECRET_FILE`, ADR 0046 T5): secret-by-reference, so the HMAC key is mounted from a Secret, never inlined. Whitespace around the secret is trimmed. A file that is empty after trimming is refused, since an empty HMAC key would let anyone sign a token: the broker does not start, `--check-config --preflight` fails, and a reload keeps the running verifier. |
 | `MQTTD_JWT_RS256_PEM` | `security.jwt.rs256_pem_file` | RS256 public-key PEM (`MQTTD_JWT_RS256_PEM`). |
-| `MQTTD_JWT_ISSUER` | `security.jwt.issuer` | Required `iss` claim (`MQTTD_JWT_ISSUER`). |
-| `MQTTD_JWT_AUDIENCE` | `security.jwt.audience` | Required `aud` claim (`MQTTD_JWT_AUDIENCE`). |
-| `MQTTD_OIDC_ISSUER` | `security.oidc.issuer` | Issuer URL (`MQTTD_OIDC_ISSUER`); enables OIDC mode. Must be https unless `allow_http` (testing) is set. Also the required `iss` claim value. |
-| `MQTTD_OIDC_AUDIENCE` | `security.oidc.audience` | Required `aud` claim (`MQTTD_OIDC_AUDIENCE`); mandatory in OIDC mode. |
+| `MQTTD_JWT_ISSUER` | `security.jwt.issuer` | The `iss` claim a token must carry (`MQTTD_JWT_ISSUER`): a token without it, or with another value, is refused. |
+| `MQTTD_JWT_AUDIENCE` | `security.jwt.audience` | The `aud` claim a token must carry (`MQTTD_JWT_AUDIENCE`): a token without it, or with another value, is refused. |
+| `MQTTD_OIDC_ISSUER` | `security.oidc.issuer` | Issuer URL (`MQTTD_OIDC_ISSUER`); enables OIDC mode. Must be https unless `allow_http` (testing) is set. Also the `iss` claim every token must carry. |
+| `MQTTD_OIDC_AUDIENCE` | `security.oidc.audience` | The `aud` claim every token must carry (`MQTTD_OIDC_AUDIENCE`); mandatory in OIDC mode. A token without `aud`, or without this value in it, is refused. |
 | `MQTTD_OIDC_JWKS_REFRESH` | `security.oidc.jwks_refresh_secs` | JWKS background-refresh interval in seconds (`MQTTD_OIDC_JWKS_REFRESH`, default 300). |
 | `MQTTD_OIDC_MAX_STALE` | `security.oidc.max_stale_secs` | Staleness window in seconds before fail-closed (`MQTTD_OIDC_MAX_STALE`, default 86400). |
 | `MQTTD_OIDC_ALLOW_HTTP` | `security.oidc.allow_http` | Permit an http:// issuer (`MQTTD_OIDC_ALLOW_HTTP` — INSECURE, loudly logged; tests). |

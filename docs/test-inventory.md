@@ -46,7 +46,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/history-check/src/main.rs` — 0 test(s)
 
 
-## `crates/mqtt-auth/src/lib.rs` — 139 test(s)
+## `crates/mqtt-auth/src/lib.rs` — 141 test(s)
 
 - `acl::tests::a_bad_client_id_does_not_disturb_rules_that_never_use_it`
 - `acl::tests::a_bare_percent_is_literal`
@@ -132,6 +132,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `mtls::tests::truncated_der_is_rejected_without_panic`
 - `oidc::tests::a_garbled_jwks_never_replaces_the_last_known_good_set`
 - `oidc::tests::a_token_naming_an_unknown_critical_extension_is_rejected`
+- `oidc::tests::a_token_without_an_issuer_or_an_audience_is_rejected`
 - `oidc::tests::a_valid_token_authenticates_with_subject_and_groups`
 - `oidc::tests::an_idp_shaped_token_with_an_audience_array_authenticates`
 - `oidc::tests::an_unknown_kid_rejects_and_hints_exactly_one_refresh`
@@ -170,6 +171,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `signed_gossip::tests::garbage_crl_bytes_do_not_panic`
 - `tests::custom_authorizer_allow_path_works_through_the_trait`
 - `tests::deny_all_denies`
+- `token::tests::a_configured_issuer_or_audience_must_be_in_the_token`
 - `token::tests::a_critical_extension_or_a_mistyped_claim_is_rejected`
 - `token::tests::a_custom_groups_claim_name_is_honored`
 - `token::tests::correct_audience_is_accepted_when_audience_is_configured`
@@ -2973,9 +2975,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `the_grant_sweep_re_checks_percent_c_under_each_sessions_own_client_id`
 - `tightening_acl_reload_denies_a_live_publisher`
 
-## `crates/mqttd/tests/reload_auth.rs` — 4 test(s)
+## `crates/mqttd/tests/reload_auth.rs` — 5 test(s)
 
 - `a_removed_user_cannot_resume_their_durable_session`
+- `an_emptied_hs256_secret_file_reload_is_rejected_and_keeps_the_running_verifier`
 - `malformed_password_file_reload_is_rejected_and_keeps_the_running_authenticator`
 - `removing_a_password_user_evicts_their_live_session`
 - `rotated_password_file_reload_authenticates_the_new_credential`
