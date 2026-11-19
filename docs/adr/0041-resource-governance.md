@@ -539,3 +539,70 @@ and the terminal-verdict composition (first-terminal-wins, third-node withholds)
 extending over the set. That is a redesign of the ack ledger, recorded here as the
 follow-up shape rather than attempted under this issue; it pairs naturally with the
 hub decomposition (#258), which isolates the seams it must touch.
+
+## Amendment (2026-11-19): memory and disk, not message counts (issue #1235)
+
+> **Decided 2026-11-19** by the maintainer: "I don't think we should have a message limit.
+> Only a memory and disk limit." Then, on compatibility: "set to infinite for newly installs
+> of 1.4.0" — a new 1.4.0 install has no message-count limits, and an existing install keeps
+> the limits it runs with. Issue [#1235](https://github.com/mbilling/fss-mqtt-broker/issues/1235).
+
+### Why
+
+Three message counts bound a persistent session, and a count is not a resource:
+
+- **A reconnect replayed at most 10,000 queued messages** (`REPLAY_LIMIT`), and worse than late:
+  the rest waited for the next reconnect while live traffic went past it, and once the
+  subscriber had acknowledged that traffic the watermark covered the unread tail
+  (`safe_ack` returns the high-water when nothing is owed) and the truncation flusher
+  deleted it undelivered.
+- **A connected subscriber that fell behind lost messages, durable or not.** Past its Receive
+  Maximum window and `MQTTD_MAX_BACKLOG_MESSAGES` (10,000) the oldest backlog entry is evicted
+  and its offset released, although the message is on disk. The 2026-08-15 amendment kept
+  every byte default off for exactly this reason: eviction was the bound's only enforcement.
+- **The offline queue held at most 100,000 messages**, and on the clustered durable store,
+  the default deployment, `MQTTD_MAX_QUEUED_MESSAGES` and `MQTTD_QUEUE_OVERFLOW` did not
+  even apply: the store is built with `QueueLimits::default()`.
+
+### Decision
+
+1. **A reconnect replays the whole queue, a page at a time** (0041-T18). The attach reads
+   the first 1,000 entries; while more remain, a cursor reads the next page on the
+   session's lane once the subscriber's backlog has drained and its outbound queue is not
+   deep. The read is a lane barrier, so it sees every append admitted before it, and its
+   result reaches the loop before the completion of any append admitted after it. While
+   the cursor is active, live deliveries to the session are written rather than sent, so
+   the cursor reaches them in the queue's order (write elision is off and `QoS` 0 is
+   written too), and truncation never passes the last offset the replay has read. A
+   short page ends the replay.
+2. **A durable session that falls behind stops holding, it does not drop** (0041-T19).
+   Past the backlog bound, a message that is already in the session's log stays there and
+   is read back as the window frees; only a session with nothing to read back from (clean,
+   or a non-persistent store) still drops its oldest.
+3. **New 1.4.0 installs have no message counts** (0041-T20). A data directory created by
+   1.4.0 records it; on such an install `max_queued_messages` and `max_backlog_messages`
+   default to unbounded. An existing install keeps 1.3.0's defaults unless configured, and an
+   explicit setting is always honoured. The clustered store gets the configured limits.
+4. **Memory and disk defaults for new installs** (0041-T21), to be decided with the
+   maintainer: whether the store-wide disk watermark (`MQTTD_STORE_MAX_BYTES`) is the disk
+   limit, or each session also gets a byte limit (0041-T6's persisted per-session count),
+   and the default sizes.
+
+The mqtt-bridge's spool is not in this amendment: the maintainer decided the bridge keeps
+no spool at all, which is ADR 0060's to record.
+
+### Consequences
+
+- **Good:** no queued message waits for a second reconnect or is truncated unread; a
+  replay needs memory for one page and the window, not 10,000 entries; the clustered store
+  honours the queue settings (T20).
+- **Cost:** live delivery to a session waits behind its replay, and is written while it
+  waits, `QoS` 0 included; a long queue takes one lane read per 1,000 entries.
+- **Left as is:** the replay reads by count, because `pending` takes one; a page of very
+  large messages is bounded by `MQTTD_MAX_PACKET_SIZE` per entry.
+
+### Delivery
+
+Tasks 0041-T18 to 0041-T21 in the
+[delivery doc](../delivery/0041-resource-governance.md), issue
+[#1235](https://github.com/mbilling/fss-mqtt-broker/issues/1235).
