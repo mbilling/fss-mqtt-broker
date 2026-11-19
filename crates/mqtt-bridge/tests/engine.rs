@@ -11,10 +11,14 @@ use bytes::Bytes;
 use mqtt_bridge::client::{ConnectOptions, Event, MqttClient, Transport};
 use mqtt_bridge::config::BridgeConfig;
 use mqtt_bridge::engine::Bridge;
+use mqtt_bridge::spool::{Spool, SpooledMessage};
+use mqtt_codec::packet::{Ack, ConnAck, Packet, Publish, SubAck};
 use mqtt_codec::properties::{Properties, Property};
 use mqtt_codec::{ProtocolVersion, QoS};
+use mqtt_net::{FrameReader, FrameWriter};
 use mqttd::Hub;
-use tokio::net::TcpListener;
+use tokio::io::{ReadHalf, WriteHalf};
+use tokio::net::{TcpListener, TcpStream};
 
 async fn start_broker() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -28,12 +32,35 @@ async fn start_broker() -> SocketAddr {
 fn serve_broker(listener: TcpListener) {
     let (hub, hub_tx) = Hub::new();
     tokio::spawn(hub.run());
+    serve_on(listener, hub_tx);
+}
+
+/// Accept connections on `listener` into an existing broker.
+fn serve_on(listener: TcpListener, hub_tx: mqttd::hub::shards::HubTx) {
     tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
             tokio::spawn(mqttd::conn::handle(stream, hub_tx.clone()));
         }
     });
+}
+
+/// A broker that is about to come up at `addr`, with a subscriber already on `filter`.
+///
+/// The subscriber connects through a side door (a second listener on the same broker)
+/// BEFORE `addr` accepts anything, so the bridge, which keeps retrying `addr`, can never
+/// connect and forward ahead of the subscriber. Returns the subscriber; the broker serves
+/// `addr` from `listener` once this returns.
+async fn broker_with_subscriber(listener: TcpListener, id: &str, filter: &str) -> MqttClient {
+    let (hub, hub_tx) = Hub::new();
+    tokio::spawn(hub.run());
+    let side_door = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let side_addr = side_door.local_addr().unwrap();
+    serve_on(side_door, hub_tx.clone());
+    let mut sub = client(side_addr, id).await;
+    subscribe_qos1(&mut sub, filter).await;
+    serve_on(listener, hub_tx);
+    sub
 }
 
 async fn client(addr: SocketAddr, id: &str) -> MqttClient {
@@ -46,6 +73,8 @@ async fn client(addr: SocketAddr, id: &str) -> MqttClient {
         password: None,
         keep_alive: 30,
         clean_start: true,
+        session_expiry: 0,
+        receive_maximum: None,
     })
     .await
     .unwrap()
@@ -719,85 +748,54 @@ async fn two_partitioned_instances_deliver_each_inbound_message_exactly_once() {
     b2.shutdown();
 }
 
-/// ADR 0025-T7: messages destined for a **down** upstream are spooled (not lost) and
-/// replayed when it comes back.
+/// ADR 0060 T1/T2 + T5, on the path that still spools (Amendment 1 §7): messages from an
+/// upstream while the local link is down.
 #[tokio::test]
 async fn a_full_spool_must_not_shed_a_message_the_bridge_already_accepted() {
-    // ADR 0060 T1/T2 + T5: a spooled message was already acknowledged to the source, so the
-    // source has dropped its copy. Shedding it to make room for a NEWER message loses a message
-    // the source believes was delivered — the newer one must be refused instead (and left
-    // unacked, so the source keeps it). Before the fix, drop-oldest quietly evicted the older,
-    // already-acked message.
-    let local = start_broker().await;
-    let upstream_addr = TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap()
-        .local_addr()
-        .unwrap();
+    // A spooled message was already acknowledged to the upstream, so the upstream has
+    // dropped its copy. Shedding it to make room for a NEWER message loses a message the
+    // upstream believes was delivered — the newer one must be refused instead, and held
+    // unacknowledged. Before T5, drop-oldest quietly evicted the older, already-acked message.
+    let upstream = start_broker().await;
+    let local_addr = reserve_addr().await;
 
     // A QoS-1 rule (so the spool refuses at the cap) with room for exactly ONE message.
     let cfg = BridgeConfig::parse_toml(&format!(
         r#"
         share_group = ""
         [local]
-        url = "{local}"
+        url = "{local_addr}"
         [spool]
         max_messages = 1
         allow_ephemeral_spool = true
         [[upstreams]]
-        name = "down"
-        url = "{upstream_addr}"
+        name = "partner"
+        url = "{upstream}"
         [[upstreams.rules]]
-        direction = "out"
+        direction = "in"
         filter = "t/#"
         qos = 1
         "#,
     ))
     .unwrap();
     let bridge = Bridge::start(cfg);
-    // The local side must be up (and the upstream must still be down) before publishing.
-    await_connected(&bridge, "local").await;
+    await_connected(&bridge, "partner").await;
 
     // FIRST is accepted into the one-slot spool; SECOND arrives with the spool full. The
     // ORDER is the whole subject, so "FIRST is in the spool" is asserted rather than waited
-    // out: the spool-depth gauge answers it directly, and a 200 ms sleep that lost the race
-    // would have silently tested the reverse case.
-    let mut local_pub = client(local, "shed-pub").await;
-    local_pub
-        .publish(
-            "t/x",
-            Bytes::from_static(b"FIRST"),
-            QoS::AtLeastOnce,
-            false,
-            Some(1),
-            Properties::new(),
-        )
-        .await
-        .unwrap();
-    await_spool_depth(&bridge, "down", 1).await;
-    local_pub
-        .publish(
-            "t/x",
-            Bytes::from_static(b"SECOND"),
-            QoS::AtLeastOnce,
-            false,
-            Some(2),
-            Properties::new(),
-        )
-        .await
-        .unwrap();
+    // out: the spool-depth gauge answers it directly.
+    publish_acked(upstream, "shed-pub-1", "t/x", "FIRST", 1).await;
+    await_spool_depth(&bridge, "local", 1).await;
+    publish_acked(upstream, "shed-pub-2", "t/x", "SECOND", 1).await;
     // SETTLE(bridge-spool-refusal): SECOND's *refusal* is deliberately not counted anywhere —
     // spool.rs documents that an `Overflow::Refuse` rejection is not a loss and so must not
-    // land in `fss_bridge_dropped_total`. That decision is right for operators and it leaves
-    // this test with no positive observable for "SECOND has been offered to a full spool", so
-    // the depth gauge is sampled over a bounded window instead of polled to a target. The
-    // window is not load-bearing for correctness: every sample asserts, so a spool that sheds
-    // FIRST or accepts both fails here immediately. On a slow machine the risk is the milder
-    // one — the window can expire before SECOND is offered, which makes the check vacuous
-    // rather than wrong, and the replay assertion below still pins the ordering. Closing that
-    // last gap needs a `fss_bridge_spool_refused_total` counter; issue #260 records the ask.
+    // land in `fss_bridge_dropped_total`. That leaves no positive observable for "SECOND has
+    // been offered to a full spool", so the depth gauge is sampled over a bounded window
+    // instead. Every sample asserts, so a spool that sheds FIRST or accepts both fails here
+    // immediately; on a slow machine the window can only make the check vacuous, and the
+    // delivery assertion below still pins the ordering (issue #260 asks for a counter).
     for _ in 0..50 {
-        let depth = spool_depth(&bridge.metrics().render(), "down");
+        let depth = spool_depth(&bridge.metrics().render(), "local");
         assert_eq!(
             depth,
             Some(1),
@@ -807,119 +805,46 @@ async fn a_full_spool_must_not_shed_a_message_the_bridge_already_accepted() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    // Bring the upstream up; the spool replays on reconnect.
-    let listener = TcpListener::bind(upstream_addr).await.unwrap();
-    serve_broker(listener);
-    let mut up_sub = client(upstream_addr, "shed-up-sub").await;
-    subscribe(&mut up_sub, "t/#").await;
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
-    let replayed = loop {
-        if let Ok(Ok(Event::Publish(p))) =
-            tokio::time::timeout(Duration::from_millis(300), up_sub.next_event()).await
-        {
-            if let Some(id) = p.pkid {
-                up_sub.puback(id).await.unwrap();
-            }
-            break p.payload.to_vec();
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "nothing replayed after the upstream came back — the accepted message was lost"
-        );
-    };
+    // The local cluster comes up: the spool replays FIRST, then SECOND follows from memory.
+    let listener = TcpListener::bind(local_addr).await.unwrap();
+    let mut local_sub = broker_with_subscriber(listener, "shed-local-sub", "t/#").await;
+    let got = collect_n(&mut local_sub, "", 2).await;
     assert_eq!(
-        replayed,
-        b"FIRST".to_vec(),
+        got.first().map(String::as_str),
+        Some("FIRST1"),
         "the spool shed a message it had already accepted (and acked) to make room for a newer \
          one; the newer message must be refused instead"
+    );
+    assert_eq!(
+        distinct_in_order(&got),
+        ["FIRST1", "SECOND1"],
+        "the refused message must not be lost"
     );
 
     bridge.shutdown();
 }
 
+/// ADR 0060 Amendment 1 §1: messages for an unreachable upstream wait in the bridge's local
+/// session, not in the bridge. While the upstream is down the link stays away from the local
+/// cluster, and everything published meanwhile crosses, in order, once it is back.
 #[tokio::test]
-async fn messages_spooled_while_an_upstream_is_down_replay_on_reconnect() {
+async fn messages_published_while_an_upstream_is_down_wait_in_the_local_session() {
     let local = start_broker().await;
-    // Reserve an upstream address, then free it so the bridge's connects are refused (the
-    // upstream is "down").
-    let upstream_addr = TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap()
-        .local_addr()
-        .unwrap();
+    let upstream_addr = reserve_addr().await;
+    let bridge = Bridge::start(out_rule_config(local, upstream_addr, ""));
+    await_local_session(&bridge, "local").await;
 
-    let cfg = BridgeConfig::parse_toml(&format!(
-        r#"
-        share_group = ""
-        [local]
-        url = "{local}"
-        [spool]
-        allow_ephemeral_spool = true   # this test uses the in-memory spool deliberately
-        [[upstreams]]
-        name = "down"
-        url = "{upstream_addr}"
-        [[upstreams.rules]]
-        direction = "out"
-        filter = "t/#"
-        qos = 1
-        "#,
-    ))
-    .unwrap();
-    let bridge = Bridge::start(cfg);
+    publish_acked(local, "wait-pub", "t/x", "s", 5).await;
+    // The bridge holds none of it: it is not even connected to the local cluster.
+    assert!(
+        !render_connected(&bridge, "local"),
+        "the local side must stay disconnected while its upstream is down"
+    );
 
-    // The local side must be up before publishing (the upstream keeps failing — it is down).
-    await_connected(&bridge, "local").await;
-
-    // Publish while the upstream is down → the router spools these for it.
-    let mut local_pub = client(local, "spool-pub").await;
-    for n in 1..=5u16 {
-        local_pub
-            .publish(
-                "t/x",
-                Bytes::from(format!("s{n}")),
-                QoS::AtLeastOnce,
-                false,
-                Some(n),
-                Properties::new(),
-            )
-            .await
-            .unwrap();
-    }
-    // All five must be IN the spool before the upstream returns; otherwise a message that
-    // was still in flight would take the live path and the replay this test checks would
-    // never be exercised. The spool-depth gauge says so directly.
-    await_spool_depth(&bridge, "down", 5).await;
-
-    // Bring the upstream up on the reserved address, and subscribe before the bridge's
-    // backoff fires its reconnect (which replays the spool).
     let listener = TcpListener::bind(upstream_addr).await.unwrap();
-    serve_broker(listener);
-    let mut up_sub = client(upstream_addr, "spool-up-sub").await;
-    subscribe(&mut up_sub, "t/#").await;
-
-    // The spooled messages replay to the upstream once the bridge reconnects.
-    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
-    while seen.is_empty() {
-        if let Ok(Ok(Event::Publish(p))) =
-            tokio::time::timeout(Duration::from_millis(300), up_sub.next_event()).await
-        {
-            assert!(
-                p.payload.starts_with(b"s"),
-                "unexpected payload {:?}",
-                p.payload
-            );
-            seen.insert(p.payload.to_vec());
-            if let Some(id) = p.pkid {
-                up_sub.puback(id).await.unwrap();
-            }
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "spooled messages never replayed after the upstream came back"
-        );
-    }
+    let mut up_sub = broker_with_subscriber(listener, "wait-up-sub", "t/#").await;
+    let got = collect_n(&mut up_sub, "s", 5).await;
+    assert_eq!(distinct_in_order(&got), ["s1", "s2", "s3", "s4", "s5"]);
 
     bridge.shutdown();
 }
@@ -1511,9 +1436,10 @@ async fn a_remap_ping_pong_within_one_bridge_is_stopped_by_no_local() {
 /// connected side is either sent or still sent later; it never waits for a reconnect
 /// that may not come.
 ///
-/// The fix puts the router's live-or-spool decision and the supervisor's connect handoff
-/// (drain, queue the replay, set the flag) under one per-side lock (`Handoff` in
-/// `engine.rs`), so a forward lands wholly before the drain or wholly after the flag.
+/// The first fix put the live-or-spool decision and the connect handoff under one lock. Since
+/// ADR 0060 Amendment 1 a link spools only while its local connection is down, and once it is
+/// up it replays the spool before anything newer, deleting each message on its PUBACK, so a
+/// message can no longer slip into a spool that nothing will drain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_message_spooled_while_its_side_connects_is_not_stranded_in_the_spool() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1630,4 +1556,584 @@ fn render_connected(bridge: &Bridge, side: &str) -> bool {
         .metrics()
         .render()
         .contains(&format!("fss_bridge_connected{{side=\"{side}\"}} 1"))
+}
+
+/// A free address: bound, then released, so a broker can come up on it later.
+async fn reserve_addr() -> SocketAddr {
+    TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap()
+}
+
+/// One upstream with an `out` `QoS` 1 rule on `t/#`, ephemeral spool; `extra` lands in the
+/// upstream table.
+fn out_rule_config(local: SocketAddr, upstream: SocketAddr, extra: &str) -> BridgeConfig {
+    BridgeConfig::parse_toml(&format!(
+        r#"
+        share_group = ""
+        [local]
+        url = "{local}"
+        [spool]
+        allow_ephemeral_spool = true
+        [[upstreams]]
+        name = "up"
+        url = "{upstream}"
+        {extra}
+        [[upstreams.rules]]
+        direction = "out"
+        filter = "t/#"
+        qos = 1
+        "#
+    ))
+    .unwrap()
+}
+
+/// The `fss_bridge_reconnects_total` reading for `side`.
+fn reconnects(render: &str, side: &str) -> u64 {
+    metric(
+        render,
+        &format!("fss_bridge_reconnects_total{{side=\"{side}\"}}"),
+    )
+    .unwrap_or(0)
+}
+
+/// A series' value in a render, by its full name with labels.
+fn metric(render: &str, series: &str) -> Option<u64> {
+    let prefix = format!("{series} ");
+    render
+        .lines()
+        .find_map(|l| l.strip_prefix(prefix.as_str())?.trim().parse().ok())
+}
+
+/// Wait until the link has set up (or found) its local session: that first, short connect
+/// counts as the local side's first connection (ADR 0060 Amendment 1 §1).
+async fn await_local_session(bridge: &Bridge, side: &str) {
+    await_metrics(
+        bridge,
+        &format!("the bridge never set up the local session of `{side}`"),
+        |r| reconnects(r, side) >= 1,
+    )
+    .await;
+}
+
+/// Subscribe at `QoS` 1 and wait for the SUBACK.
+async fn subscribe_qos1(c: &mut MqttClient, filter: &str) {
+    c.subscribe(1, filter, QoS::AtLeastOnce).await.unwrap();
+    loop {
+        if let Event::SubAck { .. } = c.next_event().await.unwrap() {
+            return;
+        }
+    }
+}
+
+/// Publish `n` `QoS` 1 messages `<prefix>1..=<prefix>n` on `topic` and wait for the broker's
+/// PUBACKs, so they are surely in it.
+async fn publish_acked(addr: SocketAddr, id: &str, topic: &str, prefix: &str, n: u16) {
+    let mut p = client(addr, id).await;
+    for i in 1..=n {
+        p.publish(
+            topic,
+            Bytes::from(format!("{prefix}{i}")),
+            QoS::AtLeastOnce,
+            false,
+            Some(i),
+            Properties::new(),
+        )
+        .await
+        .unwrap();
+    }
+    let mut acks = 0;
+    while acks < n {
+        if let Event::PubAck(_) = p.next_event().await.unwrap() {
+            acks += 1;
+        }
+    }
+}
+
+/// Receive until `n` distinct payloads starting with `prefix` have arrived (acknowledging
+/// each), or fail after `POLL_LIMIT`. Returns every matching payload in arrival order,
+/// duplicates included — at-least-once allows them.
+async fn collect_n(c: &mut MqttClient, prefix: &str, n: usize) -> Vec<String> {
+    let deadline = tokio::time::Instant::now() + POLL_LIMIT;
+    let mut got: Vec<String> = Vec::new();
+    while distinct_in_order(&got).len() < n {
+        if let Ok(Ok(Event::Publish(p))) =
+            tokio::time::timeout(Duration::from_millis(300), c.next_event()).await
+        {
+            if let Some(id) = p.pkid {
+                c.puback(id).await.unwrap();
+            }
+            let payload = String::from_utf8_lossy(&p.payload).into_owned();
+            if payload.starts_with(prefix) {
+                got.push(payload);
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "only {got:?} of {n} messages starting with {prefix:?} arrived"
+        );
+    }
+    got
+}
+
+/// The payloads in first-arrival order, each once.
+fn distinct_in_order(got: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    got.iter().filter(|g| seen.insert(*g)).cloned().collect()
+}
+
+type FakeReader = FrameReader<ReadHalf<TcpStream>>;
+type FakeWriter = FrameWriter<WriteHalf<TcpStream>>;
+
+/// Play a broker by hand: accept one connection on `listener` and answer its CONNECT.
+async fn accept_fake(listener: &TcpListener) -> (FakeReader, FakeWriter) {
+    let (stream, _) = listener.accept().await.unwrap();
+    let (rh, wh) = tokio::io::split(stream);
+    let mut r = FrameReader::new(rh, ProtocolVersion::V5);
+    let mut w = FrameWriter::new(wh, ProtocolVersion::V5);
+    match r.next_packet().await {
+        Ok(Some(Packet::Connect(_))) => {}
+        other => panic!("expected CONNECT, got {other:?}"),
+    }
+    w.send(&Packet::ConnAck(ConnAck {
+        session_present: false,
+        code: 0,
+        properties: Properties::new(),
+    }))
+    .await
+    .unwrap();
+    (r, w)
+}
+
+/// The next PUBLISH the bridge sends a fake broker. SUBSCRIBEs are granted; everything else
+/// (PINGREQ among it) goes unanswered.
+async fn fake_next_publish(r: &mut FakeReader, w: &mut FakeWriter) -> Publish {
+    loop {
+        match r.next_packet().await {
+            Ok(Some(Packet::Publish(p))) => return p,
+            Ok(Some(Packet::Subscribe(s))) => {
+                w.send(&Packet::SubAck(SubAck {
+                    pkid: s.pkid,
+                    return_codes: vec![1; s.filters.len()],
+                    properties: Properties::new(),
+                }))
+                .await
+                .unwrap();
+            }
+            Ok(Some(_)) => {}
+            other => panic!("the fake broker's connection ended: {other:?}"),
+        }
+    }
+}
+
+/// #1103 finding 1: a `QoS` 1 forward written to the upstream but not yet acknowledged when the
+/// link drops is not lost. The bridge acknowledges the local cluster only on the upstream's
+/// PUBACK (Amendment 1 §1), so the local session resends it on the next connect.
+#[tokio::test]
+async fn a_forward_on_the_wire_when_the_upstream_drops_is_delivered_after_the_reconnect() {
+    let local = start_broker().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_addr = listener.local_addr().unwrap();
+    let bridge = Bridge::start(out_rule_config(local, up_addr, ""));
+
+    // The first upstream connection is a fake that takes the forwards and never answers them.
+    let (mut r, mut w) = accept_fake(&listener).await;
+    await_connected(&bridge, "local").await;
+    publish_acked(local, "wire-pub", "t/x", "f", 5).await;
+    for _ in 0..5 {
+        fake_next_publish(&mut r, &mut w).await;
+    }
+
+    // A real upstream takes over the address; then the fake link drops with all 5 unanswered.
+    let mut up_sub = broker_with_subscriber(listener, "wire-up-sub", "t/#").await;
+    drop(r);
+    drop(w);
+    let got = collect_n(&mut up_sub, "f", 5).await;
+    assert_eq!(distinct_in_order(&got), ["f1", "f2", "f3", "f4", "f5"]);
+
+    bridge.shutdown();
+}
+
+/// The local session outlives a bridge restart (Amendment 1 §1): the bridge now sends a
+/// Session Expiry Interval, so what is published while it is down waits for it. Before, MQTT 5
+/// read the missing interval as 0 and every message published during a restart was lost.
+#[tokio::test]
+async fn messages_published_while_the_bridge_restarts_cross_after_it() {
+    let local = start_broker().await;
+    let upstream = start_broker().await;
+    let mut up_sub = client(upstream, "restart-up-sub").await;
+    subscribe_qos1(&mut up_sub, "t/#").await;
+
+    let bridge = Bridge::start(out_rule_config(local, upstream, ""));
+    await_connected(&bridge, "local").await;
+    publish_acked(local, "restart-warm", "t/x", "w", 3).await;
+    collect_n(&mut up_sub, "w", 3).await;
+
+    bridge.shutdown(); // a restart: both connections close
+                       // SETTLE(bridge-restart-gap): the gap is the subject — the broker must see the bridge's
+                       // local session disconnect before the publishes, so they land in the stored session.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    publish_acked(local, "restart-gap", "t/x", "g", 5).await;
+
+    let bridge = Bridge::start(out_rule_config(local, upstream, ""));
+    let got = collect_n(&mut up_sub, "g", 5).await;
+    assert_eq!(distinct_in_order(&got), ["g1", "g2", "g3", "g4", "g5"]);
+
+    bridge.shutdown();
+}
+
+/// Amendment 1 §4: an upstream that vanishes without a reset is noticed by the keepalive, and
+/// what was on the wire to it is resent. Before, PINGRESPs were never checked, so such a link
+/// counted as up until TCP gave up, about 15 minutes with Linux defaults.
+#[tokio::test]
+async fn a_half_open_upstream_is_caught_by_the_keepalive() {
+    let local = start_broker().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_addr = listener.local_addr().unwrap();
+    let bridge = Bridge::start(out_rule_config(local, up_addr, "keep_alive_secs = 2"));
+
+    // The fake answers the CONNECT, takes three forwards, then goes silent with its socket
+    // still open: no PUBACK, no PINGRESP, no close.
+    let (mut r, mut w) = accept_fake(&listener).await;
+    await_connected(&bridge, "local").await;
+    publish_acked(local, "half-open-pub", "t/x", "h", 3).await;
+    for _ in 0..3 {
+        fake_next_publish(&mut r, &mut w).await;
+    }
+    let silent_since = tokio::time::Instant::now();
+
+    let mut up_sub = broker_with_subscriber(listener, "half-open-up-sub", "t/#").await;
+    let got = collect_n(&mut up_sub, "h", 3).await;
+    assert_eq!(distinct_in_order(&got), ["h1", "h2", "h3"]);
+    assert!(
+        silent_since.elapsed() < Duration::from_secs(15),
+        "a 2-second keepalive must notice the silent link within seconds, took {:?}",
+        silent_since.elapsed()
+    );
+
+    drop((r, w));
+    bridge.shutdown();
+}
+
+/// Amendment 1 §2: each upstream has its own local session, so one that is down does not
+/// stall another; its messages wait in its own session.
+#[tokio::test]
+async fn an_unreachable_upstream_does_not_stall_another() {
+    let local = start_broker().await;
+    let b = start_broker().await;
+    let mut b_sub = client(b, "iso-b-sub").await;
+    subscribe_qos1(&mut b_sub, "t/#").await;
+    let a_addr = reserve_addr().await;
+    let cfg = BridgeConfig::parse_toml(&format!(
+        r#"
+        share_group = ""
+        [local]
+        url = "{local}"
+        [[upstreams]]
+        name = "a"
+        url = "{a_addr}"
+        [[upstreams.rules]]
+        direction = "out"
+        filter = "t/#"
+        qos = 1
+        [[upstreams]]
+        name = "b"
+        url = "{b}"
+        [[upstreams.rules]]
+        direction = "out"
+        filter = "t/#"
+        qos = 1
+        "#
+    ))
+    .unwrap();
+    let bridge = Bridge::start(cfg);
+    await_local_session(&bridge, "local:a").await;
+    await_connected(&bridge, "local:b").await;
+
+    publish_acked(local, "iso-pub", "t/x", "i", 3).await;
+    let got = collect_n(&mut b_sub, "i", 3).await;
+    assert_eq!(
+        distinct_in_order(&got),
+        ["i1", "i2", "i3"],
+        "b must not wait for a"
+    );
+    assert!(!render_connected(&bridge, "local:a"));
+
+    let listener = TcpListener::bind(a_addr).await.unwrap();
+    let mut a_sub = broker_with_subscriber(listener, "iso-a-sub", "t/#").await;
+    let got = collect_n(&mut a_sub, "i", 3).await;
+    assert_eq!(
+        distinct_in_order(&got),
+        ["i1", "i2", "i3"],
+        "a's messages waited in its session"
+    );
+
+    bridge.shutdown();
+}
+
+/// Amendment 1 §5: a permanent refusal (0x87, not authorized) is acknowledged at the source,
+/// audited and counted, so it cannot block the link; a temporary one (0x97, quota exceeded)
+/// is published again. Both end acknowledged at the local cluster: when the link reconnects,
+/// its session gives back nothing.
+#[tokio::test]
+async fn refusals_are_dropped_or_retried_and_both_are_acknowledged_at_the_source() {
+    let local = start_broker().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_addr = listener.local_addr().unwrap();
+    let bridge = Bridge::start(out_rule_config(local, up_addr, ""));
+    let (mut r, mut w) = accept_fake(&listener).await;
+    await_connected(&bridge, "local").await;
+
+    publish_acked(local, "refuse-pub-1", "t/denied", "d", 1).await;
+    publish_acked(local, "refuse-pub-2", "t/busy", "b", 1).await;
+    publish_acked(local, "refuse-pub-3", "t/ok", "o", 1).await;
+    let mut busy_seen = 0;
+    let mut answered = 0;
+    while answered < 4 {
+        let p = fake_next_publish(&mut r, &mut w).await;
+        let reason = match p.topic.as_str() {
+            "t/denied" => 0x87,
+            "t/busy" => {
+                busy_seen += 1;
+                if busy_seen == 1 {
+                    0x97
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        };
+        w.send(&Packet::PubAck(Ack {
+            pkid: p.pkid.unwrap(),
+            reason,
+            properties: Properties::new(),
+        }))
+        .await
+        .unwrap();
+        answered += 1;
+    }
+    assert_eq!(
+        busy_seen, 2,
+        "the temporarily refused message is published again"
+    );
+    await_metrics(&bridge, "the refusal was never counted", |r| {
+        metric(r, r#"fss_bridge_dropped_total{reason="refused",side="up"}"#) == Some(1)
+    })
+    .await;
+
+    // Everything was acknowledged at the local cluster. The upstream drops, so the link leaves
+    // the local cluster (acknowledgements first, then the disconnect, on the one connection);
+    // when the upstream is back the link resumes the session, which has nothing to resend.
+    drop((r, w));
+    await_metrics(&bridge, "the link never left the local cluster", |r| {
+        metric(r, r#"fss_bridge_connected{side="local"}"#) == Some(0)
+    })
+    .await;
+    let (mut r2, mut w2) = accept_fake(&listener).await;
+    await_connected(&bridge, "local").await;
+    let leftover =
+        tokio::time::timeout(Duration::from_secs(2), fake_next_publish(&mut r2, &mut w2)).await;
+    assert!(
+        leftover.is_err(),
+        "a message came back from the local session, so it was never acknowledged: {leftover:?}"
+    );
+
+    bridge.shutdown();
+}
+
+/// Amendment 1 §7: messages from an upstream that are on their way to the local cluster when
+/// the local link drops go to the spool, and replay once it is back. Before, they were written,
+/// acknowledged to the upstream at dispatch, and lost.
+#[tokio::test]
+async fn inbound_messages_in_flight_when_the_local_link_drops_are_spooled_and_replayed() {
+    let upstream = start_broker().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    let cfg = BridgeConfig::parse_toml(&format!(
+        r#"
+        share_group = ""
+        [local]
+        url = "{local_addr}"
+        [spool]
+        allow_ephemeral_spool = true
+        [[upstreams]]
+        name = "partner"
+        url = "{upstream}"
+        [[upstreams.rules]]
+        direction = "in"
+        filter = "t/#"
+        qos = 1
+        "#
+    ))
+    .unwrap();
+    let bridge = Bridge::start(cfg);
+    // The first local connection is a fake that takes the forwards and never answers them.
+    let (mut r, mut w) = accept_fake(&listener).await;
+    await_connected(&bridge, "partner").await;
+    publish_acked(upstream, "in-wire-pub", "t/x", "n", 3).await;
+    for _ in 0..3 {
+        fake_next_publish(&mut r, &mut w).await;
+    }
+
+    let mut local_sub = broker_with_subscriber(listener, "in-wire-sub", "t/#").await;
+    drop(r);
+    drop(w);
+    let got = collect_n(&mut local_sub, "n", 3).await;
+    assert_eq!(distinct_in_order(&got), ["n1", "n2", "n3"]);
+
+    bridge.shutdown();
+}
+
+/// #1103 / Amendment 1 §7: a replay deletes a spooled message only once the local cluster
+/// acknowledges it. A bridge that stops in the middle of a replay loses nothing; before, the
+/// drain removed everything from disk first.
+#[tokio::test]
+async fn a_replay_cut_short_by_a_restart_loses_nothing() {
+    let upstream = start_broker().await;
+    let local_addr = reserve_addr().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = || {
+        BridgeConfig::parse_toml(&format!(
+            r#"
+            share_group = ""
+            [local]
+            url = "{local_addr}"
+            [spool]
+            dir = "{dir}"
+            [[upstreams]]
+            name = "partner"
+            url = "{upstream}"
+            [[upstreams.rules]]
+            direction = "in"
+            filter = "t/#"
+            qos = 1
+            "#,
+            dir = dir.path().display(),
+        ))
+        .unwrap()
+    };
+    let bridge = Bridge::start(cfg());
+    await_connected(&bridge, "partner").await;
+    publish_acked(upstream, "cut-pub", "t/x", "r", 3).await;
+    await_spool_depth(&bridge, "local", 3).await;
+
+    // The local cluster comes back as a fake that takes the replay and never acknowledges it;
+    // then the bridge stops.
+    let listener = TcpListener::bind(local_addr).await.unwrap();
+    let (mut r, mut w) = accept_fake(&listener).await;
+    for _ in 0..3 {
+        fake_next_publish(&mut r, &mut w).await;
+    }
+    bridge.shutdown();
+    drop((r, w));
+
+    let mut local_sub = broker_with_subscriber(listener, "cut-sub", "t/#").await;
+    let bridge = Bridge::start(cfg());
+    let got = collect_n(&mut local_sub, "r", 3).await;
+    assert_eq!(distinct_in_order(&got), ["r1", "r2", "r3"]);
+
+    bridge.shutdown();
+}
+
+/// Amendment 1 §8: spools an older bridge left behind are sent, not dropped — its spool for an
+/// upstream to that upstream, its shared spool for the local cluster to the local cluster.
+#[tokio::test]
+async fn spools_an_older_bridge_left_behind_are_drained() {
+    let dir = tempfile::tempdir().unwrap();
+    let message = |topic: &str, payload: &str| SpooledMessage {
+        topic: topic.into(),
+        payload: payload.as_bytes().to_vec(),
+        qos: 1,
+        retain: false,
+        user_properties: vec![("fss-bridge-hop-count".into(), "1".into())],
+    };
+    {
+        let out = Spool::on_disk(&dir.path().join("spool-upstream-0.redb"), 100).unwrap();
+        out.push(&message("o/legacy", "L-OUT")).unwrap();
+        let shared = Spool::on_disk(&dir.path().join("spool-local.redb"), 100).unwrap();
+        shared.push(&message("i/legacy", "L-IN")).unwrap();
+    }
+
+    let local = start_broker().await;
+    let mut local_sub = client(local, "legacy-local-sub").await;
+    subscribe_qos1(&mut local_sub, "i/#").await;
+    let upstream = start_broker().await;
+    let mut up_sub = client(upstream, "legacy-up-sub").await;
+    subscribe_qos1(&mut up_sub, "o/#").await;
+
+    let cfg = BridgeConfig::parse_toml(&format!(
+        r#"
+        share_group = ""
+        [local]
+        url = "{local}"
+        [spool]
+        dir = "{dir}"
+        [[upstreams]]
+        name = "partner"
+        url = "{upstream}"
+        [[upstreams.rules]]
+        direction = "out"
+        filter = "o/#"
+        qos = 1
+        [[upstreams.rules]]
+        direction = "in"
+        filter = "i/#"
+        qos = 1
+        "#,
+        dir = dir.path().display(),
+    ))
+    .unwrap();
+    let bridge = Bridge::start(cfg);
+    collect_n(&mut up_sub, "L-OUT", 1).await;
+    collect_n(&mut local_sub, "L-IN", 1).await;
+    // The upstream's old spool is empty once acknowledged, and the link went on to connect
+    // its local session.
+    await_connected(&bridge, "local").await;
+
+    bridge.shutdown();
+}
+
+/// Amendment 1 §1: a reconnect that finds the local session gone — here it expired while the
+/// upstream was down — is counted and audited, not silent.
+#[tokio::test]
+async fn a_local_session_found_gone_on_reconnect_is_counted() {
+    let local = start_broker().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_addr = listener.local_addr().unwrap();
+    let cfg = BridgeConfig::parse_toml(&format!(
+        r#"
+        share_group = ""
+        [local]
+        url = "{local}"
+        session_expiry_secs = 1
+        [spool]
+        allow_ephemeral_spool = true
+        [[upstreams]]
+        name = "up"
+        url = "{up_addr}"
+        [[upstreams.rules]]
+        direction = "out"
+        filter = "t/#"
+        qos = 1
+        "#
+    ))
+    .unwrap();
+    let bridge = Bridge::start(cfg);
+    let (r, w) = accept_fake(&listener).await;
+    await_connected(&bridge, "local").await;
+
+    // The upstream drops, so the link leaves the local cluster; the 1-second session expires.
+    drop((r, w));
+    // SETTLE(bridge-session-expiry): the expiry is the subject. The broker sweeps expired
+    // sessions every second, so three seconds is past a 1-second expiry with margin.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    serve_broker(listener);
+    await_metrics(&bridge, "the lost session was never counted", |r| {
+        metric(r, r#"fss_bridge_sessions_lost_total{side="local"}"#) == Some(1)
+    })
+    .await;
+
+    bridge.shutdown();
 }

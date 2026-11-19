@@ -198,15 +198,18 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `token::tests::wrong_audience_is_rejected_when_audience_is_configured`
 - `token::tests::wrong_issuer_is_rejected_when_issuer_is_configured`
 
-## `crates/mqtt-bridge/src/lib.rs` — 62 test(s)
+## `crates/mqtt-bridge/src/lib.rs` — 80 test(s)
 
+- `client::tests::a_share_subscription_never_sets_no_local`
 - `client::tests::bridge_subscriptions_set_no_local_and_retain_as_published`
 - `config::tests::a_both_rule_with_a_remap_is_rejected`
 - `config::tests::a_full_config_parses_rules_directions_and_remap`
 - `config::tests::a_minimal_config_parses_with_defaults`
-- `config::tests::a_qos1_rule_requires_a_durable_spool`
+- `config::tests::a_qos1_in_rule_requires_a_durable_spool`
+- `config::tests::a_qos1_out_rule_needs_a_lasting_local_session_but_no_spool`
 - `config::tests::a_reserved_dollar_rule_filter_is_rejected`
 - `config::tests::a_zero_hop_limit_is_rejected`
+- `config::tests::a_zero_keepalive_or_byte_bound_is_rejected`
 - `config::tests::an_invalid_rule_filter_is_rejected`
 - `config::tests::an_mtls_half_identity_is_rejected`
 - `config::tests::an_out_of_range_qos_is_rejected`
@@ -215,6 +218,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `config::tests::spool_max_bytes_parses_and_defaults_to_unbounded`
 - `config::tests::the_demo_config_parses`
 - `config::tests::valid_filters_pass_and_malformed_ones_fail`
+- `engine::default_id_tests::a_configured_local_id_names_the_upstream_only_when_there_are_several`
 - `engine::default_id_tests::a_fleet_of_pod_names_generates_no_duplicates`
 - `engine::default_id_tests::an_fqdn_keeps_the_pod_not_the_domain`
 - `engine::default_id_tests::any_host_name_yields_a_union_safe_id`
@@ -227,8 +231,11 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `forward::tests::a_local_message_forwards_out_with_remap_and_qos_downgrade`
 - `forward::tests::a_one_way_in_rule_never_forwards_out`
 - `forward::tests::a_one_way_out_rule_never_forwards_in`
+- `forward::tests::a_relay_path_is_reported_only_across_upstreams_and_after_the_remap`
 - `forward::tests::an_upstream_message_never_forwards_to_another_upstream`
 - `forward::tests::delivered_qos_downgrades_two_to_one`
+- `forward::tests::each_link_subscribes_for_its_own_upstream_under_its_own_share_group`
+- `forward::tests::filters_overlap_when_some_topic_matches_both`
 - `forward::tests::hop_count_reads_default_zero_and_increments_preserving_other_props`
 - `forward::tests::local_subscriptions_wrap_in_share_only_under_shared_ha`
 - `forward::tests::ownership_partitions_every_topic_to_exactly_one_instance`
@@ -237,12 +244,23 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `forward::tests::retain_crosses_by_default_and_the_escape_suppresses_it`
 - `forward::tests::subscriptions_follow_direction`
 - `forward::tests::the_hop_limit_drops_a_message_at_the_limit`
+- `link::tests::a_message_with_two_forwards_waits_for_both`
+- `link::tests::a_permanent_refusal_is_done_and_reported_and_a_temporary_one_waits_for_a_retry`
+- `link::tests::a_replay_is_sent_before_the_queue_and_removed_only_when_acknowledged`
+- `link::tests::a_resending_source_that_ends_leaves_no_acknowledgement_to_cross_connections`
+- `link::tests::acknowledgements_leave_in_arrival_order_whatever_order_the_destination_answers_in`
+- `link::tests::losing_the_destination_hands_back_unacknowledged_forwards_oldest_first`
+- `link::tests::orphaned_packet_ids_stay_in_use_until_the_destination_answers`
+- `link::tests::retry_delays_double_up_to_thirty_seconds`
+- `link::tests::the_destination_window_bounds_what_is_on_the_wire`
+- `link::tests::verdicts_follow_the_reason_code`
 - `metrics::tests::a_label_value_cannot_break_the_exposition_format`
 - `metrics::tests::a_spool_shedding_at_its_bound_is_counted_not_silent`
 - `metrics::tests::an_unregistered_upstream_cannot_create_unbounded_series`
 - `metrics::tests::connection_state_and_spool_depth_are_published`
 - `metrics::tests::counters_are_attributed_to_the_upstream_that_carried_them`
 - `metrics::tests::reconnects_are_per_side`
+- `metrics::tests::refusals_and_lost_sessions_are_counted_per_side`
 - `spool::tests::a_disk_spool_enforces_the_cap`
 - `spool::tests::a_disk_spool_survives_a_reopen_and_replays`
 - `spool::tests::a_foreign_schema_version_fails_closed`
@@ -271,21 +289,30 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `connect_refused_surfaces_as_an_error`
 - `the_client_connects_subscribes_and_round_trips_a_publish`
 
-## `crates/mqtt-bridge/tests/engine.rs` — 15 test(s)
+## `crates/mqtt-bridge/tests/engine.rs` — 24 test(s)
 
 - `a_bidirectional_pair_delivers_exactly_one_copy_per_side`
+- `a_forward_on_the_wire_when_the_upstream_drops_is_delivered_after_the_reconnect`
 - `a_full_spool_must_not_shed_a_message_the_bridge_already_accepted`
+- `a_half_open_upstream_is_caught_by_the_keepalive`
 - `a_live_retained_publish_crosses_the_boundary_retained`
 - `a_local_message_fans_out_to_multiple_upstreams`
+- `a_local_session_found_gone_on_reconnect_is_counted`
 - `a_message_spooled_while_its_side_connects_is_not_stranded_in_the_spool`
 - `a_no_remap_both_rule_loop_is_bounded_by_the_hop_limit`
 - `a_one_way_out_rule_forwards_to_the_upstream_and_never_leaks_back`
 - `a_remap_ping_pong_within_one_bridge_is_stopped_by_no_local`
+- `a_replay_cut_short_by_a_restart_loses_nothing`
 - `a_retained_message_crosses_the_boundary_and_lands_retained`
 - `a_retained_value_does_not_ping_pong_across_a_both_rule`
 - `a_three_broker_ring_is_terminated_by_the_hop_counter`
+- `an_unreachable_upstream_does_not_stall_another`
 - `hop_count_increments_along_a_chain`
-- `messages_spooled_while_an_upstream_is_down_replay_on_reconnect`
+- `inbound_messages_in_flight_when_the_local_link_drops_are_spooled_and_replayed`
+- `messages_published_while_an_upstream_is_down_wait_in_the_local_session`
+- `messages_published_while_the_bridge_restarts_cross_after_it`
+- `refusals_are_dropped_or_retried_and_both_are_acknowledged_at_the_source`
+- `spools_an_older_bridge_left_behind_are_drained`
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 

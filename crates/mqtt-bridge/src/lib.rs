@@ -9,12 +9,18 @@
 //!
 //! Layers:
 //! - [`client`] — a minimal async MQTT client (TCP/TLS) over `mqtt-codec`/`mqtt-net`.
-//! - the config model, forwarding engine, spool, and observability land in their own
-//!   modules as the delivery tasks (0025-T2…T9) complete.
+//! - [`config`] — the configuration model and its validation.
+//! - [`forward`] — the pure forwarding policy: direction, remap, loop bounding.
+//! - [`engine`] — builds one link per upstream from the configuration; each link owns its
+//!   local session and its upstream connection and moves messages both ways
+//!   ([ADR 0060](../../../docs/adr/0060-bridge-durability-and-ack-contract.md) Amendment 1).
+//! - [`spool`] — the bounded store-and-forward spool for traffic coming in from an upstream.
+//! - [`metrics`] — Prometheus text and the audit log.
 
 pub mod client;
 pub mod config;
 pub mod engine;
 pub mod forward;
+mod link;
 pub mod metrics;
 pub mod spool;

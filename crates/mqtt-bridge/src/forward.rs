@@ -232,6 +232,140 @@ pub fn upstream_subscriptions(cfg: &BridgeConfig, i: usize) -> Vec<(String, u8)>
     subs
 }
 
+/// The `$share` group upstream `i`'s link subscribes under (ADR 0060 Amendment 1 §2): the
+/// configured group when there is one upstream, and `<group>.<upstream name>` when there are
+/// several, so each link is its own group — one shared group across links would deal each
+/// message to only one of them. The characters MQTT forbids in a share name (`/`, `+`, `#`,
+/// [MQTT-4.8.2-2]) become `_`.
+#[must_use]
+pub fn share_group_for(cfg: &BridgeConfig, i: usize) -> String {
+    if cfg.upstreams.len() <= 1 {
+        return cfg.share_group.clone();
+    }
+    let name = cfg.upstreams.get(i).map_or("", |u| u.name.as_str());
+    let clean: String = name
+        .chars()
+        .map(|c| if matches!(c, '/' | '+' | '#') { '_' } else { c })
+        .collect();
+    format!("{}.{clean}", cfg.share_group)
+}
+
+/// The filters **upstream `i`'s link** subscribes to on its local session: that upstream's
+/// `out`/`both` rule filters, `$share`-wrapped under `ha = "shared"` with
+/// [`share_group_for`]. A link never subscribes for another upstream's rules, so an
+/// unreachable upstream stops only its own traffic (ADR 0060 Amendment 1 §2).
+#[must_use]
+pub fn link_local_subscriptions(cfg: &BridgeConfig, i: usize) -> Vec<(String, u8)> {
+    let use_share = cfg.ha == HaMode::Shared && !cfg.share_group.is_empty();
+    let group = share_group_for(cfg, i);
+    let Some(up) = cfg.upstreams.get(i) else {
+        return Vec::new();
+    };
+    up.rules
+        .iter()
+        .filter(|rule| rule.direction.allows_out())
+        .map(|rule| {
+            let filter = if use_share {
+                format!("$share/{group}/{}", rule.filter)
+            } else {
+                rule.filter.clone()
+            };
+            (filter, delivered_qos(rule.qos))
+        })
+        .collect()
+}
+
+/// Whether some topic matches both filters `a` and `b`. Neither may be a `$`-filter (rule
+/// validation refuses those), so the `$`-topic exception to leading wildcards never applies.
+#[must_use]
+pub fn filters_overlap(a: &str, b: &str) -> bool {
+    fn go(a: &[&str], b: &[&str]) -> bool {
+        match (a.first(), b.first()) {
+            // `#` matches the rest, including nothing at all (`x/#` matches `x`).
+            (Some(&"#"), _) | (_, Some(&"#")) | (None, None) => true,
+            (None, Some(_)) | (Some(_), None) => false,
+            (Some(x), Some(y)) => (*x == "+" || *y == "+" || x == y) && go(&a[1..], &b[1..]),
+        }
+    }
+    let a: Vec<&str> = a.split('/').collect();
+    let b: Vec<&str> = b.split('/').collect();
+    go(&a, &b)
+}
+
+/// The local topics a rule with `filter` and `remap` can produce, as filters. Exact when
+/// `strip_prefix` is absent or the filter starts with it literally; otherwise it also
+/// includes `#` after the prefix, an over-approximation that can only make
+/// [`relay_paths`] report a pair that cannot actually relay.
+fn remapped_filters(filter: &str, remap: Option<&Remap>) -> Vec<String> {
+    let Some(remap) = remap else {
+        return vec![filter.to_string()];
+    };
+    let prefix = remap.prefix.as_deref().unwrap_or("");
+    let mut out = Vec::new();
+    match remap.strip_prefix.as_deref() {
+        Some(sp) if filter.starts_with(sp) => {
+            out.push(format!("{prefix}{}", &filter[sp.len()..]));
+        }
+        Some(sp) => {
+            out.push(format!("{prefix}{filter}"));
+            // A wildcard can still match topics that start with the stripped prefix.
+            let literal_head = filter.split(['+', '#']).next().unwrap_or("");
+            if sp.starts_with(literal_head) || literal_head.starts_with(sp) {
+                out.push(format!("{prefix}#"));
+            }
+        }
+        None => out.push(format!("{prefix}{filter}")),
+    }
+    out.retain(|f| !f.is_empty());
+    out
+}
+
+/// One way a message the bridge brings in from one upstream can be forwarded out to another
+/// (ADR 0060 Amendment 1 §2): `from`'s `in`/`both` rule `from_filter` lands messages on
+/// local topics that `to`'s `out`/`both` rule `to_filter` matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayPath {
+    /// The upstream the message comes in from.
+    pub from: String,
+    /// That upstream's rule filter.
+    pub from_filter: String,
+    /// The upstream it can be forwarded to.
+    pub to: String,
+    /// That upstream's rule filter.
+    pub to_filter: String,
+}
+
+/// Every pair of rules on different upstreams through which a message brought in from one
+/// can be forwarded out to the other. With one local session per upstream the bridge does
+/// forward along these (a message brought in is an ordinary local message to the other
+/// links), where one local connection with No Local used to keep it from doing so; the engine
+/// warns about each at startup.
+#[must_use]
+pub fn relay_paths(cfg: &BridgeConfig) -> Vec<RelayPath> {
+    let mut out = Vec::new();
+    for (i, from) in cfg.upstreams.iter().enumerate() {
+        for rin in from.rules.iter().filter(|r| r.direction.allows_in()) {
+            let landed = remapped_filters(&rin.filter, rin.remap.as_ref());
+            for (j, to) in cfg.upstreams.iter().enumerate() {
+                if i == j {
+                    continue; // one link: No Local still applies on its own session
+                }
+                for rout in to.rules.iter().filter(|r| r.direction.allows_out()) {
+                    if landed.iter().any(|f| filters_overlap(f, &rout.filter)) {
+                        out.push(RelayPath {
+                            from: from.name.clone(),
+                            from_filter: rin.filter.clone(),
+                            to: to.name.clone(),
+                            to_filter: rout.filter.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,6 +578,125 @@ mod tests {
         assert!(plan_forwards(&c, Side::Local, "shared/x", 3).is_empty());
         // Above the limit: dropped.
         assert!(plan_forwards(&c, Side::Local, "shared/x", 9).is_empty());
+    }
+
+    #[test]
+    fn filters_overlap_when_some_topic_matches_both() {
+        for (a, b) in [
+            ("a/b", "a/b"),
+            ("a/+", "a/b"),
+            ("+/b", "a/+"),
+            ("a/#", "a"),
+            ("a/#", "a/b/c"),
+            ("#", "x/y"),
+            ("+/+/c", "a/#"),
+        ] {
+            assert!(filters_overlap(a, b), "{a} and {b} overlap");
+            assert!(filters_overlap(b, a), "{b} and {a} overlap");
+        }
+        for (a, b) in [
+            ("a/b", "a/c"),
+            ("a/+", "a/b/c"),
+            ("a", "a/b"),
+            ("+", "a/b"),
+            ("x/#", "y/#"),
+        ] {
+            assert!(!filters_overlap(a, b), "{a} and {b} do not overlap");
+            assert!(!filters_overlap(b, a), "{b} and {a} do not overlap");
+        }
+    }
+
+    #[test]
+    fn a_relay_path_is_reported_only_across_upstreams_and_after_the_remap() {
+        let c = cfg(r#"
+            share_group = ""
+            [local]
+            url = "local:1883"
+            [[upstreams]]
+            name = "a"
+            url = "a:1883"
+            [[upstreams.rules]]
+            direction = "in"
+            filter = "sensors/#"
+            [[upstreams.rules]]
+            direction = "in"
+            filter = "alarms/#"
+            remap = { prefix = "partner-a/" }
+            [[upstreams]]
+            name = "b"
+            url = "b:1883"
+            [[upstreams.rules]]
+            direction = "out"
+            filter = "sensors/temp/+"
+            [[upstreams.rules]]
+            direction = "out"
+            filter = "alarms/#"
+            [[upstreams.rules]]
+            direction = "both"
+            filter = "x/#"
+        "#);
+        // a's sensors land on local sensors/#, which b's out rule matches. a's alarms land on
+        // partner-a/alarms/#, which b's alarms/# does not match, and b's own `both` rule is
+        // on b's link, where No Local applies.
+        assert_eq!(
+            relay_paths(&c),
+            vec![RelayPath {
+                from: "a".into(),
+                from_filter: "sensors/#".into(),
+                to: "b".into(),
+                to_filter: "sensors/temp/+".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn each_link_subscribes_for_its_own_upstream_under_its_own_share_group() {
+        let c = cfg(r#"
+            ha = "shared"
+            share_group = "g"
+            [local]
+            url = "local:1883"
+            [[upstreams]]
+            name = "a/1"
+            url = "a:1883"
+            [[upstreams.rules]]
+            direction = "out"
+            filter = "t/#"
+            [[upstreams]]
+            name = "b"
+            url = "b:1883"
+            [[upstreams.rules]]
+            direction = "out"
+            filter = "t/#"
+            [[upstreams.rules]]
+            direction = "in"
+            filter = "c/#"
+        "#);
+        assert_eq!(
+            link_local_subscriptions(&c, 0),
+            vec![("$share/g.a_1/t/#".to_string(), 0)]
+        );
+        assert_eq!(
+            link_local_subscriptions(&c, 1),
+            vec![("$share/g.b/t/#".to_string(), 0)]
+        );
+        // One upstream keeps the configured group unchanged.
+        let one = cfg(r#"
+            ha = "shared"
+            share_group = "g"
+            [local]
+            url = "local:1883"
+            [[upstreams]]
+            name = "a"
+            url = "a:1883"
+            [[upstreams.rules]]
+            direction = "out"
+            filter = "t/#"
+        "#);
+        assert_eq!(
+            link_local_subscriptions(&one, 0),
+            vec![("$share/g/t/#".to_string(), 0)]
+        );
     }
 
     #[test]
