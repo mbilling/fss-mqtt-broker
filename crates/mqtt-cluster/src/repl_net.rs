@@ -49,7 +49,7 @@ use tokio::sync::{mpsc, oneshot};
 /// unreachable) and its in-flight entry is reaped. `fail_node` still handles the
 /// common case (a link that actually drops) faster; this is the backstop for a link
 /// that stays up but stops answering.
-const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The record-byte budget of one page of a paged recovery read (#758): well under
 /// [`crate::peer::MAX_FRAME`] with room for the entries' framing, and small enough

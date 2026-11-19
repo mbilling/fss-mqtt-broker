@@ -640,7 +640,9 @@ impl<S: LeaseSource, T: ReplicaTransport + Clone + 'static> GroupRoutedLog<S, T>
     /// joiners — replicas that entered the set mid-history and hold entries above a
     /// hole — could silently truncate the history none of them received. When every
     /// replica has answered and the complete copies still fall short of a quorum, the
-    /// merge rests on the complete copies there are.
+    /// merge rests on the complete copies there are. A replica whose link is up but
+    /// which never answers has answered only when its read times out (the transport's
+    /// RPC timeout, 5 s by default), so it holds such a read that long.
     async fn recover_key(
         &self,
         key: &str,
@@ -2502,6 +2504,102 @@ mod tests {
             after.claim_session(&client, "alice").await.unwrap(),
             SessionClaim::Granted { present: true },
             "the resume finds the session f2 holds"
+        );
+        assert_eq!(
+            after.subscriptions(&client).await.unwrap().len(),
+            1,
+            "and its subscription"
+        );
+    }
+
+    /// The fall-through of the read above: the lease has moved to a joiner, f1 holds the
+    /// whole history, and f2 is wedged, its link up but never answering. The joiner's own
+    /// copy vouches for nothing, so f1 alone is short of a quorum of vouching copies, and
+    /// the read waits for f2 until the RPC timeout gives up on it. With every replica
+    /// reported, the merge rests on f1, the one complete copy, and the resume finds the
+    /// session. The wait is what not trusting the joiner's copy costs while a replica is
+    /// wedged; the clock is paused, so the test does not pay it.
+    #[tokio::test(start_paused = true)]
+    async fn a_joiner_recovers_from_one_complete_copy_after_a_wedged_peer_times_out() {
+        use mqtt_storage::SessionClaim;
+        let owner = nid("owner");
+        // A 3-node ring (R=3, quorum=2): owner + two followers.
+        let mut p = Placement::new(owner.clone(), DEFAULT_REPLICAS);
+        p.observe(&nid("f1"), MemberState::Alive, "f1:7000", None);
+        p.observe(&nid("f2"), MemberState::Alive, "f2:7000", None);
+        let placement = Arc::new(RwLock::new(p));
+        let (_group, client) = owned_group_and_client(&placement.read().unwrap());
+        let mkey = format!("m/{}", client.0);
+        let subscription = mqtt_core::Subscription {
+            filter: "plant/#".into(),
+            max_qos: QoS::AtLeastOnce,
+            no_local: false,
+            sub_id: None,
+        };
+
+        // Before the move, at epoch 3: the session and its subscription reach every copy.
+        let f1_state = Arc::new(Mutex::new(ReplicaState::new()));
+        {
+            let transport = Arc::new(PeerReplicaTransport::new());
+            for (node, state) in [
+                (nid("f1"), f1_state.clone()),
+                (nid("f2"), Arc::new(Mutex::new(ReplicaState::new()))),
+            ] {
+                let (tx, rx) = mpsc::unbounded_channel();
+                transport.register(node, tx);
+                spawn_follower(transport.clone(), state, rx);
+            }
+            let before = ReplicatedSessionStore::new(GroupRoutedLog::new(
+                owner.clone(),
+                placement.clone(),
+                transport,
+                FixedLease(3),
+                Arc::new(Mutex::new(ReplicaState::new())),
+            ));
+            assert_eq!(
+                before.claim_session(&client, "alice").await.unwrap(),
+                SessionClaim::Granted { present: false }
+            );
+            before
+                .set_subscriptions(&client, std::slice::from_ref(&subscription))
+                .await
+                .unwrap();
+        }
+        {
+            let f1 = f1_state.lock().unwrap();
+            assert!(
+                f1.complete(&mkey) && f1.entries(&mkey).len() == 1,
+                "f1 holds the session record, gap-free"
+            );
+        }
+
+        // After the move, at epoch 7. f1 answers. f2's link is registered and nothing
+        // ever reads it, so every request to f2 waits for a reply that never comes.
+        let transport = Arc::new(PeerReplicaTransport::new());
+        let (f1_tx, f1_rx) = mpsc::unbounded_channel();
+        transport.register(nid("f1"), f1_tx);
+        spawn_follower(transport.clone(), f1_state, f1_rx);
+        let (f2_tx, _f2_wedged) = mpsc::unbounded_channel();
+        transport.register(nid("f2"), f2_tx);
+        // The new owner's own copy: empty and never stamped current, a joiner's.
+        let after = ReplicatedSessionStore::new(GroupRoutedLog::new(
+            owner.clone(),
+            placement.clone(),
+            transport,
+            FixedLease(7),
+            Arc::new(Mutex::new(ReplicaState::new())),
+        ));
+
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            after.claim_session(&client, "alice").await.unwrap(),
+            SessionClaim::Granted { present: true },
+            "the resume finds the session f1 holds"
+        );
+        assert!(
+            started.elapsed() >= crate::repl_net::DEFAULT_RPC_TIMEOUT,
+            "the read gave up on f2 only at the RPC timeout, after {:?}",
+            started.elapsed()
         );
         assert_eq!(
             after.subscriptions(&client).await.unwrap().len(),

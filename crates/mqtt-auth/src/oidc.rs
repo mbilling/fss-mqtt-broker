@@ -370,6 +370,79 @@ mod tests {
         }
     }
 
+    /// An access token shaped like a real identity provider's (Keycloak's): `aud` is an
+    /// array that names this broker beside another client, and the provider's own claims
+    /// ride along. The array form authenticates; an array that does not name the broker is
+    /// refused.
+    #[tokio::test]
+    async fn an_idp_shaped_token_with_an_audience_array_authenticates() {
+        let (a, _rx) = authenticator();
+        a.install_jwks(JWKS).unwrap();
+        let issued = exp() - 600;
+        let token = mint(
+            "t1",
+            &json!({
+                "exp": exp(), "iat": issued, "auth_time": issued,
+                "jti": "0d6f3a51-4b7e-4c55-9a51-6c1f0e2b9d7e",
+                "iss": ISSUER, "aud": [AUD, "account"], "sub": "device-7",
+                "typ": "Bearer", "azp": "plant-gateway", "acr": "1",
+                "realm_access": {"roles": ["offline_access", "uma_authorization"]},
+                "scope": "openid profile", "email_verified": false,
+                "preferred_username": "device-7", "groups": ["sensors"],
+            }),
+        );
+        let id = auth(&a, &token).await.unwrap();
+        assert_eq!(id.subject, "device-7");
+        assert_eq!(id.groups, vec!["sensors".to_string()]);
+
+        let elsewhere = mint(
+            "t1",
+            &json!({"sub":"device-7","iss":ISSUER,"aud":["account","other"],"exp":exp()}),
+        );
+        assert!(matches!(
+            auth(&a, &elsewhere).await.unwrap_err(),
+            AuthError::Rejected
+        ));
+    }
+
+    /// An `iss`, `aud` or `sub` of the wrong type is refused, whatever the signature.
+    #[tokio::test]
+    async fn claims_of_the_wrong_type_are_rejected() {
+        let (a, _rx) = authenticator();
+        a.install_jwks(JWKS).unwrap();
+        for claims in [
+            json!({"sub":"d","iss":ISSUER,"aud":1234,"exp":exp()}),
+            json!({"sub":"d","iss":ISSUER,"aud":{"aud":AUD},"exp":exp()}),
+            json!({"sub":"d","iss":1234,"aud":AUD,"exp":exp()}),
+            json!({"sub":42,"iss":ISSUER,"aud":AUD,"exp":exp()}),
+        ] {
+            assert!(
+                matches!(
+                    auth(&a, &mint("t1", &claims)).await.unwrap_err(),
+                    AuthError::Rejected
+                ),
+                "{claims}"
+            );
+        }
+    }
+
+    /// A header that lists a critical extension the verifier does not implement
+    /// (RFC 7515 §4.1.11) is refused even though the signature checks out.
+    #[tokio::test]
+    async fn a_token_naming_an_unknown_critical_extension_is_rejected() {
+        let (a, _rx) = authenticator();
+        a.install_jwks(JWKS).unwrap();
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("t1".to_string());
+        header.crit = Some(vec!["urn:example:must-understand".to_string()]);
+        let key = EncodingKey::from_rsa_pem(PRIVATE_PEM).unwrap();
+        let token = jsonwebtoken::encode(&header, &good_claims(), &key).unwrap();
+        assert!(matches!(
+            auth(&a, &token).await.unwrap_err(),
+            AuthError::Rejected
+        ));
+    }
+
     #[tokio::test]
     async fn an_unknown_kid_rejects_and_hints_exactly_one_refresh() {
         let (a, rx) = authenticator();

@@ -317,6 +317,9 @@ impl Default for Security {
 pub struct Jwt {
     /// Path to a file holding the HS256 shared secret (`MQTTD_JWT_HS256_SECRET_FILE`, ADR 0046
     /// T5): secret-by-reference, so the HMAC key is mounted from a Secret, never inlined.
+    /// Whitespace around the secret is trimmed. A file that is empty after trimming is
+    /// refused, since an empty HMAC key would let anyone sign a token: the broker does not
+    /// start, `--check-config --preflight` fails, and a reload keeps the running verifier.
     pub hs256_secret_file: Option<String>,
     /// RS256 public-key PEM (`MQTTD_JWT_RS256_PEM`).
     pub rs256_pem_file: Option<String>,
