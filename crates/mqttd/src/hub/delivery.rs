@@ -600,6 +600,7 @@ impl Hub {
     /// on the one path that hands the message to nobody: the recipient is not
     /// connected and has no session here to queue for.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)] // one decision per delivery path; the replay arm made it 101
     fn deliver_to_client_noting(
         &mut self,
         client: &ClientId,
@@ -727,6 +728,9 @@ impl Hub {
                     // (the caller withholds the publisher's ack so it retries).
                     Submitted::Full => DurableOutcome::Failed,
                 };
+            }
+            if persistent && self.replays.contains_key(client) {
+                return self.write_behind_replay(client, &message, message_expiry, gate);
             }
             // No append owed (`QoS` 0, or a clean session). If earlier appends for
             // this SAME client are still in flight, a direct send would overtake
@@ -2269,6 +2273,29 @@ impl Hub {
         }
     }
 
+    /// While a replay is still reading `client`'s queue (issue #1235), a live delivery to
+    /// the persistent session is written, `QoS` 0 included, exactly as for an offline
+    /// session, so the replay reaches it in the queue's order instead of it going out
+    /// ahead of older queued messages.
+    fn write_behind_replay(
+        &mut self,
+        client: &ClientId,
+        message: &Message,
+        message_expiry: Option<u32>,
+        gate: &AppendGate,
+    ) -> DurableOutcome {
+        let (qos, answerable) = (message.qos, gate.answerable());
+        let conn = self.online.get(client).map(|o| o.conn_id);
+        match self.submit_append(client, message, message_expiry, gate, conn) {
+            Submitted::Queued => DurableOutcome::Ok,
+            // At-most-once owes no redelivery, and an unanswerable refusal has nobody to
+            // tell: both are counted drops, as on the offline branch.
+            Submitted::Refused(_) if qos == QoS::AtMostOnce || !answerable => DurableOutcome::Ok,
+            Submitted::Refused(r) => DurableOutcome::Refused(r),
+            Submitted::Full => DurableOutcome::Failed,
+        }
+    }
+
     /// Drain backlogged `QoS` > 0 messages onto the wire while the client is online and
     /// quota is available (ADR 0012). Called after a PUBACK/PUBCOMP frees a slot, and
     /// by the two off-loop completions that re-open their gates (issue #242 finding A:
@@ -2291,6 +2318,10 @@ impl Hub {
             .get(client)
             .is_none_or(|inf| inf.backlog.is_empty())
         {
+            // An empty backlog is room for a replay's next page (#1235).
+            if !self.replays.is_empty() {
+                self.read_next_replay_page(client);
+            }
             return;
         }
         let Some(tx) = self.online.get(client).map(|s| s.tx.clone()) else {
@@ -2333,6 +2364,10 @@ impl Hub {
                 // refused.
                 QosSend::Staged | QosSend::Deferred => break,
             }
+        }
+        // The backlog may have emptied: room for a replay's next page (#1235).
+        if !self.replays.is_empty() {
+            self.read_next_replay_page(client);
         }
     }
 

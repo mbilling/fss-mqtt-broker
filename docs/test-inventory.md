@@ -1597,7 +1597,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 929 test(s)
+## `crates/mqttd/src/lib.rs` — 933 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1916,6 +1916,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_completed_qos2_delivery_does_not_replay_when_the_truncate_lands`
 - `hub::tests::a_congested_relaxed_forward_is_answered_at_append_completion`
 - `hub::tests::a_congested_relaxed_publish_waits_for_its_append`
+- `hub::tests::a_connection_lost_mid_replay_loses_nothing`
 - `hub::tests::a_control_command_is_reached_ahead_of_a_deep_data_backlog`
 - `hub::tests::a_crashed_hub_releases_the_store_so_the_node_can_restart`
 - `hub::tests::a_cross_node_shared_delivery_is_answered_and_reselects_before_refusing`
@@ -1982,6 +1983,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_pubcomp_for_a_staged_unsent_id_is_ignored`
 - `hub::tests::a_publish_already_stored_is_withheld_not_refused_when_a_later_pass_is_refused`
 - `hub::tests::a_publish_owing_no_durability_is_still_acked_under_brownout`
+- `hub::tests::a_qos0_delivery_during_a_replay_arrives_behind_the_queue`
 - `hub::tests::a_qos0_passthrough_completion_does_not_overtake_a_staged_record`
 - `hub::tests::a_qos0_send_behind_a_busy_lane_does_not_overtake_the_pending_qos1_delivery`
 - `hub::tests::a_qos1_delivery_records_no_outbound_id`
@@ -1989,6 +1991,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_qos2_packet_reaches_the_wire_only_after_its_outbound_id_is_durable`
 - `hub::tests::a_reaped_session_still_honours_the_real_detach_graceful_flag_for_its_will`
 - `hub::tests::a_reconnect_mid_record_never_sends_to_the_new_connection`
+- `hub::tests::a_reconnect_replays_a_queue_longer_than_one_page`
 - `hub::tests::a_recreated_topic_leaves_the_discharge_clock`
 - `hub::tests::a_refused_durable_recovery_is_counted`
 - `hub::tests::a_refused_shared_publish_does_not_consume_the_groups_round_robin_turn`
@@ -1999,6 +2002,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::a_remote_retained_commit_is_committed_by_the_owner`
 - `hub::tests::a_remote_retained_update_applies_monotonically_per_topic`
 - `hub::tests::a_reopened_cache_holding_a_value_the_cluster_cleared_drops_it`
+- `hub::tests::a_replay_ceiling_caps_the_truncation_point`
 - `hub::tests::a_restart_after_pubrec_resumes_with_pubrel_under_the_original_id`
 - `hub::tests::a_restart_before_pubrec_republishes_dup_under_the_original_id`
 - `hub::tests::a_restarted_owners_snapshot_exports_committed_tokens_and_readopts_the_record`
@@ -2115,6 +2119,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::inherited_session_expiry_is_swept_after_takeover`
 - `hub::tests::interest_snapshots_follow_subscription_changes`
 - `hub::tests::live_delivery_carries_message_expiry_interval`
+- `hub::tests::live_traffic_waits_behind_a_long_replay_and_the_tail_is_not_lost`
 - `hub::tests::message_events::a_backlog_eviction_is_noted_for_the_subscriber_s_connection`
 - `hub::tests::message_events::a_delivery_carries_its_origin_only_while_a_delivery_event_is_selected`
 - `hub::tests::message_events::a_forward_that_reaches_nobody_is_dropped_on_the_receiving_node`
@@ -2175,7 +2180,6 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::remote_group_index::remote_group_index_keeps_hot_and_cold_candidate_order_and_qos`
 - `hub::tests::remote_group_index::remote_group_index_rebuilds_on_replacement_disconnect_and_death`
 - `hub::tests::remote_group_index::remote_group_index_skips_only_the_exact_local_group_and_filter`
-- `hub::tests::replay_is_bounded_and_resumes_on_next_connect`
 - `hub::tests::replayed_message_forwards_remaining_expiry_interval`
 - `hub::tests::retain_as_published_preserves_the_retain_flag_only_for_rap_subscribers`
 - `hub::tests::retain_handling_controls_the_replay_at_subscribe`

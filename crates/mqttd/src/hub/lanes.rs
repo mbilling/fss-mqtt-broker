@@ -181,6 +181,20 @@ pub enum LaneJob {
         /// Frozen store work.
         op: Qos2LaneOp,
     },
+    /// The next page of a resume replay (issue #1235): `pending(after, limit)`, run as a
+    /// barrier, so it sees every append admitted before it and its result is posted
+    /// after their completions and before any later one's. A control job, like
+    /// [`LaneJob::Qos2Op`]. Posts [`HubCommand::ReplayPageDone`].
+    ReplayPage {
+        /// The session being replayed (the lane key).
+        client: ClientId,
+        /// The connection the replay delivers to, echoed back.
+        conn_id: u64,
+        /// Read entries with offsets strictly greater than this.
+        after: Offset,
+        /// At most this many.
+        limit: usize,
+    },
 }
 
 /// One session's append lane: a bounded FIFO queue to a dedicated worker task. Keyed
@@ -648,6 +662,19 @@ async fn run_barrier_job(
             let outcome = exec_qos2_lane_op(store, &client, op).await;
             let _ = self_tx.send(HubCommand::Qos2OpDone { client, outcome });
         }
+        LaneJob::ReplayPage {
+            client,
+            conn_id,
+            after,
+            limit,
+        } => {
+            let result = store.pending(&client, after, limit).await;
+            let _ = self_tx.send(HubCommand::ReplayPageDone {
+                client,
+                conn_id,
+                result,
+            });
+        }
         LaneJob::Deliver(_) => unreachable!("Deliver jobs are handled by the worker"),
     }
 }
@@ -1079,6 +1106,10 @@ impl Hub {
             && match outcome {
                 // Held (#784): already queued here, the attach replay's to deliver.
                 LaneOutcome::Failed | LaneOutcome::Held => false,
+                // A replay is still reading this session's queue (#1235): the stored
+                // copy is the replay's to deliver, in the queue's order. Sending it now
+                // would overtake older queued messages and arrive twice.
+                LaneOutcome::Stored(_) if self.replays.contains_key(&job.client) => false,
                 // No durable copy exists (queue-cap drop) or none was owed
                 // (passthrough): the live send is delivery itself, valid only for
                 // the exact planned connection.

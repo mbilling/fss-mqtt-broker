@@ -264,6 +264,7 @@ impl HubCommand {
             | Self::Detach { client, .. }
             | Self::Evict { client, .. }
             | Self::Qos2OpDone { client, .. }
+            | Self::ReplayPageDone { client, .. }
             | Self::PkidBlockReserved { client, .. }
             | Self::RemoteSharedDeliver { client, .. }
             | Self::RemoteSharedDeliverAcked { client, .. } => Route::Client(client),

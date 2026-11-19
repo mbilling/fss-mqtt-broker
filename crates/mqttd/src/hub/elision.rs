@@ -161,6 +161,9 @@ impl Hub {
             || self.brownout
             || self.draining
             || self.connecting.contains_key(client)
+            // A replay still reading the session's queue (#1235) delivers in the queue's
+            // order, so a live message must be written for it to reach, not held.
+            || self.replays.contains_key(client)
             // A takeover window, not every scan: the periodic reconcile leaves
             // elision on (Amendment 2, see `takeover_window_open`).
             || self.takeover_window_open()
@@ -696,6 +699,11 @@ impl Hub {
         if same {
             if let Some(p) = inf.pending.get_mut(&pkid) {
                 p.offset = Some(offset);
+            }
+            // A replay still reading the queue (#1235) will come to this offset: it is
+            // on the wire already, under `pkid`, and must not be sent again.
+            if let Some(cursor) = self.replays.get_mut(client) {
+                cursor.state.resumed_offsets.insert(offset);
             }
         } else {
             // Acknowledged already (or the session moved on): nothing is owed for it.
