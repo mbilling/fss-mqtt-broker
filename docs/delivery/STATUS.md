@@ -67,7 +67,7 @@
 | [0057](../adr/0057-durable-outbound-inflight.md) | Durable outbound in-flight state: exactly-once across a broker crash | Proposed | [8/8 done](0057-durable-outbound-inflight.md) | — |
 | [0058](../adr/0058-one-dot-zero-stability-contract.md) | The 1.0 stability contract: upgrade-in-place, never wipe-and-rejoin | Proposed | [5/5 done](0058-one-dot-zero-stability-contract.md) | — |
 | [0059](../adr/0059-bridge-ha-topology-and-ordering.md) | Bridge HA topology and message ordering | Proposed | [5/6 done](0059-bridge-ha-topology-and-ordering.md) | 1 deferred |
-| [0060](../adr/0060-bridge-durability-and-ack-contract.md) | Bridge durability and acknowledgement contract | Proposed | [7/8 done](0060-bridge-durability-and-ack-contract.md) | 1 deferred |
+| [0060](../adr/0060-bridge-durability-and-ack-contract.md) | Bridge durability and acknowledgement contract | Proposed | [7/9 done](0060-bridge-durability-and-ack-contract.md) | 1 open, 1 deferred |
 | [0061](../adr/0061-off-loop-durable-appends.md) | Off-loop durable appends: per-session lanes for the publish path | Accepted | [6/6 done](0061-off-loop-durable-appends.md) | — |
 | [0062](../adr/0062-online-backup-and-restore.md) | Online backup and restore: a per-node export with a stated window | Accepted | [11/11 done](0062-online-backup-and-restore.md) | — |
 | [0063](../adr/0063-external-consumer-integration.md) | External integration without a rule engine: the consumer-group pattern | Accepted | [3/3 done](0063-external-consumer-integration.md) | — |
@@ -196,7 +196,8 @@
 
 **0060 — Bridge durability and acknowledgement contract**
 
-- `0060-T8` 💤 deferred ([#552](https://github.com/mbilling/fss-mqtt-broker/issues/552)): "Fast path waits for the downstream PUBACK: correlate the destination's pkid back to the source obligation, closing the dispatch->ack window (ADR 0060 §5.1-5.2)" — "Deferred 2026-10-02: issue #552 closed; was planned."
+- `0060-T8` 💤 deferred ([#552](https://github.com/mbilling/fss-mqtt-broker/issues/552)): "Fast path waits for the downstream PUBACK: correlate the destination's pkid back to the source obligation, closing the dispatch->ack window (ADR 0060 §5.1-5.2)" — "Deferred 2026-10-02: issue #552 closed; was planned. Superseded 2026-11-19 by T9 (Amendment 1), which acknowledges the source on the destination's PUBACK for both directions."
+- `0060-T9` 🚧 in-progress ([#1103](https://github.com/mbilling/fss-mqtt-broker/issues/1103)): "Amendment 1: one link per upstream; traffic from the local cluster rides the bridge's persistent local session (expiry set, acknowledged after the upstream's PUBACK, disconnected while the upstream is down); traffic from an upstream acknowledged after the local PUBACK or a spool commit; non-destructive replay; keepalive deadline; refusals; old spools drained"
 
 **0065 — Security legibility: scorecard, VEX, dependency automation, lifecycle statements**
 
