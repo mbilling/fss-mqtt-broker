@@ -91,6 +91,25 @@ key-confusion attack), as is `alg=none`. `exp`/`nbf` are enforced with bounded c
 The issuer URL must be `https://`; a loudly-logged `MQTTD_OIDC_ALLOW_HTTP=1` exists for
 tests and closed networks, following the codebase's established INSECURE-warning idiom.
 
+**Amended (2026-11-19): checked against the standards.** A review against RFC 7519, 7517,
+7518, 8725 and 9068 and OpenID Connect Discovery 1.0 found two rules of this section that
+were not in force. jsonwebtoken compares `iss` and `aud` only when a token carries them,
+and skips `nbf` unless asked. Both rules are now enforced, and:
+
+- `iss` must be a single string (RFC 7519 §4.1.1);
+- discovery (§1) refuses a document whose `issuer` is not exactly the configured one
+  (OpenID Connect Discovery 1.0 §4.3);
+- a JWKS key without `alg`, which RFC 7517 §4.4 makes optional, verifies the one allowed
+  algorithm its type implies: RS256 for RSA, ES256 for P-256. A key published for
+  encryption (`use: enc`) is never used;
+- `MQTTD_OIDC_REQUIRE_AT_JWT`, off by default, accepts only RFC 9068 access tokens (`typ`
+  `at+jwt`), so an ID token cannot stand in for one (RFC 8725 §3.11). It is off by
+  default because most providers do not type their access tokens that way.
+
+The static-key mode gains the same `nbf` and single-string `iss` checks, requires a
+configured `iss` or `aud` to be present, and refuses an HS256 secret under 256 bits
+(RFC 7518 §3.2).
+
 ### 5. Supply chain
 
 No new TLS or HTTP stack: the fetcher reuses the rustls-based HTTP client already in the

@@ -12,6 +12,10 @@
 //!   are additionally rate-limited here, so a hostile client spamming unknown `kid`s
 //!   cannot turn the broker into a request cannon against its own `IdP`.
 //!
+//! Discovery is checked before its `jwks_uri` is trusted: the document must name the
+//! configured issuer exactly (OIDC Discovery 1.0 §4.3), and the `jwks_uri` must
+//! be https unless the loud test override is set.
+//!
 //! Failure never panics and never fails open: fetch errors leave the installed set
 //! untouched; the authenticator's own staleness window decides when last-known-good
 //! stops being good (fail closed, ADR 0050 §3).
@@ -30,9 +34,10 @@ const RETRY_MAX: Duration = Duration::from_mins(1);
 /// Per-request timeout.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The discovery document — the single field we consume.
+/// The discovery document — the two fields we consume.
 #[derive(serde::Deserialize)]
 struct Discovery {
+    issuer: String,
     jwks_uri: String,
 }
 
@@ -85,7 +90,7 @@ pub async fn run_fetch_loop(
     let jwks_uri = loop {
         tokio::select! {
             () = shutdown.cancelled() => return,
-            res = fetch_discovery(&client, &discovery_url, allow_http) => match res {
+            res = fetch_discovery(&client, &discovery_url, &issuer, allow_http) => match res {
                 Ok(uri) => break uri,
                 Err(e) => {
                     warn!(url = %discovery_url, error = %e,
@@ -133,14 +138,34 @@ pub async fn run_fetch_loop(
 async fn fetch_discovery(
     client: &reqwest::Client,
     url: &str,
+    issuer: &str,
     allow_http: bool,
 ) -> Result<String, String> {
     let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
     }
-    let doc: Discovery = serde_json::from_slice(&resp.bytes().await.map_err(|e| e.to_string())?)
+    jwks_uri_from_discovery(
+        &resp.bytes().await.map_err(|e| e.to_string())?,
+        issuer,
+        allow_http,
+    )
+}
+
+/// The `jwks_uri` of a discovery document, once the document has passed its checks.
+fn jwks_uri_from_discovery(body: &[u8], issuer: &str, allow_http: bool) -> Result<String, String> {
+    let doc: Discovery = serde_json::from_slice(body)
         .map_err(|e| format!("discovery document does not parse: {e}"))?;
+    // OpenID Connect Discovery 1.0 §4.3: the document names the issuer it was fetched for,
+    // exactly. A document for another issuer (a misrouted proxy, a mixed-up tenant) would
+    // otherwise hand over that issuer's keys.
+    if doc.issuer != issuer {
+        return Err(format!(
+            "discovery document names issuer {:?}, not the configured {issuer:?} \
+             (MQTTD_OIDC_ISSUER must match it exactly)",
+            doc.issuer
+        ));
+    }
     // The jwks_uri inherits the issuer's transport bar: https unless explicitly
     // downgraded for tests — a compromised discovery document must not quietly
     // redirect key fetching onto plaintext.
@@ -159,4 +184,57 @@ async fn fetch_jwks(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, Stri
         return Err(format!("HTTP {}", resp.status()));
     }
     Ok(resp.bytes().await.map_err(|e| e.to_string())?.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::jwks_uri_from_discovery;
+
+    const ISSUER: &str = "https://idp.test/realms/iot";
+
+    fn doc(issuer: &str, jwks_uri: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "issuer": issuer,
+            "jwks_uri": jwks_uri,
+            "token_endpoint": format!("{issuer}/protocol/openid-connect/token"),
+        }))
+        .unwrap()
+    }
+
+    /// A document that names the configured issuer yields its `jwks_uri`.
+    #[test]
+    fn a_document_for_the_configured_issuer_yields_its_jwks_uri() {
+        let jwks = format!("{ISSUER}/protocol/openid-connect/certs");
+        assert_eq!(
+            jwks_uri_from_discovery(&doc(ISSUER, &jwks), ISSUER, false),
+            Ok(jwks)
+        );
+    }
+
+    /// OIDC Discovery 1.0 §4.3: a document that names any other issuer is
+    /// refused, a trailing-slash difference included, and so is one without an issuer.
+    #[test]
+    fn a_document_for_another_issuer_is_refused() {
+        let jwks = format!("{ISSUER}/protocol/openid-connect/certs");
+        for other in [
+            "https://idp.test/realms/other",
+            "https://idp.test/realms/iot/",
+        ] {
+            let err = jwks_uri_from_discovery(&doc(other, &jwks), ISSUER, false).unwrap_err();
+            assert!(err.contains(other) && err.contains(ISSUER), "{err}");
+        }
+        let no_issuer = serde_json::to_vec(&serde_json::json!({ "jwks_uri": jwks })).unwrap();
+        assert!(jwks_uri_from_discovery(&no_issuer, ISSUER, false).is_err());
+    }
+
+    /// The `jwks_uri` must be https unless the loud test override is set.
+    #[test]
+    fn a_plaintext_jwks_uri_needs_the_test_override() {
+        let plain = doc(ISSUER, "http://idp.test/certs");
+        assert!(jwks_uri_from_discovery(&plain, ISSUER, false).is_err());
+        assert_eq!(
+            jwks_uri_from_discovery(&plain, ISSUER, true),
+            Ok("http://idp.test/certs".to_string())
+        );
+    }
 }

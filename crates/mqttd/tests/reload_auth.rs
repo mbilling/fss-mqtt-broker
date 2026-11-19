@@ -230,7 +230,7 @@ async fn malformed_password_file_reload_is_rejected_and_keeps_the_running_authen
 #[tokio::test]
 async fn an_emptied_hs256_secret_file_reload_is_rejected_and_keeps_the_running_verifier() {
     use mqtt_auth::token::{TokenAuthenticator, TokenConfig};
-    let secret = PwFile::new("first-hmac-secret\n");
+    let secret = PwFile::new("a-32-byte-hmac-secret-for-reload\n");
     let path = secret.path.clone();
     let (addr, reloader) = start_reloadable_node_with(move || -> reload::BuildResult {
         let key = mqtt_core::read_secret_file(&path).map_err(|e| format!("read secret: {e}"))?;
@@ -250,7 +250,8 @@ async fn an_emptied_hs256_secret_file_reload_is_rejected_and_keeps_the_running_v
     let token = jsonwebtoken::encode(
         &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
         &serde_json::json!({ "sub": "device-7", "exp": exp }),
-        &jsonwebtoken::EncodingKey::from_secret(b"first-hmac-secret").expect("a non-empty secret"),
+        &jsonwebtoken::EncodingKey::from_secret(b"a-32-byte-hmac-secret-for-reload")
+            .expect("a non-empty secret"),
     )
     .expect("encode");
     // The token rides in the password field, as a client sends it.

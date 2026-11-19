@@ -317,9 +317,11 @@ impl Default for Security {
 pub struct Jwt {
     /// Path to a file holding the HS256 shared secret (`MQTTD_JWT_HS256_SECRET_FILE`, ADR 0046
     /// T5): secret-by-reference, so the HMAC key is mounted from a Secret, never inlined.
-    /// Whitespace around the secret is trimmed. A file that is empty after trimming is
-    /// refused, since an empty HMAC key would let anyone sign a token: the broker does not
-    /// start, `--check-config --preflight` fails, and a reload keeps the running verifier.
+    /// Whitespace around the secret is trimmed. What remains must be at least 32 bytes
+    /// (256 bits, RFC 7518 §3.2): a shorter secret can be guessed offline from one captured
+    /// token, and an empty one lets anyone sign a token. A shorter or empty secret is
+    /// refused: the broker does not start, `--check-config --preflight` fails, and a reload
+    /// keeps the running verifier.
     pub hs256_secret_file: Option<String>,
     /// RS256 public-key PEM (`MQTTD_JWT_RS256_PEM`).
     pub rs256_pem_file: Option<String>,
@@ -351,6 +353,11 @@ pub struct Oidc {
     pub allow_http: bool,
     /// Claim to read group memberships from (`MQTTD_OIDC_GROUPS_CLAIM`, default `groups`).
     pub groups_claim: Option<String>,
+    /// Accept only JWT access tokens as RFC 9068 types them, header `typ` `at+jwt`
+    /// (`MQTTD_OIDC_REQUIRE_AT_JWT`, `1`/`0`), so an ID token cannot stand in for an access
+    /// token. **Off by default**: most providers do not type their access tokens that way;
+    /// turn it on where yours does.
+    pub require_at_jwt: bool,
 }
 
 /// Remote HTTP authentication hook (`MQTTD_HTTP_AUTH_*`, ADR 0004 T16).
@@ -1619,6 +1626,9 @@ impl Config {
         on!("MQTTD_OIDC_GROUPS_CLAIM", v, {
             self.security.oidc.groups_claim = Some(v);
         });
+        on!("MQTTD_OIDC_REQUIRE_AT_JWT", v, {
+            self.security.oidc.require_at_jwt = on_off("MQTTD_OIDC_REQUIRE_AT_JWT", &v)?;
+        });
         on!("MQTTD_AUTH_TIMEOUT", v, {
             self.security.auth_timeout_secs = Some(num("MQTTD_AUTH_TIMEOUT", &v)?);
         });
@@ -2590,6 +2600,7 @@ pub const ENV_VARS: &[&str] = &[
     "MQTTD_OIDC_MAX_STALE",
     "MQTTD_OIDC_ALLOW_HTTP",
     "MQTTD_OIDC_GROUPS_CLAIM",
+    "MQTTD_OIDC_REQUIRE_AT_JWT",
     "MQTTD_AUTH_TIMEOUT",
     "MQTTD_AUTH_PENALTY_THRESHOLD",
     "MQTTD_AUTH_PENALTY_DECAY_SECS",
@@ -3848,6 +3859,7 @@ mod tests {
             | "MQTTD_TLS_END_SESSIONS_AT_CERT_EXPIRY"
             | "MQTTD_RULES_TRACE"
             | "MQTTD_HUB_THREAD"
+            | "MQTTD_OIDC_REQUIRE_AT_JWT"
             | "MQTTD_RULES_JQ" => "1",
             // Enums: any valid, non-default (default None) member.
             "MQTTD_SWIM_SIGNED" | "MQTTD_SWIM_REPLAY" => "require",
@@ -4144,8 +4156,9 @@ mod tests {
             // plus MQTTD_HUB_SHARDS (ADR 0092 T5),
             // plus MQTTD_HUB_HANDOFF_WAKE (ADR 0093 D4),
             // plus MQTTD_HUB_HANDOFF_INFLIGHT (ADR 0093 D3),
-            // plus MQTTD_HUB_YIELD_DEEP (ADR 0093 Amendment 3).
-            135,
+            // plus MQTTD_HUB_YIELD_DEEP (ADR 0093 Amendment 3),
+            // plus MQTTD_OIDC_REQUIRE_AT_JWT (ADR 0050, the 2026-11-19 amendment).
+            136,
             "the MQTTD_* surface changed — update ENV_VARS"
         );
         // Issue #239: MQTTD_MIN_REPLICAS was wired in `overlay_from` but never

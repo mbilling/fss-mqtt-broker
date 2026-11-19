@@ -2197,6 +2197,7 @@ impl OidcSettings {
         if let Some(c) = config.security.oidc.groups_claim.clone() {
             oidc.groups_claim = c;
         }
+        oidc.require_at_jwt = config.security.oidc.require_at_jwt;
         let refresh =
             Duration::from_secs(config.security.oidc.jwks_refresh_secs.unwrap_or(300).max(5));
         Ok(Some(Self {

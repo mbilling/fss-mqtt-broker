@@ -46,7 +46,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/history-check/src/main.rs` — 0 test(s)
 
 
-## `crates/mqtt-auth/src/lib.rs` — 141 test(s)
+## `crates/mqtt-auth/src/lib.rs` — 149 test(s)
 
 - `acl::tests::a_bad_client_id_does_not_disturb_rules_that_never_use_it`
 - `acl::tests::a_bare_percent_is_literal`
@@ -131,16 +131,21 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `mtls::tests::the_default_source_is_the_common_name`
 - `mtls::tests::truncated_der_is_rejected_without_panic`
 - `oidc::tests::a_garbled_jwks_never_replaces_the_last_known_good_set`
+- `oidc::tests::a_key_published_for_encryption_is_not_used`
+- `oidc::tests::a_key_without_alg_verifies_the_algorithm_its_type_implies`
 - `oidc::tests::a_token_naming_an_unknown_critical_extension_is_rejected`
+- `oidc::tests::a_token_that_is_not_yet_valid_is_rejected`
 - `oidc::tests::a_token_without_an_issuer_or_an_audience_is_rejected`
 - `oidc::tests::a_valid_token_authenticates_with_subject_and_groups`
 - `oidc::tests::an_idp_shaped_token_with_an_audience_array_authenticates`
+- `oidc::tests::an_issuer_that_is_not_a_single_string_is_rejected`
 - `oidc::tests::an_unknown_kid_rejects_and_hints_exactly_one_refresh`
 - `oidc::tests::claims_of_the_wrong_type_are_rejected`
 - `oidc::tests::hs256_is_refused_even_if_it_matches_a_key`
 - `oidc::tests::no_keys_installed_fails_closed_and_hints_refresh`
 - `oidc::tests::non_token_credentials_chain_through`
 - `oidc::tests::staleness_beyond_the_window_fails_closed_then_reinstall_recovers`
+- `oidc::tests::with_at_jwt_required_only_an_access_token_type_authenticates`
 - `oidc::tests::wrong_issuer_audience_and_expiry_are_rejected`
 - `password::tests::a_generated_hash_authenticates_through_a_password_file`
 - `password::tests::a_hash_minted_by_argon2_0_5_still_verifies`
@@ -174,11 +179,14 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `token::tests::a_configured_issuer_or_audience_must_be_in_the_token`
 - `token::tests::a_critical_extension_or_a_mistyped_claim_is_rejected`
 - `token::tests::a_custom_groups_claim_name_is_honored`
+- `token::tests::a_token_that_is_not_yet_valid_is_rejected`
+- `token::tests::an_issuer_that_is_not_a_single_string_is_rejected`
 - `token::tests::correct_audience_is_accepted_when_audience_is_configured`
 - `token::tests::correct_issuer_is_accepted_when_issuer_is_configured`
 - `token::tests::empty_sub_is_rejected`
 - `token::tests::expired_token_is_rejected`
 - `token::tests::groups_are_parsed_from_the_default_claim`
+- `token::tests::hs256_refuses_a_secret_shorter_than_256_bits`
 - `token::tests::hs256_refuses_an_empty_secret`
 - `token::tests::missing_sub_is_rejected`
 - `token::tests::non_token_credentials_are_not_permitted`
@@ -1561,7 +1569,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 926 test(s)
+## `crates/mqttd/src/lib.rs` — 929 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -2291,6 +2299,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `memory_watch::tests::the_watcher_drives_brownout_on_watermark_transitions`
 - `memory_watch::tests::vm_rss_is_parsed_in_bytes_from_the_right_line`
 - `memory_watch::tests::without_a_watermark_nothing_is_ever_browned_out`
+- `oidc::tests::a_document_for_another_issuer_is_refused`
+- `oidc::tests::a_document_for_the_configured_issuer_yields_its_jwks_uri`
+- `oidc::tests::a_plaintext_jwks_uri_needs_the_test_override`
 - `peer::tests::a_dialer_links_only_the_member_it_was_aimed_at`
 - `peer::tests::a_dialer_stops_dialing_a_peer_confirmed_gone_and_is_set_going_again_by_alive`
 - `peer::tests::a_frame_produced_during_the_yield_joins_the_same_write`
@@ -2653,7 +2664,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `a_missing_referenced_file_is_refused_by_the_preflight_only`
 - `a_password_file_without_read_permission_is_refused_by_the_preflight` — only when `cfg(unix)`
 - `a_valid_file_validates_and_reports_the_path`
-- `an_empty_hs256_secret_file_is_refused_by_the_preflight_naming_the_file`
+- `an_empty_or_short_hs256_secret_file_is_refused_by_the_preflight_naming_the_file`
 - `an_unknown_key_fails_with_a_located_error_and_exit_1`
 - `an_unparseable_bind_is_refused_naming_the_key`
 - `bare_defaults_are_refused_naming_both_remedies`
