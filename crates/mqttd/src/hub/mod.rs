@@ -79,12 +79,15 @@ mod events;
 pub(crate) use events::origin_from_wire;
 mod lanes;
 mod qos2;
+/// The resume replay, a page at a time (issue #1235).
+mod replay;
 #[allow(clippy::wildcard_imports)] // an intra-hub module split (#258): the five
 // siblings share one type/state vocabulary by design, and enumerating it would
 // re-couple every future hub change to six import lists. Scoped to these files.
 use lanes::*;
 pub use lanes::{AppendJob, AppendThen, LaneJob, LaneOutcome, LaneWork};
 pub use qos2::{Qos2LaneOp, Qos2OpOutcome};
+use replay::{ReplayCursor, ReplayState, REPLAY_PAGE};
 mod policy;
 pub use policy::BrownoutAxis;
 /// Relay streams (ADR 0005) held to the certificates they were admitted under (#1016).
@@ -110,9 +113,6 @@ pub use shards::{
     shard_of, spawn_mailman, HubTx, ShardAnswer, ShardBatch, ShardDeliver, ShardMailbox,
     ShardTarget, MAX_SHARDS,
 };
-
-/// Maximum number of queued messages replayed to a reconnecting session at once.
-const REPLAY_LIMIT: usize = 10_000;
 
 /// Default outbound Receive Maximum when the client advertised none — effectively
 /// unlimited (ADR 0012). v3.1.1 sessions always use this.
@@ -1175,6 +1175,10 @@ struct Inflight {
     /// The highest offset ever tracked, so a fully drained session truncates its whole
     /// log rather than stalling at the last released offset.
     high_water: Offset,
+    /// While a resume replay is still reading the session's queue (issue #1235): the last
+    /// offset it has read. Truncation never passes it, so nothing the replay has not yet
+    /// read is let go of, whatever raised the high-water. `None` when no replay is running.
+    replay_ceiling: Option<Offset>,
     /// The last offset already handed to [`SessionStore::ack`], so an advance that would
     /// not move the truncation point costs no store write.
     acked_through: Offset,
@@ -1208,6 +1212,7 @@ impl Default for Inflight {
             outstanding: BTreeSet::new(),
             released: BTreeSet::new(),
             high_water: 0,
+            replay_ceiling: None,
             acked_through: 0,
             records_pending: 0,
             banked_base: None,
@@ -1261,6 +1266,10 @@ impl Inflight {
             // Nothing owed: the whole observed log is settled.
             None => self.high_water,
         };
+        // A replay still reading the queue (#1235): what it has not read is not settled.
+        let safe = self
+            .replay_ceiling
+            .map_or(safe, |ceiling| safe.min(ceiling));
         // Unmatched durable IDs may point beyond the replay window, not to
         // retired messages. Later live completions must not truncate over them.
         self.orphaned_qos2
@@ -1470,6 +1479,16 @@ pub enum HubCommand {
         client: ClientId,
         /// What the store did.
         outcome: Qos2OpOutcome,
+    },
+    /// Internal: a session lane read the next page of a resume replay (issue #1235).
+    /// Not sent by connections.
+    ReplayPageDone {
+        /// The session being replayed.
+        client: ClientId,
+        /// The connection the replay delivers to.
+        conn_id: u64,
+        /// The page, oldest first, or the read's failure.
+        result: Result<Vec<mqtt_storage::QueuedMessage>, StorageError>,
     },
     /// Internal: the off-loop packet-id block reservation finished (ADR 0007 T9 /
     /// issue #242 finding A) — bank the base and drain the deliveries deferred on
@@ -2200,6 +2219,9 @@ impl HubCommand {
         match self {
             Self::AppendDone { .. }
             | Self::Qos2OpDone { .. }
+            // A store completion like the two above, posted by the same lane in order
+            // with them: the order a page's read and the appends around it rely on.
+            | Self::ReplayPageDone { .. }
             | Self::PkidBlockReserved { .. }
             | Self::PubAck { .. }
             | Self::PubAcks { .. }
@@ -2266,7 +2288,9 @@ impl HubCommand {
 
     fn class(&self) -> &'static str {
         match self {
-            Self::Attach { .. } | Self::SessionRecovered { .. } => "attach",
+            Self::Attach { .. } | Self::SessionRecovered { .. } | Self::ReplayPageDone { .. } => {
+                "attach"
+            }
             Self::Publish { .. }
             | Self::PublishBatch(_)
             | Self::RuleDerived(_)
@@ -3100,6 +3124,9 @@ pub struct Hub {
     /// group's degraded followers stall only its own sessions' appends — never every
     /// client on the node. Spawned on first submission; reaped by the sweep when idle.
     append_lanes: FastMap<ClientId, AppendLane>,
+    /// Resume replays that have not reached the end of their session's queue yet (issue
+    /// #1235): the next page is read on the session's lane when the subscriber has room.
+    replays: FastMap<ClientId, ReplayCursor>,
     /// [`HubCommand::Drained`] barriers waiting for the in-flight work to finish.
     drained_waiters: Vec<oneshot::Sender<u64>>,
     /// A graceful drain has begun ([`HubCommand::Draining`]).
@@ -3506,6 +3533,7 @@ impl Hub {
                 self_tx: tx.clone(),
                 connecting: HashMap::default(),
                 append_lanes: HashMap::default(),
+                replays: HashMap::default(),
                 drained_waiters: Vec::new(),
                 draining: false,
                 drain_gating: false,
@@ -4126,6 +4154,7 @@ impl Hub {
         self.refresh_message_wants();
         self.sweep_expired_sessions().await;
         self.submit_pending_qos2_cleanup();
+        self.pump_replays();
         self.refresh_gauges().await;
         self.shrink_idle_lanes();
         self.refresh_ownership_domain();
@@ -4374,6 +4403,13 @@ impl Hub {
             }
             HubCommand::Qos2OpDone { client, outcome } => {
                 self.qos2_op_done(&client, outcome);
+            }
+            HubCommand::ReplayPageDone {
+                client,
+                conn_id,
+                result,
+            } => {
+                Box::pin(self.replay_page_done(&client, conn_id, result)).await;
             }
             HubCommand::PkidBlockReserved { client, result } => {
                 self.pkid_block_reserved(&client, result);
@@ -5956,12 +5992,21 @@ impl Hub {
             }
         }
 
-        // Replay queued messages (they land in the channel after CONNACK). The lease is
-        // usually warm (recovery just succeeded), so these reads are fast and local. A
-        // message whose MQTT 5.0 expiry deadline has passed is dropped, not delivered,
-        // and the remaining interval is forwarded on the rest (ADR 0009 §3).
+        // Replay queued messages (they land in the channel after CONNACK), a page at a
+        // time (#1235): this attach reads the first page; a longer queue keeps a cursor
+        // whose next page is read on the session's lane as the subscriber makes room. The
+        // lease is usually warm (recovery just succeeded), so the reads are fast and
+        // local. A message whose MQTT 5.0 expiry deadline has passed is dropped, not
+        // delivered, and the remaining interval is forwarded on the rest (ADR 0009 §3).
         if !clean_start {
-            let pending = match self.store.pending(&client, 0, REPLAY_LIMIT).await {
+            // A takeover mid-replay: the old connection's cursor is superseded, and until
+            // this replay has read something, truncation stops where it stands.
+            self.replays.remove(&client);
+            self.inflight
+                .entry(client.clone())
+                .or_default()
+                .replay_ceiling = Some(0);
+            let pending = match self.store.pending(&client, 0, REPLAY_PAGE).await {
                 Ok(pending) => pending,
                 Err(error) => {
                     // The warm-up in `recover_once` is not a lock: the group's lease
@@ -5979,141 +6024,40 @@ impl Hub {
                     return;
                 }
             };
+            let full = pending.len() >= REPLAY_PAGE;
+            let mut state = ReplayState {
+                restored,
+                resumed_offsets,
+                revoked_grants,
+            };
             let now = self.clock.now_epoch_secs();
             let mut last = 0;
             for qm in pending {
                 last = qm.offset;
-                // Raise the truncation ceiling for every entry read, so the ones
-                // dropped below are let go of even though nothing will deliver
-                // them (#124). Entries that ARE sent additionally become owed, in
-                // `send_to_client`, and hold the ceiling down until acknowledged.
+                self.replay_entry(&client, &outbound, &qm, now, &mut state);
+            }
+            if full {
+                // More than a page queued: read on, a page at a time. Live deliveries
+                // to this session are written meanwhile, and reached in order.
                 self.inflight
                     .entry(client.clone())
                     .or_default()
-                    .note_offset(qm.offset);
-                // Still in the in-flight table means this is a client reconnect, not
-                // a broker restart: the DUP resume above already re-sent it under its
-                // original packet id — and for `QoS` 2 possibly as a bare PUBREL,
-                // because the client has acknowledged receipt and only owes the
-                // release. Replaying the PUBLISH here would deliver it twice.
-                if resumed_offsets.contains(&qm.offset) {
-                    debug!(client = %client.0, offset = qm.offset,
-                           "queued message is still in flight in memory; not replaying");
-                    restored.remove(&qm.offset);
-                    continue;
-                }
-                // Acknowledged on an earlier connection, kept in the queue only because
-                // an older entry still owed blocks truncation (issue #1056): settled,
-                // not owed, and a copy here would be a new message to the client.
-                if self
-                    .inflight
-                    .get(&client)
-                    .is_some_and(|inf| inf.settled_above_watermark(qm.offset))
-                {
-                    debug!(client = %client.0, offset = qm.offset,
-                           "queued message was acknowledged before this connection and awaits \
-                            truncation; not replaying (#1056)");
-                    continue;
-                }
-                // A broker restart with a durably-recorded id (ADR 0057): resume the
-                // handshake mid-phrase UNDER THE ORIGINAL ID, never through a fresh
-                // allocation. Before PUBREC: the PUBLISH goes out again with DUP and
-                // the id the subscriber may already hold. After PUBREC: a bare
-                // PUBREL — the subscriber has the message; re-publishing it is the
-                // #130 duplicate this table exists to prevent.
-                if let Some((pkid, pubrec_seen)) = restored.remove(&qm.offset) {
-                    let inf = self.inflight.entry(client.clone()).or_default();
-                    inf.orphaned_qos2.remove(&pkid);
-                    inf.orphaned_qos2_cleanup.remove(&pkid);
-                    let state = if pubrec_seen {
-                        OutState::AwaitingPubComp
-                    } else {
-                        OutState::AwaitingPubRec
-                    };
-                    // Restored handshakes still owe their queued delivery. Without
-                    // this, replay's prefix truncate can delete an earlier unacked
-                    // restored message while completing a later one (#577).
-                    self.inflight
-                        .entry(client.clone())
-                        .or_default()
-                        .track(qm.offset);
-                    self.inflight
-                        .entry(client.clone())
-                        .or_default()
-                        .pending
-                        .insert(
-                            pkid,
-                            PendingOut {
-                                message: qm.message.clone(),
-                                state,
-                                offset: Some(qm.offset),
-                            },
-                        );
-                    let packet = if pubrec_seen {
-                        Packet::PubRel(pkid.into())
-                    } else {
-                        publish_packet(
-                            &qm.message.topic,
-                            qm.message.payload.clone(),
-                            qm.message.qos,
-                            Some(pkid),
-                            true,
-                            false,
-                            None,
-                            &qm.message.app,
-                            &self.matching_sub_ids(&client, &qm.message.topic),
-                        )
-                    };
-                    let _ = outbound.send_from(packet, self.delivery_origin(&qm.message.app));
-                    continue;
-                }
-                // A queued message that only a revoked grant admits is dropped
-                // (ADR 0040 T3): delivering it would leak data the new policy
-                // denies. A topic a surviving grant also matches still replays.
-                if !revoked_grants.is_empty() {
-                    let topic = &qm.message.topic;
-                    let admits = |f: &str| {
-                        let f = parse_shared(f).map_or(f, |(_, inner)| inner);
-                        topic_matches(f, topic)
-                    };
-                    let survives = self
-                        .subs
-                        .get(&client)
-                        .is_some_and(|subs| subs.iter().any(|e| admits(&e.filter)));
-                    if revoked_grants.iter().map(String::as_str).any(admits) && !survives {
-                        debug!(client = %client.0, offset = qm.offset, %topic,
-                               "dropping queued message for a revoked grant (ADR 0040 T3)");
-                        continue;
-                    }
-                }
-                match qm.expiry_at {
-                    Some(deadline) if deadline <= now => {
-                        debug!(client = %client.0, offset = qm.offset, "dropping expired queued message");
-                        // EMQX's `expired`. Its interval has run out: none is left.
-                        self.note_delivery_dropped(&client, "expired", &qm.message, false, Some(0));
-                    }
-                    Some(deadline) => {
-                        let remaining = u32::try_from(deadline - now).unwrap_or(u32::MAX);
-                        self.send_to_client(
-                            &client,
-                            &outbound,
-                            &qm.message,
-                            false,
-                            Some(remaining),
-                            Some(qm.offset),
-                        );
-                    }
-                    None => {
-                        self.send_to_client(
-                            &client,
-                            &outbound,
-                            &qm.message,
-                            false,
-                            None,
-                            Some(qm.offset),
-                        );
-                    }
-                }
+                    .replay_ceiling = Some(last);
+                self.replays.insert(
+                    client.clone(),
+                    ReplayCursor {
+                        conn_id,
+                        after: last,
+                        reading: false,
+                        state,
+                    },
+                );
+                self.truncate_acked(&client);
+                self.read_next_replay_page(&client);
+                return;
+            }
+            if let Some(inf) = self.inflight.get_mut(&client) {
+                inf.replay_ceiling = None;
             }
             if last > 0 {
                 debug!(client = %client.0, up_to = last, "replayed queued messages");
@@ -6122,30 +6066,7 @@ impl Hub {
                 // acknowledges it, not when it was sent (#124).
                 self.truncate_acked(&client);
             }
-
-            // IDs not matched in this replay window are only POSSIBLE orphans.
-            // Released phase resumes PUBREL; PUBCOMP makes cleanup eligible.
-            // Unreleased phase can attempt cleanup immediately. Both paths must
-            // prove durable prefix retirement, not infer absence from this window.
-            for (offset, (pkid, pubrec_seen)) in restored {
-                self.inflight
-                    .entry(client.clone())
-                    .or_default()
-                    .orphaned_qos2
-                    .insert(pkid, offset);
-                if pubrec_seen {
-                    debug!(client = %client.0, pkid, offset,
-                           "orphaned outbound QoS2 id in released phase; sending PUBREL");
-                    let _ = outbound.send(Packet::PubRel(pkid.into()));
-                } else {
-                    // Absence from a limited replay window is not proof of absence
-                    // from storage. Check this exact offset before retiring its ID.
-                    // The store waits run on the session lane (#575) so attach of
-                    // an unrelated session is not parked behind this proof.
-                    self.queue_unreleased_qos2_orphan(&client, pkid, offset);
-                }
-            }
-            self.submit_qos2_retire(&client);
+            self.finish_replay(&client, &outbound, state.restored);
         }
     }
 
@@ -7092,6 +7013,8 @@ impl Hub {
             return;
         }
         let departed = self.online.remove(client);
+        // Its replay ends with it; the next attach replays from the start (#1235).
+        self.replays.remove(client);
         // Out of every group's online prefix: a member offline here is not
         // immediately deliverable, which is what the selection reads.
         self.shared.set_client_online(client, false);
@@ -7225,6 +7148,7 @@ impl Hub {
             "reaping session whose connection already ended; Detach still queued (#504)"
         );
         let departed = self.online.remove(client);
+        self.replays.remove(client);
         self.shared.set_client_online(client, false);
         self.mirror_routing(client);
         if let Some(inf) = self.inflight.get_mut(client) {
@@ -10427,7 +10351,7 @@ mod tests {
     use super::{
         Admission, AttachOutcome, AuthMethod, BrownoutAxis, Hub, HubCommand, Inflight, Outbound,
         PeerOutbound, ProtocolVersion, PublishOutcome, PublishRefusal, RemoteSharedGroup, Will,
-        EXPIRY_RECONCILE_EVERY, MAX_OUTBOUND_QUEUE, REPLAY_LIMIT,
+        EXPIRY_RECONCILE_EVERY, MAX_OUTBOUND_QUEUE, REPLAY_PAGE,
     };
     use crate::backpressure::{
         BacklogBound, BacklogEntry, SubscriberLimits, DEFAULT_MAX_BACKLOG_MESSAGES,
@@ -10724,7 +10648,7 @@ mod tests {
         /// SEPARATE lever from the enqueue one, because the append happens first and
         /// failing it would mask the very path ADR 0057's tests exist to exercise.
         fail_outbound: std::sync::atomic::AtomicBool,
-        /// The next this-many REPLAY reads (`pending` at `REPLAY_LIMIT`) fail with
+        /// The next this-many REPLAY reads (`pending` at `REPLAY_PAGE`) fail with
         /// `NoQuorum`; the one-entry warm-up read in `recover_once` is untouched.
         fail_replay: std::sync::atomic::AtomicUsize,
         /// While true, every durable append waits before it is applied: a delivery's
@@ -10849,7 +10773,7 @@ mod tests {
             limit: usize,
         ) -> Result<Vec<mqtt_storage::QueuedMessage>, mqtt_storage::StorageError> {
             use std::sync::atomic::Ordering;
-            if limit == super::REPLAY_LIMIT
+            if limit == super::REPLAY_PAGE
                 && self
                     .fail_replay
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -22215,15 +22139,17 @@ mod tests {
         }
     }
 
-    /// Replay is bounded by `REPLAY_LIMIT` per reconnect; the remainder stays
-    /// queued (unacked) for the next one.
+    /// Issue #1235: a reconnect replays the whole queue, a page at a time, on that one
+    /// connection. It used to read 10,000 entries once and leave the rest for the next
+    /// reconnect.
     #[tokio::test]
-    async fn replay_is_bounded_and_resumes_on_next_connect() {
+    async fn a_reconnect_replays_a_queue_longer_than_one_page() {
         let tx = start_hub();
         let (_rx, _) = attach(&tx, "r", 1, false).await;
         subscribe(&tx, "r", "rl");
         detach(&tx, "r", 1);
-        for _ in 0..(REPLAY_LIMIT + 2) {
+        let total = REPLAY_PAGE * 2 + 7;
+        for _ in 0..total {
             publish(&tx, "rl", b"m");
         }
 
@@ -22232,15 +22158,218 @@ mod tests {
         while recv_packet(&mut rx).await.is_some() {
             replayed += 1;
         }
-        assert_eq!(replayed, REPLAY_LIMIT);
+        assert_eq!(replayed, total, "the whole queue replays on one connect");
 
+        // At-most-once owes nothing once sent, so the replay let it all go.
         detach(&tx, "r", 2);
         let (mut rx, _) = attach(&tx, "r", 3, false).await;
-        let mut rest = 0usize;
-        while recv_packet(&mut rx).await.is_some() {
-            rest += 1;
+        assert!(
+            recv_packet(&mut rx).await.is_none(),
+            "nothing replays twice"
+        );
+    }
+
+    fn publish_numbered(tx: &HubTx, topic: &str, n: usize, qos: QoS) {
+        tx.send(HubCommand::Publish {
+            topic: topic.into(),
+            payload: Bytes::from(n.to_string()),
+            qos,
+            retain: false,
+            message_expiry: None,
+            app: AppProperties::default(),
+            done: None,
+            v5: false,
+            publisher: None,
+            credit: None,
+        })
+        .unwrap();
+    }
+
+    /// Receive until the stream goes quiet, acknowledging each `QoS` 1 PUBLISH, and return
+    /// the numbered payloads in arrival order.
+    async fn receive_numbered(
+        tx: &HubTx,
+        client: &str,
+        rx: &mut crate::hub::OutboundRx,
+    ) -> Vec<usize> {
+        let mut seen = Vec::new();
+        while let Some(packet) = recv_packet(rx).await {
+            if let Packet::Publish(p) = &packet {
+                seen.push(
+                    String::from_utf8_lossy(&p.payload)
+                        .parse::<usize>()
+                        .unwrap(),
+                );
+                if let Some(pkid) = p.pkid {
+                    pub_ack(tx, client, pkid);
+                }
+            }
         }
-        assert_eq!(rest, 2, "unreplayed tail must survive for the next connect");
+        seen
+    }
+
+    /// Issue #1235: live deliveries that arrive while a long replay is under way wait
+    /// behind the queued messages, and the queue is never truncated past what the replay
+    /// has read. Before paging, a live `QoS` 1 message was sent ahead of the queue's
+    /// unread tail, raising the session's high-water above it; once the subscriber had
+    /// acknowledged everything it held, `safe_ack` returned that high-water and the
+    /// truncation flusher deleted the tail undelivered.
+    #[tokio::test]
+    async fn live_traffic_waits_behind_a_long_replay_and_the_tail_is_not_lost() {
+        let tx = start_hub();
+        let (_rx, _) = attach(&tx, "s", 1, false).await;
+        subscribe_qos(&tx, "s", "q/#", QoS::AtLeastOnce);
+        detach(&tx, "s", 1);
+        let queued = REPLAY_PAGE * 2 + 50;
+        for n in 0..queued {
+            publish_numbered(&tx, "q/x", n, QoS::AtLeastOnce);
+        }
+
+        // A small receive window, so the replay pages and takes acknowledgements to finish.
+        let (mut rx, _) = attach_full(&tx, "s", 2, false, u32::MAX, 10).await;
+        // Live traffic, published while the replay is still reading the queue.
+        let live = 30;
+        for n in queued..queued + live {
+            publish_numbered(&tx, "q/x", n, QoS::AtLeastOnce);
+        }
+        let seen = receive_numbered(&tx, "s", &mut rx).await;
+        let expected: Vec<usize> = (0..queued + live).collect();
+        assert_eq!(
+            seen, expected,
+            "every queued message, then the live ones, each exactly once, in order"
+        );
+
+        // All acknowledged: a reconnect finds nothing left, and nothing was lost to get
+        // there (the order check above saw every message).
+        detach(&tx, "s", 2);
+        let (mut rx, _) = attach(&tx, "s", 3, false).await;
+        assert!(receive_numbered(&tx, "s", &mut rx).await.is_empty());
+    }
+
+    /// Issue #1235: while a replay is still reading the queue, truncation stops at the last
+    /// offset it has read, even when something has raised the high-water past it (a
+    /// write-elision fallback linked to a resumed entry, say).
+    #[test]
+    fn a_replay_ceiling_caps_the_truncation_point() {
+        let mut inf = Inflight::default();
+        inf.note_offset(5_000);
+        inf.replay_ceiling = Some(1_000);
+        assert_eq!(
+            inf.safe_ack(),
+            1_000,
+            "nothing past what the replay read is settled"
+        );
+        inf.track(400);
+        assert_eq!(inf.safe_ack(), 399, "an owed entry still holds it lower");
+        inf.release(400);
+        inf.replay_ceiling = None;
+        assert_eq!(
+            inf.safe_ack(),
+            5_000,
+            "with the replay done, the whole observed log is settled"
+        );
+    }
+
+    /// Issue #1235: a `QoS` 0 delivery that arrives while a replay waits for its reader to
+    /// make room is written, and arrives behind the queued messages, not ahead of them.
+    #[tokio::test]
+    async fn a_qos0_delivery_during_a_replay_arrives_behind_the_queue() {
+        let tx = start_hub();
+        let (_rx, _) = attach(&tx, "z", 1, false).await;
+        subscribe(&tx, "z", "z/#");
+        detach(&tx, "z", 1);
+        // More than the replay sends before it waits for the reader to drain.
+        let queued = MAX_OUTBOUND_QUEUE / 2 + REPLAY_PAGE;
+        for n in 0..queued {
+            publish_numbered(&tx, "z/x", n, QoS::AtMostOnce);
+        }
+        // Keep the outbound meter, so reading drains the queue's depth the way the
+        // connection writer does. Nothing is read yet, so the replay pauses part-way.
+        let (t, mut rx) = mpsc::unbounded_channel();
+        let (out_tx, meter) = Outbound::new(t);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(HubCommand::Attach {
+            client: ClientId("z".into()),
+            admission: Box::new(admission("z")),
+            conn_id: 2,
+            clean_start: false,
+            session_expiry: u32::MAX,
+            receive_maximum: u16::MAX,
+            will: None,
+            outbound: out_tx,
+            reply: reply_tx,
+        })
+        .unwrap();
+        assert!(matches!(
+            reply_rx.await.unwrap(),
+            AttachOutcome::Present(true)
+        ));
+        let live = 10;
+        for n in queued..queued + live {
+            publish_numbered(&tx, "z/x", n, QoS::AtMostOnce);
+        }
+        let mut seen = Vec::new();
+        while seen.len() < queued + live {
+            // Once the reader has drained, the replay resumes on the sweep's next tick.
+            let Ok(Some(out)) = timeout(Duration::from_secs(5), rx.recv()).await else {
+                break;
+            };
+            meter.drained(&out);
+            if let Some(Packet::Publish(p)) = out.into_packet() {
+                seen.push(
+                    String::from_utf8_lossy(&p.payload)
+                        .parse::<usize>()
+                        .unwrap(),
+                );
+            }
+        }
+        assert_eq!(
+            seen,
+            (0..queued + live).collect::<Vec<_>>(),
+            "every queued message, then the live ones, in order"
+        );
+    }
+
+    /// Issue #1235: a connection that ends in the middle of a replay leaves nothing behind.
+    /// The next connection resumes what was in flight with DUP and replays the rest from
+    /// the start of the queue, without resending what was acknowledged.
+    #[tokio::test]
+    async fn a_connection_lost_mid_replay_loses_nothing() {
+        let tx = start_hub();
+        let (_rx, _) = attach(&tx, "m", 1, false).await;
+        subscribe_qos(&tx, "m", "q/#", QoS::AtLeastOnce);
+        detach(&tx, "m", 1);
+        let queued = REPLAY_PAGE * 2 + 3;
+        for n in 0..queued {
+            publish_numbered(&tx, "q/x", n, QoS::AtLeastOnce);
+        }
+
+        // Take and acknowledge part of the first page, then drop the connection.
+        let (mut rx, _) = attach_full(&tx, "m", 2, false, u32::MAX, 10).await;
+        let mut acked = Vec::new();
+        while acked.len() < 100 {
+            let packet = recv_packet(&mut rx).await.expect("the replay is under way");
+            if let Packet::Publish(p) = &packet {
+                acked.push(
+                    String::from_utf8_lossy(&p.payload)
+                        .parse::<usize>()
+                        .unwrap(),
+                );
+                pub_ack(&tx, "m", p.pkid.unwrap());
+            }
+        }
+        detach(&tx, "m", 2);
+
+        let (mut rx, _) = attach(&tx, "m", 3, false).await;
+        let rest = receive_numbered(&tx, "m", &mut rx).await;
+        let mut all: Vec<usize> = acked.iter().chain(rest.iter()).copied().collect();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all, (0..queued).collect::<Vec<_>>(), "nothing lost");
+        assert!(
+            rest.iter().all(|n| !acked.contains(n)),
+            "nothing acknowledged comes back"
+        );
     }
 
     /// A bounded offline queue (ADR 0001 §6) drops the oldest while a persistent
