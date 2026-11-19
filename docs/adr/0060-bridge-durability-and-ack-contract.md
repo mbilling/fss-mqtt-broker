@@ -214,8 +214,15 @@ encodes the upstream, and a `$share` group gets `.<upstream name>` appended so e
 its own group. A message the bridge brings in from upstream A is then an ordinary local
 message: if upstream B has an `out` rule that matches it, the bridge forwards it to B, and the
 hop count bounds any loop. Before, one local connection with No Local kept a single bridge
-from doing that, although a second bridge process would. The bridge warns at startup for each
-pair of rules where it can happen.
+from doing that, although a second bridge process would, and so did a second instance under
+partitioned HA for the topics it owned.
+
+A new flow between two outside zones must be chosen on purpose, so a configuration with such a
+pair of rules is **refused at startup** unless it sets `relay_between_upstreams = true`
+(decided by the maintainer on 2026-11-19, over a startup warning). The error names the pair
+and suggests remapping the `in` rule's topics. With the option set, the startup log names each
+pair it allows. The check reads the rules, so nothing on the wire can get around it; a
+partial `strip_prefix` on a wildcard filter makes it err on the side of refusing.
 
 **3. A window bounded in bytes, not messages.** The bridge does not lower the local session's
 Receive Maximum below the protocol's 65,535. It bounds what it holds by bytes instead: past
@@ -274,9 +281,10 @@ session connects, deleting each message as the upstream acknowledges it. The old
   session's queue is the only buffer, so the broker's session limits decide how long an outage
   it rides out. Issue [#1235](https://github.com/mbilling/fss-mqtt-broker/issues/1235) replaces
   their message counts with memory and disk limits.
-- **Changed behaviour:** relaying between upstreams through the local cluster (§2); local client
-  ids and `$share` groups that name the upstream when there are several; per-link local sides in
-  the metrics when there are several upstreams.
+- **Changed behaviour:** a configuration whose rules would relay between upstreams through the
+  local cluster is refused unless `relay_between_upstreams` allows it (§2); local client ids and
+  `$share` groups that name the upstream when there are several; per-link local sides in the
+  metrics when there are several upstreams.
 - **A retired bridge's session outlives it.** With the default expiry, a decommissioned bridge's
   local session keeps queueing until it is deleted. Set a finite `session_expiry_secs` to have
   it expire.
@@ -293,6 +301,12 @@ session connects, deleting each message as the upstream acknowledges it. The old
   behind its unacknowledged messages, which is why §5 kept the spool.
 - **Receive Maximum 1**, taking one message at a time. One message per round trip: about
   50 msg/s at 20 ms.
+- **Relay between upstreams with only a startup warning.** Rejected by the maintainer: a flow
+  from one partner zone to another would start on an upgrade, noticed only by someone reading
+  the log.
+- **Mark what the bridge publishes**, so a link can skip its sibling links' messages at run
+  time. Anyone who can read the bridged messages could copy the marker, and a link that is
+  down receives its siblings' messages later, from its session, when no record of them is left.
 
 ### Left open
 

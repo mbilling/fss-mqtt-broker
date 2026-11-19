@@ -198,7 +198,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `token::tests::wrong_audience_is_rejected_when_audience_is_configured`
 - `token::tests::wrong_issuer_is_rejected_when_issuer_is_configured`
 
-## `crates/mqtt-bridge/src/lib.rs` — 80 test(s)
+## `crates/mqtt-bridge/src/lib.rs` — 81 test(s)
 
 - `client::tests::a_share_subscription_never_sets_no_local`
 - `client::tests::bridge_subscriptions_set_no_local_and_retain_as_published`
@@ -215,6 +215,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `config::tests::an_out_of_range_qos_is_rejected`
 - `config::tests::both_password_sources_are_rejected`
 - `config::tests::duplicate_upstream_names_are_rejected`
+- `config::tests::rules_that_relay_between_upstreams_are_refused_unless_allowed`
 - `config::tests::spool_max_bytes_parses_and_defaults_to_unbounded`
 - `config::tests::the_demo_config_parses`
 - `config::tests::valid_filters_pass_and_malformed_ones_fail`

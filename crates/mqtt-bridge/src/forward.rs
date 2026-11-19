@@ -338,8 +338,8 @@ pub struct RelayPath {
 /// Every pair of rules on different upstreams through which a message brought in from one
 /// can be forwarded out to the other. With one local session per upstream the bridge does
 /// forward along these (a message brought in is an ordinary local message to the other
-/// links), where one local connection with No Local used to keep it from doing so; the engine
-/// warns about each at startup.
+/// links), where one local connection with No Local used to keep it from doing so. Validation
+/// refuses a configuration with any of them unless `relay_between_upstreams` is set.
 #[must_use]
 pub fn relay_paths(cfg: &BridgeConfig) -> Vec<RelayPath> {
     let mut out = Vec::new();
@@ -610,6 +610,7 @@ mod tests {
     fn a_relay_path_is_reported_only_across_upstreams_and_after_the_remap() {
         let c = cfg(r#"
             share_group = ""
+            relay_between_upstreams = true   # validation refuses the pair below otherwise
             [local]
             url = "local:1883"
             [[upstreams]]

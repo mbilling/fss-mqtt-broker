@@ -302,9 +302,24 @@ A message the bridge brings **in** from one upstream is, on the local cluster, a
 message. If another upstream has an `out` rule that matches its local topic, the bridge
 forwards it on to that upstream too, with the hop count bounding any loop. A single bridge
 did not do this before 1.4.0, when all upstreams shared one local connection with No Local
-set (a second bridge process would have). The bridge logs a warning at startup for every pair
-of rules where it can happen; if the traffic must not cross, remap the `in` rule's topics so
-the other upstream's `out` rule does not match them.
+set (a second bridge process would have).
+
+So the bridge **refuses to start** with a pair of rules on different upstreams where this can
+happen, and the error names the pair. Choose one:
+
+```toml
+# keep the two apart: the in rule's topics no longer match the other upstream's out rule
+[[upstreams.rules]]
+direction = "in"
+filter = "sensors/#"
+remap = { prefix = "partner-a/" }
+
+# or allow the flow on purpose (top level); the startup log names each pair it allows
+relay_between_upstreams = true
+```
+
+The check reads only this bridge's rules. Two separate bridge deployments, one bringing a
+partner's messages in and another sending the same topics out, relay as they always did.
 
 ---
 

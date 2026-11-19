@@ -43,15 +43,16 @@ impl Bridge {
         let names: Vec<String> = cfg.upstreams.iter().map(|u| u.name.clone()).collect();
         let metrics = Arc::new(BridgeMetrics::for_upstreams(&names));
 
+        // Validation refuses these unless `relay_between_upstreams` allows them (ADR 0060
+        // Amendment 1 §2); name each allowed pair once, so the flow is visible in the log.
         for path in relay_paths(&cfg) {
-            warn!(
+            info!(
                 from = %path.from,
                 from_filter = %path.from_filter,
                 to = %path.to,
                 to_filter = %path.to_filter,
-                "messages brought in from one upstream match another upstream's out rule, so the \
-                 bridge forwards them on to it (each upstream has its own local session, ADR 0060 \
-                 Amendment 1); remap the in rule's topics if they must not cross"
+                "relaying between upstreams, allowed by relay_between_upstreams: messages brought \
+                 in by this rule are forwarded on to the other upstream"
             );
         }
 

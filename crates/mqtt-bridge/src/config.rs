@@ -62,6 +62,14 @@ pub struct BridgeConfig {
     /// Maximum.
     #[serde(default = "default_max_inflight_bytes")]
     pub max_inflight_bytes: u64,
+    /// Allow rules on different upstreams to relay between them (ADR 0060 Amendment 1 §2).
+    /// Each upstream has its own local session, so a message the bridge brings in from one
+    /// upstream is an ordinary local message to the others, and another upstream's `out` rule
+    /// that matches it sends it on. Default `false`: a configuration with such a pair of
+    /// rules is refused, so a flow between two outside zones is always chosen on purpose.
+    /// To keep them apart instead, remap the `in` rule's topics.
+    #[serde(default)]
+    pub relay_between_upstreams: bool,
 }
 
 fn default_max_inflight_bytes() -> u64 {
@@ -430,6 +438,25 @@ impl BridgeConfig {
         }
         if self.max_inflight_bytes == 0 {
             return Err(invalid("max_inflight_bytes must be > 0"));
+        }
+        // ADR 0060 Amendment 1 §2: a message brought in from one upstream reaches another
+        // upstream's out rule like any local message. A new flow between two outside zones
+        // must be chosen on purpose, so such a pair of rules is refused unless allowed.
+        if !self.relay_between_upstreams {
+            let paths = crate::forward::relay_paths(self);
+            if let Some(p) = paths.first() {
+                let more = match paths.len() - 1 {
+                    0 => String::new(),
+                    n => format!(" ({n} more such pair(s) of rules)"),
+                };
+                return Err(invalid(format!(
+                    "messages upstream {:?} brings in by rule {:?} match upstream {:?}'s out rule \
+                     {:?}, so the bridge would forward them from one upstream to the other{more}; \
+                     remap the in rule's topics so they no longer match, or set \
+                     relay_between_upstreams = true to allow it",
+                    p.from, p.from_filter, p.to, p.to_filter
+                )));
+            }
         }
         Ok(())
     }
@@ -808,6 +835,49 @@ mod tests {
         // A QoS 0 rule promises nothing, so a session that ends with the connection is allowed.
         BridgeConfig::parse_toml(&base("session_expiry_secs = 0").replace("qos = 1", "qos = 0"))
             .expect("qos0 may use a clean session");
+    }
+
+    #[test]
+    fn rules_that_relay_between_upstreams_are_refused_unless_allowed() {
+        // ADR 0060 Amendment 1 §2: a's sensors land on local sensors/#, which b's out rule
+        // sends on to b.
+        let base = |top: &str, remap: &str| {
+            format!(
+                r#"
+                {top}
+                [local]
+                url = "x:1883"
+                [[upstreams]]
+                name = "a"
+                url = "a:1"
+                [[upstreams.rules]]
+                direction = "in"
+                filter = "sensors/#"
+                {remap}
+                [[upstreams]]
+                name = "b"
+                url = "b:1"
+                [[upstreams.rules]]
+                direction = "out"
+                filter = "sensors/#"
+                "#
+            )
+        };
+        let err = BridgeConfig::parse_toml(&base("", ""))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(r#"upstream "a" brings in by rule "sensors/#""#)
+                && err.contains(r#"upstream "b"'s out rule "sensors/#""#)
+                && err.contains("relay_between_upstreams = true"),
+            "got: {err}"
+        );
+        // The operator may allow it…
+        BridgeConfig::parse_toml(&base("relay_between_upstreams = true", ""))
+            .expect("allowed on purpose");
+        // …or keep the two apart with a remap.
+        BridgeConfig::parse_toml(&base("", r#"remap = { prefix = "partner-a/" }"#))
+            .expect("remapped topics no longer match b's rule");
     }
 
     #[test]
