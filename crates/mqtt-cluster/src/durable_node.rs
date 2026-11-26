@@ -26,7 +26,7 @@ use crate::cluster_log::ReplicaState;
 use crate::cluster_store::{GroupRoutedLog, LocalLeaseSource};
 use crate::durable_plane::DurablePlane;
 use crate::lease_assign::LeaseAssigner;
-use crate::lease_group::{config as lease_config, LeaseRaft};
+use crate::lease_group::{config as lease_config, propose, LeaseRaft};
 use crate::lease_membership::{apply_action, raft_view, FailureDomain, MembershipReconciler};
 use crate::lease_raft::{GroupId, LeaseRequest, RaftNodeId, ReplicaChange, ReplicationRecord};
 use crate::lease_store::LeaseStore;
@@ -42,7 +42,7 @@ use crate::NodeId;
 use mqtt_storage::logged::ReplicatedSessionStore;
 use mqtt_storage::retained_log::{DurableRetained, ReplicatedRetained};
 use mqtt_storage::SessionStore;
-use openraft::storage::Adaptor;
+use openraft::async_runtime::WatchReceiver;
 use openraft::Raft;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, RwLock};
@@ -209,13 +209,13 @@ pub async fn build_durable_node_with(
         None => LeaseStore::new(),
     }
     .with_commit_delay(commit_delay);
-    let (log_store, state_machine) = Adaptor::new(lease_store.clone());
+    // One store is both halves of openraft's storage: the log and the state machine.
     let raft: LeaseRaft = Raft::new(
         local,
         lease_config(),
         network.clone(),
-        log_store,
-        state_machine,
+        lease_store.clone(),
+        lease_store.clone(),
     )
     .await
     .expect("lease raft starts");
@@ -647,7 +647,7 @@ async fn run_driver(
             // 0021) does not reflect the effective voters.
             let voter_rids: BTreeSet<RaftNodeId> = raft
                 .metrics()
-                .borrow()
+                .borrow_watched()
                 .membership_config
                 .voter_ids()
                 .collect();
@@ -750,7 +750,7 @@ async fn run_driver(
 
         // A live factor change (ADR 0080 §4): the reload's proposal, the leader's
         // verification and commit, and collecting the copies a shrink dropped.
-        let leader = raft.metrics().borrow().current_leader == Some(local);
+        let leader = raft.metrics().borrow_watched().current_leader == Some(local);
         change
             .tick(
                 &raft,
@@ -986,10 +986,7 @@ impl ChangeDriver {
                 }
             }
             ProposalAction::Begin { from, to } => {
-                match raft
-                    .client_write(LeaseRequest::BeginReplicaChange { from, to })
-                    .await
-                {
+                match propose(raft, LeaseRequest::BeginReplicaChange { from, to }).await {
                     Ok(_) => {
                         tracing::info!(
                             from,
@@ -1047,10 +1044,7 @@ impl ChangeDriver {
             };
             self.control.record_round(outcome);
             if outcome.pending == 0 {
-                match raft
-                    .client_write(LeaseRequest::CommitReplicaChange { to: open.to })
-                    .await
-                {
+                match propose(raft, LeaseRequest::CommitReplicaChange { to: open.to }).await {
                     Ok(_) => tracing::info!(
                         from = open.from,
                         to = open.to,

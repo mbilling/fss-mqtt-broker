@@ -29,6 +29,7 @@ use crate::raft_mesh::{dispatch, MeshRaftNetwork};
 use crate::repl_net::PeerReplicaTransport;
 use crate::NodeId;
 use async_trait::async_trait;
+use openraft::async_runtime::WatchReceiver;
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::{mpsc, oneshot};
 
@@ -280,7 +281,7 @@ impl DurablePlane {
     /// Read from the raft metrics — a read-only snapshot, no metrics dependency here.
     #[must_use]
     pub fn lease_role(&self) -> (bool, u64) {
-        let m = self.raft.metrics().borrow().clone();
+        let m = self.raft.metrics().borrow_watched().clone();
         let is_leader = m.current_leader == Some(m.id);
         (is_leader, m.current_term)
     }
@@ -292,7 +293,7 @@ impl DurablePlane {
     pub fn voter_count(&self) -> usize {
         self.raft
             .metrics()
-            .borrow()
+            .borrow_watched()
             .membership_config
             .voter_ids()
             .count()
@@ -305,7 +306,11 @@ impl DurablePlane {
     /// leading indicator that durable recovery is about to start refusing attaches.
     #[must_use]
     pub fn quorum_ack_age_ms(&self) -> Option<u64> {
-        self.raft.metrics().borrow().millis_since_quorum_ack
+        use openraft::Instant;
+        // openraft 0.10 reports the instant of the last quorum ack; its age is read now,
+        // so it keeps growing while acks stall.
+        let acked = self.raft.metrics().borrow_watched().last_quorum_acked?;
+        Some(u64::try_from(acked.elapsed().as_millis()).unwrap_or(u64::MAX))
     }
 
     /// Whether the lease group can serve this node's durable sessions: it has a
@@ -330,7 +335,7 @@ impl DurablePlane {
         {
             return false;
         }
-        let metrics = self.raft.metrics().borrow().clone();
+        let metrics = self.raft.metrics().borrow_watched().clone();
         // ADR 0073: under the cluster-wide scale-out capability a LEARNER is a
         // first-class durable owner (the leader assigns leases to it and it reads
         // its epochs locally), so voter membership stops being a readiness
@@ -907,7 +912,6 @@ mod tests {
     use crate::repl_net::PeerReplicaTransport;
     use crate::NodeId;
     use bytes::BytesMut;
-    use openraft::storage::Adaptor;
     use openraft::{BasicNode, Raft, ServerState};
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
@@ -960,7 +964,7 @@ mod tests {
     async fn node(id: &str) -> DurablePlane {
         let net = MeshRaftNetwork::new();
         let store = LeaseStore::new();
-        let (ls, sm) = Adaptor::new(store);
+        let (ls, sm) = (store.clone(), store);
         let raft: LeaseRaft = Raft::new(raft_id(&n(id)), config(), net.clone(), ls, sm)
             .await
             .unwrap();
@@ -1053,14 +1057,15 @@ mod tests {
             .state(ServerState::Leader, "node-1 leads over the plane")
             .await
             .unwrap();
-        let resp = p1
-            .raft()
-            .client_write(LeaseRequest::Assign {
+        let resp = crate::lease_group::propose(
+            p1.raft(),
+            LeaseRequest::Assign {
                 group: 3,
                 node: raft_id(&n("node-1")),
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(resp.data.unwrap().holder, raft_id(&n("node-1")));
 
         // --- replication: node-1 quorum-appends to node-2's follower copy ---
@@ -1110,7 +1115,7 @@ mod tests {
     async fn lease_group_ready_waits_for_the_first_lease() {
         let net = MeshRaftNetwork::new();
         let store = LeaseStore::new();
-        let (ls, sm) = Adaptor::new(store.clone());
+        let (ls, sm) = (store.clone(), store.clone());
         let raft: LeaseRaft = Raft::new(raft_id(&n("first-lease")), config(), net.clone(), ls, sm)
             .await
             .unwrap();
@@ -1139,13 +1144,15 @@ mod tests {
             "a leader voter with no lease minted is not ready"
         );
 
-        p.raft()
-            .client_write(crate::lease_raft::LeaseRequest::Assign {
+        crate::lease_group::propose(
+            p.raft(),
+            crate::lease_raft::LeaseRequest::Assign {
                 group: 0,
                 node: raft_id(&n("first-lease")),
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await
+        .unwrap();
         assert!(
             p.lease_group_ready(),
             "ready once the first lease is minted"

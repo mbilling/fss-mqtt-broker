@@ -29,8 +29,6 @@
 use crate::lease::Epoch;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-// Required in scope by `declare_raft_types!` (its default `SnapshotData`).
-use std::io::Cursor;
 
 /// Identifier of a placement group whose ownership lease is under consensus.
 pub type GroupId = u64;
@@ -84,6 +82,19 @@ pub enum LeaseRequest {
         /// The factor the open change moves to.
         to: u8,
     },
+}
+
+/// How openraft names a request in its logs (it requires `Display` of the app data).
+impl std::fmt::Display for LeaseRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Assign { group, node } => write!(f, "assign group {group} to node {node}"),
+            Self::AssignMany { assignments } => write!(f, "assign {} groups", assignments.len()),
+            Self::SetReplicas { r } => write!(f, "set replicas {r}"),
+            Self::BeginReplicaChange { from, to } => write!(f, "begin replicas {from} -> {to}"),
+            Self::CommitReplicaChange { to } => write!(f, "commit replicas {to}"),
+        }
+    }
 }
 
 /// The replication factor a cluster with no committed one runs at: every cluster
@@ -354,11 +365,17 @@ openraft::declare_raft_types!(
     /// `Assign` or `AssignMany`) yields `Some(lease)` (the last, for a batch), while
     /// the `Blank`/`Membership` entries Raft commits internally — and an empty batch
     /// — yield `None`.
+    ///
+    /// `Term` and `LeaderId` are openraft's defaults, named because the log ids and
+    /// votes that lease.redb stores and the mesh carries encode them: a `u64` term
+    /// and the advanced leader id `{ term, node_id }`, as under openraft 0.9.
     pub LeaseConfig:
         D = LeaseRequest,
         R = Option<LeaseResponse>,
         NodeId = RaftNodeId,
         Node = openraft::BasicNode,
+        Term = u64,
+        LeaderId = openraft::impls::leader_id_adv::LeaderId<u64, RaftNodeId>,
 );
 
 #[cfg(test)]
@@ -644,26 +661,86 @@ mod tests {
     /// that changes a serde shape fails at `cargo test`, not in a cluster.
     #[test]
     fn openraft_wire_types_roundtrip_under_postcard() {
-        use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId, StoredMembership, Vote};
+        use super::testing::{log_id, vote};
+        use openraft::impls::EntryPayload;
+        use openraft::type_config::alias::{EntryOf, StoredMembershipOf, VoteOf};
 
-        let log_id = LogId::new(CommittedLeaderId::new(3, 1), 7);
-        let entry = Entry::<LeaseConfig> {
-            log_id,
+        let entry = EntryOf::<LeaseConfig> {
+            log_id: log_id(3, 1, 7),
             payload: EntryPayload::Normal(assign(1, 10)),
         };
         let bytes = postcard::to_allocvec(&entry).unwrap();
-        let back: Entry<LeaseConfig> = postcard::from_bytes(&bytes).unwrap();
+        let back: EntryOf<LeaseConfig> = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(back.log_id, entry.log_id);
 
-        let vote = Vote::<u64>::new(3, 1);
+        let vote = vote(3, 1);
         let bytes = postcard::to_allocvec(&vote).unwrap();
-        assert_eq!(postcard::from_bytes::<Vote<u64>>(&bytes).unwrap(), vote);
+        assert_eq!(
+            postcard::from_bytes::<VoteOf<LeaseConfig>>(&bytes).unwrap(),
+            vote
+        );
 
-        let membership = StoredMembership::<u64, openraft::BasicNode>::default();
+        let membership = StoredMembershipOf::<LeaseConfig>::default();
         let bytes = postcard::to_allocvec(&membership).unwrap();
         assert_eq!(
-            postcard::from_bytes::<StoredMembership<u64, openraft::BasicNode>>(&bytes).unwrap(),
+            postcard::from_bytes::<StoredMembershipOf<LeaseConfig>>(&bytes).unwrap(),
             membership
         );
+    }
+}
+
+/// Builders for the openraft values the lease-group tests write by hand.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::{LeaseConfig, RaftNodeId};
+    use openraft::impls::leader_id_adv::LeaderId;
+    use openraft::type_config::alias::{LogIdOf, MembershipOf, VoteOf};
+    use openraft::BasicNode;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// Voters 1 and 2, at addresses "n1" and "n2": the membership the golden-bytes
+    /// tests encode.
+    pub(crate) fn membership() -> MembershipOf<LeaseConfig> {
+        let nodes = BTreeMap::from([(1, BasicNode::new("n1")), (2, BasicNode::new("n2"))]);
+        MembershipOf::<LeaseConfig>::new(vec![BTreeSet::from([1, 2])], nodes)
+            .expect("every voter has a node")
+    }
+
+    /// Lowercase hex of `bytes`.
+    pub(crate) fn hex(bytes: &[u8]) -> String {
+        use std::fmt::Write;
+        bytes.iter().fold(String::new(), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+    }
+
+    /// The bytes a lowercase hex string spells.
+    pub(crate) fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    /// The log id at `index`, written by the leader of `term` on `node`.
+    pub(crate) fn log_id(term: u64, node: RaftNodeId, index: u64) -> LogIdOf<LeaseConfig> {
+        LogIdOf::<LeaseConfig>::new(
+            LeaderId {
+                term,
+                node_id: node,
+            },
+            index,
+        )
+    }
+
+    /// A vote for `node` in `term`, not yet granted by a quorum.
+    pub(crate) fn vote(term: u64, node: RaftNodeId) -> VoteOf<LeaseConfig> {
+        VoteOf::<LeaseConfig>::new(term, node)
+    }
+
+    /// A vote for `node` in `term` that a quorum granted.
+    pub(crate) fn committed_vote(term: u64, node: RaftNodeId) -> VoteOf<LeaseConfig> {
+        VoteOf::<LeaseConfig>::new_committed(term, node)
     }
 }
