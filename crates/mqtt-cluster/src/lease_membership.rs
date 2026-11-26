@@ -28,8 +28,9 @@
 //! result — **debounced** so a flapping member does not churn the voter set. Keeping
 //! `decide` pure makes the policy exhaustively unit-testable without a cluster.
 
-use crate::lease_group::LeaseRaft;
+use crate::lease_group::{leased, LeaseRaft};
 use crate::lease_raft::RaftNodeId;
+use openraft::async_runtime::WatchReceiver;
 use openraft::{BasicNode, ChangeMembers, ServerState};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -268,7 +269,7 @@ impl MembershipReconciler {
 /// The current [`RaftView`] of `raft`, read from its metrics.
 #[must_use]
 pub fn raft_view(raft: &LeaseRaft) -> RaftView {
-    let metrics = raft.metrics().borrow().clone();
+    let metrics = raft.metrics().borrow_watched().clone();
     let membership = metrics.membership_config.membership();
     let voters: BTreeSet<RaftNodeId> = membership.voter_ids().collect();
     let nodes: BTreeSet<RaftNodeId> = membership.nodes().map(|(id, _)| *id).collect();
@@ -315,7 +316,7 @@ pub async fn apply_action(
             add_as_learner,
         } => {
             for id in add_as_learner {
-                raft.add_learner(*id, BasicNode::default(), true)
+                leased(|| raft.add_learner(*id, BasicNode::default(), true))
                     .await
                     .map_err(|e| MembershipError::Raft(e.to_string()))?;
             }
@@ -323,17 +324,19 @@ pub async fn apply_action(
             // target): openraft would otherwise propose a redundant joint config.
             let current: BTreeSet<RaftNodeId> = raft
                 .metrics()
-                .borrow()
+                .borrow_watched()
                 .membership_config
                 .membership()
                 .voter_ids()
                 .collect();
             if &current != target_voters {
                 // retain = true: a voter dropped from the set is kept as a learner.
-                raft.change_membership(
-                    ChangeMembers::ReplaceAllVoters(target_voters.clone()),
-                    true,
-                )
+                leased(|| {
+                    raft.change_membership(
+                        ChangeMembers::ReplaceAllVoters(target_voters.clone()),
+                        true,
+                    )
+                })
                 .await
                 .map_err(|e| MembershipError::Raft(e.to_string()))?;
             }
@@ -342,7 +345,7 @@ pub async fn apply_action(
         MembershipAction::Drop(departed) => {
             // The departed members are learners here (a still-voting member would have
             // been reshaped out first), so RemoveNodes is safe.
-            raft.change_membership(ChangeMembers::RemoveNodes(departed.clone()), false)
+            leased(|| raft.change_membership(ChangeMembers::RemoveNodes(departed.clone()), false))
                 .await
                 .map_err(|e| MembershipError::Raft(e.to_string()))?;
             Ok(())
@@ -364,7 +367,6 @@ mod tests {
     use crate::repl_net::PeerReplicaTransport;
     use crate::NodeId;
     use bytes::BytesMut;
-    use openraft::storage::Adaptor;
     use openraft::{Raft, ServerState};
     use std::collections::BTreeSet;
     use std::sync::{Arc, Mutex};
@@ -749,7 +751,7 @@ mod tests {
     async fn node(id: &str) -> (DurablePlane, LeaseStore) {
         let net = MeshRaftNetwork::new();
         let store = LeaseStore::new();
-        let (ls, sm) = Adaptor::new(store.clone());
+        let (ls, sm) = (store.clone(), store.clone());
         let raft: LeaseRaft = Raft::new(raft_id(&n(id)), config(), net.clone(), ls, sm)
             .await
             .unwrap();
@@ -860,14 +862,15 @@ mod tests {
             .unwrap();
 
         // A committed lease replicates to the grown member.
-        let resp = boot
-            .raft()
-            .client_write(LeaseRequest::Assign {
+        let resp = crate::lease_group::propose(
+            boot.raft(),
+            LeaseRequest::Assign {
                 group: 1,
                 node: boot_id,
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await
+        .unwrap();
         let epoch = resp.data.unwrap().epoch;
         // The non-bootstrap node applied it.
         let target = if boot_is_1 { &p2 } else { &p1 };

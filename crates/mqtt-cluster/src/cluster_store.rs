@@ -1568,7 +1568,6 @@ mod tests {
         use crate::lease_store::LeaseStore;
         use crate::node_registry::raft_id;
         use crate::raft_mesh::MeshRaftNetwork;
-        use openraft::storage::Adaptor;
         use openraft::{BasicNode, Raft, ServerState};
         use std::collections::BTreeMap;
         use std::time::Duration;
@@ -1576,7 +1575,7 @@ mod tests {
         let local = raft_id(&nid("lease-node"));
         let store = LeaseStore::new();
         let source = LocalLeaseSource::new(store.clone(), local);
-        let (ls, sm) = Adaptor::new(store);
+        let (ls, sm) = (store.clone(), store);
         let raft = Raft::new(local, config(), MeshRaftNetwork::new(), ls, sm)
             .await
             .unwrap();
@@ -1592,13 +1591,15 @@ mod tests {
         assert!(source.epoch_for(7).await.is_err());
 
         // Assign group 7 to this node; the owner reads its epoch locally.
-        let resp = raft
-            .client_write(LeaseRequest::Assign {
+        let resp = crate::lease_group::propose(
+            &raft,
+            LeaseRequest::Assign {
                 group: 7,
                 node: local,
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await
+        .unwrap();
         raft.wait(Some(Duration::from_secs(10)))
             .applied_index_at_least(Some(resp.log_id.index), "applied")
             .await
@@ -1606,13 +1607,15 @@ mod tests {
         assert_eq!(source.epoch_for(7).await.unwrap(), resp.data.unwrap().epoch);
 
         // A group assigned to another node is NotOwner to us.
-        let resp = raft
-            .client_write(LeaseRequest::Assign {
+        let resp = crate::lease_group::propose(
+            &raft,
+            LeaseRequest::Assign {
                 group: 8,
                 node: local.wrapping_add(1),
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await
+        .unwrap();
         raft.wait(Some(Duration::from_secs(10)))
             .applied_index_at_least(Some(resp.log_id.index), "applied")
             .await

@@ -17,7 +17,7 @@
 //! the leader. The live driver (the node assembly, next) calls `reconcile` on a tick
 //! and on membership/leadership change.
 
-use crate::lease_group::LeaseRaft;
+use crate::lease_group::{propose, LeaseRaft};
 use crate::lease_membership::raft_view;
 use crate::lease_raft::{GroupId, LeaseRequest, RaftNodeId};
 use crate::lease_store::LeaseStore;
@@ -132,9 +132,12 @@ impl LeaseAssigner {
             return Ok(true); // founded, or a pre-0080 cluster that keeps 3
         }
         if founding.capable.load(Ordering::Relaxed) {
-            raft.client_write(LeaseRequest::SetReplicas {
-                r: founding.replicas,
-            })
+            propose(
+                raft,
+                LeaseRequest::SetReplicas {
+                    r: founding.replicas,
+                },
+            )
             .await
             .map_err(|e| AssignError::Raft(e.to_string()))?;
             tracing::info!(
@@ -204,7 +207,7 @@ impl LeaseAssigner {
             return Ok(0);
         }
         let count = assignments.len();
-        raft.client_write(LeaseRequest::AssignMany { assignments })
+        propose(raft, LeaseRequest::AssignMany { assignments })
             .await
             .map_err(|e| AssignError::Raft(e.to_string()))?;
         Ok(count)
@@ -220,7 +223,6 @@ mod tests {
     use crate::placement::{Placement, DEFAULT_REPLICAS, NUM_GROUPS};
     use crate::raft_mesh::MeshRaftNetwork;
     use crate::NodeId;
-    use openraft::storage::Adaptor;
     use openraft::{BasicNode, Raft, ServerState};
     use std::collections::BTreeMap;
     use std::sync::{Arc, RwLock};
@@ -278,7 +280,7 @@ mod tests {
             DEFAULT_REPLICAS,
         )));
         let store = LeaseStore::new();
-        let (ls, sm) = Adaptor::new(store.clone());
+        let (ls, sm) = (store.clone(), store.clone());
         let raft: LeaseRaft = Raft::new(local, config(), MeshRaftNetwork::new(), ls, sm)
             .await
             .unwrap();
@@ -322,7 +324,7 @@ mod tests {
         let local = raft_id(&node);
         let placement = Arc::new(RwLock::new(Placement::new(node, DEFAULT_REPLICAS)));
         let store = LeaseStore::new();
-        let (ls, sm) = Adaptor::new(store.clone());
+        let (ls, sm) = (store.clone(), store.clone());
         let raft: LeaseRaft = Raft::new(local, config(), MeshRaftNetwork::new(), ls, sm)
             .await
             .unwrap();

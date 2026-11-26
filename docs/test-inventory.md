@@ -317,7 +317,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `two_bridge_instances_do_not_duplicate_forwarding`
 - `two_partitioned_instances_deliver_each_inbound_message_exactly_once`
 
-## `crates/mqtt-cluster/src/lib.rs` — 431 test(s)
+## `crates/mqtt-cluster/src/lib.rs` — 439 test(s)
 
 - `cluster_identity::tests::a_founder_mints_once_and_reloads_stably`
 - `cluster_identity::tests::a_joiner_adopts_once_and_persists`
@@ -467,6 +467,9 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `lease_assign::tests::an_incapable_fresh_cluster_holds_then_founds_at_the_legacy_factor`
 - `lease_assign::tests::leader_assigns_every_group_to_its_owner`
 - `lease_assign::tests::pending_targets_the_hrw_owner_not_the_committed_lease`
+- `lease_group::tests::a_lease_that_never_comes_fails_the_write_after_the_wait`
+- `lease_group::tests::a_write_on_a_follower_fails_at_once`
+- `lease_group::tests::a_write_waits_until_the_leader_is_ready`
 - `lease_group::tests::single_node_group_elects_and_commits_a_lease`
 - `lease_group::tests::three_node_group_replicates_a_committed_lease`
 - `lease_membership::tests::a_dead_voter_is_replaced_by_the_lowest_id_learner`
@@ -507,6 +510,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `lease_raft::tests::unknown_group_has_no_lease`
 - `lease_raft::tests::unset_state_encodes_exactly_as_the_legacy_table`
 - `lease_store::tests::a_foreign_lease_schema_version_fails_closed`
+- `lease_store::tests::a_lease_redb_written_by_1_3_opens`
+- `lease_store::tests::lease_redb_values_keep_the_1_3_bytes`
 - `lease_store::tests::passes_openraft_conformance_suite_in_memory`
 - `lease_store::tests::passes_openraft_conformance_suite_persistent`
 - `lease_store::tests::the_migration_registry_covers_the_contract_range`
@@ -574,7 +579,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `placement::tests::this_node_is_never_removed`
 - `placement::tests::visiting_the_member_set_never_calls_the_allocating_one`
 - `placement::tests::voter_restricted_owner_is_always_a_voter`
+- `raft_mesh::tests::a_1_3_vote_request_carries_no_leadership_transfer`
+- `raft_mesh::tests::a_new_member_catches_up_from_a_snapshot_over_the_wire`
 - `raft_mesh::tests::a_prev_log_id_newer_than_the_applied_entry_at_or_below_its_index_contradicts`
+- `raft_mesh::tests::the_raft_rpcs_keep_the_1_3_wire`
 - `raft_mesh::tests::two_nodes_elect_and_replicate_over_the_wire`
 - `repl_net::tests::a_log_larger_than_a_frame_is_read_in_pages`
 - `repl_net::tests::a_paged_read_that_stops_short_fails_whole`

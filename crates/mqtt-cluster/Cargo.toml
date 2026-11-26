@@ -13,11 +13,18 @@ thiserror.workspace = true
 serde = { workspace = true }
 postcard = { workspace = true }
 bytes = { workspace = true }
+# The lease state machine reads openraft's apply stream.
+futures-util = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 aws-lc-rs = { workspace = true }
 async-trait = "0.1"
-openraft = { version = "0.10.1", features = ["serde"] }
+# Default features off: they add `clap` (Config from a command line), which mqttd
+# does not use; `tokio-rt` is the runtime.
+openraft = { version = "0.10.1", default-features = false, features = ["serde", "tokio-rt"] }
+# The v1 RaftNetwork with chunked InstallSnapshot: the lease-group wire mqttd 1.3
+# (openraft 0.9) speaks, kept so a rolling upgrade mixes versions.
+openraft-legacy = { version = "0.10.1", features = ["serde"] }
 # On-disk persistence for the lease consensus store (ADR 0018 phase 2).
 redb = "2"
 

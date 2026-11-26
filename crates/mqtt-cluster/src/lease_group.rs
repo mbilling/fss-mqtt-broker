@@ -5,7 +5,7 @@
 //! This wires [`LeaseStore`](crate::lease_store::LeaseStore) and the
 //! [`LeaseConfig`](crate::lease_raft::LeaseConfig) binding into a runnable openraft
 //! group: a tuned [`config`] and the [`LeaseRaft`] handle type. The
-//! [`RaftNetwork`](openraft::RaftNetwork) that carries openraft's RPCs between nodes
+//! [`RaftNetwork`](openraft_legacy::network_v1::RaftNetwork) that carries openraft's RPCs between nodes
 //! is implemented in two forms:
 //!
 //! - an **in-memory router** (in the tests) that forwards RPCs to in-process node
@@ -19,12 +19,87 @@
 //! and committing an [`Assign`](crate::lease_raft::LeaseRequest::Assign) into our
 //! [`LeaseMap`](crate::lease_raft::LeaseMap), replicated to every replica.
 
-use crate::lease_raft::LeaseConfig;
+use crate::lease_raft::{LeaseConfig, LeaseRequest};
+use crate::lease_store::LeaseStore;
+use openraft::errors::{ChangeMembershipError, ClientWriteError, ForwardReason, RaftError};
+use openraft::raft::ClientWriteResponse;
 use openraft::Config;
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
-/// The openraft handle type for the lease group.
-pub type LeaseRaft = openraft::Raft<LeaseConfig>;
+/// The openraft handle type for the lease group: its state machine is the
+/// [`LeaseStore`], which is also its log store.
+pub type LeaseRaft = openraft::Raft<LeaseConfig, LeaseStore>;
+
+/// What a lease-group write (`client_write`, `add_learner`, `change_membership`)
+/// fails with.
+pub type WriteError = RaftError<LeaseConfig, ClientWriteError<LeaseConfig>>;
+
+const HEARTBEAT_MS: u64 = 500;
+const ELECTION_TIMEOUT_MIN_MS: u64 = 1500;
+const ELECTION_TIMEOUT_MAX_MS: u64 = 3000;
+
+/// How long a write waits for this leader's lease (see [`leased`]): the longest
+/// election timeout, the time a quorum has to answer a leader before a follower
+/// campaigns against it.
+const LEASE_WAIT: Duration = Duration::from_millis(ELECTION_TIMEOUT_MAX_MS);
+const LEASE_POLL: Duration = Duration::from_millis(20);
+
+/// Run a lease-group write, waiting out a leader that is not ready to take it yet.
+///
+/// openraft 0.10 refuses a write on a leader that no quorum has acknowledged within
+/// the lease period (`ForwardReason::LeaseExpired`): every leader from its election
+/// until its first append is answered, and a leader whose acks stopped. It also
+/// refuses a membership change until the leader's first entry of its term has
+/// committed (`UncommittedLeaderLog`). openraft 0.9 accepted both writes and
+/// committed them once the quorum answered. This retries those refusals on this
+/// node, as openraft advises, for up to [`LEASE_WAIT`]. Any other result returns
+/// at once, including the refusal of a node that is no longer the leader.
+///
+/// # Errors
+/// What the write returns; a leader still not ready after [`LEASE_WAIT`] as that
+/// refusal.
+pub async fn leased<T, F, Fut>(mut write: F) -> Result<T, WriteError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, WriteError>>,
+{
+    let deadline = tokio::time::Instant::now() + LEASE_WAIT;
+    loop {
+        match write().await {
+            Err(e) if leader_not_ready(&e) && tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(LEASE_POLL).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Whether `e` is a leader's refusal that clears once a quorum has answered it.
+fn leader_not_ready(e: &WriteError) -> bool {
+    match e {
+        RaftError::APIError(ClientWriteError::ForwardToLeader(f)) => {
+            f.reason == ForwardReason::LeaseExpired
+        }
+        RaftError::APIError(ClientWriteError::ChangeMembershipError(
+            ChangeMembershipError::UncommittedLeaderLog(_),
+        )) => true,
+        _ => false,
+    }
+}
+
+/// Propose `req` to the lease group, through [`leased`].
+///
+/// # Errors
+/// As [`leased`]: this node is not the leader, its lease stayed unconfirmed, or
+/// the group failed.
+pub async fn propose(
+    raft: &LeaseRaft,
+    req: LeaseRequest,
+) -> Result<ClientWriteResponse<LeaseConfig>, WriteError> {
+    leased(|| raft.client_write(req.clone())).await
+}
 
 /// A tuned openraft [`Config`] for the lease group: a small, low-traffic group, so
 /// a brisk heartbeat and short election timeouts give fast failover without much
@@ -45,9 +120,9 @@ pub fn config() -> Arc<Config> {
         // these timeouts.
         Config {
             cluster_name: "mqttd-lease".to_string(),
-            heartbeat_interval: 500,
-            election_timeout_min: 1500,
-            election_timeout_max: 3000,
+            heartbeat_interval: HEARTBEAT_MS,
+            election_timeout_min: ELECTION_TIMEOUT_MIN_MS,
+            election_timeout_max: ELECTION_TIMEOUT_MAX_MS,
             ..Default::default()
         }
         .validate()
@@ -57,23 +132,28 @@ pub fn config() -> Arc<Config> {
 
 #[cfg(test)]
 mod tests {
-    use super::{config, LeaseRaft};
+    use super::{config, propose, LeaseRaft};
+    use crate::lease_raft::testing::log_id;
     use crate::lease_raft::{LeaseConfig, LeaseRecord, LeaseRequest, LeaseResponse};
-    use crate::lease_store::LeaseStore;
-    use openraft::error::{InstallSnapshotError, RPCError, RaftError, RemoteError, Unreachable};
-    use openraft::network::RPCOption;
-    use openraft::raft::{
-        AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
-        InstallSnapshotResponse, VoteRequest, VoteResponse,
+    use crate::lease_store::{LeaseStore, SnapshotData};
+    use openraft::errors::{
+        ChangeMembershipError, ClientWriteError, ForwardReason, ForwardToLeader, RPCError,
+        RaftError, RemoteError, UncommittedLeaderLog, Unreachable,
     };
-    use openraft::storage::Adaptor;
-    use openraft::{BasicNode, Raft, RaftNetwork, RaftNetworkFactory, ServerState};
+    use openraft::network::RPCOption;
+    use openraft::raft::{AppendEntriesRequest, AppendEntriesResponse, VoteRequest, VoteResponse};
+    use openraft::{BasicNode, Raft, RaftNetworkFactory, ServerState};
+    use openraft_legacy::network_v1::{
+        Adapter, ChunkedSnapshotReceiver, InstallSnapshotError, InstallSnapshotRequest,
+        InstallSnapshotResponse, RaftNetwork,
+    };
+    use std::cell::Cell;
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     type NodeId = u64;
-    type NetErr = RPCError<NodeId, BasicNode, RaftError<NodeId>>;
+    type NetErr = RPCError<LeaseConfig, RaftError<LeaseConfig>>;
 
     /// An in-memory network: forwards openraft RPCs to in-process node handles.
     #[derive(Clone, Default)]
@@ -93,12 +173,10 @@ mod tests {
 
     /// Build an `Unreachable` RPC error for a missing target (generic over the RPC's
     /// error type, so it serves all three RPCs).
-    fn unreachable<E: std::error::Error>(id: NodeId) -> RPCError<NodeId, BasicNode, E> {
-        let e = std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("node {id} not registered"),
-        );
-        RPCError::Unreachable(Unreachable::new(&e))
+    fn unreachable<E: std::error::Error>(id: NodeId) -> RPCError<LeaseConfig, E> {
+        RPCError::Unreachable(Unreachable::from_string(format!(
+            "node {id} not registered"
+        )))
     }
 
     /// A connection to one target node (a handle into the router).
@@ -108,12 +186,13 @@ mod tests {
     }
 
     impl RaftNetworkFactory<LeaseConfig> for Router {
-        type Network = Conn;
-        async fn new_client(&mut self, target: NodeId, _node: &BasicNode) -> Conn {
+        type Network = Adapter<LeaseConfig, Conn, SnapshotData>;
+        async fn new_client(&mut self, target: NodeId, _node: &BasicNode) -> Self::Network {
             Conn {
                 target,
                 router: self.clone(),
             }
+            .into_v2()
         }
     }
 
@@ -122,21 +201,22 @@ mod tests {
             &mut self,
             rpc: AppendEntriesRequest<LeaseConfig>,
             _option: RPCOption,
-        ) -> Result<AppendEntriesResponse<NodeId>, NetErr> {
+        ) -> Result<AppendEntriesResponse<LeaseConfig>, NetErr> {
             let raft = self
                 .router
                 .get(self.target)
                 .ok_or_else(|| unreachable(self.target))?;
             raft.append_entries(rpc)
                 .await
+                .map(AppendEntriesResponse::from)
                 .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
         }
 
         async fn vote(
             &mut self,
-            rpc: VoteRequest<NodeId>,
+            rpc: VoteRequest<LeaseConfig>,
             _option: RPCOption,
-        ) -> Result<VoteResponse<NodeId>, NetErr> {
+        ) -> Result<VoteResponse<LeaseConfig>, NetErr> {
             let raft = self
                 .router
                 .get(self.target)
@@ -151,8 +231,8 @@ mod tests {
             rpc: InstallSnapshotRequest<LeaseConfig>,
             _option: RPCOption,
         ) -> Result<
-            InstallSnapshotResponse<NodeId>,
-            RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
+            InstallSnapshotResponse<LeaseConfig>,
+            RPCError<LeaseConfig, RaftError<LeaseConfig, InstallSnapshotError>>,
         > {
             let raft = self
                 .router
@@ -167,8 +247,7 @@ mod tests {
     /// Bring up node `id` against `router`, returning its handle and its store.
     async fn start(router: &Router, id: NodeId) -> (LeaseRaft, LeaseStore) {
         let store = LeaseStore::new();
-        let (log_store, state_machine) = Adaptor::new(store.clone());
-        let raft = Raft::new(id, config(), router.clone(), log_store, state_machine)
+        let raft = Raft::new(id, config(), router.clone(), store.clone(), store.clone())
             .await
             .expect("raft node starts");
         router.register(id, raft.clone());
@@ -194,8 +273,7 @@ mod tests {
             .await
             .unwrap();
 
-        let resp = raft
-            .client_write(LeaseRequest::Assign { group: 7, node: 1 })
+        let resp = propose(&raft, LeaseRequest::Assign { group: 7, node: 1 })
             .await
             .unwrap();
         assert_eq!(
@@ -238,8 +316,7 @@ mod tests {
             .unwrap();
 
         // Commit a lease via the leader.
-        let resp = rafts[&1]
-            .client_write(LeaseRequest::Assign { group: 5, node: 2 })
+        let resp = propose(&rafts[&1], LeaseRequest::Assign { group: 5, node: 2 })
             .await
             .unwrap();
         let epoch = resp.data.unwrap().epoch;
@@ -261,5 +338,67 @@ mod tests {
         for id in [1, 2, 3] {
             rafts[&id].shutdown().await.unwrap();
         }
+    }
+
+    fn not_leased() -> super::WriteError {
+        RaftError::APIError(ClientWriteError::ForwardToLeader(
+            ForwardToLeader::empty().with_reason(ForwardReason::LeaseExpired),
+        ))
+    }
+
+    /// openraft 0.10 refuses writes on a leader that no quorum has acknowledged yet,
+    /// and membership changes until its first entry commits; a lease-group write
+    /// waits both out, as openraft 0.9 queued such writes.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_waits_until_the_leader_is_ready() {
+        let uncommitted = RaftError::APIError(ClientWriteError::ChangeMembershipError(
+            ChangeMembershipError::UncommittedLeaderLog(UncommittedLeaderLog {
+                committed: None,
+                leader_log_id: log_id(2, 1, 5),
+            }),
+        ));
+        let mut refusals = vec![not_leased(), uncommitted, not_leased()];
+        let attempts = Cell::new(0);
+        let written = super::leased(|| {
+            attempts.set(attempts.get() + 1);
+            let refusal = refusals.pop();
+            async move { refusal.map_or(Ok(7), Err) }
+        })
+        .await;
+        assert_eq!(written.unwrap(), 7);
+        assert_eq!(attempts.get(), 4);
+    }
+
+    /// Any other refusal returns at once: a write on a follower does not wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_on_a_follower_fails_at_once() {
+        let attempts = Cell::new(0);
+        let written: Result<(), _> = super::leased(|| {
+            attempts.set(attempts.get() + 1);
+            async {
+                Err(RaftError::APIError(ClientWriteError::ForwardToLeader(
+                    ForwardToLeader::new(2, BasicNode::default()),
+                )))
+            }
+        })
+        .await;
+        assert!(written.is_err());
+        assert_eq!(attempts.get(), 1);
+    }
+
+    /// A leader that no quorum answers fails the write after one election timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_lease_that_never_comes_fails_the_write_after_the_wait() {
+        let started = tokio::time::Instant::now();
+        let written: Result<(), _> = super::leased(|| async { Err(not_leased()) }).await;
+        assert!(matches!(
+            written,
+            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_)))
+        ));
+        let waited = started.elapsed();
+        assert!(
+            waited >= super::LEASE_WAIT && waited < super::LEASE_WAIT + Duration::from_secs(1),
+            "{waited:?}"
+        );
     }
 }

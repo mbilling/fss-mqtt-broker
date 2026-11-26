@@ -1254,6 +1254,7 @@ checksum = "8b147ee9d1f6d097cef9ce628cd2ee62288d963e16fb287bd9286455b241382d"
 dependencies = [
  "futures-channel",
  "futures-core",
+ "futures-executor",
  "futures-io",
  "futures-sink",
  "futures-task",
@@ -2347,9 +2348,11 @@ dependencies = [
  "aws-lc-rs",
  "bytes",
  "criterion",
+ "futures-util",
  "mqtt-core",
  "mqtt-storage",
  "openraft",
+ "openraft-legacy",
  "postcard",
  "redb",
  "serde",
@@ -2673,7 +2676,6 @@ dependencies = [
  "anyerror",
  "backoff-series",
  "base2histogram",
- "clap",
  "derive_more",
  "display-more",
  "futures-util",
@@ -2682,7 +2684,6 @@ dependencies = [
  "openraft-macros",
  "openraft-rt",
  "openraft-rt-tokio",
- "parse-size",
  "peel-off",
  "quorum-set",
  "rand 0.10.2",
@@ -2694,6 +2695,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "openraft-legacy"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9473613d832eaa7226f2ef097a710b5863c5f6e45d5ae7e9f70870ea89662139"
+dependencies = [
+ "anyerror",
+ "derive_more",
+ "display-more",
+ "futures",
+ "openraft",
+ "openraft-macros",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "openraft-macros"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2702,7 +2721,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "semver",
- "syn 3.0.9",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -2878,12 +2897,6 @@ dependencies = [
  "smallvec",
  "windows-link",
 ]
-
-[[package]]
-name = "parse-size"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "487f2ccd1e17ce8c1bfab3a65c89525af41cfad4c8659021a1e9a2aacd73b89b"
 
 [[package]]
 name = "password-hash"

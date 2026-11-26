@@ -993,15 +993,8 @@ async fn a_bounded_voter_cluster_owns_every_session_on_a_voter_and_survives_fail
 
     // Voter identity from the settled membership. The driver pushes this voter set into
     // Placement each tick (ADR 0049), so ownership can restrict to it — wait until it has.
-    let voter_rids: BTreeSet<RaftNodeId> = a
-        .plane
-        .raft()
-        .metrics()
-        .borrow()
-        .membership_config
-        .membership()
-        .voter_ids()
-        .collect();
+    let voter_rids: BTreeSet<RaftNodeId> =
+        mqtt_cluster::lease_membership::raft_view(a.plane.raft()).voters;
     let is_voter = |n: &DurableNode| voter_rids.contains(&raft_id(&n.node_id));
     let voters: Vec<&&DurableNode> = nodes.iter().filter(|n| is_voter(n)).collect();
     let learners: Vec<&&DurableNode> = nodes.iter().filter(|n| !is_voter(n)).collect();
@@ -1174,15 +1167,8 @@ async fn the_scale_out_domain_owns_sessions_on_learners_that_serve() {
         nodes.iter().all(|n| n.plane.voter_count() == 1)
     })
     .await;
-    let voter_rids: BTreeSet<RaftNodeId> = a
-        .plane
-        .raft()
-        .metrics()
-        .borrow()
-        .membership_config
-        .membership()
-        .voter_ids()
-        .collect();
+    let voter_rids: BTreeSet<RaftNodeId> =
+        mqtt_cluster::lease_membership::raft_view(a.plane.raft()).voters;
     let learner_ids: BTreeSet<NodeId> = nodes
         .iter()
         .filter(|n| !voter_rids.contains(&raft_id(&n.node_id)))
@@ -1330,15 +1316,8 @@ async fn growing_the_scaled_out_cluster_migrates_ownership_with_zero_acked_loss(
 
     // Ownership spreads onto the new members — learners included (the ADR 0073
     // domain; under ADR 0049 alone the newcomers could own nothing durable).
-    let voter_rids: BTreeSet<RaftNodeId> = n1
-        .plane
-        .raft()
-        .metrics()
-        .borrow()
-        .membership_config
-        .membership()
-        .voter_ids()
-        .collect();
+    let voter_rids: BTreeSet<RaftNodeId> =
+        mqtt_cluster::lease_membership::raft_view(n1.plane.raft()).voters;
     let newcomer_ids: BTreeSet<NodeId> =
         [&n4, &n5, &n6].iter().map(|n| n.node_id.clone()).collect();
     wait_until(Duration::from_mins(1), || {
