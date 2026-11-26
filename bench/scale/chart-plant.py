@@ -15,6 +15,9 @@ card exceeded its packet allowance (ENA pps_allowance_exceeded) from about 110k 
 node and the ladder ended on a VOID round there; on c6in.4xlarge, the network-optimized
 type with the same CPU, the same 12 nodes carried the rig's 2,000,000 msg/s ceiling at
 1.15M packets/s a node with no exceedance. The gap is the network card, not the broker.
+18 × c6in.4xlarge, the most brokers the account's 384-vCPU quota holds beside their
+generators, carried 2,992,500 with the knee bracketed above it (3,069,400 not taken), the
+hub task again the limit.
 
 The points are written here, with the run each is read from (named in the SVG's <desc>),
 rather than re-read from `.runs/` (untracked scratch), so the chart can be regenerated
@@ -47,17 +50,20 @@ POINTS = [
     {"nodes": 8, "host": "m6i.4xlarge", "msg_per_s": 1_322_000, "p99_ms": 494, "fast": (1_057_600, 48),
      "floor": False, "why": "", "taken": None, "run": "h3-20261106T182931Z", "date": "2026-11-06",
      "note": "after a 5 → 8 join under load; 1,355,100 not taken"},
+    {"nodes": 12, "host": "c6in.4xlarge", "msg_per_s": 2_000_000, "p99_ms": 657, "fast": (1_322_000, 12),
+     "floor": True, "why": "the rig's rate ceiling", "taken": None, "run": "h3-20261106T233606Z",
+     "date": "2026-11-07", "note": "the rig's MAX_RATE ceiling; 1,983,000 at 572 ms"},
     {"nodes": 12, "host": "m6i.4xlarge", "msg_per_s": 1_322_000, "p99_ms": 39, "fast": (1_322_000, 39),
      "floor": True, "why": "network card throttled", "taken": (1_568_049, 1_586_400),
      "run": "h3-20261106T194402Z", "date": "2026-11-06",
      "note": "after an 8 → 12 join under load; 1,454,200 VOID twice (one generator's tail) while the brokers' "
              "packet allowance was exceeded; 1,586,400 offered, 1,568,049 taken (98.8%)"},
-    {"nodes": 12, "host": "c6in.4xlarge", "msg_per_s": 2_000_000, "p99_ms": 657, "fast": (1_322_000, 12),
-     "floor": True, "why": "the rig's rate ceiling", "taken": None, "run": "h3-20261106T233606Z",
-     "date": "2026-11-07", "note": "the rig's MAX_RATE ceiling; 1,983,000 at 572 ms"},
+    {"nodes": 18, "host": "c6in.4xlarge", "msg_per_s": 2_992_500, "p99_ms": 711, "fast": (2_250_000, 35),
+     "floor": False, "why": "", "taken": None, "run": "h3-20261126T112146Z", "date": "2026-11-26",
+     "note": "3,069,400 not taken; at 3,300,000 offered the brokers took 3,040,133"},
 ]
 BASE = POINTS[0]   # the per-node rate the dotted line extends
-# Every step of the five ladders, for the latency chart, by run: (offered msg/s, verdict,
+# Every step of the six ladders, for the latency chart, by run: (offered msg/s, verdict,
 # ack p50 ms, ack p99 ms, p99 min, p99 max), the latencies the mean of the step's rounds and
 # the rounds' extremes; read from each run's report.json (the card's table has the same).
 CARRIED, NOT_TAKEN, VOID = "CARRIED", "OFFER NOT TAKEN", "VOID"
@@ -81,6 +87,10 @@ STEPS = {
     "h3-20261106T233606Z": [
         (1_322_000, CARRIED, 0.8, 11.7, 11.2, 12.5), (1_983_000, CARRIED, 21.1, 571.6, 532.0, 626.7),
         (2_000_000, CARRIED, 134.5, 656.9, 654.8, 660.0)],
+    "h3-20261126T112146Z": [
+        (2_250_000, CARRIED, 1.1, 35.5, 34.1, 37.6), (2_992_500, CARRIED, 26.2, 711.2, 699.9, 731.6),
+        (3_069_400, NOT_TAKEN, 68.4, 691.7, 691.7, 691.7), (3_146_300, NOT_TAKEN, 214.5, 749.1, 749.1, 749.1),
+        (3_300_000, NOT_TAKEN, 485.4, 714.2, 714.2, 714.2)],
 }
 # Where each ladder's label stands on the latency chart: beside the step at `at` msg/s,
 # `dx`/`dy` from that point, anchored as said. Placed by hand, since the data is fixed.
@@ -90,13 +100,14 @@ LABELS = {
     "h3-20261106T182931Z": None,
     "h3-20261106T194402Z": ("12 × m6i.4xlarge: network card throttled", 1_454_200, -11, 4, "end"),
     "h3-20261106T233606Z": ("12 × c6in.4xlarge", 1_322_000, 10, 17, "start"),
+    "h3-20261126T112146Z": ("18 × c6in.4xlarge", 2_250_000, 10, 17, "start"),
 }
 # One colour per AWS node type, in the order the types were measured: the categorical
 # slots carry identity here (one broker, two hosts), as they carry brokers elsewhere.
 SLOT = {"m6i.4xlarge": "s1", "c6in.4xlarge": "s2"}
 HOST_LABEL = {"m6i.4xlarge": "m6i.4xlarge", "c6in.4xlarge": "c6in.4xlarge: the same CPU, network-optimized"}
-TITLE = "Add a node, add 165k msg/s: durable QoS 1 scales linearly to 2 million msg/s on 12 nodes"
-TITLE_LATENCY = "Latency follows the load per node, not the cluster size: ack p99 from 3 to 12 nodes"
+TITLE = "Add a node, add 165k msg/s: durable QoS 1 scales linearly to 3 million msg/s on 18 nodes"
+TITLE_LATENCY = "Latency follows the load per node, not the cluster size: ack p99 from 3 to 18 nodes"
 OUT_LATENCY = ROOT / "docs/benchmarks/img/rig2/plant-latency.svg"
 HEADLINE = ROOT / "docs/benchmarks/data/headline.csv"
 
@@ -104,8 +115,8 @@ W, H = 1080, 560
 X0, X1 = 96, W - 48          # plot box
 YT, YB = 150, 480            # plot top and base
 BAR = 44
-X_MAX = 13.4
-Y_MAX = 2_500_000
+X_MAX = 19.4
+Y_MAX = 3_500_000
 Y_STEP = 500_000
 # The latency chart: msg/s per node across, ack p99 up on a log scale.
 LX_MAX = 205_000
@@ -141,6 +152,11 @@ def column_x(p: dict) -> float:
     return X(p["nodes"]) + (i - len(pair) / 2) * (BAR + 2) + 1
 
 
+def reach(p: dict) -> float:
+    """How high a column draws: its dashed extension where the brokers took more than it carried."""
+    return p["taken"][0] if p["taken"] else p["msg_per_s"]
+
+
 def figure(p: dict) -> str:
     return ("≥ " if p["floor"] else "") + total(p["msg_per_s"])
 
@@ -152,14 +168,15 @@ def draw() -> str:
         W, H, TITLE,
         "Plant shape: a site is one bridge connection, 250 topics, 10,000 msg/s → one durable $share historian "
         f"group · mqttd v1.3.0 · AWS, {VCPU_EACH}-vCPU nodes · Nov 2026",
-        "Columns of the cluster's maximum lossless msg/s at 3, 5, 8 and 12 nodes on AWS, coloured by node type, "
+        "Columns of the cluster's maximum lossless msg/s at 3, 5, 8, 12 and 18 nodes on AWS, coloured by node type, "
         "the type named under each column. " + "; ".join(
             f"{p['nodes']} × {p['host']}: {figure(p)} msg/s, {per_node(p['msg_per_s'] / p['nodes'])} a node, "
             f"ack p99 {p['p99_ms']} ms" for p in POINTS)
         + f". A dotted line extends the 3-node rate, {per_node(per)} a node. At 12 nodes the m6i.4xlarge column "
         "stops at 1.32M with a dashed extension to the 1.57M the brokers received but did not carry, its network "
         "card throttled; the c6in.4xlarge column, the same CPU with a network-optimized card, reaches 2.0M, the "
-        "rig's ceiling. Source: bench/scale/rig2 runs "
+        "rig's ceiling then. At 18 nodes, c6in.4xlarge, the column reaches 2.99M with its knee bracketed above. "
+        "Source: bench/scale/rig2 runs "
         + ", ".join(f"{p['run']} ({p['nodes']} × {p['host']})" for p in POINTS) + ", each run's report.md.")
     o.append(cs.text(32, 86, "each column: the cluster's maximum lossless step (3 rounds, no message lost) and "
                      "its ack p99 · ≥ where the ladder ended above the step", size=13, role="ink2"))
@@ -186,7 +203,7 @@ def draw() -> str:
     o.append(cs.text((X0 + X1) / 2, YB + 52, f"nodes, {VCPU_EACH} vCPU each · at 12 the same cluster on both "
                      "node types", size=11, role="muted", anchor="middle"))
     # The dotted line of the 3-node rate, drawn before the columns so they sit on it.
-    x_end = 12.9
+    x_end = 18.9
     o.append(f'<line x1="{X(BASE["nodes"]):.1f}" y1="{Y(per * BASE["nodes"]):.1f}" x2="{X(x_end):.1f}" '
              f'y2="{Y(per * x_end):.1f}" class="k-ghost" stroke-width="2" stroke-dasharray="0.1 5" '
              'stroke-linecap="round"/>')
@@ -211,10 +228,15 @@ def draw() -> str:
         if p["taken"]:
             got, offered = p["taken"]
             lines.append((f"received {total(got)} of {total(offered)} offered", 11, "muted", 400))
-        # A pair's left column labels to the left of the pair, clear of the taller column.
+        # The shorter column of a pair labels on its outer side, beside its top and clear of
+        # the taller column, which labels above itself like a lone one.
         pair = [q for q in POINTS if q["nodes"] == p["nodes"]]
-        if len(pair) > 1 and pair.index(p) == 0:
-            anchor, lx_, ly = "end", bx - 6, Y(p["taken"][0] if p["taken"] else p["msg_per_s"]) + 4
+        if len(pair) > 1 and reach(p) < max(reach(q) for q in pair):
+            if pair.index(p) == len(pair) - 1:
+                anchor, lx_ = "start", bx + BAR + 6
+            else:
+                anchor, lx_ = "end", bx - 6
+            ly = Y(reach(p)) + 4
             for s_, size, role_, wt in lines:
                 o.append(cs.text(lx_, ly, s_, size=size, role=role_, anchor=anchor, weight=wt, num=True, halo=True))
                 ly += size + 3
@@ -253,12 +275,14 @@ def draw_latency() -> str:
     hosts = sorted({p["host"] for p in POINTS}, key=lambda h: SLOT[h])
     o = cs.open_svg(
         W, H, TITLE_LATENCY,
-        "every step of the five ladders above: ack p99, the mean of its rounds, by msg/s offered per node · "
+        "every step of the six ladders above: ack p99, the mean of its rounds, by msg/s offered per node · "
         "ack p50 about 1 ms to 132k a node on an unthrottled card",
-        "Ack p99 on a log scale against msg/s offered per node for every step of the five plant-shape ladders, "
+        "Ack p99 on a log scale against msg/s offered per node for every step of the six plant-shape ladders, "
         "coloured by node type, one line per ladder through its carried steps. The 3-, 5- and 8-node m6i.4xlarge "
-        "ladders and the 12-node c6in.4xlarge ladder lie on one curve: about 1 ms to 75k a node, 12-16 ms at 110k, "
-        "46-55 ms at 132-141k, 180 ms at 155k, 390-570 ms at 165k and 657 ms at 167k, the 12-node ladder's end. "
+        "ladders and the 12- and 18-node c6in.4xlarge ladders lie on one curve: about 1 ms to 75k a node, 12-16 ms "
+        "at 110k, 35 ms at 125k, 46-55 ms at 132-141k, 180 ms at 155k, 390-570 ms at 165k and 657-711 ms at "
+        "166-167k, where the 12- and 18-node ladders carry their last step; the 18-node steps above it, 171k to "
+        "183k a node, were not taken. "
         "The 12-node m6i.4xlarge ladder leaves that curve early: 39 ms at 110k a node, a voided round at 463 ms "
         "at 121k, the offer not taken at 132k, its network card throttled. Steps not carried are hollow marks. "
         "Source: the runs " + ", ".join(f"{p['run']} ({p['nodes']} × {p['host']})" for p in POINTS) + ".")
