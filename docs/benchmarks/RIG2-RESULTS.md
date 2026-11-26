@@ -578,24 +578,28 @@ Run `h3-20261030T211314Z` · 1 × m7a.8xlarge broker (32 vCPU in all), 1 × m6i.
 
 ## AWS, the plant shape
 
-Durable QoS 1 in the shape of a fleet of power plants, measured on 2026-11-06 and 2026-11-07
-on the v1.3.0 release with `MQTTD_RECEIVE_MAXIMUM=4096` (the shipped default is 256, which
+Durable QoS 1 in the shape of a fleet of power plants, measured on 2026-11-06, 2026-11-07 and
+2026-11-26 on the v1.3.0 release with `MQTTD_RECEIVE_MAXIMUM=4096` (the shipped default is 256, which
 holds a site at 256 publishes in flight ÷ the ack latency). The workload is
 `bench/scale/rig2/workloads/plant-qos1.env`: every site is one bridge connection carrying
 its own 250 topics at up to 10,000 msg/s, payloads of 50 to 200 bytes, and one durable
 `$share` group of 240 members per generator, the historian, takes every topic. Sites
 follow the rate: a step's sites on a generator are its rate ÷ 10,000, rounded up to a whole
 number per broker. Brokers are 16-vCPU `m6i.4xlarge` (Intel Xeon Platinum 8375C) and, in the
-last run, `c6in.4xlarge`: the same CPU and vCPU count on a network-optimized card. The
-generators are `m6i.2xlarge`, 6 for the 3-, 5- and 8-node clusters and 8 for 12 nodes.
+last two runs, `c6in.4xlarge`: the same CPU and vCPU count on a network-optimized card. The
+generators are `m6i.2xlarge`, 6 for the 3-, 5- and 8-node clusters and 8 for 12 nodes, and
+11 × `c6in.2xlarge` for 18 nodes.
 
-**Linear from 3 to 12 nodes.** The maximum lossless step is 495,800 msg/s on 3 nodes,
-826,300 on 5, 1,322,000 on 8 and 2,000,000 on 12 × `c6in.4xlarge`: 165,250–166,667 msg/s a
-node, within 1%, at ack p99 0.39–0.66 s. The 12-node ladder ended at the rig's 2,000,000
-msg/s ceiling (`MAX_RATE`), carried in all 3 rounds, so its knee lies above the figure. Each
-cluster's highest step within ack p99 ≤ 100 ms is 421,900, 661,000, 1,057,600 and 1,322,000
-msg/s (55, 46, 48 and 12 ms). The README's `plant-scale-out.svg` and `plant-latency.svg`
-(`bench/scale/chart-plant.py`) draw these five ladders.
+**Linear from 3 to 18 nodes.** The maximum lossless step is 495,800 msg/s on 3 nodes,
+826,300 on 5, 1,322,000 on 8, 2,000,000 on 12 × `c6in.4xlarge` and 2,992,500 on 18 ×
+`c6in.4xlarge`: 165,250–166,667 msg/s a node, within 1%, at ack p99 0.39–0.71 s. The 12-node
+ladder ended at the rig's 2,000,000 msg/s ceiling (`MAX_RATE`) of the time, carried in all 3
+rounds, so its knee lies above the figure; the 18-node ladder, with the ceiling at 3,300,000,
+bracketed its knee: 3,069,400 was not taken. Each cluster's highest step within ack p99 ≤ 100
+ms is 421,900, 661,000, 1,057,600, 1,322,000 and 2,250,000 msg/s (55, 46, 48, 12 and 35 ms);
+2,250,000 is the 18-node ladder's first step, so that band's edge lies at or above it. The
+README's `plant-scale-out.svg` and `plant-latency.svg` (`bench/scale/chart-plant.py`) draw
+these six ladders.
 
 **The 5-, 8- and 12-node m6i clusters were built by a join under load** ([the rig's join
 step](../../bench/scale/rig2/README.md#join-under-load)): a cluster carrying cohort A's traffic took its new
@@ -630,14 +634,26 @@ on the rig.
   (the rule is 99%) with the hub loops' queues at 1,400–2,700 of their ~4,100 cap. The same 12
   nodes as `c6in.4xlarge` moved 1.15 million packets/s each at 2,000,000 msg/s with no
   exceedance on any of the 20 hosts, and carried 1,322,000 at ack p99 11.7 ms.
-- **Hub-bound at 2,000,000.** On 12 × `c6in.4xlarge` the busiest node's hub loop dispatched
-  83% of wall-clock at 2,000,000 msg/s, 4.9 µs a message, with its queue at most 6,172
-  commands: the per-node ceiling is the hub task's, as on the other AWS shapes.
+- **Hub-bound at 2,000,000 and at 2,992,500.** On 12 × `c6in.4xlarge` the busiest node's hub
+  loop dispatched 83% of wall-clock at 2,000,000 msg/s, 4.9 µs a message, with its queue at
+  most 6,172 commands. On 18 it dispatched 85% at 2,992,500 and 85–86% at every step above,
+  5.0–5.1 µs a message, with no queue above 5,623, while the busiest host's broker used 6.0
+  of its 16 cores and its busiest disk was 21% busy: the per-node ceiling is the hub task's,
+  as on the other AWS shapes.
+- **18 × `c6in.4xlarge`: the network card is the next limit.** At 2,250,000 msg/s the
+  busiest broker moved 0.86 million packets/s and no broker's ENA counter grew. At 2,992,500
+  the busiest moved 1.04–1.07 million, and in every round 5 or 6 of the 18 brokers'
+  `pps_allowance_exceeded` counters grew, by 21,818–31,798 packets a round in all, about
+  0.002–0.003% of the brokers' packets. Above the knee the counts were no larger (2,332–23,775
+  a round, the busiest broker at 1.09–1.17 million packets/s), so these are bursts, not yet a
+  ceiling; the 11 generators' counters never grew. A node that dispatched faster would meet
+  its card's allowance soon after.
 - **Latency at the knee.** Every cluster's maximum lossless step sits at ack p99 0.39–0.66 s;
   its highest step within 100 ms is 66–85% of it. The band edges are not bisected in these
   ladders (`band_bisect` off).
 - **Uneven `$share` spread,** as on the other AWS runs: the busiest consumer received
-  1.5–2.5× the mean consumer's deliveries at 12 nodes.
+  1.5–2.5× the mean consumer's deliveries at 12 nodes, and 1.7–4.4× at 18 nodes' maximum
+  lossless step.
 
 ### 3 × m6i.4xlarge
 
@@ -746,3 +762,25 @@ Run `h3-20261106T233606Z` · 12 × c6in.4xlarge brokers (192 vCPU in all), 8 × 
 | 3 | 2,000,000 | CARRIED | 3 | 1,991,040 | 656.9 ± 2.7 ms |
 
 The figure is a floor: the ladder's ceiling, not a knee. Every round at 2,000,000 was carried with the brokers receiving 99.3–99.8% of the offer and no message lost; the hub loops were at 0.82–0.83 busy on the busiest node. The ENA counters on all 20 hosts read no `pps_allowance_exceeded` at 1.15 million packets/s per broker.
+
+### 18 × c6in.4xlarge
+
+![Durable QoS 1 in the plant shape, 18 × c6in.4xlarge: ack p99 by offered msg/s](img/rig2/aws-18x-c6in4xl-plant-qos1.svg)
+
+Run `h3-20261126T112146Z` · 18 × c6in.4xlarge brokers (288 vCPU in all), 11 × c6in.2xlarge generators · 3 rounds a step · 50–200 B payload · latency is the ack p99, the mean of the rounds ± their standard deviation. A cluster formed at once, not grown by a join: the most brokers the account's 384-vCPU quota holds beside their generators. The ladder started at 2,250,000 (125,000 a node), climbed ×1.33 to 2,992,500 and to the 3,300,000 msg/s ceiling (`MAX_RATE`), and bisected to 3%.
+
+- **Maximum lossless:** 2,992,500 msg/s offered, 166.2k per node and 10,391 per vCPU (brokers received 2,965,219), ack p99 711.2 ± 17.8 ms
+- **ack p99 ≤ 1 s:** 2,992,500 msg/s (711.2 ± 17.8 ms)
+- **ack p99 ≤ 250 ms:** 2,250,000 msg/s (35.5 ± 1.9 ms)
+- **ack p99 ≤ 100 ms:** 2,250,000 msg/s (35.5 ± 1.9 ms)
+- ladder ended: knee bracketed: good at 2992500, not at 3069400 msg/s (2.6% gap)
+
+| step | offered msg/s | verdict | rounds | brokers received (mean) | ack p99 (mean ± sd) |
+|---|---|---|---|---|---|
+| 1 | 2,250,000 | CARRIED | 3 | 2,250,031 | 35.5 ± 1.9 ms |
+| 2 | 2,992,500 | CARRIED | 3 | 2,965,219 | 711.2 ± 17.8 ms |
+| 3 | 3,300,000 | OFFER NOT TAKEN | 1 | 3,040,133 | 714 ms |
+| 4 | 3,146,300 | OFFER NOT TAKEN | 1 | 3,006,630 | 749 ms |
+| 5 | 3,069,400 | OFFER NOT TAKEN | 1 | 3,013,704 | 692 ms |
+
+The second round at 2,992,500 was not taken at first (no reason recorded) and carried on its retry, the rig's transient retry after a step below at ack p99 under 50 ms. At the maximum lossless step the brokers received 99.1% of the offer; above it they took at most 3,040,133 msg/s, at 3,300,000 offered. The 11 generators ran at 44–51% CPU with scheduling lag p99 at most 1.6 ms. The hub loops and the network cards are in the known limits above.

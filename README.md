@@ -10,8 +10,8 @@
 An MQTT 3.1.1 and 5.0 broker in Rust that clusters, replicates durable sessions by
 default, and ships every feature under Apache-2.0.
 
-> - **Durable QoS 1 scales linearly:** 2,000,000 msg/s with no message lost on 12 nodes,
->   165k a node from 3 nodes to 12, with site bridges feeding one `$share` group; every
+> - **Durable QoS 1 scales linearly:** 2,992,500 msg/s with no message lost on 18 nodes,
+>   165k a node from 3 nodes to 18, with site bridges feeding one `$share` group; every
 >   message is acked after fsync and a quorum copy on another node.
 > - **Against HiveMQ:** 390,300 durable msg/s with no message lost on 96 vCPU from
 >   thousands of small publishers, at ack p99 112 ms; HiveMQ 4.18 publishes 270,000 on the
@@ -55,21 +55,25 @@ mqttd has no production users yet. The evidence below is what it offers instead.
 Durable QoS 1 is the hardest path a broker serves: every acknowledgement waits for
 fsync and a quorum copy on another node. It is the one we measure first.
 
-![Durable QoS 1 in the plant shape on AWS: one column per cluster at its maximum lossless msg/s from 3 to 12 nodes, coloured by node type, with a dotted line extending the 3-node rate per node; 12 nodes on m6i.4xlarge stop where their network cards throttled, the same 12 nodes on c6in.4xlarge reach the generators' rate ceiling](docs/benchmarks/img/rig2/plant-scale-out.svg)
+![Durable QoS 1 in the plant shape on AWS: one column per cluster at its maximum lossless msg/s from 3 to 18 nodes, coloured by node type, with a dotted line extending the 3-node rate per node; 12 nodes on m6i.4xlarge stop where their network cards throttled, the same 12 nodes on c6in.4xlarge reach the rig's rate ceiling of the time, and 18 nodes on c6in.4xlarge stay on the line](docs/benchmarks/img/rig2/plant-scale-out.svg)
 
 - **Add a node, add 165k msg/s.** The plant shape: every site is one bridge connection
   carrying its own 250 topics, and one durable `$share` historian group takes them all.
   On AWS, with 16-vCPU nodes, 3 × m6i.4xlarge carry 495,800 msg/s, 5 carry 826,300, 8
-  carry 1,322,000 and 12 × c6in.4xlarge carry 2,000,000, the most the load generators
-  offer: 165k a node from 3 to 12, no message lost, ack p99 under 1 s. At ack p99 ≤ 100 ms
-  the 12 nodes carry 1,322,000 msg/s (ack p99 12 ms) and the smaller clusters 80–85% of
-  their maximum.
+  carry 1,322,000, 12 × c6in.4xlarge carry 2,000,000, all the rig offered then, and 18 ×
+  c6in.4xlarge carry 2,992,500: 165k a node from 3 to 18, no message lost, ack p99 under
+  1 s. At ack p99 ≤ 100 ms each cluster carries 66–85% of its maximum, the 18 nodes 75% at
+  35 ms.
 - **The network card, not the broker.** Twelve m6i.4xlarge nodes stopped at 1,322,000
   msg/s (ack p99 39 ms): from about 110k msg/s a node their network cards exceeded AWS's
   packet allowance, and the ladder ended on a round that one load generator's host
   decided, not the brokers. Twelve c6in.4xlarge nodes, the same CPU behind a
   network-optimized card, moved 1.15 million packets a second each with no exceedance and
   carried 2,000,000.
+- **At 18 nodes, the hub task again.** The 18 c6in.4xlarge nodes stopped where their one hub
+  task did: the busiest was 85% busy, its broker using 6 of its 16 cores. Their network cards
+  came close: at 2,992,500 msg/s the busiest moved about 1.05 million packets a second, and
+  5 or 6 of the 18 briefly exceeded their packet allowance in every round.
 - **Grown under load.** The 5-, 8- and 12-node m6i.4xlarge clusters were built by joining
   nodes to a cluster carrying traffic (3 → 5, 5 → 8, 8 → 12) and measured after. The first
   two joins kept every session and every message. The 8 → 12 join lost 11 durable
@@ -80,7 +84,7 @@ fsync and a quorum copy on another node. It is the one we measure first.
   is fixed in [#1220](https://github.com/mbilling/fss-mqtt-broker/pull/1220) but not yet
   measured on the rig. No message went missing end to end.
 
-![Ack p99 on a log scale by msg/s per node for every step of the five plant-shape ladders: the 3-, 5- and 8-node m6i.4xlarge ladders and the 12-node c6in.4xlarge ladder lie on one curve, about 1 ms at low load and half a second at 165k a node; the 12-node m6i.4xlarge ladder leaves it at 110k a node, its network cards throttled](docs/benchmarks/img/rig2/plant-latency.svg)
+![Ack p99 on a log scale by msg/s per node for every step of the six plant-shape ladders: the 3-, 5- and 8-node m6i.4xlarge ladders and the 12- and 18-node c6in.4xlarge ladders lie on one curve, about 1 ms at low load and 0.4–0.7 s at 165k a node; the 12-node m6i.4xlarge ladder leaves it at 110k a node, its network cards throttled](docs/benchmarks/img/rig2/plant-latency.svg)
 
 The standard durable workload is the other extreme: thousands of publishers at 50 msg/s
 each, into `$share` groups of persistent consumers. On Hetzner and AWS, against HiveMQ's
