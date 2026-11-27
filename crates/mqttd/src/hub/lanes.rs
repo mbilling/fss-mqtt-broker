@@ -307,6 +307,20 @@ pub(super) enum AppendGate {
         /// Its pending publish there.
         id: u64,
     },
+    /// A peer's forward another shard of this node received and handed here (ADR 0093
+    /// Amendment 5): answered to that shard as [`Shard`](Self::Shard) is — it answers
+    /// the peer once every shard has — and recorded under the forward's own identity, as
+    /// [`Peer`](Self::Peer) is.
+    ShardPeer {
+        /// The shard the forward arrived on.
+        origin: u8,
+        /// Its hand-off gate there.
+        id: u64,
+        /// The publish's identity on the node that sent it, when the forward named it.
+        from: Option<PublishOrigin>,
+        /// A takeover re-route (#784): skip a session already holding the publish.
+        replay: bool,
+    },
     /// Nobody is told (a Will, a plain forward, a retained-window back-fill): a
     /// refused durable copy is a counted drop and the live delivery still happens
     /// (issue #238).
@@ -329,7 +343,9 @@ impl AppendGate {
         match self {
             Self::Pending(id) | Self::Replay(id) => AppendThen::Gate(*id),
             Self::Peer { node, seq, .. } => AppendThen::Peer(node.clone(), *seq),
-            Self::Shard { origin, id } => AppendThen::Shard(*origin, *id),
+            Self::Shard { origin, id } | Self::ShardPeer { origin, id, .. } => {
+                AppendThen::Shard(*origin, *id)
+            }
             Self::None | Self::LiveOnly => AppendThen::Ungated,
         }
     }
@@ -367,6 +383,7 @@ impl AppendGate {
                 }),
                 *replay,
             ),
+            Self::ShardPeer { from, replay, .. } => (from.clone(), *replay),
             Self::Peer { origin: None, .. } | Self::None | Self::LiveOnly => (None, false),
         }
     }

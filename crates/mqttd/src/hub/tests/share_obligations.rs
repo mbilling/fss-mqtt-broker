@@ -58,7 +58,7 @@ fn link_as(hub: &mut Hub, name: &str, proto: u32, conn_id: u64) -> Link {
     let node = NodeId(name.into());
     let (tx, rx) = mpsc::unbounded_channel();
     let (ctl, ctl_rx) = mpsc::unbounded_channel();
-    hub.peer_connected(node.clone(), conn_id, tx, ctl, None, proto, Arc::default());
+    hub.peer_connected(&node, conn_id, tx, ctl, None, proto, Arc::default());
     Link {
         node,
         rx,
@@ -336,8 +336,7 @@ async fn a_peer_silent_for_a_sweep_interval_is_sent_its_ordinary_forwards_oldest
     for proto in [PROTO_MAX, PROTO_V1_1_0] {
         let mut h = hub();
         let first = peer(&mut h, "p", proto, &["c"]);
-        h.interest
-            .replace(first.node.clone(), vec!["t/#".to_string()]);
+        h.interest.replace(first.node.clone(), &["t/#".to_string()]);
         h.peer_disconnected(&first.node, 0);
         let (older, _a) = publish_ordinary(&mut h, "t/a", QoS::AtLeastOnce);
         let (newer, _b) = publish_ordinary(&mut h, "t/a", QoS::AtLeastOnce);

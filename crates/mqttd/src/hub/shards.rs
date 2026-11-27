@@ -17,7 +17,7 @@
 //! the loop's own sender, [`Hub::owns`] is always true, there is no board, nothing is
 //! published and no answer waits.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use bytes::Bytes;
@@ -81,6 +81,16 @@ pub struct RoutingBoard {
     /// `max_sessions` quota (ADR 0041 T4).
     sessions: Box<[AtomicUsize]>,
     reaper: std::sync::mpsc::SyncSender<Arc<RoutingPartition>>,
+    /// ADR 0093 Amendment 5: one bit per shard, set once its interest is authoritative
+    /// (its boot scan has landed). Shard 0 gossips the node's interest only with all set.
+    authoritative: AtomicU32,
+    /// One bit per shard, set while its routing view is settling: a takeover window, a
+    /// session scan in flight, no complete scan yet. A publish on any shard can match a
+    /// session that is still on its way to another.
+    settling: AtomicU32,
+    /// One bit per shard, set while its takeover is open: its window armed, or a scan
+    /// it started still materialising sessions.
+    takeover: AtomicU32,
 }
 
 /// How many replaced partitions per shard of the node the reaper's one queue holds before
@@ -113,6 +123,9 @@ impl RoutingBoard {
             version: AtomicU64::new(0),
             sessions: (0..shards).map(|_| AtomicUsize::new(0)).collect(),
             reaper,
+            authoritative: AtomicU32::new(0),
+            settling: AtomicU32::new(0),
+            takeover: AtomicU32::new(0),
         });
         (board, freed)
     }
@@ -171,6 +184,49 @@ impl RoutingBoard {
         })
     }
 
+    /// Shard `shard`'s interest is authoritative (ADR 0093 Amendment 5).
+    pub(super) fn mark_authoritative(&self, shard: usize) {
+        self.authoritative.fetch_or(1 << shard, Ordering::Release);
+    }
+
+    /// Whether every shard's interest is authoritative.
+    pub(super) fn all_authoritative(&self) -> bool {
+        self.authoritative.load(Ordering::Acquire) == self.every_shard()
+    }
+
+    /// Record whether shard `shard`'s routing view is settling (ADR 0093 Amendment 5).
+    pub(super) fn set_settling(&self, shard: usize, settling: bool) {
+        if settling {
+            self.settling.fetch_or(1 << shard, Ordering::Release);
+        } else {
+            self.settling.fetch_and(!(1 << shard), Ordering::Release);
+        }
+    }
+
+    /// Whether a shard other than `shard` is settling.
+    pub(super) fn others_settling(&self, shard: usize) -> bool {
+        self.settling.load(Ordering::Acquire) & !(1 << shard) != 0
+    }
+
+    /// Record whether shard `shard`'s takeover is open (ADR 0093 Amendment 5).
+    pub(super) fn set_takeover(&self, shard: usize, open: bool) {
+        if open {
+            self.takeover.fetch_or(1 << shard, Ordering::Release);
+        } else {
+            self.takeover.fetch_and(!(1 << shard), Ordering::Release);
+        }
+    }
+
+    /// Whether a shard other than `shard` has its takeover open.
+    pub(super) fn others_in_takeover(&self, shard: usize) -> bool {
+        self.takeover.load(Ordering::Acquire) & !(1 << shard) != 0
+    }
+
+    /// One bit for each of the node's shards.
+    fn every_shard(&self) -> u32 {
+        (1u32 << self.cells.len()) - 1
+    }
+
     fn sessions_besides(&self, shard: usize) -> usize {
         self.sessions
             .iter()
@@ -226,6 +282,32 @@ pub fn shard_of(client: &str, shards: usize) -> usize {
     let group = mqtt_cluster::placement::group_of(client);
     let shards = u64::try_from(shards).unwrap_or(u64::MAX);
     usize::try_from(group % shards).unwrap_or(0)
+}
+
+/// Where a shard's tag sits in the ids it issues: the top bits of every publish id and
+/// forward seq of a shard of more than one (`set_shards`).
+const SHARD_TAG_SHIFT: u32 = 60;
+
+/// The shard a peer's forwards are handled on (ADR 0093 Amendment 5): its node's place,
+/// plus `lane`, the shard of that node that sent an acknowledged one. A retransmission
+/// carries the same seq, so it reaches the window that saw the original, and one
+/// publisher's forwards — all sent by one shard of its node — keep their order. One shard
+/// handles all of a node's unacknowledged forwards.
+#[must_use]
+pub fn peer_shard(node: &mqtt_cluster::NodeId, lane: u64, shards: usize) -> usize {
+    if shards <= 1 {
+        return 0;
+    }
+    let base = mqtt_cluster::placement::group_of(&node.0);
+    let shards = u64::try_from(shards).unwrap_or(u64::MAX);
+    usize::try_from(base.wrapping_add(lane) % shards).unwrap_or(0)
+}
+
+/// The shard that sent a forward this node is answered for: its seq's tag
+/// (`set_shards`). A tag past the last shard — a seq from a previous life of the node with
+/// more shards, which nobody here waits for — goes to the last, which finds nothing.
+fn issuing_shard(seq: u64, shards: usize) -> usize {
+    usize::try_from(seq >> SHARD_TAG_SHIFT).map_or(shards - 1, |s| s.min(shards - 1))
 }
 
 /// The sender connections and the rest of the node reach the hub by (ADR 0092 T5).
@@ -324,6 +406,8 @@ impl HubTx {
         };
         let target = match cmd.route() {
             Route::Client(client) => Target::Shard(shard_of(&client.0, shards.len())),
+            Route::Peer(node, lane) => Target::Shard(peer_shard(node, lane, shards.len())),
+            Route::Issuer(seq) => Target::Shard(issuing_shard(seq, shards.len())),
             Route::First => Target::Shard(0),
             Route::All => Target::All,
             Route::Join => Target::Join,
@@ -418,6 +502,11 @@ where
 enum Route<'a> {
     /// The shard that owns this client.
     Client(&'a ClientId),
+    /// A peer's forward (ADR 0093 Amendment 5): its node, and the shard of that node
+    /// that sent it (an acknowledged forward's seq says which; 0 for one that is not).
+    Peer(&'a mqtt_cluster::NodeId, u64),
+    /// The answer to a forward this node sent: the shard its seq names.
+    Issuer(u64),
     /// The first shard: nothing about the command names a client.
     First,
     /// Every shard, each its own copy.
@@ -443,6 +532,11 @@ impl HubCommand {
             | Self::PkidBlockReserved { client, .. }
             | Self::RemoteSharedDeliver { client, .. }
             | Self::RemoteSharedDeliverAcked { client, .. } => Route::Client(client),
+            Self::RemotePublishAcked { node, seq, .. } => Route::Peer(node, seq >> SHARD_TAG_SHIFT),
+            Self::RemotePublish { node, .. } => Route::Peer(node, 0),
+            Self::RemotePublishAck { seq, .. } | Self::RemotePublishVerdict { seq, .. } => {
+                Route::Issuer(*seq)
+            }
             Self::SessionRecovered { pending, .. } => Route::Client(&pending.client),
             Self::AppendDone { job, .. } => Route::Client(&job.client),
             Self::Publish {
@@ -496,12 +590,23 @@ pub enum ShardTarget {
         /// `min(publish QoS, granted)`.
         qos: QoS,
     },
+    /// An ordinary subscriber a settle-window re-delivery found (ADR 0093 Amendment 5):
+    /// delivered only if its session is offline, or was resumed since the publish was
+    /// made, as the origin's own re-delivery chooses (#1011).
+    Replay {
+        /// The subscriber.
+        client: ClientId,
+        /// When the publish was made.
+        since: tokio::time::Instant,
+    },
 }
 
 impl ShardTarget {
     fn client(&self) -> &ClientId {
         match self {
-            Self::Ordinary(c) | Self::Shared { client: c, .. } => c,
+            Self::Ordinary(c) | Self::Shared { client: c, .. } | Self::Replay { client: c, .. } => {
+                c
+            }
         }
     }
 }
@@ -513,10 +618,21 @@ impl ShardTarget {
 pub struct ShardDeliver {
     /// The shard the publish entered on, where its pending entry lives.
     pub origin: u8,
-    /// The origin's pending publish, when the publisher waits for an acknowledgement:
-    /// answered with one [`HubCommand::ShardDone`] once every delivery here has settled.
+    /// The origin's pending publish, when the publisher waits for an acknowledgement,
+    /// or (with [`HANDOFF_GATE`] set) the origin's gate for a peer's forward or a
+    /// re-delivery (ADR 0093 Amendment 5): answered with one [`HubCommand::ShardDone`]
+    /// once every delivery here has settled.
     /// `None` for a `QoS` 0 publish, a Will or a peer's unanswered forward.
     pub gate: Option<u64>,
+    /// The publish a copy comes from when it is a peer's forward, as the forward named it
+    /// (#784): recorded with every copy queued here, as the receiving shard records its
+    /// own. `None` for this node's publishes, whose identity is the origin's pending id.
+    pub from: Option<mqtt_storage::PublishOrigin>,
+    /// A re-route or re-delivery (#784): a session already holding the publish is skipped.
+    pub replay: bool,
+    /// The broker's own `$SYS` message (ADR 0084): delivered to the sessions connected
+    /// now, kept for none.
+    pub live_only: bool,
     /// Destination topic.
     pub topic: String,
     /// Application payload.
@@ -535,6 +651,46 @@ pub struct ShardDeliver {
     /// this shard has dispatched it; a gated publish's stays on its pending entry until
     /// the last shard answers.
     pub credit: Option<crate::ingress::IngressPermit>,
+}
+
+/// The bit that marks a hand-off's gate as one of the origin's [`GateHandoff`]s rather
+/// than a pending publish (ADR 0093 Amendment 5). Pending ids stay below it.
+pub(super) const HANDOFF_GATE: u64 = 1 << 63;
+
+/// What a hand-off gate answers (ADR 0093 Amendment 5).
+#[derive(Debug, Clone)]
+pub(super) enum HandoffFor {
+    /// A peer's acknowledged forward: the peer is answered once every shard has.
+    Peer {
+        node: mqtt_cluster::NodeId,
+        seq: u64,
+    },
+    /// A settle-window re-delivery of this shard's pending publish `id`: its
+    /// acknowledgement waits for it, and a session it reached is the evidence a local
+    /// one is.
+    Redelivery { id: u64 },
+}
+
+/// How one publish's hand-offs are gated ([`Hub::flush_handoffs`]).
+struct HandoffGate {
+    /// The id the target answers: the pending publish's, or one of this shard's gates.
+    id: Option<u64>,
+    /// What one of this shard's gates answers, when `id` is one.
+    what: Option<HandoffFor>,
+    /// The publish a copy comes from, when not this node's own pending publish.
+    from: Option<mqtt_storage::PublishOrigin>,
+    /// A re-route or re-delivery (#784).
+    replay: bool,
+    /// The broker's own `$SYS` message.
+    live_only: bool,
+}
+
+/// A hand-off gate this shard issued, and the shards that still owe their answer.
+#[derive(Debug)]
+pub(super) struct GateHandoff {
+    what: HandoffFor,
+    /// One bit per shard.
+    outstanding: u8,
 }
 
 /// The hand-offs one shard owes another from one of its dispatch batches, sent as one
@@ -676,8 +832,8 @@ impl Hub {
             // A publish's identity on the node is `(node, id)` (#784), recorded with
             // every copy a session queues: each shard issues from its own range, the
             // shard in the top bits, so two shards never mint the same id.
-            let low = (1u64 << 60) - 1;
-            let tag = u64::from(shard) << 60;
+            let low = (1u64 << SHARD_TAG_SHIFT) - 1;
+            let tag = u64::from(shard) << SHARD_TAG_SHIFT;
             self.publish_ids = (self.publish_ids & low) | tag;
             self.forward_seq = (self.forward_seq & low) | tag;
         }
@@ -763,6 +919,7 @@ impl Hub {
     /// `idle` (the loop is about to park, or a flush asks) publishes whatever the spacing.
     /// Nothing with one shard.
     pub(super) fn publish_routing(&mut self, idle: bool) {
+        self.publish_settling();
         let Some(board) = &self.routing_board else {
             return;
         };
@@ -800,6 +957,60 @@ impl Hub {
             }
             waiting.answer.send();
         }
+        // ADR 0093 Amendment 5: shard 0 gossips the node's interest, and reads this shard's
+        // change in what was just published.
+        if self.gossip_owed {
+            self.gossip_owed = false;
+            if let Some(first) = self.shard_txs.first() {
+                let _ = first.send(HubCommand::GossipInterest);
+            }
+        }
+    }
+
+    /// Tell the board whether this shard's routing view is settling, when that changed
+    /// (ADR 0093 Amendment 5). Nothing with one shard.
+    pub(super) fn publish_settling(&mut self) {
+        let Some(board) = &self.routing_board else {
+            return;
+        };
+        let settling = self.own_routing_settling();
+        if settling != self.settling_published {
+            board.set_settling(usize::from(self.shard), settling);
+            self.settling_published = settling;
+        }
+        let takeover = self.takeover_reconcile_ticks > 0 || self.inherited_scan_inflight;
+        if takeover != self.takeover_published {
+            board.set_takeover(usize::from(self.shard), takeover);
+            self.takeover_published = takeover;
+        }
+    }
+
+    /// Whether another shard's takeover is open (ADR 0093 Amendment 5): a session this
+    /// shard's publishes match may still be on its way there. Never with one shard.
+    pub(super) fn others_in_takeover(&self) -> bool {
+        self.routing_board
+            .as_ref()
+            .is_some_and(|board| board.others_in_takeover(usize::from(self.shard)))
+    }
+
+    /// This shard's interest is authoritative: its boot scan landed (or the backstop ran
+    /// out). With more than one shard the board says so for the node's gossip (ADR 0093
+    /// Amendment 5).
+    pub(super) fn note_interest_authoritative(&mut self) {
+        self.interest_authoritative = true;
+        if let Some(board) = &self.routing_board {
+            board.mark_authoritative(usize::from(self.shard));
+        }
+    }
+
+    /// Whether the node's interest is authoritative: this shard's, and every other
+    /// shard's as the board says (ADR 0093 Amendment 5).
+    pub(super) fn node_interest_authoritative(&self) -> bool {
+        self.interest_authoritative
+            && self
+                .routing_board
+                .as_ref()
+                .is_none_or(|board| board.all_authoritative())
     }
 
     /// Before a publish is matched (ADR 0093 Amendment 4): the other shards' routing as
@@ -881,18 +1092,17 @@ impl Hub {
             return;
         }
         let mut targets = std::mem::take(&mut self.handoff);
-        let gated = match gate {
-            AppendGate::Pending(id) => Some(*id),
-            AppendGate::Replay(_) => {
-                targets.clear();
-                self.handoff = targets;
-                return;
-            }
-            AppendGate::Peer { .. }
-            | AppendGate::Shard { .. }
-            | AppendGate::None
-            | AppendGate::LiveOnly => None,
-        };
+        let g = self.handoff_gate(gate);
+        // Whom a gated publish's fan-out reached includes the sessions other shards hold,
+        // so a re-delivery hands none of them a second copy (ADR 0093 Amendment 5).
+        if let AppendGate::Pending(id) | AppendGate::Replay(id) = gate {
+            let reached: Vec<ClientId> = targets
+                .iter()
+                .filter(|t| !matches!(t, ShardTarget::Shared { .. }))
+                .map(|t| t.client().clone())
+                .collect();
+            self.pending_reached(*id, reached.into_iter());
+        }
         let count = usize::from(self.shard_count);
         let me = usize::from(self.shard);
         for shard in (0..count).filter(|s| *s != me) {
@@ -909,34 +1119,17 @@ impl Hub {
             if batch.is_empty() {
                 continue;
             }
-            // ADR 0093 D3: the publish's ingress credit travels with its hand-off — on
-            // the pending entry until the last shard answers when it is gated, inside
-            // the batch until the target has dispatched it when it is not — so the pool
-            // is charged for the hand-off's lifetime, and a shard that answers late
-            // parks the publishers that feed it as a loop that dispatches late parks
-            // its own (ADR 0082).
-            let credit = if let Some(id) = gated {
-                if let Some(p) = self.pending_publishes.get_mut(id) {
-                    p.shard_outstanding |= 1 << shard;
-                }
-                if let Some(credit) = self.publish_credit.take() {
-                    self.pending_publishes.hold_credit(id, credit);
-                }
-                // The per-pair credit: one more answer owed by `shard`.
-                if let Some(owed) = self.handoff_inflight.get_mut(shard) {
-                    *owed = owed.saturating_add(1);
-                }
-                None
-            } else {
-                self.publish_credit.take()
-            };
+            let credit = self.owe_handoff_answer(&g, shard);
             if let Some(m) = &self.metrics {
                 m.publish_forwarded("shard");
             }
             if let Some(pending) = self.handoff_batches.get_mut(shard) {
                 pending.push(ShardDeliver {
                     origin: self.shard,
-                    gate: gated,
+                    gate: g.id,
+                    from: g.from.clone(),
+                    replay: g.replay,
+                    live_only: g.live_only,
                     topic: topic.to_string(),
                     payload: payload.clone(),
                     qos,
@@ -951,6 +1144,124 @@ impl Hub {
         if targets.capacity() > 0 && targets.is_empty() {
             self.handoff = targets;
         }
+    }
+
+    /// How a hand-off of a publish gated here by `gate` is gated (ADR 0093 Amendment 5).
+    /// A peer's acknowledged forward is gated as a client's publish is — the peer is
+    /// answered once every shard has stored its part — and its copies keep the forward's
+    /// identity. A settle-window re-delivery reaches the sessions other shards
+    /// materialised since the publish, as a replay of it (#784), under a gate of its own.
+    /// A `$SYS` message stays live-only.
+    fn handoff_gate(&mut self, gate: &AppendGate) -> HandoffGate {
+        let plain = HandoffGate {
+            id: None,
+            what: None,
+            from: None,
+            replay: false,
+            live_only: false,
+        };
+        match gate {
+            AppendGate::Pending(id) => HandoffGate {
+                id: Some(*id),
+                ..plain
+            },
+            AppendGate::Replay(id) => HandoffGate {
+                id: Some(self.next_handoff_gate()),
+                what: Some(HandoffFor::Redelivery { id: *id }),
+                from: Some(mqtt_storage::PublishOrigin {
+                    node: self.node_id.0.clone(),
+                    id: *id,
+                }),
+                replay: true,
+                ..plain
+            },
+            AppendGate::Peer {
+                node,
+                seq,
+                origin,
+                replay,
+            } => HandoffGate {
+                id: Some(self.next_handoff_gate()),
+                what: Some(HandoffFor::Peer {
+                    node: node.clone(),
+                    seq: *seq,
+                }),
+                from: origin.map(|id| mqtt_storage::PublishOrigin {
+                    node: node.0.clone(),
+                    id,
+                }),
+                replay: *replay,
+                ..plain
+            },
+            AppendGate::LiveOnly => HandoffGate {
+                live_only: true,
+                ..plain
+            },
+            AppendGate::Shard { .. } | AppendGate::ShardPeer { .. } | AppendGate::None => plain,
+        }
+    }
+
+    /// Shard `shard` is handed a part of a publish gated by `g`, and owes the answer.
+    ///
+    /// ADR 0093 D3: the publish's ingress credit travels with its hand-off — on the
+    /// pending entry until the last shard answers when it is gated, inside the batch
+    /// until the target has dispatched it when it is not (the credit returned) — so the
+    /// pool is charged for the hand-off's lifetime, and a shard that answers late parks
+    /// the publishers that feed it as a loop that dispatches late parks its own (ADR
+    /// 0082).
+    fn owe_handoff_answer(
+        &mut self,
+        g: &HandoffGate,
+        shard: usize,
+    ) -> Option<crate::ingress::IngressPermit> {
+        let Some(id) = g.id else {
+            return self.publish_credit.take();
+        };
+        if let Some(what) = &g.what {
+            match what {
+                HandoffFor::Peer { node, seq } => {
+                    // One more answer the forward's verdict waits for, and no relaxed
+                    // early answer (#399): the other shard has not yet taken it.
+                    let gate = self
+                        .remote_append_pending
+                        .entry((node.clone(), *seq))
+                        .or_insert(super::lanes::RemoteAppendGate {
+                            awaiting: 0,
+                            worst: DurableOutcome::Ok,
+                            congested: false,
+                            answered: false,
+                            reached: false,
+                            held: false,
+                        });
+                    gate.awaiting += 1;
+                    gate.congested = true;
+                }
+                HandoffFor::Redelivery { id: pending } => {
+                    if let Some(p) = self.pending_publishes.get_mut(*pending) {
+                        p.redeliveries = p.redeliveries.saturating_add(1);
+                    }
+                }
+            }
+            self.gate_handoffs
+                .entry(id)
+                .or_insert_with(|| GateHandoff {
+                    what: what.clone(),
+                    outstanding: 0,
+                })
+                .outstanding |= 1 << shard;
+        } else {
+            if let Some(p) = self.pending_publishes.get_mut(id) {
+                p.shard_outstanding |= 1 << shard;
+            }
+            if let Some(credit) = self.publish_credit.take() {
+                self.pending_publishes.hold_credit(id, credit);
+            }
+        }
+        // The per-pair credit: one more answer owed by `shard`.
+        if let Some(owed) = self.handoff_inflight.get_mut(shard) {
+            *owed = owed.saturating_add(1);
+        }
+        None
     }
 
     /// Send what this dispatch batch collected (ADR 0093 D3): one
@@ -1014,6 +1325,13 @@ impl Hub {
     /// answer the origin once every delivery has settled (gated) or not at all.
     pub(super) fn dispatch_shard_deliver(&mut self, d: ShardDeliver) {
         let gate = match d.gate {
+            _ if d.live_only => AppendGate::LiveOnly,
+            Some(id) if id & HANDOFF_GATE != 0 => AppendGate::ShardPeer {
+                origin: d.origin,
+                id,
+                from: d.from.clone(),
+                replay: d.replay,
+            },
             Some(id) => AppendGate::Shard {
                 origin: d.origin,
                 id,
@@ -1041,6 +1359,34 @@ impl Hub {
                         d.message_expiry,
                         &d.app,
                         d.retain && terms.retain_as_published,
+                        &gate,
+                    );
+                    worst = worst.and(out);
+                    reached = true;
+                }
+                ShardTarget::Replay { client, since } => {
+                    if !self.owns(&client) {
+                        continue;
+                    }
+                    let terms = self.delivery_terms(&client, &d.topic);
+                    // Offline (an inherited session), or attached since the publish by
+                    // resuming a session that existed before it: as the origin's own
+                    // re-delivery chooses (#1011).
+                    let owed = self
+                        .online
+                        .get(&client)
+                        .is_none_or(|o| o.resumed && o.attached_at > since);
+                    if !terms.matched || !owed {
+                        continue;
+                    }
+                    let out = self.deliver_to_client(
+                        &client,
+                        &d.topic,
+                        &d.payload,
+                        min_qos(d.qos, terms.granted),
+                        d.message_expiry,
+                        &d.app,
+                        false,
                         &gate,
                     );
                     worst = worst.and(out);
@@ -1146,6 +1492,10 @@ impl Hub {
         reached: bool,
     ) {
         let bit = 1u8 << shard.min(7);
+        if id & HANDOFF_GATE != 0 {
+            self.gate_handoff_done(bit, shard, id, outcome, reached);
+            return;
+        }
         let Some(p) = self.pending_publishes.get_mut(id) else {
             return;
         };
@@ -1174,6 +1524,46 @@ impl Hub {
             DurableOutcome::Ok => self.try_complete_pending(id),
             DurableOutcome::Failed => self.drop_pending(id),
             DurableOutcome::Refused(r) => self.refuse_pending(id, r),
+        }
+    }
+}
+
+impl Hub {
+    /// A fresh id for one of this shard's hand-off gates (ADR 0093 Amendment 5).
+    fn next_handoff_gate(&mut self) -> u64 {
+        self.gate_handoff_ids = self.gate_handoff_ids.wrapping_add(1);
+        HANDOFF_GATE | (self.gate_handoff_ids & !HANDOFF_GATE)
+    }
+
+    /// Shard `shard` settled its part of a hand-off gate this shard issued (ADR 0093
+    /// Amendment 5): a peer's forward is answered once every part has, and a pending
+    /// publish's re-delivery counts as its other answers do.
+    fn gate_handoff_done(
+        &mut self,
+        bit: u8,
+        shard: u8,
+        id: u64,
+        out: DurableOutcome,
+        reached: bool,
+    ) {
+        let Some(h) = self.gate_handoffs.get_mut(&id) else {
+            return;
+        };
+        if h.outstanding & bit == 0 {
+            return;
+        }
+        h.outstanding &= !bit;
+        let what = h.what.clone();
+        if h.outstanding == 0 {
+            self.gate_handoffs.remove(&id);
+        }
+        // The per-pair credit, as for a client's publish.
+        if let Some(owed) = self.handoff_inflight.get_mut(usize::from(shard)) {
+            *owed = owed.saturating_sub(1);
+        }
+        match what {
+            HandoffFor::Peer { node, seq } => self.settle_peer(&node, seq, out, reached),
+            HandoffFor::Redelivery { id } => self.redelivery_answered(id, out, reached),
         }
     }
 }
@@ -1264,6 +1654,90 @@ mod tests {
             assert_eq!(shard_of(id, 1), 0);
             assert_eq!(shard_of(id, 0), 0);
         }
+    }
+
+    /// ADR 0093 Amendment 5: a peer's forward goes to the shard its node and sending shard
+    /// pick, and a retransmission with it; the answer to a forward this node sent goes to
+    /// the shard its seq names.
+    #[test]
+    fn a_peers_forward_and_an_answer_find_their_shards() {
+        let (t0, mut r0) = mpsc::unbounded_channel();
+        let (t1, mut r1) = mpsc::unbounded_channel();
+        let tx = HubTx::sharded(vec![t0, t1]);
+        let node = mqtt_cluster::NodeId("n".into());
+        let answer = |seq| HubCommand::RemotePublishAck {
+            node: node.clone(),
+            seq,
+            ok: true,
+        };
+        tx.send(answer((1 << 60) | 9)).unwrap();
+        assert!(r0.try_recv().is_err());
+        assert!(matches!(
+            r1.try_recv(),
+            Ok(HubCommand::RemotePublishAck { .. })
+        ));
+        tx.send(answer(9)).unwrap();
+        assert!(matches!(
+            r0.try_recv(),
+            Ok(HubCommand::RemotePublishAck { .. })
+        ));
+        // A tag past the last shard, from a life of the node with more shards: the last.
+        tx.send(answer((5 << 60) | 9)).unwrap();
+        assert!(matches!(
+            r1.try_recv(),
+            Ok(HubCommand::RemotePublishAck { .. })
+        ));
+        let mut landed = Vec::new();
+        for lane in 0..2u64 {
+            for _ in 0..2 {
+                tx.send(HubCommand::RemotePublishAcked {
+                    node: node.clone(),
+                    seq: (lane << 60) | 3,
+                    topic: "t".into(),
+                    payload: Bytes::new(),
+                    qos: QoS::AtLeastOnce,
+                    retain: false,
+                    message_expiry: None,
+                    app: AppProperties::default(),
+                    origin: None,
+                    replay: false,
+                })
+                .unwrap();
+                let got = if r0.try_recv().is_ok() {
+                    0
+                } else {
+                    assert!(r1.try_recv().is_ok());
+                    1
+                };
+                assert_eq!(got, peer_shard(&node, lane, 2), "lane {lane}");
+                landed.push(got);
+            }
+        }
+        assert_eq!(
+            landed[0], landed[1],
+            "a retransmission lands with its original"
+        );
+        assert_ne!(
+            landed[0], landed[2],
+            "a node's two sending shards land on both"
+        );
+        tx.send(HubCommand::RemotePublish {
+            node: node.clone(),
+            topic: "t".into(),
+            payload: Bytes::new(),
+            qos: QoS::AtMostOnce,
+            retain: false,
+            message_expiry: None,
+            app: AppProperties::default(),
+            credit: None,
+        })
+        .unwrap();
+        let got = usize::from(r0.try_recv().is_err());
+        assert_eq!(
+            got,
+            peer_shard(&node, 0, 2),
+            "an unacknowledged one: lane 0"
+        );
     }
 
     #[test]

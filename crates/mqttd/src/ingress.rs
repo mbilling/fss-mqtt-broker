@@ -206,7 +206,18 @@ impl IngressCredit {
     /// first shard's pool: peer traffic enters there (ADR 0093 D5).
     #[must_use]
     pub fn try_acquire_pool(&self, cost: u32) -> Option<IngressPermit> {
-        let pool = self.pools[0].clone().try_acquire_many_owned(cost).ok()?;
+        self.try_acquire_pool_on(0, cost)
+    }
+
+    /// As [`try_acquire_pool`](Self::try_acquire_pool), from shard `shard`'s pool: the
+    /// shard that handles a peer's forward (ADR 0093 Amendment 5). The last pool for a
+    /// shard past the end.
+    #[must_use]
+    pub fn try_acquire_pool_on(&self, shard: usize, cost: u32) -> Option<IngressPermit> {
+        let pool = self.pools[shard.min(self.pools.len() - 1)]
+            .clone()
+            .try_acquire_many_owned(cost)
+            .ok()?;
         Some(IngressPermit {
             _conn: None,
             _pool: pool,

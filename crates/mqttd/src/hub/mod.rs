@@ -107,11 +107,14 @@ mod quarantine;
 /// item 2.1).
 mod settle;
 pub use quarantine::QUARANTINE_LISTED;
+/// ADR 0093 Amendment 5: the node's view of its peers on every shard.
+mod peer_view;
+pub use peer_view::{LinkLane, PeerView};
 /// ADR 0092 T5: the node's data shards and the sender in front of them.
 pub mod shards;
 pub use shards::{
-    shard_of, spawn_mailman, HubTx, RoutingBoard, RoutingPartition, ShardAnswer, ShardBatch,
-    ShardDeliver, ShardMailbox, ShardTarget, MAX_SHARDS,
+    peer_shard, shard_of, spawn_mailman, HubTx, RoutingBoard, RoutingPartition, ShardAnswer,
+    ShardBatch, ShardDeliver, ShardMailbox, ShardTarget, MAX_SHARDS,
 };
 
 /// Default outbound Receive Maximum when the client advertised none — effectively
@@ -1834,6 +1837,14 @@ pub enum HubCommand {
         /// The node.
         node: NodeId,
     },
+    /// ADR 0093 Amendment 5: a change shard 0 made to the node's view of its peers,
+    /// sent to every other shard in the order it made them. Never routed: shard 0 sends
+    /// it on each shard's own sender.
+    PeerView(PeerView),
+    /// ADR 0093 Amendment 5: another shard's routing changed and is published; shard 0
+    /// gossips the node's interest, every shard's, to the peers. Sent on shard 0's own
+    /// sender.
+    GossipInterest,
     /// A peer said whether its rules select a message event (ADR 0083; proto 13):
     /// while they do, publishes forwarded to it carry their origin
     /// ([`PeerMessage::OriginPublish`]), and every publish here is stamped with one.
@@ -2084,6 +2095,8 @@ pub enum HubCommand {
     },
     /// A publish forwarded from a peer, for **local** delivery only (never re-forwarded).
     RemotePublish {
+        /// The peer it arrived from: which shard handles it (ADR 0093 Amendment 5).
+        node: NodeId,
         /// Destination topic.
         topic: String,
         /// Application payload.
@@ -2263,6 +2276,8 @@ impl HubCommand {
             | Self::PeerDead { .. }
             | Self::PeerAlive { .. }
             | Self::PeerGone { .. }
+            | Self::PeerView(_)
+            | Self::GossipInterest
             | Self::RemoteInterest { .. }
             | Self::RemoteMessageEvents { .. }
             | Self::RemoteSharedInterest { .. }
@@ -2461,13 +2476,15 @@ struct Misplaced {
 #[derive(Debug)]
 struct Peer {
     conn_id: u64,
-    tx: PeerOutbound,
+    /// The link's bulk lane: its own sender on shard 0, a weak copy on every other
+    /// shard (ADR 0093 Amendment 5), so only shard 0 keeps a link open.
+    tx: LinkLane,
     /// Frames queued on this link's two lanes, published by its pump (issue #504).
     depth: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// The link's CONTROL lane (issue #358): raft RPCs and replication acks jump
     /// the bulk queue here, so a heartbeat is never behind a retained snapshot.
     /// Same TCP connection — the pump drains this receiver first (`biased`).
-    ctl: PeerOutbound,
+    ctl: LinkLane,
     /// The peer-bus protocol version this LINK negotiated (ADR 0038). Frame choice
     /// is gated on it, not on what this build supports: the codec is strict, so
     /// sending a variant the peer does not know leaves it with an unknown variant
@@ -2545,8 +2562,8 @@ const RETIRE_TICKS: u8 = 5;
 struct RetiringLink {
     node: NodeId,
     /// Held only to keep the link's lanes open; dropping them ends its pump.
-    _tx: PeerOutbound,
-    _ctl: PeerOutbound,
+    _tx: LinkLane,
+    _ctl: LinkLane,
     cert_serial: Option<Vec<u8>>,
     cert_ends: LinkCertEnds,
     ticks: u8,
@@ -3229,6 +3246,10 @@ pub struct Hub {
     /// Receiver side of the hand-offs: per origin pending id, what is still owed
     /// before the origin can be answered ([`shards::ShardGate`]).
     shard_append_pending: FastMap<u64, shards::ShardGate>,
+    /// ADR 0093 Amendment 5: the peer forwards this shard handed to others, by the
+    /// hand-off's gate id, and the counter that issues those ids.
+    gate_handoffs: FastMap<u64, shards::GateHandoff>,
+    gate_handoff_ids: u64,
     /// Scratch: the subscribers of the publish being dispatched that other shards own,
     /// taken by [`Hub::flush_handoffs`] at the end of its fan-out.
     handoff: Vec<shards::ShardTarget>,
@@ -3264,12 +3285,20 @@ pub struct Hub {
     foreign_version: u64,
     /// This shard's routing changed since it last published (Amendment 4).
     routing_dirty: bool,
+    /// ADR 0093 Amendment 5: on a shard other than 0, that its routing changed in a way
+    /// the peers must hear of; shard 0 is asked to gossip once the change is published.
+    gossip_owed: bool,
     /// When this shard last published its routing, and what that copy cost: the
     /// spacing of the next one under constant churn (Amendment 4).
     routing_published_at: Option<std::time::Instant>,
     routing_copy_cost: std::time::Duration,
     /// The answers waiting for this shard's next publication (Amendment 4).
     after_publish: Vec<shards::Waiting>,
+    /// ADR 0093 Amendment 5: whether the board says this shard's routing view is
+    /// settling, so it is written only when that changes.
+    settling_published: bool,
+    /// Whether the board says this shard's takeover is open.
+    takeover_published: bool,
     /// Prometheus metrics (ADR 0020), when enabled. Updated on the publish/deliver paths.
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
     /// The node's ingress credit (ADR 0082 T3), held only to export its gauges: the hub
@@ -3556,6 +3585,8 @@ impl Hub {
                 shard_count: 1,
                 shard_txs: Vec::new(),
                 shard_append_pending: HashMap::default(),
+                gate_handoffs: HashMap::default(),
+                gate_handoff_ids: 0,
                 handoff: Vec::new(),
                 handoff_batches: Vec::new(),
                 shard_done_batches: Vec::new(),
@@ -3568,9 +3599,12 @@ impl Hub {
                 foreign_routing: Vec::new(),
                 foreign_version: 0,
                 routing_dirty: false,
+                gossip_owed: false,
                 routing_published_at: None,
                 routing_copy_cost: std::time::Duration::ZERO,
                 after_publish: Vec::new(),
+                settling_published: false,
+                takeover_published: false,
                 held_forwards: Vec::new(),
                 elision: Box::default(),
                 forward_windows: HashMap::default(),
@@ -4164,6 +4198,9 @@ impl Hub {
     /// The once-a-second sweep: expiry, cleanup, gauges, retransmits, lane reaping.
     async fn run_sweep(&mut self) {
         let started = Instant::now();
+        // ADR 0093 Amendment 5: what the other shards read of this one's settling, once a
+        // tick as well as at each batch's end.
+        self.publish_settling();
         // An idle hub still tells its peers, within a tick, that a reload changed
         // whether its rules select a message event (ADR 0083).
         self.refresh_message_wants();
@@ -4919,6 +4956,7 @@ impl Hub {
                 self.finish_peer_verdict(&node, seq, out, relaxed, false);
             }
             HubCommand::RemotePublish {
+                node: _,
                 topic,
                 payload,
                 qos,
@@ -4968,7 +5006,7 @@ impl Hub {
                 proto,
                 depth,
             } => {
-                self.peer_connected(node.clone(), conn_id, tx, ctl, cert_serial, proto, depth);
+                self.peer_connected(&node, conn_id, tx, ctl, cert_serial, proto, depth);
                 self.note_link_cert_ends(&node, conn_id, cert_ends);
                 // Offer the new peer our retained topic-set digest (ADR 0014 §3,
                 // 0014-T6): it pulls the (chunked) snapshot only if the sets differ,
@@ -4982,15 +5020,11 @@ impl Hub {
             HubCommand::PeerDisconnected { node, conn_id } => {
                 self.peer_disconnected(&node, conn_id);
             }
-            HubCommand::PeerDead { node } => {
-                self.peer_dead(&node);
-                // The takeover window (ADR 0042 T9, exhibit ⑥): reconcile inherited
-                // sessions eagerly for the next several sweep ticks so their
-                // subscriptions materialize within seconds of the owner's death.
-                self.takeover_reconcile_ticks = 8;
-            }
+            HubCommand::PeerDead { node } => self.peer_dead(&node),
             HubCommand::PeerAlive { node } => self.peer_alive(&node),
             HubCommand::PeerGone { node } => self.peer_gone(&node),
+            HubCommand::PeerView(view) => self.apply_peer_view(view),
+            HubCommand::GossipInterest => self.gossip_interest(),
             HubCommand::DurableFrame { node, frame } => {
                 self.handle_durable_frame(&node, frame);
             }
@@ -6698,6 +6732,10 @@ impl Hub {
     /// move), and the revoked node cannot re-handshake (both handshake sides gate
     /// on the same live CRL slot).
     fn sweep_peers(&mut self, policy: &SweepPolicy) -> usize {
+        // ADR 0093 Amendment 5: shard 0 ends links; the others hear of it as a lost link.
+        if !self.peer_face() {
+            return 0;
+        }
         let victims: Vec<NodeId> = self
             .peers
             .iter()
@@ -7563,7 +7601,7 @@ impl Hub {
                     "interest gossip forced authoritative: the boot session scan never \
                      completed (degraded durable plane?) — advertising live interest only"
                 );
-                self.interest_authoritative = true;
+                self.note_interest_authoritative();
                 self.gossip_interest();
             }
         }
@@ -7750,10 +7788,14 @@ impl Hub {
     /// half of [`routing_unsettled`](Self::routing_unsettled) only: an incomplete
     /// scan (#1049), a mesh that is not whole or interest not yet authoritative say
     /// nothing about a session moving here, so they hold no forward.
+    ///
+    /// ADR 0093 Amendment 5: the node's question, open while any shard's is.
     fn takeover_open(&self) -> bool {
         self.sessions_can_move()
             && self.clustered()
-            && (self.takeover_reconcile_ticks > 0 || self.inherited_scan_inflight)
+            && (self.takeover_reconcile_ticks > 0
+                || self.inherited_scan_inflight
+                || self.others_in_takeover())
     }
 
     /// Whether a takeover WINDOW is open for write elision (ADR 0089 D2, Amendment 2):
@@ -7929,7 +7971,7 @@ impl Hub {
         // reflects every durable session it owns, and its interest snapshots
         // stop being lies of omission — gossip opens (below and from now on).
         if !self.interest_authoritative && complete && self.mesh_whole() {
-            self.interest_authoritative = true;
+            self.note_interest_authoritative();
             debug!("interest gossip authoritative: first complete whole-mesh session scan landed");
         }
         let mut registered = false;
@@ -8505,13 +8547,27 @@ impl Hub {
     /// (`register_pending`) and for answering a peer's gated forward that
     /// matched nothing here (the receiver-side twin). Only meaningful on a
     /// multi-node cluster.
+    ///
+    /// ADR 0093 Amendment 5: a publish on one shard matches the sessions of every shard,
+    /// so the view is the node's, unsettled while any shard's own terms are.
     fn routing_unsettled(&self) -> bool {
         self.clustered()
-            && (self.takeover_reconcile_ticks > 0
-                || self.inherited_scan_inflight
-                || !self.interest_authoritative
-                || !self.last_scan_complete
-                || !self.mesh_settled())
+            && (self.own_routing_settling()
+                || !self.mesh_settled()
+                || self
+                    .routing_board
+                    .as_ref()
+                    .is_some_and(|board| board.others_settling(usize::from(self.shard))))
+    }
+
+    /// This shard's own terms of [`routing_unsettled`](Self::routing_unsettled): a
+    /// takeover window open, a session scan in flight, its interest not yet authoritative,
+    /// its last scan incomplete.
+    fn own_routing_settling(&self) -> bool {
+        self.takeover_reconcile_ticks > 0
+            || self.inherited_scan_inflight
+            || !self.interest_authoritative
+            || !self.last_scan_complete
     }
 
     /// Whether a session this node does not have could still be on its way to it:
@@ -8663,6 +8719,10 @@ impl Hub {
     /// throughout, so a flip is a placement-preference change, never a
     /// serving-truth change.
     fn refresh_ownership_domain(&self) {
+        // ADR 0093 Amendment 5: a node-wide flag, from shard 0's view of the protocols.
+        if !self.peer_face() {
+            return;
+        }
         let Some((flag, enabled)) = &self.ownership_domain else {
             return;
         };
@@ -8706,6 +8766,9 @@ impl Hub {
 
     /// Recompute the ADR 0080 replication-factor capability, edge-logged.
     fn refresh_replication_capable(&self) {
+        if !self.peer_face() {
+            return;
+        }
         let Some(flag) = &self.replication_capable else {
             return;
         };
@@ -8986,6 +9049,8 @@ impl Hub {
                 // ADR 0092 T5: a hand-off to another shard is awaited as a peer's
                 // answer is, relaxed or not.
                 && p.shard_outstanding == 0
+                // ADR 0093 Amendment 5: and every other shard's part of a re-delivery.
+                && p.redeliveries == 0
                 // ADR 0072: relaxed acks at submit; obligations still run.
                 // Issue #399 carves two exceptions, both congestion valves:
                 // a CONGESTED publish (its own lane was deep at submit) falls
@@ -9053,7 +9118,7 @@ impl Hub {
     #[allow(clippy::too_many_arguments)]
     fn peer_connected(
         &mut self,
-        node: NodeId,
+        node: &NodeId,
         conn_id: u64,
         tx: PeerOutbound,
         ctl: PeerOutbound,
@@ -9080,25 +9145,73 @@ impl Hub {
         // snapshot from a mid-boot hub erases interest the peer still correctly
         // holds from before a fast restart (0043-P4 exhibit ②). The peer keeps its
         // prior knowledge; the real snapshot follows when the scan settles.
-        if self.interest_authoritative {
-            let _ = tx.send(PeerMessage::Interest {
-                filters: self.local_interest(),
-            });
-            let _ = tx.send(PeerMessage::SharedInterest {
-                groups: self.shared_snapshot(),
-            });
+        // ADR 0093 Amendment 5: the node's interest, every shard's, once every shard's
+        // boot scan has landed.
+        if self.node_interest_authoritative() {
+            let filters = self.local_interest();
+            let groups = self.shared_snapshot();
+            let _ = tx.send(PeerMessage::Interest { filters });
+            let _ = tx.send(PeerMessage::SharedInterest { groups });
         }
         // Register the link with the durable plane: consensus RPCs ride the CONTROL
         // lane (drained first by the pump — issue #358: a raft heartbeat behind a
         // 16 MiB retained snapshot blows its 500 ms deadline and churns elections),
         // bulk replication data rides the ordinary lane.
         if let Some(plane) = &self.durable_plane {
-            plane.register_with_proto(&node, ctl.clone(), tx.clone(), proto);
+            plane.register_with_proto(node, ctl.clone(), tx.clone(), proto);
         }
+        let (tx, ctl) = (LinkLane::Owner(tx), LinkLane::Owner(ctl));
+        // ADR 0093 Amendment 5: every other shard forwards on this link too.
+        self.tell_shards(|| PeerView::Linked {
+            node: node.clone(),
+            conn_id,
+            tx: tx.shared(),
+            ctl: ctl.shared(),
+            depth: depth.clone(),
+            proto,
+        });
+        let replaced = self.link_up(node.clone(), conn_id, tx, ctl, depth, proto, cert_serial);
+        // The link this one replaces is let go quietly ([`RetiringLink`]): nothing is
+        // sent on it from here on, and what was in flight on it still arrives.
+        if let Some(old) = replaced {
+            debug!(peer = %node.0, "peer link replaced; the old one is retired");
+            self.retiring_links.push(RetiringLink {
+                node: node.clone(),
+                _tx: old.tx,
+                _ctl: old.ctl,
+                cert_serial: old.cert_serial,
+                cert_ends: old.cert_ends,
+                ticks: RETIRE_TICKS,
+            });
+        }
+        self.tell_message_events(Some(node));
+    }
+
+    /// A link to `node` formed, as every shard records it (ADR 0093 Amendment 5): the
+    /// peer's entry, the protocol it negotiated, the hold it ends, and the mesh. Returns
+    /// the entry of the link it replaced.
+    #[allow(clippy::too_many_arguments)] // the link's facts, as `peer_connected` has them
+    fn link_up(
+        &mut self,
+        node: NodeId,
+        conn_id: u64,
+        tx: LinkLane,
+        ctl: LinkLane,
+        depth: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        proto: u32,
+        cert_serial: Option<Vec<u8>>,
+    ) -> Option<Peer> {
         // ADR 0073: remember the negotiated proto across link flaps (removed only
         // on confirmed death) — the ownership-domain capability check reads this.
         self.known_peer_protos.insert(node.clone(), proto);
-        let node_for_events = node.clone();
+        // A node held `Dead` is linked: it is reachable, whatever membership says
+        // (ADR 0087 D5), and there is nothing left to count down. (One confirmed
+        // gone stays so: only an `Alive` makes it a member again.)
+        if let Some(hold) = self.held_dead.get_mut(&node) {
+            if !matches!(hold, VerdictHold::GoneLinked { .. }) {
+                *hold = VerdictHold::Settled;
+            }
+        }
         let replaced = self.peers.insert(
             node,
             Peer {
@@ -9116,28 +9229,6 @@ impl Hub {
                 wants_origin: false,
             },
         );
-        // The link this one replaces is let go quietly ([`RetiringLink`]): nothing is
-        // sent on it from here on, and what was in flight on it still arrives.
-        if let Some(old) = replaced {
-            debug!(peer = %node_for_events.0, "peer link replaced; the old one is retired");
-            self.retiring_links.push(RetiringLink {
-                node: node_for_events.clone(),
-                _tx: old.tx,
-                _ctl: old.ctl,
-                cert_serial: old.cert_serial,
-                cert_ends: old.cert_ends,
-                ticks: RETIRE_TICKS,
-            });
-        }
-        self.tell_message_events(Some(&node_for_events));
-        // A node held `Dead` is linked: it is reachable, whatever membership says
-        // (ADR 0087 D5), and there is nothing left to count down. (One confirmed
-        // gone stays so: only an `Alive` makes it a member again.)
-        if let Some(hold) = self.held_dead.get_mut(&node_for_events) {
-            if !matches!(hold, VerdictHold::GoneLinked { .. }) {
-                *hold = VerdictHold::Settled;
-            }
-        }
         // A link (re)forming while gated publishes are held: schedule a scan so
         // the settle pass re-runs against the now-visible peer state (its
         // Interest snapshot arrives with the link) and releases what it can.
@@ -9149,6 +9240,7 @@ impl Hub {
         // SETTLED can move either way — recompute both rather than reason about
         // the direction at each site.
         self.recompute_mesh();
+        replaced
     }
 
     /// Record when the certificates of link `conn_id` to `node` end (ADR 0088 D3), so
@@ -9168,6 +9260,10 @@ impl Hub {
             return;
         }
         info!(peer = %node.0, "peer link lost");
+        self.tell_shards(|| PeerView::LinkLost {
+            node: node.clone(),
+            conn_id,
+        });
         self.peers.remove(node);
         self.recompute_peers_want_origin();
         // The peer's INTEREST is kept (ADR 0042 T9): a link-down peer is not a
@@ -9192,6 +9288,12 @@ impl Hub {
         // Mesh transition 2 of 5 (issue #613 item 1.1): a membership-alive peer
         // just lost its link, so the mesh is no longer whole.
         self.recompute_mesh();
+        self.hold_after_link_lost(node);
+    }
+
+    /// What a lost link means for the verdict that stands on its node, as every shard
+    /// resolves it (ADR 0093 Amendment 5).
+    fn hold_after_link_lost(&mut self, node: &NodeId) {
         // A node membership holds `Dead` had a link all the same — admitted by its
         // handshake (ADR 0087 D5) — and that link is now gone. No second verdict
         // will follow, so the one that stands starts its hold again: what the link
@@ -9205,7 +9307,9 @@ impl Hub {
             Some(VerdictHold::GoneLinked { .. })
         ) {
             self.held_dead.remove(node);
-            info!(peer = %node.0, "the link of a peer confirmed gone ended; resolving what it was owed");
+            if self.peer_face() {
+                info!(peer = %node.0, "the link of a peer confirmed gone ended; resolving what it was owed");
+            }
             // The takeover window opens as at a verdict's lost link: if a session of
             // the node is still to be inherited, this is when.
             self.takeover_reconcile_ticks = 8;
@@ -9227,6 +9331,7 @@ impl Hub {
     /// node is from here on held as it is for any member whose link is down — until
     /// the link returns.
     fn peer_alive(&mut self, node: &NodeId) {
+        self.tell_shards(|| PeerView::Alive { node: node.clone() });
         self.held_dead.remove(node);
     }
 
@@ -9260,9 +9365,23 @@ impl Hub {
     ///   [`VerdictHold::Unreachable`] runs out first — and the peer's state is erased
     ///   and what it was owed resolved and counted ([`erase_peer`](Self::erase_peer)).
     fn peer_dead(&mut self, node: &NodeId) {
-        let had_link = self.peers.remove(node).is_some();
+        self.tell_shards(|| PeerView::Dead { node: node.clone() });
         self.retiring_links.retain(|link| &link.node != node);
+        if self.dead(node) {
+            info!(peer = %node.0, "peer declared dead; held as unreachable");
+        }
         self.recompute_peers_want_origin();
+        if let Some(plane) = &self.durable_plane {
+            plane.fail(node);
+        }
+        self.drop_retained_handoff_state(node);
+    }
+
+    /// A verdict of death on `node`, as every shard applies it (ADR 0093 Amendment 5): the
+    /// link dropped, the node held unreachable, its `$share` deliveries moved where they
+    /// can be, the mesh, and the takeover window. `true` when the node is held.
+    fn dead(&mut self, node: &NodeId) -> bool {
+        let had_link = self.peers.remove(node).is_some();
         let hold = match self.held_dead.get(node) {
             // Already held dead, with no link since: a repeated verdict neither
             // restarts a hold that is running nor revives one that ran out.
@@ -9272,19 +9391,20 @@ impl Hub {
             },
         };
         self.held_dead.insert(node.clone(), hold);
-        if hold != VerdictHold::Settled {
+        let unreachable = hold != VerdictHold::Settled;
+        if unreachable {
             self.mark_shared_unreachable(node);
             self.move_shared_from_unreachable();
-            info!(peer = %node.0, "peer declared dead; held as unreachable");
         }
         // Mesh transition 3 of 5 (issue #613 item 1.1). A confirmed death removes
         // the peer from BOTH sides of the question — its link and, once SWIM
         // evicts it, its membership — so the answer can move in either direction.
         self.recompute_mesh();
-        if let Some(plane) = &self.durable_plane {
-            plane.fail(node);
-        }
-        self.drop_retained_handoff_state(node);
+        // The takeover window (ADR 0042 T9, exhibit ⑥): reconcile inherited
+        // sessions eagerly for the next several sweep ticks so their
+        // subscriptions materialize within seconds of the owner's death.
+        self.takeover_reconcile_ticks = 8;
+        unreachable
     }
 
     /// Mark every `$share` member `node` announced as not reachable: the selector
@@ -9309,8 +9429,19 @@ impl Hub {
         }
     }
 
-    /// A peer's interest snapshot arrived ([`PeerMessage::Interest`]).
+    /// A peer's interest snapshot arrived ([`PeerMessage::Interest`]) on its current
+    /// link: applied here, and by every other shard (ADR 0093 Amendment 5).
     fn peer_announced_interest(&mut self, node: &NodeId, filters: Vec<String>) {
+        let filters = std::sync::Arc::new(filters);
+        self.tell_shards(|| PeerView::Interest {
+            node: node.clone(),
+            filters: filters.clone(),
+        });
+        self.interest_announced(node, &filters);
+    }
+
+    /// A peer's interest snapshot, as every shard applies it.
+    fn interest_announced(&mut self, node: &NodeId, filters: &[String]) {
         debug!(node = %node.0, filters = filters.len(), "remote interest updated");
         // The peer's view is AUTHORITATIVE (it never gossips before it
         // is — 0043-P4 exhibit ②): its link now counts toward
@@ -9423,6 +9554,19 @@ impl Hub {
     ///
     /// [`REFUSAL_SHARED_MEMBER_GONE`]: mqtt_cluster::peer::REFUSAL_SHARED_MEMBER_GONE
     fn peer_announced_shared(&mut self, node: &NodeId, groups: Vec<RemoteSharedGroup>) {
+        // ADR 0093 Amendment 5: every other shard deals to the peer's members too.
+        if self.tells_shards() {
+            let shared = std::sync::Arc::new(groups.clone());
+            self.tell_shards(|| PeerView::Shared {
+                node: node.clone(),
+                groups: shared.clone(),
+            });
+        }
+        self.shared_announced(node, groups);
+    }
+
+    /// A peer's `$share` membership snapshot, as every shard applies it.
+    fn shared_announced(&mut self, node: &NodeId, groups: Vec<RemoteSharedGroup>) {
         debug!(node = %node.0, groups = groups.len(), "remote shared interest updated");
         let first_on_link = self.peers.get(node).is_some_and(|p| !p.shared_synced);
         self.remote_shared.insert(node.clone(), groups);
@@ -9607,6 +9751,16 @@ impl Hub {
     /// The count runs only with a durable plane ([`VerdictHold::Unreachable`] says
     /// why); without one a hold ends at confirmation ([`peer_gone`](Self::peer_gone)).
     fn sweep_verdict_holds(&mut self) {
+        // ADR 0093 Amendment 5: shard 0 counts the holds down and tells every other shard
+        // when one ends.
+        if self.peer_face() {
+            self.count_down_verdict_holds();
+        }
+        self.move_shared_from_unreachable();
+    }
+
+    /// Shard 0's countdown of the holds, ending those whose time is up.
+    fn count_down_verdict_holds(&mut self) {
         let mut expired: Vec<NodeId> = Vec::new();
         if self.durable_plane.is_some() {
             for (node, hold) in &mut self.held_dead {
@@ -9619,8 +9773,8 @@ impl Hub {
             }
         }
         for node in expired {
-            self.erase_peer(&node, Resolution::HoldExpired);
-            self.held_dead.insert(node, VerdictHold::Settled);
+            self.tell_shards(|| PeerView::HoldExpired { node: node.clone() });
+            self.hold_expired(&node);
         }
         // A link to a node confirmed gone is given its countdown in both modes
         // ([`VerdictHold::GoneLinked`]): then it is dropped, and the node resolved.
@@ -9634,13 +9788,26 @@ impl Hub {
             }
         }
         for node in gone {
-            self.held_dead.remove(&node);
             warn!(peer = %node.0, "the link of a peer confirmed gone outlived its countdown with no Alive; dropping it and resolving what the peer was owed");
+            self.tell_shards(|| PeerView::GoneLinkDropped { node: node.clone() });
             self.drop_link_of_gone(&node);
-            self.takeover_reconcile_ticks = 8;
-            self.erase_peer(&node, Resolution::PeerGone);
+            self.gone_link_dropped(&node);
         }
-        self.move_shared_from_unreachable();
+    }
+
+    /// The hold of `node`, held dead with no link, ran out: its routing state is erased
+    /// and what it was owed resolved (every shard, ADR 0093 Amendment 5).
+    fn hold_expired(&mut self, node: &NodeId) {
+        self.erase_peer(node, Resolution::HoldExpired);
+        self.held_dead.insert(node.clone(), VerdictHold::Settled);
+    }
+
+    /// The link of `node`, confirmed gone, was dropped once its countdown ran out: what it
+    /// was owed is resolved, and the takeover window opens (every shard).
+    fn gone_link_dropped(&mut self, node: &NodeId) {
+        self.held_dead.remove(node);
+        self.takeover_reconcile_ticks = 8;
+        self.erase_peer(node, Resolution::PeerGone);
     }
 
     /// Membership confirmed `node` gone (ADR 0087 D2, [`HubCommand::PeerGone`]).
@@ -9661,11 +9828,20 @@ impl Hub {
     /// one that has not is resolved as the rest are (until 0087-T5 the hub cannot
     /// tell it apart).
     fn peer_gone(&mut self, node: &NodeId) {
+        self.tell_shards(|| PeerView::Gone { node: node.clone() });
+        self.gone(node);
+    }
+
+    /// A confirmation that `node` is gone, as every shard applies it (ADR 0093
+    /// Amendment 5).
+    fn gone(&mut self, node: &NodeId) {
         let Some(hold) = self.held_dead.remove(node) else {
             return; // no verdict stands
         };
         if self.peers.contains_key(node) {
-            info!(peer = %node.0, "peer confirmed gone while linked; the link answers for it until it ends");
+            if self.peer_face() {
+                info!(peer = %node.0, "peer confirmed gone while linked; the link answers for it until it ends");
+            }
             self.held_dead.insert(
                 node.clone(),
                 VerdictHold::GoneLinked {
@@ -9829,45 +10005,97 @@ impl Hub {
     /// This node's **ordinary** interest snapshot for cluster gossip. Shared-group
     /// filters are gossiped separately (ADR 0015 §2), not folded in here, since
     /// shared delivery rides the targeted `SharedDeliver` path, not ordinary forward.
-    fn local_interest(&self) -> Vec<String> {
-        self.table.filters()
+    ///
+    /// ADR 0093 Amendment 5: every shard's, its own filters and the other shards' as they
+    /// last published them.
+    fn local_interest(&mut self) -> Vec<String> {
+        if self.routing_board.is_none() {
+            return self.table.filters();
+        }
+        self.refresh_foreign_routing();
+        let mut filters: FastSet<String> = self.table.filters().into_iter().collect();
+        for partition in &self.foreign_routing {
+            filters.extend(partition.table.filters());
+        }
+        filters.into_iter().collect()
     }
 
     /// This node's shared-subscription membership snapshot, in the peer wire form.
-    fn shared_snapshot(&self) -> Vec<mqtt_cluster::peer::SharedGroupWire> {
+    ///
+    /// ADR 0093 Amendment 5: every shard's groups, merged by group and filter, each
+    /// member tagged online as its own shard last published it.
+    fn shared_snapshot(&mut self) -> Vec<mqtt_cluster::peer::SharedGroupWire> {
         use mqtt_cluster::peer::{SharedGroupWire, SharedMemberWire};
-        self.shared
-            .snapshot()
-            .into_iter()
-            .map(|g| {
-                // Tag each member with whether it is online here, so a peer's selector can
-                // avoid choosing a member offline on its home node (ADR 0015 T8).
+        // Tag each member with whether it is online here, so a peer's selector can
+        // avoid choosing a member offline on its home node (ADR 0015 T8).
+        let own = self.shared.snapshot().into_iter().map(|g| {
+            let members: Vec<SharedMemberWire> = g
+                .members
+                .into_iter()
+                .map(|(c, q)| SharedMemberWire {
+                    online: self.online.contains_key(&c),
+                    client: c.0.to_string(),
+                    qos: q as u8,
+                })
+                .collect();
+            SharedGroupWire {
+                group: g.group,
+                filter: g.filter,
+                members,
+            }
+        });
+        if self.routing_board.is_none() {
+            return own.collect();
+        }
+        let mut merged: Vec<SharedGroupWire> = own.collect();
+        self.refresh_foreign_routing();
+        let mut at: HashMap<(String, String), usize> = merged
+            .iter()
+            .enumerate()
+            .map(|(i, g)| ((g.group.clone(), g.filter.clone()), i))
+            .collect();
+        for partition in &self.foreign_routing {
+            for g in partition.shared.snapshot_with_presence() {
                 let members = g
                     .members
                     .into_iter()
-                    .map(|(c, q)| SharedMemberWire {
-                        online: self.online.contains_key(&c),
+                    .map(|(c, q, online)| SharedMemberWire {
+                        online,
                         client: c.0.to_string(),
                         qos: q as u8,
-                    })
-                    .collect();
-                SharedGroupWire {
-                    group: g.group,
-                    filter: g.filter,
-                    members,
+                    });
+                let key = (g.group, g.filter);
+                if let Some(&i) = at.get(&key) {
+                    merged[i].members.extend(members);
+                } else {
+                    at.insert(key.clone(), merged.len());
+                    merged.push(SharedGroupWire {
+                        group: key.0,
+                        filter: key.1,
+                        members: members.collect(),
+                    });
                 }
-            })
-            .collect()
+            }
+        }
+        merged
     }
 
     /// Gossip this node's ordinary interest and shared membership to all peers.
     /// Called whenever local subscriptions change.
-    fn gossip_interest(&self) {
+    ///
+    /// ADR 0093 Amendment 5: shard 0 gossips the node's, every shard's. Another shard
+    /// asks it to once its own change is published, so shard 0 reads it
+    /// ([`publish_routing`](Self::publish_routing)).
+    fn gossip_interest(&mut self) {
+        if !self.peer_face() {
+            self.gossip_owed = true;
+            return;
+        }
         // No snapshots from a hub that cannot stand behind them (0043-P4
         // exhibit ②): until the boot scan has materialized every owned durable
         // session, an interest snapshot is a lie of omission that ERASES what
         // peers still correctly advertise-to and forward for.
-        if !self.interest_authoritative || self.peers.is_empty() {
+        if !self.node_interest_authoritative() || self.peers.is_empty() {
             return;
         }
         let filters = self.local_interest();
@@ -10340,6 +10568,7 @@ async fn recover_once(
 #[cfg(test)]
 mod tests {
     mod cert_expiry;
+    mod cluster_shards;
     mod elision_behind;
     mod elision_late_ack;
     mod forward_repeat;
@@ -17881,6 +18110,7 @@ mod tests {
         subscribe(&tx, "live", "t");
 
         tx.send(HubCommand::RemotePublish {
+            node: NodeId("peer".into()),
             topic: "t".into(),
             payload: Bytes::from_static(b"x"),
             qos: QoS::AtMostOnce,
@@ -19068,6 +19298,7 @@ mod tests {
         // The interest-forwarded live copy (retain flag as published, cache cold
         // under durable — ADR 0037 P4) arrives first…
         tx.send(HubCommand::RemotePublish {
+            node: NodeId("peer".into()),
             topic: "iw/t".into(),
             payload: Bytes::from_static(b"v1"),
             qos: QoS::AtMostOnce,
@@ -22112,6 +22343,7 @@ mod tests {
 
         // A publish forwarded *from* a peer is delivered locally only.
         tx.send(HubCommand::RemotePublish {
+            node: NodeId("peer".into()),
             topic: "x/2".into(),
             payload: Bytes::from_static(b"no-relay"),
             qos: QoS::AtMostOnce,
@@ -25711,6 +25943,7 @@ mod tests {
         let (tx, metrics, mut watcher) = sys_watching_hub().await;
         let mut origin = connect_peer_at_proto(&tx, "origin", 1, super::PROTO_FORWARD_REACHED);
         let remote = |topic: &str, qos, retain, payload: &'static [u8]| HubCommand::RemotePublish {
+            node: NodeId("peer".into()),
             topic: topic.into(),
             payload: Bytes::from_static(payload),
             qos,
@@ -25824,6 +26057,7 @@ mod tests {
             .unwrap();
         }
         tx.send(HubCommand::RemotePublish {
+            node: NodeId("peer".into()),
             topic: "$SYS/brokers/origin/rules".into(),
             payload: Bytes::from_static(b"{}"),
             qos: QoS::AtMostOnce,

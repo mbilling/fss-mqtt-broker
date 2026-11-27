@@ -189,6 +189,7 @@ impl Hub {
             AppendGate::Pending(_)
                 | AppendGate::Peer { replay: false, .. }
                 | AppendGate::Shard { .. }
+                | AppendGate::ShardPeer { replay: false, .. }
         ) {
             return Elidable::No;
         }
@@ -788,7 +789,13 @@ impl Hub {
 
     /// One obligation on peer forward `(node, seq)` ended with `out`; answered once
     /// the last one has, as the lane's completion does.
-    fn settle_peer(&mut self, node: &NodeId, seq: u64, out: DurableOutcome, reached: bool) {
+    pub(super) fn settle_peer(
+        &mut self,
+        node: &NodeId,
+        seq: u64,
+        out: DurableOutcome,
+        reached: bool,
+    ) {
         let key = (node.clone(), seq);
         let Some(g) = self.remote_append_pending.get_mut(&key) else {
             return;

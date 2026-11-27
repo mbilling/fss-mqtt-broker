@@ -441,6 +441,9 @@ pub(super) struct PendingPublish {
     /// a bit per shard; the ack waits for every one of them, as it waits for a peer's
     /// answer. Fits the entry's padding.
     pub(super) shard_outstanding: u8,
+    /// ADR 0093 Amendment 5: the other shards' parts of a settle-window re-delivery
+    /// still to answer; the ack waits for them too.
+    pub(super) redeliveries: u8,
 }
 
 impl PendingPublish {
@@ -711,6 +714,16 @@ impl Hub {
             p.app().clone(),
             p.created_at,
         );
+        // ADR 0093 Amendment 5: the sessions other shards hold, as each last published
+        // them, are re-delivered to there.
+        let foreign = if self.shard_count > 1 {
+            self.ordinary_targets(&topic, None, false).1
+        } else {
+            Vec::new()
+        };
+        let Some(p) = self.pending_publishes.get(id) else {
+            return DurableOutcome::Ok;
+        };
         // A session this publish already reached — the original fan-out's
         // enqueue, or an earlier pass of this same re-delivery — did not miss
         // it, and a second copy would reach it as a new message with DUP = 0
@@ -737,7 +750,27 @@ impl Hub {
                 (c, granted)
             })
             .collect();
+        let foreign: Vec<ClientId> = foreign
+            .into_iter()
+            .filter(|c| !reached.contains(c))
+            .collect();
         drop(reached);
+        // Each is delivered there only if its session is offline or resumed since, as
+        // here; the acknowledgement waits for every shard's answer.
+        if !foreign.is_empty() {
+            for client in foreign {
+                self.hand_off(super::shards::ShardTarget::Replay { client, since });
+            }
+            self.flush_handoffs(
+                &topic,
+                &payload,
+                qos,
+                false,
+                expiry,
+                &app,
+                &AppendGate::Replay(id),
+            );
+        }
         if targets.is_empty() {
             return DurableOutcome::Ok;
         }
@@ -763,6 +796,26 @@ impl Hub {
             ));
         }
         all_durable
+    }
+
+    /// Another shard answered its part of pending publish `id`'s settle-window
+    /// re-delivery (ADR 0093 Amendment 5). A session it reached is the evidence a local
+    /// one is: the subscriber has materialised on this node.
+    pub(super) fn redelivery_answered(&mut self, id: u64, out: DurableOutcome, reached: bool) {
+        let Some(p) = self.pending_publishes.get_mut(id) else {
+            return;
+        };
+        p.redeliveries = p.redeliveries.saturating_sub(1);
+        if reached && matches!(out, DurableOutcome::Ok) {
+            p.reroute_grace = None;
+            p.ack_awaits_settle = false;
+            self.discharge_unreachable(id);
+        }
+        match out {
+            DurableOutcome::Ok => self.try_complete_pending(id),
+            DurableOutcome::Failed => self.drop_pending(id),
+            DurableOutcome::Refused(r) => self.refuse_pending(id, r),
+        }
     }
 
     /// How many sessions pending publish `id` has been handed to so far (see
@@ -813,12 +866,10 @@ impl Hub {
             self.finish_peer_verdict(&node, seq, DurableOutcome::Failed, false, true);
             return;
         }
-        let reached: FastSet<ClientId> = self
-            .ordinary_targets(&topic, None, retain)
-            .0
-            .into_iter()
-            .map(|(c, _, _)| c)
-            .collect();
+        // ADR 0093 Amendment 5: the other shards' sessions it was handed to count.
+        let (own, foreign) = self.ordinary_targets(&topic, None, retain);
+        let reached: FastSet<ClientId> =
+            own.into_iter().map(|(c, _, _)| c).chain(foreign).collect();
         let gate = self
             .remote_append_pending
             .entry((node.clone(), seq))
@@ -882,7 +933,9 @@ impl Hub {
         let mut timed_out = 0usize;
         for mut h in held {
             h.ticks += 1;
-            let release = takeover_over || h.scan_landed;
+            // A scan of this shard's landing says nothing of a takeover another
+            // shard still has open (ADR 0093 Amendment 5).
+            let release = takeover_over || (h.scan_landed && !self.others_in_takeover());
             if !release && h.ticks < HELD_FORWARD_MAX_TICKS {
                 self.held_forwards.push(h);
                 continue;
@@ -937,6 +990,38 @@ impl Hub {
             origin = %h.node.0, seq = h.seq, topic = %h.topic, sessions = targets.len(),
             "takeover closed; a held forward is handed to the sessions materialised since (#1031)"
         );
+        // ADR 0093 Amendment 5: and those another shard materialised, there; the verdict
+        // waits for their answers.
+        if self.shard_count > 1 {
+            let foreign: Vec<ClientId> = self
+                .ordinary_targets(&h.topic, None, false)
+                .1
+                .into_iter()
+                .filter(|c| !h.reached.contains(c))
+                .collect();
+            if !foreign.is_empty() {
+                for client in foreign {
+                    self.hand_off(super::shards::ShardTarget::Replay {
+                        client,
+                        since: h.since,
+                    });
+                }
+                self.flush_handoffs(
+                    &h.topic,
+                    &h.payload,
+                    h.qos,
+                    false,
+                    h.message_expiry,
+                    &h.app,
+                    &AppendGate::Peer {
+                        node: h.node.clone(),
+                        seq: h.seq,
+                        origin: None,
+                        replay: true,
+                    },
+                );
+            }
+        }
         let mut all = DurableOutcome::Ok;
         for (c, granted) in targets {
             all = all.and(self.deliver_to_client(
@@ -1618,6 +1703,7 @@ impl Hub {
                 relaxed: false,
                 congested: false,
                 shard_outstanding: 0,
+                redeliveries: 0,
             },
         );
         id
@@ -2237,11 +2323,11 @@ impl InterestIndex {
 
     /// Replace `node`'s advertised interest wholesale — peers send full
     /// snapshots, so this is a remove-then-insert, not a merge.
-    pub(super) fn replace(&mut self, node: NodeId, filters: Vec<String>) {
+    pub(super) fn replace(&mut self, node: NodeId, filters: &[String]) {
         let key = Self::key(&node);
         self.by_filter.remove_client(&key);
         for f in filters {
-            let interned = self.by_filter.intern(&f);
+            let interned = self.by_filter.intern(f);
             self.by_filter.subscribe(key.clone(), interned);
         }
         self.nodes.insert(node);
@@ -2374,7 +2460,7 @@ mod interest_index_tests {
 
         let mut idx = InterestIndex::default();
         for (node, fs) in &per_node {
-            idx.replace(node.clone(), fs.clone());
+            idx.replace(node.clone(), fs);
         }
 
         for topic in &topics {
@@ -2392,7 +2478,7 @@ mod interest_index_tests {
 
         let narrowed = NodeId("n2".into());
         let keep: Vec<String> = per_node[&narrowed].iter().take(3).cloned().collect();
-        idx.replace(narrowed.clone(), keep.clone());
+        idx.replace(narrowed.clone(), &keep);
         per_node.insert(narrowed, keep);
 
         for topic in &topics {
@@ -2450,7 +2536,7 @@ mod interest_index_tests {
                 .push(f.clone());
         }
         for (node, fs) in &per_node {
-            idx.replace(node.clone(), fs.clone());
+            idx.replace(node.clone(), fs);
         }
 
         let mut scratch = Vec::new();
@@ -2492,7 +2578,7 @@ mod interest_index_tests {
     fn matching_into_collapses_a_node_on_overlapping_filters() {
         let mut idx = InterestIndex::default();
         let n = NodeId("n".into());
-        idx.replace(n.clone(), vec!["a/#".into(), "a/x".into(), "+/x".into()]);
+        idx.replace(n.clone(), &["a/#".into(), "a/x".into(), "+/x".into()]);
         let mut out = Vec::new();
         idx.matching_into("a/x", &mut out);
         assert_eq!(out.len(), 1, "three matching filters, one node: {out:?}");
@@ -2507,7 +2593,7 @@ mod interest_index_tests {
     #[test]
     fn resolving_the_same_interest_twice_mints_no_new_ids() {
         let mut idx = InterestIndex::default();
-        idx.replace(NodeId("n0".into()), vec!["a/#".into()]);
+        idx.replace(NodeId("n0".into()), &["a/#".into()]);
         let (mut a, mut b) = (Vec::new(), Vec::new());
         idx.matching_into("a/x", &mut a);
         idx.matching_into("a/x", &mut b);
@@ -2525,7 +2611,7 @@ mod interest_index_tests {
     #[test]
     fn matching_into_clears_the_caller_buffer() {
         let mut idx = InterestIndex::default();
-        idx.replace(NodeId("n0".into()), vec!["a/#".into()]);
+        idx.replace(NodeId("n0".into()), &["a/#".into()]);
         let mut out = Vec::new();
         idx.matching_into("a/x", &mut out);
         assert_eq!(out.len(), 1);
@@ -2540,7 +2626,7 @@ mod interest_index_tests {
     fn a_node_with_no_filters_still_has_an_interest_entry() {
         let mut idx = InterestIndex::default();
         let n = NodeId("quiet".into());
-        idx.replace(n.clone(), Vec::new());
+        idx.replace(n.clone(), &[]);
         assert!(idx.has_node(&n));
         assert!(idx.nodes_matching("anything").is_empty());
         assert!(idx.remove(&n), "an empty announcement is still an entry");
@@ -2554,9 +2640,9 @@ mod interest_index_tests {
     fn re_announcing_replaces_the_previous_snapshot() {
         let mut idx = InterestIndex::default();
         let n = NodeId("n".into());
-        idx.replace(n.clone(), vec!["a/#".into(), "b/c".into()]);
+        idx.replace(n.clone(), &["a/#".into(), "b/c".into()]);
         assert_eq!(idx.nodes_matching("b/c"), FastSet::from_iter([n.clone()]));
-        idx.replace(n.clone(), vec!["a/#".into()]);
+        idx.replace(n.clone(), &["a/#".into()]);
         assert!(
             idx.nodes_matching("b/c").is_empty(),
             "a filter absent from the new snapshot must stop matching"
@@ -2570,8 +2656,8 @@ mod interest_index_tests {
     fn nodes_sharing_a_filter_are_independent() {
         let mut idx = InterestIndex::default();
         let (n1, n2) = (NodeId("n1".into()), NodeId("n2".into()));
-        idx.replace(n1.clone(), vec!["s/+/t".into()]);
-        idx.replace(n2.clone(), vec!["s/+/t".into()]);
+        idx.replace(n1.clone(), &["s/+/t".into()]);
+        idx.replace(n2.clone(), &["s/+/t".into()]);
         assert_eq!(
             idx.nodes_matching("s/x/t"),
             FastSet::from_iter([n1.clone(), n2.clone()])
@@ -2665,7 +2751,7 @@ mod zone_fwd_proofs {
                 let (tx, rx) = mpsc::unbounded_channel();
                 let (ctl, ctl_rx) = mpsc::unbounded_channel();
                 hub.peer_connected(
-                    node.clone(),
+                    &node,
                     i as u64,
                     tx,
                     ctl,
@@ -2673,7 +2759,7 @@ mod zone_fwd_proofs {
                     PROTO_FORWARD_VERDICT,
                     std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 );
-                hub.interest.replace(node.clone(), vec![filter.to_string()]);
+                hub.interest.replace(node.clone(), &[filter.to_string()]);
                 announced(hub, &node);
                 PeerLink {
                     node,
@@ -2762,7 +2848,7 @@ mod zone_fwd_proofs {
         let mut h = hub();
         let mut peers = attach_peers(&mut h, 64, "other/#");
         let wanted = NodeId("p7".into());
-        h.interest.replace(wanted.clone(), vec!["t/#".into()]);
+        h.interest.replace(wanted.clone(), &["t/#".into()]);
         reset_visits();
         fan_out(&mut h, "t/1", QoS::AtMostOnce, false, None);
         assert_eq!(visits(), 64, "one interested peer must not skip the loop");
@@ -2973,7 +3059,7 @@ mod zone_fwd_proofs {
     fn attach_peer_at(hub: &mut Hub, name: &str, proto: u32, filter: &str) -> PeerLink {
         let link = link_peer_at(hub, name, proto);
         hub.interest
-            .replace(link.node.clone(), vec![filter.to_string()]);
+            .replace(link.node.clone(), &[filter.to_string()]);
         announced(hub, &link.node);
         link
     }
@@ -2986,7 +3072,7 @@ mod zone_fwd_proofs {
         let (tx, rx) = mpsc::unbounded_channel();
         let (ctl, ctl_rx) = mpsc::unbounded_channel();
         hub.peer_connected(
-            node.clone(),
+            &node,
             0,
             tx,
             ctl,
@@ -3689,7 +3775,7 @@ mod zone_fwd_proofs {
 
             // The lease's new owner materialises the session and announces it.
             h.interest
-                .replace(successor.node.clone(), vec!["t/x".to_string()]);
+                .replace(successor.node.clone(), &["t/x".to_string()]);
             sweep_tick(&mut h);
             assert!(
                 was_sent_a_forward(&mut successor),
@@ -3865,8 +3951,7 @@ mod zone_fwd_proofs {
                     .unwrap();
                 assert_eq!(queued.len(), 1, "{case}: the newcomer gets the publish");
             } else {
-                h.interest
-                    .replace(other.node.clone(), vec!["t/x".to_string()]);
+                h.interest.replace(other.node.clone(), &["t/x".to_string()]);
                 sweep_tick(&mut h);
                 let sent = forwards_sent(&mut other);
                 assert_eq!(sent.len(), 1, "{case}: the newcomer gets the publish");
@@ -4865,7 +4950,7 @@ mod pending_bounds {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (ctl, _ctl_rx) = mpsc::unbounded_channel();
         hub.peer_connected(
-            peer.clone(),
+            &peer,
             1,
             tx,
             ctl,
@@ -4914,7 +4999,7 @@ mod pending_bounds {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (ctl, _ctl_rx) = mpsc::unbounded_channel();
         hub.peer_connected(
-            peer.clone(),
+            &peer,
             1,
             tx,
             ctl,
@@ -4973,7 +5058,7 @@ mod pending_bounds {
             let (tx, mut rx) = mpsc::unbounded_channel();
             let (ctl, _ctl_rx) = mpsc::unbounded_channel();
             hub.peer_connected(
-                peer.clone(),
+                &peer,
                 1,
                 tx,
                 ctl,

@@ -8,14 +8,14 @@ use super::*;
 use std::collections::BTreeSet;
 
 /// Two shards of one node over one store, with `elision_ms` as the write-elision window.
-fn start_shards(elision_ms: u32) -> HubTx {
+pub(super) fn start_shards(elision_ms: u32) -> HubTx {
     start_shards_with(elision_ms, false, None, None, None)
 }
 
 /// As [`start_shards`], with ADR 0093 D4's remote wake (the mailboxes and the mailman)
 /// when `remote_wake`, the node's ingress credit attached, the metrics attached, and
 /// the store given (an in-memory one otherwise).
-fn start_shards_with(
+pub(super) fn start_shards_with(
     elision_ms: u32,
     remote_wake: bool,
     ingress: Option<&Arc<crate::ingress::IngressCredit>>,
@@ -72,7 +72,7 @@ fn shard_dispatches(metrics: &mqtt_observability::metrics::Metrics) -> u64 {
 }
 
 /// The `n`th client id (of the `prefix` family) that shard `shard` of two owns.
-fn client_on(shard: usize, prefix: &str, n: usize) -> String {
+pub(super) fn client_on(shard: usize, prefix: &str, n: usize) -> String {
     (0..100_000)
         .map(|i| format!("{prefix}{i}"))
         .filter(|id| crate::hub::shard_of(id, 2) == shard)
@@ -81,7 +81,7 @@ fn client_on(shard: usize, prefix: &str, n: usize) -> String {
 }
 
 /// A gated `QoS` 1 publish from `publisher`, routed to its shard as a connection's is.
-fn publish_from(
+pub(super) fn publish_from(
     tx: &HubTx,
     publisher: &str,
     topic: &str,
@@ -106,12 +106,12 @@ fn publish_from(
 
 /// Both shards have dispatched everything sent before, and everything the first barrier
 /// made them send each other (a subscribe's routing mirror): two joined flushes.
-async fn settle(tx: &HubTx) {
+pub(super) async fn settle(tx: &HubTx) {
     ping(tx).await;
     ping(tx).await;
 }
 
-async fn next_publish(rx: &mut crate::hub::OutboundRx) -> mqtt_codec::packet::Publish {
+pub(super) async fn next_publish(rx: &mut crate::hub::OutboundRx) -> mqtt_codec::packet::Publish {
     loop {
         let out = timeout(Duration::from_secs(5), rx.recv())
             .await
