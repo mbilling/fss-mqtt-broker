@@ -1025,6 +1025,9 @@ impl Hub {
         obligation: ForwardObligation,
         why: Reselect,
     ) {
+        // ADR 0093 Amendment 4: the other shards' members as each last published them,
+        // as the deal read them.
+        self.refresh_foreign_routing();
         let gone_from = obligation.node;
         let ForwardKind::Shared {
             key,
@@ -1235,6 +1238,7 @@ impl Hub {
         key: &SharedKey,
         tried: &[(Option<NodeId>, ClientId)],
     ) {
+        self.refresh_foreign_routing();
         let Some(p) = self.pending_publishes.get(id) else {
             return;
         };

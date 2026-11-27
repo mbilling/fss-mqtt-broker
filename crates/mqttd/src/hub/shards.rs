@@ -69,7 +69,10 @@ pub struct RoutingPartition {
 /// one atomic load. A cell is replaced, never edited: a shard reading an old partition
 /// keeps it whole until it reloads. A partition replaced in a cell or in a shard's view is
 /// handed to the board's reaper thread, so freeing it, which costs about half what copying
-/// it did, falls on no shard's loop and on no lock.
+/// it did, falls on no shard's loop and on no lock. The reaper's queue holds
+/// [`REAPER_QUEUE`] partitions a shard at most: when it is full, the reaper is behind and
+/// the shard frees the partition itself, so memory never holds more than that many old
+/// copies.
 #[derive(Debug)]
 pub struct RoutingBoard {
     cells: Box<[RwLock<Arc<RoutingPartition>>]>,
@@ -77,8 +80,12 @@ pub struct RoutingBoard {
     /// Each shard's session count as of its last publication, for the node-wide
     /// `max_sessions` quota (ADR 0041 T4).
     sessions: Box<[AtomicUsize]>,
-    reaper: std::sync::mpsc::Sender<Arc<RoutingPartition>>,
+    reaper: std::sync::mpsc::SyncSender<Arc<RoutingPartition>>,
 }
+
+/// How many replaced partitions per shard the reaper's queue holds before a shard frees one
+/// itself (ADR 0093 Amendment 4).
+const REAPER_QUEUE: usize = 2;
 
 impl RoutingBoard {
     /// A board for a node of `shards` shards, every partition empty, with its reaper
@@ -89,7 +96,8 @@ impl RoutingBoard {
     /// When the reaper thread cannot be started, at the node's start.
     #[must_use]
     pub fn new(shards: usize) -> Arc<Self> {
-        let (reaper, freed) = std::sync::mpsc::channel::<Arc<RoutingPartition>>();
+        let (reaper, freed) =
+            std::sync::mpsc::sync_channel::<Arc<RoutingPartition>>(REAPER_QUEUE * shards.max(1));
         std::thread::Builder::new()
             .name("mqttd-routing-reaper".to_string())
             .spawn(move || while freed.recv().is_ok() {})
@@ -102,9 +110,10 @@ impl RoutingBoard {
         })
     }
 
-    /// Hand `partition` to the reaper. A gone reaper drops it here.
+    /// Hand `partition` to the reaper. With the reaper's queue full, or the reaper gone,
+    /// it is freed here.
     fn reap(&self, partition: Arc<RoutingPartition>) {
-        let _ = self.reaper.send(partition);
+        let _ = self.reaper.try_send(partition);
     }
 
     fn publish(&self, shard: usize, partition: RoutingPartition, sessions: usize) {

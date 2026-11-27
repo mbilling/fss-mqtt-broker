@@ -9526,6 +9526,8 @@ impl Hub {
     /// snapshot arrives on a new link. With every known node linked — the steady
     /// state — it returns before it touches the pending table.
     fn move_shared_from_unreachable(&mut self) {
+        // ADR 0093 Amendment 4: the candidates below include the other shards' members.
+        self.refresh_foreign_routing();
         if !self
             .remote_shared
             .keys()
