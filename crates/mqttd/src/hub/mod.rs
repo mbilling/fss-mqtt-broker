@@ -7859,6 +7859,7 @@ impl Hub {
     fn begin_scan(&mut self) {
         self.inherited_scan_inflight = true;
         self.scan_started = (self.scan_started.0 + 1, self.ownership_epoch_now());
+        self.publish_scan(self.scan_started.0, false);
     }
 
     /// The committed ownership epoch this node's placement holds now (`None` without
@@ -8138,6 +8139,7 @@ impl Hub {
         // have skipped a group whose lease has landed since (issue #1031 review).
         if complete && self.scan_started.1 == self.ownership_epoch_now() {
             self.note_scan_landed(self.scan_started.0);
+            self.publish_scan(self.scan_started.0, true);
         }
         self.settle_passes();
     }
@@ -8447,6 +8449,8 @@ impl Hub {
         }
 
         let mut closed = 0usize;
+        // This shard's share of the node's cap (ADR 0093 Amendment 5).
+        let close_cap = self.rehome_closes_per_tick();
         let mut deferred = 0usize;
         let mut newly_deferred = 0usize;
         for (client, owner, relocatable) in candidates {
@@ -8470,7 +8474,7 @@ impl Hub {
             // deferring is one more second of a wedge that was measured unbounded, and
             // the benefit is that a mass ownership move does not close (and will-publish
             // for) every affected session in one dispatch. Counted, so it is visible.
-            if closed >= REHOME_CLOSES_PER_TICK {
+            if closed >= close_cap {
                 deferred += 1;
                 // Counted ONCE per session per deferral episode, not once per tick.
                 if !std::mem::replace(&mut entry.deferred, true) {
@@ -8554,7 +8558,7 @@ impl Hub {
             info!(
                 deferred,
                 newly_deferred,
-                cap = REHOME_CLOSES_PER_TICK,
+                cap = close_cap,
                 "rehome close cap reached this tick; the remaining misplaced sessions are \
                  deferred to later ticks (issue #284)"
             );

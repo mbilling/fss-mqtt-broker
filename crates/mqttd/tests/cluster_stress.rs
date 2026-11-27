@@ -372,29 +372,35 @@ async fn start_stress_node_full(
     let disk_faults = store.fail_writes.clone();
     let scan_hold = store.hold_scans.clone();
     let plane_observer = plane.clone();
-    let (mut hub, hub_tx) =
-        Hub::with_config_and_placement(node_id.clone(), store, Some(placement.clone()));
-    // Every stress node is cluster-configured (0043-P4 exhibit ②): the honesty
-    // gates must hold from the first moment of a (re)start, before SWIM has
-    // re-learned the membership, exactly as main.rs wires it.
-    hub.set_cluster_configured();
-    hub.set_write_elision_ms(common::write_elision_ms());
-    hub.attach_durable_plane(plane);
-    hub.attach_durable_retained(durable_retained);
     // The disk-backed retained CACHE, exactly as production wires it with a
     // data dir (main.rs): after a full-cluster stop/start every in-memory
     // cache is gone, and this reopened copy is what serves retained state
-    // until fan-out/back-fill warm it again (ADR 0018 phase 4).
-    hub.attach_retained_store(std::sync::Arc::new(
+    // until fan-out/back-fill warm it again (ADR 0018 phase 4). One for the
+    // node's hub loops, as main.rs gives them.
+    let retained: std::sync::Arc<dyn mqtt_storage::RetainedStore> = std::sync::Arc::new(
         mqtt_storage::persistent_retained::PersistentRetainedStore::open(
             data_dir.join("retained.redb"),
         )
         .expect("retained store opens"),
-    ));
-    let mut aborts = vec![
-        tokio::spawn(hub.run()).abort_handle(),
-        driver.abort_handle(),
-    ];
+    );
+    // The node's hub loops: one, or `MQTTD_HUB_SHARDS` (ADR 0093 Amendment 5).
+    let (hub_tx, mut aborts) = common::spawn_hub_shards(
+        || {
+            Hub::with_config_and_placement(node_id.clone(), store.clone(), Some(placement.clone()))
+                .0
+        },
+        |hub| {
+            // Every stress node is cluster-configured (0043-P4 exhibit ②): the honesty
+            // gates must hold from the first moment of a (re)start, before SWIM has
+            // re-learned the membership, exactly as main.rs wires it.
+            hub.set_cluster_configured();
+            hub.set_write_elision_ms(common::write_elision_ms());
+            hub.attach_durable_plane(plane.clone());
+            hub.attach_durable_retained(durable_retained.clone());
+            hub.attach_retained_store(retained.clone());
+        },
+    );
+    aborts.push(driver.abort_handle());
 
     // MQTT client listener.
     let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

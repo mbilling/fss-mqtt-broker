@@ -271,6 +271,9 @@ pub(super) struct HeldForward {
     /// that holds now, has landed: the sessions the takeover was bringing are
     /// materialised, which is what the hold waited for.
     pub(super) scan_landed: bool,
+    /// ADR 0093 Amendment 5: the scans every shard had started at the hold. A session
+    /// the takeover brings may be any shard's, so each must land one started after.
+    pub(super) others_after: Box<[u64]>,
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -900,6 +903,7 @@ impl Hub {
             ticks: 0,
             after_scan: self.scan_started.0,
             scan_landed: false,
+            others_after: self.scans_started_everywhere(),
         });
     }
 
@@ -933,9 +937,11 @@ impl Hub {
         let mut timed_out = 0usize;
         for mut h in held {
             h.ticks += 1;
-            // A scan of this shard's landing says nothing of a takeover another
-            // shard still has open (ADR 0093 Amendment 5).
-            let release = takeover_over || (h.scan_landed && !self.others_in_takeover());
+            // A scan of this shard's landing says nothing of the sessions another
+            // shard is bringing: each must have landed one started after the hold
+            // (ADR 0093 Amendment 5).
+            let release =
+                takeover_over || (h.scan_landed && self.others_scanned_since(&h.others_after));
             if !release && h.ticks < HELD_FORWARD_MAX_TICKS {
                 self.held_forwards.push(h);
                 continue;

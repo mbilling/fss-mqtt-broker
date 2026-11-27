@@ -10,8 +10,13 @@
 //! and at the end of a dispatch batch in which they changed it publishes an immutable copy
 //! of them to the node's [`RoutingBoard`]. A SUBACK, UNSUBACK or CONNACK waits for that
 //! publication, so a publish that follows the answer, on any shard, is matched with the
-//! change. Everything peer-facing, retained, relayed or administrative goes to the first
-//! shard, so a node with peers runs one shard (D5).
+//! change.
+//!
+//! A node with peers runs its shards too (Amendment 5, `peer_view`): shard 0 is the node's
+//! face to its peers and tells the others what changed in its view of them, so every shard
+//! forwards its own publishes; a forward's answer comes back to the shard its seq names; a
+//! peer's forwards are spread over the shards by its node and its sending shard; and the
+//! node's retained mutations are committed by shard 0.
 //!
 //! With one shard (the default, `node.hub_shards = 1`) nothing here runs: [`HubTx`] is
 //! the loop's own sender, [`Hub::owns`] is always true, there is no board, nothing is
@@ -96,6 +101,10 @@ pub struct RoutingBoard {
     retained_may_expire: std::sync::atomic::AtomicBool,
     /// Each shard's last value of each [`NodeGauge`].
     gauges: Box<[[AtomicUsize; NODE_GAUGES]]>,
+    /// Each shard's inherited-session scans: the number of the latest started, and of
+    /// the latest that landed complete under the ownership that held when it started.
+    /// A forward held for a takeover waits for every shard's (ADR 0093 Amendment 5).
+    scans: Box<[[AtomicU64; 2]]>,
 }
 
 /// The gauges a node reports as one figure over its shards (ADR 0093 Amendment 5): each
@@ -179,6 +188,9 @@ impl RoutingBoard {
             retained_may_expire: std::sync::atomic::AtomicBool::new(false),
             gauges: (0..shards)
                 .map(|_| std::array::from_fn(|_| AtomicUsize::new(0)))
+                .collect(),
+            scans: (0..shards)
+                .map(|_| std::array::from_fn(|_| AtomicU64::new(0)))
                 .collect(),
         });
         (board, freed)
@@ -292,6 +304,32 @@ impl RoutingBoard {
         } else {
             values.sum()
         }
+    }
+
+    /// Shard `shard` started scan number `n` (`at = 0`) or landed it complete (`at = 1`).
+    fn note_scan(&self, shard: usize, at: usize, n: u64) {
+        if let Some(cells) = self.scans.get(shard) {
+            cells[at].fetch_max(n, Ordering::Release);
+        }
+    }
+
+    /// The number of the latest scan every shard has started.
+    fn scans_started(&self) -> Box<[u64]> {
+        self.scans
+            .iter()
+            .map(|cells| cells[0].load(Ordering::Acquire))
+            .collect()
+    }
+
+    /// Whether every shard but `shard` has landed a complete scan numbered above what it
+    /// had started at `started`.
+    fn others_landed_after(&self, shard: usize, started: &[u64]) -> bool {
+        self.scans.iter().enumerate().all(|(k, cells)| {
+            k == shard
+                || started
+                    .get(k)
+                    .is_none_or(|before| cells[1].load(Ordering::Acquire) > *before)
+        })
     }
 
     /// One bit for each of the node's shards.
@@ -1057,6 +1095,13 @@ impl Hub {
         }
     }
 
+    /// This shard's part of [`super::REHOME_CLOSES_PER_TICK`], the node's cap on the
+    /// misplaced sessions closed a tick (ADR 0093 Amendment 5): an equal share, at least
+    /// one. The whole cap with one shard.
+    pub(super) fn rehome_closes_per_tick(&self) -> usize {
+        (super::REHOME_CLOSES_PER_TICK / usize::from(self.shard_count.max(1))).max(1)
+    }
+
     /// The node's figure of `gauge`, this shard's being `own`: its own with one shard
     /// (ADR 0093 Amendment 5).
     pub(super) fn node_gauge(&self, gauge: NodeGauge, own: usize) -> usize {
@@ -1091,6 +1136,31 @@ impl Hub {
                 .retained_may_expire
                 .swap(false, std::sync::atomic::Ordering::AcqRel)
         })
+    }
+
+    /// This shard started inherited-session scan `n` (`landed = false`), or landed it
+    /// complete under the ownership that held when it started (ADR 0093 Amendment 5).
+    pub(super) fn publish_scan(&self, n: u64, landed: bool) {
+        if let Some(board) = &self.routing_board {
+            board.note_scan(usize::from(self.shard), usize::from(landed), n);
+        }
+    }
+
+    /// The scans every shard has started, for a forward held now: it is released once
+    /// each shard has landed one started after (empty with one shard).
+    pub(super) fn scans_started_everywhere(&self) -> Box<[u64]> {
+        self.routing_board
+            .as_ref()
+            .map_or_else(|| Box::new([]) as Box<[u64]>, |board| board.scans_started())
+    }
+
+    /// Whether every other shard has landed a complete scan started after `started`
+    /// ([`scans_started_everywhere`](Self::scans_started_everywhere)). Always with one
+    /// shard.
+    pub(super) fn others_scanned_since(&self, started: &[u64]) -> bool {
+        self.routing_board
+            .as_ref()
+            .is_none_or(|board| board.others_landed_after(usize::from(self.shard), started))
     }
 
     /// Whether another shard's takeover is open (ADR 0093 Amendment 5): a session this

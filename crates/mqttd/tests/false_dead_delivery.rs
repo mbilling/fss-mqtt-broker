@@ -272,15 +272,10 @@ async fn start_node(id: &str, seeds: Vec<String>, mode: Mode) -> Node {
     )));
     let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("fd"));
 
-    let (store, plane, mut hub, hub_tx) = match mode {
+    let (store, plane, durable_retained) = match mode {
         Mode::Plain => {
             let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
-            let (hub, tx) = Hub::with_config_and_placement(
-                node_id.clone(),
-                store.clone(),
-                Some(placement.clone()),
-            );
-            (store, None, hub, tx)
+            (store, None, None)
         }
         Mode::Durable => {
             let (store, durable_retained, plane, _driver) = build_durable_node_with(
@@ -298,22 +293,27 @@ async fn start_node(id: &str, seeds: Vec<String>, mode: Mode) -> Node {
                 Some(common::founding()),
             )
             .await;
-            let (mut hub, tx) = Hub::with_config_and_placement(
-                node_id.clone(),
-                store.clone(),
-                Some(placement.clone()),
-            );
-            hub.attach_durable_plane(plane.clone());
-            hub.attach_durable_retained(durable_retained);
-            (store, Some(plane), hub, tx)
+            (store, Some(plane), Some(durable_retained))
         }
     };
-    // As `main` does for a node with peer networking: the cluster honesty gates apply
-    // from the first moment (the settle window, the pending-publish gate).
-    hub.set_cluster_configured();
-    hub.set_write_elision_ms(common::write_elision_ms());
-    hub.attach_metrics(metrics.clone());
-    tokio::spawn(hub.run());
+    // The node's hub loops: one, or `MQTTD_HUB_SHARDS` (ADR 0093 Amendment 5).
+    let (hub_tx, _loops) = common::spawn_hub_shards(
+        || {
+            Hub::with_config_and_placement(node_id.clone(), store.clone(), Some(placement.clone()))
+                .0
+        },
+        |hub| {
+            if let (Some(plane), Some(retained)) = (&plane, &durable_retained) {
+                hub.attach_durable_plane(plane.clone());
+                hub.attach_durable_retained(retained.clone());
+            }
+            // As `main` does for a node with peer networking: the cluster honesty gates
+            // apply from the first moment (the settle window, the pending-publish gate).
+            hub.set_cluster_configured();
+            hub.set_write_elision_ms(common::write_elision_ms());
+            hub.attach_metrics(metrics.clone());
+        },
+    );
 
     let engine = {
         let set = Arc::new(
