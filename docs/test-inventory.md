@@ -940,8 +940,10 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `tests::the_whole_env_surface_overlays_without_collision`
 - `tests::warn_mode_boots_a_newer_config_and_reports_the_ignored_keys`
 
-## `crates/mqtt-core/src/lib.rs` — 61 test(s)
+## `crates/mqtt-core/src/lib.rs` — 65 test(s)
 
+- `filter_index::tests::a_copy_matches_as_the_original_and_changes_on_its_own`
+- `filter_index::tests::a_deep_filter_is_copied_without_recursion`
 - `filter_index::tests::a_deep_wildcard_chain_drops_without_recursion`
 - `filter_index::tests::a_trie_node_stays_small`
 - `filter_index::tests::a_wildcard_only_node_survives_its_siblings_removal`
@@ -951,6 +953,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `secrets::tests::passes_clean_and_empty_input_through`
 - `secrets::tests::trims_both_ends_but_not_interior`
 - `secrets::tests::trims_trailing_newline_variants`
+- `shared::tests::a_copy_holds_the_same_members_and_changes_on_its_own`
 - `shared::tests::distinct_groups_are_reported_separately`
 - `shared::tests::for_each_matching_visits_the_same_groups_without_cloning`
 - `shared::tests::inserting_reports_whether_it_added_and_the_reverse_index_follows`
@@ -966,6 +969,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `shared::tests::the_online_prefix_survives_every_transition_order`
 - `shared::tests::the_own_prefix_holds_through_every_transition_and_selection_stays_inside_it`
 - `shared::tests::unsubscribe_and_remove_client_prune_groups`
+- `subscriptions::tests::a_copy_routes_as_the_original_and_changes_on_its_own`
 - `subscriptions::tests::a_distinct_filter_is_allocated_once_however_many_subscribers`
 - `subscriptions::tests::a_fully_removed_filter_can_be_resubscribed`
 - `subscriptions::tests::client_with_overlapping_filters_appears_once`
@@ -1605,7 +1609,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 933 test(s)
+## `crates/mqttd/src/lib.rs` — 943 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1901,6 +1905,8 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::settle::tests::a_settled_view_never_holds`
 - `hub::settle::tests::a_shared_placement_is_evidence`
 - `hub::settle::tests::a_zero_match_fan_out_on_an_unsettled_view_still_holds`
+- `hub::shards::reaper_tests::a_full_reaper_queue_frees_the_next_partition_where_it_was_replaced`
+- `hub::shards::reaper_tests::a_shard_that_frees_a_partition_itself_counts_it`
 - `hub::shards::tests::a_client_keyed_command_goes_to_its_shard`
 - `hub::shards::tests::a_command_naming_no_client_goes_first_and_a_setting_goes_everywhere`
 - `hub::shards::tests::a_joined_command_is_answered_once_every_shard_has`
@@ -2238,10 +2244,18 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::sharded::a_hand_off_through_the_mailbox_and_the_mailman_is_delivered_and_answered`
 - `hub::tests::sharded::a_publish_reaches_a_subscriber_the_other_shard_owns_and_is_acked_after_its_write`
 - `hub::tests::sharded::a_qos0_publish_is_handed_off_ungated`
+- `hub::tests::sharded::a_reconnected_shared_member_is_dealt_from_the_other_shard_at_once`
 - `hub::tests::sharded::a_shared_group_deals_on_the_publishers_shard_and_crosses_only_when_it_has_no_member_online`
 - `hub::tests::sharded::a_shared_group_on_the_other_shard_takes_every_publish_under_the_window`
+- `hub::tests::sharded::a_storm_of_routing_changes_is_published_once_a_batch`
 - `hub::tests::sharded::a_target_at_its_hand_off_cap_parks_the_origins_data_lane_until_it_answers`
+- `hub::tests::sharded::an_acknowledged_subscribe_is_matched_by_the_other_shard_at_once`
+- `hub::tests::sharded::an_answer_waits_for_its_shards_publication`
 - `hub::tests::sharded::an_unsubscribe_is_mirrored_to_the_other_shard`
+- `hub::tests::sharded::one_shard_publishes_nothing_and_answers_at_once`
+- `hub::tests::sharded::publications_under_churn_are_spaced_by_their_copy_cost`
+- `hub::tests::sharded::reselection_lists_another_shards_online_members_as_the_deal_does`
+- `hub::tests::sharded::the_session_quota_counts_every_shard`
 - `hub::tests::share_obligations::a_drain_gated_share_delivery_behind_a_lost_link_does_not_hold_the_drain`
 - `hub::tests::share_obligations::a_drain_gated_share_delivery_with_nobody_to_hand_it_to_is_dropped_and_counted`
 - `hub::tests::share_obligations::a_node_whose_view_is_unsettled_does_not_call_a_share_member_gone`

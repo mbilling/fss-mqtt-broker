@@ -110,8 +110,8 @@ pub use quarantine::QUARANTINE_LISTED;
 /// ADR 0092 T5: the node's data shards and the sender in front of them.
 pub mod shards;
 pub use shards::{
-    shard_of, spawn_mailman, HubTx, ShardAnswer, ShardBatch, ShardDeliver, ShardMailbox,
-    ShardTarget, MAX_SHARDS,
+    shard_of, spawn_mailman, HubTx, RoutingBoard, RoutingPartition, ShardAnswer, ShardBatch,
+    ShardDeliver, ShardMailbox, ShardTarget, MAX_SHARDS,
 };
 
 /// Default outbound Receive Maximum when the client advertised none — effectively
@@ -1763,17 +1763,6 @@ pub enum HubCommand {
     /// originates for a client: the Will. Client publishes are evaluated on their
     /// connection tasks, never here. Sent once at startup, before any listener accepts.
     AttachRules(crate::rules::Rules),
-    /// ADR 0092 T5: what a client of another shard subscribes to, and whether it is
-    /// connected, as its shard holds it now — this shard matches on it and hands the
-    /// deliveries back. Sent shard to shard, never by a connection.
-    ShardRoute {
-        /// The client, owned by another shard.
-        client: ClientId,
-        /// Every filter it holds, `$share/<group>/` prefix included, with its granted `QoS`.
-        filters: Vec<(String, QoS)>,
-        /// Whether it is connected there (a `$share` group's online prefix).
-        online: bool,
-    },
     /// ADR 0092 T5 / ADR 0093 D3: the publishes another shard matched during one of its
     /// dispatch batches, for the subscribers this shard owns. Boxed (#835).
     ShardDeliver(Box<shards::ShardBatch>),
@@ -2278,7 +2267,6 @@ impl HubCommand {
             | Self::RemoteMessageEvents { .. }
             | Self::RemoteSharedInterest { .. }
             | Self::InheritedSessions { .. }
-            | Self::ShardRoute { .. }
             | Self::Flush { .. }
             | Self::Drained { .. } => Lane::Data,
             #[cfg(test)]
@@ -2318,7 +2306,7 @@ impl HubCommand {
             | Self::Draining => "control",
             // ADR 0092 T5: the hand-offs between a node's shards, their own class so
             // the hub model reads what the split costs.
-            Self::ShardRoute { .. } | Self::ShardDeliver(_) | Self::ShardDone { .. } => "shard",
+            Self::ShardDeliver(_) | Self::ShardDone { .. } => "shard",
             #[cfg(test)]
             Self::Ordered(inner) => inner.class(),
             _ => "cluster",
@@ -3267,6 +3255,21 @@ pub struct Hub {
     /// a batch goes on the shard's channel and the wake is this worker's.
     shard_mailboxes: Option<Arc<[shards::ShardMailbox]>>,
     mailman: Option<std::sync::mpsc::Sender<u8>>,
+    /// ADR 0093 Amendment 4, with more than one shard: the node's routing board, where this
+    /// shard publishes the routing of the clients it owns and reads the other shards'.
+    routing_board: Option<Arc<shards::RoutingBoard>>,
+    /// The other shards' routing partitions as of `foreign_version`, by shard (this
+    /// shard's own slot unused). Empty with one shard.
+    foreign_routing: Vec<Arc<shards::RoutingPartition>>,
+    foreign_version: u64,
+    /// This shard's routing changed since it last published (Amendment 4).
+    routing_dirty: bool,
+    /// When this shard last published its routing, and what that copy cost: the
+    /// spacing of the next one under constant churn (Amendment 4).
+    routing_published_at: Option<std::time::Instant>,
+    routing_copy_cost: std::time::Duration,
+    /// The answers waiting for this shard's next publication (Amendment 4).
+    after_publish: Vec<shards::Waiting>,
     /// Prometheus metrics (ADR 0020), when enabled. Updated on the publish/deliver paths.
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
     /// The node's ingress credit (ADR 0082 T3), held only to export its gauges: the hub
@@ -3561,6 +3564,13 @@ impl Hub {
                 publish_credit: None,
                 shard_mailboxes: None,
                 mailman: None,
+                routing_board: None,
+                foreign_routing: Vec::new(),
+                foreign_version: 0,
+                routing_dirty: false,
+                routing_published_at: None,
+                routing_copy_cost: std::time::Duration::ZERO,
+                after_publish: Vec::new(),
                 held_forwards: Vec::new(),
                 elision: Box::default(),
                 forward_windows: HashMap::default(),
@@ -3984,6 +3994,9 @@ impl Hub {
                     if self.elision.entries > 0 {
                         self.expire_elided();
                     }
+                    // ADR 0093 Amendment 4: this batch's routing changes are published,
+                    // once per batch at most, and the answers that waited for them go out.
+                    self.publish_routing(false);
                     // ADR 0093 D3: the batch's hand-offs and answers go to their shards
                     // now, once per batch, before this loop gives up its worker.
                     self.flush_shard_batches();
@@ -4004,8 +4017,10 @@ impl Hub {
             if closed {
                 break;
             }
-            // Nothing left to dispatch: what this batch owes other shards goes out
-            // before the loop parks (ADR 0093 D3).
+            // Nothing left to dispatch: this batch's routing is published and what it
+            // owes other shards goes out before the loop parks (ADR 0093 D3,
+            // Amendment 4).
+            self.publish_routing(true);
             self.flush_shard_batches();
             tokio::select! {
                 cmd = self.rx.recv() => match cmd {
@@ -4282,7 +4297,9 @@ impl Hub {
                         .zip(granted)
                         .map(|(removed, qos)| removed.then(|| qos.unwrap_or(QoS::AtMostOnce)))
                         .collect();
-                    let _ = reply.send(answer);
+                    // ADR 0093 Amendment 4: the UNSUBACK waits until no shard matches
+                    // with the removed filters.
+                    self.answer_after_publish(shards::AfterPublish::Unsubscribe(reply, answer));
                 }
             }
             cmd @ HubCommand::Publish { .. } => {
@@ -4472,11 +4489,6 @@ impl Hub {
                 self.attach_rules(rules);
             }
             // ADR 0092 T5: the hand-offs between the node's shards.
-            HubCommand::ShardRoute {
-                client,
-                filters,
-                online,
-            } => self.apply_shard_route(&client, filters, online),
             HubCommand::ShardDeliver(b) => self.dispatch_shard_batch(*b),
             HubCommand::ShardDone { shard, answers } => {
                 for a in answers {
@@ -4994,6 +5006,9 @@ impl Hub {
                 self.inherit_sessions(sessions, counted);
             }
             HubCommand::Flush { reply } => {
+                // What was dispatched before the flush is visible to every shard by the
+                // time it is answered (ADR 0093 Amendment 4).
+                self.publish_routing(true);
                 let _ = reply.send(());
             }
             // Answered by `dispatch_timed` once nothing is left in flight.
@@ -5253,6 +5268,9 @@ impl Hub {
         publisher: Option<&ClientId>,
         live_only: bool,
     ) -> DurableOutcome {
+        // ADR 0093 Amendment 4: match against the other shards' routing as each last
+        // published it, before the brownout peek below plans the shared half.
+        self.refresh_foreign_routing();
         // PLAN, then COMMIT (issue #238). A refusal must be EFFECT-FREE, so it is
         // decided before the first side effect of the whole publish — before
         // `deliver`'s `retained.set`, before any append, before any live send, before
@@ -5681,7 +5699,7 @@ impl Hub {
             let over_cap = self
                 .quotas
                 .max_sessions
-                .is_some_and(|cap| self.session_count() >= cap);
+                .is_some_and(|cap| self.node_session_count() >= cap);
             if over_cap || self.brownout {
                 warn!(client = %client.0, brownout = self.brownout,
                       "session quota/brownout: new-session CONNECT refused (ADR 0041)");
@@ -5904,7 +5922,7 @@ impl Hub {
         }
         // Its groups' online prefixes must include it from here on (ADR 0015).
         self.shared.set_client_online(&client, true);
-        self.mirror_routing(&client);
+        self.routing_changed();
         info!(client = %client.0, persistent = session_expiry != 0, session_present, "client attached");
 
         // Issue #284 round 3: a session becomes misplaced by ARRIVING, not only by an
@@ -5929,8 +5947,12 @@ impl Hub {
             }
         }
 
-        // Tell the connection the result so it can CONNACK before any replay.
-        let _ = reply.send(AttachOutcome::Present(session_present));
+        // Tell the connection the result so it can CONNACK before any replay, once every
+        // shard can see this session's presence (ADR 0093 Amendment 4).
+        self.answer_after_publish(shards::AfterPublish::Attach(
+            reply,
+            AttachOutcome::Present(session_present),
+        ));
 
         // Resume in-flight QoS state: unacked PUBLISHes go out again with DUP
         // [MQTT-4.4.0-1]; half-completed QoS 2 deliveries resume at PUBREL.
@@ -6261,16 +6283,20 @@ impl Hub {
                 // exactly, options and identifiers included.
                 self.subs.insert(client.clone(), prior);
             }
-            self.mirror_routing(client);
+            self.routing_changed();
             if let Some(tx) = reply {
-                let _ = tx.send(vec![false; verdicts.len()]);
+                self.answer_after_publish(shards::AfterPublish::Subscribe(
+                    tx,
+                    vec![false; verdicts.len()],
+                ));
             }
             return;
         }
+        // ADR 0093 Amendment 4: the SUBACK waits until every shard can match with it.
+        self.routing_changed();
         if let Some(tx) = reply {
-            let _ = tx.send(verdicts);
+            self.answer_after_publish(shards::AfterPublish::Subscribe(tx, verdicts));
         }
-        self.mirror_routing(client);
         self.gossip_interest();
 
         // #219: the advertisement above takes a hop to reach every peer, and a
@@ -6351,7 +6377,7 @@ impl Hub {
         // in-memory removal above already answered the client's question
         // ("did I hold this subscription?"), which is all `0x00`/`0x11` claim.
         let _ = self.persist_subscriptions(client).await;
-        self.mirror_routing(client);
+        self.routing_changed();
         self.gossip_interest();
         existed
     }
@@ -7018,7 +7044,7 @@ impl Hub {
         // Out of every group's online prefix: a member offline here is not
         // immediately deliverable, which is what the selection reads.
         self.shared.set_client_online(client, false);
-        self.mirror_routing(client);
+        self.routing_changed();
         // Deliveries still staged behind an outbound-id record never reached this
         // connection's wire (issue #242 finding A): drop them — the durable copy
         // owns delivery on reattach, and their offsets stay owed (untouched in
@@ -7150,7 +7176,7 @@ impl Hub {
         let departed = self.online.remove(client);
         self.replays.remove(client);
         self.shared.set_client_online(client, false);
-        self.mirror_routing(client);
+        self.routing_changed();
         if let Some(inf) = self.inflight.get_mut(client) {
             inf.pending
                 .retain(|_, p| p.state != OutState::AwaitingIdRecord);
@@ -7399,7 +7425,7 @@ impl Hub {
     /// clean-start attach, ADR 0017).
     fn discard_session_local(&mut self, client: &ClientId) {
         self.drop_subscriptions(client);
-        self.mirror_routing(client);
+        self.routing_changed();
         self.inflight.remove(client);
         self.session_expiry.remove(client);
         self.expiring.remove(client);
@@ -7966,7 +7992,7 @@ impl Hub {
                 .entry(client.clone())
                 .or_insert(expiry_interval.unwrap_or(SESSION_EXPIRY_NEVER));
             debug!(client = %client.0, "inherited session materialized before re-attach (ADR 0042 T9)");
-            self.mirror_routing(&client);
+            self.routing_changed();
             registered = true;
         }
         if registered || self.interest_authoritative {
@@ -9507,6 +9533,8 @@ impl Hub {
         {
             return;
         }
+        // ADR 0093 Amendment 4: the candidates below include the other shards' members.
+        self.refresh_foreign_routing();
         let mut movable: Vec<(u64, u64)> = Vec::new();
         let mut elsewhere_by_group: HashMap<SharedKey, Vec<(Option<NodeId>, ClientId)>> =
             HashMap::default();

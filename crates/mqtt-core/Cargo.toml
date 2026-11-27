@@ -12,5 +12,13 @@ mqtt-codec = { path = "../mqtt-codec", version = "1.0.0" }
 bytes.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+criterion = { workspace = true }
+
+# ADR 0093 Amendment 4: what a hub shard pays to publish its routing.
+[[bench]]
+name = "routing_copy"
+harness = false
+
 [lints]
 workspace = true
