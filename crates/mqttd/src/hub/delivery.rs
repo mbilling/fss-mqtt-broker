@@ -109,6 +109,25 @@ pub(super) struct SharedPlan {
 /// or duplicated delivery. That is what makes hashing acceptable here. The owned
 /// key is kept beside the cursor and compared on read, so a collision degrades
 /// two groups' rotation rather than silently merging them.
+/// Whether a group's `members` include anybody besides `gone_member` of `gone_from` — a
+/// member of this node's, on another shard, when `gone_here` (ADR 0093 Amendment 5),
+/// listed without a node.
+fn group_has_others(
+    members: &[SharedCandidate],
+    gone_from: &NodeId,
+    gone_here: bool,
+    gone_member: &ClientId,
+) -> bool {
+    members.iter().any(|c| {
+        let on_gone_node = if gone_here {
+            c.node.is_none()
+        } else {
+            c.node.as_ref() == Some(gone_from)
+        };
+        !(on_gone_node && c.client == *gone_member)
+    })
+}
+
 pub(super) fn shared_cursor_hash(group: &str, filter: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -915,6 +934,7 @@ impl Hub {
                         self.hand_off(super::shards::ShardTarget::Shared {
                             client: chosen.client,
                             qos: delivered_qos,
+                            key_hash,
                         });
                         continue;
                     }
@@ -1031,6 +1051,9 @@ impl Hub {
         // as a deal made now would read them.
         self.refresh_foreign_routing();
         let gone_from = obligation.node;
+        // A member of this node's, on another shard (ADR 0093 Amendment 5), is listed
+        // without a node.
+        let gone_here = gone_from == self.node_id;
         let ForwardKind::Shared {
             key,
             client: gone_member,
@@ -1063,9 +1086,7 @@ impl Hub {
             // Whether the group has anybody besides the member that went. (That
             // member can still be listed: its node's refusal arrives before the
             // membership snapshot that drops it.)
-            let others = members
-                .iter()
-                .any(|c| !(c.node.as_ref() == Some(&gone_from) && c.client == gone_member));
+            let others = group_has_others(&members, &gone_from, gone_here, &gone_member);
             let candidates: Vec<SharedCandidate> = members
                 .into_iter()
                 .filter(|c| !tried.iter().any(|(n, cl)| *n == c.node && *cl == c.client))
@@ -1100,6 +1121,7 @@ impl Hub {
             let Some(node) = chosen.node.clone() else {
                 let out = self.deliver_to_shared_member(
                     id,
+                    shared_cursor_hash(&key.0, &key.1),
                     &chosen.client,
                     delivered_qos,
                     &topic,
@@ -1298,6 +1320,7 @@ impl Hub {
                 self.hand_off(super::shards::ShardTarget::Shared {
                     client: member.client.clone(),
                     qos: delivered_qos,
+                    key_hash: shared_cursor_hash(&key.0, &key.1),
                 });
                 self.flush_handoffs(
                     &topic,
@@ -1675,6 +1698,7 @@ impl Hub {
     fn deliver_to_shared_member(
         &mut self,
         id: u64,
+        key_hash: u64,
         client: &ClientId,
         delivered_qos: QoS,
         topic: &str,
@@ -1699,6 +1723,7 @@ impl Hub {
         self.hand_off(super::shards::ShardTarget::Shared {
             client: client.clone(),
             qos: delivered_qos,
+            key_hash,
         });
         self.flush_handoffs(topic, payload, qos, false, message_expiry, app, &gate);
         DurableOutcome::Ok

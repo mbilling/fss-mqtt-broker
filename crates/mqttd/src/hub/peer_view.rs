@@ -161,6 +161,9 @@ impl Hub {
         if !self.tells_shards() {
             return;
         }
+        // On each shard's data lane, as shard 0's own peer commands are: a shard whose data
+        // lane is parked on its hand-off cap applies the change late, on purpose — the
+        // answers it waits for travel on the control lane, so it cannot wait on itself.
         for tx in self.shard_txs.iter().skip(1) {
             let _ = tx.send(HubCommand::PeerView(view()));
         }

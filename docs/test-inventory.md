@@ -1610,7 +1610,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 953 test(s)
+## `crates/mqttd/src/lib.rs` — 956 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -2099,9 +2099,12 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::cert_expiry::a_revoked_relay_stream_is_ended_by_the_reloads_sweep`
 - `hub::tests::cert_expiry::a_splice_ends_at_the_landing_nodes_own_end_and_is_let_go_when_it_closes`
 - `hub::tests::clean_session_attach_wipes_prior_persistent_state`
+- `hub::tests::cluster_shards::a_hand_off_to_a_member_that_is_gone_names_it_in_the_answer`
 - `hub::tests::cluster_shards::a_lost_link_is_lost_on_every_shard_and_what_was_owed_goes_out_on_the_next`
+- `hub::tests::cluster_shards::a_member_gone_on_another_shard_is_dealt_again_there`
 - `hub::tests::cluster_shards::a_peers_forward_is_answered_once_the_other_shard_has_stored_it`
 - `hub::tests::cluster_shards::a_publish_on_another_shard_is_forwarded_and_its_answer_finds_that_shard`
+- `hub::tests::cluster_shards::a_publish_owed_to_a_peer_declared_dead_then_gone_is_held_then_resolved_on_its_shard`
 - `hub::tests::cluster_shards::a_value_retained_through_one_shard_is_replayed_on_the_other`
 - `hub::tests::cluster_shards::shard_0_commits_every_retained_mutation_one_at_a_time`
 - `hub::tests::cluster_shards::the_nodes_interest_is_gossiped_from_shard_0_with_every_shards_filters`

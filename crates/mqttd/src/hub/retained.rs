@@ -693,8 +693,10 @@ impl Hub {
             }
         }
         // ADR 0093 Amendment 5: shard 0 commits every retained mutation of the node, one
-        // at a time, and keeps the tokens; this shard's publish waits for its answer.
+        // at a time, and keeps the tokens; this shard's publish waits for its answer. A
+        // restore is never one of them: it is routed to shard 0.
         if !self.peer_face() {
+            debug_assert!(!restore, "a restore is shard 0's");
             if let Some(tx) = self.shard_txs.first() {
                 let _ = tx.send(HubCommand::RetainedMutation {
                     topic: topic.to_string(),
@@ -1523,7 +1525,12 @@ impl Hub {
         // ADR 0093 Amendment 5: shard 0 applies every committed value; the other shards'
         // fresh subscriptions are theirs to serve.
         if self.tells_shards() {
-            for tx in self.shard_txs.iter().skip(1) {
+            for (k, tx) in self.shard_txs.iter().enumerate().skip(1) {
+                // Only to a shard that may hold a window: one that opens one says so
+                // before its replay reads the store this value was just written to.
+                if !self.shard_has_retained_windows(k) {
+                    continue;
+                }
                 let _ = tx.send(HubCommand::RetainedWindowed {
                     topic: topic.to_string(),
                     payload: payload.clone(),

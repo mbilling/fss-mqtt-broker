@@ -477,3 +477,150 @@ async fn the_sessions_gauge_counts_every_shard() {
         assert_eq!(read().as_deref(), Some("mqttd_sessions 2"));
     }
 }
+
+/// Two shards of one node over one store, driven without their loops: what one sends
+/// the other is read from the hub's own batches.
+fn two_unrun_shards() -> (Hub, Hub) {
+    let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
+    let mut a = Hub::with_config(NodeId("hub-test".into()), store.clone()).0;
+    let mut b = Hub::with_config(NodeId("hub-test".into()), store).0;
+    let txs = vec![a.sender(), b.sender()];
+    let board = crate::hub::RoutingBoard::new(2);
+    a.set_shards(0, txs.clone(), &board);
+    b.set_shards(1, txs, &board);
+    (a, b)
+}
+
+/// The shard a `$share` delivery was handed to says, in its answer, that the member was
+/// gone (ADR 0093 Amendment 5): the outcome claims nothing stored and nothing failed.
+#[tokio::test]
+async fn a_hand_off_to_a_member_that_is_gone_names_it_in_the_answer() {
+    let (_a, mut b) = two_unrun_shards();
+    let gone = ClientId(client_on(1, "m-", 0).into());
+    let key_hash = crate::hub::delivery::shared_cursor_hash("g", "t");
+    b.dispatch_shard_deliver(crate::hub::ShardDeliver {
+        origin: 0,
+        gate: Some(7),
+        from: None,
+        replay: false,
+        live_only: false,
+        topic: "t".into(),
+        payload: Bytes::from_static(b"x"),
+        qos: QoS::AtLeastOnce,
+        retain: false,
+        message_expiry: None,
+        app: mqtt_core::AppProperties::default(),
+        targets: vec![crate::hub::ShardTarget::Shared {
+            client: gone.clone(),
+            qos: QoS::AtLeastOnce,
+            key_hash,
+        }],
+        credit: None,
+    });
+    let answers = std::mem::take(&mut b.shard_done_batches[0]);
+    assert_eq!(answers.len(), 1);
+    assert_eq!(answers[0].id, 7);
+    assert!(matches!(answers[0].outcome, crate::hub::DurableOutcome::Ok));
+    assert_eq!(answers[0].gone, vec![(key_hash, gone, QoS::AtLeastOnce)]);
+}
+
+/// The publisher's shard places a delivery whose member was gone with another member of
+/// the group, as a peer's member-gone answer is placed (ADR 0093 Amendment 5): here the
+/// other shard's online member, handed to it under the same pending publish, which stays
+/// unanswered until that shard answers.
+#[tokio::test]
+async fn a_member_gone_on_another_shard_is_dealt_again_there() {
+    let (mut a, mut b) = two_unrun_shards();
+    let gone = ClientId(client_on(1, "m-", 0).into());
+    let there = ClientId(client_on(1, "m-", 1).into());
+    b.shared
+        .subscribe(there.clone(), "g", "t", QoS::AtLeastOnce, true);
+    b.routing_changed();
+    b.publish_routing(true);
+    a.refresh_foreign_routing();
+    let key: (String, String) = ("g".into(), "t".into());
+    let key_hash = crate::hub::delivery::shared_cursor_hash("g", "t");
+    a.shared_cursor.insert(key_hash, (key, 0));
+    let (done, mut answered) = oneshot::channel();
+    let id = a.register_pending(
+        done,
+        "t",
+        &Bytes::from_static(b"moved"),
+        QoS::AtLeastOnce,
+        false,
+        None,
+        &mqtt_core::AppProperties::default(),
+    );
+    if let Some(p) = a.pending_publishes.get_mut(id) {
+        p.local_done = true;
+        p.shard_outstanding = 0b10;
+    }
+    a.shard_done(
+        1,
+        crate::hub::ShardAnswer {
+            id,
+            outcome: crate::hub::DurableOutcome::Ok,
+            reached: false,
+            gone: vec![(key_hash, gone.clone(), QoS::AtLeastOnce)],
+        },
+    );
+    assert!(
+        matches!(
+            answered.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ),
+        "not answered: the delivery was placed again, and waits for its shard"
+    );
+    assert_eq!(
+        a.pending_publishes.get(id).map(|p| p.shard_outstanding),
+        Some(0b10),
+        "owed by the shard of the member it was placed with"
+    );
+    let batch = &a.handoff_batches[1];
+    assert_eq!(batch.len(), 1);
+    let targets: Vec<&ClientId> = batch[0]
+        .targets
+        .iter()
+        .map(|t| match t {
+            crate::hub::ShardTarget::Shared { client, .. } => client,
+            other => panic!("a $share delivery: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        targets,
+        [&there],
+        "the member that is there, not the one that left"
+    );
+}
+
+/// A verdict on a peer reaches every shard (ADR 0093 Amendment 5): a publish on the shard
+/// that does not hear from membership, owed to a peer then declared dead, is held there;
+/// once membership confirms the peer gone, what it was owed is resolved on that shard and
+/// its publisher answered.
+#[tokio::test]
+async fn a_publish_owed_to_a_peer_declared_dead_then_gone_is_held_then_resolved_on_its_shard() {
+    let tx = start_shards(0);
+    let mut to_peer = link_peer(&tx, 1, &["t/#"]);
+    let a = client_on(1, "pub-", 0);
+    let _ = attach_full(&tx, &a, 1, true, 0, 256).await;
+    settle(&tx).await;
+    drain(&mut to_peer);
+    let mut done = publish_from(&tx, &a, "t/x", b"held");
+    let seq = next_forward(&mut to_peer).await;
+    assert_eq!(issuer(seq), 1);
+    tx.send(HubCommand::PeerDead { node: peer() }).unwrap();
+    settle(&tx).await;
+    assert!(
+        matches!(done.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+        "held for a peer declared dead, which may yet answer"
+    );
+    tx.send(HubCommand::PeerGone { node: peer() }).unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(5), done)
+            .await
+            .expect("resolved within 5 s")
+            .unwrap(),
+        PublishOutcome::Accepted,
+        "the peer is gone: its subscribers with it"
+    );
+}

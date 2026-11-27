@@ -2899,8 +2899,6 @@ impl mqttd::backup::RetainedSource for HubRetainedSource {
     }
 }
 
-/// Build the on-disk retained-message store at `<dir>/retained.redb` (ADR 0018 phase 4),
-/// so retained messages survive a restart.
 /// One in-memory retained store for the node's shards when there is more than one and
 /// no other store (ADR 0093 Amendment 5): a subscriber on one shard replays what was
 /// retained through another. `None` with one shard, which keeps its own, as it always
@@ -2913,6 +2911,8 @@ fn shared_memory_retained(
         .then(|| Arc::new(mqtt_storage::MemoryRetainedStore::new()) as Arc<dyn RetainedStore>)
 }
 
+/// Build the on-disk retained-message store at `<dir>/retained.redb` (ADR 0018 phase 4),
+/// so retained messages survive a restart.
 fn persistent_retained(dir: &str) -> Result<Arc<dyn RetainedStore>, Box<dyn std::error::Error>> {
     let path = Path::new(dir).join("retained.redb");
     Ok(Arc::new(PersistentRetainedStore::open(path)?))

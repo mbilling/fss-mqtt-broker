@@ -500,8 +500,12 @@ Amendment 4 found five things.
     shard its seq names. An unacknowledged forward goes to `h(node) mod K`.
   - A retransmission carries the same seq, so it reaches the window that saw the original.
   - One publisher's forwards are all sent by one shard of its node, so they keep their
-    order.
+    order. A publisher's `QoS` 0 and `QoS` 1 forwards can land on different shards and
+    reorder against each other, which MQTT allows: it orders a topic's messages per
+    `QoS`.
   - The handling shard's pool carries a plain forward's credit.
+  - A shard that has not yet heard of a peer's new link from shard 0 hands its answers
+    for that peer to shard 0, which has the link's own lanes.
 - **A peer's forward is gated like a client's publish** (D5's first point).
   - Its copy for another shard's subscriber goes over gated, and the peer is answered once
     that shard has stored it.
@@ -511,6 +515,9 @@ Amendment 4 found five things.
   - This covers a client's publish and a forward held for a takeover. The re-delivery goes
     as a replay to the sessions another shard materialised since, under a gate of its own.
   - The sessions a publish reached include the other shards', so none gets a second copy.
+- **A `$share` member that left its shard after the deal** is placed again by the
+  publisher's shard, as a peer's member-gone answer is: the hand-off's answer names it,
+  and the publisher's acknowledgement waits for the new placement.
 - **Settling and takeovers are the node's questions.**
   - Each shard publishes its own terms on the routing board.
   - `routing_unsettled` and `takeover_open` hold while any shard's do.
@@ -522,6 +529,7 @@ Amendment 4 found five things.
   - The interest is the union of every shard's routing as each last published it.
   - It is gossiped once every shard's boot scan has landed.
   - A shard whose routing changed asks shard 0 to gossip once its own publication is out.
+    Shard 0 gossips once a batch, however many shards asked.
 - **Retained is one per node, committed by shard 0.**
   - The shards share one store in every mode.
   - With durable retained, shard 0 commits every retained mutation of the node, one at a
@@ -529,8 +537,9 @@ Amendment 4 found five things.
     and its publisher is answered on its own shard once the commit lands.
   - The tokens, tombstones, digests, snapshots and exports are shard 0's, over one
     consistent set.
-  - Each value shard 0 applies goes to the other shards for their fresh subscriptions'
-    windows (#219).
+  - Each value shard 0 applies goes to the other shards that may hold a fresh
+    subscription's window (#219). A shard says so on the board before its replay reads
+    the store.
   - The reaps and the anti-entropy cadence are shard 0's.
 - **The admin API sees every shard.** A request that names a client goes to its shard. A
   list is asked of every shard and merged.
@@ -543,9 +552,8 @@ Amendment 4 found five things.
 
 **What it costs.**
 
-- **A view change reaches the other shards one queue later.** A forward's answer that
-  arrives on a shard before the shard has the link is lost, and the answer to the
-  retransmission a sweep later stands in for it.
+- **A view change reaches the other shards one queue later.** A forward's answer that a
+  shard makes before it has the link goes through shard 0, one queue more.
 - **Each shard rebuilds a peer's interest trie for every snapshot.** That is `K` times the
   CPU in a churn, spread over `K` loops.
 - **In a takeover window each shard scans the whole store for its own sessions.** That is

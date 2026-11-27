@@ -1967,8 +1967,25 @@ impl Hub {
         if let Some(w) = self.forward_windows.get_mut(node) {
             w.answered(seq, verdict);
         }
+        self.send_forward_answer(node, seq, verdict);
+    }
+
+    /// Send the answer to forward `seq` on `node`'s link. A shard that has no link to
+    /// `node` — a new one shard 0 has not yet told it of, ADR 0093 Amendment 5 — hands
+    /// it to shard 0, which has the link's own lanes; there, no link means it is gone,
+    /// and the sender's sweep retransmits.
+    pub(super) fn send_forward_answer(&mut self, node: &NodeId, seq: u64, verdict: ForwardVerdict) {
         let Some(peer) = self.peers.get(node) else {
-            return; // link gone: the sender's sweep will retransmit
+            if !self.peer_face() {
+                if let Some(first) = self.shard_txs.first() {
+                    let _ = first.send(HubCommand::ForwardAnswer {
+                        node: node.clone(),
+                        seq,
+                        verdict,
+                    });
+                }
+            }
+            return;
         };
         // A peer older than proto 11 cannot decode `Reached`; to it, it is `Stored`.
         // And one older than proto 13 does not know "the named `$share` member is

@@ -1845,6 +1845,17 @@ pub enum HubCommand {
     /// gossips the node's interest, every shard's, to the peers. Sent on shard 0's own
     /// sender.
     GossipInterest,
+    /// ADR 0093 Amendment 5: the answer to a peer's forward `seq` from a shard that has
+    /// not yet heard of the peer's new link, for shard 0, which has the link's own lanes.
+    /// Sent on shard 0's own sender; on the data lane, behind the link it follows.
+    ForwardAnswer {
+        /// The peer.
+        node: NodeId,
+        /// The forward answered.
+        seq: u64,
+        /// The answer.
+        verdict: mqtt_cluster::peer::ForwardVerdict,
+    },
     /// A peer said whether its rules select a message event (ADR 0083; proto 13):
     /// while they do, publishes forwarded to it carry their origin
     /// ([`PeerMessage::OriginPublish`]), and every publish here is stamped with one.
@@ -2322,6 +2333,7 @@ impl HubCommand {
             | Self::PeerGone { .. }
             | Self::PeerView(_)
             | Self::GossipInterest
+            | Self::ForwardAnswer { .. }
             | Self::RemoteInterest { .. }
             | Self::RemoteMessageEvents { .. }
             | Self::RemoteSharedInterest { .. }
@@ -3332,6 +3344,11 @@ pub struct Hub {
     /// ADR 0093 Amendment 5: on a shard other than 0, that its routing changed in a way
     /// the peers must hear of; shard 0 is asked to gossip once the change is published.
     gossip_owed: bool,
+    /// ADR 0093 Amendment 5: on shard 0, that another shard asked for the node's interest
+    /// to be gossiped; done once at the batch's end, however many asked.
+    gossip_due: bool,
+    /// Whether the board says this shard may hold retained windows.
+    windows_published: bool,
     /// When this shard last published its routing, and what that copy cost: the
     /// spacing of the next one under constant churn (Amendment 4).
     routing_published_at: Option<std::time::Instant>,
@@ -3644,6 +3661,8 @@ impl Hub {
                 foreign_version: 0,
                 routing_dirty: false,
                 gossip_owed: false,
+                gossip_due: false,
+                windows_published: false,
                 routing_published_at: None,
                 routing_copy_cost: std::time::Duration::ZERO,
                 after_publish: Vec::new(),
@@ -4580,7 +4599,7 @@ impl Hub {
             HubCommand::ShardDeliver(b) => self.dispatch_shard_batch(*b),
             HubCommand::ShardDone { shard, answers } => {
                 for a in answers {
-                    self.shard_done(shard, a.id, a.outcome, a.reached);
+                    self.shard_done(shard, a);
                 }
             }
             // Peer- and cluster-facing commands.
@@ -5109,7 +5128,10 @@ impl Hub {
                 app,
                 expires_at,
             } => self.deliver_to_windowed_subscribers(&topic, &payload, qos, &app, expires_at),
-            HubCommand::GossipInterest => self.gossip_interest(),
+            HubCommand::GossipInterest => self.gossip_due = true,
+            HubCommand::ForwardAnswer { node, seq, verdict } => {
+                self.send_forward_answer(&node, seq, verdict);
+            }
             HubCommand::DurableFrame { node, frame } => {
                 self.handle_durable_frame(&node, frame);
             }
@@ -6320,6 +6342,9 @@ impl Hub {
             }
             debug!(client = %client.0, filter = %f, qos = *q as u8, "subscribe");
             ordinary_granted = true;
+            // ADR 0093 Amendment 5: before the replay below reads the node's retained
+            // store, so a value shard 0 applies after that read reaches the window.
+            self.note_retained_window_opening();
             let already_held = prior.as_ref().is_some_and(|s| s.find(f).is_some());
             let key = self.table.intern(f);
             self.table.subscribe(client.clone(), key);
@@ -7784,10 +7809,7 @@ impl Hub {
         // that peer permanently divergent, because the only other reconciliation was
         // a digest at link-up. Peers in sync compare equal and transfer nothing.
         // #219: fresh-subscription retained-delivery windows expire on the sweep.
-        if !self.retained_windows.is_empty() {
-            let now = Instant::now();
-            self.retained_windows.retain(|_, w| w.until > now);
-        }
+        self.expire_retained_windows();
         self.retained_antientropy_tick = self.retained_antientropy_tick.wrapping_add(1);
         // ADR 0093 Amendment 5: the node's one retained store is reaped, and its tokens
         // kept and offered, by shard 0; another shard that stored an expiring value says
@@ -8142,6 +8164,16 @@ impl Hub {
             self.publish_scan(self.scan_started.0, true);
         }
         self.settle_passes();
+    }
+
+    /// #219: the fresh subscriptions' retained-delivery windows that have run out close,
+    /// and the board hears when the last has (ADR 0093 Amendment 5).
+    fn expire_retained_windows(&mut self) {
+        if !self.retained_windows.is_empty() {
+            let now = Instant::now();
+            self.retained_windows.retain(|_, w| w.until > now);
+        }
+        self.note_retained_windows_closed();
     }
 
     /// The deadline to arm for an inherited session whose record carries none (issue
@@ -10108,7 +10140,9 @@ impl Hub {
             self.reselect_shared(id, obligation, Reselect::MemberGone);
         }
         self.resolving_unreachable = false;
-        if had_interest || had_groups || discharged > 0 || placing > 0 {
+        // ADR 0093 Amendment 5: every shard erases the node and resolves its own; shard 0
+        // says so for the node, the others only when they resolved something.
+        if (self.peer_face() && (had_interest || had_groups)) || discharged > 0 || placing > 0 {
             warn!(
                 peer = %node.0, reason = why.reason(), resolved_undeliverable = discharged,
                 shared_placed_again = placing,

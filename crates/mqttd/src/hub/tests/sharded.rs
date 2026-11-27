@@ -312,7 +312,15 @@ async fn a_target_at_its_hand_off_cap_parks_the_origins_data_lane_until_it_answe
         a.next_command().is_none(),
         "the data lane waits while shard 1 is at its cap"
     );
-    a.shard_done(1, id, crate::hub::DurableOutcome::Ok, true);
+    a.shard_done(
+        1,
+        crate::hub::ShardAnswer {
+            id,
+            outcome: crate::hub::DurableOutcome::Ok,
+            reached: true,
+            gone: Vec::new(),
+        },
+    );
     assert_eq!(a.handoff_inflight[1], 1, "one answer fewer owed");
     assert!(
         matches!(a.next_command(), Some(HubCommand::Flush { .. })),
