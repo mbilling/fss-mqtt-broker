@@ -94,6 +94,53 @@ pub struct RoutingBoard {
     /// A shard other than 0 stored a retained value with an expiry in the node's one
     /// store: shard 0, which reaps it, looks.
     retained_may_expire: std::sync::atomic::AtomicBool,
+    /// Each shard's last value of each [`NodeGauge`].
+    gauges: Box<[[AtomicUsize; NODE_GAUGES]]>,
+}
+
+/// The gauges a node reports as one figure over its shards (ADR 0093 Amendment 5): each
+/// shard writes its own value and sets the gauge to the node's, so the series does not
+/// flip between shards.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum NodeGauge {
+    Sessions,
+    Subscriptions,
+    Inflight,
+    BacklogBytes,
+    AppendLaneJobs,
+    PendingPublishes,
+    PendingBytes,
+    ForwardsInFlight,
+    RetainedTombstones,
+    Quarantined,
+    AwaitingSettle,
+    HeldForUnreachable,
+    // The largest over the shards, not the sum.
+    BacklogBytesMax,
+    UnsettledTakeover,
+    UnsettledScan,
+    UnsettledScanIncomplete,
+    UnsettledInterest,
+    UnsettledMesh,
+}
+
+/// How many [`NodeGauge`]s there are.
+const NODE_GAUGES: usize = 18;
+const _: () = assert!(NodeGauge::UnsettledMesh as usize + 1 == NODE_GAUGES);
+
+impl NodeGauge {
+    /// Whether the node's figure is the largest shard's rather than their sum.
+    fn is_max(self) -> bool {
+        matches!(
+            self,
+            Self::BacklogBytesMax
+                | Self::UnsettledTakeover
+                | Self::UnsettledScan
+                | Self::UnsettledScanIncomplete
+                | Self::UnsettledInterest
+                | Self::UnsettledMesh
+        )
+    }
 }
 
 /// How many replaced partitions per shard of the node the reaper's one queue holds before
@@ -130,6 +177,9 @@ impl RoutingBoard {
             settling: AtomicU32::new(0),
             takeover: AtomicU32::new(0),
             retained_may_expire: std::sync::atomic::AtomicBool::new(false),
+            gauges: (0..shards)
+                .map(|_| std::array::from_fn(|_| AtomicUsize::new(0)))
+                .collect(),
         });
         (board, freed)
     }
@@ -224,6 +274,24 @@ impl RoutingBoard {
     /// Whether a shard other than `shard` has its takeover open.
     pub(super) fn others_in_takeover(&self, shard: usize) -> bool {
         self.takeover.load(Ordering::Acquire) & !(1 << shard) != 0
+    }
+
+    /// Record shard `shard`'s value of `gauge` and return the node's (ADR 0093
+    /// Amendment 5).
+    fn node_gauge(&self, shard: usize, gauge: NodeGauge, own: usize) -> usize {
+        let at = gauge as usize;
+        if let Some(cells) = self.gauges.get(shard) {
+            cells[at].store(own, Ordering::Relaxed);
+        }
+        let values = self
+            .gauges
+            .iter()
+            .map(|cells| cells[at].load(Ordering::Relaxed));
+        if gauge.is_max() {
+            values.max().unwrap_or(own)
+        } else {
+            values.sum()
+        }
     }
 
     /// One bit for each of the node's shards.
@@ -987,6 +1055,19 @@ impl Hub {
             board.set_takeover(usize::from(self.shard), takeover);
             self.takeover_published = takeover;
         }
+    }
+
+    /// The node's figure of `gauge`, this shard's being `own`: its own with one shard
+    /// (ADR 0093 Amendment 5).
+    pub(super) fn node_gauge(&self, gauge: NodeGauge, own: usize) -> usize {
+        self.routing_board.as_ref().map_or(own, |board| {
+            board.node_gauge(usize::from(self.shard), gauge, own)
+        })
+    }
+
+    /// As [`node_gauge`](Self::node_gauge) for a condition: true while any shard's is.
+    pub(super) fn node_flag(&self, gauge: NodeGauge, own: bool) -> bool {
+        self.node_gauge(gauge, usize::from(own)) > 0
     }
 
     /// This shard stored a retained value with an expiry: shard 0, which reaps the node's

@@ -124,6 +124,9 @@ pub struct Rules {
     /// What of the store's counts `/metrics` has (ADR 0085 D10): one exporter for the
     /// node, whoever asks it to look.
     state_metrics: Arc<std::sync::Mutex<crate::rule_state::report::Exporter>>,
+    /// The node's notes task, once one shard has started it (ADR 0093 Amendment 5): the
+    /// other shards raise their notes through it too.
+    notes: Arc<std::sync::OnceLock<mpsc::Sender<Box<MessageNote>>>>,
 }
 
 impl std::fmt::Debug for Rules {
@@ -651,7 +654,14 @@ impl Rules {
             functions: Functions::default(),
             state: None,
             state_metrics: Arc::default(),
+            notes: Arc::default(),
         }
+    }
+
+    /// The node's notes task, once a shard has started it ([`spawn_notes`](Self::spawn_notes)).
+    #[must_use]
+    pub fn node_notes(&self) -> Option<mpsc::Sender<Box<MessageNote>>> {
+        self.notes.get().cloned()
     }
 
     /// Bring the rule state series of `/metrics` up to what the store holds now (ADR
@@ -757,6 +767,7 @@ impl Rules {
                 }
             }
         });
+        let _ = self.notes.set(tx.clone());
         tx
     }
 

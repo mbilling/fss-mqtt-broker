@@ -443,3 +443,34 @@ async fn a_value_retained_through_one_shard_is_replayed_on_the_other() {
     assert_eq!(&p.payload[..], b"kept");
     assert!(p.retain);
 }
+
+/// The node's gauges are its shards' together (ADR 0093 Amendment 5): a session on each
+/// shard reads as two, not as whichever shard wrote last.
+#[tokio::test]
+async fn the_sessions_gauge_counts_every_shard() {
+    let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("shards"));
+    let tx = start_shards_with(0, false, None, Some(&metrics), None);
+    let a = client_on(0, "s-", 0);
+    let b = client_on(1, "s-", 0);
+    let _on_a = attach_full(&tx, &a, 1, false, 30, 256).await;
+    let _on_b = attach_full(&tx, &b, 2, false, 30, 256).await;
+    let read = || {
+        metrics
+            .render()
+            .lines()
+            .find(|l| l.starts_with("mqttd_sessions "))
+            .map(str::to_string)
+    };
+    timeout(Duration::from_secs(5), async {
+        while read().as_deref() != Some("mqttd_sessions 2") {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("both shards' sessions within 5 s");
+    // And it stays there: each shard's refresh writes the node's figure.
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(read().as_deref(), Some("mqttd_sessions 2"));
+    }
+}

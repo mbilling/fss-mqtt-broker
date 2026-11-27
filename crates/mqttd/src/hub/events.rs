@@ -354,6 +354,14 @@ impl Hub {
             },
             None => note,
         };
+        // ADR 0093 Amendment 5: shard 0 started the node's notes task; another shard
+        // raises its notes there too.
+        if self.events.notes.is_none() {
+            self.events.notes = self
+                .rules
+                .as_ref()
+                .and_then(crate::rules::Rules::node_notes);
+        }
         let Some(notes) = &self.events.notes else {
             return;
         };

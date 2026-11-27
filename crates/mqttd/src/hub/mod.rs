@@ -4548,12 +4548,18 @@ impl Hub {
                 let relays = Box::pin(self.sweep_relays(&policy)).await;
                 // One summary record per sweep (ADR 0040 T5), zeros included — the
                 // proof the sweep ran is as valuable as what it did.
+                // ADR 0093 Amendment 5: with shards, one per shard, each its own counts.
+                let shard = if self.shard_count > 1 {
+                    format!(", shard {} of {}", self.shard, self.shard_count)
+                } else {
+                    String::new()
+                };
                 policy.audit.record(
                     "security.sweep",
                     None,
                     &format!(
                         "identities={identities} grants={grants} peers={peers} \
-                         relays={relays} (trigger={})",
+                         relays={relays} (trigger={}{shard})",
                         policy.trigger
                     ),
                 );
@@ -8900,6 +8906,7 @@ impl Hub {
     }
 
     async fn refresh_gauges(&self) {
+        use shards::NodeGauge as G;
         let Some(m) = &self.metrics else { return };
         // Distinct sessions = connected clients plus offline persistent ones.
         let offline_persistent = self
@@ -8907,8 +8914,12 @@ impl Hub {
             .keys()
             .filter(|c| !self.online.contains_key(*c))
             .count();
-        m.set_sessions(self.online.len() + offline_persistent);
-        m.set_subscriptions(self.subs.values().map(ClientSubs::len).sum());
+        // ADR 0093 Amendment 5: the node's figures, over every shard.
+        m.set_sessions(self.node_gauge(G::Sessions, self.online.len() + offline_persistent));
+        m.set_subscriptions(self.node_gauge(
+            G::Subscriptions,
+            self.subs.values().map(ClientSubs::len).sum(),
+        ));
         // ONE pass over `inflight` for all three figures (issue #526). It used to be
         // three — `pending.len()` summed, `backlog.bytes()` summed, `backlog.bytes()`
         // maxed — over the same map, which holds an entry per ATTACHED CLIENT and is
@@ -8932,18 +8943,24 @@ impl Hub {
             backlog_sum += b;
             backlog_max = backlog_max.max(b);
         }
-        m.set_inflight_messages(pending);
+        m.set_inflight_messages(self.node_gauge(G::Inflight, pending));
         // Flow-control backlog bytes across sessions (issue #241): so an operator can SEE
         // the number before choosing a byte cap, and watch it after. The SUM answers
         // "how much RAM is in backlogs on this node"; the MAX is what a PER-SUBSCRIBER
         // cap must be sized against (issue #241 review — the docs pointed operators at
         // the sum for a per-subscriber decision).
-        m.set_backlog_bytes(backlog_sum);
-        m.set_backlog_bytes_max(backlog_max);
+        m.set_backlog_bytes(self.node_gauge(G::BacklogBytes, backlog_sum));
+        m.set_backlog_bytes_max(self.node_gauge(G::BacklogBytesMax, backlog_max));
         // Append-lane saturation (issue #242): sustained growth here is the warning
         // BEFORE `publish_dropped{reason="append-backlog-full"}` starts firing.
-        m.set_append_lane_jobs(self.append_lanes.values().map(|l| l.outstanding).sum());
-        m.set_pending_publishes(self.pending_publishes.len(), self.pending_publishes.bytes());
+        m.set_append_lane_jobs(self.node_gauge(
+            G::AppendLaneJobs,
+            self.append_lanes.values().map(|l| l.outstanding).sum(),
+        ));
+        m.set_pending_publishes(
+            self.node_gauge(G::PendingPublishes, self.pending_publishes.len()),
+            self.node_gauge(G::PendingBytes, self.pending_publishes.bytes()),
+        );
         if let Ok(n) = self.retained.count().await {
             m.set_retained_messages(n);
         }
@@ -8967,12 +8984,17 @@ impl Hub {
         // Issue #504: both lanes are unbounded, so this is the only report of the
         // frames that have left the hub and not yet reached the wire — the
         // population that sits between `received` and `delivered`.
-        m.set_peer_forwards_in_flight(
+        // The links' own queues, which every shard shares: shard 0 reads them for the
+        // node (ADR 0093 Amendment 5).
+        let forwards = if self.peer_face() {
             self.peers
                 .values()
                 .map(|p| p.depth.load(std::sync::atomic::Ordering::Relaxed))
-                .sum::<usize>(),
-        );
+                .sum::<usize>()
+        } else {
+            0
+        };
+        m.set_peer_forwards_in_flight(self.node_gauge(G::ForwardsInFlight, forwards));
         if let Some(placement) = &self.placement {
             if let Ok(p) = placement.read() {
                 m.set_cluster_members(p.member_count());
@@ -8987,7 +9009,10 @@ impl Hub {
                 // Held retained tombstones (issue #229): growth here means a
                 // chronically absent roster member or chronic divergence — both
                 // alert-worthy on their own.
-                m.set_retained_tombstones(self.retained_tombstone_observed_at.len());
+                m.set_retained_tombstones(self.node_gauge(
+                    G::RetainedTombstones,
+                    self.retained_tombstone_observed_at.len(),
+                ));
             }
         }
         // Lease-group role/epoch, read from the durable plane's raft metrics (durable mode).
@@ -9009,6 +9034,30 @@ impl Hub {
             let (current, tracked) = plane.caught_up_summary();
             m.set_replica_groups(current, tracked);
         }
+        self.refresh_settle_gauges(m);
+        // Issue #613 item 3.5: the hub is ONE task, so the depth of its inbound
+        // queue is its saturation, full stop.
+        m.set_hub_queue_depth(
+            self.shard,
+            self.rx.len() + self.control_q.len() + self.data_q.len(),
+        );
+        // ADR 0082 T2: the sorted lanes. Commands still on the channel are unsorted
+        // and counted in the total only.
+        m.set_hub_lane_depth(self.shard, "control", self.control_q.len());
+        m.set_hub_lane_depth(self.shard, "data", self.data_q.len());
+        if let Some(credit) = &self.ingress {
+            m.set_ingress_credit(credit.in_use(), credit.pool_bytes());
+            // ADR 0082 T4: peer readers shed `QoS` 0 without the metrics handle; the
+            // count they keep on the credit moves here.
+            m.publish_dropped_by("hub-ingress", credit.take_peer_shed());
+        }
+    }
+
+    /// The gauges of the routing view's settling, the node's over every shard (ADR 0093
+    /// Amendment 5): the five terms, quarantined sessions, and the publishes waiting on
+    /// the settle window or on a peer out of reach.
+    fn refresh_settle_gauges(&self, m: &mqtt_observability::metrics::Metrics) {
+        use shards::NodeGauge as G;
         // Issue #613 item 2.5. `routing_unsettled()` is one boolean over five
         // terms, and an operator watching a cluster that will not settle has had
         // no way to see WHICH term holds it — these are internal gates with no
@@ -9028,13 +9077,39 @@ impl Hub {
         // stops being written keeps its last value and reads as the opposite of
         // the truth.
         let clustered = self.clustered();
-        m.set_routing_unsettled("takeover", clustered && self.takeover_reconcile_ticks > 0);
-        m.set_routing_unsettled("scan", clustered && self.inherited_scan_inflight);
-        m.set_routing_unsettled("scan-incomplete", clustered && !self.last_scan_complete);
+        m.set_routing_unsettled(
+            "takeover",
+            self.node_flag(
+                G::UnsettledTakeover,
+                clustered && self.takeover_reconcile_ticks > 0,
+            ),
+        );
+        m.set_routing_unsettled(
+            "scan",
+            self.node_flag(G::UnsettledScan, clustered && self.inherited_scan_inflight),
+        );
+        m.set_routing_unsettled(
+            "scan-incomplete",
+            self.node_flag(
+                G::UnsettledScanIncomplete,
+                clustered && !self.last_scan_complete,
+            ),
+        );
         // Issue #1049: what a complete-with-quarantine scan stopped waiting for.
-        m.set_sessions_quarantined(self.quarantined_sessions.len());
-        m.set_routing_unsettled("interest", clustered && !self.interest_authoritative);
-        m.set_routing_unsettled("mesh", clustered && !self.mesh_settled());
+        m.set_sessions_quarantined(
+            self.node_gauge(G::Quarantined, self.quarantined_sessions.len()),
+        );
+        m.set_routing_unsettled(
+            "interest",
+            self.node_flag(
+                G::UnsettledInterest,
+                clustered && !self.interest_authoritative,
+            ),
+        );
+        m.set_routing_unsettled(
+            "mesh",
+            self.node_flag(G::UnsettledMesh, clustered && !self.mesh_settled()),
+        );
         // The settle window's share of the pending ledger (issue #613 items
         // 2.1/2.5). The total and its bytes are published above from the table
         // itself; this subset says how much of it is waiting on an unsettled
@@ -9046,25 +9121,13 @@ impl Hub {
             .values()
             .filter(|p| p.awaiting_settle)
             .count();
-        m.set_pending_publishes_awaiting_settle(awaiting_settle);
-        // ADR 0087 D9: a publish held for a peer out of reach is not invisible.
-        m.set_publish_held_for_unreachable(self.publishes_held_for_unreachable());
-        // Issue #613 item 3.5: the hub is ONE task, so the depth of its inbound
-        // queue is its saturation, full stop.
-        m.set_hub_queue_depth(
-            self.shard,
-            self.rx.len() + self.control_q.len() + self.data_q.len(),
+        m.set_pending_publishes_awaiting_settle(
+            self.node_gauge(G::AwaitingSettle, awaiting_settle),
         );
-        // ADR 0082 T2: the sorted lanes. Commands still on the channel are unsorted
-        // and counted in the total only.
-        m.set_hub_lane_depth(self.shard, "control", self.control_q.len());
-        m.set_hub_lane_depth(self.shard, "data", self.data_q.len());
-        if let Some(credit) = &self.ingress {
-            m.set_ingress_credit(credit.in_use(), credit.pool_bytes());
-            // ADR 0082 T4: peer readers shed `QoS` 0 without the metrics handle; the
-            // count they keep on the credit moves here.
-            m.publish_dropped_by("hub-ingress", credit.take_peer_shed());
-        }
+        // ADR 0087 D9: a publish held for a peer out of reach is not invisible.
+        m.set_publish_held_for_unreachable(
+            self.node_gauge(G::HeldForUnreachable, self.publishes_held_for_unreachable()),
+        );
     }
 
     /// Persist the current subscription set for a client if its session is durable.
