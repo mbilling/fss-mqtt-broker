@@ -1185,11 +1185,11 @@ impl Metrics {
         let hub_routing_free_inline_total = register_family(
             &mut registry,
             "hub_routing_free_inline",
-            "Replaced routing copies a hub shard freed on its own loop because the node's \
-             reaper thread was behind, its queue full, per shard (`shard`, ADR 0093 \
-             Amendment 4). Normally zero: a free costs about half a copy \
-             (hub_routing_publish_seconds), and a shard that pays it stalls its clients for \
-             that long",
+            "Replaced routing copies a hub shard freed on its own loop, per shard (`shard`, \
+             ADR 0093 Amendment 4): it held the last reference while the node's reaper \
+             thread could not take it, its queue full or the thread gone. Normally zero; a \
+             free costs about half a copy (hub_routing_publish_seconds). A steady climb \
+             with little churn means the reaper thread has stopped",
         );
         let hub_lane_depth = register_gauge_family(
             &mut registry,
@@ -2556,18 +2556,18 @@ impl Metrics {
             .record(seconds, &[KeyValue::new("shard", SHARD_LABELS[s])]);
     }
 
-    /// Hub shard `shard` freed a replaced routing copy itself, the reaper being behind
-    /// (ADR 0093 Amendment 4).
-    pub fn hub_routing_freed_inline(&self, shard: u8) {
+    /// Hub shard `shard` freed `n` replaced routing copies itself, the reaper being behind
+    /// or gone (ADR 0093 Amendment 4).
+    pub fn hub_routing_freed_inline(&self, shard: u8, n: u64) {
         let s = usize::from(shard).min(HUB_SHARDS - 1);
         self.hub_routing_free_inline_total
             .get_or_create(&ShardLabel {
                 shard: SHARD_LABELS[s].to_string(),
             })
-            .inc();
+            .inc_by(n);
         self.otel
             .hub_routing_free_inline
-            .add(1, &[KeyValue::new("shard", SHARD_LABELS[s])]);
+            .add(n, &[KeyValue::new("shard", SHARD_LABELS[s])]);
     }
 
     /// Set one lane of `hub_lane_depth` (ADR 0082 T2) for one hub loop (ADR 0092 T5).

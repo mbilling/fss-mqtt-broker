@@ -117,14 +117,25 @@ impl RoutingBoard {
         (board, freed)
     }
 
-    /// Hand `partition` to the reaper. With the reaper's queue full, or the reaper gone,
-    /// it is freed here, and `false` says so.
+    /// Hand `partition` to the reaper. With the reaper's queue full, or the reaper gone, the
+    /// caller lets go of it here; `false` says that this freed it (it held the last
+    /// reference), so a shard loop paid for the free.
     fn reap(&self, partition: Arc<RoutingPartition>) -> bool {
-        self.reaper.try_send(partition).is_ok()
+        match self.reaper.try_send(partition) {
+            Ok(()) => true,
+            Err(
+                std::sync::mpsc::TrySendError::Full(partition)
+                | std::sync::mpsc::TrySendError::Disconnected(partition),
+            ) => {
+                let last = Arc::strong_count(&partition) == 1;
+                drop(partition);
+                !last
+            }
+        }
     }
 
-    /// Publish shard `shard`'s partition; `false` when the one it replaced was freed here
-    /// because the reaper was behind.
+    /// Publish shard `shard`'s partition; `false` when the one it replaced was freed here,
+    /// the reaper being behind or gone.
     fn publish(&self, shard: usize, partition: RoutingPartition, sessions: usize) -> bool {
         let mut reaped = true;
         if let Some(cell) = self.cells.get(shard) {
@@ -768,7 +779,7 @@ impl Hub {
             if let Some(m) = &self.metrics {
                 m.hub_routing_published(self.shard, self.routing_copy_cost.as_secs_f64());
                 if !reaped {
-                    m.hub_routing_freed_inline(self.shard);
+                    m.hub_routing_freed_inline(self.shard, 1);
                 }
             }
             #[cfg(test)]
@@ -811,9 +822,7 @@ impl Hub {
         }
         if inline > 0 {
             if let Some(m) = &self.metrics {
-                for _ in 0..inline {
-                    m.hub_routing_freed_inline(self.shard);
-                }
+                m.hub_routing_freed_inline(self.shard, inline);
             }
         }
     }
@@ -1188,11 +1197,45 @@ mod reaper_tests {
         let weak = Arc::downgrade(&last);
         assert!(!board.reap(last), "the queue is full");
         assert_eq!(weak.strong_count(), 0, "freed where it was replaced");
+        // The receiver dropped, as a gone reaper's is, discards what it buffered.
         drop(queue);
         assert!(
             held.iter().all(|w| w.strong_count() == 0),
             "the reaper's queue frees the rest"
         );
+    }
+
+    /// A shard that frees a replaced partition itself, the reaper's queue being full, says so
+    /// in `mqttd_hub_routing_free_inline_total` (ADR 0093 Amendment 4).
+    #[test]
+    fn a_shard_that_frees_a_partition_itself_counts_it() {
+        let store: Arc<dyn mqtt_storage::SessionStore> =
+            Arc::new(mqtt_storage::MemorySessionStore::new());
+        let mut a =
+            super::Hub::with_config(mqtt_cluster::NodeId("hub-test".into()), store.clone()).0;
+        let b = super::Hub::with_config(mqtt_cluster::NodeId("hub-test".into()), store).0;
+        let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("reaper"));
+        a.attach_metrics(metrics.clone());
+        let (board, _queue) = RoutingBoard::unreaped(2);
+        a.set_shards(0, vec![a.sender(), b.sender()], &board);
+        let inline = || {
+            metrics
+                .render()
+                .lines()
+                .find(|l| l.starts_with("mqttd_hub_routing_free_inline_total{shard=\"0\"}"))
+                .and_then(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        // Each publication replaces the shard's cell; nobody else holds the old partition,
+        // so once the queue is full the publishing shard frees it.
+        for _ in 0..REAPER_QUEUE * 2 {
+            a.routing_changed();
+            a.publish_routing(true);
+        }
+        assert_eq!(inline(), 0, "the queue still had room");
+        a.routing_changed();
+        a.publish_routing(true);
+        assert_eq!(inline(), 1, "the next was freed by the shard");
     }
 }
 
