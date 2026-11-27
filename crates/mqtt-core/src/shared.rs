@@ -250,7 +250,7 @@ impl GroupMembers {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SharedSubscriptionTable {
     /// Source of truth: filter → share-name → members, online ones first.
     groups: FastMap<FilterKey, FastMap<String, GroupMembers>>,
@@ -511,6 +511,28 @@ mod tests {
 
     fn cid(s: &str) -> ClientId {
         ClientId(s.into())
+    }
+
+    /// A copy deals from the same members as the original, its online prefix
+    /// included, and the two change independently afterwards (ADR 0093 Amendment 4).
+    #[test]
+    fn a_copy_holds_the_same_members_and_changes_on_its_own() {
+        let mut t = SharedSubscriptionTable::new();
+        t.subscribe(cid("m1"), "g", "a/+", QoS::AtLeastOnce, true);
+        t.subscribe(cid("m2"), "g", "a/+", QoS::AtMostOnce, false);
+        let copy = t.clone();
+        assert_eq!(member_ids(&copy, "a/x"), member_ids(&t, "a/x"));
+        let online = |t: &SharedSubscriptionTable| {
+            t.matching_refs("a/x")
+                .next()
+                .map_or(0, |(_, _, members)| members.online_count())
+        };
+        assert_eq!(online(&copy), 1);
+        t.set_client_online(&cid("m2"), true);
+        t.remove_client(&cid("m1"));
+        assert_eq!(online(&copy), 1, "the copy keeps its presence");
+        assert_eq!(member_ids(&copy, "a/x"), ["m1", "m2"]);
+        assert_eq!(member_ids(&t, "a/x"), ["m2"]);
     }
 
     /// Member client ids of the single group matching `topic`, sorted.

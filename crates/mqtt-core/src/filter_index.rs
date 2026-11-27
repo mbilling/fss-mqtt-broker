@@ -178,6 +178,28 @@ pub struct FilterIndex {
     root: TrieNode,
 }
 
+impl Clone for FilterIndex {
+    /// A copy holding the same filters, built by inserting each of them into a fresh
+    /// index (ADR 0093 Amendment 4: a hub shard publishes copies of its tables). The
+    /// trie is fully determined by its filters, since every leaf ends one, so the copy
+    /// has the same shape. Both the walk that collects the filters and the inserts are
+    /// iterative: a node's depth is a client's filter length, and a derived clone would
+    /// recurse once per level. The copy shares each filter's allocation with this one.
+    fn clone(&self) -> Self {
+        let mut copy = Self::new();
+        let mut stack: Vec<&TrieNode> = vec![&self.root];
+        while let Some(node) = stack.pop() {
+            if let Some(filter) = &node.terminal {
+                copy.insert(filter);
+            }
+            stack.extend(node.children.values());
+            stack.extend(node.plus.as_deref());
+            stack.extend(node.hash.as_deref());
+        }
+        copy
+    }
+}
+
 impl FilterIndex {
     /// An empty index.
     #[must_use]
@@ -314,6 +336,36 @@ mod tests {
         index.insert(&key(&deep));
         assert_eq!(matches(&index, &vec!["x"; 50_000].join("/")).len(), 1);
         drop(index);
+    }
+
+    /// A copy matches every topic as the original does, and the two change
+    /// independently afterwards.
+    #[test]
+    fn a_copy_matches_as_the_original_and_changes_on_its_own() {
+        let mut index = FilterIndex::new();
+        for f in ["a/b", "a/+", "a/#", "+/b/#", "#", "$SYS/x", "a/b/c/d"] {
+            index.insert(&key(f));
+        }
+        let copy = index.clone();
+        for topic in ["a/b", "a/c", "a", "x/b/y", "$SYS/x", "a/b/c/d", "z"] {
+            assert_eq!(matches(&copy, topic), matches(&index, topic), "{topic}");
+        }
+        index.remove("a/+");
+        assert_eq!(matches(&copy, "a/c"), ["#", "a/#", "a/+"]);
+        assert_eq!(matches(&index, "a/c"), ["#", "a/#"]);
+    }
+
+    /// A filter as deep as a client may send is copied without recursion.
+    #[test]
+    fn a_deep_filter_is_copied_without_recursion() {
+        let mut index = FilterIndex::new();
+        let deep = vec!["l"; 100_000].join("/");
+        index.insert(&key(&deep));
+        index.insert(&key(&vec!["+"; 50_000].join("/")));
+        let copy = index.clone();
+        assert_eq!(matches(&copy, &deep).len(), 1);
+        drop(index);
+        drop(copy);
     }
 
     /// One node's size is paid per registered topic level; the keyed hasher's state and
