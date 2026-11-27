@@ -1026,7 +1026,7 @@ impl Hub {
         why: Reselect,
     ) {
         // ADR 0093 Amendment 4: the other shards' members as each last published them,
-        // as the deal read them.
+        // as a deal made now would read them.
         self.refresh_foreign_routing();
         let gone_from = obligation.node;
         let ForwardKind::Shared {

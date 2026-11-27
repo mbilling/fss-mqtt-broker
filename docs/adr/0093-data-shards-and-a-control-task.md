@@ -434,8 +434,10 @@ is at most a batch. Under constant churn it can be up to about ten copies' time:
 Freeing a replaced copy costs about half what making it did (43 ms at 100,000 device
 subscriptions). So a partition replaced in a cell, or in a shard's view of the others, goes
 to the board's reaper thread: it is freed outside the cell's lock and off every shard's
-loop. The reaper's queue holds two partitions a shard. When it is full the reaper is behind,
-and the shard frees the partition itself, so memory never holds more old copies than that.
+loop. The reaper has one queue for the node, of two partitions per shard. When it is full
+the reaper is behind, and the shard frees the partition itself
+(`mqttd_hub_routing_free_inline_total{shard}` counts it), so memory holds at most that many
+old copies queued, plus the one being freed.
 
 A publication proportional to the change rather than the table (a base copy, and the
 changes since it) is the next step, if a large fleet needs `K > 1`: task T13.

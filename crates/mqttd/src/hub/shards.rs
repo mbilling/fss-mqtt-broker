@@ -69,10 +69,10 @@ pub struct RoutingPartition {
 /// one atomic load. A cell is replaced, never edited: a shard reading an old partition
 /// keeps it whole until it reloads. A partition replaced in a cell or in a shard's view is
 /// handed to the board's reaper thread, so freeing it, which costs about half what copying
-/// it did, falls on no shard's loop and on no lock. The reaper's queue holds
-/// [`REAPER_QUEUE`] partitions a shard at most: when it is full, the reaper is behind and
-/// the shard frees the partition itself, so memory never holds more than that many old
-/// copies.
+/// it did, falls on no shard's loop and on no lock. The reaper's queue, one for the node,
+/// holds [`REAPER_QUEUE`] partitions per shard of it: when it is full, the reaper is
+/// behind and the shard frees the partition itself (`mqttd_hub_routing_free_inline_total`),
+/// so memory holds at most that many old copies queued, and the one being freed.
 #[derive(Debug)]
 pub struct RoutingBoard {
     cells: Box<[RwLock<Arc<RoutingPartition>>]>,
@@ -83,8 +83,8 @@ pub struct RoutingBoard {
     reaper: std::sync::mpsc::SyncSender<Arc<RoutingPartition>>,
 }
 
-/// How many replaced partitions per shard the reaper's queue holds before a shard frees one
-/// itself (ADR 0093 Amendment 4).
+/// How many replaced partitions per shard of the node the reaper's one queue holds before
+/// a shard frees one itself (ADR 0093 Amendment 4).
 const REAPER_QUEUE: usize = 2;
 
 impl RoutingBoard {
@@ -96,40 +96,51 @@ impl RoutingBoard {
     /// When the reaper thread cannot be started, at the node's start.
     #[must_use]
     pub fn new(shards: usize) -> Arc<Self> {
-        let (reaper, freed) =
-            std::sync::mpsc::sync_channel::<Arc<RoutingPartition>>(REAPER_QUEUE * shards.max(1));
+        let (board, freed) = Self::unreaped(shards);
         std::thread::Builder::new()
             .name("mqttd-routing-reaper".to_string())
             .spawn(move || while freed.recv().is_ok() {})
             .expect("the routing reaper thread starts");
-        Arc::new(Self {
+        board
+    }
+
+    /// A board whose reaper is the returned receiver, drained by whoever holds it.
+    fn unreaped(shards: usize) -> (Arc<Self>, std::sync::mpsc::Receiver<Arc<RoutingPartition>>) {
+        let (reaper, freed) =
+            std::sync::mpsc::sync_channel::<Arc<RoutingPartition>>(REAPER_QUEUE * shards.max(1));
+        let board = Arc::new(Self {
             cells: (0..shards).map(|_| RwLock::new(Arc::default())).collect(),
             version: AtomicU64::new(0),
             sessions: (0..shards).map(|_| AtomicUsize::new(0)).collect(),
             reaper,
-        })
+        });
+        (board, freed)
     }
 
     /// Hand `partition` to the reaper. With the reaper's queue full, or the reaper gone,
-    /// it is freed here.
-    fn reap(&self, partition: Arc<RoutingPartition>) {
-        let _ = self.reaper.try_send(partition);
+    /// it is freed here, and `false` says so.
+    fn reap(&self, partition: Arc<RoutingPartition>) -> bool {
+        self.reaper.try_send(partition).is_ok()
     }
 
-    fn publish(&self, shard: usize, partition: RoutingPartition, sessions: usize) {
+    /// Publish shard `shard`'s partition; `false` when the one it replaced was freed here
+    /// because the reaper was behind.
+    fn publish(&self, shard: usize, partition: RoutingPartition, sessions: usize) -> bool {
+        let mut reaped = true;
         if let Some(cell) = self.cells.get(shard) {
             let old = std::mem::replace(
                 &mut *cell.write().unwrap_or_else(PoisonError::into_inner),
                 Arc::new(partition),
             );
-            // Outside the lock, and off this loop.
-            self.reap(old);
+            // Outside the lock, and off this loop unless the reaper is behind.
+            reaped = self.reap(old);
         }
         if let Some(count) = self.sessions.get(shard) {
             count.store(sessions, Ordering::Relaxed);
         }
         // Release: a shard that reads the new version sees the cell it was bumped for.
         self.version.fetch_add(1, Ordering::Release);
+        reaped
     }
 
     fn version(&self) -> u64 {
@@ -750,12 +761,15 @@ impl Hub {
                 table: self.table.clone(),
                 shared: self.shared.clone(),
             };
-            board.publish(usize::from(self.shard), partition, self.session_count());
+            let reaped = board.publish(usize::from(self.shard), partition, self.session_count());
             let published = std::time::Instant::now();
             self.routing_copy_cost = published - started;
             self.routing_published_at = Some(published);
             if let Some(m) = &self.metrics {
                 m.hub_routing_published(self.shard, self.routing_copy_cost.as_secs_f64());
+                if !reaped {
+                    m.hub_routing_freed_inline(self.shard);
+                }
             }
             #[cfg(test)]
             self.probe
@@ -782,12 +796,23 @@ impl Hub {
         }
         self.foreign_version = version;
         let me = usize::from(self.shard);
+        let mut inline = 0u64;
         for (k, slot) in self.foreign_routing.iter_mut().enumerate() {
             if k != me {
                 let fresh = board.partition(k);
                 if !Arc::ptr_eq(slot, &fresh) {
-                    // Freed by the reaper, not by this shard's publish path.
-                    board.reap(std::mem::replace(slot, fresh));
+                    // Freed by the reaper, not by this shard's publish path, unless the
+                    // reaper is behind.
+                    if !board.reap(std::mem::replace(slot, fresh)) {
+                        inline += 1;
+                    }
+                }
+            }
+        }
+        if inline > 0 {
+            if let Some(m) = &self.metrics {
+                for _ in 0..inline {
+                    m.hub_routing_freed_inline(self.shard);
                 }
             }
         }
@@ -1134,6 +1159,40 @@ impl Hub {
             DurableOutcome::Failed => self.drop_pending(id),
             DurableOutcome::Refused(r) => self.refuse_pending(id, r),
         }
+    }
+}
+
+#[cfg(test)]
+mod reaper_tests {
+    use super::{RoutingBoard, RoutingPartition, REAPER_QUEUE};
+    use std::sync::Arc;
+
+    /// With the reaper's queue full, a replaced partition is freed by the shard that
+    /// replaced it, at once, and the board says so; with room, it waits for the reaper
+    /// (ADR 0093 Amendment 4).
+    #[test]
+    fn a_full_reaper_queue_frees_the_next_partition_where_it_was_replaced() {
+        let shards = 2;
+        let (board, queue) = RoutingBoard::unreaped(shards);
+        let mut held = Vec::new();
+        for _ in 0..REAPER_QUEUE * shards {
+            let partition = Arc::new(RoutingPartition::default());
+            held.push(Arc::downgrade(&partition));
+            assert!(board.reap(partition), "queued while the reaper has room");
+        }
+        assert!(
+            held.iter().all(|w| w.strong_count() == 1),
+            "queued, not freed"
+        );
+        let last = Arc::new(RoutingPartition::default());
+        let weak = Arc::downgrade(&last);
+        assert!(!board.reap(last), "the queue is full");
+        assert_eq!(weak.strong_count(), 0, "freed where it was replaced");
+        drop(queue);
+        assert!(
+            held.iter().all(|w| w.strong_count() == 0),
+            "the reaper's queue frees the rest"
+        );
     }
 }
 

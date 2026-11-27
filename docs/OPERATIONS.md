@@ -1408,9 +1408,11 @@ msg/s with its ack p99 at half a second.
     CONNACK waits for its shard's next copy. On a busy shard that is at most a batch. Under
     constant churn it can be up to about ten copies' time: about 50 ms at 10,000 device
     subscriptions a shard, about 0.8 s at 100,000.
-  - **Freeing:** old copies are freed on the board's reaper thread, not on any shard. When the
-    reaper falls two copies a shard behind, a shard frees the next one itself, so old copies
-    never pile up in memory.
+  - **Freeing:** old copies are freed on the board's reaper thread, not on any shard. Its queue
+    holds two copies per shard of the node. When it is full, a shard frees the next copy
+    itself, so old copies never pile up in memory; `mqttd_hub_routing_free_inline_total{shard}`
+    counts those frees. Each one stalls the shard for about half a copy, so this counter
+    should stay at zero.
   - **One shard:** nothing is copied and nothing waits.
 
 ## Overload: bounded hub ingress (ADR 0082)

@@ -1609,7 +1609,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 941 test(s)
+## `crates/mqttd/src/lib.rs` — 942 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -1905,6 +1905,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::settle::tests::a_settled_view_never_holds`
 - `hub::settle::tests::a_shared_placement_is_evidence`
 - `hub::settle::tests::a_zero_match_fan_out_on_an_unsettled_view_still_holds`
+- `hub::shards::reaper_tests::a_full_reaper_queue_frees_the_next_partition_where_it_was_replaced`
 - `hub::shards::tests::a_client_keyed_command_goes_to_its_shard`
 - `hub::shards::tests::a_command_naming_no_client_goes_first_and_a_setting_goes_everywhere`
 - `hub::shards::tests::a_joined_command_is_answered_once_every_shard_has`
