@@ -127,9 +127,16 @@ impl RoutingBoard {
                 std::sync::mpsc::TrySendError::Full(partition)
                 | std::sync::mpsc::TrySendError::Disconnected(partition),
             ) => {
-                let last = Arc::strong_count(&partition) == 1;
-                drop(partition);
-                !last
+                // Two shards letting go of the same partition at once could both read a
+                // count of two; `into_inner` hands it to exactly one of them, so the free
+                // is counted once, on the loop that made it.
+                match Arc::into_inner(partition) {
+                    Some(last) => {
+                        drop(last);
+                        false
+                    }
+                    None => true,
+                }
             }
         }
     }
@@ -1226,8 +1233,9 @@ mod reaper_tests {
                 .and_then(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
                 .unwrap_or(0)
         };
-        // Each publication replaces the shard's cell; nobody else holds the old partition,
-        // so once the queue is full the publishing shard frees it.
+        // Each publication replaces the shard's cell; nobody else holds the old partition
+        // (`b` is never given the board, so it keeps no copy), so once the queue is full
+        // the publishing shard frees it.
         for _ in 0..REAPER_QUEUE * 2 {
             a.routing_changed();
             a.publish_routing(true);
