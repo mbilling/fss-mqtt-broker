@@ -470,6 +470,9 @@ async fn the_sessions_gauge_counts_every_shard() {
     .expect("both shards' sessions within 5 s");
     // And it stays there: each shard's refresh writes the node's figure.
     for _ in 0..3 {
+        // SETTLE(shard-gauges-hold): what is under test is an absence — that neither
+        // shard's next refresh (one a second each) writes its own count back over the
+        // node's — so there is no event to wait on; 1.2 s spans both shards' next ticks.
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert_eq!(read().as_deref(), Some("mqttd_sessions 2"));
     }
