@@ -34,8 +34,9 @@ fn start_shards_with(
         let mailman = crate::hub::spawn_mailman(boxes.clone());
         (boxes, mailman)
     });
+    let board = crate::hub::RoutingBoard::new(2);
     for (k, hub) in hubs.iter_mut().enumerate() {
-        hub.set_shards(u8::try_from(k).unwrap(), txs.clone());
+        hub.set_shards(u8::try_from(k).unwrap(), txs.clone(), &board);
         hub.set_write_elision_ms(elision_ms);
         // As the node runs it (`cluster.shared_prefer_local`, on by default): the
         // `$share` fast path, where a shard deals among its own members (ADR 0093
@@ -276,7 +277,11 @@ async fn a_target_at_its_hand_off_cap_parks_the_origins_data_lane_until_it_answe
     let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
     let mut a = Hub::with_config(NodeId("hub-test".into()), store.clone()).0;
     let b = Hub::with_config(NodeId("hub-test".into()), store).0;
-    a.set_shards(0, vec![a.sender(), b.sender()]);
+    a.set_shards(
+        0,
+        vec![a.sender(), b.sender()],
+        &crate::hub::RoutingBoard::new(2),
+    );
     a.set_handoff_inflight_cap(2);
     // A pending publish handed to shard 1, and the pair at its cap.
     let (done, _rx) = oneshot::channel();
@@ -291,11 +296,9 @@ async fn a_target_at_its_hand_off_cap_parks_the_origins_data_lane_until_it_answe
     );
     a.pending_publishes.get_mut(id).unwrap().shard_outstanding = 1 << 1;
     a.handoff_inflight[1] = 2;
-    a.enqueue(HubCommand::ShardRoute {
-        client: ClientId("elsewhere".into()),
-        filters: vec![],
-        online: true,
-    });
+    // Any data-lane command serves as the probe; a flush has no other effect.
+    let (flushed, _flushed_rx) = oneshot::channel();
+    a.enqueue(HubCommand::Flush { reply: flushed });
     a.enqueue(HubCommand::Draining);
     assert!(
         matches!(a.next_command(), Some(HubCommand::Draining)),
@@ -308,7 +311,7 @@ async fn a_target_at_its_hand_off_cap_parks_the_origins_data_lane_until_it_answe
     a.shard_done(1, id, crate::hub::DurableOutcome::Ok, true);
     assert_eq!(a.handoff_inflight[1], 1, "one answer fewer owed");
     assert!(
-        matches!(a.next_command(), Some(HubCommand::ShardRoute { .. })),
+        matches!(a.next_command(), Some(HubCommand::Flush { .. })),
         "answered: the data lane moves again"
     );
     assert!(
@@ -562,4 +565,314 @@ async fn a_qos0_publish_is_handed_off_ungated() {
     let p = next_publish(&mut brx).await;
     assert_eq!(&p.payload[..], b"fire and forget");
     assert_eq!(p.qos, QoS::AtMostOnce);
+}
+
+/// ADR 0093 Amendment 4: a SUBACK is answered once every shard can match with the
+/// subscription, so a publish sent on the other shard the moment the answer arrives
+/// reaches the new subscriber, with no settling in between. Under the routing mirror the
+/// answer went out before the mirror was sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_acknowledged_subscribe_is_matched_by_the_other_shard_at_once() {
+    let tx = start_shards(0);
+    let p = client_on(0, "pub-", 0);
+    let s = client_on(1, "sub-", 0);
+    let _ = attach_full(&tx, &p, 1, true, 0, 256).await;
+    let (mut s_rx, _) = attach_full(&tx, &s, 2, true, 0, 256).await;
+    for round in 0..20 {
+        let topic = format!("t/{round}");
+        let (reply, answered) = oneshot::channel();
+        tx.send(HubCommand::Subscribe {
+            client: ClientId(s.as_str().into()),
+            filters: vec![(topic.clone(), QoS::AtLeastOnce)],
+            sub_id: None,
+            no_local_filters: Vec::new(),
+            rap_filters: Vec::new(),
+            retain_handling: Vec::new(),
+            reply: Some(reply),
+        })
+        .unwrap();
+        let verdicts = timeout(Duration::from_secs(5), answered)
+            .await
+            .expect("answered within 5 s")
+            .unwrap();
+        assert_eq!(verdicts, vec![true]);
+        let payload = format!("r{round}");
+        let done = publish_from(&tx, &p, &topic, payload.as_bytes());
+        assert_eq!(
+            &next_publish(&mut s_rx).await.payload[..],
+            payload.as_bytes(),
+            "round {round}: the subscription was matched as soon as it was acknowledged"
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(5), done)
+                .await
+                .expect("acked within 5 s")
+                .unwrap(),
+            PublishOutcome::Accepted
+        );
+    }
+}
+
+/// ADR 0093 Amendment 4: a CONNACK is answered once every shard sees the session online,
+/// so a `$share` member that reconnects on one shard is dealt the next publish from the
+/// other, where the group has no member at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reconnected_shared_member_is_dealt_from_the_other_shard_at_once() {
+    let tx = start_shards(0);
+    let p = client_on(0, "pub-", 0);
+    let m = client_on(1, "con-", 0);
+    let _ = attach_full(&tx, &p, 1, true, 0, 256).await;
+    let (_first, _) = attach_full(&tx, &m, 2, true, 3600, 256).await;
+    subscribe_qos(&tx, &m, "$share/g/t", QoS::AtLeastOnce);
+    for round in 0..10u64 {
+        detach(&tx, &m, 2 + round);
+        settle(&tx).await;
+        let (mut m_rx, present) = attach_full(&tx, &m, 3 + round, false, 3600, 256).await;
+        assert!(present, "the persistent session is resumed");
+        let payload = format!("r{round}");
+        let done = publish_from(&tx, &p, "t", payload.as_bytes());
+        let delivered = next_publish(&mut m_rx).await;
+        assert_eq!(
+            &delivered.payload[..],
+            payload.as_bytes(),
+            "round {round}: the member was online on the other shard by its CONNACK"
+        );
+        // Acknowledged, so the next reconnect resumes nothing.
+        tx.send(HubCommand::PubAck {
+            client: ClientId(m.as_str().into()),
+            pkid: delivered.pkid.expect("a QoS 1 delivery"),
+            received: tokio::time::Instant::now(),
+        })
+        .unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(5), done)
+                .await
+                .expect("acked within 5 s")
+                .unwrap(),
+            PublishOutcome::Accepted
+        );
+    }
+}
+
+/// ADR 0093 Amendment 4: however many routing changes a batch makes, its shard publishes
+/// once, at the batch's end. A reconnect storm costs one copy of the shard's routing a
+/// batch, never one a session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_storm_of_routing_changes_is_published_once_a_batch() {
+    const CHANGES: usize = 640;
+    let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
+    let mut hubs: Vec<Hub> = (0..2)
+        .map(|_| Hub::with_config(NodeId("hub-test".into()), store.clone()).0)
+        .collect();
+    let txs: Vec<_> = hubs.iter().map(Hub::sender).collect();
+    let board = crate::hub::RoutingBoard::new(2);
+    for (k, hub) in hubs.iter_mut().enumerate() {
+        hub.set_shards(u8::try_from(k).unwrap(), txs.clone(), &board);
+    }
+    let probe = hubs[1].probe();
+    let tx = HubTx::sharded(txs);
+    // Queued before the loops start, so shard 1 dispatches them back to back.
+    for i in 0..CHANGES {
+        subscribe_qos(
+            &tx,
+            &client_on(1, "storm-", i),
+            &format!("s/{i}"),
+            QoS::AtMostOnce,
+        );
+    }
+    for hub in hubs {
+        tokio::spawn(hub.run());
+    }
+    settle(&tx).await;
+    let published = probe
+        .routing_publications
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let batches = CHANGES / crate::hub::HUB_YIELD_EVERY + 1;
+    assert!(
+        (1..=batches + 1).contains(&published),
+        "{published} publications for {CHANGES} changes in about {batches} batches"
+    );
+    // And every one of them is matched from the other shard.
+    let p = client_on(0, "pub-", 0);
+    let _ = attach_full(&tx, &p, 1, true, 0, 256).await;
+    let done = publish_from(&tx, &p, &format!("s/{}", CHANGES - 1), b"last");
+    assert_eq!(
+        timeout(Duration::from_secs(5), done)
+            .await
+            .expect("answered within 5 s")
+            .unwrap(),
+        PublishOutcome::Accepted
+    );
+}
+
+/// With one shard there is no board: nothing is published and no answer waits, so the
+/// default path is the one loop as it was (ADR 0093 Amendment 4).
+#[test]
+fn one_shard_publishes_nothing_and_answers_at_once() {
+    let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
+    let mut hub = Hub::with_config(NodeId("hub-test".into()), store).0;
+    let probe = hub.probe();
+    hub.routing_changed();
+    let (reply, mut answered) = oneshot::channel();
+    hub.answer_after_publish(crate::hub::shards::AfterPublish::Subscribe(
+        reply,
+        vec![true],
+    ));
+    assert_eq!(answered.try_recv().unwrap(), vec![true], "answered at once");
+    hub.publish_routing(true);
+    assert_eq!(
+        probe
+            .routing_publications
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+}
+
+/// With two shards an answer waits for its shard's publication, and the other shard sees
+/// the published routing on its next refresh (ADR 0093 Amendment 4).
+#[test]
+fn an_answer_waits_for_its_shards_publication() {
+    let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
+    let mut a = Hub::with_config(NodeId("hub-test".into()), store.clone()).0;
+    let mut b = Hub::with_config(NodeId("hub-test".into()), store).0;
+    let txs = vec![a.sender(), b.sender()];
+    let board = crate::hub::RoutingBoard::new(2);
+    a.set_shards(0, txs.clone(), &board);
+    b.set_shards(1, txs, &board);
+    let probe = a.probe();
+    let client = ClientId(client_on(0, "sub-", 0).into());
+    let filter = a.table.intern("t/x");
+    a.table.subscribe(client.clone(), filter);
+    a.routing_changed();
+    let (reply, mut answered) = oneshot::channel();
+    a.answer_after_publish(crate::hub::shards::AfterPublish::Subscribe(
+        reply,
+        vec![true],
+    ));
+    assert!(
+        answered.try_recv().is_err(),
+        "the answer waits for the publication"
+    );
+    b.refresh_foreign_routing();
+    assert!(
+        b.foreign_partitions()
+            .all(|(_, p)| p.table.matching_clients("t/x").is_empty()),
+        "nothing is visible before the publication"
+    );
+    a.publish_routing(true);
+    assert_eq!(answered.try_recv().unwrap(), vec![true]);
+    assert_eq!(
+        probe
+            .routing_publications
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    b.refresh_foreign_routing();
+    let seen: Vec<_> = b
+        .foreign_partitions()
+        .flat_map(|(_, p)| p.table.matching_clients("t/x"))
+        .collect();
+    assert_eq!(seen, vec![client]);
+    a.publish_routing(true);
+    assert_eq!(
+        probe
+            .routing_publications
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "nothing changed, nothing published"
+    );
+}
+
+/// `max_sessions` caps the node, not each shard: with one session on each of two shards
+/// and a cap of two, a third client is refused on either (ADR 0041 T4, Amendment 4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_session_quota_counts_every_shard() {
+    let tx = start_shards(0);
+    tx.send(HubCommand::SetQuotas(crate::hub::Quotas {
+        max_sessions: Some(2),
+        ..Default::default()
+    }))
+    .unwrap();
+    let _ = attach_full(&tx, &client_on(0, "q-", 0), 1, true, 3600, 256).await;
+    let _ = attach_full(&tx, &client_on(1, "q-", 0), 2, true, 3600, 256).await;
+    settle(&tx).await;
+    for (conn, shard) in [(3, 0), (4, 1)] {
+        let (out_tx, _out_rx) = {
+            let (t, r) = mpsc::unbounded_channel();
+            (Outbound::new(t).0, r)
+        };
+        let client = client_on(shard, "q-", 1);
+        let (reply, answered) = oneshot::channel();
+        tx.send(HubCommand::Attach {
+            client: ClientId(client.as_str().into()),
+            admission: Box::new(admission(&client)),
+            conn_id: conn,
+            clean_start: true,
+            session_expiry: 3600,
+            receive_maximum: 256,
+            will: None,
+            outbound: out_tx,
+            reply,
+        })
+        .unwrap();
+        assert!(
+            matches!(
+                timeout(Duration::from_secs(5), answered)
+                    .await
+                    .expect("answered within 5 s")
+                    .unwrap(),
+                AttachOutcome::QuotaExceeded
+            ),
+            "a third session on shard {shard} is refused"
+        );
+    }
+}
+
+/// Under constant churn a shard spaces its publications by what the last copy cost, so
+/// copying a large table cannot take the loop's time; an idle loop publishes at once
+/// (ADR 0093 Amendment 4).
+#[test]
+fn publications_under_churn_are_spaced_by_their_copy_cost() {
+    let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
+    let mut a = Hub::with_config(NodeId("hub-test".into()), store.clone()).0;
+    let b = Hub::with_config(NodeId("hub-test".into()), store).0;
+    a.set_shards(
+        0,
+        vec![a.sender(), b.sender()],
+        &crate::hub::RoutingBoard::new(2),
+    );
+    let probe = a.probe();
+    let published = || {
+        probe
+            .routing_publications
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    for i in 0..5_000 {
+        let filter = a.table.intern(&format!("devices/{i}/cmd"));
+        a.table
+            .subscribe(ClientId(format!("device-{i}").into()), filter);
+    }
+    a.routing_changed();
+    a.publish_routing(false);
+    assert_eq!(published(), 1, "the first publication is never held");
+    a.routing_changed();
+    let (reply, mut answered) = oneshot::channel();
+    a.answer_after_publish(crate::hub::shards::AfterPublish::Subscribe(
+        reply,
+        vec![true],
+    ));
+    a.publish_routing(false);
+    assert_eq!(
+        published(),
+        1,
+        "the next waits for nine copies' worth of time"
+    );
+    assert!(answered.try_recv().is_err(), "and its answer with it");
+    a.publish_routing(true);
+    assert_eq!(
+        published(),
+        2,
+        "an idle loop publishes whatever the spacing"
+    );
+    assert_eq!(answered.try_recv().unwrap(), vec![true]);
 }

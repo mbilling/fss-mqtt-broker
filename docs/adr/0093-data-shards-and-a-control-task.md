@@ -361,6 +361,70 @@ worker, +10–20% on the four-shard knee, in the run that also measures ADR 0089
 (a delivery behind a write in flight waits for it); then eight shards, whose wall is the
 sixteen cores at about 400,000–450,000 (D8). Tasks T11 and T12.
 
+## Amendment 4 (2026-11-27): each shard publishes its own clients' routing
+
+**What the code showed.** Mapping T1's work against the code found three things D2 did not
+foresee.
+
+- **A shard holds live routing state for its own clients whatever else exists.** Delivery
+  and `$share` dealing read its own clients' presence synchronously. The publish path also
+  writes it: a delivery that finds a closed connection reaps it on the spot
+  (`reap_closed_connection`). What a shard needs from elsewhere is only the other shards'
+  clients.
+- **The mirror broke D2's rule.** A SUBACK went out before the mirror carrying the
+  subscription was even sent, so a publish on another shard right after it could miss it.
+- **`max_sessions` was enforced per shard.** The node's cap was `K` times the configured
+  one.
+
+**The decision changes D2 (the maintainer, 2026-11-27).** There is no control task.
+
+- **What each shard publishes.** Each data shard keeps the routing of the clients it owns:
+  their ordinary filters, their `$share` memberships and their presence. At the end of a
+  dispatch batch in which that changed, it publishes an immutable copy to the node's
+  routing board. The board has one cell per shard and one version counter.
+- **How the others read it.** A shard about to match a publish compares the version with
+  the one it last read, and reloads the other shards' cells only when it moved. That is one
+  atomic load in the common case.
+- **Why the answer can wait for it.** The comparison happens after the publish was taken
+  from the shard's channel. So a publish that arrived after an answer is matched against
+  the publication that preceded the answer. The SUBACK, UNSUBACK and CONNACK each wait for
+  their shard's publication.
+- **What stays as it was.** The settings every shard must agree on stay broadcast, as the
+  prototype sends them. `max_sessions` now counts every shard's sessions, as each last
+  published them.
+- **Matching.** A publish finds its ordinary subscribers on other shards in their
+  partitions. `$share` dealing takes another shard's online members only for a group with
+  no online member of its own (Amendment 1), and never another shard's offline member (D5).
+- **One shard.** With one shard there is no board, nothing is published and no answer
+  waits: the default path is the one loop as it was.
+
+The trade against a control task is two-sided. This way, attach and subscribe have no extra
+hop, and no single task serializes the node's routing changes. The cost is one table walk
+per other shard per publish; an empty table answers without walking.
+
+**What a publication costs.** A copy is proportional to the shard's own tables.
+`crates/mqtt-core/benches/routing_copy.rs` measured these on an Apple M1 Pro, release
+build:
+
+| subscriptions | device table (`devices/<i>/cmd`, one client each) | `$share` table (100 groups) |
+|---|---|---|
+| 1,000 | 0.31 ms | 0.12 ms |
+| 10,000 | 5.1 ms | 1.2 ms |
+| 100,000 | 85 ms | 16.6 ms |
+
+So under constant churn a shard spaces its publications. After a copy that took `c`, the
+next waits until `9c` has passed, so copying takes at most about a tenth of the loop's time,
+and the answers wait for the next publication. A loop about to park, or a flush, publishes at
+once. `mqttd_hub_routing_publish_seconds{shard}` reports every copy. A shard of 100,000
+device subscriptions whose routing changes in every batch can make an answer wait about
+0.8 s. A publication proportional to the change rather than the table (a base copy, and the
+changes since it) is the next step, if a large fleet needs `K > 1`: task T13.
+
+**What it should buy, to be measured.** T1's acceptance is unchanged in substance. The
+control path, now the `subscribe` and `attach` dispatches plus the publications, must stay
+under 2% of hub time at the knee on h3 and fan-in. At one shard the durable QoS 1 path must
+read the same: a local A/B (`durable_bench`, release build), then the rig.
+
 ## Consequences
 
 - **The split's cost is known before it is built:** about 2 µs a message for the hand-off,
@@ -403,9 +467,10 @@ sixteen cores at about 400,000–450,000 (D8). Tasks T11 and T12.
 
 ## Delivery
 
-Twelve tasks: the control task and its snapshots (T1), hand-offs with credit and batching
+Thirteen tasks: the routing snapshots (T1, D2 as Amendment 4 changes it), hand-offs with credit and batching
 (T2), the worker capture removed by measurement (T3), the ENA packet-rate probe on AWS
 (T4), the cluster paths on shards (T5), a shard's failure modes (T6), the four-shard knee
 against D8 (T7), the hot-group and `#`-subscriber shapes (T8), shard-local `$share`
 dealing (T9, Amendment 1), the bounds that push back (T10, Amendment 2), the yield by the
-queue's depth (T11) and eight shards (T12, both Amendment 3). Status in the delivery doc.
+queue's depth (T11) and eight shards (T12, both Amendment 3), and a routing publication
+proportional to the change (T13, Amendment 4). Status in the delivery doc.

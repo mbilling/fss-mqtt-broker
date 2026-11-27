@@ -297,6 +297,8 @@ impl Hub {
         // refused publish receives nothing, because the publisher still owns the message
         // and is expected to retry it (there is no way to say "delivered to two of your
         // three subscribers" on one PUBACK).
+        // ADR 0093 Amendment 4: the other shards' clients as each last published them.
+        self.refresh_foreign_routing();
         let (targets, foreign) = self.ordinary_targets(topic, publisher, retain);
         let matched = targets.len() + foreign.len();
         if gate.answerable() {
@@ -421,8 +423,9 @@ impl Hub {
 
     /// The ordinary (non-shared) local recipients of `topic` and each one's delivery
     /// terms: `(client, granted QoS, wire retain flag)` — and, second, the matched
-    /// subscribers other shards of this node own (ADR 0092 T5), whose terms are their
-    /// shard's to compute.
+    /// subscribers other shards of this node own, whose terms are their shard's to
+    /// compute. This shard's table holds only its own clients; the others come from the
+    /// routing each other shard last published (ADR 0093 Amendment 4).
     ///
     /// Pure and I/O-free, so it can be computed in the PLAN pass — before any side
     /// effect — and handed to the COMMIT pass unchanged (issue #238).
@@ -433,15 +436,15 @@ impl Hub {
         source_retain: bool,
     ) -> (Vec<(ClientId, QoS, bool)>, Vec<ClientId>) {
         let mut foreign = Vec::new();
+        for (_, partition) in self.foreign_partitions() {
+            // An empty table answers without walking anything.
+            foreign.extend(partition.table.matching_clients(topic));
+        }
         let own = self
             .table
             .matching_clients(topic)
             .into_iter()
             .filter_map(|c| {
-                if !self.owns(&c) {
-                    foreign.push(c);
-                    return None;
-                }
                 let terms = self.delivery_terms(&c, topic);
                 // No Local suppresses only the publisher's own copy (#198).
                 if publisher == Some(&c) && terms.no_local {
@@ -1475,7 +1478,7 @@ impl Hub {
         // is the exact table that pass reads (`by_filter.get(filter)` returns `None`
         // for every filter when it is empty, and the closure returns immediately),
         // so this cannot fork the definition of "which groups exist elsewhere".
-        let track_decided = !self.remote_by_filter.is_empty();
+        let track_decided = !self.remote_by_filter.is_empty() || !self.foreign_routing.is_empty();
         #[cfg(test)]
         if track_decided {
             self.probe
@@ -1500,23 +1503,16 @@ impl Hub {
                 continue;
             }
             let entry = by_key.entry((group, filter)).or_default();
-            let online_prefix = members.online_count();
-            for (i, (client, qos)) in members.iter().enumerate() {
+            for (client, qos) in members.iter() {
                 entry.push(SharedCandidateRef {
                     node: None,
                     client,
                     qos: *qos,
-                    // ADR 0092 T5: a member another shard owns is online as its shard
-                    // last mirrored it (the group's online prefix); one of ours, as
-                    // this shard holds it.
-                    online: if self.owns(client) {
-                        self.online.contains_key(client)
-                    } else {
-                        i < online_prefix
-                    },
+                    online: self.online.contains_key(client),
                 });
             }
         }
+        self.foreign_shared_candidates(topic, &decided, &mut by_key);
         // Peers, via the derived index rather than a scan of every peer's every
         // group. `remote_by_filter` was built in sorted node order, so the
         // candidate list is stable per publish — the property the old
@@ -1595,6 +1591,38 @@ impl Hub {
                 }),
         );
         plans
+    }
+
+    /// ADR 0093 Amendment 4: [`plan_shared`](Self::plan_shared)'s candidates among the
+    /// members other shards own, online as each shard last published them (a group's
+    /// online prefix). They are candidates only for a group that no online member of this
+    /// shard has taken (`decided`), so the deal stays on this shard when it can
+    /// (Amendment 1); with locality off they join this shard's own in one rotation.
+    /// Another shard's offline member is never dealt to (D5): its session and its queue
+    /// are that shard's.
+    fn foreign_shared_candidates<'a>(
+        &'a self,
+        topic: &'a str,
+        decided: &[(&'a str, &'a str)],
+        by_key: &mut BTreeMap<(&'a str, &'a str), Vec<SharedCandidateRef<'a>>>,
+    ) {
+        for (_, partition) in self.foreign_partitions() {
+            for (group, filter, members) in partition.shared.matching_refs(topic) {
+                if decided.iter().any(|&(g, f)| g == group && f == filter) {
+                    continue;
+                }
+                let online_prefix = members.online_count();
+                let entry = by_key.entry((group, filter)).or_default();
+                for (i, (client, qos)) in members.iter().enumerate() {
+                    entry.push(SharedCandidateRef {
+                        node: None,
+                        client,
+                        qos: *qos,
+                        online: i < online_prefix,
+                    });
+                }
+            }
+        }
     }
 
     /// Round-robin one member for a shared group, advancing the per-group cursor.

@@ -134,6 +134,25 @@ Ordinary subscriptions received this index in issue #445 (+29% routing
 throughput per core, v1.0.8 → v1.0.9). Shared subscriptions did not, and were
 still scanning until this change.
 
+## Routing copy (`cargo bench -p mqtt-core --bench routing_copy`)
+
+What a hub shard pays to publish its routing to the node's other shards (ADR 0093
+Amendment 4): one copy of its subscription table and one of its `$share` table, at the end
+of a batch in which either changed. With one shard (the default) nothing is copied. A copy
+is proportional to the table, so the shard spaces its copies under constant churn to about
+a tenth of its time.
+
+Recorded 2026-11-27 on an Apple M1 Pro (macOS, `--release`), not the reference machine:
+
+| Table | Subscriptions | Time (mean) |
+|---|---|---|
+| devices (`devices/<i>/cmd`, one client each) | 1,000 | ~0.31 ms |
+| devices | 10,000 | ~5.1 ms |
+| devices | 100,000 | ~85 ms |
+| `$share` (100 groups, one wildcard filter) | 1,000 | ~0.12 ms |
+| `$share` | 10,000 | ~1.2 ms |
+| `$share` | 100,000 | ~16.6 ms |
+
 ## The regression gate
 
 Two layers watch these numbers:
@@ -156,5 +175,6 @@ Two layers watch these numbers:
 cargo bench -p mqtt-codec        # codec hot path
 cargo bench -p mqtt-cluster      # durable-plane hot path
 cargo bench -p mqtt-bridge       # bridge per-message hot paths
+cargo bench -p mqtt-core --bench routing_copy   # a hub shard's routing copy
 cargo test  -p mqtt-codec --test perf_gate   # the per-PR floor
 ```

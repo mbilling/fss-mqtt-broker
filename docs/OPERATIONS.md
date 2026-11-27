@@ -1397,6 +1397,14 @@ msg/s with its ack p99 at half a second.
   every 64) — the queue is the latency then, and a yield buys nothing but the wake that
   brings the loop back (ADR 0093 Amendment 3). Yields a second against commands a second
   shows which regime a loop is in.
+- **What sharing the routing costs, with `node.hub_shards` above 1:**
+  `mqttd_hub_routing_publish_seconds{shard}`. Each shard copies the routing of the clients
+  it owns to the node's other shards once at the end of a batch in which it changed
+  (ADR 0093 Amendment 4), and the count is the copies. A copy grows with the shard's
+  subscriptions, about 5 ms for 10,000 device subscriptions, so under constant churn a shard
+  spaces its copies to about a tenth of its time. A SUBACK, UNSUBACK or CONNACK waits for
+  its shard's next copy, so a large mean here is also how long those answers wait. With one
+  shard nothing is copied.
 
 ## Overload: bounded hub ingress (ADR 0082)
 

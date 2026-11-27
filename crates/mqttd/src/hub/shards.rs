@@ -1,30 +1,33 @@
-//! ADR 0092 T5: the two-shard prototype — `K` hub loops ("data shards") on one node
-//! behind one [`HubTx`], each owning the clients of disjoint placement groups.
+//! ADR 0093: `K` hub loops ("data shards") on one node behind one [`HubTx`], each owning
+//! the clients of disjoint placement groups.
 //!
-//! What it measures is the split's cost per message, before the ADR is written: a
-//! publish is matched on its publisher's shard, the subscribers that shard owns are
+//! A publish is matched on its publisher's shard, the subscribers that shard owns are
 //! delivered there, and the rest are handed to their shard as one
-//! [`HubCommand::ShardDeliver`] (the message and its clients), whose durable
-//! completions come back as one [`HubCommand::ShardDone`] — two hand-offs per
-//! cross-shard message. Routing state is not snapshotted in the prototype: the shard
-//! that owns a client mirrors its filters, and whether it is connected, to every other
-//! shard ([`HubCommand::ShardRoute`]); the others match on them and own nothing else
-//! about the client. Everything peer-facing, retained, relayed or administrative goes
-//! to the first shard, so the prototype is for one node.
+//! [`HubCommand::ShardDeliver`] per batch (the messages and their clients), whose durable
+//! completions come back as one [`HubCommand::ShardDone`] (D3). What a shard matches the
+//! other shards' clients against is their routing as each last published it (Amendment 4):
+//! every shard keeps the filters, `$share` memberships and presence of the clients it owns,
+//! and at the end of a dispatch batch in which they changed it publishes an immutable copy
+//! of them to the node's [`RoutingBoard`]. A SUBACK, UNSUBACK or CONNACK waits for that
+//! publication, so a publish that follows the answer, on any shard, is matched with the
+//! change. Everything peer-facing, retained, relayed or administrative goes to the first
+//! shard, so a node with peers runs one shard (D5).
 //!
 //! With one shard (the default, `node.hub_shards = 1`) nothing here runs: [`HubTx`] is
-//! the loop's own sender, [`Hub::owns`] is always true, the mirror sends nothing.
+//! the loop's own sender, [`Hub::owns`] is always true, there is no board, nothing is
+//! published and no answer waits.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use bytes::Bytes;
 use mqtt_codec::QoS;
-use mqtt_core::{AppProperties, ClientId};
+use mqtt_core::{AppProperties, ClientId, SharedSubscriptionTable, SubscriptionTable};
 use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
 
 use super::lanes::AppendGate;
-use super::{min_qos, parse_shared, ClientSubs, DurableOutcome, Hub, HubCommand};
+use super::{min_qos, AttachOutcome, DurableOutcome, Hub, HubCommand};
 
 /// The most shards a node may run (`MQTTD_HUB_SHARDS`): the width of
 /// [`super::forwarding::PendingPublish::shard_outstanding`]'s bits, a byte (four until
@@ -39,6 +42,109 @@ pub const MAX_SHARDS: usize = 8;
 /// bound would evict it; and by Little's law a round trip of 0.2 s lets 16,384 in flight
 /// carry 80,000 crossing messages a second, above what one m6i.8xlarge pair deals across.
 pub const DEFAULT_HANDOFF_INFLIGHT: u32 = 16_384;
+
+/// ADR 0093 Amendment 4: how far apart a shard under constant churn spaces its routing
+/// publications, in copies: after a copy that took `c`, the next waits until `9c` has
+/// passed, so copying takes at most about a tenth of the loop's time. A copy is
+/// proportional to the shard's own tables (`crates/mqtt-core/benches/routing_copy.rs`:
+/// about 5 ms for 10,000 device subscriptions), so without the spacing a shard with a
+/// large table that changes every batch would spend its time copying.
+const PUBLISH_SPACING: u32 = 9;
+
+/// ADR 0093 Amendment 4: the routing of the clients one shard owns, as that shard last
+/// published it: their ordinary filters, and their `$share` memberships with each member's
+/// presence. The other shards match their publishes against it and own nothing else about
+/// those clients.
+#[derive(Debug, Default)]
+pub struct RoutingPartition {
+    pub(super) table: SubscriptionTable,
+    pub(super) shared: SharedSubscriptionTable,
+}
+
+/// ADR 0093 Amendment 4: where the shards of one node publish their routing partitions.
+///
+/// A shard writes its own cell at the end of a dispatch batch in which its routing changed,
+/// then bumps the version. A shard about to match a publish compares the version with the
+/// one it last read and reloads the other cells only when it moved, so the common case is
+/// one atomic load. A cell is replaced, never edited: a shard reading an old partition
+/// keeps it whole until it reloads.
+#[derive(Debug)]
+pub struct RoutingBoard {
+    cells: Box<[RwLock<Arc<RoutingPartition>>]>,
+    version: AtomicU64,
+    /// Each shard's session count as of its last publication, for the node-wide
+    /// `max_sessions` quota (ADR 0041 T4).
+    sessions: Box<[AtomicUsize]>,
+}
+
+impl RoutingBoard {
+    /// A board for a node of `shards` shards, every partition empty.
+    #[must_use]
+    pub fn new(shards: usize) -> Arc<Self> {
+        Arc::new(Self {
+            cells: (0..shards).map(|_| RwLock::new(Arc::default())).collect(),
+            version: AtomicU64::new(0),
+            sessions: (0..shards).map(|_| AtomicUsize::new(0)).collect(),
+        })
+    }
+
+    fn publish(&self, shard: usize, partition: RoutingPartition, sessions: usize) {
+        if let Some(cell) = self.cells.get(shard) {
+            *cell.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(partition);
+        }
+        if let Some(count) = self.sessions.get(shard) {
+            count.store(sessions, Ordering::Relaxed);
+        }
+        // Release: a shard that reads the new version sees the cell it was bumped for.
+        self.version.fetch_add(1, Ordering::Release);
+    }
+
+    fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
+    fn partition(&self, shard: usize) -> Arc<RoutingPartition> {
+        self.cells.get(shard).map_or_else(Arc::default, |cell| {
+            cell.read().unwrap_or_else(PoisonError::into_inner).clone()
+        })
+    }
+
+    fn sessions_besides(&self, shard: usize) -> usize {
+        self.sessions
+            .iter()
+            .enumerate()
+            .filter(|(k, _)| *k != shard)
+            .map(|(_, count)| count.load(Ordering::Relaxed))
+            .sum()
+    }
+}
+
+/// An answer that waits for its shard's next publication (ADR 0093 Amendment 4): the
+/// connection writes the SUBACK, UNSUBACK or CONNACK it carries only once every shard
+/// can match with the change it reports.
+#[derive(Debug)]
+pub(super) enum AfterPublish {
+    Subscribe(oneshot::Sender<Vec<bool>>, Vec<bool>),
+    Unsubscribe(oneshot::Sender<Vec<Option<QoS>>>, Vec<Option<QoS>>),
+    Attach(oneshot::Sender<AttachOutcome>, AttachOutcome),
+}
+
+impl AfterPublish {
+    /// A dropped receiver is a connection that has gone; the change stands either way.
+    fn send(self) {
+        match self {
+            Self::Subscribe(tx, verdicts) => {
+                let _ = tx.send(verdicts);
+            }
+            Self::Unsubscribe(tx, answer) => {
+                let _ = tx.send(answer);
+            }
+            Self::Attach(tx, outcome) => {
+                let _ = tx.send(outcome);
+            }
+        }
+    }
+}
 
 /// The shard that owns `client`: its placement group (ADR 0007 §1), folded onto the
 /// node's shards. Every shard and every connection computes the same answer from the
@@ -466,12 +572,18 @@ pub(super) struct ShardGate {
 
 impl Hub {
     /// Make this loop shard `shard` of `txs.len()`, with every shard's sender (its own
-    /// included) for the hand-offs. One sender leaves the hub as it was.
+    /// included) for the hand-offs and the node's routing board (Amendment 4). One sender
+    /// leaves the hub as it was.
     ///
     /// # Panics
     ///
     /// When `shard` is not an index into `txs`, or there are more than [`MAX_SHARDS`].
-    pub fn set_shards(&mut self, shard: u8, txs: Vec<mpsc::UnboundedSender<HubCommand>>) {
+    pub fn set_shards(
+        &mut self,
+        shard: u8,
+        txs: Vec<mpsc::UnboundedSender<HubCommand>>,
+        board: &Arc<RoutingBoard>,
+    ) {
         assert!(
             usize::from(shard) < txs.len() && txs.len() <= MAX_SHARDS,
             "shard {shard} of {} (at most {MAX_SHARDS})",
@@ -479,6 +591,12 @@ impl Hub {
         );
         self.shard = shard;
         self.shard_count = u8::try_from(txs.len()).expect("at most MAX_SHARDS");
+        // ADR 0093 Amendment 4: with more than one shard, the node's board is where this
+        // shard publishes its clients' routing and reads the others'.
+        if txs.len() > 1 {
+            self.routing_board = Some(board.clone());
+            self.foreign_routing = (0..txs.len()).map(|_| Arc::default()).collect();
+        }
         // ADR 0093 D3: one batch of hand-offs and one of answers per shard, and the
         // per-pair count of hand-offs still owed an answer.
         self.handoff_batches = (0..txs.len()).map(|_| Vec::new()).collect();
@@ -546,69 +664,104 @@ impl Hub {
             || shard_of(&client.0, usize::from(self.shard_count)) == usize::from(self.shard)
     }
 
-    /// Tell every other shard what `client` subscribes to and whether it is connected,
-    /// as of now: called wherever its filters or its presence change. Nothing with one
-    /// shard.
-    pub(super) fn mirror_routing(&mut self, client: &ClientId) {
-        if self.shard_count <= 1 {
-            return;
-        }
-        let mut filters: Vec<(String, QoS)> = self
-            .subs
-            .get(client)
-            .into_iter()
-            .flat_map(ClientSubs::iter)
-            .map(|e| (String::from(&*e.filter), e.qos))
-            .collect();
-        let online = self.online.contains_key(client);
-        let me = usize::from(self.shard);
-        let others: Vec<&mpsc::UnboundedSender<HubCommand>> = self
-            .shard_txs
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != me)
-            .map(|(_, tx)| tx)
-            .collect();
-        for (n, tx) in others.iter().enumerate() {
-            let filters = if n + 1 == others.len() {
-                std::mem::take(&mut filters)
-            } else {
-                filters.clone()
-            };
-            let _ = tx.send(HubCommand::ShardRoute {
-                client: client.clone(),
-                filters,
-                online,
-            });
+    /// ADR 0093 Amendment 4: the routing of a client this shard owns changed (a filter,
+    /// a `$share` membership, its presence). The shard publishes at the end of the batch.
+    /// Nothing with one shard.
+    pub(super) fn routing_changed(&mut self) {
+        if self.routing_board.is_some() {
+            self.routing_dirty = true;
         }
     }
 
-    /// Another shard's client, as it subscribes now: replace what this shard matches
-    /// on for it. Nothing else about the client lives here.
-    pub(super) fn apply_shard_route(
-        &mut self,
-        client: &ClientId,
-        filters: Vec<(String, QoS)>,
-        online: bool,
-    ) {
-        if self.owns(client) {
-            debug!(client = %client.0, "a routing mirror for a client this shard owns; ignored");
+    /// Send `answer`, or keep it until this shard has published the routing change it
+    /// reports (ADR 0093 Amendment 4). Call [`routing_changed`](Self::routing_changed)
+    /// first. With one shard, or with nothing unpublished, it goes now.
+    pub(super) fn answer_after_publish(&mut self, answer: AfterPublish) {
+        if self.routing_dirty {
+            self.after_publish.push(answer);
+        } else {
+            answer.send();
+        }
+    }
+
+    /// The end of a dispatch batch (ADR 0093 Amendment 4): publish this shard's routing if
+    /// it changed, then send the answers that waited for it. One publication a batch at
+    /// most, however many changes the batch made, and under constant churn one in every
+    /// [`PUBLISH_SPACING`] copies' worth of time: the answers wait for it meanwhile.
+    /// `idle` (the loop is about to park, or a flush asks) publishes whatever the spacing.
+    /// Nothing with one shard.
+    pub(super) fn publish_routing(&mut self, idle: bool) {
+        let Some(board) = &self.routing_board else {
+            return;
+        };
+        if self.routing_dirty {
+            let spaced = self
+                .routing_published_at
+                .is_none_or(|at| at.elapsed() >= self.routing_copy_cost * PUBLISH_SPACING);
+            if !idle && !spaced {
+                return;
+            }
+            self.routing_dirty = false;
+            let started = std::time::Instant::now();
+            let partition = RoutingPartition {
+                table: self.table.clone(),
+                shared: self.shared.clone(),
+            };
+            board.publish(usize::from(self.shard), partition, self.session_count());
+            let published = std::time::Instant::now();
+            self.routing_copy_cost = published - started;
+            self.routing_published_at = Some(published);
+            if let Some(m) = &self.metrics {
+                m.hub_routing_published(self.shard, self.routing_copy_cost.as_secs_f64());
+            }
+            #[cfg(test)]
+            self.probe
+                .routing_publications
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        for answer in std::mem::take(&mut self.after_publish) {
+            answer.send();
+        }
+    }
+
+    /// Before a publish is matched (ADR 0093 Amendment 4): the other shards' routing as
+    /// each last published it. One atomic load when nothing moved since the last call.
+    pub(super) fn refresh_foreign_routing(&mut self) {
+        let Some(board) = &self.routing_board else {
+            return;
+        };
+        let version = board.version();
+        if version == self.foreign_version {
             return;
         }
-        self.table.remove_client(client);
-        self.shared.remove_client(client);
-        for (f, qos) in filters {
-            if let Some((group, filter)) = parse_shared(&f) {
-                // Another shard's member: past this shard's own prefix, dealt to only
-                // when this shard has no online member of its own (ADR 0093
-                // Amendment 1).
-                self.shared
-                    .subscribe_member(client.clone(), group, filter, qos, online, false);
-            } else {
-                let key = self.table.intern(&f);
-                self.table.subscribe(client.clone(), key);
+        self.foreign_version = version;
+        let me = usize::from(self.shard);
+        for (k, slot) in self.foreign_routing.iter_mut().enumerate() {
+            if k != me {
+                *slot = board.partition(k);
             }
         }
+    }
+
+    /// The other shards' routing partitions (ADR 0093 Amendment 4), with each one's shard.
+    /// Empty with one shard.
+    pub(super) fn foreign_partitions(&self) -> impl Iterator<Item = (usize, &RoutingPartition)> {
+        let me = usize::from(self.shard);
+        self.foreign_routing
+            .iter()
+            .enumerate()
+            .filter(move |(k, _)| *k != me)
+            .map(|(k, partition)| (k, &**partition))
+    }
+
+    /// The node's session count for the `max_sessions` quota (ADR 0041 T4): this shard's,
+    /// plus every other shard's as of its last publication.
+    pub(super) fn node_session_count(&self) -> usize {
+        self.session_count()
+            + self
+                .routing_board
+                .as_ref()
+                .map_or(0, |board| board.sessions_besides(usize::from(self.shard)))
     }
 
     /// A subscriber of the publish being dispatched that another shard owns.
@@ -821,7 +974,8 @@ impl Hub {
                         reached = true;
                     } else {
                         // The member left between the origin's dealing and this
-                        // delivery (its mirror in flight): nothing was stored, and the
+                        // delivery (the origin dealt from routing this shard had not yet
+                        // republished, Amendment 4): nothing was stored, and the
                         // publisher is not told it was (#973). Withheld; the retry is
                         // dealt to a member that is here.
                         debug!(member = %client.0, topic = %d.topic,

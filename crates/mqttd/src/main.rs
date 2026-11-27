@@ -3432,8 +3432,14 @@ fn start_shards(
     });
     let mut hubs: Vec<hub::Hub> = (0..shards).map(|_| make()).collect();
     let txs: Vec<_> = hubs.iter().map(hub::Hub::sender).collect();
+    // ADR 0093 Amendment 4: where each shard publishes its clients' routing.
+    let board = hub::RoutingBoard::new(shards);
     for (k, hub) in hubs.iter_mut().enumerate() {
-        hub.set_shards(u8::try_from(k).expect("at most MAX_SHARDS"), txs.clone());
+        hub.set_shards(
+            u8::try_from(k).expect("at most MAX_SHARDS"),
+            txs.clone(),
+            &board,
+        );
         hub.set_handoff_inflight_cap(config.node.hub_handoff_inflight);
         hub.set_hub_yield_deep(config.node.hub_yield_deep);
         if let Some((boxes, mailman)) = &mailboxes {
