@@ -1977,6 +1977,47 @@ pub enum HubCommand {
         /// the committed value warms every cache as usual, and NOTHING is delivered.
         restore: bool,
     },
+    /// ADR 0093 Amendment 5: a retained mutation another shard's publish made, for
+    /// shard 0, which commits every retained mutation of the node — one in flight per
+    /// node (ADR 0037 §5) — and keeps its tokens. Sent on shard 0's own sender.
+    RetainedMutation {
+        /// The topic.
+        topic: String,
+        /// The payload; empty = clear (tombstone).
+        payload: Bytes,
+        /// The publish `QoS` as its 2-bit wire value.
+        qos: u8,
+        /// The publish's application properties. Boxed (#835).
+        app: Box<AppProperties>,
+        /// The pending publish on the sending shard whose ack waits for the commit.
+        publish: Option<u64>,
+        /// The absolute expiry deadline (issue #227).
+        expires_at: Option<u64>,
+    },
+    /// ADR 0093 Amendment 5: shard 0 resolved the retained commit pending publish `id`
+    /// waited for — committed, or dropped at the queue bound — on the shard that owns
+    /// the publish. Sent on that shard's own sender.
+    RetainedDone {
+        /// The pending publish.
+        id: u64,
+        /// Whether the commit landed; `false` withholds the ack.
+        committed: bool,
+    },
+    /// ADR 0093 Amendment 5: shard 0 applied a committed retained value; every other
+    /// shard delivers it to its own fresh subscriptions' windows (#219), as shard 0 does
+    /// to its own. Sent on each shard's own sender.
+    RetainedWindowed {
+        /// The topic.
+        topic: String,
+        /// The committed payload.
+        payload: Bytes,
+        /// The `QoS` as its 2-bit wire value.
+        qos: u8,
+        /// The committed application properties. Boxed (#835).
+        app: Box<AppProperties>,
+        /// The absolute expiry deadline.
+        expires_at: Option<u64>,
+    },
     /// A committed retained value fanned out by its topic's group owner
     /// (ADR 0037 §3): apply it to the local cache iff its `(epoch, offset)` token
     /// exceeds the held one — monotonic per topic, idempotent, order-insensitive.
@@ -2233,6 +2274,7 @@ impl HubCommand {
             | Self::RemotePublishVerdict { .. }
             | Self::RemoteRetainedCommitAck { .. }
             | Self::RetainedCommitDone { .. }
+            | Self::RetainedDone { .. }
             | Self::DurableFrame { .. }
             | Self::Ping { .. }
             | Self::Draining
@@ -2265,6 +2307,8 @@ impl HubCommand {
             | Self::AttachAuthorizer(_)
             | Self::AttachRules(_)
             | Self::RemoteRetainedUpdate { .. }
+            | Self::RetainedMutation { .. }
+            | Self::RetainedWindowed { .. }
             | Self::RemoteRetainedSnapshot { .. }
             | Self::RemoteRetainedDigest { .. }
             | Self::RemoteRetainedRequest { .. }
@@ -4217,8 +4261,9 @@ impl Hub {
         // or quorum returning on links that never dropped. No-ops when idle.
         self.retry_retained_handoff();
         self.kick_retained_queue();
-        // Retained `$SYS/` leftovers go, during the first minute after boot (ADR 0084).
-        if self.reserved_purge_ticks > 0 {
+        // Retained `$SYS/` leftovers go, during the first minute after boot (ADR 0084):
+        // from the node's one store, by shard 0 (ADR 0093 Amendment 5).
+        if self.reserved_purge_ticks > 0 && self.peer_face() {
             self.purge_reserved_retained().await;
         }
         // A peer held dead with no link is kept as unreachable for a bounded
@@ -5024,6 +5069,40 @@ impl Hub {
             HubCommand::PeerAlive { node } => self.peer_alive(&node),
             HubCommand::PeerGone { node } => self.peer_gone(&node),
             HubCommand::PeerView(view) => self.apply_peer_view(view),
+            HubCommand::RetainedMutation {
+                topic,
+                payload,
+                qos,
+                app,
+                publish,
+                expires_at,
+            } => {
+                self.enqueue_retained_mutation(retained::RetainedMutation {
+                    topic,
+                    payload,
+                    qos,
+                    app: *app,
+                    reply: None,
+                    publish,
+                    expires_at,
+                    restore: false,
+                });
+                self.kick_retained_queue();
+            }
+            HubCommand::RetainedDone { id, committed } => {
+                if committed {
+                    self.pending_retained_done(id);
+                } else {
+                    self.drop_pending(id);
+                }
+            }
+            HubCommand::RetainedWindowed {
+                topic,
+                payload,
+                qos,
+                app,
+                expires_at,
+            } => self.deliver_to_windowed_subscribers(&topic, &payload, qos, &app, expires_at),
             HubCommand::GossipInterest => self.gossip_interest(),
             HubCommand::DurableFrame { node, frame } => {
                 self.handle_durable_frame(&node, frame);
@@ -5124,7 +5203,7 @@ impl Hub {
                     // mutation is finally done — resolve the gated publish riding
                     // it (ADR 0042 T9, exhibit ⑦) and drive the next one.
                     if let Some(id) = mutation.publish {
-                        self.pending_retained_done(id);
+                        self.retained_obligation_done(id, true);
                     }
                     self.kick_retained_queue();
                 } else {
@@ -5149,9 +5228,9 @@ impl Hub {
                 self.retained_commit_inflight = false;
                 if let Some((epoch, offset)) = token {
                     // The authority commit landed: resolve the gated publish riding
-                    // this mutation (ADR 0042 T9, exhibit ⑦).
+                    // this mutation (ADR 0042 T9, exhibit ⑦), on its own shard.
                     if let Some(id) = publish {
-                        self.pending_retained_done(id);
+                        self.retained_obligation_done(id, true);
                     }
                     // Committed: warm the local cache, fan the tokened value out to
                     // every peer (ADR 0037 §3 — best-effort; a peer that misses it
@@ -7704,14 +7783,17 @@ impl Hub {
             self.retained_windows.retain(|_, w| w.until > now);
         }
         self.retained_antientropy_tick = self.retained_antientropy_tick.wrapping_add(1);
-        if self.retained_may_expire {
+        // ADR 0093 Amendment 5: the node's one retained store is reaped, and its tokens
+        // kept and offered, by shard 0; another shard that stored an expiring value says
+        // so on the board.
+        if self.peer_face() && (self.retained_may_expire || self.retained_may_expire_elsewhere()) {
             self.reap_expired_retained().await;
         }
         if !self.retained_tombstone_observed_at.is_empty() {
             self.reap_discharged_tombstones().await;
         }
 
-        if self.retained_antientropy_tick % RETAINED_ANTIENTROPY_EVERY == 0 {
+        if self.retained_antientropy_tick % RETAINED_ANTIENTROPY_EVERY == 0 && self.peer_face() {
             // Re-learn committed retained state this process no longer remembers
             // BEFORE offering the digest built from it (issue #183): a restart
             // empties the in-memory token map, and a tombstoned topic leaves no

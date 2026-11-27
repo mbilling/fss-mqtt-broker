@@ -2514,6 +2514,9 @@ async fn start_hub(
             Some(dir) => Some(persistent_retained(dir)?), // ADR 0018 phase 4
             None => None,
         };
+        // ADR 0093 Amendment 5: one retained cache for the node's shards, in memory when
+        // there is no data dir.
+        let shared_retained = shared_memory_retained(config, retained_handle.as_ref());
         let members = config.durable.ownership_domain == OwnershipDomain::Members;
         let hub_tx = start_shards(
             config,
@@ -2538,7 +2541,7 @@ async fn start_hub(
                 // topic's group lease-owner, so retained state converges instead of
                 // diverging.
                 hub.attach_durable_retained(durable_retained.clone());
-                if let Some(retained) = &retained_handle {
+                if let Some(retained) = retained_handle.as_ref().or(shared_retained.as_ref()) {
                     hub.attach_retained_store(retained.clone());
                 }
             },
@@ -2591,6 +2594,7 @@ async fn start_hub(
         let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::with_limits(
             queue_limits_from_config(config)?,
         ));
+        let shared_retained = shared_memory_retained(config, None);
         let hub_tx = start_shards(
             config,
             cluster_configured,
@@ -2606,7 +2610,11 @@ async fn start_hub(
                 )
                 .0
             },
-            |_| {},
+            |hub| {
+                if let Some(retained) = &shared_retained {
+                    hub.attach_retained_store(retained.clone());
+                }
+            },
         )?;
         Ok((hub_tx, store, None, None, None))
     }
@@ -2893,6 +2901,18 @@ impl mqttd::backup::RetainedSource for HubRetainedSource {
 
 /// Build the on-disk retained-message store at `<dir>/retained.redb` (ADR 0018 phase 4),
 /// so retained messages survive a restart.
+/// One in-memory retained store for the node's shards when there is more than one and
+/// no other store (ADR 0093 Amendment 5): a subscriber on one shard replays what was
+/// retained through another. `None` with one shard, which keeps its own, as it always
+/// has, or with a store already given.
+fn shared_memory_retained(
+    config: &Config,
+    given: Option<&Arc<dyn RetainedStore>>,
+) -> Option<Arc<dyn RetainedStore>> {
+    (config.node.hub_shards > 1 && given.is_none())
+        .then(|| Arc::new(mqtt_storage::MemoryRetainedStore::new()) as Arc<dyn RetainedStore>)
+}
+
 fn persistent_retained(dir: &str) -> Result<Arc<dyn RetainedStore>, Box<dyn std::error::Error>> {
     let path = Path::new(dir).join("retained.redb");
     Ok(Arc::new(PersistentRetainedStore::open(path)?))

@@ -35,8 +35,12 @@ pub(super) fn start_shards_with(
         (boxes, mailman)
     });
     let board = crate::hub::RoutingBoard::new(2);
+    // As the node gives them (ADR 0093 Amendment 5): one retained store for both.
+    let retained: Arc<dyn mqtt_storage::RetainedStore> =
+        Arc::new(mqtt_storage::MemoryRetainedStore::new());
     for (k, hub) in hubs.iter_mut().enumerate() {
         hub.set_shards(u8::try_from(k).unwrap(), txs.clone(), &board);
+        hub.attach_retained_store(retained.clone());
         hub.set_write_elision_ms(elision_ms);
         // As the node runs it (`cluster.shared_prefer_local`, on by default): the
         // `$share` fast path, where a shard deals among its own members (ADR 0093

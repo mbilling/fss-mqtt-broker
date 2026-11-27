@@ -91,6 +91,9 @@ pub struct RoutingBoard {
     /// One bit per shard, set while its takeover is open: its window armed, or a scan
     /// it started still materialising sessions.
     takeover: AtomicU32,
+    /// A shard other than 0 stored a retained value with an expiry in the node's one
+    /// store: shard 0, which reaps it, looks.
+    retained_may_expire: std::sync::atomic::AtomicBool,
 }
 
 /// How many replaced partitions per shard of the node the reaper's one queue holds before
@@ -126,6 +129,7 @@ impl RoutingBoard {
             authoritative: AtomicU32::new(0),
             settling: AtomicU32::new(0),
             takeover: AtomicU32::new(0),
+            retained_may_expire: std::sync::atomic::AtomicBool::new(false),
         });
         (board, freed)
     }
@@ -306,7 +310,7 @@ pub fn peer_shard(node: &mqtt_cluster::NodeId, lane: u64, shards: usize) -> usiz
 /// The shard that sent a forward this node is answered for: its seq's tag
 /// (`set_shards`). A tag past the last shard — a seq from a previous life of the node with
 /// more shards, which nobody here waits for — goes to the last, which finds nothing.
-fn issuing_shard(seq: u64, shards: usize) -> usize {
+pub(super) fn issuing_shard(seq: u64, shards: usize) -> usize {
     usize::try_from(seq >> SHARD_TAG_SHIFT).map_or(shards - 1, |s| s.min(shards - 1))
 }
 
@@ -983,6 +987,29 @@ impl Hub {
             board.set_takeover(usize::from(self.shard), takeover);
             self.takeover_published = takeover;
         }
+    }
+
+    /// This shard stored a retained value with an expiry: shard 0, which reaps the node's
+    /// one store, is told on the board (ADR 0093 Amendment 5).
+    pub(super) fn note_retained_may_expire(&mut self) {
+        self.retained_may_expire = true;
+        if let Some(board) = &self.routing_board {
+            if self.shard != 0 {
+                board
+                    .retained_may_expire
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+
+    /// Whether another shard stored a retained value with an expiry since shard 0 last
+    /// looked, clearing the flag. Never with one shard.
+    pub(super) fn retained_may_expire_elsewhere(&self) -> bool {
+        self.routing_board.as_ref().is_some_and(|board| {
+            board
+                .retained_may_expire
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+        })
     }
 
     /// Whether another shard's takeover is open (ADR 0093 Amendment 5): a session this

@@ -327,7 +327,9 @@ impl Hub {
                 // The absolute deadline persists with the copy (issue #227).
                 expires_at: message_expiry.map(|s| self.clock.now_epoch_secs() + u64::from(s)),
             };
-            self.retained_may_expire |= message.expires_at.is_some();
+            if message.expires_at.is_some() {
+                self.note_retained_may_expire();
+            }
             // Boxed: the retained store's write future is the rare path's, and it must
             // not size every publish's future (ADR 0092 T3).
             if let Err(e) = Box::pin(self.retained.set(&message)).await {

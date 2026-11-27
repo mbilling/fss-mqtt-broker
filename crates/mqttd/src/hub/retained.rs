@@ -165,6 +165,25 @@ impl Hub {
         !self.retained.contains(topic).await.unwrap_or(false)
     }
 
+    /// The retained authority commit pending publish `id` waited for was resolved:
+    /// committed, or dropped (its ack withheld). The publish may be another shard's —
+    /// shard 0 commits every retained mutation of the node — and that shard is told
+    /// (ADR 0093 Amendment 5).
+    pub(super) fn retained_obligation_done(&mut self, id: u64, committed: bool) {
+        let shard = super::shards::issuing_shard(id, usize::from(self.shard_count).max(1));
+        if shard != usize::from(self.shard) {
+            if let Some(tx) = self.shard_txs.get(shard) {
+                let _ = tx.send(HubCommand::RetainedDone { id, committed });
+            }
+            return;
+        }
+        if committed {
+            self.pending_retained_done(id);
+        } else {
+            self.drop_pending(id);
+        }
+    }
+
     /// The retained authority commit obligation resolved (ADR 0042 T9, exhibit ⑦).
     pub(super) fn pending_retained_done(&mut self, id: u64) {
         if let Some(p) = self.pending_publishes.get_mut(id) {
@@ -673,6 +692,21 @@ impl Hub {
                 p.awaiting_retained = true;
             }
         }
+        // ADR 0093 Amendment 5: shard 0 commits every retained mutation of the node, one
+        // at a time, and keeps the tokens; this shard's publish waits for its answer.
+        if !self.peer_face() {
+            if let Some(tx) = self.shard_txs.first() {
+                let _ = tx.send(HubCommand::RetainedMutation {
+                    topic: topic.to_string(),
+                    payload: payload.clone(),
+                    qos,
+                    app: Box::new(app.clone()),
+                    publish: gate,
+                    expires_at,
+                });
+            }
+            return;
+        }
         self.enqueue_retained_mutation(RetainedMutation {
             topic: topic.to_string(),
             payload: payload.clone(),
@@ -819,7 +853,7 @@ impl Hub {
                 // A gated publish whose authority commit was dropped never acks
                 // (ADR 0042 T9, exhibit ⑦): the publisher retries.
                 if let Some(id) = dropped.publish {
-                    self.drop_pending(id);
+                    self.retained_obligation_done(id, false);
                 }
             }
             if let Some(m) = &self.metrics {
@@ -1483,7 +1517,23 @@ impl Hub {
         // Nor one in `$SYS/`, as at the subscribe replay: an owner that predates ADR 0084
         // can still commit a client's retained `$SYS` value, and this path would hand it
         // to a fresh subscriber the replay just kept it from.
-        if self.retained_windows.is_empty() || mqtt_core::is_reserved_topic(topic) {
+        if mqtt_core::is_reserved_topic(topic) {
+            return;
+        }
+        // ADR 0093 Amendment 5: shard 0 applies every committed value; the other shards'
+        // fresh subscriptions are theirs to serve.
+        if self.tells_shards() {
+            for tx in self.shard_txs.iter().skip(1) {
+                let _ = tx.send(HubCommand::RetainedWindowed {
+                    topic: topic.to_string(),
+                    payload: payload.clone(),
+                    qos,
+                    app: Box::new(app.clone()),
+                    expires_at,
+                });
+            }
+        }
+        if self.retained_windows.is_empty() {
             return;
         }
         // An already-expired value is not delivered [MQTT-3.3.2-5]; the remaining
