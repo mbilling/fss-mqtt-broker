@@ -103,7 +103,11 @@ pub fn spawn_node_hub(
     id: &mqtt_cluster::NodeId,
     store: Arc<dyn mqtt_storage::SessionStore>,
 ) -> mqttd::hub::HubTx {
-    spawn_hub_shards(move || Hub::with_config(id.clone(), store.clone()).0, |_| {}).0
+    spawn_hub_shards(
+        move || Hub::with_config(id.clone(), store.clone()).0,
+        |_| {},
+    )
+    .0
 }
 
 /// Spawn a permissive in-process broker (anonymous allowed, open ACL) on an
