@@ -1610,7 +1610,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 956 test(s)
+## `crates/mqttd/src/lib.rs` — 957 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -2109,6 +2109,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::cluster_shards::shard_0_commits_every_retained_mutation_one_at_a_time`
 - `hub::tests::cluster_shards::the_nodes_interest_is_gossiped_from_shard_0_with_every_shards_filters`
 - `hub::tests::cluster_shards::the_sessions_gauge_counts_every_shard`
+- `hub::tests::cluster_shards::two_members_gone_in_one_gap_are_each_tried_once`
 - `hub::tests::commands_sort_into_the_control_and_data_lanes`
 - `hub::tests::durable_failure_reasons_are_bounded`
 - `hub::tests::durable_off_keeps_the_adr_0014_behaviour_with_no_retained_commit`

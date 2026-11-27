@@ -935,6 +935,7 @@ impl Hub {
                             client: chosen.client,
                             qos: delivered_qos,
                             key_hash,
+                            tried: Vec::new(),
                         });
                         continue;
                     }
@@ -1122,6 +1123,7 @@ impl Hub {
                 let out = self.deliver_to_shared_member(
                     id,
                     shared_cursor_hash(&key.0, &key.1),
+                    &tried,
                     &chosen.client,
                     delivered_qos,
                     &topic,
@@ -1321,6 +1323,7 @@ impl Hub {
                     client: member.client.clone(),
                     qos: delivered_qos,
                     key_hash: shared_cursor_hash(&key.0, &key.1),
+                    tried: Vec::new(),
                 });
                 self.flush_handoffs(
                     &topic,
@@ -1699,6 +1702,7 @@ impl Hub {
         &mut self,
         id: u64,
         key_hash: u64,
+        tried: &[(Option<NodeId>, ClientId)],
         client: &ClientId,
         delivered_qos: QoS,
         topic: &str,
@@ -1724,6 +1728,7 @@ impl Hub {
             client: client.clone(),
             qos: delivered_qos,
             key_hash,
+            tried: tried.to_vec(),
         });
         self.flush_handoffs(topic, payload, qos, false, message_expiry, app, &gate);
         DurableOutcome::Ok

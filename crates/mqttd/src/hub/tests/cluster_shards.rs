@@ -514,6 +514,7 @@ async fn a_hand_off_to_a_member_that_is_gone_names_it_in_the_answer() {
             client: gone.clone(),
             qos: QoS::AtLeastOnce,
             key_hash,
+            tried: Vec::new(),
         }],
         credit: None,
     });
@@ -521,7 +522,15 @@ async fn a_hand_off_to_a_member_that_is_gone_names_it_in_the_answer() {
     assert_eq!(answers.len(), 1);
     assert_eq!(answers[0].id, 7);
     assert!(matches!(answers[0].outcome, crate::hub::DurableOutcome::Ok));
-    assert_eq!(answers[0].gone, vec![(key_hash, gone, QoS::AtLeastOnce)]);
+    assert_eq!(
+        answers[0].gone,
+        vec![crate::hub::GoneMember {
+            key_hash,
+            client: gone,
+            qos: QoS::AtLeastOnce,
+            tried: Vec::new(),
+        }]
+    );
 }
 
 /// The publisher's shard places a delivery whose member was gone with another member of
@@ -561,7 +570,12 @@ async fn a_member_gone_on_another_shard_is_dealt_again_there() {
             id,
             outcome: crate::hub::DurableOutcome::Ok,
             reached: false,
-            gone: vec![(key_hash, gone.clone(), QoS::AtLeastOnce)],
+            gone: vec![crate::hub::GoneMember {
+                key_hash,
+                client: gone.clone(),
+                qos: QoS::AtLeastOnce,
+                tried: Vec::new(),
+            }],
         },
     );
     assert!(
@@ -622,5 +636,78 @@ async fn a_publish_owed_to_a_peer_declared_dead_then_gone_is_held_then_resolved_
             .unwrap(),
         PublishOutcome::Accepted,
         "the peer is gone: its subscribers with it"
+    );
+}
+
+/// Two `$share` members that left their shard in one routing gap are each tried once
+/// (ADR 0093 Amendment 5): the second's answer carries who was tried, so the re-placement
+/// does not hand the delivery back to the first, and with nobody left that can take it
+/// the publish is withheld for its publisher to retry, not dealt round again.
+#[tokio::test]
+async fn two_members_gone_in_one_gap_are_each_tried_once() {
+    let (mut a, mut b) = two_unrun_shards();
+    let first = ClientId(client_on(1, "m-", 0).into());
+    let second = ClientId(client_on(1, "m-", 1).into());
+    // Shard 1's routing as last published: both online. Both have left since.
+    b.shared
+        .subscribe(first.clone(), "g", "t", QoS::AtLeastOnce, true);
+    b.shared
+        .subscribe(second.clone(), "g", "t", QoS::AtLeastOnce, true);
+    b.routing_changed();
+    b.publish_routing(true);
+    a.refresh_foreign_routing();
+    let key_hash = crate::hub::delivery::shared_cursor_hash("g", "t");
+    a.shared_cursor
+        .insert(key_hash, (("g".into(), "t".into()), 0));
+    let (done, mut answered) = oneshot::channel();
+    let id = a.register_pending(
+        done,
+        "t",
+        &Bytes::from_static(b"twice"),
+        QoS::AtLeastOnce,
+        false,
+        None,
+        &mqtt_core::AppProperties::default(),
+    );
+    if let Some(p) = a.pending_publishes.get_mut(id) {
+        p.local_done = true;
+        p.shard_outstanding = 0b10;
+    }
+    let gone =
+        |client: &ClientId, tried: Vec<(Option<NodeId>, ClientId)>| crate::hub::ShardAnswer {
+            id,
+            outcome: crate::hub::DurableOutcome::Ok,
+            reached: false,
+            gone: vec![crate::hub::GoneMember {
+                key_hash,
+                client: client.clone(),
+                qos: QoS::AtLeastOnce,
+                tried,
+            }],
+        };
+    // The deal took `first`; it was gone.
+    a.shard_done(1, gone(&first, Vec::new()));
+    let placed = std::mem::take(&mut a.handoff_batches[1]);
+    let (to, tried) = match &placed[0].targets[0] {
+        crate::hub::ShardTarget::Shared { client, tried, .. } => (client.clone(), tried.clone()),
+        other => panic!("a $share delivery: {other:?}"),
+    };
+    assert_eq!(to, second, "placed with the other member");
+    assert!(
+        tried.iter().any(|(_, c)| *c == first) && tried.iter().any(|(_, c)| *c == second),
+        "and the hand-off says who was tried: {tried:?}"
+    );
+    // `second` was gone too: its answer carries that list back.
+    a.shard_done(1, gone(&second, tried));
+    assert!(
+        a.handoff_batches[1].is_empty(),
+        "not handed back to `first`: nobody left was tried twice"
+    );
+    assert!(
+        matches!(
+            answered.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ),
+        "withheld: the group's routing still lists members, and its publisher retries"
     );
 }

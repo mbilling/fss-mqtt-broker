@@ -721,6 +721,10 @@ pub enum ShardTarget {
         /// The group's cursor hash on the origin (`shared_cursor_hash`): which group to
         /// place the delivery with again if the member is gone (ADR 0093 Amendment 5).
         key_hash: u64,
+        /// The members this delivery was already placed with, this one included when it
+        /// is a re-placement: what a placement after this one must not try again, so two
+        /// members gone in one routing gap are tried once each. Empty for a first deal.
+        tried: Vec<(Option<mqtt_cluster::NodeId>, ClientId)>,
     },
     /// An ordinary subscriber a settle-window re-delivery found (ADR 0093 Amendment 5):
     /// delivered only if its session is offline, or was resumed since the publish was
@@ -867,10 +871,24 @@ pub struct ShardAnswer {
     pub outcome: DurableOutcome,
     /// Whether a subscriber there took it (fan-out evidence, as a peer's `Reached`).
     pub reached: bool,
-    /// The `$share` members it was dealt that were gone by the time it arrived: group
-    /// cursor hash, member and `QoS`. The origin places each again (ADR 0093
-    /// Amendment 5), as a peer's member-gone answer is placed.
-    pub gone: Vec<(u64, ClientId, QoS)>,
+    /// The `$share` members it was dealt that were gone by the time it arrived. The
+    /// origin places each delivery again (ADR 0093 Amendment 5), as a peer's member-gone
+    /// answer is placed.
+    pub gone: Vec<GoneMember>,
+}
+
+/// A `$share` member a hand-off was dealt to that was gone when it arrived
+/// ([`ShardAnswer::gone`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoneMember {
+    /// The group's cursor hash on the origin.
+    pub key_hash: u64,
+    /// The member.
+    pub client: ClientId,
+    /// The delivery's `QoS`.
+    pub qos: QoS,
+    /// The members the delivery was already placed with (see [`ShardTarget::Shared`]).
+    pub tried: Vec<(Option<mqtt_cluster::NodeId>, ClientId)>,
 }
 
 /// ADR 0093 D4, the second arm (`node.hub_handoff_wake = "remote"`): where a shard's
@@ -952,7 +970,7 @@ pub(super) struct ShardGate {
     /// Whether a subscriber here took the message.
     reached: bool,
     /// The `$share` members it was dealt that were gone.
-    gone: Vec<(u64, ClientId, QoS)>,
+    gone: Vec<GoneMember>,
 }
 
 impl Hub {
@@ -1594,7 +1612,7 @@ impl Hub {
         let gate = d.append_gate();
         let mut worst = DurableOutcome::Ok;
         let mut reached = false;
-        let mut gone: Vec<(u64, ClientId, QoS)> = Vec::new();
+        let mut gone: Vec<GoneMember> = Vec::new();
         for target in d.targets {
             match target {
                 ShardTarget::Ordinary(client) => {
@@ -1651,6 +1669,7 @@ impl Hub {
                     client,
                     qos,
                     key_hash,
+                    tried,
                 } => {
                     if !self.owns(&client) {
                         continue;
@@ -1679,7 +1698,12 @@ impl Hub {
                         debug!(member = %client.0, topic = %d.topic,
                                "shard hand-off to a member that is not here");
                         if d.gate.is_some() {
-                            gone.push((key_hash, client, qos));
+                            gone.push(GoneMember {
+                                key_hash,
+                                client,
+                                qos,
+                                tried,
+                            });
                         } else if let Some(m) = &self.metrics {
                             m.publish_dropped("shard-member-gone");
                         }
@@ -1700,7 +1724,7 @@ impl Hub {
         id: u64,
         sync: DurableOutcome,
         reached: bool,
-        gone: Vec<(u64, ClientId, QoS)>,
+        gone: Vec<GoneMember>,
     ) {
         if let Some(g) = self.shard_append_pending.get_mut(&id) {
             g.worst = g.worst.and(sync);
@@ -1749,7 +1773,7 @@ impl Hub {
         id: u64,
         outcome: DurableOutcome,
         reached: bool,
-        gone: Vec<(u64, ClientId, QoS)>,
+        gone: Vec<GoneMember>,
     ) {
         if let Some(batch) = self.shard_done_batches.get_mut(usize::from(origin)) {
             batch.push(ShardAnswer {
@@ -1772,6 +1796,15 @@ impl Hub {
         } = answer;
         let bit = 1u8 << shard.min(7);
         if id & HANDOFF_GATE != 0 {
+            // No `$share` delivery travels under one of these gates (a peer's forward is
+            // ordinary; a re-delivery replays ordinary subscribers). Were one ever to, a
+            // member gone there must not read as stored: nothing places it again here.
+            debug_assert!(gone.is_empty(), "a $share hand-off under a hand-off gate");
+            let outcome = if gone.is_empty() {
+                outcome
+            } else {
+                outcome.and(DurableOutcome::Failed)
+            };
             self.gate_handoff_done(bit, shard, id, outcome, reached);
             return;
         }
@@ -1804,8 +1837,8 @@ impl Hub {
         // settled above, so a placement with the same shard owes a new answer — and the
         // acknowledgement below waits for that placement.
         if matches!(outcome, DurableOutcome::Ok) {
-            for (key_hash, client, qos) in gone {
-                self.member_gone_elsewhere(id, key_hash, client, qos);
+            for member in gone {
+                self.member_gone_elsewhere(id, member);
             }
         }
         match outcome {
@@ -1817,30 +1850,40 @@ impl Hub {
 }
 
 impl Hub {
-    /// The `$share` member `client` that pending publish `id` was dealt at `qos`, in the
-    /// group with cursor hash `key_hash`, was gone from its shard when the delivery got
-    /// there (ADR 0093 Amendment 5): the delivery is placed again, as a peer's
-    /// member-gone answer is. A group this shard no longer has a cursor for cannot be
-    /// named, and the publish is withheld as before.
-    fn member_gone_elsewhere(&mut self, id: u64, key_hash: u64, client: ClientId, qos: QoS) {
-        if let Some(m) = &self.metrics {
-            m.publish_dropped("shard-member-gone");
-        }
+    /// The `$share` member that pending publish `id` was dealt to was gone from its shard
+    /// when the delivery got there (ADR 0093 Amendment 5): the delivery is placed again,
+    /// as a peer's member-gone answer is, never with a member it was already placed with.
+    /// A group this shard no longer has a cursor for cannot be named, and the publish is
+    /// withheld, counted.
+    fn member_gone_elsewhere(&mut self, id: u64, gone: GoneMember) {
+        let GoneMember {
+            key_hash,
+            client,
+            qos,
+            mut tried,
+        } = gone;
         let Some(key) = self
             .shared_cursor
             .get(&key_hash)
             .map(|(key, _)| key.clone())
         else {
+            if let Some(m) = &self.metrics {
+                m.publish_dropped("shard-member-gone");
+            }
             self.drop_pending(id);
             return;
         };
+        debug!(publish = id, member = %client.0, "a $share member left its shard; placing again");
+        if !tried.iter().any(|(n, c)| n.is_none() && *c == client) {
+            tried.push((None, client.clone()));
+        }
         self.reselect_shared(
             id,
             super::forwarding::ForwardObligation {
                 node: self.node_id.clone(),
                 kind: super::forwarding::ForwardKind::Shared {
                     key,
-                    tried: vec![(None, client.clone())],
+                    tried,
                     client,
                     qos,
                     sent: true,

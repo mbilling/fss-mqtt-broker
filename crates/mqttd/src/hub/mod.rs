@@ -113,8 +113,8 @@ pub use peer_view::{LinkLane, PeerView};
 /// ADR 0092 T5: the node's data shards and the sender in front of them.
 pub mod shards;
 pub use shards::{
-    peer_shard, shard_of, spawn_mailman, HubTx, RoutingBoard, RoutingPartition, ShardAnswer,
-    ShardBatch, ShardDeliver, ShardMailbox, ShardTarget, MAX_SHARDS,
+    peer_shard, shard_of, spawn_mailman, GoneMember, HubTx, RoutingBoard, RoutingPartition,
+    ShardAnswer, ShardBatch, ShardDeliver, ShardMailbox, ShardTarget, MAX_SHARDS,
 };
 
 /// Default outbound Receive Maximum when the client advertised none — effectively
@@ -1847,7 +1847,8 @@ pub enum HubCommand {
     GossipInterest,
     /// ADR 0093 Amendment 5: the answer to a peer's forward `seq` from a shard that has
     /// not yet heard of the peer's new link, for shard 0, which has the link's own lanes.
-    /// Sent on shard 0's own sender; on the data lane, behind the link it follows.
+    /// Sent on shard 0's own sender; on the data lane, behind the link it follows, so a
+    /// shard 0 parked on its hand-off cap sends it late, and the peer's sweep covers that.
     ForwardAnswer {
         /// The peer.
         node: NodeId,

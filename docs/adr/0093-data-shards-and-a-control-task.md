@@ -517,7 +517,10 @@ Amendment 4 found five things.
   - The sessions a publish reached include the other shards', so none gets a second copy.
 - **A `$share` member that left its shard after the deal** is placed again by the
   publisher's shard, as a peer's member-gone answer is: the hand-off's answer names it,
-  and the publisher's acknowledgement waits for the new placement.
+  and the publisher's acknowledgement waits for the new placement. The hand-off and its
+  answer carry the members already tried, so two members gone in one routing gap are
+  tried once each, and with nobody left the publish is withheld for its publisher to
+  retry.
 - **Settling and takeovers are the node's questions.**
   - Each shard publishes its own terms on the routing board.
   - `routing_unsettled` and `takeover_open` hold while any shard's do.
