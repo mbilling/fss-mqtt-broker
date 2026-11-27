@@ -50,6 +50,66 @@ pub fn write_elision_ms() -> u32 {
         .unwrap_or(0)
 }
 
+/// How many hub loops a node in a suite runs: `MQTTD_HUB_SHARDS`, as the broker reads it,
+/// or one. Set it to run a cluster suite with data shards (ADR 0093 Amendment 5).
+#[allow(dead_code)] // not every test binary that includes `common` builds a hub
+pub fn hub_shards() -> usize {
+    std::env::var("MQTTD_HUB_SHARDS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, mqttd::hub::MAX_SHARDS)
+}
+
+/// A node's hub loops as `main` starts them: one, or [`hub_shards`] data shards behind one
+/// sender with one routing board and one retained store, each made by `make` and then
+/// given what `configure` gives (which may attach the node's own retained store, one for
+/// every shard). Returns the sender and each loop's abort handle.
+#[allow(dead_code)] // not every test binary that includes `common` builds a hub
+pub fn spawn_hub_shards(
+    make: impl Fn() -> Hub,
+    configure: impl Fn(&mut Hub),
+) -> (mqttd::hub::HubTx, Vec<tokio::task::AbortHandle>) {
+    let shards = hub_shards();
+    let mut hubs: Vec<Hub> = (0..shards).map(|_| make()).collect();
+    let txs: Vec<_> = hubs.iter().map(Hub::sender).collect();
+    if shards > 1 {
+        let board = mqttd::hub::RoutingBoard::new(shards);
+        let retained: Arc<dyn mqtt_storage::RetainedStore> =
+            Arc::new(mqtt_storage::MemoryRetainedStore::new());
+        for (k, hub) in hubs.iter_mut().enumerate() {
+            hub.set_shards(u8::try_from(k).expect("at most eight"), txs.clone(), &board);
+            hub.attach_retained_store(retained.clone());
+        }
+    }
+    for hub in &mut hubs {
+        configure(hub);
+    }
+    let aborts = hubs
+        .into_iter()
+        .map(|hub| tokio::spawn(hub.run()).abort_handle())
+        .collect();
+    let tx = if shards > 1 {
+        mqttd::hub::HubTx::sharded(txs)
+    } else {
+        mqttd::hub::HubTx::from(txs[0].clone())
+    };
+    (tx, aborts)
+}
+
+/// A cluster node's hub over `store`, as [`spawn_hub_shards`] starts it.
+#[allow(dead_code)] // not every test binary that includes `common` builds a cluster node
+pub fn spawn_node_hub(
+    id: &mqtt_cluster::NodeId,
+    store: Arc<dyn mqtt_storage::SessionStore>,
+) -> mqttd::hub::HubTx {
+    spawn_hub_shards(
+        move || Hub::with_config(id.clone(), store.clone()).0,
+        |_| {},
+    )
+    .0
+}
+
 /// Spawn a permissive in-process broker (anonymous allowed, open ACL) on an
 /// ephemeral port and return its address. The common path for protocol tests.
 pub async fn start_broker() -> SocketAddr {
@@ -107,8 +167,7 @@ pub async fn start_node(name: &str) -> Node {
     let client_addr = cli.local_addr().unwrap();
 
     let id = NodeId(name.to_string());
-    let (hub, tx) = Hub::with_config(id.clone(), Arc::new(MemorySessionStore::new()));
-    tokio::spawn(hub.run());
+    let tx = spawn_node_hub(&id, Arc::new(MemorySessionStore::new()));
     spawn_client_loop(cli, tx.clone());
     tokio::spawn(mqttd::peer::serve_listener(
         peer,
@@ -185,10 +244,8 @@ pub async fn start_two_node_cluster() -> (SocketAddr, SocketAddr) {
 
     let id_a = NodeId("node-a".into());
     let id_b = NodeId("node-b".into());
-    let (hub_a, tx_a) = Hub::with_config(id_a.clone(), Arc::new(MemorySessionStore::new()));
-    let (hub_b, tx_b) = Hub::with_config(id_b.clone(), Arc::new(MemorySessionStore::new()));
-    tokio::spawn(hub_a.run());
-    tokio::spawn(hub_b.run());
+    let tx_a = spawn_node_hub(&id_a, Arc::new(MemorySessionStore::new()));
+    let tx_b = spawn_node_hub(&id_b, Arc::new(MemorySessionStore::new()));
 
     spawn_client_loop(cli_a, tx_a.clone());
     spawn_client_loop(cli_b, tx_b.clone());

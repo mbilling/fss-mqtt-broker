@@ -37,6 +37,8 @@ pub(super) struct HubProbe {
     /// `decided` set (item 1.5). Same slope framing: the count per publish must
     /// stop growing with the number of matching groups.
     pub(super) shared_plan_scratch_uses: AtomicUsize,
+    /// ADR 0093 Amendment 4: how many times this shard published its routing.
+    pub(super) routing_publications: AtomicUsize,
     /// Stands in for a durable plane where only a takeover's bookkeeping is under
     /// test (issue #1031): sessions may move to this node, so a takeover can be open.
     pub(super) sessions_move: std::sync::atomic::AtomicBool,

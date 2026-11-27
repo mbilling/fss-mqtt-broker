@@ -574,6 +574,7 @@ async fn a_forward_that_reaches_nobody_is_dropped_on_the_receiving_node() {
     subscribe(&tx, "watcher", "ev/#");
     ping(&tx).await;
     let forward = |payload: &'static [u8], retain| HubCommand::RemotePublish {
+        node: NodeId("peer".into()),
         topic: "t/stale".into(),
         payload: Bytes::from_static(payload),
         qos: QoS::AtMostOnce,

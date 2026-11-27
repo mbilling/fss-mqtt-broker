@@ -29,7 +29,7 @@ use std::collections::hash_map::Entry;
 use std::collections::HashSet;
 
 /// Maps topic filters to the set of clients subscribed to each.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SubscriptionTable {
     by_filter: FastMap<FilterKey, FastSet<ClientId>>,
     /// The derived match index (issue #445). Lives in [`crate::filter_index`] so
@@ -188,6 +188,26 @@ mod tests {
 
     fn cid(s: &str) -> ClientId {
         ClientId(s.into())
+    }
+
+    /// A copy routes as the original does, and the two change independently
+    /// afterwards (ADR 0093 Amendment 4: a hub shard publishes copies).
+    #[test]
+    fn a_copy_routes_as_the_original_and_changes_on_its_own() {
+        let mut t = SubscriptionTable::new();
+        let ab = t.intern("a/b");
+        t.subscribe(cid("c1"), ab.clone());
+        t.subscribe(cid("c2"), t.intern("a/+"));
+        t.subscribe(cid("c3"), t.intern("#"));
+        let copy = t.clone();
+        assert_eq!(copy.matching_clients("a/b"), t.matching_clients("a/b"));
+        t.unsubscribe(&cid("c1"), "a/b");
+        t.remove_client(&cid("c3"));
+        assert_eq!(
+            copy.matching_clients("a/b"),
+            HashSet::from([cid("c1"), cid("c2"), cid("c3")])
+        );
+        assert_eq!(t.matching_clients("a/b"), HashSet::from([cid("c2")]));
     }
 
     #[test]

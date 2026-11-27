@@ -12,7 +12,9 @@ pub mod subscriptions;
 pub use subscriptions::SubscriptionTable;
 
 pub mod shared;
-pub use shared::{is_shared_filter, parse_shared, SharedGroup, SharedSubscriptionTable};
+pub use shared::{
+    is_shared_filter, parse_shared, SharedGroup, SharedGroupPresence, SharedSubscriptionTable,
+};
 
 pub mod secrets;
 pub use secrets::read_secret_file;

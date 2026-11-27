@@ -49,6 +49,18 @@ pub struct SharedGroup {
     pub members: Vec<(ClientId, QoS)>,
 }
 
+/// A shared group with whether each member is online
+/// ([`SharedSubscriptionTable::snapshot_with_presence`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedGroupPresence {
+    /// The share name.
+    pub group: String,
+    /// The underlying topic filter.
+    pub filter: TopicFilter,
+    /// Members, their granted `QoS`, and whether each is online.
+    pub members: Vec<(ClientId, QoS, bool)>,
+}
+
 /// One matching group as the per-publish path borrows it: `(share name, filter,
 /// members)`, all tied to the table's lifetime — nothing cloned.
 pub type MatchedGroup<'a> = (&'a str, &'a str, &'a GroupMembers);
@@ -250,7 +262,7 @@ impl GroupMembers {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SharedSubscriptionTable {
     /// Source of truth: filter → share-name → members, online ones first.
     groups: FastMap<FilterKey, FastMap<String, GroupMembers>>,
@@ -497,6 +509,29 @@ impl SharedSubscriptionTable {
             .collect()
     }
 
+    /// Every shared group with its members and whether each is online, as this table
+    /// holds it: what a node gossips of another hub shard's groups, whose presence that
+    /// shard's table keeps in its online prefix (ADR 0093 Amendment 5).
+    #[must_use]
+    pub fn snapshot_with_presence(&self) -> Vec<SharedGroupPresence> {
+        self.groups
+            .iter()
+            .flat_map(|(filter, by_group)| {
+                by_group
+                    .iter()
+                    .map(move |(group, members)| SharedGroupPresence {
+                        group: group.clone(),
+                        filter: String::from(&**filter),
+                        members: members
+                            .iter()
+                            .enumerate()
+                            .map(|(i, (c, q))| (c.clone(), *q, i < members.online_count()))
+                            .collect(),
+                    })
+            })
+            .collect()
+    }
+
     /// Number of distinct shared groups currently registered.
     #[must_use]
     pub fn group_count(&self) -> usize {
@@ -511,6 +546,52 @@ mod tests {
 
     fn cid(s: &str) -> ClientId {
         ClientId(s.into())
+    }
+
+    /// A copy deals from the same members as the original, its online prefix
+    /// included, and the two change independently afterwards (ADR 0093 Amendment 4).
+    #[test]
+    fn a_copy_holds_the_same_members_and_changes_on_its_own() {
+        let mut t = SharedSubscriptionTable::new();
+        t.subscribe(cid("m1"), "g", "a/+", QoS::AtLeastOnce, true);
+        t.subscribe(cid("m2"), "g", "a/+", QoS::AtMostOnce, false);
+        let copy = t.clone();
+        assert_eq!(member_ids(&copy, "a/x"), member_ids(&t, "a/x"));
+        let online = |t: &SharedSubscriptionTable| {
+            t.matching_refs("a/x")
+                .next()
+                .map_or(0, |(_, _, members)| members.online_count())
+        };
+        assert_eq!(online(&copy), 1);
+        t.set_client_online(&cid("m2"), true);
+        t.remove_client(&cid("m1"));
+        assert_eq!(online(&copy), 1, "the copy keeps its presence");
+        assert_eq!(member_ids(&copy, "a/x"), ["m1", "m2"]);
+        assert_eq!(member_ids(&t, "a/x"), ["m2"]);
+    }
+
+    /// What a node gossips of another shard's groups carries each member's presence
+    /// (ADR 0093 Amendment 5).
+    #[test]
+    fn a_snapshot_with_presence_says_who_is_online() {
+        let mut t = SharedSubscriptionTable::new();
+        t.subscribe(cid("m1"), "g", "a/+", QoS::AtLeastOnce, true);
+        t.subscribe(cid("m2"), "g", "a/+", QoS::AtMostOnce, false);
+        t.subscribe(cid("m3"), "h", "b", QoS::AtLeastOnce, false);
+        t.set_client_online(&cid("m3"), true);
+        let mut groups = t.snapshot_with_presence();
+        groups.sort_by(|a, b| a.group.cmp(&b.group));
+        let mut g = groups[0].members.clone();
+        g.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        assert_eq!(groups[0].filter, "a/+");
+        assert_eq!(
+            g,
+            [
+                (cid("m1"), QoS::AtLeastOnce, true),
+                (cid("m2"), QoS::AtMostOnce, false)
+            ]
+        );
+        assert_eq!(groups[1].members, [(cid("m3"), QoS::AtLeastOnce, true)]);
     }
 
     /// Member client ids of the single group matching `topic`, sorted.

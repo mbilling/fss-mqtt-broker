@@ -1663,6 +1663,7 @@ async fn write_state<W: AsyncWrite + Unpin>(
 /// retained copy is this node's only record of the topic's state, so neither is shed.
 fn peer_credit(
     ingress: Option<&IngressCredit>,
+    shard: usize,
     qos: mqtt_codec::QoS,
     retain: bool,
     topic_len: usize,
@@ -1674,7 +1675,7 @@ fn peer_credit(
     if qos != mqtt_codec::QoS::AtMostOnce || retain {
         return Ok(None);
     }
-    let permit = ingress.try_acquire_pool(ingress.cost(topic_len, body_len));
+    let permit = ingress.try_acquire_pool_on(shard, ingress.cost(topic_len, body_len));
     if permit.is_none() {
         ingress.note_peer_shed();
         return Err(());
@@ -1812,10 +1813,13 @@ fn forward_inbound(
             let qos = mqtt_codec::QoS::from_u8(qos).unwrap_or(mqtt_codec::QoS::AtMostOnce);
             let app = app_of(app);
             let body = payload.len() + app.accounted_bytes();
-            let Ok(credit) = peer_credit(ingress, qos, retain, topic.len(), body) else {
+            // ADR 0093 Amendment 5: the pool of the shard that handles the forward.
+            let shard = crate::hub::peer_shard(remote, 0, hub.shards());
+            let Ok(credit) = peer_credit(ingress, shard, qos, retain, topic.len(), body) else {
                 return;
             };
             let _ = hub.send(HubCommand::RemotePublish {
+                node: remote.clone(),
                 topic,
                 payload: payload.into(),
                 qos,
@@ -1942,7 +1946,9 @@ fn forward_inbound(
             let qos = mqtt_codec::QoS::from_u8(qos).unwrap_or(mqtt_codec::QoS::AtMostOnce);
             let app = app_of(app);
             let body = payload.len() + app.accounted_bytes();
-            let Ok(credit) = peer_credit(ingress, qos, false, topic.len(), body) else {
+            // The pool of the member's shard, where the delivery waits.
+            let shard = crate::hub::shard_of(&client, hub.shards());
+            let Ok(credit) = peer_credit(ingress, shard, qos, false, topic.len(), body) else {
                 return;
             };
             let _ = hub.send(HubCommand::RemoteSharedDeliver {

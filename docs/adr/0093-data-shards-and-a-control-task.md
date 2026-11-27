@@ -188,6 +188,9 @@ gated like one, the retained index and the relay become the control task's, the 
 lists every shard's sessions, and the cluster fault suites run with shards on. Nothing in
 a cluster changes before then.
 
+*Amendment 5 moves them with no control task: shard 0 speaks for the node to its peers and
+commits its retained mutations, and the guard goes.*
+
 ### D6. `$share` dealing runs on the origin; a `#` subscriber is one shard's load
 
 A `$share` publish is dealt on its origin shard against the snapshot, with every member's
@@ -361,6 +364,211 @@ worker, +10–20% on the four-shard knee, in the run that also measures ADR 0089
 (a delivery behind a write in flight waits for it); then eight shards, whose wall is the
 sixteen cores at about 400,000–450,000 (D8). Tasks T11 and T12.
 
+## Amendment 4 (2026-11-27): each shard publishes its own clients' routing
+
+**What the code showed.** Mapping T1's work against the code found three things D2 did not
+foresee.
+
+- **A shard holds live routing state for its own clients whatever else exists.** Delivery
+  and `$share` dealing read its own clients' presence synchronously. The publish path also
+  writes it: a delivery that finds a closed connection reaps it on the spot
+  (`reap_closed_connection`). What a shard needs from elsewhere is only the other shards'
+  clients.
+- **The mirror broke D2's rule.** A SUBACK went out before the mirror carrying the
+  subscription was even sent, so a publish on another shard right after it could miss it.
+- **`max_sessions` was enforced per shard.** The node's cap was `K` times the configured
+  one.
+
+**The decision changes D2 (the maintainer, 2026-11-27).** There is no control task.
+
+- **What each shard publishes.** Each data shard keeps the routing of the clients it owns:
+  their ordinary filters, their `$share` memberships and their presence. At the end of a
+  dispatch batch in which that changed, it publishes an immutable copy to the node's
+  routing board. The board has one cell per shard and one version counter.
+- **How the others read it.** A shard about to match a publish compares the version with
+  the one it last read, and reloads the other shards' cells only when it moved. That is one
+  atomic load in the common case.
+- **Why the answer can wait for it.** The comparison happens after the publish was taken
+  from the shard's channel. So a publish that arrived after an answer is matched against
+  the publication that preceded the answer. The SUBACK, UNSUBACK and CONNACK each wait for
+  their shard's publication.
+- **What stays as it was.** The settings every shard must agree on stay broadcast, as the
+  prototype sends them.
+- **`max_sessions` counts every shard.** Each shard adds its own sessions to the other
+  shards' as each last published them. The cap is therefore enforced eventually, not
+  exactly: shards admitting in the same publication window can each pass the check, so
+  the node can overshoot by what they admit before they publish. Before, the cap was
+  enforced per shard, `K` times the configured one.
+- **Matching.** A publish finds its ordinary subscribers on other shards in their
+  partitions.
+- **Dealing.** `$share` dealing takes another shard's online members only for a group with
+  no online member of its own (Amendment 1). It never takes another shard's offline
+  member: those are no candidates at all (D5). The deal and the cold re-selection path list
+  the same members in the same order: this shard's, then the other shards' in shard order,
+  then each peer's. Another shard's member counts as local under `shared_prefer_local`,
+  since it is on the same node.
+- **One shard.** With one shard there is no board, nothing is published and no answer
+  waits: the default path is the one loop as it was.
+
+The trade against a control task is two-sided. This way, attach and subscribe have no extra
+hop, and no single task serializes the node's routing changes. The cost is one table walk
+per other shard per publish; an empty table answers without walking.
+
+**What a publication costs.** A copy is proportional to the shard's own tables.
+`crates/mqtt-core/benches/routing_copy.rs` measured these on an Apple M1 Pro, release
+build:
+
+| subscriptions | device table (`devices/<i>/cmd`, one client each) | `$share` table (100 groups) |
+|---|---|---|
+| 1,000 | 0.31 ms | 0.12 ms |
+| 10,000 | 5.1 ms | 1.2 ms |
+| 100,000 | 85 ms | 16.6 ms |
+
+So under constant churn a shard spaces its publications. After a copy that took `c`, the
+next waits until `9c` has passed, so copying takes at most about a tenth of the loop's time.
+A loop about to park, or a flush, publishes at once.
+
+The answers pay for that spacing: they wait for the next publication. On a busy shard that
+is at most a batch. Under constant churn it can be up to about ten copies' time: about
+50 ms at 10,000 device subscriptions a shard, and about 0.8 s at 100,000.
+`mqttd_hub_routing_publish_seconds{shard}` reports every copy, and
+`mqttd_hub_routing_answer_wait_seconds{shard}` every answer's wait.
+
+Freeing a replaced copy costs about half what making it did (43 ms at 100,000 device
+subscriptions). So a partition replaced in a cell, or in a shard's view of the others, goes
+to the board's reaper thread: it is freed outside the cell's lock and off every shard's
+loop. The reaper has one queue for the node, of two partitions per shard. When it is full
+the reaper is behind, and the shard frees the partition itself
+(`mqttd_hub_routing_free_inline_total{shard}` counts it), so memory holds at most that many
+old copies queued, plus the one being freed.
+
+A publication proportional to the change rather than the table (a base copy, and the
+changes since it) is the next step, if a large fleet needs `K > 1`: task T13.
+
+**What it should buy, to be measured.** T1's acceptance is unchanged in substance. The
+control path, now the `subscribe` and `attach` dispatches plus the publications, must stay
+under 2% of hub time at the knee on h3 and fan-in. At one shard the durable QoS 1 path must
+read the same: a local A/B (`durable_bench`, release build), then the rig.
+
+## Amendment 5 (2026-11-27): a node with peers runs its shards
+
+**What the code showed.** T5 was written against D2's control task: D5 gave it the retained
+index and the relay. Amendment 4 removed that task. Mapping the cluster paths against
+Amendment 4 found five things.
+
+- **Everything a node knew of its peers lived on shard 0.** That was the links and their
+  protocols, what each peer subscribes to, its `$share` members, the holds of peers declared
+  dead, and the mesh. A publish on another shard found no peer. It was forwarded nowhere
+  and owed nothing, so its `QoS` 1 publisher would be acknowledged for a subscriber on
+  another node who never received it. That shard never settled, because its mesh had no
+  links, and its subscriptions were never gossiped.
+- **Peer events have three producers:** each link's task, membership, and shard 0's own
+  sweeps. Copying the events to every shard gives each shard a different order, so a link
+  coming up while membership declares its peer dead could leave one shard linked and
+  another not.
+- **A link closes when its last sender is dropped.** A copy on every shard keeps a link
+  open until the slowest shard lets go.
+- **Retained ran per shard.** That covered the commit queue and its one slot, the tokens,
+  the windows, and, in memory, the store itself. ADR 0037 §5's one commit in flight per node
+  became one per shard. The cache could fall behind the authority, and exports paired values
+  with another shard's tokens.
+- **The admin API, the gauges and the capability flags answered from one shard.** A purge
+  on the owner node could remove the stored session of a client another shard served. The
+  relay already worked: a relayed connection pins its shard like any other.
+
+**The decision (T5, the maintainer's order T1 → T5 → the rig, 2026-11-27).**
+
+- **Shard 0 is the node's face to its peers.**
+  - It alone hears from the links and from membership. Only its sweeps end links: a
+    revoked or expired certificate, a hold's countdown.
+  - After each change to its view it sends the change to every other shard as a
+    `PeerView`, in the order it made the changes. A change is a link up or lost, a verdict,
+    a hold ended, a peer's interest, its `$share` members, or its message-events wish.
+  - Each shard applies the change to its own copy. It then does what the change means for
+    its own pending publishes: re-routes, flushes, holds, `$share` moves, the takeover
+    window.
+  - What happens once per node stays on shard 0: the durable plane's links, the snapshots
+    a new link is sent, the retained digest and queue, the rules' origin flag, the
+    capability flags, the message-events frames.
+  - The other shards hold a link's lanes weakly, so only shard 0 and the durable plane keep
+    a link open.
+- **Every shard forwards its own publishes.** It matches them against its copy and sends
+  them under its own seqs. A forward's answer returns to the shard its seq's top bits name
+  (T1).
+- **A peer's forwards are spread over the shards.**
+  - An acknowledged forward goes to shard `(h(node) + s) mod K`, where `s` is the sending
+    shard its seq names. An unacknowledged forward goes to `h(node) mod K`.
+  - A retransmission carries the same seq, so it reaches the window that saw the original.
+  - One publisher's forwards are all sent by one shard of its node, so they keep their
+    order. A publisher's `QoS` 0 and `QoS` 1 forwards can land on different shards and
+    reorder against each other, which MQTT allows: it orders a topic's messages per
+    `QoS`.
+  - The handling shard's pool carries a plain forward's credit.
+  - A shard that has not yet heard of a peer's new link from shard 0 hands its answers
+    for that peer to shard 0, which has the link's own lanes.
+- **A peer's forward is gated like a client's publish** (D5's first point).
+  - Its copy for another shard's subscriber goes over gated, and the peer is answered once
+    that shard has stored it.
+  - The copy keeps the forward's identity (#784).
+  - A `$SYS` hand-off stays live-only.
+- **A settle-window re-delivery reaches the other shards.**
+  - This covers a client's publish and a forward held for a takeover. The re-delivery goes
+    as a replay to the sessions another shard materialised since, under a gate of its own.
+  - The sessions a publish reached include the other shards', so none gets a second copy.
+- **A `$share` member that left its shard after the deal** is placed again by the
+  publisher's shard, as a peer's member-gone answer is: the hand-off's answer names it,
+  and the publisher's acknowledgement waits for the new placement. The hand-off and its
+  answer carry the members already tried, so two members gone in one routing gap are
+  tried once each, and with nobody left the publish is withheld for its publisher to
+  retry.
+- **Settling and takeovers are the node's questions.**
+  - Each shard publishes its own terms on the routing board.
+  - `routing_unsettled` and `takeover_open` hold while any shard's do.
+  - A forward held for a takeover (#1031) is released once every shard has landed a
+    complete scan that started after the hold: the session the takeover brings may be
+    any shard's.
+  - Each shard computes the mesh terms from its copy.
+- **Shard 0 gossips the node's interest.**
+  - The interest is the union of every shard's routing as each last published it.
+  - It is gossiped once every shard's boot scan has landed.
+  - A shard whose routing changed asks shard 0 to gossip once its own publication is out.
+    Shard 0 gossips once a batch, however many shards asked.
+- **Retained is one per node, committed by shard 0.**
+  - The shards share one store in every mode.
+  - With durable retained, shard 0 commits every retained mutation of the node, one at a
+    time as ADR 0037 §5 has it. A retained publish on another shard hands its mutation over,
+    and its publisher is answered on its own shard once the commit lands.
+  - The tokens, tombstones, digests, snapshots and exports are shard 0's, over one
+    consistent set.
+  - Each value shard 0 applies goes to the other shards that may hold a fresh
+    subscription's window (#219). A shard says so on the board before its replay reads
+    the store.
+  - The reaps and the anti-entropy cadence are shard 0's.
+- **The admin API sees every shard.** A request that names a client goes to its shard. A
+  list is asked of every shard and merged.
+- **A node's numbers are the node's.**
+  - A gauge one shard computes from its own state is written as the sum over the shards:
+    the largest, for the backlog maximum and the settle terms.
+  - A rule note on any shard reaches the node's notes task.
+  - Each shard's security sweep record names its shard.
+- **The guard goes.** A node with peers runs `hub_shards` loops.
+
+**What it costs.**
+
+- **A view change reaches the other shards one queue later.** A forward's answer that a
+  shard makes before it has the link goes through shard 0, one queue more.
+- **Each shard rebuilds a peer's interest trie for every snapshot.** That is `K` times the
+  CPU in a churn, spread over `K` loops.
+- **In a takeover window each shard scans the whole store for its own sessions.** That is
+  `K` enumerations.
+- **One shard per peer handles all of a node's unacknowledged forwards.** With few peers,
+  inbound `QoS` 0 spreads over fewer shards than `K`.
+- **The node's retained commits stay serial on shard 0,** as they were on one loop.
+
+**What it should buy, to be measured.** The cluster suites pass with shards on. On the rig a
+clustered node's knee follows `K` as a lone node's did (Amendment 3), on the node types of
+the scale runs and on a larger-NIC type.
+
 ## Consequences
 
 - **The split's cost is known before it is built:** about 2 µs a message for the hand-off,
@@ -375,8 +583,9 @@ sixteen cores at about 400,000–450,000 (D8). Tasks T11 and T12.
   probe is the term that says where; until it is measured the README does not claim a
   figure for `K > 1`.
 - **A broad subscriber is a stated limit**, not a defect to be fixed by `K`.
-- **A node with peers runs one loop** until T5. The README's cluster figures do not move
-  before it.
+- **A node with peers runs its shards** (Amendment 5): shard 0 speaks for the node to its
+  peers, and every shard forwards, settles and is answered for itself. The README's
+  cluster figures move by the rig's numbers only.
 
 ## Alternatives considered
 
@@ -403,9 +612,10 @@ sixteen cores at about 400,000–450,000 (D8). Tasks T11 and T12.
 
 ## Delivery
 
-Twelve tasks: the control task and its snapshots (T1), hand-offs with credit and batching
+Thirteen tasks: the routing snapshots (T1, D2 as Amendment 4 changes it), hand-offs with credit and batching
 (T2), the worker capture removed by measurement (T3), the ENA packet-rate probe on AWS
-(T4), the cluster paths on shards (T5), a shard's failure modes (T6), the four-shard knee
+(T4), the cluster paths on shards (T5, Amendment 5), a shard's failure modes (T6), the four-shard knee
 against D8 (T7), the hot-group and `#`-subscriber shapes (T8), shard-local `$share`
 dealing (T9, Amendment 1), the bounds that push back (T10, Amendment 2), the yield by the
-queue's depth (T11) and eight shards (T12, both Amendment 3). Status in the delivery doc.
+queue's depth (T11) and eight shards (T12, both Amendment 3), and a routing publication
+proportional to the change (T13, Amendment 4). Status in the delivery doc.

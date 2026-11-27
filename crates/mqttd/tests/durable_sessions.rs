@@ -155,21 +155,25 @@ async fn start_durable_node_capped(
     )
     .await;
     let plane_observer = plane.clone();
-    let (mut hub, hub_tx) =
-        Hub::with_config_and_placement(node_id.clone(), store.clone(), Some(placement.clone()));
-    hub.attach_durable_plane(plane);
-    // Durable retained (ADR 0037 P3): retained mutations route to the group owner,
-    // exactly as production wires it.
-    hub.attach_durable_retained(durable_retained);
     // Metrics, so tests can read the divergence counter (ADR 0037 P4 convergence
     // proof). One registry per node ("dur" is just the namespace).
     let metrics = Arc::new(mqtt_observability::metrics::Metrics::new("dur"));
-    hub.attach_metrics(metrics.clone());
+    // The node's hub loops: one, or `MQTTD_HUB_SHARDS` (ADR 0093 Amendment 5).
+    let (hub_tx, mut aborts) = common::spawn_hub_shards(
+        || {
+            Hub::with_config_and_placement(node_id.clone(), store.clone(), Some(placement.clone()))
+                .0
+        },
+        |hub| {
+            hub.attach_durable_plane(plane.clone());
+            // Durable retained (ADR 0037 P3): retained mutations route to the group owner,
+            // exactly as production wires it.
+            hub.attach_durable_retained(durable_retained.clone());
+            hub.attach_metrics(metrics.clone());
+        },
+    );
     // Killing a node aborts its hub, accept loop, and lease-group driver together.
-    let mut aborts = vec![
-        tokio::spawn(hub.run()).abort_handle(),
-        driver.abort_handle(),
-    ];
+    aborts.push(driver.abort_handle());
 
     // MQTT client listener (permissive, served by this node's hub). Clients connect
     // here directly; for the failover test a client reconnects to the new owner.

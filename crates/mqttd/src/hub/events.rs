@@ -168,6 +168,10 @@ impl Hub {
     /// when that differs from what the peer was last told (a new link starts at "no").
     /// Never sent to a link below proto 13.
     pub(super) fn tell_message_events(&mut self, only: Option<&NodeId>) {
+        // ADR 0093 Amendment 5: the node tells its peers once, from shard 0.
+        if !self.peer_face() {
+            return;
+        }
         let wanted = self.events.wants.any();
         // A new link: it has heard nothing, and "no" is its default.
         if let Some(node) = only {
@@ -191,19 +195,35 @@ impl Hub {
         }
     }
 
-    /// A peer said whether it wants origins.
+    /// A peer said whether it wants origins: recorded here and by every other shard
+    /// (ADR 0093 Amendment 5), which stamp what they forward to it.
     pub(super) fn remote_message_events(&mut self, node: &NodeId, wanted: bool) {
+        if self.note_wants_origin(node, wanted) {
+            self.tell_shards(|| super::PeerView::MessageEvents {
+                node: node.clone(),
+                wanted,
+            });
+            self.recompute_peers_want_origin();
+        }
+    }
+
+    /// Record whether `node` wants origins on its link; `false` when it has none.
+    pub(super) fn note_wants_origin(&mut self, node: &NodeId, wanted: bool) -> bool {
         let Some(peer) = self.peers.get_mut(node) else {
-            return;
+            return false;
         };
         debug!(peer = %node.0, wanted, "peer's rules select a message event: {wanted}");
         peer.wants_origin = wanted && peer.proto >= PROTO_MESSAGE_ORIGIN;
-        self.recompute_peers_want_origin();
+        true
     }
 
     /// Tell the rule engine whether any linked peer wants origins, so every publish on
     /// this node is — or is no longer — stamped with one for them.
     pub(super) fn recompute_peers_want_origin(&mut self) {
+        // ADR 0093 Amendment 5: a node-wide flag, from shard 0's view.
+        if !self.peer_face() {
+            return;
+        }
         if let Some(rules) = &self.rules {
             rules.set_peers_want_origin(self.peers.values().any(|p| p.wants_origin));
         }
@@ -334,6 +354,14 @@ impl Hub {
             },
             None => note,
         };
+        // ADR 0093 Amendment 5: shard 0 started the node's notes task; another shard
+        // raises its notes there too.
+        if self.events.notes.is_none() {
+            self.events.notes = self
+                .rules
+                .as_ref()
+                .and_then(crate::rules::Rules::node_notes);
+        }
         let Some(notes) = &self.events.notes else {
             return;
         };

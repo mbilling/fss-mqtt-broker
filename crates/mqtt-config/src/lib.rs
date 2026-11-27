@@ -81,14 +81,12 @@ pub struct Node {
     /// CPU: for a core of the hub's own, keep the rest of the process off it too (a
     /// `taskset`, a cpuset). Ignored with `hub_thread = false`. Restart-scoped.
     pub hub_core: Option<u32>,
-    /// How many hub loops ("data shards") the node runs (`MQTTD_HUB_SHARDS`, ADR 0092 T5's
-    /// prototype): each owns the clients of disjoint placement groups, and a publish
-    /// matched on one shard is handed to the others for the subscribers they own. Default
-    /// `1`, the one loop; `2` to `8` (ADR 0093 Amendment 3; `4` before it) is the one-node
-    /// prototype, refused on a node that
-    /// names peers (`cluster.peers`, `cluster.swim.seeds`) and run with a warning on a
-    /// node alone in its cluster. With `hub_thread = true`, shard `k` is pinned to
-    /// `hub_core + k`. Restart-scoped.
+    /// How many hub loops ("data shards") the node runs (`MQTTD_HUB_SHARDS`, ADR 0093):
+    /// each owns the clients of disjoint placement groups, and a publish matched on one
+    /// shard is handed to the others for the subscribers they own. Default `1`, the one
+    /// loop; `2` to `8` (ADR 0093 Amendment 3), on a node alone or with peers (Amendment
+    /// 5). With `hub_thread = true`, shard `k` is pinned to `hub_core + k`.
+    /// Restart-scoped.
     pub hub_shards: u8,
     /// ADR 0093 D4: how a shard wakes another for a batch of hand-offs
     /// (`MQTTD_HUB_HANDOFF_WAKE`). `"local"` (the default): the batch goes on the other

@@ -109,6 +109,25 @@ pub(super) struct SharedPlan {
 /// or duplicated delivery. That is what makes hashing acceptable here. The owned
 /// key is kept beside the cursor and compared on read, so a collision degrades
 /// two groups' rotation rather than silently merging them.
+/// Whether a group's `members` include anybody besides `gone_member` of `gone_from` — a
+/// member of this node's, on another shard, when `gone_here` (ADR 0093 Amendment 5),
+/// listed without a node.
+fn group_has_others(
+    members: &[SharedCandidate],
+    gone_from: &NodeId,
+    gone_here: bool,
+    gone_member: &ClientId,
+) -> bool {
+    members.iter().any(|c| {
+        let on_gone_node = if gone_here {
+            c.node.is_none()
+        } else {
+            c.node.as_ref() == Some(gone_from)
+        };
+        !(on_gone_node && c.client == *gone_member)
+    })
+}
+
 pub(super) fn shared_cursor_hash(group: &str, filter: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -297,6 +316,8 @@ impl Hub {
         // refused publish receives nothing, because the publisher still owns the message
         // and is expected to retry it (there is no way to say "delivered to two of your
         // three subscribers" on one PUBACK).
+        // ADR 0093 Amendment 4: the other shards' clients as each last published them.
+        self.refresh_foreign_routing();
         let (targets, foreign) = self.ordinary_targets(topic, publisher, retain);
         let matched = targets.len() + foreign.len();
         if gate.answerable() {
@@ -325,7 +346,9 @@ impl Hub {
                 // The absolute deadline persists with the copy (issue #227).
                 expires_at: message_expiry.map(|s| self.clock.now_epoch_secs() + u64::from(s)),
             };
-            self.retained_may_expire |= message.expires_at.is_some();
+            if message.expires_at.is_some() {
+                self.note_retained_may_expire();
+            }
             // Boxed: the retained store's write future is the rare path's, and it must
             // not size every publish's future (ADR 0092 T3).
             if let Err(e) = Box::pin(self.retained.set(&message)).await {
@@ -421,8 +444,9 @@ impl Hub {
 
     /// The ordinary (non-shared) local recipients of `topic` and each one's delivery
     /// terms: `(client, granted QoS, wire retain flag)` — and, second, the matched
-    /// subscribers other shards of this node own (ADR 0092 T5), whose terms are their
-    /// shard's to compute.
+    /// subscribers other shards of this node own, whose terms are their shard's to
+    /// compute. This shard's table holds only its own clients; the others come from the
+    /// routing each other shard last published (ADR 0093 Amendment 4).
     ///
     /// Pure and I/O-free, so it can be computed in the PLAN pass — before any side
     /// effect — and handed to the COMMIT pass unchanged (issue #238).
@@ -433,15 +457,15 @@ impl Hub {
         source_retain: bool,
     ) -> (Vec<(ClientId, QoS, bool)>, Vec<ClientId>) {
         let mut foreign = Vec::new();
+        for (_, partition) in self.foreign_partitions() {
+            // An empty table answers without walking anything.
+            foreign.extend(partition.table.matching_clients(topic));
+        }
         let own = self
             .table
             .matching_clients(topic)
             .into_iter()
             .filter_map(|c| {
-                if !self.owns(&c) {
-                    foreign.push(c);
-                    return None;
-                }
                 let terms = self.delivery_terms(&c, topic);
                 // No Local suppresses only the publisher's own copy (#198).
                 if publisher == Some(&c) && terms.no_local {
@@ -834,6 +858,8 @@ impl Hub {
         live_only: bool,
     ) -> (DurableOutcome, bool) {
         let answerable = gate.is_some();
+        // ADR 0093 Amendment 4: the other shards' members as each last published them.
+        self.refresh_foreign_routing();
         // A live-only message (the broker's `$SYS`, ADR 0084) reaches an offline member
         // nowhere: not here, and not on a peer, which treats a forwarded `$SYS` message
         // the same way.
@@ -908,6 +934,8 @@ impl Hub {
                         self.hand_off(super::shards::ShardTarget::Shared {
                             client: chosen.client,
                             qos: delivered_qos,
+                            key_hash,
+                            tried: Vec::new(),
                         });
                         continue;
                     }
@@ -1020,7 +1048,13 @@ impl Hub {
         obligation: ForwardObligation,
         why: Reselect,
     ) {
+        // ADR 0093 Amendment 4: the other shards' members as each last published them,
+        // as a deal made now would read them.
+        self.refresh_foreign_routing();
         let gone_from = obligation.node;
+        // A member of this node's, on another shard (ADR 0093 Amendment 5), is listed
+        // without a node.
+        let gone_here = gone_from == self.node_id;
         let ForwardKind::Shared {
             key,
             client: gone_member,
@@ -1053,9 +1087,7 @@ impl Hub {
             // Whether the group has anybody besides the member that went. (That
             // member can still be listed: its node's refusal arrives before the
             // membership snapshot that drops it.)
-            let others = members
-                .iter()
-                .any(|c| !(c.node.as_ref() == Some(&gone_from) && c.client == gone_member));
+            let others = group_has_others(&members, &gone_from, gone_here, &gone_member);
             let candidates: Vec<SharedCandidate> = members
                 .into_iter()
                 .filter(|c| !tried.iter().any(|(n, cl)| *n == c.node && *cl == c.client))
@@ -1088,15 +1120,17 @@ impl Hub {
             let delivered_qos = min_qos(qos, chosen.qos);
             tried.push((chosen.node.clone(), chosen.client.clone()));
             let Some(node) = chosen.node.clone() else {
-                let out = self.deliver_to_client(
+                let out = self.deliver_to_shared_member(
+                    id,
+                    shared_cursor_hash(&key.0, &key.1),
+                    &tried,
                     &chosen.client,
+                    delivered_qos,
                     &topic,
                     &payload,
-                    delivered_qos,
+                    qos,
                     message_expiry,
                     &app,
-                    false,
-                    &AppendGate::Pending(id),
                 );
                 match out {
                     // `Ok` = the append is SUBMITTED (issue #242): the obligation is
@@ -1230,6 +1264,7 @@ impl Hub {
         key: &SharedKey,
         tried: &[(Option<NodeId>, ClientId)],
     ) {
+        self.refresh_foreign_routing();
         let Some(p) = self.pending_publishes.get(id) else {
             return;
         };
@@ -1282,6 +1317,24 @@ impl Hub {
                     ));
                 }
             }
+            // ADR 0093 Amendment 4: a member another shard owns takes it there.
+            None if !self.owns(&member.client) => {
+                self.hand_off(super::shards::ShardTarget::Shared {
+                    client: member.client.clone(),
+                    qos: delivered_qos,
+                    key_hash: shared_cursor_hash(&key.0, &key.1),
+                    tried: Vec::new(),
+                });
+                self.flush_handoffs(
+                    &topic,
+                    &payload,
+                    qos,
+                    false,
+                    message_expiry,
+                    &app,
+                    &AppendGate::None,
+                );
+            }
             None => {
                 let _ = self.deliver_to_client(
                     &member.client,
@@ -1320,8 +1373,9 @@ impl Hub {
     }
 
     /// The shared groups matching `topic`, each with its global candidate list:
-    /// local members (`node` = None) first, then each peer's members in node-id
-    /// order, so the round-robin cursor is stable (ADR 0015 §2).
+    /// local members (`node` = None) first — this shard's, then the online members other
+    /// shards own, in shard order (ADR 0093 Amendment 4) — then each peer's members in
+    /// node-id order, so the round-robin cursor is stable (ADR 0015 §2).
     pub(super) fn shared_candidates(&self, topic: &str) -> Vec<SharedMatch> {
         let mut by_key: BTreeMap<SharedKey, Vec<SharedCandidate>> = BTreeMap::new();
         // Borrow each matching group's members (ADR 0010 T8): clone only what we keep — the
@@ -1341,6 +1395,23 @@ impl Hub {
                     });
                 }
             });
+        // ADR 0093 Amendment 4: the online members other shards own, as `plan_shared`'s
+        // `foreign_shared_candidates` lists them.
+        for (_, partition) in self.foreign_partitions() {
+            for (group, filter, members) in partition.shared.matching_refs(topic) {
+                let entry = by_key
+                    .entry((group.to_string(), filter.to_string()))
+                    .or_default();
+                for (client, qos) in members.iter().take(members.online_count()) {
+                    entry.push(SharedCandidate {
+                        node: None,
+                        client: client.clone(),
+                        qos: *qos,
+                        online: true,
+                    });
+                }
+            }
+        }
         // Via the same index and the same sorted-node order `plan_shared` uses.
         // This is the cold reselect path, not the per-publish one, but the two
         // representations must produce IDENTICALLY ORDERED candidate lists —
@@ -1475,7 +1546,7 @@ impl Hub {
         // is the exact table that pass reads (`by_filter.get(filter)` returns `None`
         // for every filter when it is empty, and the closure returns immediately),
         // so this cannot fork the definition of "which groups exist elsewhere".
-        let track_decided = !self.remote_by_filter.is_empty();
+        let track_decided = !self.remote_by_filter.is_empty() || !self.foreign_routing.is_empty();
         #[cfg(test)]
         if track_decided {
             self.probe
@@ -1500,23 +1571,16 @@ impl Hub {
                 continue;
             }
             let entry = by_key.entry((group, filter)).or_default();
-            let online_prefix = members.online_count();
-            for (i, (client, qos)) in members.iter().enumerate() {
+            for (client, qos) in members.iter() {
                 entry.push(SharedCandidateRef {
                     node: None,
                     client,
                     qos: *qos,
-                    // ADR 0092 T5: a member another shard owns is online as its shard
-                    // last mirrored it (the group's online prefix); one of ours, as
-                    // this shard holds it.
-                    online: if self.owns(client) {
-                        self.online.contains_key(client)
-                    } else {
-                        i < online_prefix
-                    },
+                    online: self.online.contains_key(client),
                 });
             }
         }
+        self.foreign_shared_candidates(topic, &decided, &mut by_key);
         // Peers, via the derived index rather than a scan of every peer's every
         // group. `remote_by_filter` was built in sorted node order, so the
         // candidate list is stable per publish — the property the old
@@ -1595,6 +1659,79 @@ impl Hub {
                 }),
         );
         plans
+    }
+
+    /// ADR 0093 Amendment 4: [`plan_shared`](Self::plan_shared)'s candidates among the
+    /// members other shards own: the online ones, as each shard last published them (a
+    /// group's online prefix), in shard order. They are candidates only for a group that
+    /// no online member of this shard has taken (`decided`), so the deal stays on this
+    /// shard when it can (Amendment 1); with locality off they join this shard's own in one
+    /// rotation. Another shard's offline member is no candidate at all (D5): its session
+    /// and its queue are that shard's. [`shared_candidates`](Self::shared_candidates)
+    /// lists the same members in the same order.
+    fn foreign_shared_candidates<'a>(
+        &'a self,
+        topic: &'a str,
+        decided: &[(&'a str, &'a str)],
+        by_key: &mut BTreeMap<(&'a str, &'a str), Vec<SharedCandidateRef<'a>>>,
+    ) {
+        for (_, partition) in self.foreign_partitions() {
+            for (group, filter, members) in partition.shared.matching_refs(topic) {
+                if decided.iter().any(|&(g, f)| g == group && f == filter) {
+                    continue;
+                }
+                let entry = by_key.entry((group, filter)).or_default();
+                for (client, qos) in members.iter().take(members.online_count()) {
+                    entry.push(SharedCandidateRef {
+                        node: None,
+                        client,
+                        qos: *qos,
+                        online: true,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Pending publish `id`'s re-selected delivery to `$share` member `client` at
+    /// `delivered_qos`: on this shard when it owns the member, else handed to the shard that
+    /// does (ADR 0093 Amendment 4), the entry waiting for that shard's answer as it waits
+    /// for a deal's, and `Ok` then.
+    #[allow(clippy::too_many_arguments)] // the publish's fields
+    fn deliver_to_shared_member(
+        &mut self,
+        id: u64,
+        key_hash: u64,
+        tried: &[(Option<NodeId>, ClientId)],
+        client: &ClientId,
+        delivered_qos: QoS,
+        topic: &str,
+        payload: &Bytes,
+        qos: QoS,
+        message_expiry: Option<u32>,
+        app: &AppProperties,
+    ) -> DurableOutcome {
+        let gate = AppendGate::Pending(id);
+        if self.owns(client) {
+            return self.deliver_to_client(
+                client,
+                topic,
+                payload,
+                delivered_qos,
+                message_expiry,
+                app,
+                false,
+                &gate,
+            );
+        }
+        self.hand_off(super::shards::ShardTarget::Shared {
+            client: client.clone(),
+            qos: delivered_qos,
+            key_hash,
+            tried: tried.to_vec(),
+        });
+        self.flush_handoffs(topic, payload, qos, false, message_expiry, app, &gate);
+        DurableOutcome::Ok
     }
 
     /// Round-robin one member for a shared group, advancing the per-group cursor.

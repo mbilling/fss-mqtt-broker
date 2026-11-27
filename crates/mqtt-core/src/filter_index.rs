@@ -178,6 +178,107 @@ pub struct FilterIndex {
     root: TrieNode,
 }
 
+impl Clone for FilterIndex {
+    /// A node-for-node copy (ADR 0093 Amendment 4: a hub shard publishes copies of its
+    /// tables). Iterative, because a node's depth is a client's filter length and a
+    /// derived clone would recurse once per level: each node is assembled once its
+    /// children are, bottom-up, with each literal map sized for its children up front.
+    /// The copy shares each filter's allocation with this one.
+    fn clone(&self) -> Self {
+        Self {
+            root: copy_trie(&self.root),
+        }
+    }
+}
+
+/// Which child of a node a copy is being made for.
+enum Slot<'a> {
+    Literal(&'a String),
+    Plus,
+    Hash,
+}
+
+/// One node of [`copy_trie`]'s walk: its source, the children copied so far, and the
+/// literal children still to copy.
+struct Frame<'a> {
+    source: &'a TrieNode,
+    literals: std::collections::hash_map::Iter<'a, String, TrieNode>,
+    children: crate::FastMap<String, TrieNode>,
+    plus: Option<Box<TrieNode>>,
+    hash: Option<Box<TrieNode>>,
+    /// The next wildcard child to copy once the literals are done: 0 `+`, 1 `#`, 2 none.
+    wildcard: u8,
+    /// The child being copied now, filled in when its frame is popped.
+    slot: Option<Slot<'a>>,
+}
+
+impl<'a> Frame<'a> {
+    fn new(source: &'a TrieNode) -> Self {
+        Self {
+            source,
+            literals: source.children.iter(),
+            children: crate::FastMap::with_capacity_and_hasher(
+                source.children.len(),
+                source.children.hasher().clone(),
+            ),
+            plus: None,
+            hash: None,
+            wildcard: 0,
+            slot: None,
+        }
+    }
+
+    /// The next child to copy and the slot it fills, or `None` when every child is done.
+    fn next_child(&mut self) -> Option<(&'a TrieNode, Slot<'a>)> {
+        if let Some((level, child)) = self.literals.next() {
+            return Some((child, Slot::Literal(level)));
+        }
+        while self.wildcard < 2 {
+            self.wildcard += 1;
+            let (child, slot) = if self.wildcard == 1 {
+                (self.source.plus.as_deref(), Slot::Plus)
+            } else {
+                (self.source.hash.as_deref(), Slot::Hash)
+            };
+            if let Some(child) = child {
+                return Some((child, slot));
+            }
+        }
+        None
+    }
+}
+
+/// Copy the subtree under `root` without recursion.
+fn copy_trie(root: &TrieNode) -> TrieNode {
+    let mut stack: Vec<Frame<'_>> = vec![Frame::new(root)];
+    loop {
+        let top = stack.last_mut().expect("the root's frame is popped last");
+        if let Some((child, slot)) = top.next_child() {
+            top.slot = Some(slot);
+            stack.push(Frame::new(child));
+            continue;
+        }
+        let done = stack.pop().expect("a frame is on the stack");
+        let node = TrieNode {
+            children: done.children,
+            plus: done.plus,
+            hash: done.hash,
+            terminal: done.source.terminal.clone(),
+        };
+        let Some(parent) = stack.last_mut() else {
+            return node;
+        };
+        match parent.slot.take() {
+            Some(Slot::Literal(level)) => {
+                parent.children.insert(level.clone(), node);
+            }
+            Some(Slot::Plus) => parent.plus = Some(Box::new(node)),
+            Some(Slot::Hash) => parent.hash = Some(Box::new(node)),
+            None => unreachable!("a child frame is pushed only with its slot set"),
+        }
+    }
+}
+
 impl FilterIndex {
     /// An empty index.
     #[must_use]
@@ -314,6 +415,36 @@ mod tests {
         index.insert(&key(&deep));
         assert_eq!(matches(&index, &vec!["x"; 50_000].join("/")).len(), 1);
         drop(index);
+    }
+
+    /// A copy matches every topic as the original does, and the two change
+    /// independently afterwards.
+    #[test]
+    fn a_copy_matches_as_the_original_and_changes_on_its_own() {
+        let mut index = FilterIndex::new();
+        for f in ["a/b", "a/+", "a/#", "+/b/#", "#", "$SYS/x", "a/b/c/d"] {
+            index.insert(&key(f));
+        }
+        let copy = index.clone();
+        for topic in ["a/b", "a/c", "a", "x/b/y", "$SYS/x", "a/b/c/d", "z"] {
+            assert_eq!(matches(&copy, topic), matches(&index, topic), "{topic}");
+        }
+        index.remove("a/+");
+        assert_eq!(matches(&copy, "a/c"), ["#", "a/#", "a/+"]);
+        assert_eq!(matches(&index, "a/c"), ["#", "a/#"]);
+    }
+
+    /// A filter as deep as a client may send is copied without recursion.
+    #[test]
+    fn a_deep_filter_is_copied_without_recursion() {
+        let mut index = FilterIndex::new();
+        let deep = vec!["l"; 100_000].join("/");
+        index.insert(&key(&deep));
+        index.insert(&key(&vec!["+"; 50_000].join("/")));
+        let copy = index.clone();
+        assert_eq!(matches(&copy, &deep).len(), 1);
+        drop(index);
+        drop(copy);
     }
 
     /// One node's size is paid per registered topic level; the keyed hasher's state and

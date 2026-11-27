@@ -376,8 +376,9 @@ fn each_shard_runs_its_periodic_scan_at_its_own_phase() {
             .map(|_| Hub::with_config(NodeId("k".into()), store.clone()).0)
             .collect();
         let txs: Vec<_> = hubs.iter().map(Hub::sender).collect();
+        let board = crate::hub::RoutingBoard::new(usize::from(shards));
         for (k, hub) in hubs.iter_mut().enumerate() {
-            hub.set_shards(u8::try_from(k).unwrap(), txs.clone());
+            hub.set_shards(u8::try_from(k).unwrap(), txs.clone(), &board);
         }
         let phases: Vec<u32> = hubs.iter().map(Hub::periodic_scan_phase).collect();
         let expected: Vec<u32> = (0..u32::from(shards))

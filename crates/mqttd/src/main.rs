@@ -2514,6 +2514,9 @@ async fn start_hub(
             Some(dir) => Some(persistent_retained(dir)?), // ADR 0018 phase 4
             None => None,
         };
+        // ADR 0093 Amendment 5: one retained cache for the node's shards, in memory when
+        // there is no data dir.
+        let shared_retained = shared_memory_retained(config, retained_handle.as_ref());
         let members = config.durable.ownership_domain == OwnershipDomain::Members;
         let hub_tx = start_shards(
             config,
@@ -2538,7 +2541,7 @@ async fn start_hub(
                 // topic's group lease-owner, so retained state converges instead of
                 // diverging.
                 hub.attach_durable_retained(durable_retained.clone());
-                if let Some(retained) = &retained_handle {
+                if let Some(retained) = retained_handle.as_ref().or(shared_retained.as_ref()) {
                     hub.attach_retained_store(retained.clone());
                 }
             },
@@ -2591,6 +2594,7 @@ async fn start_hub(
         let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::with_limits(
             queue_limits_from_config(config)?,
         ));
+        let shared_retained = shared_memory_retained(config, None);
         let hub_tx = start_shards(
             config,
             cluster_configured,
@@ -2606,7 +2610,11 @@ async fn start_hub(
                 )
                 .0
             },
-            |_| {},
+            |hub| {
+                if let Some(retained) = &shared_retained {
+                    hub.attach_retained_store(retained.clone());
+                }
+            },
         )?;
         Ok((hub_tx, store, None, None, None))
     }
@@ -2889,6 +2897,18 @@ impl mqttd::backup::RetainedSource for HubRetainedSource {
             .map(|(message, token)| mqttd::backup::RetainedSnapshotEntry { message, token })
             .collect())
     }
+}
+
+/// One in-memory retained store for the node's shards when there is more than one and
+/// no other store (ADR 0093 Amendment 5): a subscriber on one shard replays what was
+/// retained through another. `None` with one shard, which keeps its own, as it always
+/// has, or with a store already given.
+fn shared_memory_retained(
+    config: &Config,
+    given: Option<&Arc<dyn RetainedStore>>,
+) -> Option<Arc<dyn RetainedStore>> {
+    (config.node.hub_shards > 1 && given.is_none())
+        .then(|| Arc::new(mqtt_storage::MemoryRetainedStore::new()) as Arc<dyn RetainedStore>)
 }
 
 /// Build the on-disk retained-message store at `<dir>/retained.redb` (ADR 0018 phase 4),
@@ -3375,10 +3395,9 @@ fn place_hub(
 }
 
 /// Build the node's hub loops — one, or `node.hub_shards` data shards behind one
-/// sender (ADR 0092 T5) — configure each the same way, wire and place them. The
-/// prototype is for one node: a node that names peers is refused more than one shard,
-/// so a peer's forward is never answered by a loop that owns half the sessions; a node
-/// alone in its cluster (the rig's one-node bootstrap) runs them with a warning.
+/// sender (ADR 0092 T5) — configure each the same way, wire and place them. A node with
+/// peers runs them too (ADR 0093 Amendment 5): shard 0 is its face to the peers, and
+/// tells the others what changed.
 #[allow(clippy::too_many_arguments)] // the three construction arms' shared wiring
 fn start_shards(
     config: &Config,
@@ -3397,21 +3416,6 @@ fn start_shards(
             hub::MAX_SHARDS
         )
         .into());
-    }
-    let peers_named = !config.cluster.peers.is_empty() || !config.cluster.swim.seeds.is_empty();
-    if shards > 1 && peers_named {
-        return Err(format!(
-            "node.hub_shards = {shards} on a node that names peers: the sharded hub is the \
-             one-node prototype of ADR 0092 T5; a node with peers runs one hub loop"
-        )
-        .into());
-    }
-    if shards > 1 && cluster_configured {
-        tracing::warn!(
-            shards,
-            "the sharded hub is ADR 0092 T5's one-node prototype: a member that joins this \
-             node is served by its first shard alone"
-        );
     }
     // ADR 0093 D4: how a shard wakes another for a batch of hand-offs.
     let remote_wake = match config.node.hub_handoff_wake.as_str() {
@@ -3432,8 +3436,14 @@ fn start_shards(
     });
     let mut hubs: Vec<hub::Hub> = (0..shards).map(|_| make()).collect();
     let txs: Vec<_> = hubs.iter().map(hub::Hub::sender).collect();
+    // ADR 0093 Amendment 4: where each shard publishes its clients' routing.
+    let board = hub::RoutingBoard::new(shards);
     for (k, hub) in hubs.iter_mut().enumerate() {
-        hub.set_shards(u8::try_from(k).expect("at most MAX_SHARDS"), txs.clone());
+        hub.set_shards(
+            u8::try_from(k).expect("at most MAX_SHARDS"),
+            txs.clone(),
+            &board,
+        );
         hub.set_handoff_inflight_cap(config.node.hub_handoff_inflight);
         hub.set_hub_yield_deep(config.node.hub_yield_deep);
         if let Some((boxes, mailman)) = &mailboxes {
@@ -3460,9 +3470,10 @@ fn start_shards(
             shards,
             handoff_wake = %config.node.hub_handoff_wake,
             yield_deep = config.node.hub_yield_deep,
-            "hub shards (ADR 0092 T5 prototype, ADR 0093 D3): each owns the clients of its \
-             placement groups; a publish matched on one is handed to the others for theirs, \
-             once per dispatch batch, carrying its ingress credit"
+            "hub shards (ADR 0093): each owns the clients of its placement groups; a publish \
+             matched on one is handed to the others for theirs, once per dispatch batch, \
+             carrying its ingress credit; with peers, shard 0 speaks for the node \
+             (Amendment 5)"
         );
     }
     Ok(hub::HubTx::sharded(txs))

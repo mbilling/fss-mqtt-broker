@@ -47,7 +47,7 @@ impl Rig {
         let (tx, to_receiver) = mpsc::unbounded_channel();
         let (ctl, _) = mpsc::unbounded_channel();
         sender.peer_connected(
-            target(),
+            &target(),
             1,
             tx,
             ctl,
