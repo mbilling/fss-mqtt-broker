@@ -74,6 +74,19 @@ fn non_empty(req: &Request, name: &str) -> Option<String> {
     req.param(name).filter(|v| !v.is_empty()).map(String::from)
 }
 
+/// Ask every shard of the hub, in turn, and gather their answers (ADR 0093
+/// Amendment 5): each holds its own clients. One answer with one shard.
+async fn ask_all<T>(
+    hub: &HubTx,
+    build: impl Fn(oneshot::Sender<T>) -> AdminRequest,
+) -> Result<Vec<T>, Answer> {
+    let mut answers = Vec::with_capacity(hub.shards());
+    for shard in 0..hub.shards() {
+        answers.push(ask(&hub.shard(shard), &build).await?);
+    }
+    Ok(answers)
+}
+
 /// Send a request to the hub and wait for its answer.
 async fn ask<T>(
     hub: &HubTx,
@@ -113,15 +126,15 @@ pub async fn clients(state: &AdminState, req: &Request) -> Answer {
         source: non_empty(req, "source"),
     };
     let after = non_empty(req, "cursor");
-    match ask(&access.hub, |reply| AdminRequest::Sessions {
-        filter,
-        after,
+    match ask_all(&access.hub, |reply| AdminRequest::Sessions {
+        filter: filter.clone(),
+        after: after.clone(),
         limit,
         reply,
     })
     .await
     {
-        Ok(page) => to_json(&page),
+        Ok(pages) => to_json(&crate::hub::admin::merge_session_pages(pages, limit)),
         Err(e) => e,
     }
 }
@@ -141,7 +154,9 @@ pub async fn session(state: &AdminState, req: &Request) -> Answer {
             .owner(&client)
             .0
     });
-    let detail = match ask(&access.hub, |reply| AdminRequest::Session {
+    // The shard that owns the client holds its session (ADR 0093 Amendment 5).
+    let hub = access.hub.pin(&ClientId(client.as_str().into()));
+    let detail = match ask(&hub, |reply| AdminRequest::Session {
         client: client.clone(),
         reply,
     })
@@ -209,14 +224,14 @@ pub async fn subscribers(state: &AdminState, req: &Request) -> Answer {
         Ok(n) => n,
         Err(e) => return e,
     };
-    match ask(&access.hub, |reply| AdminRequest::Subscribers {
-        topic,
+    match ask_all(&access.hub, |reply| AdminRequest::Subscribers {
+        topic: topic.clone(),
         limit,
         reply,
     })
     .await
     {
-        Ok(list) => to_json(&list),
+        Ok(lists) => to_json(&crate::hub::admin::merge_subscriber_lists(lists, limit)),
         Err(e) => e,
     }
 }
@@ -231,8 +246,8 @@ pub async fn backlog(state: &AdminState, req: &Request) -> Answer {
         Ok(n) => n,
         Err(e) => return e,
     };
-    match ask(&access.hub, |reply| AdminRequest::Backlog { top, reply }).await {
-        Ok(list) => to_json(&json!({ "sessions": list })),
+    match ask_all(&access.hub, |reply| AdminRequest::Backlog { top, reply }).await {
+        Ok(lists) => to_json(&json!({ "sessions": crate::hub::admin::merge_backlogs(lists, top) })),
         Err(e) => e,
     }
 }

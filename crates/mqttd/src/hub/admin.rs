@@ -229,6 +229,74 @@ pub struct SubscriberList {
     pub truncated: bool,
 }
 
+/// One page of sessions from the pages a node's shards gave for the same request
+/// (ADR 0093 Amendment 5): each shard lists its own clients, the smallest after the same
+/// cursor, so the node's page is the smallest `limit` of their union.
+#[must_use]
+pub fn merge_session_pages(pages: Vec<SessionPage>, limit: usize) -> SessionPage {
+    let mut more = false;
+    let mut matched = 0;
+    let mut sessions = Vec::new();
+    for page in pages {
+        more |= page.next_cursor.is_some();
+        matched += page.matched;
+        sessions.extend(page.sessions);
+    }
+    sessions.sort_by(|a, b| a.client_id.cmp(&b.client_id));
+    more |= sessions.len() > limit;
+    sessions.truncate(limit);
+    let next_cursor = if more {
+        sessions.last().map(|s| s.client_id.clone())
+    } else {
+        None
+    };
+    SessionPage {
+        sessions,
+        next_cursor,
+        matched,
+    }
+}
+
+/// One list of subscribers from a node's shards' lists for the same topic (ADR 0093
+/// Amendment 5), by client id then filter, at most `limit`.
+#[must_use]
+pub fn merge_subscriber_lists(lists: Vec<SubscriberList>, limit: usize) -> SubscriberList {
+    let mut topic = String::new();
+    let mut truncated = false;
+    let mut subscribers = Vec::new();
+    for list in lists {
+        topic = list.topic;
+        truncated |= list.truncated;
+        subscribers.extend(list.subscribers);
+    }
+    subscribers.sort_by(|a, b| {
+        a.client_id
+            .cmp(&b.client_id)
+            .then_with(|| a.filter.cmp(&b.filter))
+    });
+    truncated |= subscribers.len() > limit;
+    subscribers.truncate(limit);
+    SubscriberList {
+        topic,
+        subscribers,
+        truncated,
+    }
+}
+
+/// The node's `top` sessions with the most messages waiting, from its shards' (ADR 0093
+/// Amendment 5): largest first, ties by client id, as one shard ranks them.
+#[must_use]
+pub fn merge_backlogs(lists: Vec<Vec<SessionSummary>>, top: usize) -> Vec<SessionSummary> {
+    let mut all: Vec<SessionSummary> = lists.into_iter().flatten().collect();
+    all.sort_by(|a, b| {
+        (b.inflight + b.backlog)
+            .cmp(&(a.inflight + a.backlog))
+            .then_with(|| a.client_id.cmp(&b.client_id))
+    });
+    all.truncate(top.clamp(1, MAX_LIMIT));
+    all
+}
+
 fn qos(q: mqtt_codec::QoS) -> u8 {
     q as u8
 }
@@ -566,5 +634,114 @@ impl Hub {
             .into_iter()
             .map(|(_, c)| self.admin_summary(c))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    fn summary(client: &str, waiting: usize) -> SessionSummary {
+        SessionSummary {
+            client_id: client.to_string(),
+            connected: false,
+            user: None,
+            auth: None,
+            protocol: None,
+            source: None,
+            connected_secs: None,
+            persistent: true,
+            expiry_secs: None,
+            expires_at: None,
+            subscriptions: 0,
+            inflight: waiting,
+            backlog: 0,
+            backlog_bytes: 0,
+        }
+    }
+
+    /// The page one shard of two gives for `limit` after `after`: its own clients.
+    fn page(own: &[&str], after: Option<&str>, limit: usize) -> SessionPage {
+        let listed: Vec<&str> = own
+            .iter()
+            .copied()
+            .filter(|c| after.is_none_or(|a| *c > a))
+            .collect();
+        let more = listed.len() > limit;
+        let sessions: Vec<SessionSummary> =
+            listed.iter().take(limit).map(|c| summary(c, 0)).collect();
+        SessionPage {
+            next_cursor: more
+                .then(|| sessions.last().map(|s| s.client_id.clone()))
+                .flatten(),
+            sessions,
+            matched: own.len(),
+        }
+    }
+
+    /// ADR 0093 Amendment 5: a node's pages, merged from its shards', list every session
+    /// once, in order, and count them all.
+    #[test]
+    fn merged_pages_list_every_shards_sessions_once_in_order() {
+        let a = ["c1", "c3"];
+        let b = ["c2", "c4", "c5"];
+        let mut after: Option<String> = None;
+        let mut listed = Vec::new();
+        loop {
+            let merged = merge_session_pages(
+                vec![page(&a, after.as_deref(), 2), page(&b, after.as_deref(), 2)],
+                2,
+            );
+            assert_eq!(merged.matched, 5);
+            listed.extend(merged.sessions.iter().map(|s| s.client_id.clone()));
+            match merged.next_cursor {
+                Some(c) => after = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(listed, ["c1", "c2", "c3", "c4", "c5"]);
+    }
+
+    /// Subscribers by client then filter, and the largest backlogs first, across shards.
+    #[test]
+    fn merged_subscribers_and_backlogs_rank_as_one_shard_does() {
+        let row = |c: &str, f: &str| SubscriberView {
+            client_id: c.to_string(),
+            filter: f.to_string(),
+            qos: 1,
+            shared_group: None,
+            connected: true,
+        };
+        let merged = merge_subscriber_lists(
+            vec![
+                SubscriberList {
+                    topic: "t".into(),
+                    subscribers: vec![row("b", "t")],
+                    truncated: false,
+                },
+                SubscriberList {
+                    topic: "t".into(),
+                    subscribers: vec![row("a", "t"), row("a", "#")],
+                    truncated: false,
+                },
+            ],
+            2,
+        );
+        let rows: Vec<(&str, &str)> = merged
+            .subscribers
+            .iter()
+            .map(|r| (r.client_id.as_str(), r.filter.as_str()))
+            .collect();
+        assert_eq!(rows, [("a", "#"), ("a", "t")]);
+        assert!(merged.truncated, "three matched, two listed");
+        let top = merge_backlogs(
+            vec![
+                vec![summary("x", 3), summary("y", 1)],
+                vec![summary("w", 3), summary("z", 9)],
+            ],
+            3,
+        );
+        let ranked: Vec<&str> = top.iter().map(|s| s.client_id.as_str()).collect();
+        assert_eq!(ranked, ["z", "w", "x"]);
     }
 }

@@ -84,7 +84,11 @@ pub async fn act(
             reply: tx,
         },
     };
-    if access.hub.send(HubCommand::Admin(request)).is_err() {
+    // The shard that owns the client holds its connection and session (ADR 0093
+    // Amendment 5): asked elsewhere, it finds nothing — and a purge on the owner node
+    // would remove the stored session of one it serves.
+    let hub = access.hub.pin(&mqtt_core::ClientId(client.into()));
+    if hub.send(HubCommand::Admin(request)).is_err() {
         return error(503, "unavailable", "the hub is not running");
     }
     let Ok(ActionOutcome {
