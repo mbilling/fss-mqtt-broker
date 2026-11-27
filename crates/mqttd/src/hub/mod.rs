@@ -3269,7 +3269,7 @@ pub struct Hub {
     routing_published_at: Option<std::time::Instant>,
     routing_copy_cost: std::time::Duration,
     /// The answers waiting for this shard's next publication (Amendment 4).
-    after_publish: Vec<shards::AfterPublish>,
+    after_publish: Vec<shards::Waiting>,
     /// Prometheus metrics (ADR 0020), when enabled. Updated on the publish/deliver paths.
     metrics: Option<Arc<mqtt_observability::metrics::Metrics>>,
     /// The node's ingress credit (ADR 0082 T3), held only to export its gauges: the hub

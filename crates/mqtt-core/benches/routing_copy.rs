@@ -7,12 +7,16 @@
 //! a shard's routing can grow before publishing it shows in the hub's time. The node's
 //! default, one shard, never copies anything.
 //!
+//! Freeing a copy costs about half what making it did, so each shape is measured twice: the
+//! copy (`…_table/N`) and the free of one (`…_table_free/N`). The hub frees replaced
+//! copies on the board's reaper thread, off every shard's loop.
+//!
 //! Shapes:
 //! - `subscription_table/N`: N devices, each subscribed to its own command topic
 //!   (`devices/<i>/cmd`), the widest trie a fleet builds;
 //! - `shared_table/N`: N `$share` members over 100 groups of one wildcard filter.
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use mqtt_core::{ClientId, QoS, SharedSubscriptionTable, SubscriptionTable};
 
 fn devices(n: usize) -> SubscriptionTable {
@@ -47,10 +51,20 @@ fn routing_copy(c: &mut Criterion) {
             &table,
             |b, table| b.iter(|| table.clone()),
         );
+        group.bench_with_input(
+            BenchmarkId::new("subscription_table_free", n),
+            &table,
+            |b, table| b.iter_batched(|| table.clone(), drop, BatchSize::LargeInput),
+        );
         let shared = members(n);
         group.bench_with_input(BenchmarkId::new("shared_table", n), &shared, |b, shared| {
             b.iter(|| shared.clone());
         });
+        group.bench_with_input(
+            BenchmarkId::new("shared_table_free", n),
+            &shared,
+            |b, shared| b.iter_batched(|| shared.clone(), drop, BatchSize::LargeInput),
+        );
     }
     group.finish();
 }

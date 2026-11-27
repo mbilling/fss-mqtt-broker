@@ -409,6 +409,7 @@ struct OtelInstruments {
     hub_lane_depth: OtelGauge<i64>,
     hub_yields: OtelCounter<u64>,
     hub_routing_publish: OtelHistogram<f64>,
+    hub_routing_answer_wait: OtelHistogram<f64>,
     ingress_paused: OtelCounter<u64>,
     ingress_paused_seconds: OtelHistogram<f64>,
     ingress_credit_bytes: OtelGauge<i64>,
@@ -579,6 +580,9 @@ impl OtelInstruments {
             hub_lane_depth: meter.i64_gauge("hub_lane_depth").build(),
             hub_yields: meter.u64_counter("hub_yields").build(),
             hub_routing_publish: meter.f64_histogram("hub_routing_publish_seconds").build(),
+            hub_routing_answer_wait: meter
+                .f64_histogram("hub_routing_answer_wait_seconds")
+                .build(),
             ingress_paused: meter.u64_counter("ingress_paused").build(),
             ingress_paused_seconds: meter.f64_histogram("ingress_paused_seconds").build(),
             ingress_credit_bytes: meter.i64_gauge("ingress_credit_bytes").build(),
@@ -749,6 +753,9 @@ pub struct Metrics {
     /// ADR 0093 Amendment 4: each hub shard's routing publications, and what copying its
     /// routing cost each one.
     hub_routing_publish_seconds: Family<ShardLabel, Histogram>,
+    /// ADR 0093 Amendment 4: how long a SUBACK, UNSUBACK or CONNACK waited for its
+    /// shard's routing publication.
+    hub_routing_answer_wait_seconds: Family<ShardLabel, Histogram>,
     /// ADR 0082 T3: client connections that stopped reading for want of ingress
     /// credit, and for how long each pause lasted.
     ingress_paused_total: Counter,
@@ -1160,6 +1167,15 @@ impl Metrics {
              at the end of a batch in which its routing changed, at most about a tenth of \
              the loop's time under constant churn. The count is the publications. Never \
              observed with one shard",
+        );
+        let hub_routing_answer_wait_seconds = register_wide_latency_histogram_family(
+            &mut registry,
+            "hub_routing_answer_wait_seconds",
+            "Time a SUBACK, UNSUBACK or CONNACK waited for its hub shard to publish the \
+             routing change it reports to the node's other shards, per shard (`shard`, ADR \
+             0093 Amendment 4): up to a batch when the shard is busy, up to about ten copies' \
+             time (hub_routing_publish_seconds) under constant churn. Never observed with \
+             one shard",
         );
         let hub_lane_depth = register_gauge_family(
             &mut registry,
@@ -2081,6 +2097,7 @@ impl Metrics {
             hub_lane_depth,
             hub_yields_total,
             hub_routing_publish_seconds,
+            hub_routing_answer_wait_seconds,
             ingress_paused_total,
             ingress_paused_seconds,
             ingress_credit_bytes,
@@ -2507,6 +2524,20 @@ impl Metrics {
             .observe(seconds);
         self.otel
             .hub_routing_publish
+            .record(seconds, &[KeyValue::new("shard", SHARD_LABELS[s])]);
+    }
+
+    /// A SUBACK, UNSUBACK or CONNACK of hub shard `shard` waited `seconds` for the shard's
+    /// routing publication (ADR 0093 Amendment 4).
+    pub fn hub_routing_answer_waited(&self, shard: u8, seconds: f64) {
+        let s = usize::from(shard).min(HUB_SHARDS - 1);
+        self.hub_routing_answer_wait_seconds
+            .get_or_create(&ShardLabel {
+                shard: SHARD_LABELS[s].to_string(),
+            })
+            .observe(seconds);
+        self.otel
+            .hub_routing_answer_wait
             .record(seconds, &[KeyValue::new("shard", SHARD_LABELS[s])]);
     }
 

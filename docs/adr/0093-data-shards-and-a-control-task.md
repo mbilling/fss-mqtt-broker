@@ -390,11 +390,20 @@ foresee.
   the publication that preceded the answer. The SUBACK, UNSUBACK and CONNACK each wait for
   their shard's publication.
 - **What stays as it was.** The settings every shard must agree on stay broadcast, as the
-  prototype sends them. `max_sessions` now counts every shard's sessions, as each last
-  published them.
+  prototype sends them.
+- **`max_sessions` counts every shard.** Each shard adds its own sessions to the other
+  shards' as each last published them. The cap is therefore enforced eventually, not
+  exactly: shards admitting in the same publication window can each pass the check, so
+  the node can overshoot by what they admit before they publish. Before, the cap was
+  enforced per shard, `K` times the configured one.
 - **Matching.** A publish finds its ordinary subscribers on other shards in their
-  partitions. `$share` dealing takes another shard's online members only for a group with
-  no online member of its own (Amendment 1), and never another shard's offline member (D5).
+  partitions.
+- **Dealing.** `$share` dealing takes another shard's online members only for a group with
+  no online member of its own (Amendment 1). It never takes another shard's offline
+  member: those are no candidates at all (D5). The deal and the cold re-selection path list
+  the same members in the same order: this shard's, then the other shards' in shard order,
+  then each peer's. Another shard's member counts as local under `shared_prefer_local`,
+  since it is on the same node.
 - **One shard.** With one shard there is no board, nothing is published and no answer
   waits: the default path is the one loop as it was.
 
@@ -413,11 +422,21 @@ build:
 | 100,000 | 85 ms | 16.6 ms |
 
 So under constant churn a shard spaces its publications. After a copy that took `c`, the
-next waits until `9c` has passed, so copying takes at most about a tenth of the loop's time,
-and the answers wait for the next publication. A loop about to park, or a flush, publishes at
-once. `mqttd_hub_routing_publish_seconds{shard}` reports every copy. A shard of 100,000
-device subscriptions whose routing changes in every batch can make an answer wait about
-0.8 s. A publication proportional to the change rather than the table (a base copy, and the
+next waits until `9c` has passed, so copying takes at most about a tenth of the loop's time.
+A loop about to park, or a flush, publishes at once.
+
+The answers pay for that spacing: they wait for the next publication. On a busy shard that
+is at most a batch. Under constant churn it can be up to about ten copies' time: about
+50 ms at 10,000 device subscriptions a shard, and about 0.8 s at 100,000.
+`mqttd_hub_routing_publish_seconds{shard}` reports every copy, and
+`mqttd_hub_routing_answer_wait_seconds{shard}` every answer's wait.
+
+Freeing a replaced copy costs about half what making it did (43 ms at 100,000 device
+subscriptions). So a partition replaced in a cell, or in a shard's view of the others, goes
+to the board's reaper thread: it is freed outside the cell's lock and off every shard's
+loop.
+
+A publication proportional to the change rather than the table (a base copy, and the
 changes since it) is the next step, if a large fleet needs `K > 1`: task T13.
 
 **What it should buy, to be measured.** T1's acceptance is unchanged in substance. The

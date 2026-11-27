@@ -1609,7 +1609,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 ## `crates/mqttd-operator/src/main.rs` — 0 test(s)
 
 
-## `crates/mqttd/src/lib.rs` — 940 test(s)
+## `crates/mqttd/src/lib.rs` — 941 test(s)
 
 - `admin::cli::tests::a_page_of_keys_is_a_table_of_type_size_and_expiry`
 - `admin::cli::tests::a_refusal_shows_what_it_carries`
@@ -2252,6 +2252,7 @@ runs it, and `--check-results` fails if the ignored set in an actual run differs
 - `hub::tests::sharded::an_unsubscribe_is_mirrored_to_the_other_shard`
 - `hub::tests::sharded::one_shard_publishes_nothing_and_answers_at_once`
 - `hub::tests::sharded::publications_under_churn_are_spaced_by_their_copy_cost`
+- `hub::tests::sharded::reselection_lists_another_shards_online_members_as_the_deal_does`
 - `hub::tests::sharded::the_session_quota_counts_every_shard`
 - `hub::tests::share_obligations::a_drain_gated_share_delivery_behind_a_lost_link_does_not_hold_the_drain`
 - `hub::tests::share_obligations::a_drain_gated_share_delivery_with_nobody_to_hand_it_to_is_dropped_and_counted`

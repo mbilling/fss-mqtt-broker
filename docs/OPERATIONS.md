@@ -1398,13 +1398,18 @@ msg/s with its ack p99 at half a second.
   brings the loop back (ADR 0093 Amendment 3). Yields a second against commands a second
   shows which regime a loop is in.
 - **What sharing the routing costs, with `node.hub_shards` above 1:**
-  `mqttd_hub_routing_publish_seconds{shard}`. Each shard copies the routing of the clients
-  it owns to the node's other shards once at the end of a batch in which it changed
-  (ADR 0093 Amendment 4), and the count is the copies. A copy grows with the shard's
-  subscriptions, about 5 ms for 10,000 device subscriptions, so under constant churn a shard
-  spaces its copies to about a tenth of its time. A SUBACK, UNSUBACK or CONNACK waits for
-  its shard's next copy, so a large mean here is also how long those answers wait. With one
-  shard nothing is copied.
+  - **Copies:** `mqttd_hub_routing_publish_seconds{shard}`. Each shard copies the routing of
+    the clients it owns to the node's other shards at the end of a batch in which it changed
+    (ADR 0093 Amendment 4). The histogram's count is the copies.
+  - **How big they get:** a copy grows with the shard's subscriptions, about 5 ms for 10,000
+    device subscriptions. So under constant churn a shard spaces its copies, waiting about
+    nine copies' time after each, which caps copying near a tenth of its time.
+  - **Answers wait:** `mqttd_hub_routing_answer_wait_seconds{shard}`. A SUBACK, UNSUBACK or
+    CONNACK waits for its shard's next copy. On a busy shard that is at most a batch. Under
+    constant churn it can be up to about ten copies' time: about 50 ms at 10,000 device
+    subscriptions a shard, about 0.8 s at 100,000.
+  - **Freeing:** old copies are freed on the board's reaper thread, not on any shard.
+  - **One shard:** nothing is copied and nothing waits.
 
 ## Overload: bounded hub ingress (ADR 0082)
 

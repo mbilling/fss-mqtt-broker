@@ -67,7 +67,9 @@ pub struct RoutingPartition {
 /// then bumps the version. A shard about to match a publish compares the version with the
 /// one it last read and reloads the other cells only when it moved, so the common case is
 /// one atomic load. A cell is replaced, never edited: a shard reading an old partition
-/// keeps it whole until it reloads.
+/// keeps it whole until it reloads. A partition replaced in a cell or in a shard's view is
+/// handed to the board's reaper thread, so freeing it, which costs about half what copying
+/// it did, falls on no shard's loop and on no lock.
 #[derive(Debug)]
 pub struct RoutingBoard {
     cells: Box<[RwLock<Arc<RoutingPartition>>]>,
@@ -75,22 +77,44 @@ pub struct RoutingBoard {
     /// Each shard's session count as of its last publication, for the node-wide
     /// `max_sessions` quota (ADR 0041 T4).
     sessions: Box<[AtomicUsize]>,
+    reaper: std::sync::mpsc::Sender<Arc<RoutingPartition>>,
 }
 
 impl RoutingBoard {
-    /// A board for a node of `shards` shards, every partition empty.
+    /// A board for a node of `shards` shards, every partition empty, with its reaper
+    /// thread, which ends with the board.
+    ///
+    /// # Panics
+    ///
+    /// When the reaper thread cannot be started, at the node's start.
     #[must_use]
     pub fn new(shards: usize) -> Arc<Self> {
+        let (reaper, freed) = std::sync::mpsc::channel::<Arc<RoutingPartition>>();
+        std::thread::Builder::new()
+            .name("mqttd-routing-reaper".to_string())
+            .spawn(move || while freed.recv().is_ok() {})
+            .expect("the routing reaper thread starts");
         Arc::new(Self {
             cells: (0..shards).map(|_| RwLock::new(Arc::default())).collect(),
             version: AtomicU64::new(0),
             sessions: (0..shards).map(|_| AtomicUsize::new(0)).collect(),
+            reaper,
         })
+    }
+
+    /// Hand `partition` to the reaper. A gone reaper drops it here.
+    fn reap(&self, partition: Arc<RoutingPartition>) {
+        let _ = self.reaper.send(partition);
     }
 
     fn publish(&self, shard: usize, partition: RoutingPartition, sessions: usize) {
         if let Some(cell) = self.cells.get(shard) {
-            *cell.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(partition);
+            let old = std::mem::replace(
+                &mut *cell.write().unwrap_or_else(PoisonError::into_inner),
+                Arc::new(partition),
+            );
+            // Outside the lock, and off this loop.
+            self.reap(old);
         }
         if let Some(count) = self.sessions.get(shard) {
             count.store(sessions, Ordering::Relaxed);
@@ -127,6 +151,13 @@ pub(super) enum AfterPublish {
     Subscribe(oneshot::Sender<Vec<bool>>, Vec<bool>),
     Unsubscribe(oneshot::Sender<Vec<Option<QoS>>>, Vec<Option<QoS>>),
     Attach(oneshot::Sender<AttachOutcome>, AttachOutcome),
+}
+
+/// An [`AfterPublish`] waiting since `since`.
+#[derive(Debug)]
+pub(super) struct Waiting {
+    since: std::time::Instant,
+    answer: AfterPublish,
 }
 
 impl AfterPublish {
@@ -678,7 +709,10 @@ impl Hub {
     /// first. With one shard, or with nothing unpublished, it goes now.
     pub(super) fn answer_after_publish(&mut self, answer: AfterPublish) {
         if self.routing_dirty {
-            self.after_publish.push(answer);
+            self.after_publish.push(Waiting {
+                since: std::time::Instant::now(),
+                answer,
+            });
         } else {
             answer.send();
         }
@@ -719,8 +753,11 @@ impl Hub {
                 .routing_publications
                 .fetch_add(1, Ordering::Relaxed);
         }
-        for answer in std::mem::take(&mut self.after_publish) {
-            answer.send();
+        for waiting in std::mem::take(&mut self.after_publish) {
+            if let Some(m) = &self.metrics {
+                m.hub_routing_answer_waited(self.shard, waiting.since.elapsed().as_secs_f64());
+            }
+            waiting.answer.send();
         }
     }
 
@@ -738,7 +775,11 @@ impl Hub {
         let me = usize::from(self.shard);
         for (k, slot) in self.foreign_routing.iter_mut().enumerate() {
             if k != me {
-                *slot = board.partition(k);
+                let fresh = board.partition(k);
+                if !Arc::ptr_eq(slot, &fresh) {
+                    // Freed by the reaper, not by this shard's publish path.
+                    board.reap(std::mem::replace(slot, fresh));
+                }
             }
         }
     }

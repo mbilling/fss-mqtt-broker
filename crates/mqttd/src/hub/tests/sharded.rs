@@ -876,3 +876,45 @@ fn publications_under_churn_are_spaced_by_their_copy_cost() {
     );
     assert_eq!(answered.try_recv().unwrap(), vec![true]);
 }
+
+/// The cold re-selection path lists another shard's online `$share` members as the deal
+/// does, after this shard's own, so its round-robin cursor indexes both alike; another
+/// shard's offline member is in neither list (ADR 0093 Amendment 4, D5).
+#[test]
+fn reselection_lists_another_shards_online_members_as_the_deal_does() {
+    let store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
+    let mut a = Hub::with_config(NodeId("hub-test".into()), store.clone()).0;
+    let mut b = Hub::with_config(NodeId("hub-test".into()), store).0;
+    let txs = vec![a.sender(), b.sender()];
+    let board = crate::hub::RoutingBoard::new(2);
+    a.set_shards(0, txs.clone(), &board);
+    b.set_shards(1, txs, &board);
+    let own = ClientId(client_on(0, "m-", 0).into());
+    let far_online = ClientId(client_on(1, "m-", 0).into());
+    let far_offline = ClientId(client_on(1, "m-", 1).into());
+    a.shared
+        .subscribe(own.clone(), "g", "t", QoS::AtLeastOnce, false);
+    b.shared
+        .subscribe(far_online.clone(), "g", "t", QoS::AtLeastOnce, true);
+    b.shared
+        .subscribe(far_offline, "g", "t", QoS::AtLeastOnce, false);
+    b.routing_changed();
+    b.publish_routing(true);
+    a.refresh_foreign_routing();
+
+    let cold = a.shared_candidates("t");
+    assert_eq!(cold.len(), 1, "one group");
+    let listed: Vec<(&ClientId, bool)> = cold[0].1.iter().map(|c| (&c.client, c.online)).collect();
+    assert_eq!(
+        listed,
+        vec![(&own, false), (&far_online, true)],
+        "this shard's member, then the other shard's online one; its offline one is left out"
+    );
+    let plans = a.plan_shared("t");
+    assert_eq!(plans.len(), 1);
+    assert_eq!(
+        plans[0].chosen.as_ref().map(|c| &c.client),
+        Some(&far_online),
+        "the deal takes the other shard's online member, as re-selection would"
+    );
+}

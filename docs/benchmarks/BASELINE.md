@@ -144,14 +144,16 @@ a tenth of its time.
 
 Recorded 2026-11-27 on an Apple M1 Pro (macOS, `--release`), not the reference machine:
 
-| Table | Subscriptions | Time (mean) |
-|---|---|---|
-| devices (`devices/<i>/cmd`, one client each) | 1,000 | ~0.31 ms |
-| devices | 10,000 | ~5.1 ms |
-| devices | 100,000 | ~85 ms |
-| `$share` (100 groups, one wildcard filter) | 1,000 | ~0.12 ms |
-| `$share` | 10,000 | ~1.2 ms |
-| `$share` | 100,000 | ~16.6 ms |
+| Table | Subscriptions | Copy (mean) | Free (mean) |
+|---|---|---|---|
+| devices (`devices/<i>/cmd`, one client each) | 1,000 | ~0.31 ms | ~0.17 ms |
+| devices | 10,000 | ~5.1 ms | ~2.7 ms |
+| devices | 100,000 | ~85 ms | ~43 ms |
+| `$share` (100 groups, one wildcard filter) | 1,000 | ~0.12 ms | ~0.06 ms |
+| `$share` | 10,000 | ~1.2 ms | ~0.63 ms |
+| `$share` | 100,000 | ~16.6 ms | ~12.8 ms |
+
+The free runs on the board's reaper thread, off every shard's loop.
 
 ## The regression gate
 
